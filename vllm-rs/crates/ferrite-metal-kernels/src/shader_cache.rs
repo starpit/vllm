@@ -88,6 +88,20 @@ impl ShaderCache {
                 &crate::embedded_metallib!("quantized_splitk_reduce")[..],
             ),
             ("silu_mul", &crate::embedded_metallib!("silu_mul")[..]),
+            ("softmax", &crate::embedded_metallib!("softmax")[..]),
+            ("argpartition", &crate::embedded_metallib!("argpartition")[..]),
+            (
+                "take_along_axis",
+                &crate::embedded_metallib!("take_along_axis")[..],
+            ),
+            (
+                "moe_weighted_sum",
+                &crate::embedded_metallib!("moe_weighted_sum")[..],
+            ),
+            (
+                "slice_trailing_cols",
+                &crate::embedded_metallib!("slice_trailing_cols")[..],
+            ),
         ] {
             let lib = load_library_from_bytes(&device, bytes).map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `{name}.metallib`: {e}"))
@@ -133,9 +147,13 @@ impl ShaderCache {
             // `affine_qmm_n_<dtype>_*` by prefix — all live in
             // shaders/quantized_qmm.metal.
             self.libraries.get("quantized_qmm")
-        } else if name.starts_with("affine_qmv_") {
+        } else if name.starts_with("affine_qmv_") || name.starts_with("affine_gather_qmv_") {
             // Also matches `affine_qmv_quad_*` and `affine_qmv_fast_*`
-            // by prefix.
+            // by prefix, and the MoE gather variants
+            // `affine_gather_qmv_*` / `affine_gather_qmv_fast_*` that
+            // live alongside the plain qmv kernels in
+            // shaders/quantized_qmv.metal (added in the MoE-on-Metal
+            // port).
             self.libraries.get("quantized_qmv")
         } else if name.starts_with("affine_qvm_") {
             // Matches `affine_qvm_<dtype>_*` and
@@ -149,6 +167,19 @@ impl ShaderCache {
             self.libraries.get("quantized_splitk_reduce")
         } else if name.starts_with("silu_mul") {
             self.libraries.get("silu_mul")
+        } else if name.starts_with("block_softmax_")
+            || name.starts_with("looped_softmax_")
+            || name.starts_with("topk_renorm_")
+        {
+            self.libraries.get("softmax")
+        } else if name.starts_with("c_arg_block_sort_") {
+            self.libraries.get("argpartition")
+        } else if name.starts_with("take_along_axis_") {
+            self.libraries.get("take_along_axis")
+        } else if name.starts_with("moe_weighted_sum_") {
+            self.libraries.get("moe_weighted_sum")
+        } else if name.starts_with("slice_trailing_cols_") {
+            self.libraries.get("slice_trailing_cols")
         } else {
             self.libraries.get("activation")
         };

@@ -124,6 +124,18 @@ impl SpecializedPipelines {
             return Err(PipelineLookupError::OpaqueKernel(KernelId::Gemm));
         }
         let key = PipelineKey::new(cmd.library, cmd.function, cmd.constants.clone());
+        if std::env::var_os("FERRITE_METAL_DUMP_PIPELINES").is_some() {
+            // Diagnostic: log unique (library, function) pairs as
+            // they're requested. Useful for verifying the symbol
+            // pickers route to the right kernel instantiations on
+            // new arch/quant combos.
+            static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(&'static str, &'static str)>>> = std::sync::OnceLock::new();
+            let seen = SEEN.get_or_init(Default::default);
+            let mut guard = seen.lock().unwrap();
+            if guard.insert((cmd.library, cmd.function)) {
+                eprintln!("[ferrite-metal pipeline] {}::{}", cmd.library, cmd.function);
+            }
+        }
         self.cache
             .get_or_build(&key)
             .map_err(PipelineLookupError::Build)

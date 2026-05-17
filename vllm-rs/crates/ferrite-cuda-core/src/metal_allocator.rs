@@ -373,6 +373,20 @@ impl MetalAllocator {
         // Bulk-copy mmap → aligned_buffer at offset `shift` via the
         // blit engine (~30 GB/s on Apple Silicon vs ~5 GB/s CPU
         // memcpy_nonoverlapping on M2/M3 unified-memory hardware).
+        //
+        // CHUNKED to ≤2 GiB per `copyFromBuffer:...` call: a single
+        // blit >~4 GiB SILENTLY truncates on Apple Silicon — the
+        // destination bytes past the truncation point remain
+        // uninitialized (zeros from VM page allocation) and any GPU
+        // kernel reading from a binding offset that lands in that
+        // region produces output consistent with `W == 0`. Hit live
+        // by Qwen3-MoE-30B-A3B-4bit's `switch_mlp.down_proj.weight`
+        // at shard-offset 4.67 GiB in a 4.95 GiB shard. The cap
+        // appears to be hard, with no NSError surfaced by the
+        // command buffer (`status == Completed`, `error == nil`).
+        // Reproducer: `tests/large_buffer_offset_probe_test.rs::
+        // nocopy_source_blit_above_4_gib_round_trip`.
+        const BLIT_CHUNK: usize = 2 * 1024 * 1024 * 1024;
         let queue = self.bulk_copy_queue();
         let cmd_buf = queue
             .commandBuffer()
@@ -380,14 +394,19 @@ impl MetalAllocator {
         let blit = cmd_buf
             .blitCommandEncoder()
             .expect("MTLCommandBuffer.blitCommandEncoder returned nil");
-        unsafe {
-            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &src_buffer,
-                0,
-                &dst_buffer,
-                shift,
-                len,
-            );
+        let mut copied = 0usize;
+        while copied < len {
+            let n = (len - copied).min(BLIT_CHUNK);
+            unsafe {
+                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                    &src_buffer,
+                    copied,
+                    &dst_buffer,
+                    shift + copied,
+                    n,
+                );
+            }
+            copied += n;
         }
         blit.endEncoding();
         cmd_buf.commit();

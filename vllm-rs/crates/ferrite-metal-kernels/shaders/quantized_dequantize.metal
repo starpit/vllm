@@ -158,9 +158,17 @@ inline void affine_embed_b4_kernel(
             w, scales, biases, indices, out, AFFINE_EMBED_HIDDEN_SIZE, index);           \
     }
 
-DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,  32)
-DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,  64)
-DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half, 128)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,  32)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,  64)
-DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half, 128)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    32)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,    64)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   f16, half,   128)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,    32)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,    64)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, f16, half,   128)
+// bf16-scale variants — Qwen3-MoE / `torch_dtype: bfloat16` ships BF16
+// scales/biases.
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, bf16, bfloat, 32)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, bf16, bfloat, 64)
+DEFINE_AFFINE_EMBED_B4(bf16, bfloat, bf16, bfloat, 128)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   bf16, bfloat, 32)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   bf16, bfloat, 64)
+DEFINE_AFFINE_EMBED_B4(f16,  half,   bf16, bfloat, 128)

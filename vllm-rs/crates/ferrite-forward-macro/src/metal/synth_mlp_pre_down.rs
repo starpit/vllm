@@ -54,12 +54,11 @@ pub struct MetalSynthMlpPreDownImpl {
 
 impl MetalSynthMlpPreDownImpl {
     pub fn bf16_gs64() -> Self {
-        Self {
-            act_tag: "bfloat",
-            scale_tag: "half",
-            group_size: 64,
-            bits: 4,
-        }
+        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4 }
+    }
+    /// Qwen3-family BF16-scale variant.
+    pub fn bf16_gs64_s_bf16() -> Self {
+        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4 }
     }
 }
 
@@ -88,6 +87,15 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         }
         match &profile.backend_spec {
             crate::target::BackendSpec::Metal(m) => !m.generation.starts_with("M1"),
+            _ => false,
+        }
+    }
+
+    fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
+        let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
+        match (is_qwen3, self.scale_tag) {
+            (true, "bfloat") => true,
+            (false, "half") => true,
             _ => false,
         }
     }

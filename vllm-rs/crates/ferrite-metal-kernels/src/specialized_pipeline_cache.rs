@@ -299,6 +299,25 @@ impl SpecializedPipelineCache {
                 ),
                 ("silu_mul", crate::embedded_metallib!("silu_mul")),
                 ("gemm", crate::embedded_metallib!("gemm")),
+                // MoE-on-Metal: router decomposition kernels.
+                // `lower_metal_moe` (Phase A) emits commands that
+                // reference these libraries by name; without them
+                // the per-(library, function) pipeline lookup in
+                // `get_or_build` panics at first MoE forward.
+                ("softmax", crate::embedded_metallib!("softmax")),
+                ("argpartition", crate::embedded_metallib!("argpartition")),
+                (
+                    "take_along_axis",
+                    crate::embedded_metallib!("take_along_axis"),
+                ),
+                (
+                    "slice_trailing_cols",
+                    crate::embedded_metallib!("slice_trailing_cols"),
+                ),
+                (
+                    "moe_weighted_sum",
+                    crate::embedded_metallib!("moe_weighted_sum"),
+                ),
             ],
         )
     }

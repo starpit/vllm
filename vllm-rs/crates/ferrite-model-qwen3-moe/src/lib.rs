@@ -31,7 +31,7 @@
 use ferrite_forward_macro::forward;
 
 #[forward(
-    workloads = [1, 8, 64, 512, 4096],
+    workloads = [1, 8, 64],
 )]
 fn qwen3_moe() {
     hidden_states = embed(input_ids, embed_tokens);

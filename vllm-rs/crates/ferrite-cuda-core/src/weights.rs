@@ -1376,16 +1376,22 @@ impl GpuWeights {
             "take_affine_dequant_b4: `{weight_name}` dtype is {} (expected U32)",
             w_ref.dtype,
         );
+        // mlx-community 4bit repos ship scales/biases as either F16
+        // (older Llama / Mixtral) or BF16 (newer Qwen3-MoE). Both are
+        // 2 bytes per element; the dequant loop below decodes the
+        // right f16/bf16 bit pattern based on the actual dtype.
         anyhow::ensure!(
-            s_ref.dtype == DType::F16,
-            "take_affine_dequant_b4: `{scales_name}` dtype is {} (expected F16)",
+            matches!(s_ref.dtype, DType::F16 | DType::BF16),
+            "take_affine_dequant_b4: `{scales_name}` dtype is {} (expected F16 or BF16)",
             s_ref.dtype,
         );
         anyhow::ensure!(
-            b_ref.dtype == DType::F16,
-            "take_affine_dequant_b4: `{biases_name}` dtype is {} (expected F16)",
+            b_ref.dtype == s_ref.dtype,
+            "take_affine_dequant_b4: `{biases_name}` dtype is {} (expected same as scales {})",
             b_ref.dtype,
+            s_ref.dtype,
         );
+        let scale_dtype = s_ref.dtype;
         anyhow::ensure!(
             w_ref.shape.len() == 2,
             "take_affine_dequant_b4: packed weight shape rank {} (expected 2)",
@@ -1444,11 +1450,18 @@ impl GpuWeights {
         let gs = group_size as usize;
         let out_halves =
             unsafe { std::slice::from_raw_parts_mut(out_bytes.as_mut_ptr() as *mut u16, n * k) };
+        let decode_half = |bits: u16| -> f32 {
+            match scale_dtype {
+                DType::F16 => half::f16::from_bits(bits).to_f32(),
+                DType::BF16 => half::bf16::from_bits(bits).to_f32(),
+                _ => unreachable!("scale_dtype guarded F16|BF16 above"),
+            }
+        };
         for (offset, &byte) in w_bytes.iter().enumerate() {
             let oindex = offset * 2;
             let gindex = oindex / gs;
-            let scale = half::f16::from_bits(s_halves[gindex]).to_f32();
-            let bias = half::f16::from_bits(b_halves[gindex]).to_f32();
+            let scale = decode_half(s_halves[gindex]);
+            let bias = decode_half(b_halves[gindex]);
             let lo = (byte & 0x0f) as f32;
             let hi = ((byte >> 4) & 0x0f) as f32;
             match dtype_out {

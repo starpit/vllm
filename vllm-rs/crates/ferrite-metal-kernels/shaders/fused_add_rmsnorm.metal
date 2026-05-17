@@ -200,10 +200,12 @@ template <typename T_act, typename T_scale>
   [[kernel]] decltype(fused_add_rmsnorm_specialized_impl<act_type, scale_type>) \
       fused_add_rmsnorm_specialized_impl<act_type, scale_type>;
 
-// Coverage matches the standalone rmsnorm template: T_scale = half
-// always; the `bf16 × bf16` instantiation is removed.
-INST_FUSED_ARN(f16,  half,   f16, half)
-INST_FUSED_ARN(bf16, bfloat, f16, half)
+// Coverage: T_scale tracks on-disk gain dtype. Llama-3.x ships F16
+// gains; Qwen3 family ships BF16. See INST_RMSNORM in `rmsnorm.metal`.
+INST_FUSED_ARN(f16,  half,   f16,  half)
+INST_FUSED_ARN(bf16, bfloat, f16,  half)
+INST_FUSED_ARN(bf16, bfloat, bf16, bfloat)
+INST_FUSED_ARN(f16,  half,   bf16, bfloat)
 
 /// Optimized variant with vectorized loads (half4) for better memory bandwidth
 /// Requires N to be multiple of 4

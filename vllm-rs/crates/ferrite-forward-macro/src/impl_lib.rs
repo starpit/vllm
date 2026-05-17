@@ -29,7 +29,7 @@ use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
-use crate::target::TargetProfile;
+use crate::target::{Backend, TargetProfile};
 
 /// Ambient context for [`Implementation::applies_to`]. Carries the
 /// per-canonical model config + the resolved program so per-arch
@@ -1499,6 +1499,8 @@ impl Implementation for RmsNormRefImpl {
                 ("in_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
+                ("hidden_size", syn::parse_quote!(u32)),
+                ("m_multiplier", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -1508,7 +1510,7 @@ impl Implementation for RmsNormRefImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
         let tile = m.claimed_tiles[0];
@@ -1526,9 +1528,36 @@ impl Implementation for RmsNormRefImpl {
         let acc = accessors
             .first()
             .expect("RmsNorm: required_weights returned empty");
-        let (_base, layer) = split_base_layer(&acc.name.to_string());
+        let acc_name = acc.name.to_string();
+        let (_base, layer) = split_base_layer(&acc_name);
         let layer = layer.unwrap_or(0) as u32;
-        Some(vec![Instruction::RmsNorm(in_slot_idx, out_slot_idx, layer)])
+        // `hidden_size` — the reduction width the metal kernel reads
+        // as `RMSNORM_HIDDEN_SIZE`. Cuda eval ignores this field
+        // (reads tile shape directly). On metal we need the actual
+        // last-dim size baked because the kernel uses a
+        // function-constant loop bound.
+        //
+        // Detection rule (name-based, matches the DSL conventions
+        // across `ferrite-model-*` crates): the per-head q_norm /
+        // k_norm read `[T*heads, head_dim]` so use `head_dim`;
+        // every other RmsNorm reads `[T, hidden]` so use
+        // `hidden_size`. Falls back to `hidden_size` if `bounds`
+        // doesn't carry `head_dim` (older arches that never had
+        // per-head norms).
+        let is_q_norm = acc_name.contains("q_norm");
+        let is_k_norm = acc_name.contains("k_norm");
+        let is_head_norm = is_q_norm || is_k_norm;
+        let hidden = *bounds.get("hidden_size").unwrap_or(&0) as u32;
+        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let num_q_heads = bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
+        let num_kv_heads = bounds.get("num_key_value_heads").copied().unwrap_or(num_q_heads as u64) as u32;
+        let hidden_size = if is_head_norm && head_dim > 0 { head_dim } else { hidden };
+        let m_multiplier = if is_q_norm { num_q_heads.max(1) }
+            else if is_k_norm { num_kv_heads.max(1) }
+            else { 1 };
+        Some(vec![Instruction::RmsNorm(
+            in_slot_idx, out_slot_idx, layer, hidden_size, m_multiplier,
+        )])
     }
 }
 /// Reference HostCallback impl for `OpKind::Gemm`. Hand-written
@@ -1946,12 +1975,26 @@ pub fn starter_library() -> ImplementationLibrary {
         // rejects Affine so these win on the quantized path.
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_fp16()));
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_bf16()));
+        // Metal MoE singletons. Match `OpKind::Moe` on MLX-affine
+        // int4 expert weights; emit the shape-bearing
+        // `Instruction::Metal{Fused,SharedFused}Moe` variants for the
+        // Metal lowering pass. Their CUDA peers
+        // (`FusedMoeRefImpl` / `SharedFusedMoeRefImpl`) are registered
+        // unconditionally and stay target_compatible=true, but the
+        // solver picks these when `profile.backend == Metal` because
+        // a more-specific Impl with a matching target gate wins by
+        // the existing impl-priority ordering (see `MetalGemmImpl`
+        // for the same pattern at the Gemm site).
+        lib.push(Box::new(crate::metal::MetalFusedMoeImpl::default()));
+        lib.push(Box::new(crate::metal::MetalSharedFusedMoeImpl::default()));
         // Solver-side claim for the synth pre-attn megakernel. With
         // no swept `synth_pre_attn_*` rows in the chip's cost CSV,
         // `cost_us` returns +infinity and the solver never picks
         // this — the `apply_synth_replacement` post-pass + bucket_m
         // gate continue to drive the fusion. Registered now so the
         // pluck-in is ready when the sweep wires through.
+        // F16-scale variants — claim on Llama-3.x / Qwen2.5 / SmolLM
+        // mlx-community 4bit (their `.scales` / `.biases` ship F16).
         lib.push(Box::new(crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64()));
         lib.push(Box::new(
             crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_init(),
@@ -1961,6 +2004,20 @@ pub fn starter_library() -> ImplementationLibrary {
         ));
         lib.push(Box::new(
             crate::metal::synth_gate_up_silu_mul::MetalSynthGateUpSiluMulImpl::bf16_gs64(),
+        ));
+        // BF16-scale variants — claim on Qwen3 family (their
+        // `.scales` / `.biases` ship BF16). The Impl `applies_to`
+        // gate keys on the canonical's `architectures` so exactly
+        // one of the two scale variants ever fires per model.
+        lib.push(Box::new(crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_s_bf16()));
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_s_bf16_init(),
+        ));
+        lib.push(Box::new(
+            crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl::bf16_gs64_s_bf16(),
+        ));
+        lib.push(Box::new(
+            crate::metal::synth_gate_up_silu_mul::MetalSynthGateUpSiluMulImpl::bf16_gs64_s_bf16(),
         ));
         // Metal Fused Add+RMSNorm implementations - only match Metal targets
         lib.push(Box::new(
@@ -4668,6 +4725,8 @@ impl Implementation for FusedAddRmsNormImpl {
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
+                ("hidden_size", syn::parse_quote!(u32)),
+                ("m_multiplier", syn::parse_quote!(u32)),
             ],
         )
     }
@@ -4685,7 +4744,7 @@ impl Implementation for FusedAddRmsNormImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = *m
@@ -4712,10 +4771,16 @@ impl Implementation for FusedAddRmsNormImpl {
             .expect("FusedAddRmsNorm: required_weights returned empty");
         let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
+        // Always on the residual stream → `hidden_size`,
+        // `m_multiplier = 1`. See `RmsNormRefImpl::fan_out` for the
+        // field semantics.
+        let hidden_size = *bounds.get("hidden_size").unwrap_or(&0) as u32;
         Some(vec![Instruction::FusedAddRmsNorm(
             delta_idx,
             residual_idx,
             layer,
+            hidden_size,
+            1,
         )])
     }
 }
@@ -15271,6 +15336,12 @@ impl Implementation for FusedMoeRefImpl {
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // Emits `Instruction::FusedMoe` (CUDA-only at runtime), but
+        // partitioned away from Metal by storage gate in `matches`:
+        // Affine-stored experts route to `MetalFusedMoeImpl` (which
+        // emits `Instruction::MetalFusedMoe`). Dense-stored MoE on
+        // Metal is structurally unclaimed today; it would need a
+        // dense-per-expert Metal kernel that hasn't been ported.
         true
     }
 
@@ -15286,6 +15357,14 @@ impl Implementation for FusedMoeRefImpl {
         // Mixtral family — when they land they will defer here the same way
         // DeepSeekMoeRefImpl defers to its FP8/GGML peers).
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
+            return None;
+        }
+        // Affine-stored MoE routes to `MetalFusedMoeImpl` (Metal-only
+        // SwitchGLU decomposition). This Impl is Dense-only at
+        // runtime — the cuda `FusedMoELayer::load` (layers_moe.rs:160)
+        // reads dense BF16 stacked tensors.
+        let node = fuf.get(seed);
+        if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
             return None;
         }
         single_tile_match(fuf, seed, OpKind::Moe)
@@ -15413,6 +15492,8 @@ impl Implementation for SharedFusedMoeRefImpl {
     }
 
     fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        // Partitioned from Metal via Affine-storage gate in `matches`;
+        // see `FusedMoeRefImpl::target_compatible` for the rationale.
         true
     }
 
@@ -15434,6 +15515,12 @@ impl Implementation for SharedFusedMoeRefImpl {
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
         if is_fp8_block_moe(fuf, seed) || is_ggml_moe(fuf, seed) {
+            return None;
+        }
+        // Affine-stored MoE → `MetalSharedFusedMoeImpl`. cuda's
+        // `SharedFusedMoELayer::load` (layers_moe.rs:429) is Dense-only.
+        let node = fuf.get(seed);
+        if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
             return None;
         }
         single_tile_match(fuf, seed, OpKind::Moe)

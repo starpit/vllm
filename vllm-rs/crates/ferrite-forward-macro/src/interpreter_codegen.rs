@@ -101,11 +101,13 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { Embed(#a) }
         }
-        I::RmsNorm(a, b, c) => {
+        I::RmsNorm(a, b, c, d, e) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
-            quote! { RmsNorm(#a, #b, #c) }
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { RmsNorm(#a, #b, #c, #d, #e) }
         }
         I::MeanSubRmsNorm(a, b, c) => {
             let a = lit_u32(a);
@@ -159,11 +161,13 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let b = lit_u32(b);
             quote! { TanhSoftCap(#a, #b) }
         }
-        I::FusedAddRmsNorm(a, b, c) => {
+        I::FusedAddRmsNorm(a, b, c, d, e) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
-            quote! { FusedAddRmsNorm(#a, #b, #c) }
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { FusedAddRmsNorm(#a, #b, #c, #d, #e) }
         }
         I::FusedAddRmsNormWithOffset(a, b, c, d) => {
             let a = lit_u32(a);
@@ -436,6 +440,32 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let b = lit_u32(b);
             let c = lit_u32(c);
             quote! { SharedFusedMoe(#a, #b, #c) }
+        }
+        I::MetalFusedMoe(a, b, c, d, e, f, g, h, i) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            quote! { MetalFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, k) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            let i = lit_u32(i);
+            let j = lit_u32(j);
+            let k = if k { quote! { true } } else { quote! { false } };
+            quote! { MetalSharedFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j, #k) }
         }
         I::CutlassGemm(a, b, c, d, e, f, g, h) => {
             let a = lit_u32(a);
@@ -813,6 +843,8 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
         I::FusedMoe(..) => "FusedMoe",
         I::SharedFusedMoe(..) => "SharedFusedMoe",
+        I::MetalFusedMoe(..) => "MetalFusedMoe",
+        I::MetalSharedFusedMoe(..) => "MetalSharedFusedMoe",
         I::CutlassGemm(..) => "CutlassGemm",
         I::CutlassGemmSplitK(..) => "CutlassGemmSplitK",
         I::CutlassGemmAdd(..) => "CutlassGemmAdd",
@@ -873,10 +905,12 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             0 => u(a),
             _ => None,
         },
-        I::RmsNorm(a, b, c) => match idx {
+        I::RmsNorm(a, b, c, d, e) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
+            3 => u(d),
+            4 => u(e),
             _ => None,
         },
         I::MeanSubRmsNorm(a, b, c) => match idx {
@@ -927,10 +961,12 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             1 => u(b),
             _ => None,
         },
-        I::FusedAddRmsNorm(a, b, c) => match idx {
+        I::FusedAddRmsNorm(a, b, c, d, e) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
+            3 => u(d),
+            4 => u(e),
             _ => None,
         },
         I::FusedAddRmsNormWithOffset(a, b, c, _) => match idx {
@@ -1188,6 +1224,32 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             0 => u(a),
             1 => u(b),
             2 => u(c),
+            _ => None,
+        },
+        I::MetalFusedMoe(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            _ => None,
+        },
+        I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, k) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            7 => u(h),
+            8 => u(i),
+            9 => u(j),
+            10 => Some(if k { 1 } else { 0 }),
             _ => None,
         },
         I::CutlassGemm(a, b, c, d, e, f, g, h) => match idx {
@@ -1514,10 +1576,12 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             0 => I::Embed(n),
             _ => panic!("Embed: bad idx {idx}"),
         },
-        I::RmsNorm(a, b, c) => match idx {
-            0 => I::RmsNorm(n, b, c),
-            1 => I::RmsNorm(a, n, c),
-            2 => I::RmsNorm(a, b, n),
+        I::RmsNorm(a, b, c, d, e) => match idx {
+            0 => I::RmsNorm(n, b, c, d, e),
+            1 => I::RmsNorm(a, n, c, d, e),
+            2 => I::RmsNorm(a, b, n, d, e),
+            3 => I::RmsNorm(a, b, c, n, e),
+            4 => I::RmsNorm(a, b, c, d, n),
             _ => panic!("RmsNorm: bad idx {idx}"),
         },
         I::MeanSubRmsNorm(a, b, c) => match idx {
@@ -1567,10 +1631,12 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             1 => I::TanhSoftCap(a, n),
             _ => panic!("TanhSoftCap: bad idx {idx}"),
         },
-        I::FusedAddRmsNorm(a, b, c) => match idx {
-            0 => I::FusedAddRmsNorm(n, b, c),
-            1 => I::FusedAddRmsNorm(a, n, c),
-            2 => I::FusedAddRmsNorm(a, b, n),
+        I::FusedAddRmsNorm(a, b, c, d, e) => match idx {
+            0 => I::FusedAddRmsNorm(n, b, c, d, e),
+            1 => I::FusedAddRmsNorm(a, n, c, d, e),
+            2 => I::FusedAddRmsNorm(a, b, n, d, e),
+            3 => I::FusedAddRmsNorm(a, b, c, n, e),
+            4 => I::FusedAddRmsNorm(a, b, c, d, n),
             _ => panic!("FusedAddRmsNorm: bad idx {idx}"),
         },
         I::FusedAddRmsNormWithOffset(a, b, c, d) => match idx {
@@ -1821,6 +1887,32 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             1 => I::FusedMoe(a, n, c),
             2 => I::FusedMoe(a, b, n),
             _ => panic!("FusedMoe: bad idx {idx}"),
+        },
+        I::MetalFusedMoe(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::MetalFusedMoe(n, b, c, d, e, f, g, h, i),
+            1 => I::MetalFusedMoe(a, n, c, d, e, f, g, h, i),
+            2 => I::MetalFusedMoe(a, b, n, d, e, f, g, h, i),
+            3 => I::MetalFusedMoe(a, b, c, n, e, f, g, h, i),
+            4 => I::MetalFusedMoe(a, b, c, d, n, f, g, h, i),
+            5 => I::MetalFusedMoe(a, b, c, d, e, n, g, h, i),
+            6 => I::MetalFusedMoe(a, b, c, d, e, f, n, h, i),
+            7 => I::MetalFusedMoe(a, b, c, d, e, f, g, n, i),
+            8 => I::MetalFusedMoe(a, b, c, d, e, f, g, h, n),
+            _ => panic!("MetalFusedMoe: bad idx {idx}"),
+        },
+        I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, k) => match idx {
+            0 => I::MetalSharedFusedMoe(n, b, c, d, e, f, g, h, i, j, k),
+            1 => I::MetalSharedFusedMoe(a, n, c, d, e, f, g, h, i, j, k),
+            2 => I::MetalSharedFusedMoe(a, b, n, d, e, f, g, h, i, j, k),
+            3 => I::MetalSharedFusedMoe(a, b, c, n, e, f, g, h, i, j, k),
+            4 => I::MetalSharedFusedMoe(a, b, c, d, n, f, g, h, i, j, k),
+            5 => I::MetalSharedFusedMoe(a, b, c, d, e, n, g, h, i, j, k),
+            6 => I::MetalSharedFusedMoe(a, b, c, d, e, f, n, h, i, j, k),
+            7 => I::MetalSharedFusedMoe(a, b, c, d, e, f, g, n, i, j, k),
+            8 => I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, n, j, k),
+            9 => I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, n, k),
+            10 => I::MetalSharedFusedMoe(a, b, c, d, e, f, g, h, i, j, n != 0),
+            _ => panic!("MetalSharedFusedMoe: bad idx {idx}"),
         },
         I::SharedFusedMoe(a, b, c) => match idx {
             0 => I::SharedFusedMoe(n, b, c),
@@ -2405,17 +2497,26 @@ pub fn colored_slot_map(
         let tile_shape = fuf.get(tile).outputs[slot as usize].clone();
         let is_alias = alias_to_owner.contains_key(&(tile, slot));
 
-        // Same-shape alias collapse: dst pins to owner's color.
-        // No active entry (the owner's already covers the combined
-        // lifetime via `owner_last_use` resolution).
+        // Alias collapse: dst pins to owner's color. By construction
+        // an alias preserves bytes (Reshape is metadata-only on the
+        // arena, just changes the logical shape interpretation), so
+        // sharing the owner's color is safe even when shapes differ
+        // (`[T, 4096]` vs `[T, num_q, head_dim]` for Qwen3's per-head
+        // q_norm path).
+        //
+        // Pre-2026-05-17 this branch had a `owner_shape == tile_shape`
+        // gate. That worked for Llama (no reshape between gemm and
+        // rmsnorm) but broke Qwen3-family per-head q_norm/k_norm: the
+        // reshaped view got its own arena slot, never written by the
+        // upstream gemm, so RmsNorm read zeros → cascading garbage
+        // through attention/MoE. The MLX-vs-metal parity bisect at
+        // dispatch 8 (q_norm) showed input ptr != q_proj output ptr;
+        // see `project-metal-bf16-scales` memory.
         if is_alias {
             let owner = resolve((tile, slot));
-            let owner_shape = fuf.get(owner.0).outputs[owner.1 as usize].clone();
-            if owner_shape == tile_shape {
-                let owner_color = sm.of(owner.0, owner.1);
-                sm.insert_at(tile, slot, owner_color);
-                continue;
-            }
+            let owner_color = sm.of(owner.0, owner.1);
+            sm.insert_at(tile, slot, owner_color);
+            continue;
         }
 
         // Compute lu_self for the active entry.
@@ -3359,6 +3460,17 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         | I::FusedQkvRopePrefill(..)
         | I::CutlassFusedQkvRopeCache(..)
         | I::CutlassFusedQkvRopePrefill(..) => 3,
+        // MoE Instructions consume one full MoE layer accessor
+        // (`FusedMoELayer` / `SharedFusedMoELayer` enum). The Impl's
+        // `required_weights` returns exactly one accessor per
+        // Instruction; counting it here makes the macro register a
+        // (bucket, op_idx, 0) → wm.<base>(layer) arm on the
+        // appropriate accessor method (`fused_moe_at` or
+        // `shared_fused_moe_at`). Without this slot the per-arch
+        // `WeightAccessors` impl falls back to the trait's
+        // `unreachable!()` default and panics at first MoE forward.
+        I::FusedMoe(..) | I::MetalFusedMoe(..) => 1,
+        I::SharedFusedMoe(..) | I::MetalSharedFusedMoe(..) => 1,
         // Everything else: no codegen-time weight, or weight resolved
         // via a different path (MetalBiasAdd through the upstream
         // Linear's `AffineLinearBias` field, attention reads through
@@ -4087,9 +4199,9 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("RmsNorm".to_string(), 2usize);
         let v = vec![
-            Instruction::RmsNorm(0, 1, 0),
-            Instruction::RmsNorm(0, 1, 1),
-            Instruction::RmsNorm(0, 1, 2),
+            Instruction::RmsNorm(0, 1, 0, 2048, 1),
+            Instruction::RmsNorm(0, 1, 1, 2048, 1),
+            Instruction::RmsNorm(0, 1, 2, 2048, 1),
         ];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, Some((0, 1, 3)));
@@ -4103,9 +4215,9 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("RmsNorm".to_string(), 2usize);
         let v = vec![
-            Instruction::RmsNorm(0, 1, 0),
-            Instruction::RmsNorm(0, 1, 2),
-            Instruction::RmsNorm(0, 1, 4),
+            Instruction::RmsNorm(0, 1, 0, 2048, 1),
+            Instruction::RmsNorm(0, 1, 2, 2048, 1),
+            Instruction::RmsNorm(0, 1, 4, 2048, 1),
         ];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, None);
@@ -4119,7 +4231,7 @@ mod tests {
     fn loop_detection_rejects_non_iter_field_drift() {
         let mut map = std::collections::HashMap::new();
         map.insert("RmsNorm".to_string(), 2usize);
-        let v = vec![Instruction::RmsNorm(0, 1, 0), Instruction::RmsNorm(7, 1, 1)];
+        let v = vec![Instruction::RmsNorm(0, 1, 0, 2048, 1), Instruction::RmsNorm(7, 1, 1, 2048, 1)];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, None);
     }
@@ -4141,9 +4253,9 @@ mod tests {
         ));
         let mut lb = LoweredBucket {
             instances: vec![
-                Instruction::RmsNorm(0, 1, 0),
-                Instruction::RmsNorm(0, 1, 1),
-                Instruction::RmsNorm(0, 1, 2),
+                Instruction::RmsNorm(0, 1, 0, 2048, 1),
+                Instruction::RmsNorm(0, 1, 1, 2048, 1),
+                Instruction::RmsNorm(0, 1, 2, 2048, 1),
             ],
             barriers: vec![false; 3],
             weight_slots: vec![Vec::new(); 3],
@@ -4191,14 +4303,14 @@ mod tests {
         let mut lb = LoweredBucket {
             instances: vec![
                 // iter 0: RmsNorm@0, FusedAddRmsNorm@1
-                Instruction::RmsNorm(0, 1, 0),
-                Instruction::FusedAddRmsNorm(0, 1, 1),
+                Instruction::RmsNorm(0, 1, 0, 2048, 1),
+                Instruction::FusedAddRmsNorm(0, 1, 1, 2048, 1),
                 // iter 1
-                Instruction::RmsNorm(0, 1, 1),
-                Instruction::FusedAddRmsNorm(0, 1, 2),
+                Instruction::RmsNorm(0, 1, 1, 2048, 1),
+                Instruction::FusedAddRmsNorm(0, 1, 2, 2048, 1),
                 // iter 2
-                Instruction::RmsNorm(0, 1, 2),
-                Instruction::FusedAddRmsNorm(0, 1, 3),
+                Instruction::RmsNorm(0, 1, 2, 2048, 1),
+                Instruction::FusedAddRmsNorm(0, 1, 3, 2048, 1),
             ],
             barriers: vec![false; 6],
             weight_slots: vec![Vec::new(); 6],

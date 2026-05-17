@@ -9,16 +9,21 @@
 pub mod activation;
 pub mod allocator;
 pub mod argmax;
+pub mod argpartition;
 pub mod cpu_reference;
 pub mod device;
 pub mod fused_kernels;
 pub mod gemm;
+pub mod moe_weighted_sum;
 pub mod quantized;
 pub mod residency;
 pub mod rope;
 pub mod shader_cache;
+pub mod slice_trailing_cols;
+pub mod softmax;
 pub mod specialized_pipeline_cache;
 pub mod stream;
+pub mod take_along_axis;
 
 // Instruction recording for ICB execution
 pub mod instruction_executor;

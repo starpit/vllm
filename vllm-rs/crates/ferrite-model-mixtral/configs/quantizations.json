@@ -1,3 +1,5 @@
 {
-  "quantizations": []
+  "quantizations": [
+    "mlx-affine-b4-g64"
+  ]
 }

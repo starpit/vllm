@@ -837,6 +837,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         use ::objc2_metal::MTLCommandEncoder;
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
         let t_pre = std::time::Instant::now();
+        // FERRITE_DUMP_LAYER0 dump path — encode+sync per dispatch
+        // so layer-0 activations can be compared against an MLX
+        // reference. Returns early; slow but only used for parity.
+        if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
+            worker
+                .run_bucket_mtl3_with_dumps(bucket_idx, num_tokens as u32, queue)
+                .map_err(ForwardError::Worker)?;
+            return Ok(());
+        }
         let cb = queue.commandBuffer().expect("commandBuffer");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
         worker

@@ -114,7 +114,7 @@ impl Instruction {
             Instruction::Embed(out_slot) => {
                 ("Embed", vec![F::Slot(out_slot), F::LayerKind("Embedding")])
             }
-            Instruction::RmsNorm(in_slot, out_slot, layer) => (
+            Instruction::RmsNorm(in_slot, out_slot, layer, _hidden_size, _m_mult) => (
                 "RmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -175,7 +175,7 @@ impl Instruction {
             Instruction::TanhSoftCap(in_slot, out_slot) => {
                 ("TanhSoftCap", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
-            Instruction::FusedAddRmsNorm(in_slot, out_slot, layer) => (
+            Instruction::FusedAddRmsNorm(in_slot, out_slot, layer, _hidden_size, _m_mult) => (
                 "FusedAddRmsNorm",
                 vec![
                     F::Slot(in_slot),
@@ -620,6 +620,60 @@ impl Instruction {
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::LayerKind("SharedFusedMoELayer"),
+                ],
+            ),
+            Instruction::MetalFusedMoe(
+                in_slot,
+                out_slot,
+                layer,
+                num_experts,
+                top_k,
+                moe_inter,
+                hidden,
+                gs,
+                bits,
+            ) => (
+                "MetalFusedMoe",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("FusedMoELayer"),
+                    F::ConstU32(num_experts),
+                    F::ConstU32(top_k),
+                    F::ConstU32(moe_inter),
+                    F::ConstU32(hidden),
+                    F::ConstU32(gs),
+                    F::ConstU32(bits),
+                ],
+            ),
+            Instruction::MetalSharedFusedMoe(
+                in_slot,
+                out_slot,
+                layer,
+                num_experts,
+                top_k,
+                moe_inter,
+                hidden,
+                shared_inter,
+                gs,
+                bits,
+                norm_topk_prob,
+            ) => (
+                "MetalSharedFusedMoe",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("SharedFusedMoELayer"),
+                    F::ConstU32(num_experts),
+                    F::ConstU32(top_k),
+                    F::ConstU32(moe_inter),
+                    F::ConstU32(hidden),
+                    F::ConstU32(shared_inter),
+                    F::ConstU32(gs),
+                    F::ConstU32(bits),
+                    F::ConstBool(norm_topk_prob),
                 ],
             ),
             Instruction::CutlassGemm(in_slot, out_slot, layer, tile_m, tile_n, stages, n, k) => (
@@ -1204,7 +1258,7 @@ mod tests {
 
     #[test]
     fn fused_add_rmsnorm_carries_layer_and_kernel_class() {
-        let i: Instruction = Instruction::FusedAddRmsNorm(3, 4, 12);
+        let i: Instruction = Instruction::FusedAddRmsNorm(3, 4, 12, 2048, 1);
         let n = i.normalize();
         assert_eq!(n.kind, "FusedAddRmsNorm");
         assert_eq!(

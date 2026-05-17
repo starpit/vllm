@@ -204,6 +204,39 @@ pub trait CanonicalParams: WeightAccessors {
     const METAL_DTYPE: crate::interpreter::metal::MetalDtype =
         crate::interpreter::metal::MetalDtype::Bf16;
 
+    /// `hidden_size` (residual-stream width) — distinct from
+    /// `Q_SIZE = num_q_heads * head_dim`. On Llama / Qwen2.5 these
+    /// happen to be equal because each Q head is `hidden_size /
+    /// num_heads`. On Qwen3 (and any GQA / different head_dim
+    /// arch) they differ: e.g. Qwen3-30B-A3B has hidden=2048,
+    /// num_q=32, head_dim=128 → Q_SIZE=4096. The metal interpreter
+    /// previously baked `W::Q_SIZE` as `AFFINE_EMBED_HIDDEN_SIZE`
+    /// and `RMSNORM_HIDDEN_SIZE`, which broke Qwen3 silently. The
+    /// macro emits this const from `model.bounds["hidden_size"]`.
+    /// Default value is invalid (0) so unset arches surface as
+    /// compile-time-detectable bad values rather than silent
+    /// corruption.
+    const HIDDEN_SIZE: usize = 0;
+
+    /// On-disk storage dtype for `*.scales` / `*.biases` tensors on
+    /// mlx-affine-b4 checkpoints. The affine quant Metal kernels
+    /// (`affine_qmv`, `affine_qmm_t`, `affine_qvm`, `affine_gather_qmv`,
+    /// `affine_embed`) read these as `T_scale` and cast to `T_act` in-
+    /// register. MLX templates `T_scale ∈ {half, bfloat16_t}` natively
+    /// (`mlx/.../quantized.h INSTANTIATE_QUANTIZED_FUNCTIONS`);
+    /// ferrite-metal mirrors that surface, picking the right symbol
+    /// based on this const.
+    ///
+    /// `mlx-community` convention varies by arch family (probed across
+    /// the cached HF snapshots): Llama-3.x / Qwen2.5 / SmolLM → F16,
+    /// Qwen3 family → BF16. Default `F16` matches the
+    /// majority-of-checkpoints convention; per-arch macro overrides
+    /// flip it to BF16 (Qwen3 family). Sourced from the manifest's
+    /// `scale_dtype` field on the matched `mlx-affine-*` preset.
+    #[cfg(feature = "metal")]
+    const SCALE_DTYPE: crate::interpreter::metal::ScaleDtype =
+        crate::interpreter::metal::ScaleDtype::F16;
+
     // ── Backend-capability flags ────────────────────────────────
     //
     // Each `HAS_*` flag tells [`crate::backend_compat::BackendCompat`]
@@ -475,9 +508,22 @@ pub struct InterpreterCtx<'a, W> {
 #[allow(clippy::type_complexity)]
 pub enum Instruction {
     Embed(u32),
-    /// `RmsNorm(in_slot, out_slot, layer)`. Weight accessor lives
-    /// at the tape level — see [`Tape`].
-    RmsNorm(u32, u32, u32),
+    /// `RmsNorm(in_slot, out_slot, layer, hidden_size, m_multiplier)`.
+    /// Weight accessor lives at the tape level — see [`Tape`].
+    ///
+    /// `hidden_size` is the row width the kernel reduces over;
+    /// `m_multiplier` is the number of normalization rows per input
+    /// token. For the standard residual-stream RmsNorm:
+    /// `(hidden_size = W::HIDDEN_SIZE, m_multiplier = 1)`. For
+    /// per-head `q_norm` (Qwen3): `(W::HEAD_DIM, num_q_heads)`;
+    /// for `k_norm`: `(W::HEAD_DIM, num_kv_heads)`. The metal kernel
+    /// dispatches `bucket_m * m_multiplier` threadgroups, each
+    /// reducing `hidden_size` elements. Pre-Qwen3 the lowering
+    /// hardcoded `(W::Q_SIZE, 1)` — correct for Llama (Q_SIZE ==
+    /// hidden) but wrong for Qwen3 (Q_SIZE != hidden, q_norm has
+    /// per-head reduction). The cuda interpreter reads tile shape
+    /// directly and ignores both fields.
+    RmsNorm(u32, u32, u32, u32, u32),
     /// CohereLayerNorm-flavored norm (subtracts mean before scaling).
     /// Claimed from the `(mean, sub, rmsnorm)` math trio in the DSL.
     /// Weight is typed `RmsNorm` because the DSL author writes
@@ -537,7 +583,11 @@ pub enum Instruction {
     SpliceMmEmbeds(u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
-    FusedAddRmsNorm(u32, u32, u32),
+    /// `FusedAddRmsNorm(delta_slot, residual_slot, layer, hidden_size, m_multiplier)`.
+    /// See [`RmsNorm`](Instruction::RmsNorm) for the field semantics.
+    /// FusedAddRmsNorm is always on the residual stream so
+    /// `m_multiplier = 1` and `hidden_size = W::HIDDEN_SIZE`.
+    FusedAddRmsNorm(u32, u32, u32, u32, u32),
     FusedAddRmsNormWithOffset(u32, u32, u32, f32),
     ScalarOffsetRmsNorm(u32, u32, u32, f32),
     /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
@@ -734,6 +784,46 @@ pub enum Instruction {
     /// `FusedMoe` (with `renormalize=true`); the shared expert is a
     /// SwiGLU MLP gated by `sigmoid(shared_expert_gate(x))`.
     SharedFusedMoe(u32, u32, u32),
+    /// Metal-only Mixtral-style fused MoE: carries the full structural
+    /// shape baked at macro-expansion time from the model config, so
+    /// the Metal lowering pass + worker can specialize pipelines
+    /// (`function_constant`s for moe_weighted_sum, affine_gather_qmv),
+    /// stamp `Binding::Inline` u32s (top_k, axis_size), and size the
+    /// per-bucket MoE scratch buffer — all without a runtime
+    /// shape-resolution detour.
+    ///
+    /// Tuple fields: `(in_slot, out_slot, layer, num_experts, top_k,
+    /// moe_intermediate_size, hidden_size, group_size, bits)`.
+    /// `group_size` + `bits` come from the per-expert weight
+    /// `StorageFormat::Affine`; for the on-disk mlx-community 4bit
+    /// MoE checkpoints those are `64` and `4` respectively.
+    ///
+    /// Softmax order is fixed by variant identity: Mixtral does
+    /// `topk → softmax(scores)`, no renorm flag. (See `SharedFusedMoe`
+    /// for the Qwen `softmax → topk → take_along_axis` order.)
+    /// CUDA-target macros keep emitting [`Instruction::FusedMoe`];
+    /// the Metal-target `MetalFusedMoeImpl` (in
+    /// `ferrite-forward-macro::metal::moe`) emits this variant when
+    /// `profile.backend == Backend::Metal` and the per-expert weight
+    /// storage is `Affine`.
+    MetalFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32),
+    /// Metal-only Qwen-MoE-style fused MoE + optional shared expert.
+    /// Same rationale as [`Instruction::MetalFusedMoe`]: macro-baked
+    /// shape for the Metal lowering arm.
+    ///
+    /// Tuple fields: `(in_slot, out_slot, layer, num_experts, top_k,
+    /// moe_intermediate_size, hidden_size, shared_intermediate_size,
+    /// group_size, bits, norm_topk_prob)`.
+    /// `shared_intermediate_size = 0` means no shared expert — the
+    /// lowering arm skips the shared-expert tail entirely
+    /// (modern Qwen3-MoE-30B-A3B-Instruct ships this). Qwen1.5-MoE /
+    /// Qwen2-MoE ship non-zero. `norm_topk_prob = true` triggers the
+    /// post-`take_along_axis` renorm of gathered scores (Qwen3-MoE's
+    /// `norm_topk_prob` config flag).
+    ///
+    /// Softmax order is fixed by variant identity: Qwen-MoE does
+    /// `softmax → topk → take_along_axis(scores)`.
+    MetalSharedFusedMoe(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, bool),
     CutlassGemm(u32, u32, u32, u32, u32, u32, u32, u32),
     CutlassGemmSplitK(u32, u32, u32, u32, u32, u32, u32, u32, u32),
     CutlassGemmAdd(u32, u32, u32, u32, u32, u32, u32, u32),
@@ -1044,7 +1134,7 @@ impl Instruction {
                     src_row += length;
                 }
             },
-            Instruction::RmsNorm(in_slot, out_slot, layer) => unsafe {
+            Instruction::RmsNorm(in_slot, out_slot, layer, _hidden_size, _m_multiplier) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
@@ -1180,7 +1270,7 @@ impl Instruction {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer) => unsafe {
+            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer, _hidden_size, _m_multiplier) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
@@ -3238,6 +3328,15 @@ impl Instruction {
                      MetalBiasAddImpl for QKV biases on the singleton \
                      (non-synth) path. cuda folds biases into cuBLAS \
                      gemm_bias via FusedGemmBias instead"
+                );
+            }
+            Instruction::MetalFusedMoe(..) | Instruction::MetalSharedFusedMoe(..) => {
+                unreachable!(
+                    "Instruction::Metal{{,Shared}}FusedMoe is metal-only — \
+                     emitted by Metal{{,Shared}}FusedMoeImpl carrying macro-baked \
+                     MoE shape for the Metal lowering arm. cuda's MoE path emits \
+                     Instruction::{{,Shared}}FusedMoe and reads shape from the \
+                     runtime FusedMoELayer / SharedFusedMoELayer struct"
                 );
             }
             #[cfg(feature = "metal")]

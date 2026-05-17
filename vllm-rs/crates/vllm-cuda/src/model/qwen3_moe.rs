@@ -20,7 +20,8 @@ use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Linear, LinearLayer, RmsNorm};
 use crate::layers_moe::{
-    Fp8BlockFusedMoELayer, Fp8FusedMoELayer, FusedMoELayer, MarlinSharedFusedMoELayer,
+    DenseFusedMoELayer, Fp8BlockFusedMoELayer, Fp8FusedMoELayer, FusedMoELayer,
+    MarlinSharedFusedMoELayer,
 };
 use crate::model::llama::{LlamaAttention, LlamaMLP, RotaryCache, TpConfig};
 #[cfg(feature = "nccl")]
@@ -375,7 +376,7 @@ impl Qwen3MoeDecoderLayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * ipp, hidden], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, ipp], dtype) };
 
-        let moe = FusedMoELayer {
+        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -390,7 +391,7 @@ impl Qwen3MoeDecoderLayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        };
+        });
 
         let shared_inter = config.shared_expert_intermediate_size;
         let sipp = shared_inter / world_size;

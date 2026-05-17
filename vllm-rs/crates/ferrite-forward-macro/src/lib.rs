@@ -932,6 +932,16 @@ fn compile_common(
                 "deepseek_moe_ggml",
                 "fused_moe_ref",
                 "shared_fused_moe_ref",
+                // Metal MoE Impls. Same "host-callback dispatch
+                // wrapper, internal compute steps already classified
+                // (Gemm via metal_gemm_, gather_qmv via
+                // metal_affine_qmm_)" shape as the cuda *_ref
+                // siblings — bucket them under non-gemm for
+                // accounting.
+                #[cfg(feature = "metal")]
+                "metal_fused_moe",
+                #[cfg(feature = "metal")]
+                "metal_shared_fused_moe",
                 "fused_add_rms_norm",
                 "fused_add_rms_norm_with_offset",
                 "mean_sub_rms_norm",

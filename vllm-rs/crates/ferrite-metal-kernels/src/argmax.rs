@@ -230,9 +230,18 @@ pub fn dispatch_argmax_bf16(
     cmdbuf.commit();
     cmdbuf.waitUntilCompleted();
     if cmdbuf.status() != MTLCommandBufferStatus::Completed {
+        // Surface the underlying `NSError` (e.g.
+        // `kIOGPUCommandBufferCallbackErrorOutOfMemory`) — the bare
+        // status code makes status=5 indistinguishable between a
+        // memory error and a kernel fault.
+        let err_desc = cmdbuf
+            .error()
+            .map(|e| format!("{:?}", e))
+            .unwrap_or_else(|| "(no NSError)".into());
         return Err(MetalStreamError::ShaderCompilationFailed(format!(
-            "argmax_bf16 dispatch finished with status {:?}",
-            cmdbuf.status()
+            "argmax_bf16 dispatch finished with status {:?} — error={}",
+            cmdbuf.status(),
+            err_desc,
         )));
     }
     Ok(())

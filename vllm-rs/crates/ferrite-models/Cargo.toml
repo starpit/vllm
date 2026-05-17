@@ -87,7 +87,10 @@ metal = [
     "ferrite-model-mistral?/metal",
     "ferrite-model-modernbert?/metal",
     "ferrite-model-qwen2?/metal",
+    "ferrite-model-qwen2-moe?/metal",
     "ferrite-model-qwen3?/metal",
+    "ferrite-model-qwen3-moe?/metal",
+    "ferrite-model-mixtral?/metal",
 ]
 
 # Tensor-parallel umbrella. Forwards `nccl` through to every per-arch

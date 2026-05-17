@@ -468,9 +468,17 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   INST_QVM_SPLIT_K(act_tag, act_type, scale_tag, scale_type, gs)
 
 // Coverage: see header note in `quantized_qmv.metal`.
-INST_QVM_ALL(f16,  half,   f16, half,  32)
-INST_QVM_ALL(f16,  half,   f16, half,  64)
-INST_QVM_ALL(f16,  half,   f16, half, 128)
-INST_QVM_ALL(bf16, bfloat, f16, half,  32)
-INST_QVM_ALL(bf16, bfloat, f16, half,  64)
-INST_QVM_ALL(bf16, bfloat, f16, half, 128)
+INST_QVM_ALL(f16,  half,   f16, half,    32)
+INST_QVM_ALL(f16,  half,   f16, half,    64)
+INST_QVM_ALL(f16,  half,   f16, half,   128)
+INST_QVM_ALL(bf16, bfloat, f16, half,    32)
+INST_QVM_ALL(bf16, bfloat, f16, half,    64)
+INST_QVM_ALL(bf16, bfloat, f16, half,   128)
+// bf16-scale variants — Qwen3-MoE / `torch_dtype: bfloat16` ships BF16
+// scales/biases. Mirrors MLX's `T_scale = bfloat16_t` instantiations.
+INST_QVM_ALL(bf16, bfloat, bf16, bfloat, 32)
+INST_QVM_ALL(bf16, bfloat, bf16, bfloat, 64)
+INST_QVM_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_QVM_ALL(f16,  half,   bf16, bfloat, 32)
+INST_QVM_ALL(f16,  half,   bf16, bfloat, 64)
+INST_QVM_ALL(f16,  half,   bf16, bfloat, 128)

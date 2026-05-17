@@ -58,22 +58,17 @@ pub struct MetalSynthPreAttnImpl {
 
 impl MetalSynthPreAttnImpl {
     pub fn bf16_gs64() -> Self {
-        Self {
-            act_tag: "bfloat",
-            scale_tag: "half",
-            group_size: 64,
-            bits: 4,
-            init: false,
-        }
+        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4, init: false }
     }
     pub fn bf16_gs64_init() -> Self {
-        Self {
-            act_tag: "bfloat",
-            scale_tag: "half",
-            group_size: 64,
-            bits: 4,
-            init: true,
-        }
+        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4, init: true }
+    }
+    /// Qwen3-family BF16-scale variant. See [`is_qwen3_arch`] for the gate.
+    pub fn bf16_gs64_s_bf16() -> Self {
+        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4, init: false }
+    }
+    pub fn bf16_gs64_s_bf16_init() -> Self {
+        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4, init: true }
     }
 }
 
@@ -88,6 +83,15 @@ impl Implementation for MetalSynthPreAttnImpl {
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
         profile.backend == Backend::Metal
+    }
+
+    fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
+        let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
+        match (is_qwen3, self.scale_tag) {
+            (true, "bfloat") => true,
+            (false, "half") => true,
+            _ => false,
+        }
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {

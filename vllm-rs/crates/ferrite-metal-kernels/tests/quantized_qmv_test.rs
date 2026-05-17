@@ -577,3 +577,150 @@ fn affine_qmv_generic_b4_bf16_matches_cpu_reference() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// BF16 SCALES — Qwen3 mlx-community 4bit convention. Mirrors the
+// three F16-scale tests above but loads scales/biases as `half::bf16`
+// and dispatches the `_s_bf16_` kernel arms (instantiated via
+// `INST_QMV_ALL(_, _, bf16, bfloat, …)` in `quantized_qmv.metal`).
+// Validates `ScaleDtype::Bf16` end-to-end without needing a full
+// Qwen3 model load (24 GiB-cap blocks Qwen3-30B-A3B end-to-end on
+// this machine, per `project_metal_moe_instr_shape.md`).
+// ─────────────────────────────────────────────────────────────────
+
+/// Same as `make_inputs_bf16` but with BF16 scales/biases.
+fn make_inputs_bf16_s_bf16(
+    seed: u64,
+    n: usize,
+    k: usize,
+    m: usize,
+    group_size: usize,
+) -> (Vec<u8>, Vec<half::bf16>, Vec<half::bf16>, Vec<half::bf16>) {
+    assert_eq!(k % group_size, 0);
+    let n_bytes = n * k / 2;
+    let n_groups = n * k / group_size;
+    let mut rng = SplitMix64(seed);
+    let packed: Vec<u8> = (0..n_bytes).map(|_| rng.next_byte()).collect();
+    let scales: Vec<half::bf16> = (0..n_groups)
+        .map(|_| half::bf16::from_f32(0.01 + 0.04 * rng.next_unit_f32()))
+        .collect();
+    let biases: Vec<half::bf16> = (0..n_groups)
+        .map(|_| half::bf16::from_f32(rng.next_unit_f32() - 0.5))
+        .collect();
+    let x: Vec<half::bf16> = (0..(m * k))
+        .map(|_| half::bf16::from_f32(2.0 * rng.next_unit_f32() - 1.0))
+        .collect();
+    (packed, scales, biases, x)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qmv_bf16_s_bf16(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    x: &[half::bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: u32,
+) -> Vec<half::bf16> {
+    let device = detect_device().expect("Metal device").device;
+    let mut stream = MetalStream::new(&device);
+    let qmv = MetalAffineQmv::new(device.clone()).expect("MetalAffineQmv");
+    let packed_buf = buffer_from_bytes(&device, packed);
+    let scales_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(scales.as_ptr() as *const u8, std::mem::size_of_val(scales))
+    };
+    let biases_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(biases.as_ptr() as *const u8, std::mem::size_of_val(biases))
+    };
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(x)) };
+    let scales_buf = buffer_from_bytes(&device, scales_bytes);
+    let biases_buf = buffer_from_bytes(&device, biases_bytes);
+    let x_buf = buffer_from_bytes(&device, x_bytes);
+    let n_out = m * n;
+    let y_buf = zeroed_buffer(&device, n_out * std::mem::size_of::<half::bf16>());
+    let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
+    let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
+    qmv.execute(
+        &x_buf, &packed_buf, &scales_buf, &biases_buf, &y_buf,
+        m as u32, n as u32, k as u32, 1, group_size, 4,
+        DequantDtype::Bf16, ScaleDtype::Bf16, &encoder,
+    )
+    .expect("qmv dispatch");
+    encoder.endEncoding();
+    stream.commit().expect("commit");
+    stream.synchronize().expect("sync");
+    read_buffer_bf16(&y_buf, n_out)
+}
+
+#[test]
+fn affine_qmv_quad_b4_bf16_s_bf16_matches_cpu_reference() {
+    // K=128 → qmv_quad with D=128.
+    let m = 1;
+    let n = 64;
+    let k = 128;
+    for &group_size in &[32usize, 64, 128] {
+        let (packed, scales, biases, x) =
+            make_inputs_bf16_s_bf16(0xC0DE_u64 ^ group_size as u64, n, k, m, group_size);
+        let expected =
+            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+                &packed, &scales, &biases, &x, m, n, k, group_size,
+            );
+        let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+        let (idx, mv, ev, abs_err, allowed) =
+            worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+        assert!(
+            abs_err <= allowed,
+            "qmv_quad s_bf16 gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+             (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+        );
+    }
+}
+
+#[test]
+fn affine_qmv_fast_b4_bf16_s_bf16_matches_cpu_reference() {
+    let m = 1;
+    let n = 64;
+    let k = 512;
+    for &group_size in &[32usize, 64, 128] {
+        let (packed, scales, biases, x) =
+            make_inputs_bf16_s_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
+        let expected =
+            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+                &packed, &scales, &biases, &x, m, n, k, group_size,
+            );
+        let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+        let (idx, mv, ev, abs_err, allowed) =
+            worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+        assert!(
+            abs_err <= allowed,
+            "qmv_fast s_bf16 gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+             (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+        );
+    }
+}
+
+#[test]
+fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
+    let m = 1;
+    let n = 12;
+    let k = 384;
+    for &group_size in &[32usize, 64, 128] {
+        let (packed, scales, biases, x) =
+            make_inputs_bf16_s_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
+        let expected =
+            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+                &packed, &scales, &biases, &x, m, n, k, group_size,
+            );
+        let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
+        let (idx, mv, ev, abs_err, allowed) =
+            worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+        assert!(
+            abs_err <= allowed,
+            "qmv generic s_bf16 gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
+             (allowed {allowed:.5}; metal={mv}, cpu={ev})"
+        );
+    }
+}

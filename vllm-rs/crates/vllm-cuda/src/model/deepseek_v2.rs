@@ -22,7 +22,7 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::kv_cache::KvCachePool;
 use crate::layers::{Embedding, Linear, RmsNorm};
-use crate::layers_moe::{Fp8FusedMoELayer, FusedMoELayer, GgmlFusedMoELayer};
+use crate::layers_moe::{DenseFusedMoELayer, Fp8FusedMoELayer, FusedMoELayer, GgmlFusedMoELayer};
 use crate::model::llama::{LlamaMLP, RotaryCache, TpConfig};
 use crate::tensor::{GpuTensor, TensorView};
 use crate::weights as gpu_weights;
@@ -1063,7 +1063,7 @@ impl DeepSeekV2DecoderLayer {
             None
         };
 
-        let moe = FusedMoELayer {
+        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -1078,7 +1078,7 @@ impl DeepSeekV2DecoderLayer {
             routed_scaling_factor: config.routed_scaling_factor,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        };
+        });
 
         // Shared expert: n_shared_experts * moe_intermediate_size
         let shared_inter = config.n_shared_experts * config.moe_intermediate_size;

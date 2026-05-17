@@ -36,6 +36,12 @@ pub use lowered::{
 };
 pub use lowering::{lower, lower_pair};
 pub use pipelines::{PipelineLookupError, SpecializedPipelines};
+/// Re-export of `ferrite_metal_kernels::quantized::ScaleDtype` so the
+/// macro-emitted `impl CanonicalParams for Weights` block can name it
+/// without per-arch crates pulling `ferrite-metal-kernels` directly.
+/// Mirrors the [`MetalDtype`] re-export above.
+#[cfg(feature = "metal")]
+pub use ferrite_metal_kernels::quantized::ScaleDtype;
 
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};

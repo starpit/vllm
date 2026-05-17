@@ -1113,7 +1113,16 @@ fn extract_bounds(json: &serde_json::Value) -> BTreeMap<String, u64> {
     json.as_object()
         .map(|obj| {
             obj.iter()
-                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .filter_map(|(k, v)| {
+                    // Integers → as-is. Booleans → 0/1 (HF stores
+                    // model config booleans like `norm_topk_prob`,
+                    // `tie_word_embeddings`, `use_qk_norm` here; the
+                    // bounds map is the only u64 table downstream
+                    // consumers read).
+                    v.as_u64()
+                        .map(|n| (k.clone(), n))
+                        .or_else(|| v.as_bool().map(|b| (k.clone(), b as u64)))
+                })
                 .collect()
         })
         .unwrap_or_default()

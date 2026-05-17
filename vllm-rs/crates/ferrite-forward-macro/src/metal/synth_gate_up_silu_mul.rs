@@ -38,9 +38,25 @@ pub struct MetalSynthGateUpSiluMulImpl {
 }
 
 impl MetalSynthGateUpSiluMulImpl {
+    /// Llama-3.x / Qwen2.5 / SmolLM mlx-community 4bit: F16 scales.
     pub fn bf16_gs64() -> Self {
         Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4 }
     }
+    /// Qwen3 family mlx-community 4bit: BF16 scales.
+    pub fn bf16_gs64_s_bf16() -> Self {
+        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4 }
+    }
+}
+
+/// True iff the model's HF architecture string is one of the Qwen3
+/// family (`Qwen3ForCausalLM` / `Qwen3MoeForCausalLM`). Their
+/// mlx-community 4bit checkpoints ship BF16 scales/biases (probed
+/// across cached HF snapshots) while Llama-3.x / Qwen2.5 / SmolLM
+/// ship F16 — drives the synth Impl's `applies_to` gate.
+pub(crate) fn is_qwen3_arch(model: &crate::config::ModelParams) -> bool {
+    model.architectures.iter().any(|a| {
+        matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM")
+    })
 }
 
 impl Implementation for MetalSynthGateUpSiluMulImpl {
@@ -50,6 +66,19 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
         profile.backend == Backend::Metal
+    }
+
+    fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
+        // Gate by scale dtype: only the synth variant whose
+        // `scale_tag` matches the model's on-disk scale convention
+        // claims a tile. The other variant returns false so the
+        // solver doesn't see a duplicate match.
+        let is_qwen3 = is_qwen3_arch(ctx.model);
+        match (is_qwen3, self.scale_tag) {
+            (true,  "bfloat") => true,
+            (false, "half")   => true,
+            _                 => false,
+        }
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {

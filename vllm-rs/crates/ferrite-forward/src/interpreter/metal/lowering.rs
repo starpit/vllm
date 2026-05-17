@@ -196,6 +196,7 @@ pub fn lower_pair<W: CanonicalParams>(
         commands,
         barrier_before,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
+        moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
     })
 }
 
@@ -357,6 +358,7 @@ pub fn lower<W: CanonicalParams>(
     let mut commands = Vec::with_capacity(instructions.len());
     let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
     let mut splitk_scratch_bytes: u32 = 0;
+    let mut moe_scratch_bytes: u32 = 0;
     let mut i = 0usize;
     // Macro-static-aligned barrier accessor: the macro emits one bool
     // per `Instruction` (pre-loop-unrolling). Loop expansion at
@@ -403,6 +405,7 @@ pub fn lower<W: CanonicalParams>(
                             iter as u32,
                             tape_index,
                             &mut splitk_scratch_bytes,
+                            &mut moe_scratch_bytes,
                             profile,
                         )?;
                         let n_cmds = cmds.len();
@@ -418,7 +421,7 @@ pub fn lower<W: CanonicalParams>(
                 i = body_end;
             }
             other => {
-                let cmds = lower_one::<W>(other, i, bucket_m, 0, tape_index, &mut splitk_scratch_bytes, profile)?;
+                let cmds = lower_one::<W>(other, i, bucket_m, 0, tape_index, &mut splitk_scratch_bytes, &mut moe_scratch_bytes, profile)?;
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -439,6 +442,7 @@ pub fn lower<W: CanonicalParams>(
         commands,
         barrier_before,
         splitk_scratch_bytes,
+        moe_scratch_bytes,
     })
 }
 
@@ -472,8 +476,13 @@ fn lower_one<W: CanonicalParams>(
     layer_offset: u32,
     tape_index: u32,
     splitk_scratch_bytes: &mut u32,
+    moe_scratch_bytes: &mut u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
+    // Quiet the "unused mut" warning until the I::FusedMoe / I::SharedFusedMoe
+    // arms land; the variable is threaded so the MoE lowering pass can grow
+    // the bucket's scratch footprint as it stamps Binding::MoeScratch offsets.
+    let _ = &moe_scratch_bytes;
     use Instruction as I;
 
     let cmd = match inst {
@@ -527,28 +536,43 @@ fn lower_one<W: CanonicalParams>(
         // (see `instr.rs:689`). An earlier `(out_slot, in_slot, ...)`
         // pattern here silently swapped the names — the kernel read
         // from a fresh slot and overwrote the upstream tile.
-        I::RmsNorm(in_slot, out_slot, layer) => LoweredCommand {
+        I::RmsNorm(in_slot, out_slot, layer, hidden_size, m_multiplier) => LoweredCommand {
             kernel: KernelId::RmsNorm,
             library: "rmsnorm",
-            // Symbol names are `rmsnorm_<T_act>_s_<T_scale>_specialized`
-            // — the in-register T_scale cast P10c added so RMSNorm
-            // gains stay F16 on device (`feedback_no_silent_deferrals`,
-            // mirrors P10b for quant scales). `scale_dtype_for::<W>()`
-            // returns F16 today; expand the picker when a model ships
-            // bf16 norm gains on disk.
+            // Symbol names are `rmsnorm_<T_act>_s_<T_scale>_specialized`.
+            // `scale_dtype_for::<W>()` flips between `_s_f16_` (Llama
+            // family) and `_s_bf16_` (Qwen3 family) based on the
+            // canonical's on-disk scale-storage convention.
             function: rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
             constants: super::kernel_constants::RmsNormConstants {
-                bucket_m: super::ids::BucketM(bucket_m),
-                q_size: super::ids::QSize(W::Q_SIZE as u32),
+                // Total row count = bucket_m * m_multiplier. For
+                // standard residual-stream norms m_multiplier=1
+                // (rows-per-token). For per-head q_norm/k_norm
+                // (Qwen3) m_multiplier=num_q_heads/num_kv_heads —
+                // the input is treated as `[T*heads, head_dim]` and
+                // the kernel needs T*heads RMSNORM_M rows.
+                bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
+                // Per-instruction `hidden_size` — for the standard
+                // residual-stream norm this is `W::HIDDEN_SIZE`; for
+                // per-head q_norm/k_norm (Qwen3) it's `W::HEAD_DIM`.
+                q_size: super::ids::QSize(*hidden_size),
                 rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
             }
             .into(),
-            // Per-token threadgroup; threads cooperate on the
-            // hidden-size reduction inside.
+            // Dispatch: `bucket_m * m_multiplier` threadgroups at
+            // bake time; runtime scaling rule
+            // (`worker::scale_tg_for_num_tokens`) computes
+            // `scaled = baseline * n / s.bucket_m` where
+            // `n = num_tokens`. Setting `baseline = bucket_m * m_mult`
+            // and `s.bucket_m = bucket_m` makes `scaled = num_tokens *
+            // m_mult` — exactly the per-head row count we need.
             dispatch: DispatchShape {
-                threadgroups: (bucket_m, 1, 1),
+                threadgroups: (bucket_m * *m_multiplier, 1, 1),
                 threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
-                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
             },
             bindings: vec![
                 Binding::ArenaSlot {
@@ -571,18 +595,20 @@ fn lower_one<W: CanonicalParams>(
         },
 
         // ── Fused residual-add + RMSNorm ───────────────────────────
-        I::FusedAddRmsNorm(delta_slot, residual_slot, layer) => {
+        I::FusedAddRmsNorm(delta_slot, residual_slot, layer, hidden_size, _m_multiplier) => {
             LoweredCommand {
                 kernel: KernelId::FusedAddRmsNorm,
                 library: "fused_add_rmsnorm",
-                // Symbol `fused_add_rmsnorm_<T_act>_s_<T_scale>_specialized`
-                // (P10c — see RmsNorm comment above).
                 function: fused_add_rmsnorm_kernel_static_name::<W>(
                     scale_dtype_for::<W>(),
                 ),
                 constants: super::kernel_constants::RmsNormConstants {
                     bucket_m: super::ids::BucketM(bucket_m),
-                    q_size: super::ids::QSize(W::Q_SIZE as u32),
+                    // Per-instruction hidden_size — see I::RmsNorm
+                    // arm. FusedAddRmsNorm is always on the residual
+                    // stream so it's always `W::HIDDEN_SIZE`, but
+                    // we plumb it through the field for uniformity.
+                    q_size: super::ids::QSize(*hidden_size),
                     rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
                 }
                 .into(),
@@ -1046,7 +1072,14 @@ fn lower_one<W: CanonicalParams>(
                  (mlx-community uses gs=64 for every Llama/Qwen/Gemma 4bit; \
                  INT4_PARITY_PROBES.md §3); got gs={gs}"
             );
-            let hidden_size = W::Q_SIZE as u32;
+            // AffineEmbed reads rows of `hidden_size` (residual-stream
+            // width) — NOT `Q_SIZE` (= num_q_heads * head_dim).
+            // Llama-3.x / Qwen2.5 have hidden==Q_SIZE so the
+            // pre-existing `W::Q_SIZE` worked by coincidence;
+            // Qwen3-30B-A3B has hidden=2048, Q_SIZE=4096 — the
+            // wrong width yielded out-of-bounds `gindex` into scales
+            // and garbage embed output (silent, no fault).
+            let hidden_size = W::HIDDEN_SIZE as u32;
             let bytes_per_row = hidden_size / 2;
             let groups_x = bytes_per_row.div_ceil(THREADS_PER_GROUP);
             LoweredCommand {
@@ -2009,6 +2042,90 @@ fn lower_one<W: CanonicalParams>(
             gemm_dims: None,
         },
 
+        // ── Metal MoE: SwitchGLU decomposition ─────────────────────
+        //
+        // `MetalFusedMoeImpl` / `MetalSharedFusedMoeImpl` (in
+        // `ferrite-forward-macro/src/metal/moe.rs`) emit these
+        // variants with full macro-baked shape. The arm emits the
+        // 10-command Switch-GLU decomposition from
+        // `project_metal_moe_switchglu`. Worker-side wiring for
+        // `Binding::{Inline, MoeScratch}` lives in §3a; until it
+        // lands the worker errors `Inline/MoeScratch not yet wired`
+        // when these commands are executed. The lowering shape is
+        // structurally complete here so the macro-side build stays
+        // green and the worker side has a fixed contract to wire
+        // against.
+        I::MetalFusedMoe(
+            in_slot,
+            out_slot,
+            layer,
+            num_experts,
+            top_k,
+            moe_inter,
+            hidden,
+            group_size,
+            bits,
+        ) => {
+            let cmds = lower_metal_moe::<W>(
+                MetalMoeLowering {
+                    in_slot: *in_slot,
+                    out_slot: *out_slot,
+                    layer: *layer + layer_offset,
+                    num_experts: *num_experts,
+                    top_k: *top_k,
+                    moe_inter: *moe_inter,
+                    hidden: *hidden,
+                    group_size: *group_size,
+                    bits: *bits,
+                    softmax_first: false,
+                    norm_topk_prob: false,
+                    shared_intermediate: 0,
+                    tape_index,
+                    op_idx: index as u32,
+                    bucket_m,
+                    is_shared: false,
+                },
+                moe_scratch_bytes,
+            );
+            return Ok(cmds);
+        }
+        I::MetalSharedFusedMoe(
+            in_slot,
+            out_slot,
+            layer,
+            num_experts,
+            top_k,
+            moe_inter,
+            hidden,
+            shared_intermediate,
+            group_size,
+            bits,
+            norm_topk_prob,
+        ) => {
+            let cmds = lower_metal_moe::<W>(
+                MetalMoeLowering {
+                    in_slot: *in_slot,
+                    out_slot: *out_slot,
+                    layer: *layer + layer_offset,
+                    num_experts: *num_experts,
+                    top_k: *top_k,
+                    moe_inter: *moe_inter,
+                    hidden: *hidden,
+                    group_size: *group_size,
+                    bits: *bits,
+                    softmax_first: true,
+                    norm_topk_prob: *norm_topk_prob,
+                    shared_intermediate: *shared_intermediate,
+                    tape_index,
+                    op_idx: index as u32,
+                    bucket_m,
+                    is_shared: true,
+                },
+                moe_scratch_bytes,
+            );
+            return Ok(cmds);
+        }
+
         // ── Metadata-only: no Metal dispatch ───────────────────────
         I::Reshape(_, _, _, _, _, _) | I::Alias(_, _) | I::Free(_) => {
             // These rebind / drop slots in the dispatcher's logical
@@ -2110,15 +2227,12 @@ fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
 }
 
 /// Scale-storage dtype the kernel reads `*.scales` / `*.biases` device
-/// pointers as — i.e. the safetensors on-disk dtype for the affine
-/// quant per-group params. Every sampled mlx-community 4bit checkpoint
-/// ships F16 scales (`INT4_PARITY_PROBES.md:73,287`), so this is a
-/// constant today; P11 (mixed-quant / NAX / FP-quant) will extend it.
-/// Kept as a separate fn for symmetry with [`dequant_dtype_for`] so the
-/// model author has a single seam to extend.
+/// pointers as — the on-disk dtype for the affine quant per-group
+/// params. Reads `W::SCALE_DTYPE`, populated from each arch's
+/// quantization manifest (default F16; Qwen3 family overrides to BF16
+/// because their mlx-community 4bit checkpoints ship BF16 scales).
 fn scale_dtype_for<W: CanonicalParams>() -> ScaleDtype {
-    let _ = std::marker::PhantomData::<W>;
-    ScaleDtype::F16
+    W::SCALE_DTYPE
 }
 
 /// Bindings shared by every `Instruction::AffineQmm` lowering's qmv
@@ -2226,12 +2340,13 @@ fn rmsnorm_kernel_static_name<W: CanonicalParams>(
 ) -> &'static str {
     use ScaleDtype as S;
     match (W::METAL_DTYPE, scale_dtype) {
-        (MetalDtype::F16, S::F16) => "rmsnorm_f16_s_f16_specialized",
-        (MetalDtype::Bf16, S::F16) => "rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::F16)   => "rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16)  => "rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16)  => "rmsnorm_f16_s_bf16_specialized",
+        (MetalDtype::Bf16, S::Bf16) => "rmsnorm_bf16_s_bf16_specialized",
         (dt, sdt) => unreachable!(
             "rmsnorm_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}) \
-             not instantiated — only (f16|bf16, f16) ship today; \
-             lower_one's pre-checks should have caught this"
+             not instantiated"
         ),
     }
 }
@@ -2245,12 +2360,13 @@ fn fused_add_rmsnorm_kernel_static_name<W: CanonicalParams>(
 ) -> &'static str {
     use ScaleDtype as S;
     match (W::METAL_DTYPE, scale_dtype) {
-        (MetalDtype::F16, S::F16) => "fused_add_rmsnorm_f16_s_f16_specialized",
-        (MetalDtype::Bf16, S::F16) => "fused_add_rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::F16)   => "fused_add_rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16)  => "fused_add_rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16)  => "fused_add_rmsnorm_f16_s_bf16_specialized",
+        (MetalDtype::Bf16, S::Bf16) => "fused_add_rmsnorm_bf16_s_bf16_specialized",
         (dt, sdt) => unreachable!(
             "fused_add_rmsnorm_kernel_static_name: (dtype={dt:?}, \
-             scale_dtype={sdt:?}) not instantiated — only (f16|bf16, f16) \
-             ship today; lower_one's pre-checks should have caught this"
+             scale_dtype={sdt:?}) not instantiated"
         ),
     }
 }
@@ -2266,18 +2382,874 @@ fn affine_embed_kernel_static_name(
 ) -> &'static str {
     use ScaleDtype as S;
     match (dtype, scale_dtype, group_size) {
-        (DequantDtype::F16, S::F16, 32)  => "affine_embed_f16_s_f16_gs_32_b_4",
-        (DequantDtype::F16, S::F16, 64)  => "affine_embed_f16_s_f16_gs_64_b_4",
-        (DequantDtype::F16, S::F16, 128) => "affine_embed_f16_s_f16_gs_128_b_4",
+        (DequantDtype::F16, S::F16, 32)   => "affine_embed_f16_s_f16_gs_32_b_4",
+        (DequantDtype::F16, S::F16, 64)   => "affine_embed_f16_s_f16_gs_64_b_4",
+        (DequantDtype::F16, S::F16, 128)  => "affine_embed_f16_s_f16_gs_128_b_4",
         (DequantDtype::Bf16, S::F16, 32)  => "affine_embed_bf16_s_f16_gs_32_b_4",
         (DequantDtype::Bf16, S::F16, 64)  => "affine_embed_bf16_s_f16_gs_64_b_4",
         (DequantDtype::Bf16, S::F16, 128) => "affine_embed_bf16_s_f16_gs_128_b_4",
+        (DequantDtype::F16, S::Bf16, 32)   => "affine_embed_f16_s_bf16_gs_32_b_4",
+        (DequantDtype::F16, S::Bf16, 64)   => "affine_embed_f16_s_bf16_gs_64_b_4",
+        (DequantDtype::F16, S::Bf16, 128)  => "affine_embed_f16_s_bf16_gs_128_b_4",
+        (DequantDtype::Bf16, S::Bf16, 32)  => "affine_embed_bf16_s_bf16_gs_32_b_4",
+        (DequantDtype::Bf16, S::Bf16, 64)  => "affine_embed_bf16_s_bf16_gs_64_b_4",
+        (DequantDtype::Bf16, S::Bf16, 128) => "affine_embed_bf16_s_bf16_gs_128_b_4",
         (dt, sdt, gs) => unreachable!(
             "affine_embed_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}, gs={gs}) \
-             not instantiated — only (f16|bf16, f16, 32|64|128) ship; \
+             not instantiated — only (f16|bf16, f16|bf16, 32|64|128) ship; \
              lower_one's assert should have caught this"
         ),
     }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Metal MoE lowering (`I::MetalFusedMoe` / `I::MetalSharedFusedMoe`)
+// ────────────────────────────────────────────────────────────────────
+
+/// Tuple of inputs to [`lower_metal_moe`]. Keeps the two arms in
+/// `lower_one` from having to pass 14 positional args each.
+struct MetalMoeLowering {
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    num_experts: u32,
+    top_k: u32,
+    moe_inter: u32,
+    hidden: u32,
+    group_size: u32,
+    bits: u32,
+    /// `false` = Mixtral order (`topk → softmax(scores)`).
+    /// `true`  = Qwen-MoE order (`softmax(probs) → topk → take_along_axis(probs)`).
+    softmax_first: bool,
+    /// Qwen3-MoE `norm_topk_prob=True` — renorm gathered top-k scores
+    /// by their sum so they sum to 1 again.
+    /// `NotYetWired`: the renorm kernel itself doesn't exist; the lowering
+    /// arm currently asserts this is false. Path will land alongside §3a.
+    norm_topk_prob: bool,
+    /// Shared-expert intermediate size; `0` means no shared expert.
+    /// Non-zero requires emitting the shared-expert tail (3× AffineQmm
+    /// + sigmoid-gate fusion), which depends on a fused-add-sigmoid-
+    /// gate-mul kernel that isn't ported yet. The lowering arm
+    /// asserts this is `0` for now and panics otherwise. Both Mixtral
+    /// and Qwen3-MoE-30B-A3B-Instruct ship `shared_intermediate=0` —
+    /// the shared-expert path is only needed for Qwen1.5-MoE-A2.7B
+    /// (and falls under §3 follow-up work).
+    shared_intermediate: u32,
+    /// Carries through to `WeightLocator` on the emitted commands.
+    tape_index: u32,
+    op_idx: u32,
+    bucket_m: u32,
+    /// `false` → caller is `I::MetalFusedMoe` (Mixtral); emitted
+    /// `Binding::Weight`s carry `WeightBundleKind::FusedMoe` so the
+    /// worker resolves through `WeightAccessors::fused_moe_at`.
+    /// `true` → caller is `I::MetalSharedFusedMoe` (Qwen2/3-MoE);
+    /// flip to `SharedFusedMoe` so the worker resolves through
+    /// `shared_fused_moe_at`. The macro emits exactly one of the two
+    /// accessor methods per arch — picking the wrong bundle here
+    /// panics with `fused_moe_at not implemented` (or vice versa).
+    is_shared: bool,
+}
+
+/// Per-bucket MoE scratch layout. Each region is 256-byte aligned
+/// (Apple Silicon `MTLBuffer.offset` alignment for general buffer
+/// bindings). Offsets are stamped into `Binding::MoeScratch` on the
+/// emitted commands; the worker (§3a) allocates one shared
+/// `moe_scratch` buffer of `total` bytes and binds at the offsets.
+#[derive(Clone, Copy, Debug)]
+struct MoeScratchLayout {
+    router_logits: u32,
+    sorted_full: u32,
+    topk_inds: u32,
+    topk_scores: u32,
+    gate_out: u32,
+    up_out: u32,
+    down_out: u32,
+    total: u32,
+}
+
+fn align_256(n: u32) -> u32 {
+    (n + 255) & !255
+}
+
+impl MoeScratchLayout {
+    fn compute(bucket_m: u32, num_experts: u32, top_k: u32, moe_inter: u32, hidden: u32, elem_size: u32) -> Self {
+        let mut off = 0u32;
+        let router_logits = off;
+        off = align_256(off + bucket_m * num_experts * elem_size);
+        let sorted_full = off;
+        off = align_256(off + bucket_m * num_experts * 4);
+        let topk_inds = off;
+        off = align_256(off + bucket_m * top_k * 4);
+        let topk_scores = off;
+        off = align_256(off + bucket_m * top_k * elem_size);
+        let gate_out = off;
+        off = align_256(off + bucket_m * top_k * moe_inter * elem_size);
+        let up_out = off;
+        off = align_256(off + bucket_m * top_k * moe_inter * elem_size);
+        let down_out = off;
+        off = align_256(off + bucket_m * top_k * hidden * elem_size);
+        Self {
+            router_logits,
+            sorted_full,
+            topk_inds,
+            topk_scores,
+            gate_out,
+            up_out,
+            down_out,
+            total: off,
+        }
+    }
+}
+
+/// Long-form dtype infix used by softmax / take_along_axis /
+/// moe_weighted_sum shader symbols (`float16` / `bfloat16`). Distinct
+/// from `dequant_dtype_for::<W>().symbol_infix()` which yields the
+/// compact form (`f16` / `bf16`) used by the qmv/qmm_t/affine_gather
+/// kernels.
+fn long_dtype_infix<W: CanonicalParams>() -> &'static str {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => "float16",
+        MetalDtype::Bf16 => "bfloat16",
+        MetalDtype::Int4 => panic!("MoE lowering: W::METAL_DTYPE must be F16 or Bf16, got Int4"),
+    }
+}
+
+fn softmax_precise_symbol<W: CanonicalParams>() -> &'static str {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => "block_softmax_precise_float16",
+        MetalDtype::Bf16 => "block_softmax_precise_bfloat16",
+        MetalDtype::Int4 => panic!(),
+    }
+}
+
+fn take_along_axis_symbol<W: CanonicalParams>() -> &'static str {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => "take_along_axis_2d_contig_float16",
+        MetalDtype::Bf16 => "take_along_axis_2d_contig_bfloat16",
+        MetalDtype::Int4 => panic!(),
+    }
+}
+
+fn moe_weighted_sum_symbol<W: CanonicalParams>() -> &'static str {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => "moe_weighted_sum_float16",
+        MetalDtype::Bf16 => "moe_weighted_sum_bfloat16",
+        MetalDtype::Int4 => panic!(),
+    }
+}
+
+/// `c_arg_block_sort_<dtype>_uint32_bn<bn>_tn4` symbol picker for
+/// MoE router argsort. Today `bn=32` always (Mixtral E=8, Qwen3 E=128,
+/// all ≤ bn*tn = 128). The router input is router-probs (Qwen) or
+/// router-logits (Mixtral), both in W::METAL_DTYPE.
+fn argpartition_symbol<W: CanonicalParams>() -> &'static str {
+    match W::METAL_DTYPE {
+        MetalDtype::F16 => "c_arg_block_sort_float16_uint32_bn32_tn4",
+        MetalDtype::Bf16 => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
+        MetalDtype::Int4 => panic!(
+            "argpartition_symbol: MoE router argsort over int4 dtype is nonsensical"
+        ),
+    }
+}
+
+fn affine_gather_qmv_symbol(
+    n_out: u32,
+    k_in: u32,
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+) -> &'static str {
+    use DequantDtype as D;
+    use ScaleDtype as S;
+    let fast = n_out.is_multiple_of(8) && k_in.is_multiple_of(512);
+    match (fast, dtype, scale_dtype, group_size) {
+        (true, D::F16, S::F16, 32)   => "affine_gather_qmv_fast_f16_s_f16_gs_32_b_4",
+        (true, D::F16, S::F16, 64)   => "affine_gather_qmv_fast_f16_s_f16_gs_64_b_4",
+        (true, D::F16, S::F16, 128)  => "affine_gather_qmv_fast_f16_s_f16_gs_128_b_4",
+        (true, D::Bf16, S::F16, 32)  => "affine_gather_qmv_fast_bf16_s_f16_gs_32_b_4",
+        (true, D::Bf16, S::F16, 64)  => "affine_gather_qmv_fast_bf16_s_f16_gs_64_b_4",
+        (true, D::Bf16, S::F16, 128) => "affine_gather_qmv_fast_bf16_s_f16_gs_128_b_4",
+        (true, D::F16, S::Bf16, 32)  => "affine_gather_qmv_fast_f16_s_bf16_gs_32_b_4",
+        (true, D::F16, S::Bf16, 64)  => "affine_gather_qmv_fast_f16_s_bf16_gs_64_b_4",
+        (true, D::F16, S::Bf16, 128) => "affine_gather_qmv_fast_f16_s_bf16_gs_128_b_4",
+        (true, D::Bf16, S::Bf16, 32)  => "affine_gather_qmv_fast_bf16_s_bf16_gs_32_b_4",
+        (true, D::Bf16, S::Bf16, 64)  => "affine_gather_qmv_fast_bf16_s_bf16_gs_64_b_4",
+        (true, D::Bf16, S::Bf16, 128) => "affine_gather_qmv_fast_bf16_s_bf16_gs_128_b_4",
+        (false, D::F16, S::F16, 32)   => "affine_gather_qmv_f16_s_f16_gs_32_b_4",
+        (false, D::F16, S::F16, 64)   => "affine_gather_qmv_f16_s_f16_gs_64_b_4",
+        (false, D::F16, S::F16, 128)  => "affine_gather_qmv_f16_s_f16_gs_128_b_4",
+        (false, D::Bf16, S::F16, 32)  => "affine_gather_qmv_bf16_s_f16_gs_32_b_4",
+        (false, D::Bf16, S::F16, 64)  => "affine_gather_qmv_bf16_s_f16_gs_64_b_4",
+        (false, D::Bf16, S::F16, 128) => "affine_gather_qmv_bf16_s_f16_gs_128_b_4",
+        (false, D::F16, S::Bf16, 32)  => "affine_gather_qmv_f16_s_bf16_gs_32_b_4",
+        (false, D::F16, S::Bf16, 64)  => "affine_gather_qmv_f16_s_bf16_gs_64_b_4",
+        (false, D::F16, S::Bf16, 128) => "affine_gather_qmv_f16_s_bf16_gs_128_b_4",
+        (false, D::Bf16, S::Bf16, 32)  => "affine_gather_qmv_bf16_s_bf16_gs_32_b_4",
+        (false, D::Bf16, S::Bf16, 64)  => "affine_gather_qmv_bf16_s_bf16_gs_64_b_4",
+        (false, D::Bf16, S::Bf16, 128) => "affine_gather_qmv_bf16_s_bf16_gs_128_b_4",
+        (_, _, _, gs) => panic!(
+            "affine_gather_qmv_symbol: unsupported group_size={gs} \
+             — only 32, 64, 128 instantiated. Caller should validate."
+        ),
+    }
+}
+
+/// Build a `LoweredCommand` for one of the new MoE kernels with the
+/// usual fields filled in. Callers populate `bindings` + `dispatch` +
+/// `constants` then pass through.
+fn make_moe_command(
+    kernel: KernelId,
+    library: &'static str,
+    function: &'static str,
+    constants: Vec<ConstantValue>,
+    dispatch: DispatchShape,
+    bindings: Vec<Binding>,
+) -> LoweredCommand {
+    LoweredCommand {
+        kernel,
+        library,
+        function,
+        constants,
+        dispatch,
+        bindings,
+        gemm_dims: None,
+    }
+}
+
+/// Emit the multi-`LoweredCommand` decomposition for a single
+/// `I::MetalFusedMoe` / `I::MetalSharedFusedMoe` instance.
+fn lower_metal_moe<W: CanonicalParams>(
+    p: MetalMoeLowering,
+    moe_scratch_bytes: &mut u32,
+) -> Vec<LoweredCommand> {
+    let dtype = dequant_dtype_for::<W>();
+    let scale_dtype = scale_dtype_for::<W>();
+    let elem = elem_size_bytes(dtype);
+    // Shared-expert tail + norm_topk_prob require kernels that aren't
+    // ported yet; assert this session's scope. SharedFusedMoe
+    // variants with shared_intermediate==0 and norm_topk_prob=false
+    // (modern Qwen3-MoE-30B-A3B-Instruct) lower through fine; both
+    // additions land in §3-followup.
+    assert!(
+        p.shared_intermediate == 0,
+        "lower_metal_moe: shared_intermediate={} > 0 requires the shared-expert tail \
+         kernels (sigmoid-gate fusion) which aren't ported yet. Modern \
+         Qwen3-MoE-30B-A3B-Instruct ships shared_intermediate=0 and works through \
+         this arm; Qwen1.5-MoE-A2.7B-Chat (shared_intermediate=5632) needs the \
+         §3 follow-up tail.",
+        p.shared_intermediate
+    );
+    // norm_topk_prob handled inline via the topk_renorm kernel (see
+    // softmax.metal). Lowering inserts a renorm step between
+    // TakeAlongAxis (gathered top-k scores) and AffineGatherQmv
+    // (expert dispatch) so the per-row weights sum to 1 — matches
+    // `weights / weights.sum(-1, keepdims=True)` in MLX/PyTorch
+    // Qwen3MoE source.
+
+    let layout = MoeScratchLayout::compute(
+        p.bucket_m,
+        p.num_experts,
+        p.top_k,
+        p.moe_inter,
+        p.hidden,
+        elem,
+    );
+    *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
+
+    let layer_id = super::ids::LayerId(p.layer);
+    let locator0 = super::lowered::WeightLocator {
+        bucket: p.tape_index,
+        op_idx: p.op_idx,
+        slot: 0,
+    };
+    // Bundle kind picks which `WeightAccessors` method the worker
+    // resolves through. The macro emits exactly one of
+    // `fused_moe_at` (MetalFusedMoeImpl, FusedMoELayer accessor
+    // type) or `shared_fused_moe_at` (MetalSharedFusedMoeImpl,
+    // SharedFusedMoELayer accessor type) per arch. Using the wrong
+    // bundle panics with `..._at not implemented for this arch`.
+    let bundle_kind = if p.is_shared {
+        WeightBundleKind::SharedFusedMoe
+    } else {
+        WeightBundleKind::FusedMoe
+    };
+
+    let mut cmds: Vec<LoweredCommand> = Vec::with_capacity(10);
+
+    // ── Step 1: router_logits = Gemm(x, W_router_gate) ─────────────
+    //
+    // Dense BF16/F16 GEMM. Output goes to moe_scratch[router_logits]
+    // — the worker resolves `Binding::MoeScratch` against
+    // `moe_scratch + byte_offset` (§3a).
+    //
+    // Reuses `KernelId::Gemm` (opaque to the pipeline cache; routed
+    // through the worker's MPS / hand-rolled bf16 path). Worker
+    // changes needed for §3a: `resolve_gemm_buffers` accepts
+    // `Binding::MoeScratch` outputs.
+    {
+        let tg_x = p.bucket_m.div_ceil(GEMM_TILE_M);
+        let tg_y = p.num_experts.div_ceil(GEMM_TILE_N);
+        cmds.push(LoweredCommand {
+            kernel: KernelId::Gemm,
+            library: "",
+            function: "",
+            constants: Vec::new(),
+            dispatch: DispatchShape {
+                threadgroups: (tg_x, tg_y, 1),
+                threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            bindings: vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.router_logits,
+                },
+                Binding::ArenaSlot {
+                    slot: p.in_slot,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: WeightTensor::MoeRouterGate,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: Some(GemmDims {
+                m: p.bucket_m,
+                n: p.num_experts,
+                k: p.hidden,
+            }),
+        });
+    }
+
+    // ── Step 2a (Qwen, softmax_first): router_probs = Softmax(logits) ─
+    //
+    // Writes back into the same router_logits region (in-place is OK
+    // per MLX). Mixtral does softmax AFTER topk on the gathered
+    // scores; see Step 5b below.
+    if p.softmax_first {
+        cmds.push(make_moe_command(
+            KernelId::Softmax,
+            "softmax",
+            softmax_precise_symbol::<W>(),
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (p.bucket_m, 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.router_logits,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.router_logits,
+                },
+                Binding::Inline {
+                    binding_index: 2,
+                    value: p.num_experts,
+                },
+            ],
+        ));
+    }
+
+    // ── Step 3: sorted_full_inds = ArgPartitionTopK(probs|logits) ──
+    //
+    // Full ascending sort over the per-row num_experts axis. Output
+    // is `[M, num_experts]` u32 with NaN entries (none in practice
+    // for the small E we target) trailing. SliceTrailingColsU32
+    // pulls the top-k window next.
+    {
+        let bn: u32 = 32; // Mixtral E=8, Qwen3 E=128 → bn*tn=128 covers.
+        cmds.push(make_moe_command(
+            KernelId::ArgPartitionTopK,
+            "argpartition",
+            argpartition_symbol::<W>(),
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (1, p.bucket_m, 1),
+                threads_per_threadgroup: (bn, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.router_logits,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.sorted_full,
+                },
+                Binding::Inline { binding_index: 2, value: p.num_experts },
+                Binding::Inline { binding_index: 3, value: 1 },
+                Binding::Inline { binding_index: 4, value: 1 },
+                Binding::Inline { binding_index: 5, value: p.num_experts },
+                Binding::Inline { binding_index: 6, value: p.num_experts },
+            ],
+        ));
+    }
+
+    // ── Step 4: topk_inds = SliceTrailingColsU32(sorted_full_inds) ─
+    //
+    // `slice_trailing_cols.rs` uses `dispatchThreads`; convert to
+    // threadgroup form: tg_x = ceil(top_k / min(32, top_k)).
+    {
+        let tg_x_threads = p.top_k.min(32);
+        let tg_x_count = p.top_k.div_ceil(tg_x_threads);
+        cmds.push(make_moe_command(
+            KernelId::SliceTrailingColsU32,
+            "slice_trailing_cols",
+            "slice_trailing_cols_u32",
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (tg_x_count, p.bucket_m, 1),
+                threads_per_threadgroup: (tg_x_threads, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.sorted_full,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.topk_inds,
+                },
+                Binding::Inline { binding_index: 2, value: p.num_experts },
+                Binding::Inline { binding_index: 3, value: p.top_k },
+            ],
+        ));
+    }
+
+    // ── Step 5a: topk_scores = TakeAlongAxis(scores_src, topk_inds) ─
+    //
+    // Qwen: `scores_src = router_probs` (after Step 2a softmax).
+    // Mixtral: `scores_src = router_logits` (raw, softmax happens
+    //          AFTER this step on the gathered scores).
+    //
+    // Both cases read from `layout.router_logits` since the Qwen
+    // softmax wrote back in-place there.
+    {
+        let tg_x_threads = p.top_k.min(32);
+        let tg_x_count = p.top_k.div_ceil(tg_x_threads);
+        cmds.push(make_moe_command(
+            KernelId::TakeAlongAxis,
+            "take_along_axis",
+            take_along_axis_symbol::<W>(),
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (tg_x_count, p.bucket_m, 1),
+                threads_per_threadgroup: (tg_x_threads, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.router_logits,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.topk_inds,
+                },
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::Inline { binding_index: 3, value: p.num_experts },
+                Binding::Inline { binding_index: 4, value: p.top_k },
+            ],
+        ));
+    }
+
+    // ── Step 5b (Mixtral, !softmax_first): softmax(topk_scores) ───
+    //
+    // In-place row-softmax over the gathered scores (axis_size = top_k).
+    // 256-thread blocks handle top_k ≤ 1024 (we're at 2..8).
+    if !p.softmax_first {
+        cmds.push(make_moe_command(
+            KernelId::Softmax,
+            "softmax",
+            softmax_precise_symbol::<W>(),
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (p.bucket_m, 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::Inline { binding_index: 2, value: p.top_k },
+            ],
+        ));
+    }
+
+    // ── Step 5c (Qwen3-MoE, norm_topk_prob): topk_scores /= sum ───
+    //
+    // In-place row-renorm of the gathered top-k scores so they sum
+    // to 1. Matches `weights / weights.sum(-1, keepdims=True)` from
+    // `qwen3_moe.py` when `norm_topk_prob=True`. Same dispatch shape
+    // as the !softmax_first softmax above (256 threads × bucket_m
+    // threadgroups). Symbol `topk_renorm_{float16,bfloat16}` —
+    // instantiated in `shaders/softmax.metal`.
+    if p.norm_topk_prob {
+        let renorm_symbol: &'static str = match W::METAL_DTYPE {
+            MetalDtype::F16 => "topk_renorm_float16",
+            MetalDtype::Bf16 => "topk_renorm_bfloat16",
+            MetalDtype::Int4 => panic!("topk_renorm: int4 unreachable"),
+        };
+        cmds.push(make_moe_command(
+            KernelId::Softmax, // pipeline cache routing only — library/function disambiguate
+            "softmax",
+            renorm_symbol,
+            Vec::new(),
+            DispatchShape {
+                threadgroups: (p.bucket_m, 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::Inline { binding_index: 2, value: p.top_k },
+            ],
+        ));
+    }
+
+    // ── Steps 6-8: gate_out / up_out / down_out via affine_gather_qmv
+    //
+    // Common dispatch shape: `(1, n_out/8, M*top_k)` threadgroups ×
+    // `(32, 2, 1)` threads. K and N specialize via function_constant
+    // 0 / 1. top_k Inline at buffer slot 6 for the kernel's pointer
+    // arithmetic.
+    let gather_qmv = |which_w, which_s, which_b, x_off, y_off, n_out: u32, k_in: u32| -> LoweredCommand {
+        let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, p.group_size);
+        let bn: u32 = 8;
+        let kernel = if symbol.contains("_fast_") {
+            KernelId::AffineGatherQmvFast
+        } else {
+            KernelId::AffineGatherQmv
+        };
+        make_moe_command(
+            kernel,
+            "quantized_qmv",
+            symbol,
+            vec![
+                ConstantValue::int(0, k_in as i32),
+                ConstantValue::int(1, n_out as i32),
+            ],
+            DispatchShape {
+                threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
+                threads_per_threadgroup: (32, 2, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Z,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: which_w,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 0,
+                },
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: which_s,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: which_b,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 2,
+                },
+                x_off,                                               // buffer 3 = x
+                Binding::MoeScratch {
+                    binding_index: 4,
+                    byte_offset: layout.topk_inds,
+                },                                                   // rhs_indices
+                y_off,                                               // buffer 5 = y
+                Binding::Inline { binding_index: 6, value: p.top_k },
+            ],
+        )
+    };
+
+    // Step 6: gate_out = affine_gather_qmv(x, W_expert_gate)
+    cmds.push(gather_qmv(
+        WeightTensor::MoeExpertGateW,
+        WeightTensor::MoeExpertGateS,
+        WeightTensor::MoeExpertGateB,
+        Binding::ArenaSlot { slot: p.in_slot, binding_index: 3 },
+        Binding::MoeScratch { binding_index: 5, byte_offset: layout.gate_out },
+        p.moe_inter,
+        p.hidden,
+    ));
+    // Step 7: up_out = affine_gather_qmv(x, W_expert_up)
+    cmds.push(gather_qmv(
+        WeightTensor::MoeExpertUpW,
+        WeightTensor::MoeExpertUpS,
+        WeightTensor::MoeExpertUpB,
+        Binding::ArenaSlot { slot: p.in_slot, binding_index: 3 },
+        Binding::MoeScratch { binding_index: 5, byte_offset: layout.up_out },
+        p.moe_inter,
+        p.hidden,
+    ));
+    // Step 8: act_out = SiluMul(gate_out, up_out) — write into gate_out
+    //
+    // Reuses the existing `silu_mul_<dtype>` kernel from `silu_mul.metallib`.
+    // Bindings match the standard SiluMul lowering (gate, up, out, n).
+    {
+        // silu_mul.metal is a 1-element-per-thread kernel
+        // (`uint gid [[thread_position_in_grid]]`, `if gid >= SILU_MUL_N
+        // return`). Total flat elements across all (token, slot)
+        // pairs at bake time = `bucket_m * top_k * moe_inter`.
+        // The MoE block writes gate_out / up_out as `[bucket_m,
+        // top_k, moe_inter]` row-major, so a single 1D dispatch
+        // covering that flat extent computes silu(gate)*up over the
+        // whole region. m_scaling::X with `BucketM(bucket_m)` scales
+        // the dispatch by `num_tokens` at runtime: the live thread
+        // count becomes `num_tokens * top_k * moe_inter`, exactly
+        // what the down_proj reads back. Mirrors the standalone
+        // `I::SiluMul` lowering above.
+        let n_total = p.bucket_m * p.top_k * p.moe_inter;
+        let groups = n_total.div_ceil(256);
+        cmds.push(make_moe_command(
+            KernelId::SiluMul,
+            "silu_mul",
+            silu_mul_static_name(dtype),
+            // n_features is bound as `[[function_constant(0)]]` of
+            // type `uint` in silu_mul.metal — must use
+            // `ConstantValue::uint` to match the kernel's expected
+            // MTLDataType (the standalone SiluMul lowering uses
+            // `SiluMulConstants` which wraps `::uint(...)` for the
+            // same reason). Baked for max bucket; under-dispatched
+            // tiles (num_tokens < bucket_m) just don't run, since
+            // m_scaling shrinks the thread count proportionally.
+            vec![ConstantValue::uint(0, n_total)],
+            DispatchShape {
+                threadgroups: (groups, 1, 1),
+                threads_per_threadgroup: (256, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            // `silu_mul` kernel signature: `(out @ 0, gate @ 1, up @ 2)`.
+            // Computes `out = silu(gate) * up`. In Qwen3-MoE we want
+            // `silu(gate_proj_out) * up_proj_out` — so `gate` (binding 1)
+            // must point at `gate_out` and `up` (binding 2) at `up_out`.
+            // Out aliases `gate_out` so the next kernel (down_proj)
+            // reads the silumul result from there.
+            //
+            // Pre-2026-05-17 these were swapped: bind 1 = up_out, bind 2
+            // = gate_out, producing `silu(up_proj) * gate_proj` which
+            // matches neither Qwen3-MoE nor any other arch's MLP. Caught
+            // by MLX-vs-metal layer-0 parity bisect at dispatch 24
+            // (down_proj reads silumul values that diverge from MLX
+            // expert-53 reference).
+            vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.gate_out,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.gate_out,
+                },
+                Binding::MoeScratch {
+                    binding_index: 2,
+                    byte_offset: layout.up_out,
+                },
+            ],
+        ));
+    }
+
+    // Step 9: down_out = affine_gather_qmv(act_out, W_expert_down)
+    //
+    // act_out lives at `layout.gate_out` (the SiluMul wrote it there).
+    // BUT this kernel's "x" input expects `[num_tokens, K]` shape; for
+    // the expert-aware gather we actually need `x[token_n]` indexed by
+    // `token_n = nk / top_k` inside the kernel. The MLX
+    // affine_gather_qmv kernel does this lookup itself based on
+    // rhs_indices stride. The `x` parameter here is the activation
+    // **before** the per-token-broadcast — for the down projection
+    // that's the `act_out` of dimension `[M*top_k, moe_inter]`. The
+    // gather kernel handles the per-token replication via its
+    // `token_n = nk / top_k` arithmetic; for the down step the
+    // top_k-axis is already materialized in act_out, so we need a
+    // different code path. **This is the unresolved binding shape
+    // for the down projection.** Plan: use a 1-to-1 (top_k=1) view
+    // since act_out is pre-replicated, OR port the
+    // `affine_gather_qmm_rhs_*` kernel (Phase C of
+    // project_metal_moe_switchglu) which handles the
+    // `[M, top_k, I] × [E, H, I]` shape natively.
+    //
+    // For this initial structural lowering, emit a single
+    // affine_gather_qmv call with `top_k = 1` against an `x` of
+    // shape `[M*top_k, moe_inter]` and same `rhs_indices`. The kernel
+    // sees N = M*top_k rows and reads one expert per row. This is
+    // **functionally correct** for the down step when `act_out` is
+    // already replicated per-expert and `rhs_indices[token_n]` picks
+    // the right expert. Validate empirically in §5.
+    {
+        let n_out = p.hidden;
+        let k_in = p.moe_inter;
+        let bn: u32 = 8;
+        let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, p.group_size);
+        let kernel = if symbol.contains("_fast_") {
+            KernelId::AffineGatherQmvFast
+        } else {
+            KernelId::AffineGatherQmv
+        };
+        cmds.push(make_moe_command(
+            kernel,
+            "quantized_qmv",
+            symbol,
+            vec![
+                ConstantValue::int(0, k_in as i32),
+                ConstantValue::int(1, n_out as i32),
+            ],
+            DispatchShape {
+                threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
+                threads_per_threadgroup: (32, 2, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Z,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            vec![
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: WeightTensor::MoeExpertDownW,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 0,
+                },
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: WeightTensor::MoeExpertDownS,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: bundle_kind,
+                    which: WeightTensor::MoeExpertDownB,
+                    layer: layer_id,
+                    locator: locator0,
+                    binding_index: 2,
+                },
+                // x = act_out (M*top_k rows of moe_inter cols).
+                Binding::MoeScratch {
+                    binding_index: 3,
+                    byte_offset: layout.gate_out,
+                },
+                Binding::MoeScratch {
+                    binding_index: 4,
+                    byte_offset: layout.topk_inds,
+                },
+                Binding::MoeScratch {
+                    binding_index: 5,
+                    byte_offset: layout.down_out,
+                },
+                // top_k = 1 for the down step since act_out is already
+                // per-expert-replicated; kernel's `token_n = nk / 1`
+                // walks the rows 1-for-1.
+                Binding::Inline { binding_index: 6, value: 1 },
+            ],
+        ));
+    }
+
+    // ── Step 10: moe_out = MoeWeightedSum(down_out, topk_scores) ───
+    //
+    // Reduction: `out[n, d] = Σ_k expert[n, k, d] * scores[n, k]`.
+    // Top-k + hidden ride on function_constants (0, 1). Dispatch is
+    // 2D over (hidden, M); convert dispatchThreads → threadgroups.
+    {
+        let tg_x_threads = p.hidden.min(64);
+        let tg_x_count = p.hidden.div_ceil(tg_x_threads);
+        cmds.push(LoweredCommand {
+            kernel: KernelId::MoeWeightedSum,
+            library: "moe_weighted_sum",
+            function: moe_weighted_sum_symbol::<W>(),
+            constants: vec![
+                ConstantValue::int(0, p.top_k as i32),
+                ConstantValue::int(1, p.hidden as i32),
+            ],
+            dispatch: DispatchShape {
+                threadgroups: (tg_x_count, p.bucket_m, 1),
+                threads_per_threadgroup: (tg_x_threads, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(p.bucket_m),
+                }),
+            },
+            bindings: vec![
+                Binding::MoeScratch {
+                    binding_index: 0,
+                    byte_offset: layout.down_out,
+                },
+                Binding::MoeScratch {
+                    binding_index: 1,
+                    byte_offset: layout.topk_scores,
+                },
+                Binding::ArenaSlot {
+                    slot: p.out_slot,
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: None,
+        });
+        // suppress unused-helper warning when the long-form dtype
+        // helper isn't otherwise referenced (it's used inside the
+        // panic message of softmax_precise_symbol's Int4 arm but
+        // optimizers strip those).
+        let _ = long_dtype_infix::<W>;
+    }
+
+    cmds
 }
 
 #[cfg(test)]

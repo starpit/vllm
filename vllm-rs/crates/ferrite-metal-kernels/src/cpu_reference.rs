@@ -243,6 +243,22 @@ pub fn affine_qmm_t_b4_bf16(
     affine_qmm_t_b4::<half::bf16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
+/// `TAct = bfloat, TScale = bfloat` reference — Qwen3 mlx-community
+/// 4bit convention (see `INST_QMV_ALL(bf16, bfloat, bf16, bfloat, …)`
+/// instantiations in `shaders/quantized_qmv.metal`).
+pub fn affine_qmm_t_b4_bf16_s_bf16(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    x: &[half::bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<half::bf16> {
+    affine_qmm_t_b4::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+}
+
 pub fn affine_qmm_n_b4_f16(
     packed: &[u8],
     scales: &[half::f16],
@@ -276,4 +292,5 @@ pub fn affine_qmm_n_b4_bf16(
 pub use affine_qmm_n_b4_bf16 as affine_qvm_b4_bf16;
 pub use affine_qmm_n_b4_f16 as affine_qvm_b4_f16;
 pub use affine_qmm_t_b4_bf16 as affine_qmv_b4_bf16;
+pub use affine_qmm_t_b4_bf16_s_bf16 as affine_qmv_b4_bf16_s_bf16;
 pub use affine_qmm_t_b4_f16 as affine_qmv_b4_f16;

@@ -308,21 +308,27 @@ enum FieldLoad {
         n_expert_group: usize,
         topk_group: usize,
     },
-    /// Mixtral-style BF16 fused MoE — no shared expert. Calls
-    /// `FusedMoELayer::load`. Used by Mixtral (and any future
-    /// shared-expert-free MoE arch using HF's
-    /// `block_sparse_moe.experts.{e}.{w1,w2,w3}` layout).
+    /// Mixtral-style fused MoE — no shared expert. Dispatches to
+    /// `FusedMoELayer::load` (Dense BF16 expert weights, cuda) or
+    /// `FusedMoELayer::load_affine` (MLX-affine int4 expert weights,
+    /// metal) based on `affine`. Mixtral uses HF's
+    /// `block_sparse_moe.experts.{e}.{w1,w2,w3}` layout.
     FusedMoe {
         prefix: String,
         num_experts: usize,
         top_k: usize,
         intermediate_size: usize,
         hidden_size: usize,
+        /// `Some((group_size, bits))` when the macro detected
+        /// `StorageFormat::Affine` on the MoE source weight — emits
+        /// the Metal `load_affine` call site. `None` → Dense BF16
+        /// path → cuda `load` call site.
+        affine: Option<(u32, u32)>,
     },
-    /// Qwen-MoE-style BF16 fused MoE + shared expert. Calls
-    /// `SharedFusedMoELayer::load`. Used by Qwen2-MoE / Qwen3-MoE
-    /// whose checkpoints use HF's `experts.{e}.{gate,up,down}_proj`
-    /// naming and ship a shared-expert SwiGLU + sigmoid gate.
+    /// Qwen-MoE-style fused MoE + shared expert. Cuda Dense via
+    /// `SharedFusedMoELayer::load`, metal MLX-affine int4 via
+    /// `SharedFusedMoELayer::load_affine`. Qwen2-MoE / Qwen3-MoE use
+    /// HF's `experts.{e}.{gate,up,down}_proj` naming.
     SharedFusedMoe {
         prefix: String,
         num_experts: usize,
@@ -330,6 +336,9 @@ enum FieldLoad {
         moe_intermediate_size: usize,
         shared_expert_intermediate_size: usize,
         hidden_size: usize,
+        /// `Some((group_size, bits))` when MLX-affine int4 — see
+        /// [`FieldLoad::FusedMoe::affine`].
+        affine: Option<(u32, u32)>,
     },
 }
 
@@ -846,12 +855,28 @@ fn plan_field_load(
             .copied()
             .unwrap_or(14336) as usize;
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(4096) as usize;
+        // Probe storage format: if expert weights are MLX-affine int4
+        // (mlx-community 4bit Mixtral / Qwen-MoE), emit the metal
+        // `load_affine` call site; otherwise emit cuda `load`.
+        // Same check the `MetalFusedMoeImpl::matches` uses via
+        // `affine_gs_bits`. Source weights all share storage format
+        // (the macro asserts this elsewhere for AffineQuantLinear).
+        let only_src = accessor.source_weights[0].0;
+        let affine = match crate::quantization::storage_format_for_weight(
+            program, fuf, only_src, model,
+        ) {
+            crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                Some((group_size, bits))
+            }
+            _ => None,
+        };
         return FieldLoad::FusedMoe {
             prefix,
             num_experts,
             top_k,
             intermediate_size,
             hidden_size,
+            affine,
         };
     }
 
@@ -905,6 +930,15 @@ fn plan_field_load(
                     .unwrap_or(0) as usize
             });
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
+        let only_src = accessor.source_weights[0].0;
+        let affine = match crate::quantization::storage_format_for_weight(
+            program, fuf, only_src, model,
+        ) {
+            crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                Some((group_size, bits))
+            }
+            _ => None,
+        };
         return FieldLoad::SharedFusedMoe {
             prefix,
             num_experts,
@@ -912,6 +946,7 @@ fn plan_field_load(
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+            affine,
         };
     }
 
@@ -3796,21 +3831,39 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             top_k,
             intermediate_size,
             hidden_size,
+            affine,
         } => {
             let num_experts = *num_experts;
             let top_k = *top_k;
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
-            quote! {
-                let #name = ::ferrite_kernels::layers_moe::FusedMoELayer::load(
-                    gw,
-                    #prefix,
-                    #num_experts,
-                    #top_k,
-                    #intermediate_size,
-                    #hidden_size,
-                    stream,
-                )?;
+            if let Some((group_size, bits)) = *affine {
+                let group_size = group_size as u32;
+                let bits = bits as u32;
+                quote! {
+                    let #name = ::ferrite_kernels::layers_moe::FusedMoELayer::load_affine(
+                        gw,
+                        #prefix,
+                        #num_experts,
+                        #top_k,
+                        #intermediate_size,
+                        #hidden_size,
+                        #group_size,
+                        #bits,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_moe::FusedMoELayer::load(
+                        gw,
+                        #prefix,
+                        #num_experts,
+                        #top_k,
+                        #intermediate_size,
+                        #hidden_size,
+                        stream,
+                    )?;
+                }
             }
         }
         FieldLoad::SharedFusedMoe {
@@ -3820,23 +3873,42 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+            affine,
         } => {
             let num_experts = *num_experts;
             let top_k = *top_k;
             let moe_intermediate_size = *moe_intermediate_size;
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
-            quote! {
-                let #name = ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
-                    gw,
-                    #prefix,
-                    #num_experts,
-                    #top_k,
-                    #moe_intermediate_size,
-                    #shared_expert_intermediate_size,
-                    #hidden_size,
-                    stream,
-                )?;
+            if let Some((group_size, bits)) = *affine {
+                let group_size = group_size as u32;
+                let bits = bits as u32;
+                quote! {
+                    let #name = ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load_affine(
+                        gw,
+                        #prefix,
+                        #num_experts,
+                        #top_k,
+                        #moe_intermediate_size,
+                        #shared_expert_intermediate_size,
+                        #hidden_size,
+                        #group_size,
+                        #bits,
+                    )?;
+                }
+            } else {
+                quote! {
+                    let #name = ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
+                        gw,
+                        #prefix,
+                        #num_experts,
+                        #top_k,
+                        #moe_intermediate_size,
+                        #shared_expert_intermediate_size,
+                        #hidden_size,
+                        stream,
+                    )?;
+                }
             }
         }
     }
@@ -4473,6 +4545,7 @@ fn emit_layered_load_body(
             top_k,
             intermediate_size,
             hidden_size,
+            affine,
         } => {
             let p = layer_templated_prefix_expr(
                 prefix,
@@ -4483,20 +4556,41 @@ fn emit_layered_load_body(
             let top_k = *top_k;
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
-            quote! {
-                (0u32..#n_lit)
-                    .map(|layer: u32| -> ::anyhow::Result<_> {
-                        ::ferrite_kernels::layers_moe::FusedMoELayer::load(
-                            gw,
-                            &#p,
-                            #num_experts,
-                            #top_k,
-                            #intermediate_size,
-                            #hidden_size,
-                            stream,
-                        )
-                    })
-                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            if let Some((group_size, bits)) = *affine {
+                let group_size = group_size as u32;
+                let bits = bits as u32;
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_moe::FusedMoELayer::load_affine(
+                                gw,
+                                &#p,
+                                #num_experts,
+                                #top_k,
+                                #intermediate_size,
+                                #hidden_size,
+                                #group_size,
+                                #bits,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
+            } else {
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_moe::FusedMoELayer::load(
+                                gw,
+                                &#p,
+                                #num_experts,
+                                #top_k,
+                                #intermediate_size,
+                                #hidden_size,
+                                stream,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
             }
         }
         FieldLoad::SharedFusedMoe {
@@ -4506,6 +4600,7 @@ fn emit_layered_load_body(
             moe_intermediate_size,
             shared_expert_intermediate_size,
             hidden_size,
+            affine,
         } => {
             let p = layer_templated_prefix_expr(
                 prefix,
@@ -4517,21 +4612,43 @@ fn emit_layered_load_body(
             let moe_intermediate_size = *moe_intermediate_size;
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
-            quote! {
-                (0u32..#n_lit)
-                    .map(|layer: u32| -> ::anyhow::Result<_> {
-                        ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
-                            gw,
-                            &#p,
-                            #num_experts,
-                            #top_k,
-                            #moe_intermediate_size,
-                            #shared_expert_intermediate_size,
-                            #hidden_size,
-                            stream,
-                        )
-                    })
-                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            if let Some((group_size, bits)) = *affine {
+                let group_size = group_size as u32;
+                let bits = bits as u32;
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load_affine(
+                                gw,
+                                &#p,
+                                #num_experts,
+                                #top_k,
+                                #moe_intermediate_size,
+                                #shared_expert_intermediate_size,
+                                #hidden_size,
+                                #group_size,
+                                #bits,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
+            } else {
+                quote! {
+                    (0u32..#n_lit)
+                        .map(|layer: u32| -> ::anyhow::Result<_> {
+                            ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load(
+                                gw,
+                                &#p,
+                                #num_experts,
+                                #top_k,
+                                #moe_intermediate_size,
+                                #shared_expert_intermediate_size,
+                                #hidden_size,
+                                stream,
+                            )
+                        })
+                        .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+                }
             }
         }
     }
@@ -5179,7 +5296,16 @@ fn emit_synthesized_kernel_sources_override(
     // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
     // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
     let t_act = "bfloat";
-    let t_scale = "half";
+    // T_scale tracks on-disk scale convention. Mirrors the SCALE_DTYPE
+    // override in `emit_canonical_params_impl`: Qwen3 family ships BF16
+    // scales+biases, everything else ships F16. Synth kernel symbol
+    // must match the corresponding `MetalSynth*Impl` instantiation
+    // registered in `starter_library` (otherwise the solver's pick and
+    // the runtime pipeline cache disagree on the library key).
+    let is_qwen3 = model.architectures.iter().any(|a| {
+        matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM")
+    });
+    let t_scale = if is_qwen3 { "bfloat" } else { "half" };
 
     // Model dims baked as MSL `constant constexpr` literals at synth
     // time. Same TP-sharding rules as `emit_canonical_params_impl`:
@@ -5448,6 +5574,15 @@ fn emit_canonical_params_impl(
     let num_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_kv_heads);
     let q_size_lit = proc_macro2::Literal::usize_unsuffixed(q_size);
     let kv_size_lit = proc_macro2::Literal::usize_unsuffixed(kv_size);
+    // HIDDEN_SIZE = residual stream width = config.json `hidden_size`.
+    // Distinct from Q_SIZE on GQA arches with head_dim != hidden/num_heads.
+    let hidden_size_for_const: usize = model
+        .bounds
+        .get("hidden_size")
+        .copied()
+        .map(|v| v as usize)
+        .unwrap_or(q_size);
+    let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     let kv_lora_rank_lit = proc_macro2::Literal::usize_unsuffixed(kv_lora_rank);
     let qk_nope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_nope_head_dim);
@@ -5510,6 +5645,33 @@ fn emit_canonical_params_impl(
     let synth_sources_override =
         emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add);
 
+    // SCALE_DTYPE override — only matters under `--features metal`.
+    // mlx-community 4bit convention (probed across cached HF snapshots):
+    // Llama-3.x / Qwen2.5 / SmolLM ship F16 scales+biases+norm gains,
+    // Qwen3 family ships BF16. Default in the trait is F16; emit a
+    // `BF16` override for the Qwen3-family architectures so their
+    // affine kernels and RMSNorm pipelines pick the matching
+    // `_s_bf16_` symbol arms. Match on the HF `architectures` strings
+    // baked into `model.architectures`.
+    let scale_dtype_override = {
+        let is_qwen3 = model.architectures.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"
+            )
+        });
+        if is_qwen3 {
+            quote! {
+                #[cfg(feature = "metal")]
+                const SCALE_DTYPE:
+                    ::ferrite_forward::interpreter::metal::ScaleDtype =
+                    ::ferrite_forward::interpreter::metal::ScaleDtype::Bf16;
+            }
+        } else {
+            quote! {}
+        }
+    };
+
     quote! {
         // `CanonicalParams` is backend-agnostic — the trait, its
         // associated `const`s, and every callsite (`<W as
@@ -5524,6 +5686,7 @@ fn emit_canonical_params_impl(
             const NUM_KV_HEADS: u32 = #num_kv_heads_lit;
             const Q_SIZE: usize = #q_size_lit;
             const KV_SIZE: usize = #kv_size_lit;
+            const HIDDEN_SIZE: usize = #hidden_size_lit;
             const INTERMEDIATE_SIZE: usize = #intermediate_size_lit;
             const ATTN_SCALE: f32 = #attn_scale_lit;
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;
@@ -5543,6 +5706,7 @@ fn emit_canonical_params_impl(
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
             #mrope_section_tokens
             #synth_sources_override
+            #scale_dtype_override
         }
     }
 }

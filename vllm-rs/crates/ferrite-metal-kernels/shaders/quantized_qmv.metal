@@ -1023,9 +1023,138 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
 // The `bfloat × bfloat` family that P1-P6 shipped (loader-cast F16→BF16)
 // is removed here — that was the regression site `INT4_PARITY_PROBES.md`
 // §7 `Decision: in-register cast` repays.
-INST_QMV_ALL(f16,  half,   f16, half,  32)
-INST_QMV_ALL(f16,  half,   f16, half,  64)
-INST_QMV_ALL(f16,  half,   f16, half, 128)
-INST_QMV_ALL(bf16, bfloat, f16, half,  32)
+INST_QMV_ALL(f16,  half,   f16, half,    32)
+INST_QMV_ALL(f16,  half,   f16, half,    64)
+INST_QMV_ALL(f16,  half,   f16, half,   128)
+INST_QMV_ALL(bf16, bfloat, f16, half,    32)
+// bf16-scale instantiations — Qwen3-MoE (and any `torch_dtype: bfloat16`
+// mlx-community 4bit) ships scales/biases as BF16, not F16. Matches
+// MLX's `INSTANTIATE_QUANTIZED_FUNCTIONS(T_scale=bfloat16_t)` surface.
+INST_QMV_ALL(bf16, bfloat, bf16, bfloat, 32)
+INST_QMV_ALL(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_QMV_ALL(f16,  half,   bf16, bfloat, 32)
+INST_QMV_ALL(f16,  half,   bf16, bfloat, 64)
+INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
+
+// ─────────────────────────────────────────────────────────────────
+// affine_gather_qmv_{fast,} — quantized.h:1899-2021 (MoE rhs gather)
+//
+// SwitchGLU per-expert qmv. Each output row picks an expert via
+// `rhs_indices[n * top_k + slot_k]`, offsets w/scales/biases into
+// the expert's weight slab, and reuses qmv_fast_impl / qmv_impl
+// for the actual matvec compute.
+//
+// Bindings (MLX gather kernels at quantized.h:1900 use 21-buffer
+// layout for full broadcast support; we collapse to the SwitchGLU
+// shape where x is [N, hidden] and rhs_indices is [N, top_k]):
+//   buffer(0) = w           [num_experts, out_vec, in_vec/8]  uint32
+//   buffer(1) = scales      [num_experts, out_vec, in_vec/gs] T_scale
+//   buffer(2) = biases      [num_experts, out_vec, in_vec/gs] T_scale
+//   buffer(3) = x           [N, in_vec]                       T_act
+//   buffer(4) = rhs_indices [N, top_k]                        uint32
+//   buffer(5) = y           [N, top_k, out_vec]               T_act
+//   buffer(6) = top_k       constant int
+//
+// IN_VEC_SIZE / OUT_VEC_SIZE ride as function constants 0/1 just
+// like the non-gather affine_qmv variants — the lowering arm
+// reuses the same SpecializedPipelineCache key shape.
+//
+// Dispatch: tid.x = 0 (we feed the broadcast token via z-axis),
+// tid.y = output-block-row index, tid.z = n * top_k + slot_k. The
+// non-gather qmv_*_impl reads `tid.x * in_vec_size` from x and
+// `tid.x * out_vec_size` from y, so pinning tid.x=0 and pre-
+// offsetting both pointers is identical to a single-batch matvec.
+//
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+[[kernel]] void affine_gather_qmv_fast(
+    const device uint32_t* w           [[buffer(0)]],
+    const device T_scale*  scales      [[buffer(1)]],
+    const device T_scale*  biases      [[buffer(2)]],
+    const device T_act*    x           [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    device T_act*          y           [[buffer(5)]],
+    const constant int&    top_k       [[buffer(6)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]) {
+  // `tid.z` flattens the (token, top_k_slot) axis. tid.x is fixed
+  // to 0 — the M-axis broadcast is folded into z.
+  uint nk = tid.z;
+  uint token_n = nk / uint(top_k);
+  uint expert_idx = rhs_indices[nk];
+
+  // Per-expert weight slab strides: w is packed int4 with
+  // `in_vec/8 * out_vec` uint32 per expert; scales/biases hold
+  // `in_vec/gs * out_vec` per expert.
+  size_t expert_stride_w = size_t(IN_VEC_SIZE / 8) * size_t(OUT_VEC_SIZE);
+  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
+  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
+  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
+  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
+  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
+  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
+
+  uint3 inner_tid = uint3(0, tid.y, 0);
+  qmv_fast_impl<T_act, T_scale, group_size, bits>(
+      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
+      inner_tid, simd_gid, simd_lid);
+}
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+[[kernel]] void affine_gather_qmv(
+    const device uint32_t* w           [[buffer(0)]],
+    const device T_scale*  scales      [[buffer(1)]],
+    const device T_scale*  biases      [[buffer(2)]],
+    const device T_act*    x           [[buffer(3)]],
+    const device uint32_t* rhs_indices [[buffer(4)]],
+    device T_act*          y           [[buffer(5)]],
+    const constant int&    top_k       [[buffer(6)]],
+    uint3 tid       [[threadgroup_position_in_grid]],
+    uint  simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid  [[thread_index_in_simdgroup]]) {
+  uint nk = tid.z;
+  uint token_n = nk / uint(top_k);
+  uint expert_idx = rhs_indices[nk];
+
+  size_t expert_stride_w = size_t(IN_VEC_SIZE / 8) * size_t(OUT_VEC_SIZE);
+  size_t expert_stride_sb = size_t(IN_VEC_SIZE / group_size) * size_t(OUT_VEC_SIZE);
+  const device uint32_t* w_e = w + expert_idx * expert_stride_w;
+  const device T_scale*  s_e = scales + expert_idx * expert_stride_sb;
+  const device T_scale*  b_e = biases + expert_idx * expert_stride_sb;
+  const device T_act*    x_e = x + size_t(token_n) * size_t(IN_VEC_SIZE);
+  device T_act*          y_e = y + size_t(nk) * size_t(OUT_VEC_SIZE);
+
+  uint3 inner_tid = uint3(0, tid.y, 0);
+  qmv_impl<T_act, T_scale, group_size, bits>(
+      w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
+      inner_tid, simd_gid, simd_lid);
+}
+
+#define INST_GATHER_QMV(name, act_tag, act_type, scale_tag, scale_type, gs, bits)               \
+  template [[host_name(                                                                          \
+      #name "_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_" #bits)]]                              \
+  [[kernel]] decltype(name<act_type, scale_type, gs, bits>)                                      \
+      name<act_type, scale_type, gs, bits>;
+
+#define INST_GATHER_QMV_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
+  INST_GATHER_QMV(affine_gather_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 4) \
+  INST_GATHER_QMV(affine_gather_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 4)
+
+INST_GATHER_QMV_ALL(f16,  half,   f16, half,    32)
+INST_GATHER_QMV_ALL(f16,  half,   f16, half,    64)
+INST_GATHER_QMV_ALL(f16,  half,   f16, half,   128)
+INST_GATHER_QMV_ALL(bf16, bfloat, f16, half,    32)
+INST_GATHER_QMV_ALL(bf16, bfloat, f16, half,    64)
+INST_GATHER_QMV_ALL(bf16, bfloat, f16, half,   128)
+// bf16-scale variants — see the bf16-scale block under INST_QMV_ALL.
+INST_GATHER_QMV_ALL(bf16, bfloat, bf16, bfloat, 32)
+INST_GATHER_QMV_ALL(bf16, bfloat, bf16, bfloat, 64)
+INST_GATHER_QMV_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_GATHER_QMV_ALL(f16,  half,   bf16, bfloat, 32)
+INST_GATHER_QMV_ALL(f16,  half,   bf16, bfloat, 64)
+INST_GATHER_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 INST_QMV_ALL(bf16, bfloat, f16, half,  64)
 INST_QMV_ALL(bf16, bfloat, f16, half, 128)

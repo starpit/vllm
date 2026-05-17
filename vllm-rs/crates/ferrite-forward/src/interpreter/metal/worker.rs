@@ -103,6 +103,17 @@ pub struct BucketBaking {
     /// MTL4 steps built from `steps`. `None` iff any step is a
     /// `Gemm` (MPS f16) or a kernel exceeds the 31-binding cap.
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
+    /// Per-bucket inline-constants buffer. Backs every
+    /// `Binding::Inline { value }` in this bucket's commands by packing
+    /// all u32 values into one shared-storage MTLBuffer at consecutive
+    /// 4-byte offsets, in command-then-binding order. `None` if the
+    /// bucket has no Inline bindings. Lives on the baking (not the
+    /// worker) because the values are baked at record-time from the
+    /// command-specific literals in the lowered tape — different
+    /// buckets fed by the same model have different axis_sizes /
+    /// top_k stamps. ICB-bound commands access this via
+    /// `setBuffer_offset_atIndex` like any other device buffer.
+    pub moe_inline_buf: Option<Buffer>,
 }
 
 #[derive(Debug)]
@@ -220,6 +231,14 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// successive `affine_qmm_t_splitk` calls inside a single ICB
     /// run sequentially and can reuse the same buffer.
     pub splitk_scratch: Option<Buffer>,
+    /// Shared MoE scratch buffer for `Binding::MoeScratch` resolution.
+    /// Sized to `max(bucket_tapes.moe_scratch_bytes)`. `None` when no
+    /// MoE instruction lowered (every bucket reports
+    /// `moe_scratch_bytes = 0`). Layout decisions
+    /// (router_logits / sorted_full / topk_inds / topk_scores /
+    /// gate_out / up_out / down_out byte offsets) are owned by the
+    /// lowering pass — see `MoeScratchLayout` in `lowering.rs`.
+    pub moe_scratch: Option<Buffer>,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -315,12 +334,52 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .max()
             .unwrap_or(0);
         let splitk_scratch: Option<Buffer> = if max_splitk_scratch_bytes > 0 {
+            let mode = if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
+                MTLResourceOptions::StorageModeShared
+            } else {
+                MTLResourceOptions::StorageModePrivate
+            };
             let buf = device
                 .newBufferWithLength_options(
                     max_splitk_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
+                    mode,
                 )
                 .expect("newBufferWithLength_options returned nil (splitk scratch)");
+            if let Some(r) = residency {
+                r.insert(&buf);
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
+        // Shared MoE scratch buffer for `Binding::MoeScratch`. Sized
+        // to the max per-bucket `moe_scratch_bytes` because MoE blocks
+        // within one bucket execute serially through the ICB; cross-
+        // bucket reuse is fine because only one bucket runs per
+        // forward. Private storage — host never reads these
+        // intermediates back.
+        let max_moe_scratch_bytes: u32 = bucket_tapes
+            .iter()
+            .map(|t| t.moe_scratch_bytes)
+            .max()
+            .unwrap_or(0);
+        let moe_scratch: Option<Buffer> = if max_moe_scratch_bytes > 0 {
+            // FERRITE_DUMP_LAYER0 diagnostic — temporary Shared
+            // storage so the per-dispatch dump can read MoE
+            // intermediates (router logits/probs, topk scores).
+            // Switch back to Private once parity is reached.
+            let mode = if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
+                MTLResourceOptions::StorageModeShared
+            } else {
+                MTLResourceOptions::StorageModePrivate
+            };
+            let buf = device
+                .newBufferWithLength_options(
+                    max_moe_scratch_bytes as usize,
+                    mode,
+                )
+                .expect("newBufferWithLength_options returned nil (moe scratch)");
             if let Some(r) = residency {
                 r.insert(&buf);
             }
@@ -360,13 +419,25 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 tape,
                 &arena,
                 splitk_scratch.as_ref(),
+                moe_scratch.as_ref(),
                 pipelines,
                 weights,
                 allocator,
                 runtime,
                 device.clone(),
             )?;
+            // Insert the per-bucket inline-constants buffer into the
+            // residency set so the ICB exec dispatch sees its
+            // residency entry (the dispatch never `setBuffer`s these
+            // explicitly — bindings are pre-recorded in the ICB).
+            if let (Some(r), Some(b)) = (residency, baking.moe_inline_buf.as_ref()) {
+                r.insert(b);
+            }
             bucket_bakings.push(baking);
+        }
+        if let (Some(r), Some(b)) = (residency, moe_scratch.as_ref()) {
+            r.insert(b);
+            r.commit();
         }
 
         // Each ICB built during bake_bucket needs to be resident
@@ -390,6 +461,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             arena,
             bucket_bakings,
             splitk_scratch,
+            moe_scratch,
             _marker: std::marker::PhantomData,
         })
     }
@@ -442,6 +514,152 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         reason: "MTL3 path cannot handle Gemm step (MPS dispatch). Use MTL4 path for Gemm buckets.",
                     });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Diagnostic variant of [`run_bucket_mtl3`]: encode + commit +
+    /// wait per sub-dispatch and dump the first 16 bf16 elements of
+    /// binding-index-0 of each dispatch to stderr. Gated on
+    /// `FERRITE_DUMP_LAYER0=1`. Slow (1 cmdbuf per dispatch + GPU
+    /// sync) — for parity checks only. Mirrors the order MLX's layer
+    /// 0 produces (input_layernorm → q_proj → … → moe_out) so the
+    /// parity script can read first divergence directly.
+    ///
+    /// Returns the underlying [`run_bucket_mtl3`] error if any
+    /// dispatch fails; treats Gemm steps as an error (same as the
+    /// fast path — Gemm needs MPS encoders).
+    pub fn run_bucket_mtl3_with_dumps(
+        &self,
+        bucket: usize,
+        num_tokens: u32,
+        queue: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
+    ) -> Result<(), WorkerError> {
+        use ::objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+            MTLCommandBufferStatus, MTLComputeCommandEncoder, MTLResourceOptions,
+        };
+        use ::objc2::rc::Retained;
+        use ::objc2::runtime::ProtocolObject;
+        let baking = &self.bucket_bakings[bucket];
+        let mut dispatch_idx = 0usize;
+        for step in &baking.steps {
+            let BucketStep::Icb {
+                kernel,
+                pipeline,
+                direct_bindings,
+                direct_dispatch,
+                direct_m_scaling,
+                ..
+            } = step else {
+                return Err(WorkerError::WeightLookupFailed {
+                    reason: "MTL3 dump path cannot handle Gemm step",
+                });
+            };
+            for ((bindings, (tg, tpt)), scaling) in direct_bindings
+                .iter()
+                .zip(direct_dispatch.iter())
+                .zip(direct_m_scaling.iter())
+            {
+                let cb: Retained<ProtocolObject<dyn MTLCommandBuffer>> =
+                    queue.commandBuffer().expect("commandBuffer");
+                let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
+                enc.setComputePipelineState(pipeline);
+                for (buf, off, idx) in bindings {
+                    unsafe {
+                        enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
+                    }
+                }
+                let tg_scaled = scale_tg_for_num_tokens(
+                    *tg,
+                    *scaling,
+                    super::ids::NumTokens(num_tokens),
+                );
+                enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
+                enc.endEncoding();
+                cb.commit();
+                cb.waitUntilCompleted();
+                if cb.status() != MTLCommandBufferStatus::Completed {
+                    let err_desc = cb
+                        .error()
+                        .map(|e| format!("{:?}", e))
+                        .unwrap_or_else(|| "(no NSError)".into());
+                    eprintln!(
+                        "[ferrite dump {:03}] kernel={:?} FAILED status={:?} error={}",
+                        dispatch_idx, kernel, cb.status(), err_desc
+                    );
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "dump-mode dispatch did not complete",
+                    });
+                }
+                // Sniff every binding's first 8 bf16 elements so the
+                // parity script can locate output-bindings per kernel.
+                // Output-binding-index varies across kernels (rmsnorm=0,
+                // affine_qmv=4, affine_gather_qmv=5, moe_weighted_sum=2,
+                // softmax=1, silu_mul=2). Dumping all bindings lets us
+                // map without baking a per-KernelId table here.
+                let tg_s = (tg_scaled.width, tg_scaled.height, tg_scaled.depth);
+                let pipeline_ptr = ::objc2::rc::Retained::as_ptr(pipeline) as *const _ as usize;
+                eprintln!(
+                    "[ferrite dump {:03}] kernel={:?} pipeline=0x{:x} tg={:?} bindings={}",
+                    dispatch_idx, kernel, pipeline_ptr, tg_s, bindings.len()
+                );
+                for (buf, off, idx) in bindings {
+                    // Skip Private-storage buffers (splitk_scratch,
+                    // moe_scratch) — `contents()` is undefined on
+                    // those and segfaults on read. `resourceOptions()`
+                    // is a public MTL property.
+                    use ::objc2_metal::MTLResource;
+                    // MTLResourceStorageMode is bits [4:5] of options:
+                    //   Shared=0, Managed=1, Private=2, Memoryless=3.
+                    // Mask = 0x30; Private = 0x20.
+                    let opts = (*buf).resourceOptions();
+                    let storage_mode_bits = opts.0 & 0x30;
+                    let storage_private = storage_mode_bits == 0x20;
+                    if storage_private {
+                        eprintln!(
+                            "  bind[{}] off=0x{:x} (private storage, no CPU view)",
+                            idx, off,
+                        );
+                        continue;
+                    }
+                    let nbytes = (*buf).length() as usize;
+                    let base_ptr = (*buf).contents().as_ptr() as *const u8;
+                    let off_us = *off as usize;
+                    let n_elems_bf16 = ((nbytes.saturating_sub(off_us)) / 2).min(8);
+                    let n_elems_u32 = ((nbytes.saturating_sub(off_us)) / 4).min(8);
+                    let bf16s: Vec<f32> = unsafe {
+                        let ptr = base_ptr.add(off_us) as *const u16;
+                        (0..n_elems_bf16)
+                            .map(|i| half::bf16::from_bits(*ptr.add(i)).to_f32())
+                            .collect()
+                    };
+                    let u32s: Vec<u32> = unsafe {
+                        let ptr = base_ptr.add(off_us) as *const u32;
+                        (0..n_elems_u32).map(|i| *ptr.add(i)).collect()
+                    };
+                    let head_bf16: String = bf16s
+                        .iter()
+                        .map(|v| format!("{:+.5}", v))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let head_u32: String = u32s
+                        .iter()
+                        .map(|v| format!("{}", v))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    eprintln!(
+                        "  bind[{}] off=0x{:x} buf_len=0x{:x} ptr=0x{:x} bf16={} u32=[{}]",
+                        idx,
+                        off,
+                        nbytes,
+                        (base_ptr as usize).wrapping_add(off_us),
+                        head_bf16,
+                        head_u32,
+                    );
+                }
+                dispatch_idx += 1;
             }
         }
         Ok(())
@@ -660,6 +878,7 @@ fn bake_bucket<W: CanonicalParams>(
     tape: &LoweredMetalTape,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
+    moe_scratch: Option<&Buffer>,
     pipelines: &SpecializedPipelines,
     weights: &W,
     allocator: &MetalAllocator,
@@ -672,6 +891,47 @@ fn bake_bucket<W: CanonicalParams>(
             actual: arena.len(),
         });
     }
+
+    // Pre-pass: harvest every `Binding::Inline { value }` in
+    // command-then-binding order, allocate one shared-storage MTLBuffer
+    // sized to hold them all at 4-byte stride, write the values, and
+    // produce a flat offset list the main resolve loop walks via a
+    // cursor. The cursor's invariant: at command `cmd_idx`, before
+    // resolving any of its bindings, `inline_cursor` equals the number
+    // of Inline bindings seen in commands `0..cmd_idx`. Each Inline
+    // binding resolved consumes one slot (cursor += 1) and returns
+    // `(moe_inline_buf, cursor_pre * 4, binding_index)`.
+    let inline_values: Vec<u32> = tape
+        .commands
+        .iter()
+        .flat_map(|c| c.bindings.iter().filter_map(|b| match b {
+            Binding::Inline { value, .. } => Some(*value),
+            _ => None,
+        }))
+        .collect();
+    let moe_inline_buf: Option<Buffer> = if inline_values.is_empty() {
+        None
+    } else {
+        let n_bytes = inline_values.len() * std::mem::size_of::<u32>();
+        let buf = device
+            .newBufferWithLength_options(n_bytes, MTLResourceOptions::StorageModeShared)
+            .expect("newBufferWithLength_options returned nil (moe inline)");
+        // SAFETY: `contents()` returns a host-visible pointer for a
+        // shared-storage buffer; we wrote `n_bytes` bytes through it
+        // before any GPU command touches the buffer. ICB recording
+        // happens later in the same `bake_bucket`; the ICB exec runs
+        // strictly after this `new` returns to the caller.
+        unsafe {
+            let dst = buf.contents().as_ptr().cast::<u32>();
+            std::ptr::copy_nonoverlapping(
+                inline_values.as_ptr(),
+                dst,
+                inline_values.len(),
+            );
+        }
+        Some(buf)
+    };
+    let mut inline_cursor: u32 = 0;
 
     let mut steps: Vec<BucketStep> = Vec::new();
 
@@ -686,6 +946,9 @@ fn bake_bucket<W: CanonicalParams>(
                 cmd_idx,
                 cmd,
                 arena,
+                moe_scratch,
+                moe_inline_buf.as_ref(),
+                &mut inline_cursor,
                 weights,
                 allocator,
                 runtime,
@@ -828,6 +1091,9 @@ fn bake_bucket<W: CanonicalParams>(
             cmd,
             arena,
             splitk_scratch,
+            moe_scratch,
+            moe_inline_buf.as_ref(),
+            &mut inline_cursor,
             weights,
             allocator,
             runtime,
@@ -922,6 +1188,7 @@ fn bake_bucket<W: CanonicalParams>(
         bucket_m: tape.bucket_m,
         steps,
         mtl4_steps,
+        moe_inline_buf,
     })
 }
 
@@ -936,18 +1203,28 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
     command_index: usize,
     cmd: &LoweredCommand,
     arena: &[Buffer],
+    moe_scratch: Option<&Buffer>,
+    moe_inline_buf: Option<&Buffer>,
+    inline_cursor: &mut u32,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
 ) -> Result<(BoundBuffer, BoundBuffer, BoundBuffer), WorkerError> {
     // KernelId::Gemm never references the SplitK scratch buffer
     // (Dense GEMM has its own dispatch path via MPS), so pass None.
+    // MoE plumbing IS passed through: the §3b lowering emits the MoE
+    // router-projection step as `Instruction::Gemm` with a
+    // `Binding::MoeScratch` output, so the resolve has to be able to
+    // unwrap MoE scratch refs the same as the ICB path.
     let bound = resolve_bindings(
         bucket_index,
         command_index,
         cmd,
         arena,
         /*splitk_scratch=*/ None,
+        moe_scratch,
+        moe_inline_buf,
+        inline_cursor,
         weights,
         allocator,
         runtime,
@@ -1063,6 +1340,36 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                                  macro should only emit Dense or AffineQuant on metal",
                     });
                 }
+                // `Moe*` WeightTensor variants are only valid against
+                // `WeightBundleKind::{FusedMoe, SharedFusedMoe}`. The
+                // lowering pass should never pair a Moe tensor with a
+                // LinearLayer bundle — surface as a config bug rather
+                // than a panic.
+                (
+                    WeightTensor::MoeRouterGate
+                    | WeightTensor::MoeExpertGateW
+                    | WeightTensor::MoeExpertGateS
+                    | WeightTensor::MoeExpertGateB
+                    | WeightTensor::MoeExpertUpW
+                    | WeightTensor::MoeExpertUpS
+                    | WeightTensor::MoeExpertUpB
+                    | WeightTensor::MoeExpertDownW
+                    | WeightTensor::MoeExpertDownS
+                    | WeightTensor::MoeExpertDownB
+                    | WeightTensor::MoeSharedGateUpW
+                    | WeightTensor::MoeSharedGateUpS
+                    | WeightTensor::MoeSharedGateUpB
+                    | WeightTensor::MoeSharedDownW
+                    | WeightTensor::MoeSharedDownS
+                    | WeightTensor::MoeSharedDownB
+                    | WeightTensor::MoeSharedExpertGate,
+                    _,
+                ) => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "Moe* WeightTensor variant requested against LinearLayer bundle — \
+                                 expected FusedMoe or SharedFusedMoe bundle",
+                    });
+                }
             }
         }
         WeightBundleKind::CosSin => weights.cos_sin_at(bucket, op_idx, slot, layer),
@@ -1082,6 +1389,143 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "AffineQuantEmbedding has no linear-layer bias \
                                  — embeddings only carry (weight, scales, biases)",
+                    });
+                }
+                WeightTensor::MoeRouterGate
+                | WeightTensor::MoeExpertGateW
+                | WeightTensor::MoeExpertGateS
+                | WeightTensor::MoeExpertGateB
+                | WeightTensor::MoeExpertUpW
+                | WeightTensor::MoeExpertUpS
+                | WeightTensor::MoeExpertUpB
+                | WeightTensor::MoeExpertDownW
+                | WeightTensor::MoeExpertDownS
+                | WeightTensor::MoeExpertDownB
+                | WeightTensor::MoeSharedGateUpW
+                | WeightTensor::MoeSharedGateUpS
+                | WeightTensor::MoeSharedGateUpB
+                | WeightTensor::MoeSharedDownW
+                | WeightTensor::MoeSharedDownS
+                | WeightTensor::MoeSharedDownB
+                | WeightTensor::MoeSharedExpertGate => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "Moe* WeightTensor variant against AffineQuantEmbedding bundle — \
+                                 expected FusedMoe or SharedFusedMoe bundle",
+                    });
+                }
+            }
+        }
+        // ── FusedMoe / SharedFusedMoe ──────────────────────────────
+        //
+        // §2: dispatch into the AffineFusedMoELayer /
+        // AffineSharedFusedMoELayer struct fields. The Metal worker
+        // can only resolve the `Affine` variant — the Dense variant
+        // is cuda-only and never reaches this code path (the
+        // MetalFusedMoeImpl only claims `OpKind::Moe` tiles whose
+        // source weight has `StorageFormat::Affine`, and the macro
+        // emits `load_affine` accordingly).
+        #[cfg(feature = "metal")]
+        WeightBundleKind::FusedMoe => {
+            let layer_struct = weights.fused_moe_at(bucket, op_idx, slot, layer);
+            let affine = match layer_struct {
+                ferrite_kernels::layers_moe::FusedMoELayer::Affine(a) => a.as_ref(),
+                ferrite_kernels::layers_moe::FusedMoELayer::Dense(_) => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "FusedMoe bundle on Metal worker resolved to Dense variant — \
+                                 the macro should emit FusedMoELayer::load_affine for Metal MoE; \
+                                 reaching the Dense arm means a Dense BF16 checkpoint loaded \
+                                 through the Metal MoE path",
+                    });
+                }
+            };
+            match which {
+                WeightTensor::MoeRouterGate => affine.router_gate,
+                WeightTensor::MoeExpertGateW => affine.expert_gate_w,
+                WeightTensor::MoeExpertGateS => affine.expert_gate_scales,
+                WeightTensor::MoeExpertGateB => affine.expert_gate_biases,
+                WeightTensor::MoeExpertUpW => affine.expert_up_w,
+                WeightTensor::MoeExpertUpS => affine.expert_up_scales,
+                WeightTensor::MoeExpertUpB => affine.expert_up_biases,
+                WeightTensor::MoeExpertDownW => affine.expert_down_w,
+                WeightTensor::MoeExpertDownS => affine.expert_down_scales,
+                WeightTensor::MoeExpertDownB => affine.expert_down_biases,
+                // FusedMoe (Mixtral-style, no shared expert) cannot
+                // legitimately request Shared* tensors. The macro
+                // would only emit those bindings against
+                // SharedFusedMoe — surface as a lowering bug.
+                WeightTensor::MoeSharedGateUpW
+                | WeightTensor::MoeSharedGateUpS
+                | WeightTensor::MoeSharedGateUpB
+                | WeightTensor::MoeSharedDownW
+                | WeightTensor::MoeSharedDownS
+                | WeightTensor::MoeSharedDownB
+                | WeightTensor::MoeSharedExpertGate => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "MoeShared* WeightTensor requested against FusedMoe bundle — \
+                                 use SharedFusedMoe bundle for shared-expert tensors",
+                    });
+                }
+                WeightTensor::Weight
+                | WeightTensor::Bias
+                | WeightTensor::AffineScales
+                | WeightTensor::AffineBiases
+                | WeightTensor::AffineLinearBias => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "non-Moe WeightTensor variant requested against FusedMoe bundle",
+                    });
+                }
+            }
+        }
+        #[cfg(feature = "metal")]
+        WeightBundleKind::SharedFusedMoe => {
+            let layer_struct = weights.shared_fused_moe_at(bucket, op_idx, slot, layer);
+            let shared = match layer_struct {
+                ferrite_kernels::layers_moe::SharedFusedMoELayer::Affine(a) => a.as_ref(),
+                ferrite_kernels::layers_moe::SharedFusedMoELayer::Dense(_) => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "SharedFusedMoe bundle on Metal worker resolved to Dense variant",
+                    });
+                }
+            };
+            let routed = &shared.routed;
+            // Lowering only emits shared-* bindings when the layer's
+            // `shared_intermediate_size > 0`. None at runtime → the
+            // loader was built with shared_inter=0 but the macro
+            // baked a shared-expert tail into the Instruction
+            // payload anyway → lowering / loader split bug.
+            let shared_or_err =
+                |opt: Option<ferrite_cuda_core::tensor::GpuTensor>| {
+                    opt.ok_or(WorkerError::WeightLookupFailed {
+                        reason: "SharedFusedMoe shared-expert tensor binding fired but \
+                                 layer was loaded with shared_intermediate_size=0",
+                    })
+                };
+            match which {
+                WeightTensor::MoeRouterGate => routed.router_gate,
+                WeightTensor::MoeExpertGateW => routed.expert_gate_w,
+                WeightTensor::MoeExpertGateS => routed.expert_gate_scales,
+                WeightTensor::MoeExpertGateB => routed.expert_gate_biases,
+                WeightTensor::MoeExpertUpW => routed.expert_up_w,
+                WeightTensor::MoeExpertUpS => routed.expert_up_scales,
+                WeightTensor::MoeExpertUpB => routed.expert_up_biases,
+                WeightTensor::MoeExpertDownW => routed.expert_down_w,
+                WeightTensor::MoeExpertDownS => routed.expert_down_scales,
+                WeightTensor::MoeExpertDownB => routed.expert_down_biases,
+                WeightTensor::MoeSharedGateUpW => shared_or_err(shared.shared_gate_up_w)?,
+                WeightTensor::MoeSharedGateUpS => shared_or_err(shared.shared_gate_up_scales)?,
+                WeightTensor::MoeSharedGateUpB => shared_or_err(shared.shared_gate_up_biases)?,
+                WeightTensor::MoeSharedDownW => shared_or_err(shared.shared_down_w)?,
+                WeightTensor::MoeSharedDownS => shared_or_err(shared.shared_down_scales)?,
+                WeightTensor::MoeSharedDownB => shared_or_err(shared.shared_down_biases)?,
+                WeightTensor::MoeSharedExpertGate => shared_or_err(shared.shared_expert_gate)?,
+                WeightTensor::Weight
+                | WeightTensor::Bias
+                | WeightTensor::AffineScales
+                | WeightTensor::AffineBiases
+                | WeightTensor::AffineLinearBias => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "non-Moe WeightTensor variant requested against SharedFusedMoe \
+                                 bundle",
                     });
                 }
             }
@@ -1107,6 +1551,9 @@ fn resolve_bindings<W: CanonicalParams>(
     cmd: &LoweredCommand,
     arena: &[Buffer],
     splitk_scratch: Option<&Buffer>,
+    moe_scratch: Option<&Buffer>,
+    moe_inline_buf: Option<&Buffer>,
+    inline_cursor: &mut u32,
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
@@ -1160,6 +1607,30 @@ fn resolve_bindings<W: CanonicalParams>(
                     command_index,
                 })?;
                 (scratch.clone(), 0u64, *binding_index as u64)
+            }
+            Binding::Inline {
+                binding_index,
+                value,
+            } => {
+                let buf = moe_inline_buf.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "Binding::Inline reached resolve_bindings but the bucket's \
+                             `moe_inline_buf` is None — bake_bucket's pre-pass should have \
+                             allocated it from the tape's Inline bindings",
+                })?;
+                let off = (*inline_cursor as u64) * 4;
+                *inline_cursor += 1;
+                (buf.clone(), off, *binding_index as u64)
+            }
+            Binding::MoeScratch {
+                binding_index,
+                byte_offset,
+            } => {
+                let buf = moe_scratch.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "Binding::MoeScratch reached worker but `moe_scratch` is None — \
+                             a MoE instruction lowered without `LoweredMetalTape::moe_scratch_bytes` \
+                             being set (lowering pass bug)",
+                })?;
+                (buf.clone(), *byte_offset as u64, *binding_index as u64)
             }
         };
         out.push((buf, off, idx));

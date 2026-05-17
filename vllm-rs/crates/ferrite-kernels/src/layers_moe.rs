@@ -104,14 +104,16 @@ pub unsafe fn route_experts(
 }
 
 // ---------------------------------------------------------------------------
-// FusedMoELayer
+// DenseFusedMoELayer (cuda Dense MoE: Mixtral / Qwen2-MoE / Qwen3-MoE BF16)
 // ---------------------------------------------------------------------------
 
-/// Fused Mixture of Experts layer.
+/// Cuda-side Dense Mixture of Experts layer. The variant of the public
+/// [`FusedMoELayer`] enum that holds stacked BF16/F16 expert weights
+/// fed through `kernels::fused_moe_gemm`.
 ///
 /// Weights are stored as stacked `[num_experts, dim, hidden]` tensors.
 /// Forward matches Python vLLM's `fused_experts_impl` exactly.
-pub struct FusedMoELayer {
+pub struct DenseFusedMoELayer {
     /// Gate projection: `[hidden_size, num_experts]`.
     pub gate: Linear,
     /// Stacked gate+up weights: `[num_experts, 2*intermediate_size, hidden_size]`.
@@ -139,7 +141,7 @@ pub struct FusedMoELayer {
 }
 
 #[cfg(feature = "cuda")]
-impl FusedMoELayer {
+impl DenseFusedMoELayer {
     /// Load a Mixtral-style BF16 fused MoE layer from safetensors.
     ///
     /// Mirrors `vllm-cuda/src/model/mixtral.rs::MixtralDecoderLayer::load_moe`
@@ -220,7 +222,7 @@ impl FusedMoELayer {
             )
         };
 
-        Ok(FusedMoELayer {
+        Ok(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -370,14 +372,411 @@ impl FusedMoELayer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AffineFusedMoELayer (metal: MLX-affine int4 experts + dense BF16 router)
+// ---------------------------------------------------------------------------
+
+/// MLX-affine int4 fused MoE layer (Metal-only).
+///
+/// Mirrors the binding shape consumed by `lower_metal_moe` in
+/// `ferrite-forward/src/interpreter/metal/lowering.rs`:
+/// * `router_gate` — dense `[num_experts, hidden_size]` BF16/F16 — fed
+///   to the routing Gemm.
+/// * `expert_{gate,up}_{w,scales,biases}` — stacked per-expert affine
+///   tensors with `out_features = intermediate_size`,
+///   `in_features = hidden_size`. `w` is packed U32
+///   `[E, intermediate, hidden / pack_factor]`; `scales` and `biases`
+///   are F16 `[E, intermediate, hidden / group_size]`.
+/// * `expert_down_{w,scales,biases}` — same triple but with
+///   `out_features = hidden_size`, `in_features = intermediate_size`.
+///
+/// `pack_factor = 32 / bits = 8` for bits=4 (the only configuration
+/// we ship). Reading order in `affine_gather_qmv` shaders is `[E, N, K]`
+/// — matches the per-expert flatten the loader produces.
 #[cfg(feature = "metal")]
+pub struct AffineFusedMoELayer {
+    /// Dense router projection `[num_experts, hidden_size]`,
+    /// BF16/F16 — Mixtral / Qwen-MoE / Qwen3-MoE all keep the small
+    /// router as fp (the mlx-community 4bit checkpoint quantize filter
+    /// skips linears with out_features below the 1k threshold).
+    pub router_gate: ferrite_cuda_core::tensor::GpuTensor,
+
+    pub expert_gate_w: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_gate_scales: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_gate_biases: ferrite_cuda_core::tensor::GpuTensor,
+
+    pub expert_up_w: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_up_scales: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_up_biases: ferrite_cuda_core::tensor::GpuTensor,
+
+    pub expert_down_w: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_down_scales: ferrite_cuda_core::tensor::GpuTensor,
+    pub expert_down_biases: ferrite_cuda_core::tensor::GpuTensor,
+
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    pub hidden_size: usize,
+    pub renormalize: bool,
+    pub group_size: u32,
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl AffineFusedMoELayer {
+    /// Load a Mixtral-style MLX-affine int4 MoE checkpoint. Expert
+    /// weights follow HF's `experts.{e}.{w1,w2,w3}.{weight,scales,biases}`
+    /// naming (w1 = gate_proj, w3 = up_proj, w2 = down_proj). Router
+    /// lives at `{prefix}.gate.weight` as a dense `[E, hidden]` tensor.
+    ///
+    /// Per-expert tensors are stacked into one MTLBuffer per
+    /// `(weight_kind, tensor_role)` pair — packed at expert-major
+    /// stride so the `affine_gather_qmv` kernel can resolve
+    /// `expert_offset = e * out * in/8` (for U32 weights) or
+    /// `e * out * in/gs` (for F16 scales/biases) with a single load.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_naming(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+            MoeExpertNaming::Mixtral,
+            true,
+        )
+    }
+
+    /// Load with explicit per-expert naming convention.
+    ///
+    /// Two on-disk layouts are supported, picked by probing for
+    /// `{prefix}.switch_mlp.gate_proj.weight`:
+    ///
+    /// * **switch_mlp pre-stacked** (mlx-community Qwen3-MoE-4bit and
+    ///   newer): three `[E, out, in/8]` U32 weight tensors at
+    ///   `{prefix}.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`.
+    ///   Already in the expert-major layout `affine_gather_qmv`
+    ///   expects — taken zero-copy.
+    /// * **per-expert** (mlx-community Mixtral-4bit, older Qwen-MoE
+    ///   4bit): individual `{prefix}.experts.{e}.{w1|gate_proj}.*`
+    ///   tensors. Stacked at load via `alloc_uninit` +
+    ///   `take_into_metal` into the expert-major layout.
+    ///
+    /// Router gate (`{prefix}.gate`) is always quantized in
+    /// mlx-community 4bit MoE checkpoints; we dequantize it at load
+    /// time via `take_affine_dequant_b4` so the routing Gemm step
+    /// stays on the dense BF16/F16 path (no quantized GEMM kernel
+    /// for `[E, hidden]` is needed).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_with_naming(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+        naming: MoeExpertNaming,
+        renormalize: bool,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::dtype::DType;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        anyhow::ensure!(
+            bits == 4,
+            "AffineFusedMoELayer: only bits=4 supported (got {bits})"
+        );
+        anyhow::ensure!(
+            hidden_size % group_size as usize == 0,
+            "AffineFusedMoELayer: hidden_size={hidden_size} not divisible by group_size={group_size}"
+        );
+        anyhow::ensure!(
+            intermediate_size % group_size as usize == 0,
+            "AffineFusedMoELayer: intermediate_size={intermediate_size} not divisible by \
+             group_size={group_size}"
+        );
+        let pack_factor = (32 / bits) as usize;
+        let gs = group_size as usize;
+
+        // Router gate: quantized in mlx-community 4bit MoE
+        // checkpoints (verified on Qwen3-30B-A3B-4bit and
+        // Mixtral-8x7B-Instruct-v0.1-4bit). Dequant to a typed dense
+        // tensor so the routing Gemm step in `lower_metal_moe`
+        // (Step 1) reads it as a normal `[E, hidden]` BF16/F16
+        // weight — same shape contract as the cuda Dense path.
+        // Choose dequant dtype from the model's target_dtype (BF16
+        // on every metal build path today).
+        let router_dtype = gw
+            .target_dtype()
+            .unwrap_or(DType::BF16);
+        anyhow::ensure!(
+            matches!(router_dtype, DType::BF16 | DType::F16),
+            "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
+        );
+        let router_gate = gw.take_affine_dequant_b4(
+            &format!("{prefix}.gate"),
+            group_size,
+            bits,
+            router_dtype,
+        )?;
+
+        // Probe for the switch_mlp pre-stacked layout. Qwen3-MoE-4bit
+        // and newer mlx-community repos ship one stacked tensor per
+        // role; Mixtral-4bit and older repos keep per-expert files.
+        let switch_mlp_probe = format!("{prefix}.switch_mlp.gate_proj.weight");
+        let use_switch_mlp = gw.contains(&switch_mlp_probe);
+
+        let scales_dtype = if use_switch_mlp {
+            let first = format!("{prefix}.switch_mlp.gate_proj.scales");
+            let (_, dt) = gw.tensor_info(&first).ok_or_else(|| {
+                anyhow::anyhow!("affine MoE: weight not found: {first}")
+            })?;
+            dt
+        } else {
+            let (g_name_gate, _, _) = naming.proj_names();
+            let first = format!("{prefix}.experts.0.{g_name_gate}.scales");
+            let (_, dt) = gw.tensor_info(&first).ok_or_else(|| {
+                anyhow::anyhow!("affine MoE: weight not found: {first}")
+            })?;
+            dt
+        };
+
+        let (
+            expert_gate_w,
+            expert_gate_scales,
+            expert_gate_biases,
+            expert_up_w,
+            expert_up_scales,
+            expert_up_biases,
+            expert_down_w,
+            expert_down_scales,
+            expert_down_biases,
+        ) = if use_switch_mlp {
+            // Pre-stacked path: nine `take` calls (one per
+            // tensor-role × tensor-kind triple). Shape on disk
+            // already matches `[E, out, in / div]`, dtype already
+            // matches U32 / scales_dtype.
+            let g_w = gw.take(&format!("{prefix}.switch_mlp.gate_proj.weight"))?;
+            let g_s = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.gate_proj.scales"))?;
+            let g_b = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.gate_proj.biases"))?;
+            let u_w = gw.take(&format!("{prefix}.switch_mlp.up_proj.weight"))?;
+            let u_s = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.up_proj.scales"))?;
+            let u_b = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.up_proj.biases"))?;
+            let d_w = gw.take(&format!("{prefix}.switch_mlp.down_proj.weight"))?;
+            let d_s = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.down_proj.scales"))?;
+            let d_b = gw.take_keep_dtype(&format!("{prefix}.switch_mlp.down_proj.biases"))?;
+            (g_w, g_s, g_b, u_w, u_s, u_b, d_w, d_s, d_b)
+        } else {
+            // Per-expert path: stack into pre-allocated MTLBuffers.
+            let (g_name_gate, g_name_up, g_name_down) = naming.proj_names();
+            let elem_w = DType::U32.size_bytes();
+            let elem_sb = scales_dtype.size_bytes();
+            // gate_proj / up_proj: out=intermediate, in=hidden.
+            let per_gate_w = intermediate_size * (hidden_size / pack_factor);
+            let per_gate_sb = intermediate_size * (hidden_size / gs);
+            // down_proj: out=hidden, in=intermediate.
+            let per_down_w = hidden_size * (intermediate_size / pack_factor);
+            let per_down_sb = hidden_size * (intermediate_size / gs);
+
+            let alloc_kind = |per_expert_elems: usize,
+                              elem_size: usize|
+             -> anyhow::Result<*mut u8> {
+                let bytes = num_experts * per_expert_elems * elem_size;
+                gw.metal_allocator()
+                    .alloc_uninit(bytes)
+                    .map_err(|e| anyhow::anyhow!("alloc_uninit({bytes}) failed: {e}"))
+            };
+
+            let gate_w_ptr = alloc_kind(per_gate_w, elem_w)?;
+            let gate_s_ptr = alloc_kind(per_gate_sb, elem_sb)?;
+            let gate_b_ptr = alloc_kind(per_gate_sb, elem_sb)?;
+            let up_w_ptr = alloc_kind(per_gate_w, elem_w)?;
+            let up_s_ptr = alloc_kind(per_gate_sb, elem_sb)?;
+            let up_b_ptr = alloc_kind(per_gate_sb, elem_sb)?;
+            let down_w_ptr = alloc_kind(per_down_w, elem_w)?;
+            let down_s_ptr = alloc_kind(per_down_sb, elem_sb)?;
+            let down_b_ptr = alloc_kind(per_down_sb, elem_sb)?;
+
+            for e in 0..num_experts {
+                let off_gate_w = e * per_gate_w * elem_w;
+                let off_gate_sb = e * per_gate_sb * elem_sb;
+                let off_up_w = off_gate_w;
+                let off_up_sb = off_gate_sb;
+                let off_down_w = e * per_down_w * elem_w;
+                let off_down_sb = e * per_down_sb * elem_sb;
+                unsafe {
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_gate}.weight"),
+                        gate_w_ptr.add(off_gate_w),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_gate}.scales"),
+                        gate_s_ptr.add(off_gate_sb),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_gate}.biases"),
+                        gate_b_ptr.add(off_gate_sb),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_up}.weight"),
+                        up_w_ptr.add(off_up_w),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_up}.scales"),
+                        up_s_ptr.add(off_up_sb),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_up}.biases"),
+                        up_b_ptr.add(off_up_sb),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_down}.weight"),
+                        down_w_ptr.add(off_down_w),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_down}.scales"),
+                        down_s_ptr.add(off_down_sb),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.experts.{e}.{g_name_down}.biases"),
+                        down_b_ptr.add(off_down_sb),
+                    )?;
+                }
+            }
+
+            let mk = |ptr, n_out: usize, n_in: usize, div: usize, dt: DType| unsafe {
+                GpuTensor::new(ptr, &[num_experts, n_out, n_in / div], dt)
+            };
+            (
+                mk(gate_w_ptr, intermediate_size, hidden_size, pack_factor, DType::U32),
+                mk(gate_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
+                mk(gate_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
+                mk(up_w_ptr, intermediate_size, hidden_size, pack_factor, DType::U32),
+                mk(up_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
+                mk(up_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
+                mk(down_w_ptr, hidden_size, intermediate_size, pack_factor, DType::U32),
+                mk(down_s_ptr, hidden_size, intermediate_size, gs, scales_dtype),
+                mk(down_b_ptr, hidden_size, intermediate_size, gs, scales_dtype),
+            )
+        };
+
+        Ok(AffineFusedMoELayer {
+            router_gate,
+            expert_gate_w,
+            expert_gate_scales,
+            expert_gate_biases,
+            expert_up_w,
+            expert_up_scales,
+            expert_up_biases,
+            expert_down_w,
+            expert_down_scales,
+            expert_down_biases,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            renormalize,
+            group_size,
+            bits,
+        })
+    }
+}
+
+/// Per-expert tensor naming convention. Mixtral safetensors keep the
+/// pre-Llama-2 `w1/w2/w3` names while every other HF MoE checkpoint
+/// (Qwen2-MoE, Qwen3-MoE, DeepSeek-MoE) uses `gate_proj/up_proj/down_proj`.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MoeExpertNaming {
+    /// `w1` = gate, `w3` = up, `w2` = down.
+    Mixtral,
+    /// `gate_proj`, `up_proj`, `down_proj`.
+    Qwen,
+}
+
+#[cfg(feature = "metal")]
+impl MoeExpertNaming {
+    fn proj_names(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::Mixtral => ("w1", "w3", "w2"),
+            Self::Qwen => ("gate_proj", "up_proj", "down_proj"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FusedMoELayer (enum: Dense for cuda, Affine for metal)
+// ---------------------------------------------------------------------------
+
+/// Unified fused-MoE layer. Mirrors the [`crate::layers::LinearLayer`]
+/// precedent: one public enum that holds the per-backend storage. The
+/// macro-emitted `WeightAccessors::fused_moe_at` returns a reference
+/// to this type, and the per-target Impls match on the variant they
+/// expect (the cuda `FusedMoeRefImpl` only fires on Dense MoE
+/// checkpoints; the Metal `MetalFusedMoeImpl` only fires on
+/// MLX-affine int4 checkpoints).
+pub enum FusedMoELayer {
+    /// Cuda Dense BF16/F16 MoE — Mixtral / Qwen-MoE / DeepSeek-MoE
+    /// reference path. Stacked `[E, 2*inter, hidden]` gate+up plus
+    /// `[E, hidden, inter]` down, fed through
+    /// `kernels::fused_moe_gemm`.
+    Dense(DenseFusedMoELayer),
+    /// MLX-affine int4 MoE (Metal-only). Per-expert (W, scales,
+    /// biases) triples + dense fp router; lowered to a 10-step ICB
+    /// decomposition by `lower_metal_moe`.
+    #[cfg(feature = "metal")]
+    Affine(Box<AffineFusedMoELayer>),
+}
+
 impl FusedMoELayer {
-    /// Metal stub. The fused MoE GEMM + topk + softmax/sigmoid kernel
-    /// chain is cuda-only — no Apple-silicon counterpart yet. Returning
-    /// `Err` keeps the macro emission for MoE arches well-typed under
-    /// `--features metal`; trying to actually load a Mixtral / Qwen-MoE
-    /// / DeepSeek-MoE checkpoint on metal surfaces this error at the
-    /// load site rather than blowing up during shader compilation.
+    /// Macro-emitted load entry for Dense MoE checkpoints (cuda).
+    /// Mirrors the historical struct-`FusedMoELayer::load` signature
+    /// so the macro's `FieldLoad::FusedMoe` arm doesn't need an
+    /// extra parameter.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Dense(DenseFusedMoELayer::load(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            stream,
+        )?))
+    }
+
+    /// Metal load stub for Dense MoE checkpoints. Bails at load time
+    /// — Dense BF16 MoE on Metal would need a per-expert dense-matmul
+    /// path we haven't ported. Affine int4 checkpoints go through
+    /// [`Self::load_affine`] instead. The stub exists so model crates
+    /// whose `model.bounds` advertise Dense MoE storage (e.g. the
+    /// 1-layer Mixtral test config) still satisfy macro expansion
+    /// under `--features metal` — same surface the pre-§2 `bail!`
+    /// stub provided.
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         _gw: &mut ferrite_cuda_core::weights::GpuWeights,
@@ -388,21 +787,75 @@ impl FusedMoELayer {
         _hidden_size: usize,
         _stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
-        anyhow::bail!("FusedMoELayer not supported on metal: port MoE GEMM + topk kernels first")
+        anyhow::bail!(
+            "FusedMoELayer: Dense BF16 MoE not supported on metal — use a Mixtral / \
+             Qwen-MoE / DeepSeek-MoE checkpoint with MLX-affine int4 expert weights instead"
+        )
+    }
+
+    /// Macro-emitted load entry for MLX-affine int4 MoE checkpoints
+    /// (metal). The macro detects `StorageFormat::Affine` on the MoE
+    /// source weights and emits this call site with `group_size` and
+    /// `bits` baked in from the model's `quantization_config`.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_affine(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Affine(Box::new(AffineFusedMoELayer::load(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+        )?)))
+    }
+
+    /// Cuda forward — delegates to the `Dense` variant. The `Affine`
+    /// arm is unreachable here because the Metal worker dispatches
+    /// MoE via the lowered ICB tape (`Instruction::MetalFusedMoe`),
+    /// never through this `forward` method.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn forward(
+        &self,
+        hidden_states: ferrite_cuda_core::tensor::TensorView<'_>,
+        device: &mut ferrite_cuda_core::device::GpuDevice,
+    ) -> ferrite_cuda_core::alloc::OwnedTensor {
+        match self {
+            Self::Dense(d) => unsafe { d.forward(hidden_states, device) },
+            #[cfg(feature = "metal")]
+            Self::Affine(_) => {
+                unreachable!("FusedMoELayer::forward called on Affine variant — \
+                              Metal MoE is dispatched via the ICB tape, not the \
+                              cuda forward path")
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// SharedFusedMoELayer (Qwen2/3 MoE)
+// DenseSharedFusedMoELayer (cuda BF16 Qwen2/3 MoE with shared expert)
 // ---------------------------------------------------------------------------
 
-/// MoE layer with optional shared expert (used by Qwen2 MoE, Qwen3 MoE).
+/// Cuda-side Dense MoE layer with optional shared expert (Qwen2 MoE,
+/// Qwen3 MoE). The variant of the public [`SharedFusedMoELayer`] enum
+/// holding the stacked dense expert weights + dense shared expert.
 ///
 /// The shared expert runs in parallel with the MoE routing:
 /// ```text
 /// output = moe(hidden_states) + shared_expert_gate(hidden_states).sigmoid() * shared_expert(hidden_states)
 /// ```
-pub struct SharedFusedMoELayer {
+pub struct DenseSharedFusedMoELayer {
     pub moe: FusedMoELayer,
     /// Shared expert: fused gate+up projection `[2*intermediate, hidden]`.
     pub shared_gate_up: Option<Linear>,
@@ -414,7 +867,7 @@ pub struct SharedFusedMoELayer {
 }
 
 #[cfg(feature = "cuda")]
-impl SharedFusedMoELayer {
+impl DenseSharedFusedMoELayer {
     /// Load a Qwen-MoE-style BF16 fused MoE + shared-expert layer.
     ///
     /// Mirrors `vllm-cuda/src/model/qwen3_moe.rs::Qwen3MoeDecoderLayer::load_moe`
@@ -476,7 +929,7 @@ impl SharedFusedMoELayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden_size], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden_size, inter], dtype) };
 
-        let moe = FusedMoELayer {
+        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -491,7 +944,7 @@ impl SharedFusedMoELayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        };
+        });
 
         let (shared_gate_up, shared_down, shared_expert_gate) = if shared_expert_intermediate_size
             > 0
@@ -522,7 +975,7 @@ impl SharedFusedMoELayer {
             (None, None, None)
         };
 
-        Ok(SharedFusedMoELayer {
+        Ok(DenseSharedFusedMoELayer {
             moe,
             shared_gate_up,
             shared_down,
@@ -591,9 +1044,311 @@ impl SharedFusedMoELayer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AffineSharedFusedMoELayer (metal: MLX-affine int4 Qwen-MoE family)
+// ---------------------------------------------------------------------------
+
+/// MLX-affine int4 fused MoE + shared expert layer (Metal-only).
+///
+/// Same stacked-per-expert affine layout as [`AffineFusedMoELayer`]
+/// (Qwen naming: `gate_proj/up_proj/down_proj`), plus optional shared
+/// expert tail used by Qwen2-MoE / Qwen3-MoE.
+///
+/// `shared_*` fields are `None` when `shared_intermediate_size == 0`
+/// (Qwen3-MoE-30B-A3B-Instruct ships shared_inter=0). The Metal
+/// lowering pass conditions its shared-expert tail on the same flag,
+/// so an absent shared expert is structurally consistent — the
+/// lowered tape doesn't reference these slots.
 #[cfg(feature = "metal")]
+pub struct AffineSharedFusedMoELayer {
+    /// Routed experts + dense router. Same shape as
+    /// [`AffineFusedMoELayer`].
+    pub routed: AffineFusedMoELayer,
+
+    // ── Shared expert (Option, all-or-none) ───────────────────────
+    /// Shared expert fused gate+up `[2*shared_inter, hidden]`, packed
+    /// U32 weights. Lowering's `MoeSharedGateUpW` resolves to this.
+    pub shared_gate_up_w: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    /// Shared expert gate+up scales `[2*shared_inter, hidden / gs]`,
+    /// F16. Lowering's `MoeSharedGateUpS` resolves to this.
+    pub shared_gate_up_scales: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    /// Shared expert gate+up affine biases. F16. `MoeSharedGateUpB`.
+    pub shared_gate_up_biases: Option<ferrite_cuda_core::tensor::GpuTensor>,
+
+    /// Shared expert down `[hidden, shared_inter]` packed U32.
+    /// `MoeSharedDownW`.
+    pub shared_down_w: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    pub shared_down_scales: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    pub shared_down_biases: Option<ferrite_cuda_core::tensor::GpuTensor>,
+
+    /// Shared expert sigmoid gate `[1, hidden]` dense F16/BF16.
+    /// `MoeSharedExpertGate`.
+    pub shared_expert_gate: Option<ferrite_cuda_core::tensor::GpuTensor>,
+
+    pub shared_intermediate_size: usize,
+}
+
+#[cfg(feature = "metal")]
+impl AffineSharedFusedMoELayer {
+    /// Load a Qwen-MoE-style MLX-affine int4 checkpoint. Expert
+    /// weights use HF's `gate_proj/up_proj/down_proj` naming; shared
+    /// expert lives at `{prefix}.shared_expert.{gate,up,down}_proj`
+    /// with a sigmoid gate at `{prefix}.shared_expert_gate.weight`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+    ) -> anyhow::Result<Self> {
+        use ferrite_cuda_core::dtype::DType;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        // Qwen-MoE family always renormalizes (`norm_topk_prob = true`
+        // is the family default; Qwen3-MoE configs make it explicit).
+        let routed = AffineFusedMoELayer::load_with_naming(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+            MoeExpertNaming::Qwen,
+            true,
+        )?;
+
+        // Shared expert tail — only present when shared_inter > 0.
+        let (
+            shared_gate_up_w,
+            shared_gate_up_scales,
+            shared_gate_up_biases,
+            shared_down_w,
+            shared_down_scales,
+            shared_down_biases,
+            shared_expert_gate,
+        ) = if shared_expert_intermediate_size > 0 {
+            anyhow::ensure!(
+                bits == 4,
+                "AffineSharedFusedMoELayer: only bits=4 supported"
+            );
+            let pack_factor = (32 / bits) as usize;
+            let shared_inter = shared_expert_intermediate_size;
+            // Two cases for shared gate+up: either fused on-disk
+            // (`shared_expert.gate_up_proj`) or split (the more common
+            // Qwen-MoE shape with separate gate_proj/up_proj). The
+            // affine_gather_qmv lowering wants a single packed
+            // `[2*shared_inter, hidden / pack_factor]` triple, so we
+            // stack split-on-disk variants by allocating and copying
+            // gate then up into adjacent halves.
+            let has_fused = gw.contains(&format!(
+                "{prefix}.shared_expert.gate_up_proj.weight"
+            ));
+
+            // Sample scales dtype the same way as the routed path.
+            let probe_name = if has_fused {
+                format!("{prefix}.shared_expert.gate_up_proj.scales")
+            } else {
+                format!("{prefix}.shared_expert.gate_proj.scales")
+            };
+            let (_, scales_dtype) =
+                gw.tensor_info(&probe_name).ok_or_else(|| {
+                    anyhow::anyhow!("affine MoE shared: weight not found: {probe_name}")
+                })?;
+            let elem_w = DType::U32.size_bytes();
+            let elem_sb = scales_dtype.size_bytes();
+            let gs = group_size as usize;
+
+            // Allocate destination buffers.
+            let two_si = 2 * shared_inter;
+            let gu_w_bytes = two_si * (hidden_size / pack_factor) * elem_w;
+            let gu_sb_bytes = two_si * (hidden_size / gs) * elem_sb;
+            let down_w_bytes = hidden_size * (shared_inter / pack_factor) * elem_w;
+            let down_sb_bytes = hidden_size * (shared_inter / gs) * elem_sb;
+
+            let alloc = |bytes: usize| -> anyhow::Result<*mut u8> {
+                gw.metal_allocator()
+                    .alloc_uninit(bytes)
+                    .map_err(|e| anyhow::anyhow!("alloc_uninit({bytes}) failed: {e}"))
+            };
+
+            let gu_w_ptr = alloc(gu_w_bytes)?;
+            let gu_s_ptr = alloc(gu_sb_bytes)?;
+            let gu_b_ptr = alloc(gu_sb_bytes)?;
+            let down_w_ptr = alloc(down_w_bytes)?;
+            let down_s_ptr = alloc(down_sb_bytes)?;
+            let down_b_ptr = alloc(down_sb_bytes)?;
+
+            if has_fused {
+                unsafe {
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_up_proj.weight"),
+                        gu_w_ptr,
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_up_proj.scales"),
+                        gu_s_ptr,
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_up_proj.biases"),
+                        gu_b_ptr,
+                    )?;
+                }
+            } else {
+                // Split → stack into [gate_half | up_half].
+                let half_w_bytes = shared_inter * (hidden_size / pack_factor) * elem_w;
+                let half_sb_bytes = shared_inter * (hidden_size / gs) * elem_sb;
+                unsafe {
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_proj.weight"),
+                        gu_w_ptr,
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.up_proj.weight"),
+                        gu_w_ptr.add(half_w_bytes),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_proj.scales"),
+                        gu_s_ptr,
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.up_proj.scales"),
+                        gu_s_ptr.add(half_sb_bytes),
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.gate_proj.biases"),
+                        gu_b_ptr,
+                    )?;
+                    let _ = gw.take_into_metal(
+                        &format!("{prefix}.shared_expert.up_proj.biases"),
+                        gu_b_ptr.add(half_sb_bytes),
+                    )?;
+                }
+            }
+
+            unsafe {
+                let _ = gw.take_into_metal(
+                    &format!("{prefix}.shared_expert.down_proj.weight"),
+                    down_w_ptr,
+                )?;
+                let _ = gw.take_into_metal(
+                    &format!("{prefix}.shared_expert.down_proj.scales"),
+                    down_s_ptr,
+                )?;
+                let _ = gw.take_into_metal(
+                    &format!("{prefix}.shared_expert.down_proj.biases"),
+                    down_b_ptr,
+                )?;
+            }
+
+            let gu_w = unsafe {
+                GpuTensor::new(
+                    gu_w_ptr,
+                    &[two_si, hidden_size / pack_factor],
+                    DType::U32,
+                )
+            };
+            let gu_s = unsafe {
+                GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype)
+            };
+            let gu_b = unsafe {
+                GpuTensor::new(gu_b_ptr, &[two_si, hidden_size / gs], scales_dtype)
+            };
+            let d_w = unsafe {
+                GpuTensor::new(
+                    down_w_ptr,
+                    &[hidden_size, shared_inter / pack_factor],
+                    DType::U32,
+                )
+            };
+            let d_s = unsafe {
+                GpuTensor::new(
+                    down_s_ptr,
+                    &[hidden_size, shared_inter / gs],
+                    scales_dtype,
+                )
+            };
+            let d_b = unsafe {
+                GpuTensor::new(
+                    down_b_ptr,
+                    &[hidden_size, shared_inter / gs],
+                    scales_dtype,
+                )
+            };
+            let sgate = gw.take(&format!("{prefix}.shared_expert_gate.weight"))?;
+
+            (
+                Some(gu_w),
+                Some(gu_s),
+                Some(gu_b),
+                Some(d_w),
+                Some(d_s),
+                Some(d_b),
+                Some(sgate),
+            )
+        } else {
+            (None, None, None, None, None, None, None)
+        };
+
+        Ok(AffineSharedFusedMoELayer {
+            routed,
+            shared_gate_up_w,
+            shared_gate_up_scales,
+            shared_gate_up_biases,
+            shared_down_w,
+            shared_down_scales,
+            shared_down_biases,
+            shared_expert_gate,
+            shared_intermediate_size: shared_expert_intermediate_size,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SharedFusedMoELayer (enum: Dense for cuda, Affine for metal)
+// ---------------------------------------------------------------------------
+
+pub enum SharedFusedMoELayer {
+    Dense(DenseSharedFusedMoELayer),
+    #[cfg(feature = "metal")]
+    Affine(Box<AffineSharedFusedMoELayer>),
+}
+
 impl SharedFusedMoELayer {
-    /// Metal stub — see `FusedMoELayer::load`.
+    /// Macro-emitted load entry for Dense Qwen-MoE checkpoints (cuda).
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn load(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Dense(DenseSharedFusedMoELayer::load(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+            stream,
+        )?))
+    }
+
+    /// Metal load stub — same rationale as
+    /// [`FusedMoELayer::load`] (the metal Dense MoE branch).
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         _gw: &mut ferrite_cuda_core::weights::GpuWeights,
@@ -606,8 +1361,54 @@ impl SharedFusedMoELayer {
         _stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
         anyhow::bail!(
-            "SharedFusedMoELayer not supported on metal: port MoE GEMM + topk kernels first"
+            "SharedFusedMoELayer: Dense BF16 Qwen-MoE not supported on metal — use \
+             an MLX-affine int4 checkpoint instead"
         )
+    }
+
+    /// Macro-emitted load entry for MLX-affine int4 Qwen-MoE
+    /// checkpoints (metal).
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_affine(
+        gw: &mut ferrite_cuda_core::weights::GpuWeights,
+        prefix: &str,
+        num_experts: usize,
+        top_k: usize,
+        moe_intermediate_size: usize,
+        shared_expert_intermediate_size: usize,
+        hidden_size: usize,
+        group_size: u32,
+        bits: u32,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Affine(Box::new(AffineSharedFusedMoELayer::load(
+            gw,
+            prefix,
+            num_experts,
+            top_k,
+            moe_intermediate_size,
+            shared_expert_intermediate_size,
+            hidden_size,
+            group_size,
+            bits,
+        )?)))
+    }
+
+    /// Cuda forward — delegates to the `Dense` variant. The `Affine`
+    /// arm is unreachable here (Metal worker dispatches via ICB tape).
+    #[cfg(feature = "cuda")]
+    pub unsafe fn forward(
+        &self,
+        hidden_states: ferrite_cuda_core::tensor::TensorView<'_>,
+        device: &mut ferrite_cuda_core::device::GpuDevice,
+    ) -> ferrite_cuda_core::alloc::OwnedTensor {
+        match self {
+            Self::Dense(d) => unsafe { d.forward(hidden_states, device) },
+            #[cfg(feature = "metal")]
+            Self::Affine(_) => {
+                unreachable!("SharedFusedMoELayer::forward called on Affine variant")
+            }
+        }
     }
 }
 
@@ -748,7 +1549,7 @@ impl DeepSeekV2MoELayer {
             None
         };
 
-        let moe = FusedMoELayer {
+        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -767,7 +1568,7 @@ impl DeepSeekV2MoELayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        };
+        });
 
         // Shared expert: concat gate_proj + up_proj → [2*shared_inter, hidden].
         let shared_inter = n_shared_experts * moe_intermediate_size;
@@ -2446,7 +3247,7 @@ mod tests {
         let w1 = unsafe { GpuTensor::new(0x2000 as *mut u8, &[8, 28672, 4096], DType::BF16) };
         let w2 = unsafe { GpuTensor::new(0x3000 as *mut u8, &[8, 4096, 14336], DType::BF16) };
 
-        let layer = FusedMoELayer {
+        let layer = DenseFusedMoELayer {
             gate: Linear::new(gate_w, None),
             w1,
             w2,

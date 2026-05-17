@@ -1051,20 +1051,29 @@ INST_QMM_ALL(bf16, bfloat, f16, half,  32)
 INST_QMM_ALL(bf16, bfloat, f16, half,  64)
 INST_QMM_ALL(bf16, bfloat, f16, half, 128)
 
+// bf16-scale variants — Qwen3-MoE / `torch_dtype: bfloat16` ships BF16
+// scales/biases. Mirrors MLX's `T_scale = bfloat16_t` instantiations.
+INST_QMM_ALL(bf16, bfloat, bf16, bfloat,  32)
+INST_QMM_ALL(bf16, bfloat, bf16, bfloat,  64)
+INST_QMM_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_QMM_ALL(f16,  half,   bf16, bfloat,  32)
+INST_QMM_ALL(f16,  half,   bf16, bfloat,  64)
+INST_QMM_ALL(f16,  half,   bf16, bfloat, 128)
+
 // Apple7 (M1) fast-path: bf16 device dtype, f16 compute. Skips the
 // slow bf16 simdgroup_multiply_accumulate emulation and runs the MMA
 // in half — ~1.7× faster on M1 Max for prefill matmuls. Output stays
 // bf16 so the residual stream's bf16 dynamic range is preserved.
 // Only qmm_t (not qmm_n; qmm_n isn't on the prefill hot path).
-INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 64, true,  true)
-INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 64, false, false)
-INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 32, true,  true)
-INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 32, false, false)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, true,  true)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, false, false)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  32, true,  true)
+INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  32, false, false)
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half, 128, false, false)
-INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 64, true,  true)
-INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 64, false, false)
-INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 32, true,  true)
-INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 32, false, false)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  64, true,  true)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  64, false, false)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  32, true,  true)
+INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  32, false, false)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, false, false)

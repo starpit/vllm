@@ -116,12 +116,15 @@ template <typename T_act, typename T_scale>
   [[kernel]] decltype(rmsnorm_specialized_impl<act_type, scale_type>)       \
       rmsnorm_specialized_impl<act_type, scale_type>;
 
-// Coverage: T_scale = half always (mlx-community / Llama-3.x norms
-// ship F16 gains on disk). T_act per the model's resolved dtype. The
-// `bf16 × bf16` instantiation that the pre-P10c codebase shipped
-// (loader-cast F16→BF16) is removed here.
+// Coverage: T_scale tracks on-disk gain dtype. Llama-3.x / Qwen2.5 /
+// SmolLM mlx-community 4bit ship F16 RMSNorm gains; Qwen3 family ships
+// BF16. Both are loaded with `take_keep_dtype` (no loader-side cast),
+// so the kernel template must cover both. `W::SCALE_DTYPE` picks the
+// arm at lowering time.
 INST_RMSNORM(f16,  half,   f16, half)
 INST_RMSNORM(bf16, bfloat, f16, half)
+INST_RMSNORM(bf16, bfloat, bf16, bfloat)
+INST_RMSNORM(f16,  half,   bf16, bfloat)
 
 /// BF16 variant (uses float16 as Metal doesn't have native bfloat16)
 kernel void rmsnorm_bf16(

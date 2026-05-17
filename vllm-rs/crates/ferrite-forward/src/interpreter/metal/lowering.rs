@@ -37,8 +37,9 @@ use ferrite_metal_kernels::quantized::{
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
 use super::lowered::{
-    Binding, DispatchShape, GemmDims, KernelId, LoweredCommand, LoweredMetalTape, LoweringError,
-    MetalDtype, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor,
+    Binding, DispatchShape, GemmDims, KernelId, KvCacheWhich, LoweredCommand, LoweredMetalTape,
+    LoweringError, MetalDtype, PerLayerArgField, RuntimeBindingKind, WeightBundleKind,
+    WeightLocator, WeightTensor,
 };
 
 /// Lower one bucket's `(backbone ++ lm_head)` instruction stream.
@@ -1863,6 +1864,255 @@ fn lower_one<W: CanonicalParams>(
                     Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineScales, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 }, binding_index: 8 },
                     Binding::Weight { kind: WeightBundleKind::LinearLayer, which: WeightTensor::AffineBiases, layer: super::ids::LayerId(*layer + layer_offset), locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 }, binding_index: 9 },
                     Binding::PersistentBarrierCounter { binding_index: 10 },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Whole-forward decode megakernel ───────────────────────────
+        //
+        // ONE Metal dispatch covers the entire decode forward pass for
+        // one token: embedding-output residual → for each layer
+        // (pre_attn → attention → o_proj → mlp_pre_down → down_proj)
+        // → final RmsNorm → lm_head → logits. The kernel reads per-layer
+        // weights through a `device const PerLayerWeights*` argument
+        // buffer (buffer 1) populated at worker init; cross-layer
+        // weights bind directly at buffers 10..13. Cross-TG ticket-lock
+        // barriers between phases use the shared barrier counter at
+        // buffer 0. Single-token decode → M=1 baked at function
+        // constant 0; per-sequence block-table fanout baked at slot 1.
+        //
+        // Slot conventions for the per-layer argument-buffer fields
+        // mirror what the Impl declares via `required_weights`:
+        //   `LinearLayer` slot 0..6  → q/k/v/o/gate/up/down (per-layer)
+        //   `LinearLayer` slot 7      → lm_head            (cross-layer)
+        //   `RmsNorm`     slot 0..1  → input_ln / postattn_ln (per-layer)
+        //   `RmsNorm`     slot 2      → model.norm          (cross-layer)
+        //   `CosSin`      slot 0      → per-layer rope tables
+        //
+        // The dispatch grid is a single 1D row of `dispatched_tgs` TGs;
+        // each TG iterates over its share of every phase's tiles via
+        // `for (tile = tg_id; tile < phase_tiles; tile += num_tgs)`
+        // and the kernel reads `__tgs_per_grid` at runtime. The grid
+        // must be ≤ `MetalTargetProfile::safe_max_concurrent_tgs(256)`
+        // or the cross-TG ticket-lock deadlocks (residency-cap hard
+        // constraint, [[project-metal-persistent-megakernel-feasibility]]).
+        I::ForwardDecodePersistent(
+            residual_slot,
+            q_scratch_slot,
+            attn_scratch_slot,
+            mlp_scratch_slot,
+            logits_out_slot,
+            num_layers,
+            group_size,
+            bits,
+            symbol,
+        ) => {
+            assert_eq!(
+                *bits, 4,
+                "metal lowering: ForwardDecodePersistent only wired for bits=4"
+            );
+            let _ = group_size;
+            // Synth pins NUM_SIMDGROUPS=8 → 256 threads/TG (paired with
+            // the BN=8 attention atom). Lift when bn_attention is
+            // BN-parameterized + MlpPreDown supports >1 pass per head.
+            let threads_per_tg: u32 = 256;
+            // Dispatched grid: clamp at the chip's safe concurrent-TG
+            // cap when the profile is available; otherwise fall back to
+            // the conservative 48 used by the synth-time documentation
+            // arg. Both choices satisfy `< safe_max_concurrent_tgs(256)`
+            // on M4-base (118 TGs) and M4-Pro (≥118 TGs).
+            let dispatched_tgs: u32 = profile
+                .map(|p| p.safe_max_concurrent_tgs(threads_per_tg))
+                .unwrap_or(48);
+            assert!(
+                dispatched_tgs > 0,
+                "metal lowering: ForwardDecodePersistent grid size resolved to 0 \
+                 (profile.safe_max_concurrent_tgs returned 0). Check chip caps."
+            );
+            // Per-layer argument-buffer fields — one entry per pointer
+            // in synthesize_forward_decode's `struct PerLayerWeights`,
+            // arg_id 0..25 mirroring the MSL `[[id(N)]]` annotations.
+            // Slot conventions match the per-arch `WeightAccessors`
+            // arm the matching Impl declares (Task #3).
+            let common_loc = WeightLocator {
+                bucket: tape_index,
+                op_idx: index as u32,
+                slot: 0,
+            };
+            let with_slot = |slot: u32| WeightLocator { slot, ..common_loc };
+            let mut per_layer_fields: Vec<PerLayerArgField> = Vec::with_capacity(26);
+            // id 0: input_layernorm
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 0,
+                kind: WeightBundleKind::RmsNorm,
+                which: WeightTensor::Weight,
+                locator: with_slot(0),
+            });
+            // ids 1..9: Q / K / V LinearLayer triples (weight, scales, biases)
+            for (proj_slot, base_id) in [(0u32, 1u8), (1, 4), (2, 7)] {
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::Weight,
+                    locator: with_slot(proj_slot),
+                });
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id + 1,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::AffineScales,
+                    locator: with_slot(proj_slot),
+                });
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id + 2,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::AffineBiases,
+                    locator: with_slot(proj_slot),
+                });
+            }
+            // id 10: cos_sin
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 10,
+                kind: WeightBundleKind::CosSin,
+                which: WeightTensor::Weight,
+                locator: with_slot(0),
+            });
+            // ids 11..12: KV cache halves (runtime, per-iter-layer)
+            per_layer_fields.push(PerLayerArgField::KvCache {
+                arg_id: 11,
+                which: KvCacheWhich::K,
+            });
+            per_layer_fields.push(PerLayerArgField::KvCache {
+                arg_id: 12,
+                which: KvCacheWhich::V,
+            });
+            // ids 13..15: o_proj LinearLayer triple
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 13,
+                kind: WeightBundleKind::LinearLayer,
+                which: WeightTensor::Weight,
+                locator: with_slot(3),
+            });
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 14,
+                kind: WeightBundleKind::LinearLayer,
+                which: WeightTensor::AffineScales,
+                locator: with_slot(3),
+            });
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 15,
+                kind: WeightBundleKind::LinearLayer,
+                which: WeightTensor::AffineBiases,
+                locator: with_slot(3),
+            });
+            // id 16: post_attention_layernorm
+            per_layer_fields.push(PerLayerArgField::Weight {
+                arg_id: 16,
+                kind: WeightBundleKind::RmsNorm,
+                which: WeightTensor::Weight,
+                locator: with_slot(1),
+            });
+            // ids 17..25: gate / up / down LinearLayer triples
+            for (proj_slot, base_id) in [(4u32, 17u8), (5, 20), (6, 23)] {
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::Weight,
+                    locator: with_slot(proj_slot),
+                });
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id + 1,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::AffineScales,
+                    locator: with_slot(proj_slot),
+                });
+                per_layer_fields.push(PerLayerArgField::Weight {
+                    arg_id: base_id + 2,
+                    kind: WeightBundleKind::LinearLayer,
+                    which: WeightTensor::AffineBiases,
+                    locator: with_slot(proj_slot),
+                });
+            }
+            debug_assert_eq!(per_layer_fields.len(), 26);
+            LoweredCommand {
+                kernel: KernelId::ForwardDecodePersistent,
+                library: *symbol,
+                function: *symbol,
+                // Function constants: M (slot 0) + MAX_BLOCKS_PER_SEQ (slot 1).
+                // `synthesize_forward_decode` declares both — bake them
+                // here rather than reach into a struct-per-kernel
+                // wrapper since this is the only call site.
+                constants: vec![
+                    ConstantValue::uint(
+                        ferrite_metal_kernels::specialized_pipeline_cache::ConstSlot(0),
+                        bucket_m,
+                    ),
+                    ConstantValue::uint(
+                        ferrite_metal_kernels::specialized_pipeline_cache::ConstSlot(1),
+                        W::MAX_BLOCKS_PER_SEQ,
+                    ),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (dispatched_tgs, 1, 1),
+                    threads_per_threadgroup: (threads_per_tg, 1, 1),
+                    // Decode is bucket_m=1 today; no m-scaling axis to
+                    // sweep. When chunked decode lands the kernel will
+                    // need an outer tile loop over the M axis AND a
+                    // per-token bucket sweep — both are kernel-side
+                    // changes, not lowering ones.
+                    m_scaling: None,
+                },
+                bindings: vec![
+                    // buffer 0: cross-TG ticket-lock barrier counter.
+                    Binding::PersistentBarrierCounter { binding_index: 0 },
+                    // buffer 1: MTLArgumentBuffer of per-layer weight + KV-cache pointers.
+                    Binding::PerLayerArgumentBuffer {
+                        binding_index: 1,
+                        num_layers: *num_layers,
+                        fields: per_layer_fields,
+                    },
+                    // buffers 2..5: tile arena slots.
+                    Binding::ArenaSlot { slot: *residual_slot,     binding_index: 2 },
+                    Binding::ArenaSlot { slot: *q_scratch_slot,    binding_index: 3 },
+                    Binding::ArenaSlot { slot: *attn_scratch_slot, binding_index: 4 },
+                    Binding::ArenaSlot { slot: *mlp_scratch_slot,  binding_index: 5 },
+                    // buffers 6..9: runtime metadata.
+                    Binding::Runtime { kind: RuntimeBindingKind::Positions,   binding_index: 6 },
+                    Binding::Runtime { kind: RuntimeBindingKind::SlotMapping, binding_index: 7 },
+                    Binding::Runtime { kind: RuntimeBindingKind::SeqUsedK,    binding_index: 8 },
+                    Binding::Runtime { kind: RuntimeBindingKind::BlockTable,  binding_index: 9 },
+                    // buffer 10: cross-layer model.norm (RmsNorm, slot 2, layer=0).
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(0),
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
+                        binding_index: 10,
+                    },
+                    // buffers 11..13: cross-layer lm_head (LinearLayer, slot 7, layer=0).
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(0),
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 7 },
+                        binding_index: 11,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer,
+                        which: WeightTensor::AffineScales,
+                        layer: super::ids::LayerId(0),
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 7 },
+                        binding_index: 12,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LinearLayer,
+                        which: WeightTensor::AffineBiases,
+                        layer: super::ids::LayerId(0),
+                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 7 },
+                        binding_index: 13,
+                    },
+                    // buffer 14: logits output slot.
+                    Binding::ArenaSlot { slot: *logits_out_slot, binding_index: 14 },
                 ],
                 gemm_dims: None,
             }

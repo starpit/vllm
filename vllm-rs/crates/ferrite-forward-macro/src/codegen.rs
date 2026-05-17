@@ -5591,6 +5591,45 @@ fn emit_synthesized_kernel_sources_override(
             t_scale,
             &consts,
         );
+    // Whole-forward megakernel — ONE Metal dispatch for the entire
+    // decode forward pass per token. Built only when the model shape
+    // satisfies the kernel's HEAD_DIM ÷ 64 constraint (rows-per-pass
+    // for the BN=8 attention atom). Emitted unconditionally at macro
+    // expansion; selected at runtime only when
+    // FERRITE_PERSISTENT_FORWARD=1 makes MetalForwardDecodePersistentImpl
+    // target_compatible. See `ferrite-fusion-synth::
+    // synthesize_forward_decode` for the kernel-side details and
+    // `project_persistent_decode_handoff` for the design history.
+    let num_layers = *model.bounds.get("num_hidden_layers").unwrap_or(&0) as u32;
+    let vocab_size = *model.bounds.get("vocab_size").unwrap_or(&0) as u32;
+    let forward_decode_consts = crate::fuse_pass::ForwardDecodeConstants {
+        chunk: consts.clone(),
+        num_layers,
+        vocab_size,
+    };
+    // M4-base + Llama/Qwen-class: 256 t/TG = 8 simdgroups × 32 lanes,
+    // pairs with the BN=8 attention atom. dispatched_tgs is a runtime
+    // grid parameter (not baked); the kernel reads __tgs_per_grid.
+    // The picker should consult MetalTargetProfile::safe_max_concurrent_tgs
+    // for the actual grid size — this synth-time arg only documents
+    // the intended choice.
+    let forward_threads_per_tg = 256u32;
+    let forward_dispatched_tgs = 48u32;
+    // The synth function asserts head_dim % 64 == 0 and vocab/num_layers
+    // are > 0. Filter inert models to skip emission rather than panic.
+    let forward_decode = (head_dim % 64 == 0
+        && vocab_size > 0 && num_layers > 0
+        && intermediate % consts.head_dim == 0)
+        .then(|| {
+            crate::fuse_pass::synthesize_forward_decode(
+                crate::fuse_pass::SynthesisBackend::Metal,
+                t_act,
+                t_scale,
+                &forward_decode_consts,
+                forward_threads_per_tg,
+                forward_dispatched_tgs,
+            )
+        });
     // AOT-compile each synth source to a `.metallib` blob at macro
     // expansion time. Same `xcrun metal -c` + `xcrun metallib`
     // pipeline used by `ferrite-metal-kernels/build.rs` for every
@@ -5628,6 +5667,11 @@ fn emit_synthesized_kernel_sources_override(
         &mlp_pre_down_persistent.symbol,
         &mlp_pre_down_persistent.source,
     );
+    // Whole-forward metallib (optional — `None` when the model shape
+    // is unsupported by the kernel; see `forward_decode` gate above).
+    let forward_decode_bytes = forward_decode.as_ref().map(|k| {
+        ::ferrite_fusion_synth::aot::aot_compile_metallib(&k.symbol, &k.source)
+    });
 
     let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
     let gu_bytes_lit  = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
@@ -5654,6 +5698,24 @@ fn emit_synthesized_kernel_sources_override(
     let md_bytes_lit = syn::LitByteStr::new(&md_bytes, proc_macro2::Span::call_site());
     let mdp_bytes_lit = syn::LitByteStr::new(&mdp_bytes, proc_macro2::Span::call_site());
 
+    // Whole-forward (optional). Either emit the (symbol, bytes) tuple
+    // in the returned list, or omit the entry when the model shape
+    // isn't supported. Done as separate token streams that splice
+    // into the array literal so the macro stays a single quote!.
+    let forward_decode_entry = match (forward_decode.as_ref(), forward_decode_bytes.as_ref()) {
+        (Some(fd), Some(bytes)) => {
+            let sym = syn::LitStr::new(&fd.symbol, proc_macro2::Span::call_site());
+            let by = syn::LitByteStr::new(bytes, proc_macro2::Span::call_site());
+            quote! {
+                {
+                    const __FORWARD_DECODE_LIB: &[u8] = #by;
+                    Some((#sym, __FORWARD_DECODE_LIB))
+                }
+            }
+        }
+        _ => quote! { None },
+    };
+
     quote! {
         fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
             const __SYNTH_PRE_ATTN_LIB: &[u8] = #pa_bytes_lit;
@@ -5663,7 +5725,13 @@ fn emit_synthesized_kernel_sources_override(
             const __SYNTH_MLP_PRE_DOWN_LIB: &[u8] = #md_bytes_lit;
             const __SYNTH_MLP_PRE_DOWN_PERSISTENT_LIB: &[u8] = #mdp_bytes_lit;
             const __SYNTH_GATE_UP_SILU_MUL_LIB: &[u8] = #gu_bytes_lit;
-            &[
+            // The whole-forward entry is built lazily so we can omit
+            // it when the model shape is unsupported. Stored on a
+            // local static once and concatenated with the always-on
+            // entries via a one-shot OnceCell would be cleaner; this
+            // simple Vec-build runs once per fn call (called once per
+            // model load), so the allocation isn't perf-critical.
+            const __ALWAYS: &[(&'static str, &'static [u8])] = &[
                 (#pa_symbol_lit, __SYNTH_PRE_ATTN_LIB),
                 (#pi_symbol_lit, __SYNTH_PRE_ATTN_INIT_LIB),
                 (#pap_symbol_lit, __SYNTH_PRE_ATTN_PERSISTENT_LIB),
@@ -5671,7 +5739,14 @@ fn emit_synthesized_kernel_sources_override(
                 (#md_symbol_lit, __SYNTH_MLP_PRE_DOWN_LIB),
                 (#mdp_symbol_lit, __SYNTH_MLP_PRE_DOWN_PERSISTENT_LIB),
                 (#gu_symbol_lit, __SYNTH_GATE_UP_SILU_MUL_LIB),
-            ]
+            ];
+            static FULL: std::sync::OnceLock<Vec<(&'static str, &'static [u8])>> =
+                std::sync::OnceLock::new();
+            FULL.get_or_init(|| {
+                let mut v: Vec<(&'static str, &'static [u8])> = __ALWAYS.to_vec();
+                if let Some(entry) = #forward_decode_entry { v.push(entry); }
+                v
+            }).as_slice()
         }
     }
 }

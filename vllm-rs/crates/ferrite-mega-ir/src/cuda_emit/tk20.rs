@@ -352,6 +352,30 @@ pub fn decl_rms_scale_local(
     (stmt, CuExpr::new(name.to_string()))
 }
 
+/// `ferrite::barrier_signal(slot_ptr, count);` — gmem cross-CTA
+/// counter bump from one thread. Provided by ferrite substrate
+/// (`crates/ferrite-kernels/csrc/tk/ferrite_barrier.cuh`). The
+/// helper does `__threadfence()` + `atomicAdd` from a single
+/// thread; we gate to laneid 0 explicitly + intra-warp sync after
+/// so other lanes converge.
+pub fn ferrite_barrier_signal(slot_ptr: &CuExpr, count: u32) -> CuStmt {
+    CuStmt::new(format!(
+        "if (kittens::laneid() == 0) {{ ferrite::barrier_signal({slot_ptr}, {count}); }}\n\
+         kittens::group<1>::sync();"
+    ))
+}
+
+/// `ferrite::barrier_wait(slot_ptr, expected);` — gmem cross-CTA
+/// volatile spin-load from one thread until the counter reaches
+/// `expected`, then `__threadfence()`. Gated to laneid 0;
+/// intra-warp sync converges other lanes.
+pub fn ferrite_barrier_wait(slot_ptr: &CuExpr, expected: u32) -> CuStmt {
+    CuStmt::new(format!(
+        "if (kittens::laneid() == 0) {{ ferrite::barrier_wait({slot_ptr}, {expected}); }}\n\
+         kittens::group<1>::sync();"
+    ))
+}
+
 /// Wrap a sequence of statements in `if (kittens::warpid() == 0) {
 /// ... }` — the canonical "warp 0 publishes" gate. Used to gate
 /// `kittens::group<1>::arrive(sem)` calls (which auto-laneid-gate

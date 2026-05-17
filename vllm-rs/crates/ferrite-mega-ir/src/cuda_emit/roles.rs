@@ -14,14 +14,15 @@
 //! 2.0 on the pod before it's "done."
 
 use crate::nodes::{
-    Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+    Add, BarrierSignal, BarrierWait, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul,
+    ScalarOffsetRmsNorm, TanhSoftCap,
 };
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr};
 use super::handles::{
-    gmem_act_ptr_raw, gmem_weight_ptr_raw, page_as_sv_bf, page_consumed_sem,
-    page_done_sem, page_ready_sem, scratch_as,
+    gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_weight_ptr_raw, page_as_sv_bf,
+    page_consumed_sem, page_done_sem, page_ready_sem, scratch_as,
 };
 use super::tk20;
 
@@ -61,8 +62,8 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
         MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
-        MegaNode::BarrierSignal(_) => RoleBodies::skipped("BarrierSignal"),
-        MegaNode::BarrierWait(_) => RoleBodies::skipped("BarrierWait"),
+        MegaNode::BarrierSignal(n) => emit_barrier_signal(n),
+        MegaNode::BarrierWait(n) => emit_barrier_wait(n),
     }
 }
 
@@ -841,6 +842,45 @@ fn emit_scalar_offset_rms_norm(
         launcher,
         consumer,
         storer,
+        skipped: None,
+    }
+}
+
+
+// ============================================================
+// BarrierSignal / BarrierWait — cross-CTA gmem barriers via
+// `ferrite::barrier_signal/wait` (`ferrite_barrier.cuh`).
+// ============================================================
+//
+// These ops insert a single line into the LOADER body — the
+// canonical placement for cross-CTA sync points (where gmem
+// reads cluster). The other 3 role bodies are empty.
+
+fn emit_barrier_signal(n: &BarrierSignal) -> RoleBodies {
+    let edge = n.edge().raw();
+    let slot_ptr = gmem_barrier_slot_ptr(edge);
+    let mut loader = CuBlock::new();
+    loader.push(tk20::ferrite_barrier_signal(&slot_ptr, 1));
+    RoleBodies {
+        loader,
+        launcher: CuBlock::new(),
+        consumer: CuBlock::new(),
+        storer: CuBlock::new(),
+        skipped: None,
+    }
+}
+
+fn emit_barrier_wait(n: &BarrierWait) -> RoleBodies {
+    let edge = n.edge().raw();
+    let expected = n.expected().raw();
+    let slot_ptr = gmem_barrier_slot_ptr(edge);
+    let mut loader = CuBlock::new();
+    loader.push(tk20::ferrite_barrier_wait(&slot_ptr, expected));
+    RoleBodies {
+        loader,
+        launcher: CuBlock::new(),
+        consumer: CuBlock::new(),
+        storer: CuBlock::new(),
         skipped: None,
     }
 }

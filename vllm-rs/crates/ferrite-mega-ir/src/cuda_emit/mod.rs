@@ -339,6 +339,46 @@ mod tests {
         }
     }
 
+    /// Sprint 7: BarrierSignal/Wait — cross-CTA gmem barriers via
+    /// `ferrite::barrier_signal/wait`.
+    #[test]
+    fn barrier_signal_emits_ferrite_call() {
+        use crate::substrate::EdgeId;
+        let mut b = BuilderD::new();
+        b.push_barrier_signal::<2>(EdgeId::<2, 4>::new());
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_bsig", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/barrier_signal_emit.cu", &cu.source).ok();
+        for needle in [
+            "ferrite::barrier_signal(&g.barrier_slots[2], 1);",
+            "kittens::group<1>::sync();",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    #[test]
+    fn barrier_wait_emits_ferrite_call() {
+        use crate::substrate::{EdgeId, ExpectedCount};
+        let mut b = BuilderD::new();
+        b.push_barrier_wait::<1, 16>(EdgeId::<1, 4>::new(), ExpectedCount::<16>::new());
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_bwait", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        std::fs::write("/tmp/barrier_wait_emit.cu", &cu.source).ok();
+        assert!(
+            cu.source
+                .contains("ferrite::barrier_wait(&g.barrier_slots[1], 16);"),
+            "got:\n{}",
+            cu.source
+        );
+    }
+
     /// Sprint 6: ScalarOffsetRmsNorm — out = (act * scale) *
     /// (weight + offset). gemma2's rms_norm_offset reformulation.
     #[test]

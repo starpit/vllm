@@ -264,3 +264,12 @@ pub fn gmem_weight_ptr_raw(
         "const_cast<__nv_bfloat16*>(g.weight_ptrs[{accessor} * {num_layers} + {layer}])"
     )))
 }
+
+/// `&g.barrier_slots[<edge>]` — raw int32 device pointer to the
+/// gmem cross-CTA barrier counter for the given edge. Used by
+/// `ferrite::barrier_signal/wait` (see `ferrite_barrier.cuh`).
+/// Returns a [`CuExpr`] since the ferrite-substrate barrier
+/// helpers take a raw `int32_t*`.
+pub fn gmem_barrier_slot_ptr(edge: u32) -> CuExpr {
+    CuExpr::new(format!("&g.barrier_slots[{edge}]"))
+}

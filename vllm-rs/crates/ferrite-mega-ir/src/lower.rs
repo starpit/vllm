@@ -420,9 +420,7 @@ impl<
         self
     }
 
-    /// Push a typed `Add` (residual fold). Now carries `HIDDEN_DIM` /
-    /// `NUM_TOKENS` / `DELTA_ACT_SLOT` / `RESIDUAL_ACT_SLOT` const
-    /// generics for the per-row load/add/store emit (§4a contract).
+    /// Push a typed `Add` (residual fold). Typed-args API.
     #[allow(clippy::too_many_arguments)]
     pub fn push_add<
         const DELTA_ID: u32,
@@ -436,6 +434,15 @@ impl<
         const RESIDUAL_ACT_SLOT: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _delta_page: crate::substrate::PageId<DELTA_ID, NUM_PAGES>,
+        _residual_page: crate::substrate::PageId<RESIDUAL_ID, NUM_PAGES>,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _delta_act_slot: crate::substrate::ActSlotConst<DELTA_ACT_SLOT, { u32::MAX }>,
+        _residual_act_slot: crate::substrate::ActSlotConst<RESIDUAL_ACT_SLOT, { u32::MAX }>,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_add");
         let _ = self.pool.take(DELTA_ID);
@@ -1420,18 +1427,31 @@ mod tests {
 
     #[test]
     fn lowers_add_minimal() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         let mut b = Builder6::new();
-        b.push_add::<0, 1, 0, 1, 0, 2048, 8, 0, 1>();
+        b.push_add(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+        );
         let tape = b.finish();
         let MegaNode::Add(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.delta_page_id(), 0);
-        assert_eq!(n.residual_page_id(), 1);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.num_tokens(), 8);
-        assert_eq!(n.delta_act_slot(), 0);
-        assert_eq!(n.residual_act_slot(), 1);
+        assert_eq!(n.delta_page().raw(), 0);
+        assert_eq!(n.residual_page().raw(), 1);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.delta_act_slot().raw(), 0);
+        assert_eq!(n.residual_act_slot().raw(), 1);
     }
 
     #[test]

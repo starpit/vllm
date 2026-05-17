@@ -766,19 +766,19 @@ impl FusedQkvRopeCache {
 /// Kernel ABI: bf16 elementwise per-row residual add — emit splices a
 /// per-row load/add/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
 pub struct Add {
-    delta_page_id: u32,
-    residual_page_id: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    delta_act_slot: u32,
-    residual_act_slot: u32,
+    delta_page: crate::substrate::PageRef,
+    residual_page: crate::substrate::PageRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    delta_act_slot: crate::substrate::ActSlotRef,
+    residual_act_slot: crate::substrate::ActSlotRef,
 }
 
 impl Add {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const DELTA_ID: u32,
         const RESIDUAL_ID: u32,
         const CONSUMER_PHASE: u32,
@@ -791,8 +791,10 @@ impl Add {
         const RESIDUAL_ACT_SLOT: u32,
     >() -> Self {
         const {
-            assert!(DELTA_ID < NUM_PAGES, "Add: DELTA_ID out of bounds");
-            assert!(RESIDUAL_ID < NUM_PAGES, "Add: RESIDUAL_ID out of bounds");
+            // Cross-field invariants — page non-alias, phase parity.
+            // Stable Rust can't enumerate sealed witnesses for these
+            // (page non-alias would need `NUM_PAGES * (NUM_PAGES-1)`
+            // impls; phase parity depends on unbounded ARRIVES).
             assert!(
                 DELTA_ID != RESIDUAL_ID,
                 "Add: DELTA_ID and RESIDUAL_ID alias"
@@ -805,43 +807,44 @@ impl Add {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "Add: STORER_PHASE parity mismatch"
             );
-            assert!(HIDDEN_DIM > 0, "Add: HIDDEN_DIM must be > 0");
-            assert!(NUM_TOKENS > 0, "Add: NUM_TOKENS must be > 0");
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         Self {
-            delta_page_id: DELTA_ID,
-            residual_page_id: RESIDUAL_ID,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            delta_act_slot: DELTA_ACT_SLOT,
-            residual_act_slot: RESIDUAL_ACT_SLOT,
+            delta_page: PageId::<DELTA_ID, NUM_PAGES>::new().erase(),
+            residual_page: PageId::<RESIDUAL_ID, NUM_PAGES>::new().erase(),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            delta_act_slot: ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase(),
+            residual_act_slot: ActSlotConst::<RESIDUAL_ACT_SLOT, { u32::MAX }>::new().erase(),
         }
     }
 
-    pub const fn delta_page_id(&self) -> u32 {
-        self.delta_page_id
+    pub const fn delta_page(&self) -> crate::substrate::PageRef {
+        self.delta_page
     }
-    pub const fn residual_page_id(&self) -> u32 {
-        self.residual_page_id
+    pub const fn residual_page(&self) -> crate::substrate::PageRef {
+        self.residual_page
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn delta_act_slot(&self) -> u32 {
+    pub const fn delta_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.delta_act_slot
     }
-    pub const fn residual_act_slot(&self) -> u32 {
+    pub const fn residual_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.residual_act_slot
     }
 }

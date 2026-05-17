@@ -15,7 +15,7 @@
 //! at the corresponding tape position so the structural shape of
 //! the emitted `.cu` is preserved.
 
-use crate::nodes::{Add, MegaNode, RmsNorm};
+use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -59,7 +59,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::FusedAddRmsNorm(_) => RoleBodies::skipped("FusedAddRmsNorm"),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
-        MegaNode::ScalarMul(_) => RoleBodies::skipped("ScalarMul"),
+        MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(_) => RoleBodies::skipped("TanhSoftCap"),
         MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
         MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
@@ -355,6 +355,118 @@ fn emit_add(n: &Add, budget: TapeBudget) -> RoleBodies {
     ));
     storer.push(super::tk::tma_store_async_wait());
     storer.push(super::tk::arrive(&residual_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// ScalarMul — in-place (or in→out) elementwise scale.
+// ============================================================
+//
+// Page lifecycle (in_page == out_page is valid — gemma2 uses it):
+//
+//   in == out:   Empty → Filled (loader TMA)
+//                      → Produced (consumer warp::store)
+//                      → Empty (storer TMA + arrive page_consumed)
+//   in != out:   in:  Empty → Filled → Empty (consumer arrive consumed)
+//                out: Empty → Produced (consumer warp::store)
+//                            → Empty (storer TMA + arrive consumed)
+//
+// Per `MEGA_IR_PLAN.md` section 4a ScalarMul row: emit splices a
+// per-row load/mul/store loop. No cross-warp reduction; each warp
+// scales its own slice independently.
+
+fn emit_scalar_mul(n: &ScalarMul, budget: TapeBudget) -> RoleBodies {
+    let in_page = n.in_page();
+    let out_page = n.out_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let scale_value = n.scale.raw();
+    let in_place = in_page.raw() == out_page.raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_scalar_mul: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let out_smem = page_as_sv_bf(out_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let out_consumed = page_consumed_sem(out_page);
+    let in_gmem = gmem_act_ptr_bf16(in_act_slot);
+    let out_gmem = gmem_act_ptr_bf16(out_act_slot);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    // Loader: TMA-load in_page from gmem.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&in_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&in_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &in_smem,
+        &in_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &in_ready,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: per-warp slice, warp::load (bf16->fp32 widen),
+    // warp::mul by the scalar, warp::store (fp32->bf16 narrow).
+    // No cross-warp barrier needed since each warp's slice is
+    // independent.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&in_ready, consumer_phase));
+    let in_slice = warp_slice_sv_bf(&in_smem, ncw, k_per_warp);
+    let out_slice_for_store = if in_place {
+        in_slice.clone()
+    } else {
+        warp_slice_sv_bf(&out_smem, ncw, k_per_warp)
+    };
+    let (decl, rv) = super::tk::decl_rv_fl("__smul_rv", k_per_warp);
+    consumer.push(decl);
+    consumer.push(super::tk::warp_load_bf16_to_f32(&rv, &in_slice));
+    let scale_lit = CuExpr::new(format!("{:e}f", scale_value));
+    consumer.push(super::tk::warp_mul_f32_scalar(&rv, &rv, &scale_lit));
+    consumer.push(super::tk::warp_store_bf16(&out_slice_for_store, &rv));
+    consumer.push(super::tk::warp_sync());
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&out_done));
+    if !in_place {
+        consumer.push(super::tk::arrive(&in_consumed));
+    }
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer: TMA-store out_page to gmem at out_act_slot.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&out_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &out_gmem,
+        &out_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&out_consumed));
     storer.push(CuStmt::new("}".to_string()));
 
     RoleBodies {

@@ -339,6 +339,62 @@ mod tests {
         }
     }
 
+    /// Sprint 3 — ScalarMul: in→out scale. Verifies the consumer
+    /// body splices `kittens::warp::mul(rv, rv, <scale>)` with the
+    /// IR's scale value and no cross-warp barrier (each warp scales
+    /// its own slice independently).
+    ///
+    /// `in_page != out_page` here only because `MegaTapeBuilder`'s
+    /// runtime [`PagePool`] doesn't currently model in-place ops
+    /// (it rejects `take(IN)` immediately followed by `take(OUT)`
+    /// when `IN == OUT`). The variant's IR const-asserts DO allow
+    /// `IN_ID == OUT_ID` (gemma2's post-attn `* hidden` uses it),
+    /// so the in-place path through `emit_scalar_mul` is exercised
+    /// by the proc-macro at user-build time when the tape gets
+    /// constructed — the unit test just covers the in→out path.
+    #[test]
+    fn lower_scalar_mul_to_cuda_smoke() {
+        let mut b = BuilderD::new();
+        b.push_scalar_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<4, 8>::new(), // in
+            PageId::<5, 8>::new(), // out (distinct)
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            0.5_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_smul", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "expected zero skipped variants, got {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            "kittens::tma::expect_bytes(ss.page_ready[4], 4096);",
+            "g.act_ptrs[2]",
+            "kittens::rv_fl<256> __smul_rv;",
+            "kittens::warp::mul(__smul_rv, __smul_rv, 5e-1f);",
+            // Consumer: page_done on out_page (5), page_consumed
+            // on in_page (4) since in != out.
+            "kittens::arrive(ss.page_done[5]);",
+            "kittens::arrive(ss.page_consumed[4]);",
+            // Storer: TMA-store out_page (5) to out_act_slot (3).
+            "kittens::tma::store_async(g.act_ptrs[3], (*reinterpret_cast<kittens::sv_bf<2048>*>(ss.pages[5]))",
+            "kittens::arrive(ss.page_consumed[5]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// A tape with only a SKIPPED variant produces a `.cu` that
     /// still has the full substrate scaffold but reports the
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.

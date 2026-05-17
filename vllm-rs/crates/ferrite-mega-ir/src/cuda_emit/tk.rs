@@ -170,6 +170,26 @@ pub fn warp_sync() -> CuStmt {
     CuStmt::new("kittens::warp::sync();".to_string())
 }
 
+/// `kittens::warp::mul(dst_rv, lhs_rv, <scalar>);` — elementwise
+/// fp32 register-vector multiply by a scalar literal expression.
+/// `dst` may alias `lhs`. Lengths match by construction.
+pub fn warp_mul_f32_scalar(
+    dst: &RegColVec<F32>,
+    lhs: &RegColVec<F32>,
+    scalar: &CuExpr,
+) -> CuStmt {
+    debug_assert_eq!(
+        dst.len(),
+        lhs.len(),
+        "warp_mul_f32_scalar: dst.len() must equal lhs.len()"
+    );
+    CuStmt::new(format!(
+        "kittens::warp::mul({dst}, {lhs}, {scalar});",
+        dst = dst.expr(),
+        lhs = lhs.expr()
+    ))
+}
+
 // ============================================================
 // ferrite::tk helpers — generalised TK primitives
 // ============================================================

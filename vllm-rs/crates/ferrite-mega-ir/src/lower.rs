@@ -184,6 +184,11 @@ impl<
     /// - `ARRIVES` const generic matches the builder's cumulative count.
     #[allow(clippy::too_many_arguments)]
     pub fn push_rms_norm<
+        // ARRIVES is the only const generic NOT carried by a typed
+        // primitive arg (it's the builder's runtime arrive count
+        // forecast). Caller turbofishes JUST `::<ARRIVES>`; the
+        // remaining const generics are inferred from arg types.
+        const ARRIVES: u32,
         const IN_ID: u32,
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
@@ -192,7 +197,6 @@ impl<
         const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
-        const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
         const IN_ACT_SLOT: u32,
@@ -202,14 +206,47 @@ impl<
         const CONSUMER_BAR_PUBLISH: u32,
     >(
         &mut self,
+        // ===== Typed primitives — each carries its substrate proof
+        // in its TYPE. EVERY const generic on this method is inferred
+        // from the arg types via Rust type inference; callers don't
+        // turbofish, they construct the typed primitives. No
+        // `/*FOO=*/` positional u32 comments — the type IS the
+        // documentation.
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _partial: crate::substrate::ScratchRegion<
+            PARTIAL_OFF,
+            PARTIAL_BYTES,
+            SCRATCH_BYTES,
+            crate::substrate::RmsNormScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        // ActSlot/WeightAccessor use sentinel `u32::MAX` upper bound
+        // until the builder's substrate budget gets `NUM_ACT_SLOTS` /
+        // `NUM_WEIGHT_ACCESSORS` const generics propagated. The
+        // typed-discipline (no bare u32) holds today; the proper
+        // bound check is the next sprint.
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX,
+            { u32::MAX },
+        >,
+        _consumer_bar_reduce: crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>,
+        _consumer_bar_publish: crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        _bar_pair: crate::substrate::BarSyncPair<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>,
         weight_path: String,
         eps: f32,
     ) -> &mut Self
     where
-        // Sealed-witness type-check propagated from `RmsNorm::new` —
-        // ill-formed bar IDs (out of range or aliased) fail the
-        // builder's own type check, before the inner `new` is ever
-        // resolved.
+        // Sealed-witness type-check — ill-formed bar IDs (range or
+        // aliased) fail at TYPE CHECK (E0277), not at any runtime
+        // assert.
         crate::substrate::BarSyncId<CONSUMER_BAR_REDUCE>:
             crate::substrate::IsValidBarSyncId,
         crate::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>:
@@ -1152,12 +1189,33 @@ mod tests {
     #[test]
     fn lowers_well_formed_rms_norm() {
         let mut b = Builder6::new();
-        // Substrate proofs: IN_ID=0, WEIGHT_ID=1, PARTIAL_OFF=0,
-        // PARTIAL_BYTES=32 (NUM_CONSUMER_WARPS*4), CONSUMER_PHASE=0
-        // (ARRIVES=0&1=0), STORER_PHASE=1, LAYER=0, NUM_LAYERS=16,
-        // ARRIVES=0. AST shape: HIDDEN_DIM=2048, NUM_TOKENS=8,
-        // IN_ACT_SLOT=0, OUT_ACT_SLOT=1, WEIGHT_ACCESSOR_IDX=0.
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
+        // Each typed-primitive arg is self-documenting via its type
+        // — no `/*FOO=*/` positional u32 comments needed. Substrate
+        // proofs are discharged at each typed primitive's
+        // construction (e.g. `PageId::<0, 6>` proves `0 < 6`;
+        // `BarSyncId<1>` proves bar.sync ID is in 1..=15;
+        // `BarSyncPair<1, 2>` proves the two bars are distinct).
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
+        b.push_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::norm".to_string(),
             1.0e-5_f32,
         );
@@ -1186,13 +1244,49 @@ mod tests {
 
     #[test]
     fn lowers_two_rms_norms_with_phase_advance() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = Builder6::new();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
+        b.push_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::n0".to_string(),
             1.0e-5_f32,
         );
         // After first op, ARRIVES = 1; CONSUMER_PHASE = 1, STORER_PHASE = 0.
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 1, 16, 1, 2048, 8, 0, 2, 1, 1, 2>(
+        // OUT_ACT_SLOT = 2 to avoid runtime PagePool aliasing on slot 1.
+        b.push_rms_norm(
+            ArrivesCount::<1>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<1>::new(),
+            MbarrierPhase::<0>::new(),
+            LayerIndex::<1, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<1, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::n1".to_string(),
             1.0e-5_f32,
         );
@@ -1512,12 +1606,32 @@ mod tests {
 
     #[test]
     fn barriers_do_not_advance_arrives() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
         // Barriers don't bump the per-CTA mbarrier count, so the
         // next op's ARRIVES const stays at 0 even after two barriers.
         let mut b = BuilderD::new();
         b.push_barrier_signal::<0>();
         b.push_barrier_wait::<0, 4>();
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
+        b.push_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::n".to_string(),
             1.0e-5_f32,
         );
@@ -1527,14 +1641,49 @@ mod tests {
 
     #[test]
     fn builder_arrives_visible_to_caller() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = Builder6::new();
         assert_eq!(b.arrives(), 0);
-        b.push_rms_norm::<0, 1, 0, 32, 0, 1, 0, 16, 0, 2048, 8, 0, 1, 0, 1, 2>(
+        b.push_rms_norm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::n".to_string(),
             1.0e-5_f32,
         );
         assert_eq!(b.arrives(), 1);
-        b.push_rms_norm::<0, 1, 0, 32, 1, 0, 0, 16, 1, 2048, 8, 0, 1, 0, 1, 2>(
+        b.push_rms_norm(
+            ArrivesCount::<1>::new(),
+            PageId::<0, 6>::new(),
+            PageId::<1, 6>::new(),
+            ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
+            MbarrierPhase::<1>::new(),
+            MbarrierPhase::<0>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            BarSyncId::<1>::new(),
+            BarSyncId::<2>::new(),
+            BarSyncPair::<1, 2>::new(),
             "W::n".to_string(),
             1.0e-5_f32,
         );

@@ -559,6 +559,28 @@ impl HiddenDimRef {
     }
 }
 
+/// Cumulative-arrive-count marker passed at each `push_*` call so
+/// the const-generic `ARRIVES` value flows via type inference instead
+/// of needing turbofish at the call site. The runtime `MegaTapeBuilder`
+/// verifies this against its actual arrive count
+/// (`verify_arrives`); the const-generic side carries the value into
+/// the typed primitive's substrate proof (e.g.
+/// `MbarrierPhase::assert_matches::<ARRIVES>`).
+pub struct ArrivesCount<const N: u32>;
+impl<const N: u32> ArrivesCount<N> {
+    pub const fn new() -> Self {
+        Self
+    }
+    pub const fn raw(self) -> u32 {
+        N
+    }
+}
+impl<const N: u32> Default for ArrivesCount<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Verified positive `NUM_TOKENS` template arg.
 pub struct NumTokensConst<const N: u32>;
 impl<const N: u32> NumTokensConst<N> {

@@ -5409,18 +5409,51 @@ fn dispatch_instruction_to_push(
             let consumer_bar_publish = lit(2u32);
             let weight_str = weight.as_str();
             let eps_lit = state.rms_norm_eps;
+            // Substrate budget literals propagate into the typed
+            // primitive args (PageId<#in_id, #num_pages_lit>, etc.).
+            let num_pages_lit = lit(state.num_pages_budget);
+            let scratch_lit = lit(state.scratch_bytes);
             state.arrives += 1;
             state.next_weight_accessor += 1;
+            // Each typed primitive carries its substrate proof in
+            // its TYPE. Rust infers all const generics on
+            // `push_rms_norm` from these arg types — no turbofish.
+            // Bare integer literals cannot reach the IR; they pass
+            // through `PageId<>::new()`, `BarSyncId<>::new()`, etc.
+            // whose constructors require sealed-witness type-check
+            // (E0277 for invalid bar IDs) or const-block asserts
+            // (E0080 for out-of-range page IDs / scratch overruns).
             Ok(quote! {
-                b.push_rms_norm::<
-                    #in_id, #weight_id,
-                    #partial_off, #partial_bytes,
-                    #consumer_phase, #storer_phase,
-                    #layer_lit, #num_layers, #arrives,
-                    #hidden_dim, #num_tokens,
-                    #in_act_slot, #out_act_slot, #weight_accessor_idx,
-                    #consumer_bar_reduce, #consumer_bar_publish,
-                >(#weight_str.to_string(), #eps_lit);
+                b.push_rms_norm(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::ScratchRegion::<
+                        #partial_off,
+                        #partial_bytes,
+                        #scratch_lit,
+                        ::ferrite_forward::mega_ir::RmsNormScope,
+                    >::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx,
+                        { u32::MAX },
+                    >::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_reduce>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncId::<#consumer_bar_publish>::new(),
+                    ::ferrite_forward::mega_ir::BarSyncPair::<
+                        #consumer_bar_reduce,
+                        #consumer_bar_publish,
+                    >::new(),
+                    #weight_str.to_string(),
+                    #eps_lit,
+                );
             })
         }
         I::Add(delta_slot, residual_slot) => {

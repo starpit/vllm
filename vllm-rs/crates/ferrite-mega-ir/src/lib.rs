@@ -47,7 +47,7 @@ pub use nodes::{
     WeightRef,
 };
 pub use substrate::{
-    ActSlotConst, ActSlotRef, AttentionScope, BarRef, BarSyncId, BarSyncPair,
+    ActSlotConst, ActSlotRef, ArrivesCount, AttentionScope, BarRef, BarSyncId, BarSyncPair,
     DistinctBarPairProof, EdgeId, Empty, ExpectedCount, Filled, GemmScope, HiddenDim, HiddenDimRef,
     IsDistinctBarPair, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId,
     IsValidHiddenDim, IsValidWarpRole, IterCount, LayerRef, MbarrierPhase, MbarrierPhaseRef,

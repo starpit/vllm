@@ -481,30 +481,30 @@ impl RmsNorm {
 /// per-variant `KernelExtras` flag set propagated to the kernel
 /// signature.
 pub struct FusedQkvRopeCache {
-    in_page_id: u32,
-    qkv_weight_page_id: u32,
-    cos_sin_page_id: u32,
-    q_out_page_id: u32,
-    k_out_page_id: u32,
-    v_out_page_id: u32,
-    q_rope_offset: u32,
-    q_rope_bytes: u32,
-    k_rope_offset: u32,
-    k_rope_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    iters: u32,
-    layer: u32,
-    hidden_dim: u32,
-    head_dim: u32,
-    num_q_heads: u32,
-    num_kv_heads: u32,
-    in_act_slot: u32,
-    q_out_act_slot: u32,
-    k_out_act_slot: u32,
-    v_out_act_slot: u32,
-    qkv_weight_accessor_idx: u32,
-    rotary_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    qkv_weight_page: crate::substrate::PageRef,
+    cos_sin_page: crate::substrate::PageRef,
+    q_out_page: crate::substrate::PageRef,
+    k_out_page: crate::substrate::PageRef,
+    v_out_page: crate::substrate::PageRef,
+    q_rope_offset: crate::substrate::ScratchOffsetRef,
+    q_rope_bytes: crate::substrate::ScratchBytesRef,
+    k_rope_offset: crate::substrate::ScratchOffsetRef,
+    k_rope_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    iters: crate::substrate::IterCountRef,
+    layer: crate::substrate::LayerRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    head_dim: crate::substrate::HeadDimRef,
+    num_q_heads: crate::substrate::NumQHeadsRef,
+    num_kv_heads: crate::substrate::NumKvHeadsRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    q_out_act_slot: crate::substrate::ActSlotRef,
+    k_out_act_slot: crate::substrate::ActSlotRef,
+    v_out_act_slot: crate::substrate::ActSlotRef,
+    qkv_weight_accessor_idx: crate::substrate::WeightAccessorRef,
+    rotary_accessor_idx: crate::substrate::WeightAccessorRef,
     pub qkv_weight: WeightRef,
     pub rotary: RotaryRef,
     pub biased: bool,
@@ -524,7 +524,7 @@ impl FusedQkvRopeCache {
     /// ROTARY_ACCESSOR_IDX — host-slot indices for `act_ptrs[]` /
     /// `weight_ptrs[]` / cos-sin gmem ptr.
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const QKV_ID: u32,
         const COS_SIN_ID: u32,
@@ -636,31 +636,50 @@ impl FusedQkvRopeCache {
                 "FusedQkvRopeCache: NUM_KV_HEADS must be > 0"
             );
         }
+        // Each typed primitive's `new()` runs its substrate proof
+        // (PageId<>: ID < NUM_PAGES; MbarrierPhase<>: P <= 1; etc.);
+        // erase to opaque refs for storage. Bare `u32` cannot reach
+        // the IR — they flow through typed primitive constructors.
+        use crate::substrate::{
+            ActSlotConst, HeadDim, HiddenDim, IterCount, MbarrierPhase, NumKvHeads, NumQHeads,
+            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
         Self {
-            in_page_id: IN_ID,
-            qkv_weight_page_id: QKV_ID,
-            cos_sin_page_id: COS_SIN_ID,
-            q_out_page_id: Q_ID,
-            k_out_page_id: K_ID,
-            v_out_page_id: V_ID,
-            q_rope_offset: Q_OFF,
-            q_rope_bytes: Q_BYTES,
-            k_rope_offset: K_OFF,
-            k_rope_bytes: K_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            iters: ITERS,
-            layer: LAYER,
-            hidden_dim: HIDDEN_DIM,
-            head_dim: HEAD_DIM,
-            num_q_heads: NUM_Q_HEADS,
-            num_kv_heads: NUM_KV_HEADS,
-            in_act_slot: IN_ACT_SLOT,
-            q_out_act_slot: Q_OUT_ACT_SLOT,
-            k_out_act_slot: K_OUT_ACT_SLOT,
-            v_out_act_slot: V_OUT_ACT_SLOT,
-            qkv_weight_accessor_idx: QKV_WEIGHT_ACCESSOR_IDX,
-            rotary_accessor_idx: ROTARY_ACCESSOR_IDX,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            qkv_weight_page: PageId::<QKV_ID, NUM_PAGES>::new().erase(),
+            cos_sin_page: PageId::<COS_SIN_ID, NUM_PAGES>::new().erase(),
+            q_out_page: PageId::<Q_ID, NUM_PAGES>::new().erase(),
+            k_out_page: PageId::<K_ID, NUM_PAGES>::new().erase(),
+            v_out_page: PageId::<V_ID, NUM_PAGES>::new().erase(),
+            // Scratch offset/bytes — within-budget proof from the
+            // const{} block above; ScratchRegion would be one
+            // typed primitive but FusedQkvRopeCache uses two
+            // disjoint scratch regions (Q rope + K rope), each its
+            // own offset + bytes. The `__new_for_erase` ctor stores
+            // the already-validated values via crate-private path.
+            q_rope_offset: ScratchOffsetRef::__new_for_erase(Q_OFF),
+            q_rope_bytes: ScratchBytesRef::__new_for_erase(Q_BYTES),
+            k_rope_offset: ScratchOffsetRef::__new_for_erase(K_OFF),
+            k_rope_bytes: ScratchBytesRef::__new_for_erase(K_BYTES),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            iters: IterCount::<ITERS>::new().erase(),
+            layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            head_dim: HeadDim::<HEAD_DIM>::new().erase(),
+            num_q_heads: NumQHeads::<NUM_Q_HEADS>::new().erase(),
+            num_kv_heads: NumKvHeads::<NUM_KV_HEADS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            q_out_act_slot: ActSlotConst::<Q_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            k_out_act_slot: ActSlotConst::<K_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            v_out_act_slot: ActSlotConst::<V_OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            qkv_weight_accessor_idx: WeightAccessorConst::<
+                QKV_WEIGHT_ACCESSOR_IDX,
+                { u32::MAX },
+            >::new()
+            .erase(),
+            rotary_accessor_idx: WeightAccessorConst::<ROTARY_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
             qkv_weight,
             rotary,
             biased,
@@ -668,76 +687,76 @@ impl FusedQkvRopeCache {
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn qkv_weight_page_id(&self) -> u32 {
-        self.qkv_weight_page_id
+    pub const fn qkv_weight_page(&self) -> crate::substrate::PageRef {
+        self.qkv_weight_page
     }
-    pub const fn cos_sin_page_id(&self) -> u32 {
-        self.cos_sin_page_id
+    pub const fn cos_sin_page(&self) -> crate::substrate::PageRef {
+        self.cos_sin_page
     }
-    pub const fn q_out_page_id(&self) -> u32 {
-        self.q_out_page_id
+    pub const fn q_out_page(&self) -> crate::substrate::PageRef {
+        self.q_out_page
     }
-    pub const fn k_out_page_id(&self) -> u32 {
-        self.k_out_page_id
+    pub const fn k_out_page(&self) -> crate::substrate::PageRef {
+        self.k_out_page
     }
-    pub const fn v_out_page_id(&self) -> u32 {
-        self.v_out_page_id
+    pub const fn v_out_page(&self) -> crate::substrate::PageRef {
+        self.v_out_page
     }
-    pub const fn q_rope_offset(&self) -> u32 {
+    pub const fn q_rope_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.q_rope_offset
     }
-    pub const fn q_rope_bytes(&self) -> u32 {
+    pub const fn q_rope_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.q_rope_bytes
     }
-    pub const fn k_rope_offset(&self) -> u32 {
+    pub const fn k_rope_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.k_rope_offset
     }
-    pub const fn k_rope_bytes(&self) -> u32 {
+    pub const fn k_rope_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.k_rope_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn iters(&self) -> u32 {
+    pub const fn iters(&self) -> crate::substrate::IterCountRef {
         self.iters
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn head_dim(&self) -> u32 {
+    pub const fn head_dim(&self) -> crate::substrate::HeadDimRef {
         self.head_dim
     }
-    pub const fn num_q_heads(&self) -> u32 {
+    pub const fn num_q_heads(&self) -> crate::substrate::NumQHeadsRef {
         self.num_q_heads
     }
-    pub const fn num_kv_heads(&self) -> u32 {
+    pub const fn num_kv_heads(&self) -> crate::substrate::NumKvHeadsRef {
         self.num_kv_heads
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn q_out_act_slot(&self) -> u32 {
+    pub const fn q_out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.q_out_act_slot
     }
-    pub const fn k_out_act_slot(&self) -> u32 {
+    pub const fn k_out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.k_out_act_slot
     }
-    pub const fn v_out_act_slot(&self) -> u32 {
+    pub const fn v_out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.v_out_act_slot
     }
-    pub const fn qkv_weight_accessor_idx(&self) -> u32 {
+    pub const fn qkv_weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.qkv_weight_accessor_idx
     }
-    pub const fn rotary_accessor_idx(&self) -> u32 {
+    pub const fn rotary_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.rotary_accessor_idx
     }
 }

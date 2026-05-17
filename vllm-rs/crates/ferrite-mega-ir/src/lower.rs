@@ -288,6 +288,12 @@ impl<
     }
 
     /// Push a typed FusedQkvRopeCache op onto the tape.
+    ///
+    /// Typed-args API: each typed primitive carries its substrate
+    /// proof in its TYPE; the const generics on this method are
+    /// inferred from the arg types via Rust type inference. No
+    /// turbofish; no `/*FOO=*/` positional u32 comments at the call
+    /// site.
     #[allow(clippy::too_many_arguments)]
     pub fn push_fused_qkv_rope_cache<
         const IN_ID: u32,
@@ -318,6 +324,45 @@ impl<
         const ROTARY_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _qkv_page: crate::substrate::PageId<QKV_ID, NUM_PAGES>,
+        _cos_sin_page: crate::substrate::PageId<COS_SIN_ID, NUM_PAGES>,
+        _q_out_page: crate::substrate::PageId<Q_ID, NUM_PAGES>,
+        _k_out_page: crate::substrate::PageId<K_ID, NUM_PAGES>,
+        _v_out_page: crate::substrate::PageId<V_ID, NUM_PAGES>,
+        _q_rope: crate::substrate::ScratchRegion<
+            Q_OFF,
+            Q_BYTES,
+            SCRATCH_BYTES,
+            crate::substrate::RopeScope,
+        >,
+        _k_rope: crate::substrate::ScratchRegion<
+            K_OFF,
+            K_BYTES,
+            SCRATCH_BYTES,
+            crate::substrate::RopeScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _head_dim: crate::substrate::HeadDim<HEAD_DIM>,
+        _num_q_heads: crate::substrate::NumQHeads<NUM_Q_HEADS>,
+        _num_kv_heads: crate::substrate::NumKvHeads<NUM_KV_HEADS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _q_out_act_slot: crate::substrate::ActSlotConst<Q_OUT_ACT_SLOT, { u32::MAX }>,
+        _k_out_act_slot: crate::substrate::ActSlotConst<K_OUT_ACT_SLOT, { u32::MAX }>,
+        _v_out_act_slot: crate::substrate::ActSlotConst<V_OUT_ACT_SLOT, { u32::MAX }>,
+        _qkv_weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            QKV_WEIGHT_ACCESSOR_IDX,
+            { u32::MAX },
+        >,
+        _rotary_accessor_idx: crate::substrate::WeightAccessorConst<
+            ROTARY_ACCESSOR_IDX,
+            { u32::MAX },
+        >,
         qkv_weight_path: String,
         rotary_path: String,
         biased: bool,
@@ -1317,14 +1362,39 @@ mod tests {
 
     #[test]
     fn lowers_fused_qkv_rope_cache() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HeadDim, HiddenDim, IterCount, MbarrierPhase,
+            NumKvHeads, NumQHeads, PageId, RopeScope, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = Builder8::new();
-        // 6 distinct page ids, q_off+q_bytes=2048, k_off=2048+k_bytes=4096,
-        // disjoint, within 8192 SCRATCH_BYTES, ITERS=4, LAYER=0,
+        // 6 distinct page ids, q_rope (0,2048) + k_rope (2048,2048) —
+        // disjoint, within 8192 SCRATCH_BYTES. ITERS=4, LAYER=0,
         // NUM_LAYERS=16, ARRIVES=0, CONSUMER_PHASE=0, STORER_PHASE=1.
-        b.push_fused_qkv_rope_cache::<
-            0, 1, 2, 3, 4, 5, 0, 2048, 2048, 2048, 0, 1, 4, 0, 16, 0,
-            2048, 64, 32, 8, 0, 1, 2, 3, 0, 1,
-        >(
+        b.push_fused_qkv_rope_cache(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            PageId::<3, 8>::new(),
+            PageId::<4, 8>::new(),
+            PageId::<5, 8>::new(),
+            ScratchRegion::<0, 2048, 8192, RopeScope>::new(),
+            ScratchRegion::<2048, 2048, 8192, RopeScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<4>::new(),
+            LayerIndex::<0, 16>::new(),
+            HiddenDim::<2048>::new(),
+            HeadDim::<64>::new(),
+            NumQHeads::<32>::new(),
+            NumKvHeads::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            WeightAccessorConst::<1, { u32::MAX }>::new(),
             "W::qkv".to_string(),
             "W::rot".to_string(),
             true,
@@ -1334,17 +1404,17 @@ mod tests {
         let MegaNode::FusedQkvRopeCache(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.in_page_id(), 0);
-        assert_eq!(n.qkv_weight_page_id(), 1);
-        assert_eq!(n.cos_sin_page_id(), 2);
-        assert_eq!(n.q_out_page_id(), 3);
-        assert_eq!(n.k_out_page_id(), 4);
-        assert_eq!(n.v_out_page_id(), 5);
-        assert_eq!(n.q_rope_offset(), 0);
-        assert_eq!(n.q_rope_bytes(), 2048);
-        assert_eq!(n.k_rope_offset(), 2048);
-        assert_eq!(n.k_rope_bytes(), 2048);
-        assert_eq!(n.iters(), 4);
+        assert_eq!(n.in_page().raw(), 0);
+        assert_eq!(n.qkv_weight_page().raw(), 1);
+        assert_eq!(n.cos_sin_page().raw(), 2);
+        assert_eq!(n.q_out_page().raw(), 3);
+        assert_eq!(n.k_out_page().raw(), 4);
+        assert_eq!(n.v_out_page().raw(), 5);
+        assert_eq!(n.q_rope_offset().raw(), 0);
+        assert_eq!(n.q_rope_bytes().raw(), 2048);
+        assert_eq!(n.k_rope_offset().raw(), 2048);
+        assert_eq!(n.k_rope_bytes().raw(), 2048);
+        assert_eq!(n.iters().raw(), 4);
         assert!(n.biased);
     }
 

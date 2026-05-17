@@ -634,6 +634,105 @@ impl ActSlotRef {
     }
 }
 
+/// Verified positive `HEAD_DIM` template arg.
+pub struct HeadDim<const D: u32>;
+impl<const D: u32> HeadDim<D> {
+    pub const fn new() -> Self {
+        const {
+            assert!(D > 0, "HeadDim: D must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> HeadDimRef {
+        HeadDimRef::__new_for_erase(D)
+    }
+}
+impl<const D: u32> Default for HeadDim<D> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HeadDimRef(u32);
+impl HeadDimRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive Q-head count.
+pub struct NumQHeads<const N: u32>;
+impl<const N: u32> NumQHeads<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "NumQHeads: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> NumQHeadsRef {
+        NumQHeadsRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for NumQHeads<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumQHeadsRef(u32);
+impl NumQHeadsRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive KV-head count.
+pub struct NumKvHeads<const N: u32>;
+impl<const N: u32> NumKvHeads<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "NumKvHeads: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> NumKvHeadsRef {
+        NumKvHeadsRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for NumKvHeads<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NumKvHeadsRef(u32);
+impl NumKvHeadsRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Opaque post-erasure of [`IterCount`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IterCountRef(u32);
+impl IterCountRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified weight-accessor index (`< NUM_WEIGHT_ACCESSORS`).
 pub struct WeightAccessorConst<const IDX: u32, const NUM_WEIGHT_ACCESSORS: u32>;
 impl<const IDX: u32, const NUM_WEIGHT_ACCESSORS: u32>
@@ -876,6 +975,12 @@ impl<const ITERS: u32> IterCount<ITERS> {
 
     pub const fn raw(self) -> u32 {
         ITERS
+    }
+
+    /// Erase to opaque [`IterCountRef`]. Validity (`ITERS > 0`)
+    /// discharged at `IterCount::new`'s `const {}` block.
+    pub const fn erase(self) -> IterCountRef {
+        IterCountRef::__new_for_erase(ITERS)
     }
 }
 

@@ -48,11 +48,12 @@ pub use nodes::{
 };
 pub use substrate::{
     ActSlotConst, ActSlotRef, ArrivesCount, AttentionScope, BarRef, BarSyncId, BarSyncPair,
-    DistinctBarPairProof, EdgeId, Empty, ExpectedCount, Filled, GemmScope, HiddenDim, HiddenDimRef,
-    IsDistinctBarPair, IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId,
-    IsValidHiddenDim, IsValidWarpRole, IterCount, LayerRef, MbarrierPhase, MbarrierPhaseRef,
-    MlpScope, NumTokensConst, NumTokensRef, Page, PageId, PagePool, PageRef, Produced,
-    ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope,
+    DistinctBarPairProof, EdgeId, Empty, ExpectedCount, Filled, GemmScope, HeadDim, HeadDimRef,
+    HiddenDim, HiddenDimRef, IsDistinctBarPair, IsLifecycleState, IsScratchScope,
+    IsScratchScopePub, IsValidBarSyncId, IsValidHiddenDim, IsValidWarpRole, IterCount,
+    IterCountRef, LayerRef, MbarrierPhase, MbarrierPhaseRef, MlpScope, NumKvHeads, NumKvHeadsRef,
+    NumQHeads, NumQHeadsRef, NumTokensConst, NumTokensRef, Page, PageId, PagePool, PageRef,
+    Produced, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope,
     ScratchBytesRef, ScratchOffsetRef, ScratchRegion, SubstrateBudget, WarpRoleTag,
     WeightAccessorConst, WeightAccessorRef,
 };

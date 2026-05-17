@@ -5398,6 +5398,15 @@ fn dispatch_instruction_to_push(
             let in_act_slot = lit(*in_slot);
             let out_act_slot = lit(*out_slot);
             let weight_accessor_idx = lit(state.next_weight_accessor);
+            // Sealed-witness-typed bar.sync IDs for the consumer's
+            // sum-of-squares reduction + slice-publish synchronization.
+            // Bars 1 and 2 are op-internal; reused across consecutive
+            // RmsNorm ops because each op ends with __syncthreads().
+            // Validity (1..=15) + distinctness (REDUCE != PUBLISH) is
+            // checked at type-check via `IsValidBarSyncId` /
+            // `IsDistinctBarPair` `where` bounds on `push_rms_norm`.
+            let consumer_bar_reduce = lit(1u32);
+            let consumer_bar_publish = lit(2u32);
             let weight_str = weight.as_str();
             let eps_lit = state.rms_norm_eps;
             state.arrives += 1;
@@ -5410,6 +5419,7 @@ fn dispatch_instruction_to_push(
                     #layer_lit, #num_layers, #arrives,
                     #hidden_dim, #num_tokens,
                     #in_act_slot, #out_act_slot, #weight_accessor_idx,
+                    #consumer_bar_reduce, #consumer_bar_publish,
                 >(#weight_str.to_string(), #eps_lit);
             })
         }

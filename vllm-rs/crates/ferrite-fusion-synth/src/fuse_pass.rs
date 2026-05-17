@@ -3079,11 +3079,95 @@ pub fn synthesize_forward_decode(
         residual_io = residual_io,
     );
 
+    // ── final: RmsNorm(residual) + lm_head ──
+    //
+    // After the layer-stack loop, __residual holds the final hidden
+    // state. Apply RmsNorm (init=true: no delta add) → __x_norm,
+    // then a HUGE tiled qmv against the lm_head weights writes
+    // VOCAB logits to __logits_out.
+    //
+    // RmsNorm runs on all TGs (small, redundant). The lm_head
+    // tile-loop covers `vocab / head_dim` tiles (~2004 for Llama-3.2-1B
+    // at HEAD_DIM=64 / VOCAB=128256). At ~96 dispatched TGs, each TG
+    // handles ~21 tiles. The cross-layer weights live in their own
+    // kernel-arg slots (NOT the PerLayerWeights table — they're
+    // dispatched once per model load, not per layer).
+    assert!(
+        consts.vocab_size > 0 && consts.vocab_size % c.head_dim == 0,
+        "lm_head phase requires vocab_size > 0 AND divisible by head_dim. \
+         vocab={}, head_dim={}",
+        consts.vocab_size, c.head_dim,
+    );
+    let final_rms_buf = "__final_rms_w";
+    let lm_wt_buf = "__lm_w"; let lm_sc_buf = "__lm_s"; let lm_bi_buf = "__lm_b";
+    let logits_buf = "__logits_out";
+
+    let final_addrms_in = vec![
+        residual_io.to_string(), residual_io.to_string(),
+        final_rms_buf.to_string(),
+    ];
+    let final_addrms_out = vec![x_norm_name.to_string()];
+    let final_addrms_ctx = AtomCtx {
+        bound_inputs: &final_addrms_in, bound_outputs: &final_addrms_out,
+        constants: &constants_slice, t_act, t_scale,
+    };
+    let final_addrms_body = addrms_init.emit_metal_body(&final_addrms_ctx)
+        .expect("AddRmsNormAtom (final) Metal emit");
+
+    let lm_head_body = format!(
+        r#"
+        // lm_head: tiled qmv against [vocab, hidden] weights, writes
+        // VOCAB logits to __logits_out. Same shape pattern as o_proj:
+        // each TG handles a share of vocab/head_dim tiles. Reads from
+        // __x_norm (already populated by the final rmsnorm).
+        const uint __lm_tiles = VOCAB_SIZE / __head_dim;
+        for (uint __head = __tg_id; __head < __lm_tiles; __head += num_tgs) {{
+            {lm_qmv_body}
+            // Write qmv_smem (HEAD_DIM floats) to logits at
+            // [tile*head_dim, (tile+1)*head_dim). Disjoint slices
+            // across TGs → no contention.
+            for (uint __lm_i = __tid; __lm_i < __head_dim; __lm_i += __threads_per_tg) {{
+                {logits}[__head * __head_dim + __lm_i] = {t_act}({qmv_smem}[__lm_i]);
+            }}
+            mk_sync();
+        }}
+"#,
+        // The lm_head qmv body is structurally identical to o_proj's
+        // qmv (reads __x_norm from TG, weight indexed by `__head` as
+        // local_head). The only difference is the input dim is
+        // __hidden (same as o_proj) and output dim is VOCAB. So we
+        // can reuse AffineQmvAtom verbatim.
+        lm_qmv_body = {
+            let qmv_lm = AffineQmvAtom {
+                group_size: c.group_size,
+                local_head_expr: "__head",
+                has_linear_bias: false,
+            };
+            let band_in = vec![
+                x_norm_name.to_string(), lm_wt_buf.to_string(),
+                lm_sc_buf.to_string(), lm_bi_buf.to_string(),
+            ];
+            let band_out = vec![qmv_smem_name.to_string()];
+            let band_ctx = AtomCtx {
+                bound_inputs: &band_in, bound_outputs: &band_out,
+                constants: &constants_slice, t_act, t_scale,
+            };
+            qmv_lm.emit_metal_body(&band_ctx).expect("AffineQmvAtom (lm_head) emit")
+        },
+        logits = logits_buf,
+        qmv_smem = qmv_smem_name,
+        t_act = t_act,
+    );
+
     let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
     let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
     let barrier_after_o_proj   = cross_tg_barrier_msl(2, "__barrier_counter");
     let barrier_after_mlp      = cross_tg_barrier_msl(3, "__barrier_counter");
     let barrier_after_down     = cross_tg_barrier_msl(4, "__barrier_counter");
+    // Cross-TG barrier BEFORE final rmsnorm: every TG must see all
+    // layer-loop residual writes before the rmsnorm reduction reads
+    // __residual.
+    let barrier_before_final   = cross_tg_barrier_msl(5, "__barrier_counter");
 
     let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
@@ -3145,6 +3229,7 @@ constant constexpr uint  HEAD_DIM     = {head_dim_lit}u;
 constant constexpr uint  ROT_DIM      = {rot_dim_lit}u;
 constant constexpr uint  BLOCK_SIZE   = {block_size_lit}u;
 constant constexpr uint  INTERMEDIATE = {intermediate_lit}u;
+constant constexpr uint  VOCAB_SIZE   = {vocab_size_lit}u;
 constant constexpr uint  NUM_LAYERS   = {num_layers_lit}u;
 constant constexpr float EPS        = {eps_lit}f;
 constant constexpr float ATTN_SCALE_BAKED = {attn_scale_lit}f;
@@ -3169,6 +3254,14 @@ void {symbol}(
     device const uint*            {slot_map_buf}   [[buffer(7)]],
     device const uint*            {seq_used_k} [[buffer(8)]],
     device const uint*            {block_table} [[buffer(9)]],
+    // Cross-layer (model-global) weights for final rmsnorm + lm_head.
+    // Bound once at model load — NOT in the per-layer table since
+    // there's only one of each.
+    device const {t_scale}*       {final_rms_buf}  [[buffer(10)]],
+    device const uint32_t*        {lm_wt_buf}    [[buffer(11)]],
+    device const {t_scale}*       {lm_sc_buf}    [[buffer(12)]],
+    device const {t_scale}*       {lm_bi_buf}    [[buffer(13)]],
+    device       {t_act}*         {logits_buf}   [[buffer(14)]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tgs_per_grid [[threadgroups_per_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
@@ -3273,15 +3366,16 @@ void {symbol}(
         {barrier_after_down}
     }}
 
-    // ── final: rmsnorm + lm_head (TODO) ──
+    // ── final phase: RmsNorm(residual) + lm_head ──
+    // Barrier before to flush the last layer's down_proj residual
+    // writes; otherwise RmsNorm's reduction reads stale residual.
+    {barrier_before_final}
+    {final_addrms_body}
+    {lm_head_body}
 
-    // Silence unused-variable warnings until follow-on phases consume
-    // these. The whole-forward kernel signature is fixed even when
-    // intermediate phases are stubs.
-    (void)__hidden; (void)__half_dim; (void)__block_sz;
-    (void)__threads_per_tg; (void)__num_simdgroups; (void)__eps;
-    (void)__tid; (void)__simd_gid; (void)__simd_lid;
-    (void)__scratch;
+    // Suppress unused-var warnings for the few kernel-scope decls
+    // not yet consumed at every code path.
+    (void)__half_dim; (void)__block_sz;
 }}
 "#,
         symbol = symbol, t_act = t_act, t_scale = t_scale,
@@ -3303,11 +3397,18 @@ void {symbol}(
         barrier_after_o_proj = barrier_after_o_proj,
         barrier_after_mlp = barrier_after_mlp,
         barrier_after_down = barrier_after_down,
+        barrier_before_final = barrier_before_final,
         attn_body = attn_body,
         o_proj_body = o_proj_body,
         mlp_body = mlp_body,
         down_proj_body = down_proj_body,
+        final_addrms_body = final_addrms_body,
+        lm_head_body = lm_head_body,
         down_wt_buf = down_wt_buf, down_sc_buf = down_sc_buf, down_bi_buf = down_bi_buf,
+        final_rms_buf = final_rms_buf,
+        lm_wt_buf = lm_wt_buf, lm_sc_buf = lm_sc_buf, lm_bi_buf = lm_bi_buf,
+        logits_buf = logits_buf,
+        vocab_size_lit = consts.vocab_size,
         o_wt_buf = o_wt_buf, o_sc_buf = o_sc_buf, o_bi_buf = o_bi_buf,
         postattn_rms_buf = postattn_rms_buf,
         gate_wt_buf = gate_wt_buf, gate_sc_buf = gate_sc_buf, gate_bi_buf = gate_bi_buf,
@@ -3611,6 +3712,7 @@ mod tests {
         assert!(kernel.source.contains("phase 2: o_proj"));
         assert!(kernel.source.contains("phase 3: mlp_pre_down"));
         assert!(kernel.source.contains("phase 4: down_proj"));
+        assert!(kernel.source.contains("final phase: RmsNorm(residual) + lm_head"));
         assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));   // AddRmsNorm atom
         assert!(kernel.source.contains("mk_qdot"));                // AffineQmv atom
         assert!(kernel.source.contains("mk_rope_pair"));           // RopeAppend atom
@@ -3630,15 +3732,21 @@ mod tests {
         assert!(kernel.source.contains("__down_tiles = __hidden / __head_dim"));
         assert!(kernel.source.contains("down_weight       [[id(23)]]"));
         assert!(kernel.source.contains("__dp_x_in = __mlp_scratch"));
+        // lm_head-specific: tiled qmv over vocab/head_dim, writes
+        // logits, vocab baked as constexpr. Bound at buffer 14.
+        assert!(kernel.source.contains("__lm_tiles = VOCAB_SIZE / __head_dim"));
+        assert!(kernel.source.contains("VOCAB_SIZE   = 128256u"));
+        assert!(kernel.source.contains("__logits_out   [[buffer(14)]]"));
 
-        // Five cross-TG barriers (after pre_attn, attention, o_proj,
-        // mlp_pre_down, down_proj). Phase lm_head is final, with the
-        // closing rmsnorm — lands next.
+        // Six cross-TG barriers (after pre_attn, attention, o_proj,
+        // mlp_pre_down, down_proj, before final rmsnorm). Whole-forward
+        // is now structurally complete (no TODO phases left).
         assert!(kernel.source.contains("cross-TG barrier (phase 0)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 1)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 2)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 3)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 4)"));
+        assert!(kernel.source.contains("cross-TG barrier (phase 5)"));
 
         // Each phase wraps its work in a tile-loop sharded across TGs.
         // Pre-attn iterates over `num_heads_total`, attention over

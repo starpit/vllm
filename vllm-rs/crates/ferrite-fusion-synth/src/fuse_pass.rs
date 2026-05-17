@@ -2406,18 +2406,52 @@ pub fn pre_attn_kernel_scope_prologue(
 /// the trailing `threadgroup_barrier(mem_flags::mem_device)` is
 /// what provides the actual cross-phase visibility ordering.
 fn cross_tg_barrier_msl(phase_idx: usize, counter_name: &str) -> String {
-    // Apple Metal only supports memory_order_relaxed atomics, so we
-    // rely on `threadgroup_barrier(mem_flags::mem_device)` for cross-
-    // phase visibility instead of atomic ordering. The PRE-barrier
-    // flushes this TG's phase-N writes to L2 before signalling
-    // arrival; the POST-barrier ensures phase-(N+1) reads happen
-    // after all TGs have signalled.
-    //
-    // Without the pre-barrier the atomic increment can be observed
-    // by another TG before that TG's phase-N device writes are
-    // visible, and downstream reads of those writes return stale
-    // (often zero) data — verified by the
-    // `synth_persistent_e2e_test` end-to-end check.
+    // Convenience wrapper for the straight-line (non-looped) case
+    // used by `synthesize_pre_attn_attn_chunk_persistent` etc. — the
+    // target multiplier is just `phase_idx + 1` since the kernel
+    // body runs each phase exactly once.
+    cross_tg_barrier_msl_with_target(
+        phase_idx,
+        &format!("{}u", phase_idx + 1),
+        counter_name,
+    )
+}
+
+/// Like `cross_tg_barrier_msl` but takes the `num_tgs` multiplier as
+/// an MSL expression instead of baking in `phase_idx + 1u`. Required
+/// for any caller that puts the same barrier site inside a runtime
+/// loop — `__barrier_counter` accumulates across loop iterations, so
+/// the target must accumulate too.
+///
+/// Example: a layer loop running 5 phases per layer with 16 layers
+/// emits the phase-0 barrier 16 times. The first call needs target
+/// `1`, the second `6`, the third `11`, … the sixteenth `76`. Pass
+/// `target_mult_expr = "__layer * 5u + 1u"` so MSL evaluates the
+/// correct cumulative target at each loop iteration.
+///
+/// `synthesize_pre_attn_attn_chunk_persistent` keeps using the wrapper
+/// above (compile-time constant target — straight-line body, no loop).
+/// `synthesize_forward_decode` uses THIS function so its in-loop
+/// barriers actually synchronize across all iterations (without it,
+/// every barrier from layer 1 onward exits the spin immediately
+/// because the counter has already overshot the constant target —
+/// the K/V-writeback race that produced deterministic "Tags Tags
+/// Tags…" decode output, fixed in this commit chain).
+///
+/// Apple Metal only supports `memory_order_relaxed` atomics, so we
+/// rely on `threadgroup_barrier(mem_flags::mem_device)` for cross-
+/// phase visibility instead of atomic ordering. The PRE-barrier
+/// flushes this TG's phase-N writes to L2 before signalling
+/// arrival; the POST-barrier ensures phase-(N+1) reads happen after
+/// all TGs have signalled. Without the pre-barrier the atomic
+/// increment can be observed by another TG before that TG's phase-N
+/// device writes are visible, and downstream reads return stale
+/// data.
+fn cross_tg_barrier_msl_with_target(
+    phase_idx: usize,
+    target_mult_expr: &str,
+    counter_name: &str,
+) -> String {
     format!(
         r#"
     // ── cross-TG barrier (phase {phase_idx}) ──
@@ -2426,7 +2460,7 @@ fn cross_tg_barrier_msl(phase_idx: usize, counter_name: &str) -> String {
     threadgroup_barrier(mem_flags::mem_device);
     if (tid == 0u) {{
         atomic_fetch_add_explicit({counter_name}, 1u, memory_order_relaxed);
-        uint __target = num_tgs * {target}u;
+        uint __target = num_tgs * ({target_mult_expr});
         while (atomic_load_explicit({counter_name}, memory_order_relaxed) < __target) {{
             // spin
         }}
@@ -2438,7 +2472,7 @@ fn cross_tg_barrier_msl(phase_idx: usize, counter_name: &str) -> String {
         phase_idx = phase_idx,
         next_phase = phase_idx + 1,
         counter_name = counter_name,
-        target = phase_idx + 1,
+        target_mult_expr = target_mult_expr,
     )
 }
 
@@ -3178,15 +3212,40 @@ pub fn synthesize_forward_decode(
         t_act = t_act,
     );
 
-    let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
-    let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
-    let barrier_after_o_proj   = cross_tg_barrier_msl(2, "__barrier_counter");
-    let barrier_after_mlp      = cross_tg_barrier_msl(3, "__barrier_counter");
-    let barrier_after_down     = cross_tg_barrier_msl(4, "__barrier_counter");
+    // In-loop barriers MUST use cumulative target multipliers — the
+    // shared `__barrier_counter` accumulates across all
+    // NUM_LAYERS × PHASES_PER_LAYER iterations, so a constant target
+    // of "phase_idx + 1" would only synchronize on the FIRST layer's
+    // pass and silently exit every subsequent iteration. See
+    // `cross_tg_barrier_msl_with_target` for the gory details.
+    //
+    // PHASES_PER_LAYER = 5 (pre_attn, attn, o_proj, mlp_pre_down,
+    // down_proj). MSL expression `__layer * 5u + N + 1u` gives the
+    // running per-iteration target for the N-th in-loop barrier.
+    let barrier_after_pre_attn = cross_tg_barrier_msl_with_target(
+        0, "__layer * 5u + 1u", "__barrier_counter",
+    );
+    let barrier_after_attn = cross_tg_barrier_msl_with_target(
+        1, "__layer * 5u + 2u", "__barrier_counter",
+    );
+    let barrier_after_o_proj = cross_tg_barrier_msl_with_target(
+        2, "__layer * 5u + 3u", "__barrier_counter",
+    );
+    let barrier_after_mlp = cross_tg_barrier_msl_with_target(
+        3, "__layer * 5u + 4u", "__barrier_counter",
+    );
+    let barrier_after_down = cross_tg_barrier_msl_with_target(
+        4, "__layer * 5u + 5u", "__barrier_counter",
+    );
     // Cross-TG barrier BEFORE final rmsnorm: every TG must see all
     // layer-loop residual writes before the rmsnorm reduction reads
-    // __residual.
-    let barrier_before_final   = cross_tg_barrier_msl(5, "__barrier_counter");
+    // __residual. This barrier runs ONCE after the layer loop
+    // completes, so the cumulative target is `NUM_LAYERS * 5 + 1`.
+    let barrier_before_final = cross_tg_barrier_msl_with_target(
+        5,
+        "NUM_LAYERS * 5u + 1u",
+        "__barrier_counter",
+    );
 
     let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
@@ -3537,10 +3596,13 @@ mod tests {
         assert!(kernel.source.matches("phase_c").count() >= 2);
         // Three cross-TG barriers (one after each phase).
         assert_eq!(kernel.source.matches("cross-TG barrier (phase ").count(), 3);
-        // Counter targets are strictly increasing (1, 2, 3).
-        assert!(kernel.source.contains("num_tgs * 1u"));
-        assert!(kernel.source.contains("num_tgs * 2u"));
-        assert!(kernel.source.contains("num_tgs * 3u"));
+        // Counter targets are strictly increasing (1, 2, 3). The
+        // helper now wraps the multiplier in parens to allow MSL
+        // expressions for the in-loop variant; straight-line callers
+        // still produce a literal.
+        assert!(kernel.source.contains("num_tgs * (1u)"));
+        assert!(kernel.source.contains("num_tgs * (2u)"));
+        assert!(kernel.source.contains("num_tgs * (3u)"));
         // Atomic spin pattern is intact.
         assert!(kernel.source.contains("atomic_fetch_add_explicit"));
         assert!(kernel.source.contains("memory_order_relaxed"));
@@ -3844,9 +3906,9 @@ mod tests {
         assert!(kernel.source.contains("cross-TG barrier: pre-attn"));
 
         // Cross-TG ticket-lock barrier scaffolding (phase index 0,
-        // target = num_tgs * 1u).
+        // target = num_tgs * (1u)).
         assert!(kernel.source.contains("atomic_fetch_add_explicit"));
-        assert!(kernel.source.contains("num_tgs * 1u"));
+        assert!(kernel.source.contains("num_tgs * (1u)"));
         assert!(kernel.source.contains("threadgroup_barrier(mem_flags::mem_device)"));
 
         // Buffer signature: pre-attn 0..17, attention bindings 18..20,

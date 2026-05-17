@@ -236,27 +236,33 @@ pub enum AttentionKind {
 /// - `out_act_slot` — `act_ptrs[out_act_slot]` (storer output row).
 /// - `weight_accessor_idx` — `weight_ptrs[idx * NUM_LAYERS + layer]`.
 pub struct RmsNorm {
-    in_page_id: u32,
-    weight_page_id: u32,
-    partial_offset: u32,
-    partial_bytes: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    layer: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    in_act_slot: u32,
-    out_act_slot: u32,
-    weight_accessor_idx: u32,
+    in_page: crate::substrate::PageRef,
+    weight_page: crate::substrate::PageRef,
+    partial_offset: crate::substrate::ScratchOffsetRef,
+    partial_bytes: crate::substrate::ScratchBytesRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    layer: crate::substrate::LayerRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    out_act_slot: crate::substrate::ActSlotRef,
+    weight_accessor_idx: crate::substrate::WeightAccessorRef,
     /// Cross-warp `bar.sync` ID for the consumer's sum-of-squares
     /// reduction. PTX `bar.sync` IDs are `[0, 16)`; bar 0 is
-    /// reserved for `__syncthreads`. Must be distinct from
-    /// `consumer_bar_publish` so the two barriers don't alias.
-    consumer_bar_reduce: u32,
+    /// reserved for `__syncthreads`. Constructed only via
+    /// `BarSyncId<ID>::erase()` — sealed-witness type-check
+    /// guarantees ID ∈ 1..=15.
+    consumer_bar_reduce: crate::substrate::BarRef,
     /// Cross-warp `bar.sync` ID for the consumer's "all warps wrote
     /// their output slice" publish before warp 0 arrives on the
     /// page_done semaphore.
-    consumer_bar_publish: u32,
+    consumer_bar_publish: crate::substrate::BarRef,
+    /// Witness that `consumer_bar_reduce != consumer_bar_publish`,
+    /// constructed only via `BarSyncPair<A, B>::erase()` (sealed
+    /// for distinct ordered pairs in 1..=15). Storage-erased: a
+    /// zero-sized token whose existence is the proof.
+    bar_pair_proof: crate::substrate::DistinctBarPairProof,
     eps: FiniteF32,
     pub weight: WeightRef,
 }
@@ -337,78 +343,127 @@ impl RmsNorm {
             // distinctness are enforced by the sealed-witness `where`
             // bounds above — no asserts here.
         }
+        // Construct each typed primitive (each runs its substrate
+        // proof — e.g. `PageId::new` asserts ID < NUM_PAGES;
+        // `BarSyncId::new` requires `IsValidBarSyncId`), then erase
+        // to the opaque post-erasure refs stored on the variant.
+        // Bare integer literals cannot reach the storage — they
+        // travel through `PageId<>` / `BarSyncId<>` / etc., the
+        // typed primitives' constructors validate them.
+        use crate::substrate::{
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
+        };
+        let in_page = PageId::<IN_ID, NUM_PAGES>::new().erase();
+        let weight_page = PageId::<WEIGHT_ID, NUM_PAGES>::new().erase();
+        // Scratch offset/bytes — within-budget proof from the
+        // `const {}` block above; the typed `ScratchRegion` would be
+        // overkill for a bare offset/bytes pair, so we use the
+        // `__new_for_erase` ctor directly with the already-validated
+        // values.
+        let partial_offset = ScratchOffsetRef::__new_for_erase(PARTIAL_OFF);
+        let partial_bytes = ScratchBytesRef::__new_for_erase(PARTIAL_BYTES);
+        let consumer_phase = MbarrierPhase::<CONSUMER_PHASE>::new().erase();
+        let storer_phase = MbarrierPhase::<STORER_PHASE>::new().erase();
+        let layer = LayerIndex::<LAYER, NUM_LAYERS>::new().erase();
+        let hidden_dim = HiddenDim::<HIDDEN_DIM>::new().erase();
+        let num_tokens = NumTokensConst::<NUM_TOKENS>::new().erase();
+        // Activation slots / weight accessor: range checks against
+        // a substrate-budget bound that the caller propagates via
+        // these const generics. For now we use `IN_ACT_SLOT < u32::MAX`
+        // which is trivially true; the real bound flows from the
+        // `MegaTapeBuilder` via `NUM_ACT_SLOTS` once that const
+        // generic is added (next sprint). Today, ActSlotConst pins
+        // ID < NUM_ACT_SLOTS = u32::MAX (no real check); this
+        // placeholder retains the typed-ref discipline so storage
+        // and getters are typed even before NUM_ACT_SLOTS lands.
+        let in_act_slot = ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase();
+        let out_act_slot = ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase();
+        let weight_accessor_idx =
+            WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new().erase();
+        let consumer_bar_reduce = BarSyncId::<CONSUMER_BAR_REDUCE>::new().erase();
+        let consumer_bar_publish = BarSyncId::<CONSUMER_BAR_PUBLISH>::new().erase();
+        let bar_pair_proof =
+            BarSyncPair::<CONSUMER_BAR_REDUCE, CONSUMER_BAR_PUBLISH>::new().erase();
         Self {
-            in_page_id: IN_ID,
-            weight_page_id: WEIGHT_ID,
-            partial_offset: PARTIAL_OFF,
-            partial_bytes: PARTIAL_BYTES,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            layer: LAYER,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
-            out_act_slot: OUT_ACT_SLOT,
-            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
-            consumer_bar_reduce: CONSUMER_BAR_REDUCE,
-            consumer_bar_publish: CONSUMER_BAR_PUBLISH,
+            in_page,
+            weight_page,
+            partial_offset,
+            partial_bytes,
+            consumer_phase,
+            storer_phase,
+            layer,
+            hidden_dim,
+            num_tokens,
+            in_act_slot,
+            out_act_slot,
+            weight_accessor_idx,
+            consumer_bar_reduce,
+            consumer_bar_publish,
+            bar_pair_proof,
             eps,
             weight,
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn weight_page_id(&self) -> u32 {
-        self.weight_page_id
+    pub const fn weight_page(&self) -> crate::substrate::PageRef {
+        self.weight_page
     }
-    pub const fn partial_offset(&self) -> u32 {
+    pub const fn partial_offset(&self) -> crate::substrate::ScratchOffsetRef {
         self.partial_offset
     }
-    pub const fn partial_bytes(&self) -> u32 {
+    pub const fn partial_bytes(&self) -> crate::substrate::ScratchBytesRef {
         self.partial_bytes
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn layer(&self) -> u32 {
+    pub const fn layer(&self) -> crate::substrate::LayerRef {
         self.layer
     }
     /// Kernel `<Config, HIDDEN_DIM, NUM_TOKENS>` template arg.
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
     /// Kernel `<Config, HIDDEN_DIM, NUM_TOKENS>` template arg.
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
     /// `act_ptrs[in_act_slot]` — kernel input row gmem ptr.
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
     /// `act_ptrs[out_act_slot]` — kernel output row gmem ptr (storer).
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
     /// `weight_ptrs[weight_accessor_idx * NUM_LAYERS + layer]` —
     /// flat-table index for the per-layer rms weight.
-    pub const fn weight_accessor_idx(&self) -> u32 {
+    pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
     }
     /// `bar.sync` ID for the consumer's sum-of-squares reduction.
-    /// Validated `(0, 16)` and distinct from `consumer_bar_publish`
-    /// at monomorphization time.
-    pub const fn consumer_bar_reduce(&self) -> u32 {
+    /// Validity (1..=15) was discharged by sealed-witness type-check
+    /// at construction. `BarRef` cannot be constructed from raw `u32`
+    /// outside this crate.
+    pub const fn consumer_bar_reduce(&self) -> crate::substrate::BarRef {
         self.consumer_bar_reduce
     }
     /// `bar.sync` ID for the consumer's "all warps wrote their
     /// output slice" publish before warp 0 arrives on page_done.
-    pub const fn consumer_bar_publish(&self) -> u32 {
+    pub const fn consumer_bar_publish(&self) -> crate::substrate::BarRef {
         self.consumer_bar_publish
+    }
+    /// Witness that `consumer_bar_reduce != consumer_bar_publish`.
+    /// Existence of the value IS the proof.
+    pub const fn bar_pair_proof(&self) -> crate::substrate::DistinctBarPairProof {
+        self.bar_pair_proof
     }
     /// Kernel `consumer(..., float eps)` runtime arg.
     pub fn eps(&self) -> FiniteF32 {

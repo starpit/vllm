@@ -1166,18 +1166,20 @@ mod tests {
         let MegaNode::RmsNorm(n) = &tape.nodes()[0] else {
             panic!("expected RmsNorm");
         };
-        assert_eq!(n.in_page_id(), 0);
-        assert_eq!(n.weight_page_id(), 1);
-        assert_eq!(n.partial_offset(), 0);
-        assert_eq!(n.partial_bytes(), 32);
-        assert_eq!(n.consumer_phase(), 0);
-        assert_eq!(n.storer_phase(), 1);
-        assert_eq!(n.layer(), 0);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.num_tokens(), 8);
-        assert_eq!(n.in_act_slot(), 0);
-        assert_eq!(n.out_act_slot(), 1);
-        assert_eq!(n.weight_accessor_idx(), 0);
+        assert_eq!(n.in_page().raw(), 0);
+        assert_eq!(n.weight_page().raw(), 1);
+        assert_eq!(n.partial_offset().raw(), 0);
+        assert_eq!(n.partial_bytes().raw(), 32);
+        assert_eq!(n.consumer_phase().raw(), 0);
+        assert_eq!(n.storer_phase().raw(), 1);
+        assert_eq!(n.layer().raw(), 0);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.in_act_slot().raw(), 0);
+        assert_eq!(n.out_act_slot().raw(), 1);
+        assert_eq!(n.weight_accessor_idx().raw(), 0);
+        assert_eq!(n.consumer_bar_reduce().raw(), 1);
+        assert_eq!(n.consumer_bar_publish().raw(), 2);
         assert!((n.eps().raw() - 1.0e-5_f32).abs() < 1e-9);
         assert_eq!(n.weight.path(), "W::norm");
     }
@@ -1201,10 +1203,10 @@ mod tests {
         let MegaNode::RmsNorm(n1) = &tape.nodes()[1] else {
             panic!();
         };
-        assert_eq!(n0.consumer_phase(), 0);
-        assert_eq!(n0.storer_phase(), 1);
-        assert_eq!(n1.consumer_phase(), 1);
-        assert_eq!(n1.storer_phase(), 0);
+        assert_eq!(n0.consumer_phase().raw(), 0);
+        assert_eq!(n0.storer_phase().raw(), 1);
+        assert_eq!(n1.consumer_phase().raw(), 1);
+        assert_eq!(n1.storer_phase().raw(), 0);
     }
 
     #[test]

@@ -312,6 +312,14 @@ pub struct DispatchTimingState {
     dispatch_shape: std::cell::RefCell<Vec<(u32, u32, u32)>>,
     /// Total recorded dispatches (set on the closing timestamp).
     dispatch_count: std::cell::Cell<usize>,
+    /// Nanoseconds per GPU timestamp tick — calibrated once at
+    /// construction via two `sampleTimestamps:gpuTimestamp:` calls
+    /// separated by a wall-clock interval. `resolve_and_print`
+    /// multiplies raw counter-heap deltas by this to report real ns.
+    /// Apple Silicon GPU timestamps tick at a device-specific rate
+    /// (NOT 1 GHz), so treating the raw delta as ns gives results
+    /// that are off by a constant factor (~24–40× on M-series).
+    ns_per_gpu_tick: f64,
 }
 
 impl DispatchTimingState {
@@ -321,6 +329,38 @@ impl DispatchTimingState {
         desc.setType(MTL4CounterHeapType::Timestamp);
         unsafe { desc.setCount(count); }
         let heap = unsafe { device.newCounterHeapWithDescriptor_error(&desc).ok()? };
+
+        // Calibrate GPU-tick → ns. `sampleTimestamps:gpuTimestamp:`
+        // writes a synchronized pair: CPU timestamp in
+        // mach_absolute_time ticks (= nanoseconds on Apple Silicon —
+        // mach_timebase numer/denom is 1/1) and GPU timestamp in
+        // GPU ticks. Two samples bracketed by a 10 ms sleep give
+        // ns_per_gpu_tick = Δcpu_ns / Δgpu_ticks.
+        let ns_per_gpu_tick = unsafe {
+            use std::ptr::NonNull;
+            let mut cpu1: u64 = 0;
+            let mut gpu1: u64 = 0;
+            device.sampleTimestamps_gpuTimestamp(
+                NonNull::new_unchecked(&mut cpu1 as *mut u64),
+                NonNull::new_unchecked(&mut gpu1 as *mut u64),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let mut cpu2: u64 = 0;
+            let mut gpu2: u64 = 0;
+            device.sampleTimestamps_gpuTimestamp(
+                NonNull::new_unchecked(&mut cpu2 as *mut u64),
+                NonNull::new_unchecked(&mut gpu2 as *mut u64),
+            );
+            let cpu_dt = cpu2.wrapping_sub(cpu1) as f64;
+            let gpu_dt = gpu2.wrapping_sub(gpu1) as f64;
+            if gpu_dt > 0.0 { cpu_dt / gpu_dt } else { 1.0 }
+        };
+        eprintln!(
+            "[dispatch-timing] GPU tick calibration: 1 GPU tick = {:.4} ns ({:.2} MHz)",
+            ns_per_gpu_tick,
+            1e3 / ns_per_gpu_tick,
+        );
+
         Some(Self {
             heap,
             heap_capacity: count,
@@ -330,6 +370,7 @@ impl DispatchTimingState {
             ),
             dispatch_shape: std::cell::RefCell::new(vec![(0u32, 0u32, 0u32); count]),
             dispatch_count: std::cell::Cell::new(0),
+            ns_per_gpu_tick,
         })
     }
 
@@ -384,12 +425,12 @@ impl DispatchTimingState {
         // totals + counts WITH human-readable labels.
         let mut by_pipe: std::collections::HashMap<usize, (u64, u32, super::lowered::KernelId)> =
             std::collections::HashMap::new();
-        let mut total_ns: u64 = 0;
+        let mut total_ticks: u64 = 0;
         let labels = self.pipeline_ptr.borrow();
         let kernels = self.pipeline_kernel.borrow();
         for i in 0..n {
             let dt = bytes[i + 1].wrapping_sub(bytes[i]);
-            total_ns = total_ns.wrapping_add(dt);
+            total_ticks = total_ticks.wrapping_add(dt);
             let pid = labels[i];
             let kid = kernels[i];
             let entry = by_pipe.entry(pid).or_insert((0, 0, kid));
@@ -401,15 +442,18 @@ impl DispatchTimingState {
             .map(|(p, (sum, cnt, kid))| (p, sum, cnt, kid))
             .collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let tick_ns = self.ns_per_gpu_tick;
+        let total_ns_f = total_ticks as f64 * tick_ns;
         eprintln!(
             "    total GPU time (sum of dispatch deltas): {:>9.2} ms",
-            total_ns as f64 / 1e6
+            total_ns_f / 1e6
         );
         eprintln!("    per-pipeline breakdown:");
         for (pid, sum, cnt, kid) in &sorted {
-            let avg_us = (*sum as f64) / 1e3 / (*cnt as f64);
-            let total_ms = (*sum as f64) / 1e6;
-            let pct = (*sum as f64) / (total_ns as f64) * 100.0;
+            let sum_ns = *sum as f64 * tick_ns;
+            let avg_us = sum_ns / 1e3 / (*cnt as f64);
+            let total_ms = sum_ns / 1e6;
+            let pct = sum_ns / total_ns_f * 100.0;
             eprintln!(
                 "      {:?}  pipe=0x{:016x}  count={:>3}  total={:>9.2} ms ({:>5.1}%)  avg/call={:>9.2} µs",
                 kid, pid, cnt, total_ms, pct, avg_us
@@ -423,7 +467,8 @@ impl DispatchTimingState {
             let dispatch_shapes = self.dispatch_shape.borrow();
             eprintln!("    per-dispatch (in encoder order):");
             for i in 0..n {
-                let dt = bytes[i + 1].wrapping_sub(bytes[i]);
+                let dt_ticks = bytes[i + 1].wrapping_sub(bytes[i]);
+                let dt_us = dt_ticks as f64 * tick_ns / 1e3;
                 let pid = labels[i];
                 let kid = kernels[i];
                 let (tgx, tgy, tgz) = dispatch_shapes[i];
@@ -431,7 +476,7 @@ impl DispatchTimingState {
                 let switch = if i > 0 && pid != prev_pid { "*SW*" } else { "    " };
                 eprintln!(
                     "      [{:>3}] {} {:?}  pipe=0x{:016x}  tg=({:>3},{:>3},{:>2})  dt={:>10.3} µs",
-                    i, switch, kid, pid, tgx, tgy, tgz, dt as f64 / 1e3
+                    i, switch, kid, pid, tgx, tgy, tgz, dt_us
                 );
             }
         }

@@ -703,6 +703,15 @@ impl<
         const OUT_ACT_SLOT: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
         scale: f32,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_scalar_mul");
@@ -1617,23 +1626,51 @@ mod tests {
 
     #[test]
     fn lowers_scalar_mul_finite_scale() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         let mut b = BuilderD::new();
-        b.push_scalar_mul::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(0.5);
+        b.push_scalar_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            0.5,
+        );
         let tape = b.finish();
         let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.scale.raw(), 0.5);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.in_act_slot(), 0);
-        assert_eq!(n.out_act_slot(), 1);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.in_act_slot().raw(), 0);
+        assert_eq!(n.out_act_slot().raw(), 1);
     }
 
     #[test]
     #[should_panic(expected = "FiniteF32 rejects non-finite value: NaN")]
     fn scalar_mul_rejects_nan_scale() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         let mut b = BuilderD::new();
-        b.push_scalar_mul::<0, 1, 0, 1, 0, 2048, 8, 0, 1>(f32::NAN);
+        b.push_scalar_mul(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<1, { u32::MAX }>::new(),
+            f32::NAN,
+        );
     }
 
     #[test]

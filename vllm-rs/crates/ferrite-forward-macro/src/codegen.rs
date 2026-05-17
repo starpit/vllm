@@ -5529,15 +5529,21 @@ fn dispatch_instruction_to_push(
             let in_act_slot = lit(*in_slot);
             let out_act_slot = lit(*out_slot);
             let scale_lit = *scale;
+            let num_pages_lit = lit(state.num_pages_budget);
             state.arrives += 1;
             Ok(quote! {
-                b.push_scalar_mul::<
-                    #in_id, #out_id,
-                    #consumer_phase, #storer_phase,
-                    #arrives,
-                    #hidden_dim, #num_tokens,
-                    #in_act_slot, #out_act_slot,
-                >(#scale_lit);
+                b.push_scalar_mul(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#in_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    #scale_lit,
+                );
             })
         }
         I::TanhSoftCap(in_slot, out_slot) => {

@@ -1266,20 +1266,20 @@ impl Embed {
 /// Kernel ABI: bf16 elementwise per-row scale — emit splices a per-row
 /// load/mul/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
 pub struct ScalarMul {
-    in_page_id: u32,
-    out_page_id: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    in_act_slot: u32,
-    out_act_slot: u32,
+    in_page: crate::substrate::PageRef,
+    out_page: crate::substrate::PageRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    in_act_slot: crate::substrate::ActSlotRef,
+    out_act_slot: crate::substrate::ActSlotRef,
     pub scale: FiniteF32,
 }
 
 impl ScalarMul {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const IN_ID: u32,
         const OUT_ID: u32,
         const CONSUMER_PHASE: u32,
@@ -1294,10 +1294,8 @@ impl ScalarMul {
         scale: FiniteF32,
     ) -> Self {
         const {
-            assert!(IN_ID < NUM_PAGES, "ScalarMul: IN_ID OOB");
-            assert!(OUT_ID < NUM_PAGES, "ScalarMul: OUT_ID OOB");
             // ScalarMul is elementwise; in-place (IN_ID == OUT_ID) is
-            // a valid substrate pattern (gemma2 post-attn `* hidden`).
+            // valid (gemma2 post-attn `* hidden`).
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
                 "ScalarMul: CONSUMER_PHASE parity"
@@ -1306,44 +1304,45 @@ impl ScalarMul {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "ScalarMul: STORER_PHASE parity"
             );
-            assert!(HIDDEN_DIM > 0, "ScalarMul: HIDDEN_DIM must be > 0");
-            assert!(NUM_TOKENS > 0, "ScalarMul: NUM_TOKENS must be > 0");
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+        };
         Self {
-            in_page_id: IN_ID,
-            out_page_id: OUT_ID,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            in_act_slot: IN_ACT_SLOT,
-            out_act_slot: OUT_ACT_SLOT,
+            in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
+            out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
             scale,
         }
     }
 
-    pub const fn in_page_id(&self) -> u32 {
-        self.in_page_id
+    pub const fn in_page(&self) -> crate::substrate::PageRef {
+        self.in_page
     }
-    pub const fn out_page_id(&self) -> u32 {
-        self.out_page_id
+    pub const fn out_page(&self) -> crate::substrate::PageRef {
+        self.out_page
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn in_act_slot(&self) -> u32 {
+    pub const fn in_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.in_act_slot
     }
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
 }

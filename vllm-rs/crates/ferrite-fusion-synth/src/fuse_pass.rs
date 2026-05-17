@@ -2970,10 +2970,120 @@ pub fn synthesize_forward_decode(
 "#,
     );
 
+    // ── down_proj body: GEMV (hidden ← mlp_scratch [intermediate],
+    // into residual). Inlined (not via AffineQmvAtom) because:
+    //   1. Input dim is __intermediate, not __hidden (the atom is
+    //      currently hardcoded to __hidden via __in_vec_size_*).
+    //   2. Input is in device memory (__mlp_scratch), not TG memory
+    //      — __mlp_scratch is intermediate=8192 elements, too large
+    //      to stage into the existing __HIDDEN_MAX-sized __x_norm
+    //      buffer. mk_load_vector has a device-memory overload so
+    //      we read straight from __mlp_scratch.
+    //
+    // Same tile-loop pattern as o_proj: each TG owns
+    // ceil(hidden/head_dim / num_tgs) tiles of HEAD_DIM rows. After
+    // the qmv, each tile's HEAD_DIM result is added to the residual
+    // slice [tile*head_dim, (tile+1)*head_dim). Disjoint slices
+    // across TGs → no contention.
+    //
+    // Reuses the existing __qmv_smem TG buffer as the per-tile
+    // accumulator (no need for a separate __down_smem — qmv_smem is
+    // overwritten cleanly each tile).
+    let down_wt_buf = "__down_w"; let down_sc_buf = "__down_s"; let down_bi_buf = "__down_b";
+    let down_proj_body = format!(
+        r#"
+        // Tile-loop: each TG owns `ceil(hidden/head_dim / num_tgs)`
+        // tiles of HEAD_DIM output rows; per-tile qmv reads
+        // __mlp_scratch (intermediate-sized, device memory) and writes
+        // HEAD_DIM floats into __qmv_smem, then adds to residual.
+        const uint __down_tiles = __hidden / __head_dim;
+        for (uint __head = __tg_id; __head < __down_tiles; __head += num_tgs) {{
+            constexpr int __dp_bits              = 4;
+            constexpr int __dp_pack_factor       = mk_get_pack_factor<__dp_bits, 32>();
+            constexpr int __dp_bytes_per_pack    = mk_get_bytes_per_pack<__dp_bits, 32>();
+            constexpr int __dp_values_per_thread = __dp_pack_factor * MK_PACKS_PER_THREAD;
+            constexpr int __dp_scale_step        = {gs} / __dp_values_per_thread;
+            const uint __dp_local_head           = __head;
+            const uint __dp_rows_per_pass        = __num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+            const uint __dp_num_passes           = __head_dim / __dp_rows_per_pass;
+            // weight stride is over __intermediate columns (down_proj
+            // input dim), NOT __hidden as in the other qmvs.
+            const int  __dp_in_vec_size_w        = (int)__intermediate * __dp_bytes_per_pack / __dp_pack_factor;
+            const int  __dp_in_vec_size_g        = (int)__intermediate / {gs};
+
+            for (uint __dp_pass = 0u; __dp_pass < __dp_num_passes; ++__dp_pass) {{
+                const uint __dp_pass_base = __dp_pass * __dp_rows_per_pass;
+                const uint __dp_global_out_row_base = __dp_local_head * __head_dim
+                                                    + __dp_pass_base
+                                                    + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+                const device uint8_t* __dp_ws = (const device uint8_t*){down_w}
+                    + (size_t)__dp_global_out_row_base * (size_t)__dp_in_vec_size_w
+                    + (size_t)__simd_lid * MK_PACKS_PER_THREAD * __dp_bytes_per_pack;
+                const device {t_scale}* __dp_sc = {down_s}
+                    + (size_t)__dp_global_out_row_base * (size_t)__dp_in_vec_size_g
+                    + __simd_lid / __dp_scale_step;
+                const device {t_scale}* __dp_bi = {down_b}
+                    + (size_t)__dp_global_out_row_base * (size_t)__dp_in_vec_size_g
+                    + __simd_lid / __dp_scale_step;
+
+                thread float __dp_x_thread[__dp_values_per_thread];
+                thread float __dp_result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
+                const int __dp_block_size = __dp_values_per_thread * MK_SIMD_SIZE;
+                device const {t_act}* __dp_x_in = {mlp_scratch}
+                    + (size_t)__t * (size_t)__intermediate
+                    + (size_t)__simd_lid * (size_t)__dp_values_per_thread;
+
+                const device uint8_t* __dp_ws_iter = __dp_ws;
+                const device {t_scale}* __dp_sc_iter = __dp_sc;
+                const device {t_scale}* __dp_bi_iter = __dp_bi;
+                device const {t_act}* __dp_x_iter  = __dp_x_in;
+                for (int __dp_k = 0; __dp_k < (int)__intermediate; __dp_k += __dp_block_size) {{
+                    // device-source mk_load_vector overload.
+                    float __dp_sum = mk_load_vector<{t_act}, float, __dp_values_per_thread, __dp_bits>(__dp_x_iter, __dp_x_thread);
+                    for (int __dp_row = 0; __dp_row < MK_ROWS_PER_SIMDGROUP; __dp_row++) {{
+                        const device uint8_t* __dp_wl = __dp_ws_iter + __dp_row * __dp_in_vec_size_w;
+                        float __dp_s = float(__dp_sc_iter[__dp_row * __dp_in_vec_size_g]);
+                        float __dp_b = float(__dp_bi_iter[__dp_row * __dp_in_vec_size_g]);
+                        __dp_result[__dp_row] += mk_qdot<float, __dp_values_per_thread, __dp_bits>(__dp_wl, __dp_x_thread, __dp_s, __dp_b, __dp_sum);
+                    }}
+                    __dp_ws_iter += __dp_block_size * __dp_bytes_per_pack / __dp_pack_factor;
+                    __dp_sc_iter += __dp_block_size / {gs};
+                    __dp_bi_iter += __dp_block_size / {gs};
+                    __dp_x_iter  += __dp_block_size;
+                }}
+                for (int __dp_row = 0; __dp_row < MK_ROWS_PER_SIMDGROUP; __dp_row++) {{
+                    __dp_result[__dp_row] = simd_sum(__dp_result[__dp_row]);
+                    if (__simd_lid == 0) {{
+                        {qmv_smem}[__dp_pass_base + __simd_gid * MK_ROWS_PER_SIMDGROUP + __dp_row] = __dp_result[__dp_row];
+                    }}
+                }}
+            }}
+            mk_sync();
+
+            // Add qmv_smem (HEAD_DIM floats) to residual slice
+            // [__t * hidden + tile*head_dim, +head_dim).
+            for (uint __dp_i = __tid; __dp_i < __head_dim; __dp_i += __threads_per_tg) {{
+                const uint __dp_out_idx = __t * __hidden + __head * __head_dim + __dp_i;
+                {residual_io}[__dp_out_idx] = {t_act}(
+                    float({residual_io}[__dp_out_idx]) + {qmv_smem}[__dp_i]
+                );
+            }}
+            mk_sync();
+        }}
+"#,
+        gs = c.group_size,
+        t_act = t_act, t_scale = t_scale,
+        down_w = down_wt_buf, down_s = down_sc_buf, down_b = down_bi_buf,
+        mlp_scratch = mlp_scratch,
+        qmv_smem = qmv_smem_name,
+        residual_io = residual_io,
+    );
+
     let barrier_after_pre_attn = cross_tg_barrier_msl(0, "__barrier_counter");
     let barrier_after_attn     = cross_tg_barrier_msl(1, "__barrier_counter");
     let barrier_after_o_proj   = cross_tg_barrier_msl(2, "__barrier_counter");
     let barrier_after_mlp      = cross_tg_barrier_msl(3, "__barrier_counter");
+    let barrier_after_down     = cross_tg_barrier_msl(4, "__barrier_counter");
 
     let mk_header = inline_header(include_str!(
         "../../ferrite-metal-kernels/shaders/metal_kittens.h"
@@ -3017,7 +3127,9 @@ struct PerLayerWeights {{
     device const uint32_t*  up_weight         [[id(20)]];
     device const {t_scale}* up_scales         [[id(21)]];
     device const {t_scale}* up_biases         [[id(22)]];
-    // TODO down weight/scales/biases     (id 23-25)
+    device const uint32_t*  down_weight       [[id(23)]];
+    device const {t_scale}* down_scales       [[id(24)]];
+    device const {t_scale}* down_biases       [[id(25)]];
 }};
 "#,
         t_act = t_act, t_scale = t_scale,
@@ -3122,6 +3234,9 @@ void {symbol}(
         device const uint32_t*  {up_wt_buf}   = __layer_table[__layer].up_weight;
         device const {t_scale}* {up_sc_buf}   = __layer_table[__layer].up_scales;
         device const {t_scale}* {up_bi_buf}   = __layer_table[__layer].up_biases;
+        device const uint32_t*  {down_wt_buf} = __layer_table[__layer].down_weight;
+        device const {t_scale}* {down_sc_buf} = __layer_table[__layer].down_scales;
+        device const {t_scale}* {down_bi_buf} = __layer_table[__layer].down_biases;
 
         // ── phase 0: pre-attn (AddRmsNorm + QKV qmv + RopeAppend) ──
         // Tile-loop over (token, head) — token axis is M=1 today so
@@ -3153,7 +3268,9 @@ void {symbol}(
         {mlp_body}
         {barrier_after_mlp}
 
-        // ── phase 4: down_proj (TODO: medium-N qmm: mlp_scratch → residual) ──
+        // ── phase 4: down_proj (medium-N qmv: mlp_scratch → residual) ──
+        {down_proj_body}
+        {barrier_after_down}
     }}
 
     // ── final: rmsnorm + lm_head (TODO) ──
@@ -3185,9 +3302,12 @@ void {symbol}(
         barrier_after_attn = barrier_after_attn,
         barrier_after_o_proj = barrier_after_o_proj,
         barrier_after_mlp = barrier_after_mlp,
+        barrier_after_down = barrier_after_down,
         attn_body = attn_body,
         o_proj_body = o_proj_body,
         mlp_body = mlp_body,
+        down_proj_body = down_proj_body,
+        down_wt_buf = down_wt_buf, down_sc_buf = down_sc_buf, down_bi_buf = down_bi_buf,
         o_wt_buf = o_wt_buf, o_sc_buf = o_sc_buf, o_bi_buf = o_bi_buf,
         postattn_rms_buf = postattn_rms_buf,
         gate_wt_buf = gate_wt_buf, gate_sc_buf = gate_sc_buf, gate_bi_buf = gate_bi_buf,
@@ -3490,6 +3610,7 @@ mod tests {
         assert!(kernel.source.contains("phase 1: BN=8 in-kernel attention"));
         assert!(kernel.source.contains("phase 2: o_proj"));
         assert!(kernel.source.contains("phase 3: mlp_pre_down"));
+        assert!(kernel.source.contains("phase 4: down_proj"));
         assert!(kernel.source.contains("mk_tg_rmsnorm_scale"));   // AddRmsNorm atom
         assert!(kernel.source.contains("mk_qdot"));                // AffineQmv atom
         assert!(kernel.source.contains("mk_rope_pair"));           // RopeAppend atom
@@ -3504,14 +3625,20 @@ mod tests {
         assert!(kernel.source.contains("__gate_smem"));
         assert!(kernel.source.contains("__up_smem"));
         assert!(kernel.source.contains("postattn_rms_w    [[id(16)]]"));
+        // down_proj-specific: tile loop over hidden/head_dim, reads
+        // __mlp_scratch (device memory), down weight at id 23.
+        assert!(kernel.source.contains("__down_tiles = __hidden / __head_dim"));
+        assert!(kernel.source.contains("down_weight       [[id(23)]]"));
+        assert!(kernel.source.contains("__dp_x_in = __mlp_scratch"));
 
-        // Four cross-TG barriers (after pre_attn, attention, o_proj,
-        // mlp_pre_down). Phases down_proj/lm_head land next; their
-        // barriers come with.
+        // Five cross-TG barriers (after pre_attn, attention, o_proj,
+        // mlp_pre_down, down_proj). Phase lm_head is final, with the
+        // closing rmsnorm — lands next.
         assert!(kernel.source.contains("cross-TG barrier (phase 0)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 1)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 2)"));
         assert!(kernel.source.contains("cross-TG barrier (phase 3)"));
+        assert!(kernel.source.contains("cross-TG barrier (phase 4)"));
 
         // Each phase wraps its work in a tile-loop sharded across TGs.
         // Pre-attn iterates over `num_heads_total`, attention over

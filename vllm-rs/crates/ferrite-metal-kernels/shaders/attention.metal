@@ -767,3 +767,297 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// attention_via_cache_v2_<dtype>_bn8_specialized — BN=8 decode variant
+// ─────────────────────────────────────────────────────────────────────
+//
+// Same algorithm as `attention_via_cache_v2_<dtype>_specialized` above
+// (paged-cache port of MLX `sdpa_vector`, online softmax + per-
+// simdgroup K-axis split), but dispatched at threads/TG=256 (8
+// simdgroups × 32 lanes) instead of 1024 (32×32). Built for use inside
+// a persistent decode megakernel where the residency cap forbids
+// 1024-thread TGs: see `project_metal_persistent_megakernel_feasibility`
+// — on M4-base, the safe concurrent-TG count at 1024 threads/TG is 30,
+// below the 32 q-heads Llama-3.2-1B dispatches per layer. At 256
+// threads/TG the safe cap rises to 118, which fits the whole-forward
+// grid.
+//
+// Combine step (BN-agnostic; replaces the BN==BD transpose used by the
+// 1024-thread kernel):
+//   1. After the K loop, each lane writes its `o_reg[0..qk_per_thread)`
+//      slice into `tg_partials[simd_gid * MAX_HEAD_DIM + simd_lid *
+//      qk_per_thread + j]`. Simdgroup `simd_gid` owns K-axis partition
+//      `simd_gid`; lane `simd_lid` owns hidden-dim slice
+//      `[simd_lid*qk_per_thread, (simd_lid+1)*qk_per_thread)`.
+//   2. Lane 0 of each simdgroup publishes (max_score, sum_exp_score)
+//      into `tg_max` / `tg_sum`.
+//   3. All threads compute the global max + per-thread weighted sum
+//      across the BN partials; BN=8 so the scan is cheap and the
+//      result is threadgroup-uniform.
+//   4. Simdgroup 0 writes the final output. Every simdgroup computed
+//      the same `final_o` from the same tg buffers, so any simdgroup
+//      could write; pick 0 for clarity.
+//
+// Threadgroup memory: `BN * MAX_HEAD_DIM * 4` + BN*4*2 = 8*256*4 + 64
+// = ~8.3 KiB; well under the 32 KiB Apple-GPU TG limit.
+
+#define ATTN_BN8_MAX_HEAD_DIM 256u
+
+kernel void attention_via_cache_v2_f16_bn8_specialized(
+    device       half* output      [[buffer(0)]],
+    device const half* q           [[buffer(1)]],
+    device const uint* seq_used_k  [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device const half* k_cache     [[buffer(4)]],
+    device const half* v_cache     [[buffer(5)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 8;
+    constexpr int BD = 32;
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / uint(BD);
+
+    const uint seq_idx     = tg_pos.x;
+    const uint q_head_idx  = tg_pos.y;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+    const uint kv_len      = seq_used_k[seq_idx];
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+    const uint kv_tok_stride  = head_dim;
+
+    thread U q_reg[8];
+    thread U o_reg[8];
+
+    threadgroup U tg_partials[BN * ATTN_BN8_MAX_HEAD_DIM];
+    threadgroup U tg_max[BN];
+    threadgroup U tg_sum[BN];
+
+    device const half* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
+    device       half* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const uint* row_block_table = block_table + seq_idx * max_blocks;
+
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U max_score = -FLT_MAX;
+    U sum_exp_score = 0;
+
+    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        const uint logical_block = i / block_size;
+        const uint physical_block = row_block_table[logical_block];
+        const uint token_in_block = i - logical_block * block_size;
+        device const half* k_ptr =
+            k_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+        device const half* v_ptr =
+            v_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+
+        U score = 0;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            score += q_reg[j] * U(k_ptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
+        }
+    }
+
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        tg_partials[simd_gid * ATTN_BN8_MAX_HEAD_DIM
+                    + simd_lid * qk_per_thread + j] = o_reg[j];
+    }
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U global_max = -FLT_MAX;
+    for (uint g = 0; g < uint(BN); ++g) {
+        global_max = max(global_max, tg_max[g]);
+    }
+    U global_sum = 0;
+    U factors[BN];
+    for (uint g = 0; g < uint(BN); ++g) {
+        factors[g] = metal::fast::exp(tg_max[g] - global_max);
+        global_sum += tg_sum[g] * factors[g];
+    }
+
+    thread U final_o[8];
+    for (uint j = 0; j < qk_per_thread; ++j) final_o[j] = 0;
+    for (uint g = 0; g < uint(BN); ++g) {
+        const U f = factors[g];
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            final_o[j] += tg_partials[g * ATTN_BN8_MAX_HEAD_DIM
+                                       + simd_lid * qk_per_thread + j] * f;
+        }
+    }
+    if (global_sum != 0) {
+        for (uint j = 0; j < qk_per_thread; ++j) final_o[j] /= global_sum;
+    }
+
+    if (simd_gid == 0) {
+        device half* o_ptr = o_row + simd_lid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_ptr[j] = half(final_o[j]);
+        }
+    }
+}
+
+kernel void attention_via_cache_v2_bf16_bn8_specialized(
+    device       bfloat* output      [[buffer(0)]],
+    device const bfloat* q           [[buffer(1)]],
+    device const uint*   seq_used_k  [[buffer(2)]],
+    device const uint*   block_table [[buffer(3)]],
+    device const bfloat* k_cache     [[buffer(4)]],
+    device const bfloat* v_cache     [[buffer(5)]],
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    constexpr int BN = 8;
+    constexpr int BD = 32;
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / uint(BD);
+
+    const uint seq_idx     = tg_pos.x;
+    const uint q_head_idx  = tg_pos.y;
+    const uint group_ratio = num_q / num_kv;
+    const uint kv_head_idx = q_head_idx / group_ratio;
+    const uint kv_len      = seq_used_k[seq_idx];
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+    const uint kv_tok_stride  = head_dim;
+
+    thread U q_reg[8];
+    thread U o_reg[8];
+
+    threadgroup U tg_partials[BN * ATTN_BN8_MAX_HEAD_DIM];
+    threadgroup U tg_max[BN];
+    threadgroup U tg_sum[BN];
+
+    device const bfloat* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
+    device       bfloat* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
+    device const uint*   row_block_table = block_table + seq_idx * max_blocks;
+
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U max_score = -FLT_MAX;
+    U sum_exp_score = 0;
+
+    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        const uint logical_block = i / block_size;
+        const uint physical_block = row_block_table[logical_block];
+        const uint token_in_block = i - logical_block * block_size;
+        device const bfloat* k_ptr =
+            k_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+        device const bfloat* v_ptr =
+            v_cache
+            + physical_block * kv_blk_stride
+            + kv_head_idx    * kv_head_stride
+            + token_in_block * kv_tok_stride
+            + simd_lid * qk_per_thread;
+
+        U score = 0;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            score += q_reg[j] * U(k_ptr[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
+        }
+    }
+
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        tg_partials[simd_gid * ATTN_BN8_MAX_HEAD_DIM
+                    + simd_lid * qk_per_thread + j] = o_reg[j];
+    }
+    if (simd_lid == 0) {
+        tg_max[simd_gid] = max_score;
+        tg_sum[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U global_max = -FLT_MAX;
+    for (uint g = 0; g < uint(BN); ++g) {
+        global_max = max(global_max, tg_max[g]);
+    }
+    U global_sum = 0;
+    U factors[BN];
+    for (uint g = 0; g < uint(BN); ++g) {
+        factors[g] = metal::fast::exp(tg_max[g] - global_max);
+        global_sum += tg_sum[g] * factors[g];
+    }
+
+    thread U final_o[8];
+    for (uint j = 0; j < qk_per_thread; ++j) final_o[j] = 0;
+    for (uint g = 0; g < uint(BN); ++g) {
+        const U f = factors[g];
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            final_o[j] += tg_partials[g * ATTN_BN8_MAX_HEAD_DIM
+                                       + simd_lid * qk_per_thread + j] * f;
+        }
+    }
+    if (global_sum != 0) {
+        for (uint j = 0; j < qk_per_thread; ++j) final_o[j] /= global_sum;
+    }
+
+    if (simd_gid == 0) {
+        device bfloat* o_ptr = o_row + simd_lid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) {
+            o_ptr[j] = bfloat(final_o[j]);
+        }
+    }
+}

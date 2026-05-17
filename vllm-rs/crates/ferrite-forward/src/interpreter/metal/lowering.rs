@@ -1955,14 +1955,40 @@ fn lower_one<W: CanonicalParams>(
             // error per layer on Llama-3.2 decode and produced
             // degenerate output after the first decode token).
             let n_q_heads = W::NUM_Q_HEADS;
+            // FERRITE_ATTN_BN_8 = use the BN=8 / 256-threads-per-TG
+            // variant. The default kernel is 32 simdgroups × 32 lanes
+            // = 1024 threads/TG; that shape exceeds the safe
+            // concurrent-TG residency cap on M4-base when used inside
+            // a persistent kernel with cross-TG barriers (see
+            // `project-metal-persistent-megakernel-feasibility`). The
+            // BN=8 variant uses an identical algorithm with a
+            // BN-agnostic combine; gate is for standalone validation
+            // before the persistent-kernel synthesizer picks BN via
+            // `MetalTargetProfile::safe_max_concurrent_tgs`.
+            let use_bn8 = std::env::var_os("FERRITE_ATTN_BN_8").is_some();
+            let (attn_symbol, attn_threads) = if use_bn8 {
+                (
+                    pick_specialized_symbol(
+                        "attention_via_cache_v2_f16_bn8_specialized",
+                        "attention_via_cache_v2_bf16_bn8_specialized",
+                        W::METAL_DTYPE,
+                    ),
+                    (256u32, 1u32, 1u32),
+                )
+            } else {
+                (
+                    pick_specialized_symbol(
+                        "attention_via_cache_v2_f16_specialized",
+                        "attention_via_cache_v2_bf16_specialized",
+                        W::METAL_DTYPE,
+                    ),
+                    (1024u32, 1u32, 1u32),
+                )
+            };
             LoweredCommand {
                 kernel: KernelId::AttentionViaCache,
                 library: "attention",
-                function: pick_specialized_symbol(
-                    "attention_via_cache_v2_f16_specialized",
-                    "attention_via_cache_v2_bf16_specialized",
-                    W::METAL_DTYPE,
-                ),
+                function: attn_symbol,
                 constants: super::kernel_constants::AttentionViaCacheConstants {
                     head_dim: super::ids::HeadDim(W::HEAD_DIM),
                     num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
@@ -1974,7 +2000,7 @@ fn lower_one<W: CanonicalParams>(
                 .into(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
-                    threads_per_threadgroup: (1024, 1, 1),
+                    threads_per_threadgroup: attn_threads,
                     // AttentionViaCache (decode) — bucket_m == 1 here
                     // (decode bucket). Scaling is a no-op but kept
                     // for uniformity in case decode shares a bucket.

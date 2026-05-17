@@ -884,6 +884,25 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _in_page: crate::substrate::PageId<IN_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _b_tile: crate::substrate::ScratchRegion<
+            B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::substrate::GemmScope,
+        >,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _iters: crate::substrate::IterCount<ITERS>,
+        _layer: crate::nodes::LayerIndex<LAYER, NUM_LAYERS>,
+        _n: crate::substrate::MatmulN<N>,
+        _k: crate::substrate::MatmulK<K>,
+        _m: crate::substrate::MatmulM<M>,
+        _in_act_slot: crate::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         weight_path: String,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_gemm");
@@ -1766,17 +1785,37 @@ mod tests {
 
     #[test]
     fn lowers_gemm() {
+        use crate::nodes::LayerIndex;
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, GemmScope, IterCount, MatmulK, MatmulM, MatmulN,
+            MbarrierPhase, PageId, ScratchRegion, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
-        b.push_gemm::<0, 1, 2, 0, 4096, 0, 1, 4, 3, 4096, 2048, 16, 0, 8, 0, 2, 0>(
+        b.push_gemm(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            PageId::<2, 8>::new(),
+            ScratchRegion::<0, 4096, 32_768, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<4>::new(),
+            LayerIndex::<3, 16>::new(),
+            MatmulN::<4096>::new(),
+            MatmulK::<2048>::new(),
+            MatmulM::<8>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
             "W::gemm".to_string(),
         );
         let tape = b.finish();
         let MegaNode::Gemm(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.n(), 4096);
-        assert_eq!(n.k(), 2048);
-        assert_eq!(n.iters(), 4);
+        assert_eq!(n.n().raw(), 4096);
+        assert_eq!(n.k().raw(), 2048);
+        assert_eq!(n.iters().raw(), 4);
     }
 
     #[test]

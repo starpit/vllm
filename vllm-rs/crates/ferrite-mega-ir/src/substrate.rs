@@ -663,6 +663,94 @@ impl HeadDimRef {
     }
 }
 
+/// Verified positive matmul-N (output cols / N dim).
+pub struct MatmulN<const N: u32>;
+impl<const N: u32> MatmulN<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "MatmulN: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> MatmulNRef {
+        MatmulNRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for MatmulN<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulNRef(u32);
+impl MatmulNRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive matmul-K (reduction dim).
+pub struct MatmulK<const K: u32>;
+impl<const K: u32> MatmulK<K> {
+    pub const fn new() -> Self {
+        const {
+            assert!(K > 0, "MatmulK: K must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> MatmulKRef {
+        MatmulKRef::__new_for_erase(K)
+    }
+}
+impl<const K: u32> Default for MatmulK<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulKRef(u32);
+impl MatmulKRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+/// Verified positive matmul-M (output rows / M dim, == NUM_TOKENS at
+/// canonical's workload point).
+pub struct MatmulM<const M: u32>;
+impl<const M: u32> MatmulM<M> {
+    pub const fn new() -> Self {
+        const {
+            assert!(M > 0, "MatmulM: M must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> MatmulMRef {
+        MatmulMRef::__new_for_erase(M)
+    }
+}
+impl<const M: u32> Default for MatmulM<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MatmulMRef(u32);
+impl MatmulMRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive `VOCAB_SIZE` (Embed kernel template arg).
 pub struct VocabSize<const N: u32>;
 impl<const N: u32> VocabSize<N> {

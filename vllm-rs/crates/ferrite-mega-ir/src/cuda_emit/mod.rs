@@ -395,6 +395,46 @@ mod tests {
         }
     }
 
+    /// Sprint 4 — TanhSoftCap: per-row Gemma2 logit softcap.
+    /// Verifies the consumer body splices
+    /// `ferrite::tk::tanh_softcap_vec(rv, <cap>)` and matches the
+    /// ScalarMul TMA-load/store skeleton.
+    #[test]
+    fn lower_tanh_soft_cap_to_cuda_smoke() {
+        let mut b = BuilderD::new();
+        b.push_tanh_soft_cap(
+            ArrivesCount::<0>::new(),
+            PageId::<6, 8>::new(), // in
+            PageId::<7, 8>::new(), // out
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<2, { u32::MAX }>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+            30.0_f32,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_softcap", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "expected zero skipped variants, got {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            "kittens::tma::expect_bytes(ss.page_ready[6], 4096);",
+            "kittens::rv_fl<256> __tanh_rv;",
+            "ferrite::tk::tanh_softcap_vec(__tanh_rv, 3e1f);",
+            "kittens::tma::store_async(g.act_ptrs[3], (*reinterpret_cast<kittens::sv_bf<2048>*>(ss.pages[7]))",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
     /// A tape with only a SKIPPED variant produces a `.cu` that
     /// still has the full substrate scaffold but reports the
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.

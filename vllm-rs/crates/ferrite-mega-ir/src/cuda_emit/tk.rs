@@ -244,6 +244,17 @@ pub fn rms_norm_vec(
     )
 }
 
+/// `ferrite::tk::tanh_softcap_vec(rv, cap);` — in-place per-lane
+/// `x = tanhf(x / cap) * cap`. Mirrors
+/// `ferrite_tk_helpers.cuh::tanh_softcap_vec`. No cross-warp
+/// coordination — every lane operates on its own register slots.
+pub fn tanh_softcap_vec(rv: &RegColVec<F32>, cap: &CuExpr) -> CuStmt {
+    CuStmt::new(format!(
+        "ferrite::tk::tanh_softcap_vec({rv}, {cap});",
+        rv = rv.expr()
+    ))
+}
+
 /// Bind a returned [`RegColVec`] expression to a CUDA local
 /// variable, returning the `auto <name> = <expr>;` statement plus a
 /// fresh handle that refers to the bound name. Useful when an op's

@@ -179,6 +179,30 @@ __device__ static inline void matvec(
     kittens::warp::sync();
 }
 
+// --------------------------------------------------------------------
+// tanh_softcap_vec — apply `x = tanhf(x / cap) * cap` to every lane
+// slot of a register vector, in-place. Used by Gemma2's final-logit
+// softcap (and only Gemma2 — every other arch passes cap == 0 which
+// short-circuits at codegen time to identity).
+//
+// Per-lane scalar math; no cross-warp coordination, no shared
+// memory. Iteration shape `outer_dim x inner_dim` comes from TK's
+// rv layout (`include/types/register/rv.cuh`).
+// --------------------------------------------------------------------
+
+template <typename RV>
+__device__ static inline void tanh_softcap_vec(RV &vec, float cap) {
+    const float inv_cap = 1.0f / cap;
+    #pragma unroll
+    for (int i = 0; i < RV::outer_dim; ++i) {
+        #pragma unroll
+        for (int j = 0; j < RV::inner_dim; ++j) {
+            const float x = static_cast<float>(vec.data[i][j]) * inv_cap;
+            vec.data[i][j] = tanhf(x) * cap;
+        }
+    }
+}
+
 // matvec_reduce — sum NCW per-warp partial results from scratch into rv_fl<16>.
 // Matches TK utils.cuh::matvec_reduce.
 template <int NCW>

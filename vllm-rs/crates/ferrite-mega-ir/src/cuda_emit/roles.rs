@@ -15,7 +15,7 @@
 //! at the corresponding tape position so the structural shape of
 //! the emitted `.cu` is preserved.
 
-use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul};
+use crate::nodes::{Add, MegaNode, RmsNorm, ScalarMul, TanhSoftCap};
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
@@ -60,7 +60,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
         MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
-        MegaNode::TanhSoftCap(_) => RoleBodies::skipped("TanhSoftCap"),
+        MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(_) => RoleBodies::skipped("ScalarOffsetRmsNorm"),
         MegaNode::Gemm(_) => RoleBodies::skipped("Gemm"),
         MegaNode::FusedCublasGemmAdd(_) => RoleBodies::skipped("FusedCublasGemmAdd"),
@@ -457,6 +457,112 @@ fn emit_scalar_mul(n: &ScalarMul, budget: TapeBudget) -> RoleBodies {
     consumer.push(CuStmt::new("}".to_string()));
 
     // Storer: TMA-store out_page to gmem at out_act_slot.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&out_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &out_gmem,
+        &out_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&out_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// TanhSoftCap — in-place x = tanhf(x / cap) * cap.
+// ============================================================
+//
+// Same substrate shape as ScalarMul — single-page elementwise op.
+// Per `MEGA_IR_PLAN.md` section 4a TanhSoftCap row: emit splices a
+// per-row load/tanh-cap/store loop with `<HIDDEN_DIM, NUM_TOKENS>`
+// shape and the runtime cap.
+//
+// The compute step calls `ferrite::tk::tanh_softcap_vec(rv, cap)`
+// (defined in `ferrite_tk_helpers.cuh`) — per-lane scalar tanh, no
+// cross-warp coordination.
+
+fn emit_tanh_soft_cap(n: &TanhSoftCap, budget: TapeBudget) -> RoleBodies {
+    let in_page = n.in_page();
+    let out_page = n.out_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let in_act_slot = n.in_act_slot().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let cap_value = n.cap.raw();
+    let in_place = in_page.raw() == out_page.raw();
+
+    let ncw = budget.num_consumer_warps;
+    debug_assert!(
+        ncw > 0 && hidden_dim % ncw == 0,
+        "emit_tanh_soft_cap: HIDDEN_DIM ({hidden_dim}) must be divisible by NCW ({ncw})"
+    );
+    let k_per_warp = hidden_dim / ncw;
+
+    let in_smem = page_as_sv_bf(in_page, hidden_dim);
+    let out_smem = page_as_sv_bf(out_page, hidden_dim);
+    let in_ready = page_ready_sem(in_page);
+    let out_done = page_done_sem(out_page);
+    let in_consumed = page_consumed_sem(in_page);
+    let out_consumed = page_consumed_sem(out_page);
+    let in_gmem = gmem_act_ptr_bf16(in_act_slot);
+    let out_gmem = gmem_act_ptr_bf16(out_act_slot);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    // Loader: TMA-load in_page from gmem.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&in_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&in_ready, act_bytes));
+    loader.push(super::tk::tma_load_async_bf16(
+        &in_smem,
+        &in_gmem,
+        &CuExpr::new("{0}".to_string()),
+        &in_ready,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: warp::load → ferrite::tk::tanh_softcap_vec(rv, cap)
+    // → warp::store. No cross-warp barrier.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&in_ready, consumer_phase));
+    let in_slice = warp_slice_sv_bf(&in_smem, ncw, k_per_warp);
+    let out_slice_for_store = if in_place {
+        in_slice.clone()
+    } else {
+        warp_slice_sv_bf(&out_smem, ncw, k_per_warp)
+    };
+    let (decl, rv) = super::tk::decl_rv_fl("__tanh_rv", k_per_warp);
+    consumer.push(decl);
+    consumer.push(super::tk::warp_load_bf16_to_f32(&rv, &in_slice));
+    let cap_lit = CuExpr::new(format!("{:e}f", cap_value));
+    consumer.push(super::tk::tanh_softcap_vec(&rv, &cap_lit));
+    consumer.push(super::tk::warp_store_bf16(&out_slice_for_store, &rv));
+    consumer.push(super::tk::warp_sync());
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&out_done));
+    if !in_place {
+        consumer.push(super::tk::arrive(&in_consumed));
+    }
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer.
     let mut storer = CuBlock::new();
     storer.push(super::tk::wait(&out_done, storer_phase));
     storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));

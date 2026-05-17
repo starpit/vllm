@@ -56,6 +56,25 @@ pub struct CostEntry {
     pub cost_us: f64,
 }
 
+/// Maximum concurrently-resident simdgroups per GPU core, keyed by
+/// Apple GPU family generation. These are documented Apple constants
+/// (WWDC23 "Discover Metal 3" + the same values used in MLX and
+/// llama.cpp's Metal backend). `simdgroups_per_core × 32` (the SIMD
+/// width) gives the max concurrent threads per core; multiplying by
+/// `num_cores` gives the device's residency cap, which an
+/// in-grid-spinning kernel (persistent megakernel) cannot exceed
+/// without deadlocking — TGs not yet scheduled never reach the
+/// ticket-lock barrier they're being waited on.
+pub fn simdgroups_per_core(gen: AppleSiliconGen) -> u32 {
+    match gen {
+        AppleSiliconGen::M1 | AppleSiliconGen::M2 => 64,
+        AppleSiliconGen::M3 | AppleSiliconGen::M4 => 96,
+    }
+}
+
+/// SIMD group width on Apple Silicon — 32 lanes across all generations.
+pub const SIMD_WIDTH: u32 = 32;
+
 impl MetalTargetProfile {
     /// Look up cost for a specific kernel and shape
     pub fn cost_us_for(&self, kernel: &str, m: u32, n: u32, k: u32) -> Option<f64> {
@@ -104,6 +123,43 @@ impl MetalTargetProfile {
         }
 
         Ok(())
+    }
+
+    /// Max threads that can be concurrently resident on the whole GPU
+    /// under the chip's published hardware budget — `num_cores ×
+    /// simdgroups_per_core × SIMD_WIDTH`. **Pure CPU query, no GPU
+    /// work.** Register pressure inside a specific kernel can lower
+    /// the effective per-core simdgroup occupancy below
+    /// `simdgroups_per_core`; callers that dispatch in-grid spin-
+    /// locking kernels MUST apply a safety margin (see
+    /// [`Self::safe_max_concurrent_tgs`]) since exceeding the cap
+    /// deadlocks the ticket-lock barrier.
+    pub fn max_concurrent_threads(&self) -> u32 {
+        self.gpu_cores * simdgroups_per_core(self.generation) * SIMD_WIDTH
+    }
+
+    /// Max concurrently-resident threadgroups for a kernel launched at
+    /// `threads_per_tg` per TG, assuming no register-pressure derating.
+    /// Use [`Self::safe_max_concurrent_tgs`] for the value an in-grid
+    /// spin-locking kernel can actually dispatch at.
+    pub fn max_concurrent_tgs(&self, threads_per_tg: u32) -> u32 {
+        if threads_per_tg == 0 { 0 } else {
+            self.max_concurrent_threads() / threads_per_tg
+        }
+    }
+
+    /// Safe dispatch size for a persistent (in-grid spin-locking)
+    /// kernel — applies a small safety margin below the hardware cap.
+    /// The margin covers: (1) any register-pressure-induced lowering
+    /// of the effective per-core simdgroup count for the specific
+    /// kernel, and (2) OS-reserved simdgroup slots used by the
+    /// compositor / other GPU clients. Empirically a 2-TG margin per
+    /// chip has been adequate on M4; bumping further is cheap (one
+    /// extra coalescing step per phase) compared to a deadlock.
+    pub fn safe_max_concurrent_tgs(&self, threads_per_tg: u32) -> u32 {
+        const SAFETY_MARGIN_TGS: u32 = 2;
+        self.max_concurrent_tgs(threads_per_tg)
+            .saturating_sub(SAFETY_MARGIN_TGS)
     }
 }
 
@@ -289,5 +345,42 @@ mod tests {
 
         // Non-existent kernel should return None
         assert_eq!(profile.cost_us_for("nonexistent", 128, 4096, 0), None);
+    }
+
+    /// Residency cap analytical formula cross-checked against the
+    /// single empirical data point captured on this M4 base (10
+    /// cores) during the barrier sweep: at threads_per_TG=128 the
+    /// cross-TG ticket-lock kernel completes at 240 TGs and deadlocks
+    /// at 256 — i.e. the cap is in `[240*128, 256*128) = [30720, 32768)`.
+    /// The hardware constant `num_cores × simdgroups_per_core × SIMD
+    /// _WIDTH = 10 × 96 × 32 = 30720` must land at the lower bound.
+    #[test]
+    fn m4_10core_residency_cap_matches_observation() {
+        let p = M4_10CORE.clone();
+        assert_eq!(p.max_concurrent_threads(), 30720);
+        assert_eq!(p.max_concurrent_tgs(128), 240);
+        assert_eq!(p.max_concurrent_tgs(256), 120);
+        assert_eq!(p.max_concurrent_tgs(512), 60);
+    }
+
+    /// Safe dispatch trims two TGs off the hardware cap so kernels
+    /// with marginal register pressure or background GPU work still
+    /// fit. Persistent megakernel dispatches MUST go through this.
+    #[test]
+    fn m4_10core_safe_dispatch_margin() {
+        let p = M4_10CORE.clone();
+        assert_eq!(p.safe_max_concurrent_tgs(128), 238);
+        assert_eq!(p.safe_max_concurrent_tgs(256), 118);
+        assert_eq!(p.safe_max_concurrent_tgs(512), 58);
+    }
+
+    /// Apple9 (M3/M4) carries 96 simdgroups/core; Apple7/8 (M1/M2)
+    /// carry 64. Same values MLX and llama.cpp's Metal backend use.
+    #[test]
+    fn simdgroups_per_core_per_family() {
+        assert_eq!(simdgroups_per_core(AppleSiliconGen::M1), 64);
+        assert_eq!(simdgroups_per_core(AppleSiliconGen::M2), 64);
+        assert_eq!(simdgroups_per_core(AppleSiliconGen::M3), 96);
+        assert_eq!(simdgroups_per_core(AppleSiliconGen::M4), 96);
     }
 }

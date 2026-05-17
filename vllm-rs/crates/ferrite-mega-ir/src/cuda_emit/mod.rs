@@ -121,7 +121,8 @@ fn render_source(
     s.push_str("#include \"ferrite_substrate.cuh\"\n");
     s.push_str("#include \"ferrite_globals.cuh\"\n");
     s.push_str("#include \"ferrite_warp_roles.cuh\"\n");
-    s.push_str("#include \"ferrite_tk_helpers.cuh\"\n\n");
+    s.push_str("#include \"ferrite_tk_helpers.cuh\"\n");
+    s.push_str("#include \"ferrite_barrier.cuh\"\n\n");
 
     s.push_str("namespace {\n\n");
 
@@ -148,6 +149,10 @@ fn render_source(
     s.push_str("struct Globals {\n");
     s.push_str("    __nv_bfloat16** act_ptrs;\n");
     s.push_str("    __nv_bfloat16** weight_ptrs;\n");
+    s.push_str("    // Per-token input id table — used by `Embed`'s loader.\n");
+    s.push_str("    uint32_t* input_ids;\n");
+    s.push_str("    // Cross-CTA gmem barrier counters; one slot per edge id.\n");
+    s.push_str("    int32_t* barrier_slots;\n");
     s.push_str("};\n\n");
 
     s.push_str("__device__ __forceinline__ void loader_body(\n");
@@ -181,12 +186,14 @@ fn render_source(
     // Kernel entry — fixed substrate scaffolding.
     s.push_str(&format!("extern \"C\" __global__ void {kernel_name}(\n"));
     s.push_str("    __nv_bfloat16** act_ptrs,\n");
-    s.push_str("    __nv_bfloat16** weight_ptrs\n");
+    s.push_str("    __nv_bfloat16** weight_ptrs,\n");
+    s.push_str("    uint32_t* input_ids,\n");
+    s.push_str("    int32_t* barrier_slots\n");
     s.push_str(") {\n");
     s.push_str("    extern __shared__ uint8_t shmem_buf[];\n");
     s.push_str("    auto& ss = *reinterpret_cast<ferrite::SharedState<ConfigT>*>(shmem_buf);\n");
     s.push_str("    ferrite::init_shared_state<ConfigT>(ss);\n");
-    s.push_str("    Globals g{act_ptrs, weight_ptrs};\n");
+    s.push_str("    Globals g{act_ptrs, weight_ptrs, input_ids, barrier_slots};\n");
     s.push_str("    int wid = kittens::warpid();\n");
     s.push_str("    if (wid < ConfigT::NUM_CONSUMER_WARPS) {\n");
     s.push_str("        ferrite::set_consumer_registers<ConfigT>();\n");
@@ -555,13 +562,102 @@ mod tests {
     /// skipped variant in diagnostics + as a `// SKIPPED` comment.
     #[test]
     fn skipped_variant_renders_marker() {
-        // Use a barrier op (Sprint 1: SKIPPED).
-        use crate::substrate::EdgeId;
+        // SpliceMmEmbeds is still skipped as of Sprint 6 (multimodal
+        // splice path; needs scaffold work for the per-token
+        // placeholder mask).
         let mut b = BuilderD::new();
-        b.push_barrier_signal::<0>(EdgeId::<0, 4>::new());
+        b.push_splice_mm_embeds::<3, 0, 1, 0, 2048, 1, 3>(
+            ArrivesCount::<0>::new(),
+            PageId::<3, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            ActSlotConst::<3, { u32::MAX }>::new(),
+        );
         let tape = b.finish(16);
         let cu = lower_to_cuda("test_skip", &tape);
-        assert_eq!(cu.skipped_variants, vec!["BarrierSignal".to_string()]);
-        assert!(cu.source.contains("// SKIPPED node[0]: BarrierSignal"));
+        assert_eq!(cu.skipped_variants, vec!["SpliceMmEmbeds".to_string()]);
+        assert!(cu.source.contains("// SKIPPED node[0]: SpliceMmEmbeds"));
+    }
+
+    /// Sprint 6 — Embed: vocab table lookup. Verifies the loader
+    /// emits the per-token tma::load_async loop using
+    /// `g.input_ids[t]` as the row index.
+    #[test]
+    fn lower_embed_to_cuda_smoke() {
+        use crate::substrate::VocabSize;
+        let mut b = BuilderD::new();
+        b.push_embed(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // out
+            PageId::<1, 8>::new(), // weight
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<1>::new(),
+            VocabSize::<128_256>::new(),
+            ActSlotConst::<7, { u32::MAX }>::new(),
+            WeightAccessorConst::<11, { u32::MAX }>::new(),
+            "W::embed".to_string(),
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_embed", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        for needle in [
+            "uint32_t* input_ids;",
+            "int32_t* barrier_slots;",
+            "for (int __embed_t = 0; __embed_t < 1; ++__embed_t) {",
+            "static_cast<int>(g.input_ids[__embed_t])",
+            "g.weight_ptrs[11 * 16 + 0]", // accessor=11, layer=0 (Embed convention)
+            "kittens::tma::store_async(g.act_ptrs[7],",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected source to contain {needle:?}, source was:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Sprint 6 — BarrierSignal: cross-CTA gmem barrier.
+    /// Verifies the emit lands in the loader body, gated to one
+    /// thread, and reads `g.barrier_slots[<edge>]`.
+    #[test]
+    fn lower_barrier_signal_to_cuda_smoke() {
+        use crate::substrate::EdgeId;
+        let mut b = BuilderD::new();
+        b.push_barrier_signal::<2>(EdgeId::<2, 4>::new());
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_bsig", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        for needle in [
+            "ferrite::barrier_signal(&g.barrier_slots[2], 1);",
+            // Gated to one thread.
+            "if (kittens::warpid() == 0 && kittens::laneid() == 0) {",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?}, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Sprint 6 — BarrierWait.
+    #[test]
+    fn lower_barrier_wait_to_cuda_smoke() {
+        use crate::substrate::{EdgeId, ExpectedCount};
+        let mut b = BuilderD::new();
+        b.push_barrier_wait::<1, 16>(EdgeId::<1, 4>::new(), ExpectedCount::<16>::new());
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_bwait", &tape);
+        assert!(cu.skipped_variants.is_empty());
+        assert!(
+            cu.source
+                .contains("ferrite::barrier_wait(&g.barrier_slots[1], 16);"),
+            "got:\n{}",
+            cu.source
+        );
     }
 }

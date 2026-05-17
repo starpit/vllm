@@ -285,3 +285,19 @@ pub fn gmem_weight_ptr_bf16(accessor: u32, layer: u32, num_layers: u32) -> GmemP
         "g.weight_ptrs[{accessor} * {num_layers} + {layer}]"
     )))
 }
+
+/// `g.input_ids` — typed gmem pointer to the per-token input id
+/// table. Used by `Embed`'s loader to gather one embedding row per
+/// token. The Globals struct must include `uint32_t* input_ids;`
+/// (added unconditionally by `cuda_emit::lower_to_cuda`).
+pub fn gmem_input_ids() -> GmemPtr<U32> {
+    GmemPtr::from_expr(CuExpr::new("g.input_ids".to_string()))
+}
+
+/// `&g.barrier_slots[<edge>]` — slot pointer into the gmem
+/// cross-CTA barrier-counter array for the given edge id. Used by
+/// `BarrierSignal` (atomicAdd) / `BarrierWait` (spin-load) — see
+/// `ferrite_barrier.cuh`.
+pub fn gmem_barrier_slot_ptr(edge: u32) -> CuExpr {
+    CuExpr::new(format!("&g.barrier_slots[{edge}]"))
+}

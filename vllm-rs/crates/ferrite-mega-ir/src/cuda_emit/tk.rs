@@ -337,6 +337,22 @@ pub fn tanh_softcap_vec(rv: &RegColVec<F32>, cap: &CuExpr) -> CuStmt {
     ))
 }
 
+/// `ferrite::barrier_signal(<slot_ptr>, <count>);` — atomicAdd
+/// a gmem cross-CTA counter to flag completion of a prior op.
+/// One thread per CTA; mirrors `ferrite_barrier.cuh::barrier_signal`.
+pub fn barrier_signal(slot_ptr: &CuExpr, count: u32) -> CuStmt {
+    CuStmt::new(format!("ferrite::barrier_signal({slot_ptr}, {count});"))
+}
+
+/// `ferrite::barrier_wait(<slot_ptr>, <expected>);` — spin-load
+/// the gmem counter until it reaches `expected`. One thread per
+/// CTA; mirrors `ferrite_barrier.cuh::barrier_wait`.
+pub fn barrier_wait(slot_ptr: &CuExpr, expected: u32) -> CuStmt {
+    CuStmt::new(format!(
+        "ferrite::barrier_wait({slot_ptr}, {expected});"
+    ))
+}
+
 /// Bind a returned [`RegColVec`] expression to a CUDA local
 /// variable, returning the `auto <name> = <expr>;` statement plus a
 /// fresh handle that refers to the bound name. Useful when an op's

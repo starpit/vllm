@@ -16,14 +16,16 @@
 //! the emitted `.cu` is preserved.
 
 use crate::nodes::{
-    Add, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul, ScalarOffsetRmsNorm, TanhSoftCap,
+    Add, BarrierSignal, BarrierWait, Embed, FusedAddRmsNorm, MegaNode, RmsNorm, ScalarMul,
+    ScalarOffsetRmsNorm, TanhSoftCap,
 };
 use crate::tape::TapeBudget;
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
 use super::handles::{
-    gmem_act_ptr_bf16, gmem_weight_ptr_bf16, page_as_sv_bf, page_consumed_sem, page_done_sem,
-    page_ready_sem, scratch_as, warp_slice_sv_bf,
+    gmem_act_ptr_bf16, gmem_barrier_slot_ptr, gmem_input_ids, gmem_weight_ptr_bf16,
+    page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem, scratch_as,
+    warp_slice_sv_bf,
 };
 use super::tk;
 
@@ -60,7 +62,7 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::Add(n) => emit_add(n, budget),
         MegaNode::FusedAddRmsNorm(n) => emit_fused_add_rms_norm(n, budget),
         MegaNode::FusedGateUpActivateMul(_) => RoleBodies::skipped("FusedGateUpActivateMul"),
-        MegaNode::Embed(_) => RoleBodies::skipped("Embed"),
+        MegaNode::Embed(n) => emit_embed(n, budget),
         MegaNode::ScalarMul(n) => emit_scalar_mul(n, budget),
         MegaNode::TanhSoftCap(n) => emit_tanh_soft_cap(n, budget),
         MegaNode::ScalarOffsetRmsNorm(n) => emit_scalar_offset_rms_norm(n, budget),
@@ -69,8 +71,8 @@ pub fn emit_role_bodies(node: &MegaNode, budget: TapeBudget) -> RoleBodies {
         MegaNode::CutlassFusedNormGemm(_) => RoleBodies::skipped("CutlassFusedNormGemm"),
         MegaNode::AttentionViaCache(_) => RoleBodies::skipped("AttentionViaCache"),
         MegaNode::SpliceMmEmbeds(_) => RoleBodies::skipped("SpliceMmEmbeds"),
-        MegaNode::BarrierSignal(_) => RoleBodies::skipped("BarrierSignal"),
-        MegaNode::BarrierWait(_) => RoleBodies::skipped("BarrierWait"),
+        MegaNode::BarrierSignal(n) => emit_barrier_signal(n),
+        MegaNode::BarrierWait(n) => emit_barrier_wait(n),
     }
 }
 
@@ -883,4 +885,160 @@ fn emit_scalar_offset_rms_norm(
     }
 }
 
+// ============================================================
+// Embed — vocab table lookup, one row per token.
+// ============================================================
+//
+// Loader gathers `NUM_TOKENS` rows from the embedding table at
+// indices `g.input_ids[t]` into the out_page; storer TMA-stores
+// the gathered rows back to gmem at `out_act_slot`. Consumer is a
+// passthrough — there's no compute, only a per-token TMA gather.
+//
+// Per `MEGA_IR_PLAN.md` section 4a Embed row: `<HIDDEN_DIM,
+// NUM_TOKENS>` template, `g.input_ids` runtime arg.
 
+fn emit_embed(n: &Embed, budget: TapeBudget) -> RoleBodies {
+    let out_page = n.out_page();
+    let weight_page = n.embed_weight_page();
+    let consumer_phase = n.consumer_phase().raw();
+    let storer_phase = n.storer_phase().raw();
+    let hidden_dim = n.hidden_dim().raw();
+    let num_tokens = n.num_tokens().raw();
+    let out_act_slot = n.out_act_slot().raw();
+    let weight_accessor_idx = n.weight_accessor_idx().raw();
+
+    let _ncw = budget.num_consumer_warps;
+    // Embed lives at "layer 0" by convention — there's only one
+    // embedding table, not one per layer (see Embed's IR doc
+    // comment: "LAYER is always 0 for Embed").
+    let layer = 0_u32;
+    let num_layers = budget.num_layers.max(1);
+
+    let out_smem = page_as_sv_bf(out_page, hidden_dim);
+    let _weight_smem = page_as_sv_bf(weight_page, hidden_dim);
+    let out_ready = page_ready_sem(out_page);
+    let out_done = page_done_sem(out_page);
+    let out_consumed = page_consumed_sem(out_page);
+    let weight_consumed = page_consumed_sem(weight_page);
+    let weight_gmem = gmem_weight_ptr_bf16(weight_accessor_idx, layer, num_layers);
+    let _input_ids = gmem_input_ids();
+    let out_gmem = gmem_act_ptr_bf16(out_act_slot);
+
+    let bf16_size_bytes = 2;
+    let act_bytes = hidden_dim * num_tokens * bf16_size_bytes;
+
+    // Loader: per-token tma::load_async into the per-token slice of
+    // out_smem. Coordinates are `{static_cast<int>(g.input_ids[t]),
+    // 0}` — row index = token id, col offset = 0.
+    //
+    // The loader loops over NUM_TOKENS at codegen time (NUM_TOKENS
+    // is a runtime u32 here, but const at user-build time after the
+    // proc-macro has stamped the IR's literal value). We emit a
+    // C++ `for (int t = 0; t < <NUM_TOKENS>; ++t) { ... }` loop;
+    // nvcc unrolls the small NUM_TOKENS=1 (decode) case.
+    let mut loader = CuBlock::new();
+    let loader_phase = storer_phase;
+    loader.push(super::tk::wait(&out_consumed, loader_phase));
+    loader.push(super::tk::wait(&weight_consumed, loader_phase));
+    loader.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    loader.push(super::tk::tma_expect_bytes(&out_ready, act_bytes));
+    loader.push(CuStmt::new(format!(
+        "for (int __embed_t = 0; __embed_t < {num_tokens}; ++__embed_t) {{"
+    )));
+    loader.push(CuStmt::new(format!(
+        "    auto& __embed_row = *reinterpret_cast<kittens::sv_bf<{hidden_dim}>*>(\
+         reinterpret_cast<char*>(&{out_smem}) + __embed_t * {hidden_dim} * sizeof(__nv_bfloat16));",
+        out_smem = out_smem.expr()
+    )));
+    loader.push(CuStmt::new(format!(
+        "    kittens::tma::load_async(__embed_row, {weight_gmem}, {{static_cast<int>(g.input_ids[__embed_t]), 0}}, {out_ready});",
+        weight_gmem = weight_gmem.expr(),
+        out_ready = out_ready.expr()
+    )));
+    loader.push(CuStmt::new("}".to_string()));
+    loader.push(CuStmt::new("}".to_string()));
+
+    let launcher = CuBlock::new();
+
+    // Consumer: passthrough. Wait for loader, signal storer + free
+    // the (unused) weight page. The OUT page is left as-is — the
+    // storer reads from it directly.
+    let mut consumer = CuBlock::new();
+    consumer.push(super::tk::wait(&out_ready, consumer_phase));
+    consumer.push(CuStmt::new("if (kittens::warpid() == 0) {".to_string()));
+    consumer.push(super::tk::arrive(&out_done));
+    consumer.push(super::tk::arrive(&weight_consumed));
+    consumer.push(CuStmt::new("}".to_string()));
+
+    // Storer.
+    let mut storer = CuBlock::new();
+    storer.push(super::tk::wait(&out_done, storer_phase));
+    storer.push(CuStmt::new("if (kittens::laneid() == 0) {".to_string()));
+    storer.push(super::tk::tma_store_async_bf16(
+        &out_gmem,
+        &out_smem,
+        &CuExpr::new("{0}".to_string()),
+    ));
+    storer.push(super::tk::tma_store_async_wait());
+    storer.push(super::tk::arrive(&out_consumed));
+    storer.push(CuStmt::new("}".to_string()));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// BarrierSignal / BarrierWait — cross-CTA gmem barriers.
+// ============================================================
+//
+// One thread per CTA does the work. Convention: place the line in
+// the LOADER body (the role that issues cross-CTA reads, so sync
+// points cluster naturally there). The other 3 role bodies are
+// empty for these variants.
+//
+// `ferrite::barrier_signal(&g.barrier_slots[edge], 1)` — atomicAdd.
+// `ferrite::barrier_wait(&g.barrier_slots[edge], expected)` —
+// volatile spin-load (see `ferrite_barrier.cuh`).
+
+fn emit_barrier_signal(n: &BarrierSignal) -> RoleBodies {
+    let edge = n.edge().raw();
+    let mut loader = CuBlock::new();
+    loader.push(CuStmt::new(
+        "if (kittens::warpid() == 0 && kittens::laneid() == 0) {".to_string(),
+    ));
+    loader.push(super::tk::barrier_signal(&gmem_barrier_slot_ptr(edge), 1));
+    loader.push(CuStmt::new("}".to_string()));
+    RoleBodies {
+        loader,
+        launcher: CuBlock::new(),
+        consumer: CuBlock::new(),
+        storer: CuBlock::new(),
+        skipped: None,
+    }
+}
+
+fn emit_barrier_wait(n: &BarrierWait) -> RoleBodies {
+    let edge = n.edge().raw();
+    let expected = n.expected().raw();
+    let mut loader = CuBlock::new();
+    loader.push(CuStmt::new(
+        "if (kittens::warpid() == 0 && kittens::laneid() == 0) {".to_string(),
+    ));
+    loader.push(super::tk::barrier_wait(
+        &gmem_barrier_slot_ptr(edge),
+        expected,
+    ));
+    loader.push(CuStmt::new("}".to_string()));
+    RoleBodies {
+        loader,
+        launcher: CuBlock::new(),
+        consumer: CuBlock::new(),
+        storer: CuBlock::new(),
+        skipped: None,
+    }
+}

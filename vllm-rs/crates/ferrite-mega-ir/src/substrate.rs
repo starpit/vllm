@@ -663,6 +663,35 @@ impl HeadDimRef {
     }
 }
 
+/// Verified positive `VOCAB_SIZE` (Embed kernel template arg).
+pub struct VocabSize<const N: u32>;
+impl<const N: u32> VocabSize<N> {
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0, "VocabSize: N must be > 0");
+        }
+        Self
+    }
+    pub const fn erase(self) -> VocabSizeRef {
+        VocabSizeRef::__new_for_erase(N)
+    }
+}
+impl<const N: u32> Default for VocabSize<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct VocabSizeRef(u32);
+impl VocabSizeRef {
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub(crate) const fn __new_for_erase(v: u32) -> Self {
+        Self(v)
+    }
+}
+
 /// Verified positive `INTERMEDIATE_DIM` template arg.
 pub struct IntermediateDim<const D: u32>;
 impl<const D: u32> IntermediateDim<D> {

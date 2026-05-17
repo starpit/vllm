@@ -650,6 +650,18 @@ impl<
         const WEIGHT_ACCESSOR_IDX: u32,
     >(
         &mut self,
+        _arrives: crate::substrate::ArrivesCount<ARRIVES>,
+        _out_page: crate::substrate::PageId<OUT_ID, NUM_PAGES>,
+        _weight_page: crate::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
+        _consumer_phase: crate::substrate::MbarrierPhase<CONSUMER_PHASE>,
+        _storer_phase: crate::substrate::MbarrierPhase<STORER_PHASE>,
+        _hidden_dim: crate::substrate::HiddenDim<HIDDEN_DIM>,
+        _num_tokens: crate::substrate::NumTokensConst<NUM_TOKENS>,
+        _vocab_size: crate::substrate::VocabSize<VOCAB_SIZE>,
+        _out_act_slot: crate::substrate::ActSlotConst<OUT_ACT_SLOT, { u32::MAX }>,
+        _weight_accessor_idx: crate::substrate::WeightAccessorConst<
+            WEIGHT_ACCESSOR_IDX, { u32::MAX },
+        >,
         embed_weight_path: String,
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_embed");
@@ -1572,19 +1584,35 @@ mod tests {
 
     #[test]
     fn lowers_embed() {
+        use crate::substrate::{
+            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            VocabSize, WeightAccessorConst,
+        };
         let mut b = BuilderD::new();
-        b.push_embed::<0, 1, 0, 1, 0, 2048, 8, 128_000, 0, 0>("W::embed".to_string());
+        b.push_embed(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(),
+            PageId::<1, 8>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            HiddenDim::<2048>::new(),
+            NumTokensConst::<8>::new(),
+            VocabSize::<128_000>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(),
+            WeightAccessorConst::<0, { u32::MAX }>::new(),
+            "W::embed".to_string(),
+        );
         let tape = b.finish();
         let MegaNode::Embed(n) = &tape.nodes()[0] else {
             panic!();
         };
-        assert_eq!(n.out_page_id(), 0);
-        assert_eq!(n.embed_weight_page_id(), 1);
-        assert_eq!(n.hidden_dim(), 2048);
-        assert_eq!(n.num_tokens(), 8);
-        assert_eq!(n.vocab_size(), 128_000);
-        assert_eq!(n.out_act_slot(), 0);
-        assert_eq!(n.weight_accessor_idx(), 0);
+        assert_eq!(n.out_page().raw(), 0);
+        assert_eq!(n.embed_weight_page().raw(), 1);
+        assert_eq!(n.hidden_dim().raw(), 2048);
+        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.vocab_size().raw(), 128_000);
+        assert_eq!(n.out_act_slot().raw(), 0);
+        assert_eq!(n.weight_accessor_idx().raw(), 0);
     }
 
     #[test]

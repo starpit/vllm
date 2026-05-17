@@ -53,7 +53,7 @@ pub use substrate::{
     IsLifecycleState, IsScratchScope, IsScratchScopePub, IsValidBarSyncId, IsValidHiddenDim,
     IsValidWarpRole, IterCount, IterCountRef, LayerRef, MbarrierPhase, MbarrierPhaseRef,
     MlpScope, NumKvHeads, NumKvHeadsRef, NumQHeads, NumQHeadsRef, NumTokensConst, NumTokensRef,
-    Page, PageId, PagePool, PageRef,
+    Page, PageId, PagePool, PageRef, VocabSize, VocabSizeRef,
     Produced, ROLE_CONSUMER, ROLE_LAUNCHER, ROLE_LOADER, ROLE_STORER, RmsNormScope, RopeScope,
     ScratchBytesRef, ScratchOffsetRef, ScratchRegion, SubstrateBudget, WarpRoleTag,
     WeightAccessorConst, WeightAccessorRef,

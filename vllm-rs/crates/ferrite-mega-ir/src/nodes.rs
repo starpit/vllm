@@ -1173,21 +1173,21 @@ impl FusedGateUpActivateMul {
 /// `VOCAB_SIZE × HIDDEN_DIM`. Loader needs `input_ids` (uint32_t*)
 /// as a kernel-level extra ptr (see `KernelExtras::needs_input_ids`).
 pub struct Embed {
-    out_page_id: u32,
-    embed_weight_page_id: u32,
-    consumer_phase: u32,
-    storer_phase: u32,
-    hidden_dim: u32,
-    num_tokens: u32,
-    vocab_size: u32,
-    out_act_slot: u32,
-    weight_accessor_idx: u32,
+    out_page: crate::substrate::PageRef,
+    embed_weight_page: crate::substrate::PageRef,
+    consumer_phase: crate::substrate::MbarrierPhaseRef,
+    storer_phase: crate::substrate::MbarrierPhaseRef,
+    hidden_dim: crate::substrate::HiddenDimRef,
+    num_tokens: crate::substrate::NumTokensRef,
+    vocab_size: crate::substrate::VocabSizeRef,
+    out_act_slot: crate::substrate::ActSlotRef,
+    weight_accessor_idx: crate::substrate::WeightAccessorRef,
     pub embed_weight: WeightRef,
 }
 
 impl Embed {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new<
+    pub fn new<
         const OUT_ID: u32,
         const WEIGHT_ID: u32,
         const CONSUMER_PHASE: u32,
@@ -1203,8 +1203,6 @@ impl Embed {
         embed_weight: WeightRef,
     ) -> Self {
         const {
-            assert!(OUT_ID < NUM_PAGES, "Embed: OUT_ID OOB");
-            assert!(WEIGHT_ID < NUM_PAGES, "Embed: WEIGHT_ID OOB");
             assert!(OUT_ID != WEIGHT_ID, "Embed: page alias");
             assert!(
                 CONSUMER_PHASE == ARRIVES & 1,
@@ -1214,49 +1212,51 @@ impl Embed {
                 STORER_PHASE == (ARRIVES + 1) & 1,
                 "Embed: STORER_PHASE parity"
             );
-            assert!(HIDDEN_DIM > 0, "Embed: HIDDEN_DIM must be > 0");
-            assert!(NUM_TOKENS > 0, "Embed: NUM_TOKENS must be > 0");
-            assert!(VOCAB_SIZE > 0, "Embed: VOCAB_SIZE must be > 0");
         }
+        use crate::substrate::{
+            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId, VocabSize,
+            WeightAccessorConst,
+        };
         Self {
-            out_page_id: OUT_ID,
-            embed_weight_page_id: WEIGHT_ID,
-            consumer_phase: CONSUMER_PHASE,
-            storer_phase: STORER_PHASE,
-            hidden_dim: HIDDEN_DIM,
-            num_tokens: NUM_TOKENS,
-            vocab_size: VOCAB_SIZE,
-            out_act_slot: OUT_ACT_SLOT,
-            weight_accessor_idx: WEIGHT_ACCESSOR_IDX,
+            out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
+            embed_weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
+            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
+            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
+            num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
+            vocab_size: VocabSize::<VOCAB_SIZE>::new().erase(),
+            out_act_slot: ActSlotConst::<OUT_ACT_SLOT, { u32::MAX }>::new().erase(),
+            weight_accessor_idx: WeightAccessorConst::<WEIGHT_ACCESSOR_IDX, { u32::MAX }>::new()
+                .erase(),
             embed_weight,
         }
     }
 
-    pub const fn out_page_id(&self) -> u32 {
-        self.out_page_id
+    pub const fn out_page(&self) -> crate::substrate::PageRef {
+        self.out_page
     }
-    pub const fn embed_weight_page_id(&self) -> u32 {
-        self.embed_weight_page_id
+    pub const fn embed_weight_page(&self) -> crate::substrate::PageRef {
+        self.embed_weight_page
     }
-    pub const fn consumer_phase(&self) -> u32 {
+    pub const fn consumer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.consumer_phase
     }
-    pub const fn storer_phase(&self) -> u32 {
+    pub const fn storer_phase(&self) -> crate::substrate::MbarrierPhaseRef {
         self.storer_phase
     }
-    pub const fn hidden_dim(&self) -> u32 {
+    pub const fn hidden_dim(&self) -> crate::substrate::HiddenDimRef {
         self.hidden_dim
     }
-    pub const fn num_tokens(&self) -> u32 {
+    pub const fn num_tokens(&self) -> crate::substrate::NumTokensRef {
         self.num_tokens
     }
-    pub const fn vocab_size(&self) -> u32 {
+    pub const fn vocab_size(&self) -> crate::substrate::VocabSizeRef {
         self.vocab_size
     }
-    pub const fn out_act_slot(&self) -> u32 {
+    pub const fn out_act_slot(&self) -> crate::substrate::ActSlotRef {
         self.out_act_slot
     }
-    pub const fn weight_accessor_idx(&self) -> u32 {
+    pub const fn weight_accessor_idx(&self) -> crate::substrate::WeightAccessorRef {
         self.weight_accessor_idx
     }
 }

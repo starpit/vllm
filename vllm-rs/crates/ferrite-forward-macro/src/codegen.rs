@@ -5497,16 +5497,25 @@ fn dispatch_instruction_to_push(
             let out_act_slot = lit(*out_slot);
             let weight_accessor_idx = lit(state.next_weight_accessor);
             let weight_str = weight.as_str();
+            let num_pages_lit = lit(state.num_pages_budget);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(quote! {
-                b.push_embed::<
-                    #out_id, #weight_id,
-                    #consumer_phase, #storer_phase,
-                    #arrives,
-                    #hidden_dim, #num_tokens, #vocab_size,
-                    #out_act_slot, #weight_accessor_idx,
-                >(#weight_str.to_string());
+                b.push_embed(
+                    ::ferrite_forward::mega_ir::ArrivesCount::<#arrives>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#out_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::PageId::<#weight_id, #num_pages_lit>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#consumer_phase>::new(),
+                    ::ferrite_forward::mega_ir::MbarrierPhase::<#storer_phase>::new(),
+                    ::ferrite_forward::mega_ir::HiddenDim::<#hidden_dim>::new(),
+                    ::ferrite_forward::mega_ir::NumTokensConst::<#num_tokens>::new(),
+                    ::ferrite_forward::mega_ir::VocabSize::<#vocab_size>::new(),
+                    ::ferrite_forward::mega_ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
+                    ::ferrite_forward::mega_ir::WeightAccessorConst::<
+                        #weight_accessor_idx, { u32::MAX },
+                    >::new(),
+                    #weight_str.to_string(),
+                );
             })
         }
         I::ScalarMul(in_slot, out_slot, scale) => {

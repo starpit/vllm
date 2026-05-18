@@ -202,6 +202,94 @@ fn should_use_mlx(device: &str) -> bool {
     matches!(device, "auto" | "metal")
 }
 
+/// Resolve the full set of stop-on-generate token IDs the engine
+/// should honor, merging three HuggingFace conventions:
+///
+/// 1. `config.json::eos_token_id` — single int or array. Always read.
+/// 2. `generation_config.json::eos_token_id` — same shape, but
+///    authoritative when present (HF transformers reads this first
+///    at `model.generate()` time; vLLM Python mirrors that).
+/// 3. `tokenizer_config.json::eos_token` — a string (or
+///    `{content: ...}` object) naming the actual end-of-turn token
+///    for the chat template (e.g. Llama-3-Instruct stores
+///    `"<|eot_id|>"` here, distinct from `config.json::eos_token_id`
+///    = 128001 which is `<|end_of_text|>`). Resolved against the
+///    loaded tokenizer's vocab; missing tokenizer → skipped.
+///
+/// Without #3 the chat loop never stops on `<|eot_id|>` (128009) for
+/// Llama-3-Instruct: `config.json::eos_token_id` is 128001, the base
+/// model's end-of-document token, which the Instruct fine-tune
+/// emits only after a final `<|eot_id|>`. Replicates the merge
+/// `transformers.generation.utils.GenerationMixin._prepare_generation_config`
+/// performs on the Python side.
+fn resolve_eos_token_ids(
+    hf_config: &HfModelConfig,
+    model_dir: Option<&std::path::Path>,
+    preloaded_tokenizer: Option<&tokenizers::Tokenizer>,
+) -> Vec<u32> {
+    fn extract_ids(v: &serde_json::Value) -> Vec<u32> {
+        if let Some(id) = v.as_u64() {
+            return vec![id as u32];
+        }
+        if let Some(arr) = v.as_array() {
+            return arr
+                .iter()
+                .filter_map(|e| e.as_u64().map(|id| id as u32))
+                .collect();
+        }
+        Vec::new()
+    }
+
+    let mut out: Vec<u32> = Vec::new();
+    let push = |id: u32, out: &mut Vec<u32>| {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    };
+
+    // (1) config.json::eos_token_id
+    if let Some(v) = hf_config.extra.get("eos_token_id") {
+        for id in extract_ids(v) {
+            push(id, &mut out);
+        }
+    }
+
+    let Some(dir) = model_dir else {
+        return out;
+    };
+
+    // (2) generation_config.json::eos_token_id
+    let gen_cfg_path = dir.join("generation_config.json");
+    if let Ok(bytes) = std::fs::read(&gen_cfg_path)
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(v) = json.get("eos_token_id")
+    {
+        for id in extract_ids(v) {
+            push(id, &mut out);
+        }
+    }
+
+    // (3) tokenizer_config.json::eos_token (string) → resolved via tokenizer.
+    let tok_cfg_path = dir.join("tokenizer_config.json");
+    if let (Ok(bytes), Some(tokenizer)) = (std::fs::read(&tok_cfg_path), preloaded_tokenizer)
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(eos) = json.get("eos_token")
+    {
+        let token_str: Option<&str> = if let Some(s) = eos.as_str() {
+            Some(s)
+        } else {
+            eos.get("content").and_then(|v| v.as_str())
+        };
+        if let Some(s) = token_str
+            && let Some(id) = tokenizer.token_to_id(s)
+        {
+            push(id, &mut out);
+        }
+    }
+
+    out
+}
+
 /// Result of worker creation: the worker plus metadata needed for init.
 ///
 /// The `usize` is the KV cache element size in bytes (e.g. 2 for F16/BF16, 4 for F32).
@@ -574,21 +662,11 @@ fn initialize_core(
 
     let executor = UniProcExecutor::new_pre_initialized(worker);
 
-    let eos_token_ids: Vec<u32> = hf_config
-        .extra
-        .get("eos_token_id")
-        .map(|v| {
-            if let Some(id) = v.as_u64() {
-                vec![id as u32]
-            } else if let Some(arr) = v.as_array() {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|id| id as u32))
-                    .collect()
-            } else {
-                vec![]
-            }
-        })
-        .unwrap_or_default();
+    let eos_token_ids: Vec<u32> = resolve_eos_token_ids(
+        &hf_config,
+        model_dir.as_deref(),
+        preloaded_tokenizer.as_ref(),
+    );
     if !eos_token_ids.is_empty() {
         info!("EOS token IDs: {:?}", eos_token_ids);
     }

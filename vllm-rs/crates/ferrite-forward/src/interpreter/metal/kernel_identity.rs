@@ -68,32 +68,20 @@ pub trait MetalKernel {
 }
 
 // ── AttentionPrefillSdpaPaged variants ─────────────────────────────
-
-/// `attention_steel_paged_bf16_bq32_bk16_bd128_wm4_wn1_bs16` (the
-/// production prefill kernel at HEAD; mirrors MLX SDPA via the FA-2
-/// steel template).
-pub struct AttentionSteelPagedBf16;
-
-impl MetalKernel for AttentionSteelPagedBf16 {
-    type Constants = AttentionPrefillPagedConstants;
-    type BindingSet = AttentionPrefillPagedBindingSet;
-    const LIBRARY: &'static str = "attention_steel_paged";
-    const FUNCTION: &'static str =
-        "attention_steel_paged_bf16_bq32_bk16_bd128_wm4_wn1_bs16";
-    const KERNEL_ID: KernelId = KernelId::AttentionPrefillSdpaPaged;
-}
-
-/// `attention_steel_paged_f16_bq32_bk16_bd128_wm4_wn1_bs16`.
-pub struct AttentionSteelPagedF16;
-
-impl MetalKernel for AttentionSteelPagedF16 {
-    type Constants = AttentionPrefillPagedConstants;
-    type BindingSet = AttentionPrefillPagedBindingSet;
-    const LIBRARY: &'static str = "attention_steel_paged";
-    const FUNCTION: &'static str =
-        "attention_steel_paged_f16_bq32_bk16_bd128_wm4_wn1_bs16";
-    const KERNEL_ID: KernelId = KernelId::AttentionPrefillSdpaPaged;
-}
+//
+// `attention_steel_paged` does NOT have a typed ZST per (dtype, BD)
+// combo: BD (head_dim) is part of the symbol name, and emitting one
+// `pub struct ...` + `MetalKernel` impl per combination would
+// duplicate the head-dim list in N places. Instead, the lowering arm
+// looks up the symbol at dispatch time via
+// `ferrite_metal_kernels::steel_paged::steel_paged_symbol(dtype, head_dim)`,
+// whose match arms are codegen'd from
+// `ferrite-metal-kernels/build.rs::STEEL_PAGED_HEAD_DIMS` — the same
+// list `attention_steel_paged_instantiations.h` is emitted from. See
+// `lowering.rs::AttentionPrefillPaged`.
+//
+// SDPA fallback below stays typed: its symbol is fully static (one
+// per dtype, no per-combo template instantiation).
 
 /// `attention_prefill_sdpa_v2_paged_bf16_specialized` (the
 /// known-correct sdpa_vector port, kept as fallback behind

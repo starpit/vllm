@@ -6,6 +6,16 @@
 //! Provides Metal device management, shader compilation, and kernel dispatch
 //! primitives for Apple Silicon GPUs.
 
+/// Compile-time-generated kernel instantiation tables. The
+/// `STEEL_PAGED_HEAD_DIMS` slice and `steel_paged_symbol()` lookup
+/// in here are emitted by `build.rs` from the same head-dim list
+/// that produces `attention_steel_paged_instantiations.h`. The
+/// dispatcher in `ferrite-forward/.../lowering.rs` must consume
+/// these — never hand-list head dims at the call site.
+pub mod steel_paged {
+    include!(concat!(env!("OUT_DIR"), "/steel_paged_kernels_generated.rs"));
+}
+
 pub mod activation;
 pub mod allocator;
 pub mod argmax;

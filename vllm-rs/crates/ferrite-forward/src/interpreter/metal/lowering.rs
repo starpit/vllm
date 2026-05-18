@@ -1861,25 +1861,32 @@ fn lower_one<W: CanonicalParams>(
             // independent `&'static str` fields — can't recur.
             use super::kernel_identity::{
                 AttentionSdpaPagedBf16, AttentionSdpaPagedF16,
-                AttentionSteelPagedBf16, AttentionSteelPagedF16,
             };
+            use ferrite_metal_kernels::steel_paged::steel_paged_symbol;
             let n_q_heads = W::NUM_Q_HEADS;
             const BQ_STEEL: u32 = 32;
-            // Steel attention paged is only instantiated for HEAD_DIM=128
-            // in `attention_steel_paged.metal`. Routing a HEAD_DIM=64
-            // model (Llama-3.2-1B, TinyLlama-1.1B) through the steel
-            // kernel produces silently-wrong logits — verified on
-            // mlx-community/Llama-3.2-1B-Instruct-4bit prefill on M1
-            // and M4: coherent output ("2 + 2 = 4", "Paris") with
-            // SDPA, garbage ("Question 2.0...", "irrelevant.") with
-            // steel. Gate steel on HEAD_DIM == 128 unconditionally
-            // (including under the `force` override — the kernel
-            // simply isn't built for other head dims).
-            let steel_head_dim_ok = W::HEAD_DIM == 128;
+            // Steel attention paged needs an instantiation in
+            // `attention_steel_paged.metal` for the model's HEAD_DIM
+            // (BD template arg). The instantiation list is owned by
+            // `ferrite-metal-kernels/build.rs::STEEL_PAGED_HEAD_DIMS`
+            // and exposed here through `steel_paged_symbol()` —
+            // `Some(symbol)` means the (dtype, head_dim) combo is
+            // built; `None` means we must fall through to SDPA.
+            //
+            // Routing a HEAD_DIM that's NOT instantiated through
+            // steel produces silently-wrong logits (MSL template-
+            // instance lookup fails or, worse, links to the wrong
+            // `_bd<X>_` symbol — verified on Llama-3.2-1B, HEAD_DIM=64,
+            // before the lookup-driven gate landed).
+            let steel_dtype_tag: &str = match W::METAL_DTYPE {
+                super::lowered::MetalDtype::Bf16 => "bf16",
+                _ => "f16",
+            };
+            let steel_symbol = steel_paged_symbol(steel_dtype_tag, W::HEAD_DIM);
             let use_steel = match std::env::var("FERRITE_METAL_STEEL_ATTN").ok().as_deref() {
                 Some("0") | Some("off") | Some("false") => false,
-                Some("force") | Some("always") => steel_head_dim_ok,
-                _ => steel_head_dim_ok && bucket_m >= BQ_STEEL,
+                Some("force") | Some("always") => steel_symbol.is_some(),
+                _ => steel_symbol.is_some() && bucket_m >= BQ_STEEL,
             };
             let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
                 let nq_blocks = bucket_m.div_ceil(BQ_STEEL);
@@ -1924,23 +1931,35 @@ fn lower_one<W: CanonicalParams>(
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
             };
-            match (use_steel, W::METAL_DTYPE) {
-                (true, super::lowered::MetalDtype::Bf16) => {
-                    LoweredCommand::for_kernel::<AttentionSteelPagedBf16>(
-                        constants, bindings, dispatch,
-                    )
+            if use_steel {
+                // Symbol came from the codegen'd table above
+                // (`steel_symbol.is_some()` is the gate). Build the
+                // command directly instead of going through
+                // `for_kernel::<K>` — there's no typed ZST for steel
+                // because BD lives in the symbol name; see the
+                // comment in `kernel_identity.rs`.
+                let function = steel_symbol
+                    .expect("steel_symbol is Some when use_steel is true");
+                LoweredCommand {
+                    kernel: KernelId::AttentionPrefillSdpaPaged,
+                    library: "attention_steel_paged",
+                    function,
+                    constants: constants.into(),
+                    dispatch,
+                    bindings: bindings.into(),
+                    gemm_dims: None,
                 }
-                (true, _) => LoweredCommand::for_kernel::<AttentionSteelPagedF16>(
-                    constants, bindings, dispatch,
-                ),
-                (false, super::lowered::MetalDtype::Bf16) => {
-                    LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(
+            } else {
+                match W::METAL_DTYPE {
+                    super::lowered::MetalDtype::Bf16 => {
+                        LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(
+                            constants, bindings, dispatch,
+                        )
+                    }
+                    _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(
                         constants, bindings, dispatch,
-                    )
+                    ),
                 }
-                (false, _) => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(
-                    constants, bindings, dispatch,
-                ),
             }
         }
 

@@ -11,13 +11,29 @@
 
 #include "mlx_steel_attn/steel_attention_paged_kernel.h"
 
-// Llama-3.2-{1B,3B,8B} shape: BQ=32, BK=16, BD=128, WM=4, WN=1.
-// BLOCK_SIZE=16 (ferrite-metal paged-cache block size matches BK
-// so one MLX kb iter = one paged block).
-template [[host_name("attention_steel_paged_f16_bq32_bk16_bd128_wm4_wn1_bs16")]]
-[[kernel]] decltype(attention_paged<half, 32, 16, 128, 4, 1, 16, float>)
-    attention_paged<half, 32, 16, 128, 4, 1, 16, float>;
+// Tile shape: BQ=32, BK=16, WM=4, WN=1. BLOCK_SIZE=16 matches the
+// ferrite-metal paged-cache block size so one MLX kb iter = one paged
+// block. BD (head_dim) is the only axis that varies across supported
+// arches.
+//
+// Single source of truth for the (dtype, BD) instantiation list
+// lives in `ferrite-metal-kernels/build.rs::STEEL_PAGED_HEAD_DIMS`.
+// build.rs writes:
+//   - `attention_steel_paged_instantiations.h` (this include) — the
+//     `INST_STEEL_PAGED(tag, type, bd)` expansion lines.
+//   - `steel_paged_kernels_generated.rs` — the Rust dispatcher's
+//     symbol table, mirroring the same list.
+//
+// Add a HEAD_DIM in build.rs and both sides pick it up. Adding it
+// here would link to `steel_paged_symbol()` returning `None` for the
+// new dim and the dispatcher would silently fall through to SDPA;
+// adding it in Rust without here would call `library.get_function()`
+// for an absent symbol and panic at pipeline-build time.
+#define INST_STEEL_PAGED(dt_tag, dt_type, bd)                              \
+  template [[host_name(                                                    \
+      "attention_steel_paged_" #dt_tag "_bq32_bk16_bd" #bd "_wm4_wn1_bs16" \
+  )]] [[kernel]]                                                           \
+  decltype(attention_paged<dt_type, 32, 16, bd, 4, 1, 16, float>)          \
+      attention_paged<dt_type, 32, 16, bd, 4, 1, 16, float>;
 
-template [[host_name("attention_steel_paged_bf16_bq32_bk16_bd128_wm4_wn1_bs16")]]
-[[kernel]] decltype(attention_paged<bfloat, 32, 16, 128, 4, 1, 16, float>)
-    attention_paged<bfloat, 32, 16, 128, 4, 1, 16, float>;
+#include "attention_steel_paged_instantiations.h"

@@ -197,8 +197,8 @@ pub fn render_rms_norm<
         &act_rv, &in_smem,
     ));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP>(&sq_rv, &act_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&sq_rv, &sq_rv, &sq_rv));
+    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__rms_partial_sum", "0.0f");
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
@@ -224,7 +224,7 @@ pub fn render_rms_norm<
         &weight_rv,
         &weight_smem,
     ));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&act_rv, &act_rv, &weight_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
 
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &in_smem, &act_rv,
@@ -315,7 +315,7 @@ pub fn render_add<
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &res_rv, &residual_smem,
     ));
-    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP>(&res_rv, &res_rv, &delta_rv));
+    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &residual_smem, &res_rv,
     ));
@@ -595,10 +595,10 @@ pub fn render_fused_add_rms_norm<
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &res_rv, &residual_smem,
     ));
-    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP>(&res_rv, &res_rv, &delta_rv));
+    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP>(&sq_rv, &res_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&sq_rv, &sq_rv, &sq_rv));
+    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &res_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__farn_partial_sum", "0.0f");
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
@@ -622,7 +622,7 @@ pub fn render_fused_add_rms_norm<
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &weight_rv, &weight_smem,
     ));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&res_rv, &res_rv, &weight_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &weight_rv));
 
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &residual_smem, &res_rv,
@@ -725,8 +725,8 @@ pub fn render_scalar_offset_rms_norm<
         &act_rv, &in_smem,
     ));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP>(&sq_rv, &act_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&sq_rv, &sq_rv, &sq_rv));
+    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__sors_partial_sum", "0.0f");
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
@@ -751,7 +751,7 @@ pub fn render_scalar_offset_rms_norm<
     ));
     let offset_lit = CuExpr::new(format!("{:e}f", offset));
     consumer.push(tk20::warp_add_rv_scalar_f32::<K_PER_WARP>(&weight_rv, &weight_rv, &offset_lit));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&act_rv, &act_rv, &weight_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
 
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
         &in_smem, &act_rv,
@@ -1384,7 +1384,7 @@ pub fn render_tk_fused_norm_gemm<
         consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, K>(
             &delta_rv, delta_sv,
         ));
-        consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP>(&act_rv, &act_rv, &delta_rv));
+        consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &delta_rv));
     }
 
     if matches!(norm_kind, LmHeadNormKind::MeanSubRmsNorm) {
@@ -1408,8 +1408,8 @@ pub fn render_tk_fused_norm_gemm<
         ));
     }
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP>(&sq_rv, &act_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&sq_rv, &sq_rv, &sq_rv));
+    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__lmh_partial_sum", "0.0f");
     consumer.push(decl_partial);
     consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
@@ -1439,7 +1439,7 @@ pub fn render_tk_fused_norm_gemm<
             &weight_rv, &weight_rv, &offset_lit,
         ));
     }
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP>(&act_rv, &act_rv, &weight_rv));
+    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
 
     consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, K>(
         &in_sv, &act_rv,
@@ -2224,16 +2224,19 @@ fn render_attention_via_cache_impl<
         "kittens::warp::load(__attn_q_rt, __attn_q_sub);".to_string(),
     ));
 
-    // Running state: max_vec, sum_vec (rv_fl<Q_HEAD_TILE_ROWS>),
-    // o_reg (rt_fl<Q_HEAD_TILE_ROWS, HEAD_DIM>).
+    // Running state: max_vec, sum_vec (rv_fl<Q_HEAD_TILE_ROWS, ortho>
+    // — ortho layout matches `rt<row>::col_vec_layout` per
+    // `rt_base.cuh:79`, required by row_max/row_sum/sub_row/mul_row/
+    // div_row), o_reg (rt_fl<Q_HEAD_TILE_ROWS, HEAD_DIM, row>).
     let (decl_max, max_rv) =
         tk20::decl_rv_fl_neg_infty::<Q_HEAD_TILE_ROWS>("__attn_max");
-    let (decl_sum, sum_rv) = tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_sum");
+    let (decl_sum, sum_rv) =
+        tk20::decl_rv_fl_ortho::<Q_HEAD_TILE_ROWS>("__attn_sum");
     let (decl_o, o_rt) =
         tk20::decl_rt_fl::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o");
     q_head_body.push(decl_max);
     q_head_body.push(decl_sum);
-    q_head_body.push(tk20::warp_zero_rv::<Q_HEAD_TILE_ROWS>(&sum_rv));
+    q_head_body.push(tk20::warp_zero_rv::<Q_HEAD_TILE_ROWS, _>(&sum_rv));
     q_head_body.push(decl_o);
     q_head_body.push(tk20::warp_zero_rt::<F32, RtRow, Q_HEAD_TILE_ROWS, HEAD_DIM>(
         &o_rt,
@@ -2346,7 +2349,7 @@ fn render_attention_via_cache_impl<
             &att_rt,
             &format!(
                 "((static_cast<int>(__attn_p) * {bs} + col) < \
-                 (__attn_seq_len - 1 - {w})) ? -CUDART_INF_F : x",
+                 (__attn_seq_len - 1 - {w})) ? kittens::base_types::constants<float>::neg_infty() : x",
                 bs = BLOCK_SIZE,
                 w = w,
             ),
@@ -2359,14 +2362,14 @@ fn render_attention_via_cache_impl<
         &att_rt,
         &format!(
             "((static_cast<int>(__attn_p) * {bs} + col) >= __attn_seq_len) \
-             ? -CUDART_INF_F : x",
+             ? kittens::base_types::constants<float>::neg_infty() : x",
             bs = BLOCK_SIZE,
         ),
     ));
 
     // Online softmax update.
     let (decl_new_max, new_max_rv) =
-        tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_new_max");
+        tk20::decl_rv_fl_ortho::<Q_HEAD_TILE_ROWS>("__attn_new_max");
     p_body.push(decl_new_max);
     p_body.push(tk20::warp_row_max_running::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
         &new_max_rv,
@@ -2384,16 +2387,16 @@ fn render_attention_via_cache_impl<
     ));
     // rescale = exp(max_vec - new_max).
     let (decl_rescale, rescale_rv) =
-        tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_rescale");
+        tk20::decl_rv_fl_ortho::<Q_HEAD_TILE_ROWS>("__attn_rescale");
     p_body.push(decl_rescale);
-    p_body.push(tk20::warp_sub_rv_rv::<Q_HEAD_TILE_ROWS>(
+    p_body.push(tk20::warp_sub_rv_rv::<Q_HEAD_TILE_ROWS, _>(
         &rescale_rv,
         &max_rv,
         &new_max_rv,
     ));
-    p_body.push(tk20::warp_exp_rv::<Q_HEAD_TILE_ROWS>(&rescale_rv, &rescale_rv));
+    p_body.push(tk20::warp_exp_rv::<Q_HEAD_TILE_ROWS, _>(&rescale_rv, &rescale_rv));
     // sum_vec = row_sum(att, rescale * sum_vec).
-    p_body.push(tk20::warp_mul_rv_rv::<Q_HEAD_TILE_ROWS>(
+    p_body.push(tk20::warp_mul_rv_rv::<Q_HEAD_TILE_ROWS, _>(
         &sum_rv,
         &sum_rv,
         &rescale_rv,
@@ -2408,7 +2411,7 @@ fn render_attention_via_cache_impl<
         &rescale_rv,
     ));
     // max_vec = new_max (reuse register).
-    p_body.push(tk20::warp_copy_rv::<F32, Q_HEAD_TILE_ROWS>(
+    p_body.push(tk20::warp_copy_rv::<F32, Q_HEAD_TILE_ROWS, _>(
         &max_rv,
         &new_max_rv,
     ));

@@ -148,6 +148,56 @@ impl RtLayoutTag for RtCol {
     }
 }
 
+// Register vector layout tag — `kittens::ducks::rv_layout::naive`,
+// `::ortho`, or `::align`
+// (`third_party/thunderkittens/include/types/register/rv_layout.cuh:18-28`).
+//
+// `naive` is the default unreplicated layout (`dtype == T`), used for
+// per-token coalesced loads (e.g. RMS scale) and cross-warp scalar
+// reductions. `ortho` and `align` are tile-interaction layouts whose
+// `dtype == T2` (packed float2 / bf16x2) so element-wise ops compose
+// with `rt` packed register data.
+//
+// Per `rt_base.cuh:78-79`:
+// - `rt<row>::col_vec_layout = ortho` (used for ROW reductions —
+//   `row_max`, `row_sum`, `mul_row`, `div_row`, `sub_row`, ...).
+// - `rt<row>::row_vec_layout = align` (used for COL reductions).
+// - `rt<col>` swaps the two.
+//
+// The `tk20::warp_row_*` / `tk20::warp_*_row` bindings constrain
+// their `Rv` arg to the matching layout tag at the Rust type level
+// per [[feedback-end-to-end-compile-time-proofs]]; passing a
+// `Rv<_, _, Naive>` to a row-reduction binding is a Rust type
+// error, not a TK 2.0 `static_assert`.
+#[derive(Clone, Copy, Debug)]
+pub struct Naive;
+#[derive(Clone, Copy, Debug)]
+pub struct Ortho;
+#[derive(Clone, Copy, Debug)]
+pub struct Align;
+pub trait RvLayoutTag {
+    /// CUDA token for the rv layout template arg. Empty string for
+    /// `naive` (the C++ default) so `kittens::rv_fl<LEN>` continues
+    /// to compile to the same naive layout it always has — only
+    /// `ortho` / `align` tags emit an explicit layout template arg.
+    fn cuda_layout_arg() -> &'static str;
+}
+impl RvLayoutTag for Naive {
+    fn cuda_layout_arg() -> &'static str {
+        ""
+    }
+}
+impl RvLayoutTag for Ortho {
+    fn cuda_layout_arg() -> &'static str {
+        ", kittens::ducks::rv_layout::ortho"
+    }
+}
+impl RvLayoutTag for Align {
+    fn cuda_layout_arg() -> &'static str {
+        ", kittens::ducks::rv_layout::align"
+    }
+}
+
 // ============================================================
 // Shared / register / pointer / semaphore handles
 // ============================================================
@@ -176,25 +226,29 @@ impl<T: DtypeName + SvCudaName, const LEN: u32> Sv<T, LEN> {
     }
 }
 
-/// Register column vector — `kittens::rv_<dtype><LEN>`. `LEN` const
-/// generic.
+/// Register column vector — `kittens::rv_<dtype><LEN, layout>`. `LEN`
+/// const generic; `L` is a phantom-typed [`RvLayoutTag`] (default
+/// [`Naive`]) so the Rust type carries the rv's layout and binding
+/// surface can constrain (e.g. row-tile reductions require [`Ortho`]).
 #[derive(Clone, Debug)]
-pub struct Rv<T, const LEN: u32> {
+pub struct Rv<T, const LEN: u32, L = Naive> {
     expr: CuExpr,
     _t: PhantomData<T>,
+    _l: PhantomData<L>,
 }
-impl<T: DtypeName + RvCudaName, const LEN: u32> Rv<T, LEN> {
+impl<T: DtypeName + RvCudaName, const LEN: u32, L: RvLayoutTag> Rv<T, LEN, L> {
     pub(super) fn from_expr(expr: CuExpr) -> Self {
         Self {
             expr,
             _t: PhantomData,
+            _l: PhantomData,
         }
     }
     pub(super) fn expr(&self) -> &CuExpr {
         &self.expr
     }
     pub fn cuda_type() -> String {
-        format!("{}<{}>", T::rv_token(), LEN)
+        format!("{}<{}{}>", T::rv_token(), LEN, L::cuda_layout_arg())
     }
 }
 

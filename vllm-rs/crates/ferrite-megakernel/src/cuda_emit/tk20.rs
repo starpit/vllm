@@ -31,8 +31,8 @@
 
 use super::cu::{CuExpr, CuStmt};
 use super::handles::{
-    Bf16, F32, GmemPtrRaw, Rt, RtCol, RtCudaName, RtLayoutTag, RtRow, Rv, RvCudaName,
-    Semaphore, ScratchPtr, St, Sv,
+    Bf16, F32, GmemPtrRaw, Naive, Ortho, Rt, RtCol, RtCudaName, RtLayoutTag, RtRow, Rv, RvCudaName,
+    RvLayoutTag, Semaphore, ScratchPtr, St, Sv,
 };
 
 // ============================================================
@@ -214,10 +214,14 @@ pub fn group_store_rv_to_sv_f32_to_bf16<
 /// `kittens::warp::copy(dst, src);` — register-vec dtype-converting
 /// copy.
 ///
-/// Source: `include/ops/group/register/vec/maps.cuh:176`
-pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName, const LEN: u32>(
-    dst: &Rv<T, LEN>,
-    src: &Rv<T, LEN>,
+/// Source: `include/ops/group/register/vec/maps.cuh:176`.
+///
+/// Generic over rv layout `L`: the copy walks `outer_dim x inner_dim`
+/// purely from each operand's compile-time shape, so any layout
+/// works as long as `dst` and `src` agree.
+pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName, const LEN: u32, L: RvLayoutTag>(
+    dst: &Rv<T, LEN, L>,
+    src: &Rv<T, LEN, L>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::copy({dst}, {src});",
@@ -230,10 +234,12 @@ pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName, const LEN: u32>(
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:359` (rv-rv
 /// overload via the `bin_op` template at `:35`).
-pub fn warp_mul_rv_rv<const LEN: u32>(
-    dst: &Rv<F32, LEN>,
-    lhs: &Rv<F32, LEN>,
-    rhs: &Rv<F32, LEN>,
+///
+/// Generic over rv layout `L` — see [`warp_copy_rv`].
+pub fn warp_mul_rv_rv<const LEN: u32, L: RvLayoutTag>(
+    dst: &Rv<F32, LEN, L>,
+    lhs: &Rv<F32, LEN, L>,
+    rhs: &Rv<F32, LEN, L>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::mul({dst}, {lhs}, {rhs});",
@@ -245,11 +251,13 @@ pub fn warp_mul_rv_rv<const LEN: u32>(
 
 /// `kittens::warp::add(dst, lhs, rhs);` — rv-rv elementwise add.
 ///
-/// Source: `include/ops/group/register/vec/maps.cuh:333`
-pub fn warp_add_rv_rv<const LEN: u32>(
-    dst: &Rv<F32, LEN>,
-    lhs: &Rv<F32, LEN>,
-    rhs: &Rv<F32, LEN>,
+/// Source: `include/ops/group/register/vec/maps.cuh:333`.
+///
+/// Generic over rv layout `L` — see [`warp_copy_rv`].
+pub fn warp_add_rv_rv<const LEN: u32, L: RvLayoutTag>(
+    dst: &Rv<F32, LEN, L>,
+    lhs: &Rv<F32, LEN, L>,
+    rhs: &Rv<F32, LEN, L>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::add({dst}, {lhs}, {rhs});",
@@ -534,10 +542,33 @@ pub fn warp_apply_f32_lambda<const LEN: u32>(
 // ============================================================
 
 /// `kittens::rv_fl<LEN> <name>;` — declare a local register vector
-/// + return a handle bound to it.
-pub fn decl_rv_fl<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN>) {
+/// in the default [`Naive`] layout. Use [`decl_rv_fl_ortho`] when
+/// the rv is going to interact with `rt<row>` reductions/maps.
+pub fn decl_rv_fl<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN, Naive>) {
     let stmt = CuStmt::new(format!("kittens::rv_fl<{LEN}> {name};"));
-    (stmt, Rv::<F32, LEN>::from_expr(CuExpr::new(name.to_string())))
+    (
+        stmt,
+        Rv::<F32, LEN, Naive>::from_expr(CuExpr::new(name.to_string())),
+    )
+}
+
+/// `kittens::rv_fl<LEN, kittens::ducks::rv_layout::ortho> <name>;` —
+/// declare a local register vector in [`Ortho`] layout, suitable for
+/// row reductions (`row_max`, `row_sum`) and row maps (`mul_row`,
+/// `div_row`, `sub_row`) over `rt<row>` tiles.
+///
+/// Per `rt_base.cuh:79`, `rt<row>::col_vec_layout = ortho`. The
+/// row-touching tk20 bindings constrain their rv arg to [`Ortho`]
+/// at the Rust type level, so the emitted CUDA composes with TK
+/// 2.0's `static_assert` guard at `maps.cuh:149-150`.
+pub fn decl_rv_fl_ortho<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN, Ortho>) {
+    let stmt = CuStmt::new(format!(
+        "kittens::rv_fl<{LEN}, kittens::ducks::rv_layout::ortho> {name};"
+    ));
+    (
+        stmt,
+        Rv::<F32, LEN, Ortho>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `float <name> = 0.0f;` — declare a fp32 scalar accumulator;
@@ -882,8 +913,14 @@ pub fn group_tma_store_async_raw_st_bf<
 /// of a tile into a row vector. Initial pass (no running accum).
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:253`.
+///
+/// Per `rt_base.cuh:79`, `rt<row>::col_vec_layout = ortho`, so the
+/// rv must be [`Ortho`]-layout for its packed `dtype = float2` to
+/// match the rt's data type — passing a [`Naive`]-layout rv triggers
+/// a TK 2.0 `static_assert` (and earlier a `dtype` template-arg
+/// mismatch).
 pub fn warp_row_max_init<const ROWS: u32, const COLS: u32>(
-    rv_dst: &Rv<F32, ROWS>,
+    rv_dst: &Rv<F32, ROWS, Ortho>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
 ) -> CuStmt {
     CuStmt::new(format!(
@@ -899,10 +936,12 @@ pub fn warp_row_max_init<const ROWS: u32, const COLS: u32>(
 /// across KV blocks.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:303`.
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_row_max_running<const ROWS: u32, const COLS: u32>(
-    rv_dst: &Rv<F32, ROWS>,
+    rv_dst: &Rv<F32, ROWS, Ortho>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
-    rv_src_accum: &Rv<F32, ROWS>,
+    rv_src_accum: &Rv<F32, ROWS, Ortho>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::row_max({rv}, {rt}, {acc});",
@@ -916,8 +955,10 @@ pub fn warp_row_max_running<const ROWS: u32, const COLS: u32>(
 /// Initial pass.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:277`.
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_row_sum_init<const ROWS: u32, const COLS: u32>(
-    rv_dst: &Rv<F32, ROWS>,
+    rv_dst: &Rv<F32, ROWS, Ortho>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
 ) -> CuStmt {
     CuStmt::new(format!(
@@ -932,10 +973,12 @@ pub fn warp_row_sum_init<const ROWS: u32, const COLS: u32>(
 /// track `sum_prev * scale + row_sum(exp(scores))`.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:329`.
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_row_sum_running<const ROWS: u32, const COLS: u32>(
-    rv_dst: &Rv<F32, ROWS>,
+    rv_dst: &Rv<F32, ROWS, Ortho>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
-    rv_src_accum: &Rv<F32, ROWS>,
+    rv_src_accum: &Rv<F32, ROWS, Ortho>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::row_sum({rv}, {rt}, {acc});",
@@ -967,7 +1010,12 @@ pub fn warp_exp_rt<const ROWS: u32, const COLS: u32>(
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `unary_map<base_ops::exp>` analogous to the tile variant).
-pub fn warp_exp_rv<const LEN: u32>(rv_dst: &Rv<F32, LEN>, rv_src: &Rv<F32, LEN>) -> CuStmt {
+///
+/// Generic over rv layout `L` — see [`warp_copy_rv`].
+pub fn warp_exp_rv<const LEN: u32, L: RvLayoutTag>(
+    rv_dst: &Rv<F32, LEN, L>,
+    rv_src: &Rv<F32, LEN, L>,
+) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::exp({dst}, {src});",
         dst = rv_dst.expr(),
@@ -981,10 +1029,12 @@ pub fn warp_exp_rv<const LEN: u32>(rv_dst: &Rv<F32, LEN>, rv_src: &Rv<F32, LEN>)
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `bin_map<base_ops::sub>`).
-pub fn warp_sub_rv_rv<const LEN: u32>(
-    rv_dst: &Rv<F32, LEN>,
-    rv_lhs: &Rv<F32, LEN>,
-    rv_rhs: &Rv<F32, LEN>,
+///
+/// Generic over rv layout `L` — see [`warp_copy_rv`].
+pub fn warp_sub_rv_rv<const LEN: u32, L: RvLayoutTag>(
+    rv_dst: &Rv<F32, LEN, L>,
+    rv_lhs: &Rv<F32, LEN, L>,
+    rv_rhs: &Rv<F32, LEN, L>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::sub({dst}, {lhs}, {rhs});",
@@ -1000,10 +1050,12 @@ pub fn warp_sub_rv_rv<const LEN: u32>(
 /// online-softmax body.
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:758`.
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_sub_row<const ROWS: u32, const COLS: u32>(
     rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
-    rv_row_values: &Rv<F32, ROWS>,
+    rv_row_values: &Rv<F32, ROWS, Ortho>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::sub_row({dst}, {src}, {rv});",
@@ -1020,10 +1072,12 @@ pub fn warp_sub_row<const ROWS: u32, const COLS: u32>(
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh` (mirror of
 /// `add_row` / `sub_row` at :736-784).
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_mul_row<const ROWS: u32, const COLS: u32>(
     rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
-    rv_row_values: &Rv<F32, ROWS>,
+    rv_row_values: &Rv<F32, ROWS, Ortho>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::mul_row({dst}, {src}, {rv});",
@@ -1048,13 +1102,41 @@ pub fn warp_mul_row<const ROWS: u32, const COLS: u32>(
 pub fn decl_rv_fl_init_scalar<const LEN: u32>(
     name: &str,
     init_scalar: &str,
-) -> (CuStmt, Rv<F32, LEN>) {
+) -> (CuStmt, Rv<F32, LEN, Naive>) {
     let stmt = CuStmt::new(format!(
         "kittens::rv_fl<{LEN}> {name};\n\
          kittens::warp::zero({name});\n\
          kittens::warp::add({name}, {name}, {init_scalar});"
     ));
-    (stmt, Rv::<F32, LEN>::from_expr(CuExpr::new(name.to_string())))
+    (
+        stmt,
+        Rv::<F32, LEN, Naive>::from_expr(CuExpr::new(name.to_string())),
+    )
+}
+
+/// [`Ortho`]-layout sibling of [`decl_rv_fl_init_scalar`]: declare a
+/// `kittens::rv_fl<LEN, kittens::ducks::rv_layout::ortho>` and
+/// broadcast-init each lane via `warp::zero` + `warp::add(rv, rv,
+/// scalar)`. Used for the `max_vec` running accumulator in
+/// FlashAttention-2 — its initial value `-INFINITY` lets any real
+/// score win on the first iteration.
+///
+/// `warp::add` and `warp::zero` are layout-generic per their bin/un
+/// `_op` templates (`vec/maps.cuh:35` / `:54`), so the same broadcast
+/// idiom works in ortho layout.
+pub fn decl_rv_fl_ortho_init_scalar<const LEN: u32>(
+    name: &str,
+    init_scalar: &str,
+) -> (CuStmt, Rv<F32, LEN, Ortho>) {
+    let stmt = CuStmt::new(format!(
+        "kittens::rv_fl<{LEN}, kittens::ducks::rv_layout::ortho> {name};\n\
+         kittens::warp::zero({name});\n\
+         kittens::warp::add({name}, {name}, {init_scalar});"
+    ));
+    (
+        stmt,
+        Rv::<F32, LEN, Ortho>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `kittens::warp::zero(rv);` — zero a register vector. Used to
@@ -1062,7 +1144,9 @@ pub fn decl_rv_fl_init_scalar<const LEN: u32>(
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `kittens::warp::zero`).
-pub fn warp_zero_rv<const LEN: u32>(rv: &Rv<F32, LEN>) -> CuStmt {
+///
+/// Generic over rv layout `L` — see [`warp_copy_rv`].
+pub fn warp_zero_rv<const LEN: u32, L: RvLayoutTag>(rv: &Rv<F32, LEN, L>) -> CuStmt {
     CuStmt::new(format!("kittens::warp::zero({});", rv.expr()))
 }
 
@@ -1272,12 +1356,22 @@ pub fn decl_local_int(name: &str, init_expr: &str) -> CuStmt {
     CuStmt::new(format!("int {name} = {init_expr};"))
 }
 
-/// Declare a `const __nv_bfloat16*` local pointing at a paged-KV
+/// Declare a `__nv_bfloat16*` local pointing at a paged-KV
 /// block: `cache_base_arr[layer] + block_idx * KV_BLOCK_BYTES /
 /// sizeof(bf16)`. The block index expression typically reads
 /// `block_table[p]` for the current per-token paged-KV walk.
 /// Returns both the decl and a `GmemPtrRaw<Bf16>` handle wrapping
 /// the local so downstream TMA bindings type-check.
+///
+/// Pointer is declared NON-const (matches the kernel signature
+/// `__nv_bfloat16* const* key_cache_ptrs` — outer `const*` means
+/// the array of pointers is read-only, but each element is a
+/// `__nv_bfloat16*` whose target memory is mutable). TK 2.0's
+/// raw `kittens::tma::load_async(void*, void*, ...)` at
+/// `include/ops/group/util/tma.cuh:72` requires non-const args
+/// because TMA writes the gmem pointer's metadata back to the
+/// async-copy descriptor; `reinterpret_cast<void*>` of a const
+/// pointer is rejected (cast away qualifier).
 pub fn decl_paged_kv_block_ptr(
     name: &str,
     cache_base_arr: &str,
@@ -1286,7 +1380,7 @@ pub fn decl_paged_kv_block_ptr(
     kv_block_bytes: u32,
 ) -> (CuStmt, GmemPtrRaw<Bf16>) {
     let stmt = CuStmt::new(format!(
-        "const __nv_bfloat16* {name} = \
+        "__nv_bfloat16* {name} = \
          {cache_base_arr}[{layer}] + \
          (static_cast<size_t>({block_idx_expr}) * \
          {kv_block_bytes} / sizeof(__nv_bfloat16));"
@@ -1295,12 +1389,35 @@ pub fn decl_paged_kv_block_ptr(
     (stmt, handle)
 }
 
-/// Declare an fp32 register vector with each lane initialized to
-/// negative infinity. Used as the `max_vec` running accumulator
-/// in FlashAttention-2's online softmax (initial pass requires
-/// max-of-everything to be -INF so any real score wins).
-pub fn decl_rv_fl_neg_infty<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN>) {
-    decl_rv_fl_init_scalar::<LEN>(name, "-CUDART_INF_F")
+/// Declare an fp32 register vector ([`Ortho`] layout) with each
+/// lane initialized to negative infinity. Used as the `max_vec`
+/// running accumulator in FlashAttention-2's online softmax —
+/// `max_vec` participates in `row_max(att, max_vec)` over a
+/// `rt<row>` tile, which requires [`Ortho`].
+///
+/// Composes:
+///  - `kittens::rv_fl<LEN, ortho> name;` (typed decl)
+///  - `kittens::warp::neg_infty(name);` per
+///    `include/ops/group/register/vec/maps.cuh:162` (writes
+///    `base_types::constants<float>::neg_infty()` into every
+///    lane via `base_ops::neg_infty`).
+///
+/// Avoids the older `warp::zero` + `warp::add(rv, rv,
+/// -CUDART_INF_F)` pattern: `CUDART_INF_F` is defined in CUDA's
+/// `math_constants.h`, which neither TK 2.0 nor the ferrite
+/// substrate header transitively pulls in, so the literal would
+/// fail to compile against the production include set. The TK
+/// 2.0 `neg_infty` op uses `std::bit_cast<float>(0xff800000)`
+/// directly per `common/base_types.cuh:141`.
+pub fn decl_rv_fl_neg_infty<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN, Ortho>) {
+    let stmt = CuStmt::new(format!(
+        "kittens::rv_fl<{LEN}, kittens::ducks::rv_layout::ortho> {name};\n\
+         kittens::warp::neg_infty({name});"
+    ));
+    (
+        stmt,
+        Rv::<F32, LEN, Ortho>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `kittens::warp::store(st_dst, rt_src);` — store a register
@@ -1337,10 +1454,12 @@ pub fn local_semaphore_ref(name: &str) -> Semaphore {
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh` (mirror
 /// of `mul_row` / `add_row` family).
+///
+/// rv layout constraint: see [`warp_row_max_init`].
 pub fn warp_div_row<const ROWS: u32, const COLS: u32>(
     rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
     rt_src: &Rt<F32, RtRow, ROWS, COLS>,
-    rv_row: &Rv<F32, ROWS>,
+    rv_row: &Rv<F32, ROWS, Ortho>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::div_row({dst}, {src}, {rv});",

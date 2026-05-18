@@ -1143,9 +1143,11 @@ mod tests {
             "kittens::rt_bf<16, 64> __attn_q_rt;",
             "__attn_q_tile.template subtile<16, 64>",
             "kittens::warp::load(__attn_q_rt",
-            // Running state init.
-            "kittens::rv_fl<16> __attn_max;",
-            "kittens::rv_fl<16> __attn_sum;",
+            // Running state init — ortho layout so packed dtype
+            // (float2) matches `rt<row>::col_vec_layout` for
+            // row_max/row_sum/sub_row/mul_row/div_row.
+            "kittens::rv_fl<16, kittens::ducks::rv_layout::ortho> __attn_max;",
+            "kittens::rv_fl<16, kittens::ducks::rv_layout::ortho> __attn_sum;",
             "kittens::warp::zero(__attn_sum);",
             "kittens::rt_fl<16, 64> __attn_o;",
             "kittens::warp::zero(__attn_o);",

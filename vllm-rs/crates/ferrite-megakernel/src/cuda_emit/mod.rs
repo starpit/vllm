@@ -48,6 +48,45 @@ use crate::ir::tape::TapeBudget;
 pub use cu::{CuBlock, CuExpr, CuStmt, CuVariant};
 pub use render::RoleBodies;
 
+/// Registry entry for one canonical's `.cu` emit fn. The proc-macro
+/// emits an `::ferrite_forward::inventory::submit!` block per
+/// successfully-rendered canonical (the same set that gets a
+/// `pub fn emit_for_canonical_<canonical>() -> CuVariant`),
+/// pointing `emit_fn` at that fn.
+///
+/// `ferrite-cuda-builder/build.rs` walks
+/// `::ferrite_forward::inventory::iter::<MegaCanonicalEmit>()`
+/// before the existing megakernel `.cu` discovery pass, calls each
+/// `emit_fn` to get the rendered source, and writes
+/// `<cudaforge cache>/megakernels/ferrite_<canonical>.cu` so the
+/// per-canonical `.cu` shows up alongside the existing per-op
+/// `.cuh` files for nvcc to compile into `libmegakernels.a`.
+///
+/// Wires the proc-macro's compile-time-substrate-proof-bearing
+/// `emit_for_canonical_*` fn into the production build pipeline
+/// per `MEGA_IR_PLAN.md` "Phase C step 2 (emit `.cu` per
+/// build_mega_tape fn)" — without forking the const-generic emit
+/// chain into a runtime walker (which would break
+/// [[feedback-end-to-end-compile-time-proofs]]).
+///
+/// Uses the `inventory` crate directly (not via the
+/// `cuda`-feature-gated `::ferrite_forward::inventory` re-export)
+/// so this registration is unconditionally present. Side-stepping
+/// the cuda gate avoids dragging `ferrite-forward/cuda` (and its
+/// transitive `ferrite-kernels/cuda` CUDA-link deps) into the
+/// proc-macro host tree, which would break the `.so` link.
+pub struct MegaCanonicalEmit {
+    /// Canonical name slug, e.g. `"llama_3_2_1b_m_1_sk_128"`. Used
+    /// as the `.cu` file stem (`ferrite_<canonical>.cu`).
+    pub canonical: &'static str,
+    /// Pointer to the proc-macro-emitted
+    /// `pub fn emit_for_canonical_<canonical>() -> CuVariant` —
+    /// see [`crate::codegen`] dispatch.
+    pub emit_fn: fn() -> CuVariant,
+}
+
+::inventory::collect!(MegaCanonicalEmit);
+
 /// Which host-side launch ABI tier the emitted megakernel exposes.
 ///
 /// Mirror of `ferrite_forward::interpreter::mega::LaunchTier`. The
@@ -86,6 +125,15 @@ pub fn render_canonical(
     let mut storer_block = CuBlock::new();
     let mut skipped: Vec<String> = Vec::new();
 
+    // Wrap each node's role bodies in their own `{ ... }` C++ block
+    // so per-op local declarations (`__gemm_acc`, `__rms_act_rv`,
+    // `__farn_delta_rv`, `__attn_q_rt`, ...) don't collide across
+    // nodes when multiple instances of the same op type appear in
+    // the canonical (e.g. one `Gemm` per of {q, k, v, o, gate, up,
+    // down} × NUM_LAYERS = 7 × 16 in llama). Without scoping, nvcc
+    // rejects with `"<name>" has already been declared in the
+    // current scope`. Block scoping is the cheapest fix and matches
+    // C++ idioms — a fresh `{}` per op makes its locals local.
     for (idx, bodies) in role_bodies.iter().enumerate() {
         if let Some(variant) = bodies.skipped {
             skipped.push(variant.to_string());
@@ -96,10 +144,25 @@ pub fn render_canonical(
             storer_block.push(marker);
             continue;
         }
-        loader_block.extend(bodies.loader.clone());
-        launcher_block.extend(bodies.launcher.clone());
-        consumer_block.extend(bodies.consumer.clone());
-        storer_block.extend(bodies.storer.clone());
+        let marker_open = CuStmt::new(format!("// node[{idx}] {{"));
+        let marker_close = CuStmt::new("// }".to_string());
+        let open = CuStmt::new("{".to_string());
+        let close = CuStmt::new("}".to_string());
+        for (block, body) in [
+            (&mut loader_block, &bodies.loader),
+            (&mut launcher_block, &bodies.launcher),
+            (&mut consumer_block, &bodies.consumer),
+            (&mut storer_block, &bodies.storer),
+        ] {
+            if body.is_empty() {
+                continue;
+            }
+            block.push(marker_open.clone());
+            block.push(open.clone());
+            block.extend(body.clone());
+            block.push(close.clone());
+            block.push(marker_close.clone());
+        }
     }
 
     let source = render_source(

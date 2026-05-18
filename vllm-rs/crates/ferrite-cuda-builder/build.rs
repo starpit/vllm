@@ -524,6 +524,29 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
 
+    // Phase C step 2 — `.cu` files are written by the
+    // `ferrite-mega-cu-emit` binary, which walks the
+    // `inventory::collect!(MegaCanonicalEmit)` registry that the
+    // `#[forward]` proc-macro populates and writes each
+    // `emit_fn()` output to `<cache>/megakernels/ferrite_<canonical>.cu`.
+    //
+    // Run that bin BEFORE `cargo build --features cuda` of the
+    // workspace:
+    //
+    //   FERRITE_MODELS=llama-3.2-1b FERRITE_MEGA=1 \
+    //     cargo run -p ferrite-mega-cu-emit --features cuda
+    //   FERRITE_MODELS=llama-3.2-1b FERRITE_MEGA=1 \
+    //     cargo build -p vllm-cli --features cuda
+    //
+    // The existing `.cu` discovery pass below picks them up. A
+    // build-deps invocation directly from this build.rs was
+    // attempted but breaks proc-macro crate resolution under
+    // resolver = "2" when ferrite-models is in both
+    // [dependencies] and [build-dependencies] with cuda features
+    // (model crates surface "can't find crate for
+    // ferrite_forward_macro"). The standalone bin crate sidesteps
+    // that dual-edge feature-resolution issue entirely.
+
     // The ferrite-forward macro emits an `#error "..."` stub in
     // every `.cu` whose schedule contains an op ferrite-TK can't
     // yet lower. Those stubs are written deliberately so cudaforge's

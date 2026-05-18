@@ -55,6 +55,14 @@ pub mod codegen;
 pub mod cuda_emit;
 pub mod ir;
 
+/// Re-export `inventory` so the proc-macro's emitted
+/// `inventory::submit!(MegaCanonicalEmit { ... })` blocks resolve
+/// via `::ferrite_megakernel::inventory::submit!` without each
+/// user crate needing its own `inventory` direct dep. The `inventory
+/// ::collect!(MegaCanonicalEmit)` registration in
+/// [`cuda_emit`] uses the same re-export.
+pub use inventory;
+
 // Crate-root re-exports of the most-used IR types so consumers can
 // write `ferrite_megakernel::MegaTape` instead of
 // `ferrite_megakernel::ir::tape::MegaTape`. Proc-macro emit

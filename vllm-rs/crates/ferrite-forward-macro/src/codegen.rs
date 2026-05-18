@@ -5092,6 +5092,21 @@ fn emit_canonical_build_fn(
                     &bodies,
                 )
             }
+
+            /// Phase C step 2 — register this canonical's emit fn
+            /// in the global `MegaCanonicalEmit` inventory so
+            /// the `ferrite-mega-cu-emit` binary can iterate every
+            /// canonical and write `<cache>/megakernels/ferrite_<canonical>.cu`
+            /// for nvcc to compile alongside the per-op `.cuh`
+            /// files. Ungated: both `emit_for_canonical_<canonical>`
+            /// and `MegaCanonicalEmit` are pure-Rust string
+            /// formatting, no CUDA dep.
+            ::ferrite_megakernel::inventory::submit! {
+                ::ferrite_megakernel::cuda_emit::MegaCanonicalEmit {
+                    canonical: #canonical_str,
+                    emit_fn: #emit_fn_name,
+                }
+            }
         },
         None => quote! {
             // emit_for_canonical_#canonical_name skipped: at least one

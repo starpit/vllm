@@ -28,6 +28,12 @@ quote = "1"
 # mega_ir` re-export — proc-macro emit now anchors at
 # `::ferrite_megakernel::ir::*` directly).
 ferrite-forward = { path = "../ferrite-forward" }
+# Direct dep on `inventory` so `MegaCanonicalEmit` registration in
+# `cuda_emit::mod.rs` doesn't need the `cuda`-gated re-export from
+# `ferrite-forward`. The proc-macro's per-canonical
+# `inventory::submit!` blocks reference `::inventory::submit!`
+# directly via this same crate.
+inventory = { workspace = true }
 
 # Compile-fail tests for const-generic substrate-proof rejection
 # live in `tests/compile_fail.rs` and shell out to `rustc` directly.

@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferrite-mega-cu-emit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase C step 2 driver — walks inventory::collect!(MegaCanonicalEmit) and writes per-canonical .cu files into the cudaforge megakernel cache for ferrite-cuda-builder to nvcc-compile."
+
+# Single binary, no library surface. Run before
+# `FERRITE_MEGA=1 cargo build --features cuda` of any consumer:
+#
+#   FERRITE_MODELS=llama-3.2-1b FERRITE_MEGA=1 \
+#     cargo run -p ferrite-mega-cu-emit --features cuda
+#   FERRITE_MODELS=llama-3.2-1b FERRITE_MEGA=1 \
+#     cargo build -p vllm-cli --features cuda
+[[bin]]
+name = "ferrite-mega-cu-emit"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = [
+    "ferrite-models/cuda",
+    "ferrite-cuda-core/cuda",
+    "ferrite-kernels/cuda",
+    "ferrite-cuda-builder/cuda",
+]
+
+[dependencies]
+# ferrite-models: source of truth for the proc-macro-emitted
+# `inventory::submit!(MegaCanonicalEmit { ... })` blocks. Pulling
+# the umbrella crate keeps every per-arch model's submits in the
+# binary's link set (the umbrella's `extern crate ... as _` lines
+# preserve them past dead-code stripping).
+ferrite-models = { path = "../ferrite-models" }
+ferrite-model-llama = { path = "../ferrite-model-llama" }
+# ferrite-megakernel: `MegaCanonicalEmit` struct +
+# `inventory::iter::<...>()` walker.
+ferrite-megakernel = { path = "../ferrite-megakernel" }
+# ferrite-cuda-builder is a build-only trigger: depending on it
+# from a binary ensures the static `.a` libs exist in the cudaforge
+# cache so the linker can resolve ferrite-kernels' CUDA externs
+# when building this binary. Same pattern as
+# `crates/ferrite-cost-sweep/Cargo.toml` — no code imported.
+ferrite-cuda-builder = { path = "../ferrite-cuda-builder" }
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+dirs = "6"
+
+[build-dependencies]
+# `dirs::cache_dir()` resolves the cudaforge cache path
+# ferrite-cuda-builder's build.rs populates. Same pattern as
+# ferrite-cost-sweep's build.rs.
+dirs = "6"

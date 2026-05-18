@@ -194,94 +194,18 @@ pub fn count_barrier_edges(instrs: &[ferrite_forward::Instruction]) -> u32 {
         .count() as u32
 }
 
-/// Stable variant name string for diagnostics.
+/// Stable variant name string for diagnostics on mega-reachable
+/// `Instruction` variants. Mega-claimed tapes only contain `Tk*`
+/// peers (the `Tk*Impl` cost-DP winners' Instruction emission) plus
+/// shape-named structural variants. Backend-vendor-tagged variants
+/// (the host-interpreter peers that have no megakernel fast path)
+/// are NEVER reachable from megakernel dispatch and are bucketed
+/// under `<non-mega>` rather than enumerated. See
+/// [[feedback-no-cutlass-in-mega]].
 pub fn instruction_kind(instr: &ferrite_forward::Instruction) -> &'static str {
     use ferrite_forward::Instruction as I;
     match instr {
-        I::RmsNorm(..) => "RmsNorm",
-        I::FusedQkvRopeCache(..) => "FusedQkvRopeCache",
-        I::Add(..) => "Add",
-        I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
-        I::FusedGateUpSiluMul(..) => "FusedGateUpSiluMul",
-        I::FusedGateUpGeluMul(..) => "FusedGateUpGeluMul",
-        I::Embed(..) => "Embed",
-        I::ScalarMul(..) => "ScalarMul",
-        I::TanhSoftCap(..) => "TanhSoftCap",
-        I::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
-        I::Gemm(..) => "Gemm",
-        I::CutlassFusedRmsNormGemm(..) => "CutlassFusedRmsNormGemm",
-        I::CutlassFusedAddRmsNormGemm(..) => "CutlassFusedAddRmsNormGemm",
-        I::CutlassFusedAddScalarOffsetRmsNormGemm(..) => "CutlassFusedAddScalarOffsetRmsNormGemm",
-        I::CutlassFusedMeanSubRmsNormGemm(..) => "CutlassFusedMeanSubRmsNormGemm",
-        I::AttentionViaCache(..) => "AttentionViaCache",
-        I::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
-        I::BarrierSignal(..) => "BarrierSignal",
-        I::BarrierWait(..) => "BarrierWait",
-        I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
-        I::Loop(..) => "Loop",
-        I::Alias(..) => "Alias",
-        I::Free(..) => "Free",
-        I::Reshape(..) => "Reshape",
-        I::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
-        I::MeanSubRmsNorm(..) => "MeanSubRmsNorm",
-        I::MeanSubRmsNormBiasAdd(..) => "MeanSubRmsNormBiasAdd",
-        I::FusedCublasGemmAdd(..) => "FusedCublasGemmAdd",
-        I::FusedGemmBias(..) => "FusedGemmBias",
-        I::FusedQkvRopePrefill(..) => "FusedQkvRopePrefill",
-        I::FusedQkvQkNormRopeCache(..) => "FusedQkvQkNormRopeCache",
-        I::AttentionPrefillContiguous(..) => "AttentionPrefillContiguous",
-        I::EncoderAttention(..) => "EncoderAttention",
-        I::SlidingAttentionPrefillContiguous(..) => "SlidingAttentionPrefillContiguous",
-        I::VarlenAttention(..) => "VarlenAttention",
-        I::VisionRope(..) => "VisionRope",
-        I::QuickGelu(..) => "QuickGelu",
-        I::Gelu(..) => "Gelu",
-        I::PosEmbed(..) => "PosEmbed",
-        I::LoadPixels(..) => "LoadPixels",
-        I::GeluErf(..) => "GeluErf",
-        I::EmbeddingGather(..) => "EmbeddingGather",
-        I::AvgPool2d(..) => "AvgPool2d",
-        I::StripCls(..) => "StripCls",
-        I::FlashInferAttentionDecode(..) => "FlashInferAttentionDecode",
-        I::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
-        I::RopeAppend(..) => "RopeAppend",
-        I::MlaSplit(..) => "MlaSplit",
-        I::MlaAttention(..) => "MlaAttention",
-        I::DeepSeekMoe(..) => "DeepSeekMoe",
-        I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
-        I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
-        I::FusedMoe(..) => "FusedMoe",
-        I::SharedFusedMoe(..) => "SharedFusedMoe",
-        I::CutlassGemm(..) => "CutlassGemm",
-        I::CutlassGemmSplitK(..) => "CutlassGemmSplitK",
-        I::CutlassGemmAdd(..) => "CutlassGemmAdd",
-        I::CutlassGemv(..) => "CutlassGemv",
-        I::CutlassFusedGemmBias(..) => "CutlassFusedGemmBias",
-        I::CutlassFusedGateUpSiluMul(..) => "CutlassFusedGateUpSiluMul",
-        I::CutlassFusedGateUpGeluMul(..) => "CutlassFusedGateUpGeluMul",
-        I::CutlassFusedQkvRopeCache(..) => "CutlassFusedQkvRopeCache",
-        I::CutlassFusedQkvRopePrefill(..) => "CutlassFusedQkvRopePrefill",
-        I::MarlinGemm(..) => "MarlinGemm",
-        I::MarlinFusedGateUpSiluMul(..) => "MarlinFusedGateUpSiluMul",
-        I::MarlinFusedGateUpGeluMul(..) => "MarlinFusedGateUpGeluMul",
-        I::MarlinFusedQkvRopeCache(..) => "MarlinFusedQkvRopeCache",
-        I::MarlinFusedQkvRopePrefill(..) => "MarlinFusedQkvRopePrefill",
-        I::Bnb4Gemm(..) => "Bnb4Gemm",
-        I::Bnb4FusedGateUpSiluMul(..) => "Bnb4FusedGateUpSiluMul",
-        I::Bnb4FusedGateUpGeluMul(..) => "Bnb4FusedGateUpGeluMul",
-        I::Bnb4FusedQkvRopeCache(..) => "Bnb4FusedQkvRopeCache",
-        I::Bnb4FusedQkvRopePrefill(..) => "Bnb4FusedQkvRopePrefill",
-        I::GgmlGemm(..) => "GgmlGemm",
-        I::GgmlFusedGateUpSiluMul(..) => "GgmlFusedGateUpSiluMul",
-        I::GgmlFusedGateUpGeluMul(..) => "GgmlFusedGateUpGeluMul",
-        I::GgmlFusedQkvRopeCache(..) => "GgmlFusedQkvRopeCache",
-        I::GgmlFusedQkvRopePrefill(..) => "GgmlFusedQkvRopePrefill",
-        I::Fp8Gemm(..) => "Fp8Gemm",
-        I::Fp8FusedGemmBias(..) => "Fp8FusedGemmBias",
-        I::Fp8FusedGateUpSiluMul(..) => "Fp8FusedGateUpSiluMul",
-        I::Fp8FusedGateUpGeluMul(..) => "Fp8FusedGateUpGeluMul",
-        I::Fp8FusedQkvRopeCache(..) => "Fp8FusedQkvRopeCache",
-        I::Fp8FusedQkvRopePrefill(..) => "Fp8FusedQkvRopePrefill",
+        // ── Tk* peers (frontend-emitted by `Tk*Impl::op_emit`).
         I::TkEmbed(..) => "TkEmbed",
         I::TkScalarMul(..) => "TkScalarMul",
         I::TkRmsNorm(..) => "TkRmsNorm",
@@ -301,10 +225,38 @@ pub fn instruction_kind(instr: &ferrite_forward::Instruction) -> &'static str {
         I::TkBarrierSignal(..) => "TkBarrierSignal",
         I::TkBarrierWait(..) => "TkBarrierWait",
         I::TkSpliceMmEmbeds(..) => "TkSpliceMmEmbeds",
+        // ── Shape-named variants (no fast-path peer, may appear
+        // post-`normalize_tk_prefix` strip).
+        I::RmsNorm(..) => "RmsNorm",
+        I::Add(..) => "Add",
+        I::Embed(..) => "Embed",
+        I::ScalarMul(..) => "ScalarMul",
+        I::Gemm(..) => "Gemm",
+        I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
+        I::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
+        I::FusedGateUpSiluMul(..) => "FusedGateUpSiluMul",
+        I::FusedGateUpGeluMul(..) => "FusedGateUpGeluMul",
+        I::FusedQkvRopeCache(..) => "FusedQkvRopeCache",
+        I::AttentionViaCache(..) => "AttentionViaCache",
+        I::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
+        I::TanhSoftCap(..) => "TanhSoftCap",
+        I::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
+        I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
+        I::BarrierSignal(..) => "BarrierSignal",
+        I::BarrierWait(..) => "BarrierWait",
+        // ── Structural / control flow.
+        I::Loop(..) => "Loop",
+        I::Alias(..) => "Alias",
+        I::Free(..) => "Free",
+        I::Reshape(..) => "Reshape",
         #[cfg(feature = "nccl")]
         I::AllReduce(..) => "AllReduce",
         #[cfg(feature = "nccl")]
         I::AllGather(..) => "AllGather",
+        // ── Vendor-named or non-mega-eligible variants. Reaching
+        // this arm from megakernel dispatch is itself the bug
+        // (the tape claimer should have rejected the tape).
+        _ => "<non-mega>",
     }
 }
 
@@ -1169,10 +1121,10 @@ pub fn dispatch_instruction_to_push(
                 );
             })
         }
-        I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => {
+        I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
             let weight = weight_paths
                 .first()
-                .ok_or_else(|| "FusedCublasGemmAdd weight_paths empty".to_string())?;
+                .ok_or_else(|| "TkGemmAdd weight_paths empty".to_string())?;
             let in_id = lit(*in_slot);
             let residual_id = lit(*residual_slot);
             let weight_id = lit(state.alloc_distinct(&[*in_slot, *residual_slot])?);
@@ -1289,68 +1241,26 @@ pub fn dispatch_instruction_to_push(
                 );
             })
         }
-        I::CutlassFusedRmsNormGemm(in_slot, out_slot, layer, _tile_m, _tile_n, _stages, n, k) => {
-            emit_lm_head_no_delta(
-                *in_slot,
+        I::TkFusedAddRmsNormGemm(delta_slot, residual_slot, out_slot, layer, n, k) => {
+            emit_lm_head_with_delta(
+                *residual_slot,
+                *delta_slot,
                 *out_slot,
                 *layer,
                 *n,
                 *k,
-                quote! { ::ferrite_megakernel::ir::LmHeadNormKind::RmsNorm },
+                quote! { ::ferrite_megakernel::ir::LmHeadNormKind::AddRmsNorm },
+                None,
                 weight_paths,
                 state,
             )
         }
-        I::CutlassFusedMeanSubRmsNormGemm(
-            in_slot,
-            out_slot,
-            layer,
-            _tile_m,
-            _tile_n,
-            _stages,
-            n,
-            k,
-        ) => emit_lm_head_no_delta(
-            *in_slot,
-            *out_slot,
-            *layer,
-            *n,
-            *k,
-            quote! { ::ferrite_megakernel::ir::LmHeadNormKind::MeanSubRmsNorm },
-            weight_paths,
-            state,
-        ),
-        I::CutlassFusedAddRmsNormGemm(
-            delta_slot,
-            residual_slot,
-            out_slot,
-            layer,
-            _tile_m,
-            _tile_n,
-            _stages,
-            n,
-            k,
-        ) => emit_lm_head_with_delta(
-            *residual_slot,
-            *delta_slot,
-            *out_slot,
-            *layer,
-            *n,
-            *k,
-            quote! { ::ferrite_megakernel::ir::LmHeadNormKind::AddRmsNorm },
-            None,
-            weight_paths,
-            state,
-        ),
-        I::CutlassFusedAddScalarOffsetRmsNormGemm(
+        I::TkFusedAddScalarOffsetRmsNormGemm(
             delta_slot,
             residual_slot,
             out_slot,
             layer,
             offset,
-            _tile_m,
-            _tile_n,
-            _stages,
             n,
             k,
         ) => emit_lm_head_with_delta(
@@ -1370,108 +1280,6 @@ pub fn dispatch_instruction_to_push(
             instruction_kind(other)
         )),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_lm_head_no_delta(
-    in_slot: u32,
-    out_slot: u32,
-    layer: u32,
-    n: u32,
-    k: u32,
-    norm_kind_path: TokenStream,
-    weight_paths: &[String],
-    state: &mut MegaDispatchState,
-) -> Result<TokenStream, String> {
-    if weight_paths.len() != 2 {
-        return Err(format!(
-            "TkFusedNormGemm lm_head fusion expected 2 weight_paths (norm, linear), got {}",
-            weight_paths.len()
-        ));
-    }
-    let norm_path = weight_paths[0].as_str();
-    let linear_path = weight_paths[1].as_str();
-    let lit = Literal::u32_unsuffixed;
-    let in_id = lit(in_slot);
-    let out_id = lit(out_slot);
-    let norm_w_id = lit(state.alloc_distinct(&[in_slot, out_slot])?);
-    let lin_w_id = lit(state.alloc_distinct(&[in_slot, out_slot])?);
-    let partial_off = lit(0u32);
-    let partial_bytes = lit(state.num_consumer_warps * 4);
-    let b_tile_off = lit(state.num_consumer_warps * 4);
-    let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
-    let iters_const = 1_u32;
-    let iters = lit(iters_const);
-    let arrives = lit(state.arrives);
-    let num_layers = lit(state.num_layers);
-    let layer_lit = lit(layer);
-    let n_lit = lit(n);
-    let k_lit = lit(k);
-    let num_tokens = lit(state.num_tokens);
-    let in_act_slot = lit(in_slot);
-    let out_act_slot = lit(out_slot);
-    let norm_weight_accessor_idx = lit(state.next_weight_accessor);
-    let linear_weight_accessor_idx = lit(state.next_weight_accessor + 1);
-    let eps_lit = state.rms_norm_eps;
-    let num_pages_lit = lit(state.num_pages_budget);
-    let scratch_lit = lit(state.scratch_bytes);
-    // TILE_N = N / NCW (AlongN warp split). Fall back to N when NCW
-    // doesn't divide; the IR only requires TILE_N > 0. Mirrors the
-    // S10 / S11a / S12a proc-macro logic.
-    let ncw = state.num_consumer_warps;
-    let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { n };
-    let tile_n_lit = lit(tile_n_const);
-    // ITERS=1 today → CHUNK_K must equal K (S13a IR invariant).
-    let chunk_k_lit = lit(k / iters_const);
-    // Two named bars: reduce (cross-warp norm reduce) + publish
-    // (post-norm + post-gemm sync). Mirror of FusedAddRmsNorm.
-    let consumer_bar_reduce = lit(1u32);
-    let consumer_bar_publish = lit(2u32);
-    state.arrives += 1;
-    state.next_weight_accessor += 2;
-    Ok(quote! {
-        b.push_tk_fused_norm_gemm_no_delta(
-            ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
-            ::ferrite_megakernel::ir::PageId::<#in_id, #num_pages_lit>::new(),
-            ::ferrite_megakernel::ir::PageId::<#norm_w_id, #num_pages_lit>::new(),
-            ::ferrite_megakernel::ir::PageId::<#lin_w_id, #num_pages_lit>::new(),
-            ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
-            ::ferrite_megakernel::ir::ScratchRegion::<
-                #partial_off, #partial_bytes, #scratch_lit,
-                ::ferrite_megakernel::ir::GemmScope,
-            >::new(),
-            ::ferrite_megakernel::ir::ScratchRegion::<
-                #b_tile_off, #b_tile_bytes, #scratch_lit,
-                ::ferrite_megakernel::ir::GemmScope,
-            >::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
-            ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
-            ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
-            ::ferrite_megakernel::ir::MatmulN::<#n_lit>::new(),
-            ::ferrite_megakernel::ir::MatmulK::<#k_lit>::new(),
-            ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
-            ::ferrite_megakernel::ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
-            ::ferrite_megakernel::ir::ActSlotConst::<#out_act_slot, { u32::MAX }>::new(),
-            ::ferrite_megakernel::ir::WeightAccessorConst::<
-                #norm_weight_accessor_idx, { u32::MAX },
-            >::new(),
-            ::ferrite_megakernel::ir::WeightAccessorConst::<
-                #linear_weight_accessor_idx, { u32::MAX },
-            >::new(),
-            ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
-            ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
-            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_reduce>::new(),
-            ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
-            ::ferrite_megakernel::ir::BarSyncPair::<
-                #consumer_bar_reduce,
-                #consumer_bar_publish,
-            >::new(),
-            #norm_path.to_string(), #linear_path.to_string(), #norm_kind_path, #eps_lit,
-        );
-    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1626,61 +1434,22 @@ pub fn normalize_tk_prefix(
         I::TkBarrierSignal(edge) => I::BarrierSignal(edge),
         I::TkBarrierWait(edge, count) => I::BarrierWait(edge, count),
         I::TkSpliceMmEmbeds(slot) => I::SpliceMmEmbeds(slot),
-        // TkFusedAddRmsNormGemm decomposes to CutlassFusedAddRmsNormGemm
-        // with dummy CUTLASS tile dims (the dispatch goes through the
-        // host interpreter, ignoring tile_m/tile_n/stages — see
-        // `instr.rs::eval` for the same delegation). Substrate shape
-        // is identical: residual fold + rms_norm + gemm.
-        I::TkFusedAddRmsNormGemm(delta_slot, residual_slot, out_slot, layer, n, k) => {
-            I::CutlassFusedAddRmsNormGemm(
-                delta_slot,
-                residual_slot,
-                out_slot,
-                layer,
-                /*tile_m=*/ 16,
-                /*tile_n=*/ 64,
-                /*stages=*/ 3,
-                n,
-                k,
-            )
-        }
-        I::TkFusedAddScalarOffsetRmsNormGemm(
-            delta_slot,
-            residual_slot,
-            out_slot,
-            layer,
-            offset,
-            n,
-            k,
-        ) => I::CutlassFusedAddScalarOffsetRmsNormGemm(
-            delta_slot,
-            residual_slot,
-            out_slot,
-            layer,
-            offset,
-            16,
-            64,
-            3,
-            n,
-            k,
-        ),
-        // TkGemmAdd is chunked-k gemm + add. The non-chunked frontend
-        // peer is FusedCublasGemmAdd(in, residual, layer, n, k).
-        // Until the chunked variant gets its own MegaNode, normalize
-        // to the non-chunked peer by dropping `k_offset`/`k_full` —
-        // the substrate shape matches; the chunked-k iteration count
-        // is internal to the emit step.
-        I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
-            I::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k)
-        }
+        // TkFusedAddRmsNormGemm / TkFusedAddScalarOffsetRmsNormGemm /
+        // TkGemmAdd pass through unchanged — there is no shape-named
+        // canonical for these in the frontend Instruction enum, and
+        // megakernel must not match on vendor-named variants. Dispatch
+        // matches `I::Tk*` directly.
+        passthrough @ (I::TkFusedAddRmsNormGemm(..)
+            | I::TkFusedAddScalarOffsetRmsNormGemm(..)
+            | I::TkGemmAdd(..)) => passthrough,
+        // ── Shape-renames within the shape-named family. These fold
+        // semantically-equivalent shape-named variants onto the
+        // canonical that megakernel dispatches.
         I::MeanSubRmsNorm(in_slot, out_slot, layer) => {
             I::RmsNorm(in_slot, out_slot, layer)
         }
         I::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer) => {
             I::RmsNorm(in_slot, out_slot, layer)
-        }
-        I::CutlassGemv(in_slot, out_slot, layer, n, k) => {
-            I::Gemm(in_slot, out_slot, layer, n, k)
         }
         I::FusedGemmBias(in_slot, out_slot, layer) => {
             I::Gemm(in_slot, out_slot, layer, 1, 1)
@@ -1689,42 +1458,17 @@ pub fn normalize_tk_prefix(
         I::EncoderAttention(q_slot, _k_slot, _v_slot, out_slot) => {
             I::AttentionViaCache(q_slot, out_slot, /*layer=*/ 0, /*interleaved=*/ false)
         }
-        I::MarlinFusedQkvRopeCache(in_slot, out_slot, layer)
-        | I::Bnb4FusedQkvRopeCache(in_slot, out_slot, layer)
-        | I::Fp8FusedQkvRopeCache(in_slot, out_slot, layer) => {
-            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, false)
-        }
-        I::GgmlFusedQkvRopeCache(in_slot, out_slot, layer, interleaved) => {
-            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, interleaved)
-        }
         I::FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k, biased, interleaved) => {
             I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved)
         }
-        I::MarlinFusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
-        | I::Bnb4FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
-        | I::Fp8FusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k)
-        | I::GgmlFusedQkvRopePrefill(in_slot, out_slot, layer, _n, _k) => {
-            I::FusedQkvRopeCache(in_slot, out_slot, layer, false, false)
-        }
-        I::MarlinGemm(in_slot, out_slot, layer)
-        | I::Bnb4Gemm(in_slot, out_slot, layer)
-        | I::Fp8Gemm(in_slot, out_slot, layer)
-        | I::GgmlGemm(in_slot, out_slot, layer) => I::Gemm(in_slot, out_slot, layer, 1, 1),
-        I::MarlinFusedGateUpSiluMul(in_slot, out_slot, layer)
-        | I::Bnb4FusedGateUpSiluMul(in_slot, out_slot, layer)
-        | I::Fp8FusedGateUpSiluMul(in_slot, out_slot, layer)
-        | I::GgmlFusedGateUpSiluMul(in_slot, out_slot, layer) => {
-            I::FusedGateUpSiluMul(in_slot, out_slot, layer)
-        }
-        I::MarlinFusedGateUpGeluMul(in_slot, out_slot, layer)
-        | I::Bnb4FusedGateUpGeluMul(in_slot, out_slot, layer)
-        | I::Fp8FusedGateUpGeluMul(in_slot, out_slot, layer)
-        | I::GgmlFusedGateUpGeluMul(in_slot, out_slot, layer) => {
-            I::FusedGateUpGeluMul(in_slot, out_slot, layer)
-        }
-        I::Fp8FusedGemmBias(in_slot, out_slot, layer) => {
-            I::Gemm(in_slot, out_slot, layer, 1, 1)
-        }
+        // ── Vendor-named variants are never mega-reachable (their
+        // backend Impls don't have Tk peers, so the cost DP picks
+        // them only when megakernel is OFF; mega tape claimer
+        // rejects any tape containing them). Per
+        // [[feedback-no-cutlass-in-mega]], megakernel must not
+        // pattern-match on those names. They pass through unchanged
+        // here; if one ever reaches dispatch, dispatch's `_` arm
+        // surfaces it as `<non-mega>`.
         other => other,
     }
 }
@@ -2184,14 +1928,202 @@ pub fn dispatch_instruction_to_render(
                 ));
             }))
         }
-        // Variants below are wired in dispatch_to_push but their
-        // render_* counterpart hasn't been written yet — the proc-
-        // macro skips emit_for_canonical for any tape that contains
-        // them. (TkFusedNormGemm, AttentionViaCache, RopeAppend,
-        // SlidingAttentionViaCache, FusedCublasGemmAdd, the Cutlass
-        // norm-gemm fusions.)
+        I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => Ok(Some(
+            render_tk_gemm_add(
+                *in_slot,
+                *residual_slot,
+                resolved_layer(*layer),
+                *n,
+                *k,
+                weight_paths,
+                state,
+            )?,
+        )),
+        I::TkFusedAddRmsNormGemm(delta_slot, residual_slot, out_slot, layer, n, k) => {
+            Ok(Some(render_lm_head_with_delta(
+                *residual_slot,
+                *delta_slot,
+                *out_slot,
+                resolved_layer(*layer),
+                *n,
+                *k,
+                quote! { ::ferrite_megakernel::ir::LmHeadNormKind::AddRmsNorm },
+                None,
+                weight_paths,
+                state,
+            )?))
+        }
+        I::TkFusedAddScalarOffsetRmsNormGemm(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            offset,
+            n,
+            k,
+        ) => Ok(Some(render_lm_head_with_delta(
+            *residual_slot,
+            *delta_slot,
+            *out_slot,
+            resolved_layer(*layer),
+            *n,
+            *k,
+            quote! { ::ferrite_megakernel::ir::LmHeadNormKind::AddScalarOffsetRmsNorm },
+            Some(*offset),
+            weight_paths,
+            state,
+        )?)),
+        // Variants wired in dispatch_to_push but whose render_*
+        // counterpart hasn't been written yet — the proc-macro skips
+        // emit_for_canonical for any tape that contains them.
+        // (TkAttentionViaCache, TkSlidingAttentionViaCache, RopeAppend.)
         _ => Ok(None),
     }
+}
+
+/// Render-side mirror of the `TkFusedAddRmsNormGemm` /
+/// `TkFusedAddScalarOffsetRmsNormGemm` push arms (lm_head with
+/// residual fold). Emits a
+/// `bodies.push(::ferrite_megakernel::cuda_emit::render::render_tk_fused_norm_gemm::<…>(…));`
+/// with const generics and runtime args reflecting the same
+/// per-canonical [`MegaDispatchState`] decisions the push walk made
+/// (page id allocator, arrives++, weight_accessor++, scratch layout,
+/// bar IDs).
+#[allow(clippy::too_many_arguments)]
+fn render_lm_head_with_delta(
+    residual_slot: u32,
+    delta_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+    norm_kind_path: TokenStream,
+    offset: Option<f32>,
+    weight_paths: &[String],
+    state: &mut MegaDispatchState,
+) -> Result<TokenStream, String> {
+    if weight_paths.len() != 2 {
+        return Err(format!(
+            "TkFusedNormGemm lm_head fusion expected 2 weight_paths (norm, linear), got {}",
+            weight_paths.len()
+        ));
+    }
+    let lit = Literal::u32_unsuffixed;
+    let in_id = lit(residual_slot);
+    let delta_id = lit(delta_slot);
+    let out_id = lit(out_slot);
+    let norm_w_id = lit(state.alloc_distinct(&[residual_slot, delta_slot, out_slot])?);
+    let lin_w_id = lit(state.alloc_distinct(&[residual_slot, delta_slot, out_slot])?);
+    let partial_off = lit(0u32);
+    let b_tile_off = lit(state.num_consumer_warps * 4);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters_const = 1_u32;
+    let iters = lit(iters_const);
+    let layer_lit = lit(layer);
+    let n_lit = lit(n);
+    let k_lit = lit(k);
+    let m_lit = lit(state.num_tokens);
+    let in_act_slot = lit(residual_slot);
+    let delta_act_slot = lit(delta_slot);
+    let out_act_slot = lit(out_slot);
+    let norm_weight_accessor_idx = lit(state.next_weight_accessor);
+    let linear_weight_accessor_idx = lit(state.next_weight_accessor + 1);
+    let eps_lit = state.rms_norm_eps;
+    let offset_expr = match offset {
+        Some(v) => quote! { ::core::option::Option::Some(#v) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let ncw = state.num_consumer_warps;
+    let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { n };
+    let tile_n_lit = lit(tile_n_const);
+    let k_per_warp = lit(k / ncw.max(1));
+    let ncw_lit = lit(ncw);
+    let num_layers = lit(state.num_layers);
+    let bar_reduce = lit(1u32);
+    let bar_publish = lit(2u32);
+    state.arrives += 1;
+    state.next_weight_accessor += 2;
+    Ok(quote! {
+        bodies.push(::ferrite_megakernel::cuda_emit::render::render_tk_fused_norm_gemm::<
+            #m_lit, #k_lit, #n_lit, #tile_n_lit, #ncw_lit, #k_per_warp, #num_layers, #iters,
+        >(
+            #in_id,
+            ::core::option::Option::Some(#delta_id),
+            #norm_w_id, #lin_w_id, #out_id,
+            #consumer_phase, #storer_phase,
+            #layer_lit,
+            #in_act_slot,
+            ::core::option::Option::Some(#delta_act_slot),
+            #out_act_slot,
+            #norm_weight_accessor_idx, #linear_weight_accessor_idx,
+            #bar_reduce, #bar_publish,
+            #eps_lit,
+            #norm_kind_path,
+            #offset_expr,
+            #b_tile_off,
+            #partial_off,
+        ));
+    })
+}
+
+/// Render-side mirror of the `TkGemmAdd` push arm. Emits a
+/// `bodies.push(::ferrite_megakernel::cuda_emit::render::render_tk_fused_gemm_add::<…>(…));`.
+/// State semantics mirror the push side: one
+/// `alloc_distinct(&[in, residual])` for the weight page,
+/// `arrives += 1`, `next_weight_accessor += 1`. ITERS=1 per the
+/// substrate invariant; the chunked-K `k_offset`/`k_full` fields on
+/// the Tk variant are not consumed today (one chunk = full K).
+#[allow(clippy::too_many_arguments)]
+fn render_tk_gemm_add(
+    in_slot: u32,
+    residual_slot: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+    weight_paths: &[String],
+    state: &mut MegaDispatchState,
+) -> Result<TokenStream, String> {
+    let _weight = weight_paths
+        .first()
+        .ok_or_else(|| "TkGemmAdd weight_paths empty".to_string())?;
+    let lit = Literal::u32_unsuffixed;
+    let in_id = lit(in_slot);
+    let residual_id = lit(residual_slot);
+    let weight_id = lit(state.alloc_distinct(&[in_slot, residual_slot])?);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters_const = 1_u32;
+    let iters = lit(iters_const);
+    let ncw = state.num_consumer_warps;
+    let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { n };
+    let tile_n_lit = lit(tile_n_const);
+    let layer_lit = lit(layer);
+    let n_lit = lit(n);
+    let k_lit = lit(k);
+    let m_lit = lit(state.num_tokens);
+    let in_act_slot = lit(in_slot);
+    let residual_act_slot = lit(residual_slot);
+    let weight_accessor_idx = lit(state.next_weight_accessor);
+    let num_layers = lit(state.num_layers);
+    let ncw_lit = lit(ncw);
+    let bar_publish = lit(1u32);
+    let b_tile_offset = lit(0u32);
+    state.arrives += 1;
+    state.next_weight_accessor += 1;
+    Ok(quote! {
+        bodies.push(::ferrite_megakernel::cuda_emit::render::render_tk_fused_gemm_add::<
+            #m_lit, #k_lit, #n_lit, #tile_n_lit, #ncw_lit, #num_layers, #iters,
+        >(
+            #in_id, #weight_id, #residual_id,
+            #consumer_phase, #storer_phase,
+            #layer_lit,
+            #in_act_slot, #residual_act_slot,
+            #weight_accessor_idx,
+            #bar_publish,
+            #b_tile_offset,
+        ));
+    })
 }
 
 /// Compute the [`LaunchTier`](crate::cuda_emit::LaunchTier) implied

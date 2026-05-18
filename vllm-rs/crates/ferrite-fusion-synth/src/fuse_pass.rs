@@ -2394,6 +2394,18 @@ pub fn bn8_attention_body_msl_atomic(
     // attn_scratch + KV cache are device atomic_uint* (each uint32
     // packs 2 bf16 values lo|hi<<16). Required for cross-TG visibility
     // on Apple Metal. See synth_persistent_test.rs:52-58.
+    //
+    // Generalized over even qk_per_thread ∈ {{2, 4, 6, 8}} →
+    // HEAD_DIM ∈ {{64, 128, 192, 256}}. Each lane handles
+    // `__N_PACKS = qk_per_thread/2` uint32 loads per K and per V
+    // (each uint = 2 bf16). The pack count loop is a compile-time
+    // constant so the compiler unrolls. The thread-register arrays
+    // (`__attn_q_reg[8]`, `__attn_o_reg[8]`, `__attn_final_o[8]`) and
+    // `__ATTN_MAX_HEAD_DIM=256` cap the supported HEAD_DIM at 256.
+    // Odd qk_per_thread (HEAD_DIM=96 → qk=3) is rejected because the
+    // 2-bf16-per-uint32 packing of the KV cache and attn_scratch can't
+    // be split cleanly on per-lane boundaries; supporting it requires
+    // a bf16-direct refactor of the IO side.
     if (__head < NUM_Q) {{
         constexpr int __ATTN_BN     = 8;
         constexpr int __ATTN_BD     = 32;
@@ -2402,20 +2414,23 @@ pub fn bn8_attention_body_msl_atomic(
 
         const uint __attn_seq_idx     = __t;
         const uint __attn_q_head_idx  = __head;
-        const uint __attn_qk_per_thread = HEAD_DIM / uint(__ATTN_BD);
-        // HEAD_DIM/BD must equal 2 for the packed uint32 pair load to
-        // work (one uint32 per thread per token covers qk_per_thread
-        // bfloats). HEAD_DIM=64 with BD=32 → 2. Static assert via array
-        // sizing — emits a Metal compile error if violated.
-        static_assert((HEAD_DIM / uint(__ATTN_BD)) == 2u,
-            "bn8_attention_body_msl_atomic requires qk_per_thread == 2");
+        constexpr uint __attn_qk_per_thread = HEAD_DIM / uint(__ATTN_BD);
+        constexpr uint __ATTN_N_PACKS       = __attn_qk_per_thread / 2u;
+        // Supported: even qk_per_thread ∈ {{2, 4, 6, 8}} →
+        // HEAD_DIM ∈ {{64, 128, 192, 256}}. Even because we pack 2 bf16
+        // per uint32; upper bound from the `[8]`-sized thread arrays
+        // and `__ATTN_MAX_HEAD_DIM=256`.
+        static_assert(__attn_qk_per_thread >= 2u
+                      && __attn_qk_per_thread <= 8u
+                      && (__attn_qk_per_thread % 2u) == 0u,
+            "bn8_attention_body_msl_atomic supports even qk_per_thread in [2,8]");
 
         const uint __attn_group_ratio = NUM_Q / NUM_KV;
         const uint __attn_kv_head_idx = __attn_q_head_idx / __attn_group_ratio;
         const uint __attn_kv_len      = {seq_used_k}[__attn_seq_idx];
 
         // All strides in BFLOAT units; converted to uint32 indices by
-        // dividing by 2 at the atomic_load call site (HEAD_DIM is even,
+        // dividing by 2 at the load call site (HEAD_DIM is even,
         // BLOCK_SIZE is power-of-2 ≥ 2, so all bfloat offsets used are
         // even and divide cleanly).
         const uint __attn_kv_blk_stride  = NUM_KV * BLOCK_SIZE * HEAD_DIM;
@@ -2455,23 +2470,29 @@ pub fn bn8_attention_body_msl_atomic(
             //   - a prior kernel dispatch (kernel completion fences L1→L2)
             //   - RopeAppend in THIS kernel's pre_attn phase, separated
             //     from this read by `barrier_after_pre_attn` which runs
-            //     `threadgroup_barrier(mem_flags::mem_device)` (the
-            //     existing cross-phase visibility primitive — see the
-            //     synth's own comment in `cross_tg_barrier_msl_with_target`).
+            //     `threadgroup_barrier(mem_flags::mem_device)`.
             // Both producers are barrier-fenced before this consumer, so
-            // atomic-load is redundant. Cast away atomic_uint typing via
-            // device const uint* to issue a plain load.
+            // atomic-load is redundant. Cast away atomic_uint typing.
             const size_t __attn_kv_bfloat_base =
                   (size_t)__attn_physical_block * (size_t)__attn_kv_blk_stride
                 + (size_t)__attn_kv_head_idx    * (size_t)__attn_kv_head_stride
                 + (size_t)__attn_token_in_block * (size_t)__attn_kv_tok_stride;
-            const size_t __attn_k_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
-            uint __attn_k_packed = ((device const uint*){k_cache})[__attn_k_word_idx];
-            {t_act} __attn_k_lo = as_type<{t_act}>(ushort(__attn_k_packed & 0xFFFFu));
-            {t_act} __attn_k_hi = as_type<{t_act}>(ushort((__attn_k_packed >> 16) & 0xFFFFu));
+            const size_t __attn_kv_word_base = __attn_kv_bfloat_base / (size_t)2u
+                                             + (size_t)__simd_lid * (size_t)__ATTN_N_PACKS;
 
-            __ATTN_U __attn_score = __attn_q_reg[0] * __ATTN_U(__attn_k_lo)
-                                  + __attn_q_reg[1] * __ATTN_U(__attn_k_hi);
+            // Load K (N_PACKS uint32 per lane = qk_per_thread bf16).
+            // Per-lane score is the dot of q_reg (qk_per_thread elements)
+            // with the lane's k slice, then simd_sum across the 32 lanes
+            // of the simdgroup gives the score for one KV token.
+            __ATTN_U __attn_score = 0;
+            for (uint __p = 0u; __p < __ATTN_N_PACKS; ++__p) {{
+                uint __attn_k_packed =
+                    ((device const uint*){k_cache})[__attn_kv_word_base + (size_t)__p];
+                {t_act} __attn_k_lo = as_type<{t_act}>(ushort(__attn_k_packed & 0xFFFFu));
+                {t_act} __attn_k_hi = as_type<{t_act}>(ushort((__attn_k_packed >> 16) & 0xFFFFu));
+                __attn_score += __attn_q_reg[2u * __p]      * __ATTN_U(__attn_k_lo)
+                             +  __attn_q_reg[2u * __p + 1u] * __ATTN_U(__attn_k_hi);
+            }}
             __attn_score = simd_sum(__attn_score);
 
             __ATTN_U __attn_new_max  = max(__attn_max_score, __attn_score);
@@ -2480,14 +2501,17 @@ pub fn bn8_attention_body_msl_atomic(
             __attn_max_score      = __attn_new_max;
             __attn_sum_exp_score  = __attn_sum_exp_score * __attn_factor + __attn_exp_score;
 
-            // V plain load — same fencing argument as K above.
-            const size_t __attn_v_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
-            uint __attn_v_packed = ((device const uint*){v_cache})[__attn_v_word_idx];
-            {t_act} __attn_v_lo = as_type<{t_act}>(ushort(__attn_v_packed & 0xFFFFu));
-            {t_act} __attn_v_hi = as_type<{t_act}>(ushort((__attn_v_packed >> 16) & 0xFFFFu));
-
-            __attn_o_reg[0] = __attn_o_reg[0] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_lo);
-            __attn_o_reg[1] = __attn_o_reg[1] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_hi);
+            // Load V — same offset pattern as K.
+            for (uint __p = 0u; __p < __ATTN_N_PACKS; ++__p) {{
+                uint __attn_v_packed =
+                    ((device const uint*){v_cache})[__attn_kv_word_base + (size_t)__p];
+                {t_act} __attn_v_lo = as_type<{t_act}>(ushort(__attn_v_packed & 0xFFFFu));
+                {t_act} __attn_v_hi = as_type<{t_act}>(ushort((__attn_v_packed >> 16) & 0xFFFFu));
+                __attn_o_reg[2u * __p]      = __attn_o_reg[2u * __p]      * __attn_factor
+                                            + __attn_exp_score * __ATTN_U(__attn_v_lo);
+                __attn_o_reg[2u * __p + 1u] = __attn_o_reg[2u * __p + 1u] * __attn_factor
+                                            + __attn_exp_score * __ATTN_U(__attn_v_hi);
+            }}
         }}
 
         for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
@@ -2526,19 +2550,23 @@ pub fn bn8_attention_body_msl_atomic(
         }}
 
         // Atomic output write: only simdgroup 0 writes. Each lane
-        // packs 2 bfloats (qk_per_thread=2) into one uint32 and
-        // atomic_stores at out_atomic[(q_head_base + simd_lid*2)/2 =
-        // q_head_base/2 + simd_lid]. Single-writer per word — no CAS.
+        // packs `qk_per_thread` bfloats into `N_PACKS = qk_per_thread/2`
+        // uint32 words. Single-writer per word — disjoint lane offsets,
+        // no CAS. The loop is a compile-time constant so the compiler
+        // unrolls. Stays atomic for Apple's L2 write-through hint.
         if (__simd_gid == 0u) {{
             const uint __attn_out_bfloat_base =
                 (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
-            const uint __attn_out_word_idx = __attn_out_bfloat_base / 2u + __simd_lid;
-            uint __attn_out_packed =
-                  uint(as_type<ushort>({t_act}(__attn_final_o[0])))
-                | (uint(as_type<ushort>({t_act}(__attn_final_o[1]))) << 16);
-            atomic_store_explicit(
-                &{out_atomic}[__attn_out_word_idx],
-                __attn_out_packed, memory_order_relaxed);
+            const uint __attn_out_word_base = __attn_out_bfloat_base / 2u
+                                            + __simd_lid * __ATTN_N_PACKS;
+            for (uint __p = 0u; __p < __ATTN_N_PACKS; ++__p) {{
+                uint __attn_out_packed =
+                      uint(as_type<ushort>({t_act}(__attn_final_o[2u * __p])))
+                    | (uint(as_type<ushort>({t_act}(__attn_final_o[2u * __p + 1u]))) << 16);
+                atomic_store_explicit(
+                    &{out_atomic}[__attn_out_word_base + __p],
+                    __attn_out_packed, memory_order_relaxed);
+            }}
         }}
     }}
 "#,

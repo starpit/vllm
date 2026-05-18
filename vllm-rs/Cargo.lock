@@ -2051,10 +2051,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-mega-cu-emit"
+version = "0.1.0"
+dependencies = [
+ "dirs 6.0.0",
+ "ferrite-cuda-builder",
+ "ferrite-cuda-core",
+ "ferrite-kernels",
+ "ferrite-megakernel",
+ "ferrite-model-llama",
+ "ferrite-models",
+]
+
+[[package]]
 name = "ferrite-megakernel"
 version = "0.1.0"
 dependencies = [
  "ferrite-forward",
+ "inventory",
  "proc-macro2",
  "quote",
 ]

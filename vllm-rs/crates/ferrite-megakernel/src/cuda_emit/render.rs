@@ -868,6 +868,16 @@ pub fn render_gemm<
     if ITERS != 1 {
         return RoleBodies::skipped("Gemm");
     }
+    // M < 16 (or any M not a multiple of TILE_ROW_DIM=16 for bf16) violates
+    // TK 2.0's `st_bf<rows, cols>` static_assert(rows % TILE_ROW_DIM == 0).
+    // The decode-shape port (handoff phase 6+ item 4: "render_gemm at M=1
+    // pad to [16, K] in scratch — needs page-size bump or scratch-only
+    // bypass path") is a separate dedicated phase. Until then, skip these
+    // canonicals so the rest of the build compiles clean and the gap is
+    // explicit.
+    if M % 16 != 0 {
+        return RoleBodies::skipped("Gemm");
+    }
 
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
@@ -987,6 +997,11 @@ pub fn render_tk_fused_gemm_add<
     b_tile_offset: u32,
 ) -> RoleBodies {
     if ITERS != 1 {
+        return RoleBodies::skipped("TkFusedGemmAdd");
+    }
+    // See `render_gemm` for the M%16!=0 rationale. Same TK row-dim
+    // constraint, same deferred decode-shape port.
+    if M % 16 != 0 {
         return RoleBodies::skipped("TkFusedGemmAdd");
     }
 
@@ -1118,6 +1133,10 @@ pub fn render_fused_gate_up_activate_mul<
     activation: GateUpActivation,
 ) -> RoleBodies {
     if ITERS != 1 {
+        return RoleBodies::skipped("FusedGateUpActivateMul");
+    }
+    // See `render_gemm` for the M%16!=0 rationale.
+    if M % 16 != 0 {
         return RoleBodies::skipped("FusedGateUpActivateMul");
     }
 
@@ -1281,6 +1300,13 @@ pub fn render_tk_fused_norm_gemm<
     partial_offset: u32,
 ) -> RoleBodies {
     if ITERS != 1 {
+        return RoleBodies::skipped("TkFusedNormGemm");
+    }
+    // See `render_gemm` for the M%16!=0 rationale. lm_head also needs
+    // N-streaming (handoff phase 6+ item 5: "render_lm_head_gemm with
+    // N-streaming for vocab=128256") because [M, vocab] doesn't fit a
+    // single page. Both are deferred to a dedicated phase.
+    if M % 16 != 0 {
         return RoleBodies::skipped("TkFusedNormGemm");
     }
 
@@ -1553,6 +1579,14 @@ pub fn render_fused_qkv_rope_cache<
         return RoleBodies::skipped("FusedQkvRopeCache");
     }
     if HEAD_DIM == 0 || TILE_N % HEAD_DIM != 0 {
+        return RoleBodies::skipped("FusedQkvRopeCache");
+    }
+    // See `render_gemm` for the M%16!=0 rationale. FQRC also feeds
+    // decode attention; a `TkFusedQkvRopeCacheDecode` variant (or a
+    // runtime layout flag) may be needed for heads-packed Q layout
+    // (handoff phase 6+ item 2). Deferred with the rest of the
+    // decode-shape port.
+    if M % 16 != 0 {
         return RoleBodies::skipped("FusedQkvRopeCache");
     }
 
@@ -2061,6 +2095,26 @@ fn render_attention_via_cache_impl<
         return RoleBodies::skipped("AttentionViaCache");
     }
     if NUM_Q_HEADS % NUM_KV_HEADS != 0 {
+        return RoleBodies::skipped("AttentionViaCache");
+    }
+    // The prefill render is currently only correct at M=16:
+    //   * M < 16 (e.g. M=1 decode): violates TK's
+    //     `static_assert(rows % TILE_ROW_DIM == 0)` on
+    //     `st_bf<M, q_dim>`. The decode shape needs the dedicated
+    //     `render_attention_via_cache_decode` (handoff phase 6+
+    //     item 1; multi-CTA per (batch, kv_head) port of
+    //     `third_party/thunderkittens/kernels/attn/demo/gqa_decode/template_gqa_decode_new.cu`).
+    //   * M > 16 (e.g. M=64 batched prefill): the per-Q-head loop
+    //     emits `__attn_q_tile.subtile<M, HEAD_DIM>(int2{0, q_head})`
+    //     and then `kittens::warp::load(rt<16, HEAD_DIM>,
+    //     st_subtile<..., M, HEAD_DIM>)`. TK's `group<1>::load`
+    //     static-asserts `ST::rows == RT::rows`, which fails at
+    //     M=64 (64 != 16). A proper M-chunked inner loop or
+    //     `group<NCW>::load` cooperative split is needed. Deferred.
+    // Until those land, only M=16 prefill attention emits real CUDA;
+    // every other M emits a SKIPPED marker so nvcc can compile the
+    // rest of the canonical clean.
+    if M != 16 {
         return RoleBodies::skipped("AttentionViaCache");
     }
 

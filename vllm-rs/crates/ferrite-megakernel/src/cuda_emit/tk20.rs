@@ -646,7 +646,7 @@ pub fn warp_apply_f32_rt_lambda<const ROWS: u32, const COLS: u32>(
     lambda_body: &str,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::warp::apply({dst}, {src}, [] __device__ (int /*row*/, int /*col*/, float x) {{ return {body}; }});",
+        "kittens::warp::apply({dst}, {src}, [=] __device__ (int /*row*/, int col, float x) {{ return {body}; }});",
         dst = dst.expr(),
         src = src.expr(),
         body = lambda_body
@@ -1128,4 +1128,224 @@ pub fn if_chain(
         out.push_str(&format!(" else {{\n{}}}", eb.render(4)));
     }
     CuStmt::new(out)
+}
+
+// ============================================================
+// FlashAttention-2 body primitives. Used by
+// `render_attention_via_cache` to compose the per-block-iter
+// loop. Each binding cited to its TK 2.0 source line.
+// ============================================================
+
+/// Emit `__shared__ kittens::semaphore <name>;` — a single
+/// block-scope semaphore used to handshake a TMA load from the
+/// issuing thread to the waiting consumer warps. Must be
+/// initialized via [`init_semaphore_lane0`] before first use.
+///
+/// Source: `include/types/semaphore.cuh:23` (kittens::semaphore).
+pub fn decl_shared_semaphore(name: &str) -> CuStmt {
+    CuStmt::new(format!("__shared__ kittens::semaphore {name};"))
+}
+
+/// Initialize a block-scope semaphore once across the consumer
+/// warpgroup: only consumer-warp 0 lane 0 calls
+/// `init_semaphore`, and a `kittens::group<NCW>::sync(bar_id)`
+/// follows so all consumer warps see the init before they
+/// `wait()` on the semaphore. `expected_arrives` is the count
+/// the semaphore arrives to before `wait` returns (1 for a
+/// single TMA load).
+///
+/// The double gate (`warpid() == 0 && laneid() == 0`) prevents
+/// the init from being called once per consumer warp (which
+/// would clobber the semaphore state).
+///
+/// `__syncthreads()` is NOT used because the consumer body runs
+/// inside `if (wid < NUM_CONSUMER_WARPS)`; loader/storer warps
+/// are in the `else` branch and would not reach a block-wide
+/// barrier, yielding undefined behavior. Group<NCW>::sync uses
+/// a named PTX bar.sync that only requires the consumer warps
+/// to participate.
+///
+/// Source: `include/ops/group/util/sync.cuh:53` (init_semaphore).
+pub fn init_semaphore_warp0<const NCW: u32>(
+    name: &str,
+    expected_arrives: u32,
+    bar_id: u32,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "if (kittens::warpid() == 0 && kittens::laneid() == 0) {{ \
+         kittens::init_semaphore({name}, 0, {expected_arrives}); \
+         }} kittens::group<{NCW}>::sync({bar_id});"
+    ))
+}
+
+/// `kittens::tma::expect_bytes(sem, bytes);` — warp-scope (group<1>)
+/// expect_bytes call. Issuer-thread gating happens inside the TK
+/// helper (`include/ops/group/util/tma.cuh:18-22` — `if (laneid()
+/// == 0)`).
+pub fn warp_tma_expect_bytes(sem: &Semaphore, bytes_expr: &str) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::tma::expect_bytes({sem}, {bytes});",
+        sem = sem.expr(),
+        bytes = bytes_expr,
+    ))
+}
+
+/// `kittens::tma::load_async(dst, src, bytes, sem);` — warp-scope
+/// non-tensor TMA load with a runtime-computed source pointer
+/// (used for paged-KV gather where the source is
+/// `kv_cache_ptrs[layer] + block_table[p] * KV_BLOCK_BYTES`).
+/// Issuer-thread gating is inside the TK helper.
+///
+/// Source: `include/ops/group/util/tma.cuh:72-76`.
+pub fn warp_tma_load_async_raw_st_bf<const ROWS: u32, const COLS: u32>(
+    dst: &St<Bf16, ROWS, COLS>,
+    src_ptr_expr: &str,
+    bytes_expr: &str,
+    sem: &Semaphore,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::tma::load_async(\
+         reinterpret_cast<void*>(&{dst}), \
+         reinterpret_cast<void*>({src}), \
+         {bytes}, {sem});",
+        dst = dst.expr(),
+        src = src_ptr_expr,
+        bytes = bytes_expr,
+        sem = sem.expr(),
+    ))
+}
+
+/// `kittens::wait(sem, phase);` — single-warp wait on a semaphore.
+/// Each consumer warp polls independently; all unblock once the
+/// TMA hardware arrives on the semaphore. `phase` toggles 0↔1
+/// per arrival across iterations, so the per-block-iter loop
+/// passes `(p & 1)` for the phase.
+///
+/// Source: `include/ops/group/util/sync.cuh:112` (group<1>::wait).
+pub fn warp_wait_sem(sem: &Semaphore, phase_expr: &str) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::wait({sem}, {phase});",
+        sem = sem.expr(),
+        phase = phase_expr,
+    ))
+}
+
+/// `kittens::warp::mul(rt_dst, rt_src, scalar);` — multiply each
+/// element of a register tile by a runtime scalar. Used for
+/// `att_block *= attn_scale` in FlashAttention.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:728-731`.
+pub fn warp_mul_rt_scalar<const ROWS: u32, const COLS: u32>(
+    dst: &Rt<F32, RtRow, ROWS, COLS>,
+    src: &Rt<F32, RtRow, ROWS, COLS>,
+    scalar_expr: &str,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warp::mul({dst}, {src}, {scalar});",
+        dst = dst.expr(),
+        src = src.expr(),
+        scalar = scalar_expr,
+    ))
+}
+
+/// `kittens::warp::copy(rt_bf_dst, rt_fl_src);` — element-wise
+/// copy with implicit dtype cast (fp32 → bf16). Used to convert
+/// the post-softmax probabilities to bf16 before the PV matmul.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:445-449`
+/// (copy with same shape, different dtype).
+pub fn warp_copy_rt_fl_to_bf<const ROWS: u32, const COLS: u32>(
+    dst: &Rt<Bf16, RtRow, ROWS, COLS>,
+    src: &Rt<F32, RtRow, ROWS, COLS>,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warp::copy({dst}, {src});",
+        dst = dst.expr(),
+        src = src.expr(),
+    ))
+}
+
+/// Declare an `int` local with an initializer expression. Used
+/// for runtime loop bounds (e.g. `int __attn_num_blocks =
+/// (seq_lens[t] + BLOCK_SIZE - 1) / BLOCK_SIZE`).
+pub fn decl_local_int(name: &str, init_expr: &str) -> CuStmt {
+    CuStmt::new(format!("int {name} = {init_expr};"))
+}
+
+/// Declare a `const __nv_bfloat16*` local pointing at a paged-KV
+/// block: `cache_base_arr[layer] + block_idx * KV_BLOCK_BYTES /
+/// sizeof(bf16)`. The block index expression typically reads
+/// `block_table[p]` for the current per-token paged-KV walk.
+/// Returns both the decl and a `GmemPtrRaw<Bf16>` handle wrapping
+/// the local so downstream TMA bindings type-check.
+pub fn decl_paged_kv_block_ptr(
+    name: &str,
+    cache_base_arr: &str,
+    layer: u32,
+    block_idx_expr: &str,
+    kv_block_bytes: u32,
+) -> (CuStmt, GmemPtrRaw<Bf16>) {
+    let stmt = CuStmt::new(format!(
+        "const __nv_bfloat16* {name} = \
+         {cache_base_arr}[{layer}] + \
+         (static_cast<size_t>({block_idx_expr}) * \
+         {kv_block_bytes} / sizeof(__nv_bfloat16));"
+    ));
+    let handle = GmemPtrRaw::<Bf16>::from_expr(CuExpr::new(name.to_string()));
+    (stmt, handle)
+}
+
+/// Declare an fp32 register vector with each lane initialized to
+/// negative infinity. Used as the `max_vec` running accumulator
+/// in FlashAttention-2's online softmax (initial pass requires
+/// max-of-everything to be -INF so any real score wins).
+pub fn decl_rv_fl_neg_infty<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN>) {
+    decl_rv_fl_init_scalar::<LEN>(name, "-CUDART_INF_F")
+}
+
+/// `kittens::warp::store(st_dst, rt_src);` — store a register
+/// tile to a shared tile. Already exists for fp32→bf16 (
+/// [`warp_store_st_bf_from_rt_fl`]); this variant covers the
+/// same-dtype bf16→bf16 path used when converting the per-Q-head
+/// fp32 output back to bf16 in attn_out_page (we go fp32 → bf16
+/// register first via [`warp_copy_rt_fl_to_bf`], then bf16 rt →
+/// bf16 st via `kittens::warp::store`).
+///
+/// Source: `include/ops/group/memory/tile/register_to_shared.cuh`.
+pub fn warp_store_st_bf_from_rt_bf<const ROWS: u32, const COLS: u32>(
+    st: &St<Bf16, ROWS, COLS>,
+    rt: &Rt<Bf16, RtRow, ROWS, COLS>,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warp::store({st}, {rt});",
+        st = st.expr(),
+        rt = rt.expr(),
+    ))
+}
+
+/// Build a `kittens::semaphore` handle reference for a block-
+/// scope `__shared__ kittens::semaphore <name>;` previously
+/// declared via [`decl_shared_semaphore`].
+pub fn local_semaphore_ref(name: &str) -> Semaphore {
+    Semaphore::from_expr(CuExpr::new(name.to_string()))
+}
+
+/// `kittens::warp::div_row(rt_dst, rt_src, rv_row);` — divide
+/// each row of a register tile by the matching scalar in a
+/// per-row vector. Used to finalize FlashAttention's output:
+/// `o_reg /= sum_vec` per row before the bf16 cast.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh` (mirror
+/// of `mul_row` / `add_row` family).
+pub fn warp_div_row<const ROWS: u32, const COLS: u32>(
+    rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+    rv_row: &Rv<F32, ROWS>,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warp::div_row({dst}, {src}, {rv});",
+        dst = rt_dst.expr(),
+        src = rt_src.expr(),
+        rv = rv_row.expr(),
+    ))
 }

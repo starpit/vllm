@@ -1089,4 +1089,140 @@ mod tests {
             );
         }
     }
+
+    /// AttentionViaCache — full FlashAttention-2 body. Const-generic
+    /// shape: M=16 (Q rows, padded from NUM_TOKENS=1 decode case),
+    /// HEAD_DIM=64, NUM_Q_HEADS=32, NUM_KV_HEADS=8 (GQA group of 4),
+    /// BLOCK_SIZE=16, NCW=8 (4 Q-heads per warp), NUM_LAYERS=16.
+    /// Validates the emitted role bodies contain the canonical
+    /// FlashAttention-2 building blocks: Q@K^T (mma_ABt), online
+    /// softmax (row_max + exp + row_sum), PV (mma_AB), and the
+    /// finalizing div_row.
+    #[test]
+    fn render_attention_via_cache_basic() {
+        let bodies = vec![render::render_attention_via_cache::<
+            16, 64, 32, 8, 16, 256, 8, 16, 1,
+        >(
+            /*q_in_page_id=*/ 0,
+            /*attn_out_page_id=*/ 1,
+            /*consumer_phase=*/ 0,
+            /*storer_phase=*/ 1,
+            /*layer=*/ 5,
+            /*q_in_act_slot=*/ 0,
+            /*attn_out_act_slot=*/ 1,
+            /*score_offset=*/ 0,
+            /*pv_offset=*/ 4096,
+            /*k_smem_offset=*/ 8192,
+            /*v_smem_offset=*/ 24576,
+            /*attn_scale=*/ 0.125_f32,
+            /*attn_softcap=*/ 0.0_f32,
+            /*interleaved=*/ false,
+        )];
+        let cu = render_canonical("test_attn", &budget_lg(), LaunchTier::Attn, &bodies);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        for needle in [
+            // Loader role TMA-loads Q from gmem to q_in_page.
+            "ss.pages[0]",
+            "kittens::group<1>::tma::load_async",
+            "act_ptrs[0]",
+            // Consumer role declarations.
+            "__shared__ kittens::semaphore __attn_k_arr;",
+            "__shared__ kittens::semaphore __attn_v_arr;",
+            "kittens::init_semaphore(__attn_k_arr, 0, 1);",
+            "ss.scratch + 8192",   // K_smem
+            "ss.scratch + 24576",  // V_smem
+            "static_cast<int>(seq_lens[0])",
+            "(__attn_seq_len + 16 - 1) / 16",
+            // Per-Q-head outer loop.
+            "__attn_qh < 4",
+            // Q register tile + load.
+            "kittens::rt_bf<16, 64> __attn_q_rt;",
+            "__attn_q_tile.template subtile<16, 64>",
+            "kittens::warp::load(__attn_q_rt",
+            // Running state init.
+            "kittens::rv_fl<16> __attn_max;",
+            "kittens::rv_fl<16> __attn_sum;",
+            "kittens::warp::zero(__attn_sum);",
+            "kittens::rt_fl<16, 64> __attn_o;",
+            "kittens::warp::zero(__attn_o);",
+            // Per-block inner loop.
+            "__attn_p < static_cast<uint32_t>(__attn_num_blocks)",
+            // Paged-KV gather.
+            "key_cache_ptrs[5] +",
+            "block_table[__attn_p]",
+            // QK^T pass.
+            "kittens::warp::mma_ABt",
+            // Softmax composition.
+            "kittens::warp::row_max(__attn_new_max",
+            "kittens::warp::sub_row(__attn_att",
+            "kittens::warp::exp(__attn_att, __attn_att);",
+            "kittens::warp::row_sum(__attn_sum",
+            // PV pass.
+            "kittens::warp::copy(__attn_att_bf, __attn_att);",
+            "kittens::warp::mma_AB(__attn_o, __attn_att_bf",
+            // Finalize.
+            "kittens::warp::div_row(__attn_o, __attn_o, __attn_sum);",
+            "kittens::warp::copy(__attn_o_bf, __attn_o);",
+            "__attn_o_tile.template subtile<16, 64>",
+            // Storer role TMA-stores attn_out_page to gmem.
+            "kittens::group<1>::tma::store_async",
+            "kittens::group<1>::arrive(ss.page_consumed[1])",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Dump-only: prints the full attention .cu source. Marked
+    /// ignored so it doesn't pollute regular runs; invoke via
+    /// `cargo test -p ferrite-megakernel --lib dump_attention --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_attention_via_cache_source() {
+        let bodies = vec![render::render_attention_via_cache::<
+            16, 64, 32, 8, 16, 256, 8, 16, 1,
+        >(
+            0, 1, 0, 1, 5, 0, 1,
+            0, 4096, 8192, 24576,
+            0.125_f32, 0.0_f32, false,
+        )];
+        let cu = render_canonical("test_attn", &budget_lg(), LaunchTier::Attn, &bodies);
+        println!("{}", cu.source);
+    }
+
+    /// SlidingAttentionViaCache — same algorithm with the runtime
+    /// sliding-window mask in the consumer body.
+    #[test]
+    fn render_sliding_attention_via_cache_basic() {
+        let bodies = vec![render::render_sliding_attention_via_cache::<
+            16, 64, 32, 8, 16, 256, 8, 16, 1,
+        >(
+            0, 1, 0, 1, 5, 0, 1,
+            0, 4096, 8192, 24576,
+            0.125_f32, 0.0_f32, false,
+            /*sliding_window=*/ 4096,
+        )];
+        let cu = render_canonical(
+            "test_sliding_attn",
+            &budget_lg(),
+            LaunchTier::Attn,
+            &bodies,
+        );
+        assert!(cu.skipped_variants.is_empty());
+        // Sliding-specific: the apply lambda referencing the window.
+        assert!(
+            cu.source
+                .contains("(__attn_seq_len - 1 - 4096))"),
+            "expected sliding-window mask referencing -4096, got:\n{}",
+            cu.source
+        );
+    }
 }

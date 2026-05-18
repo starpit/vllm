@@ -23,7 +23,7 @@ use crate::ir::substrate::{PageRef, ScratchOffsetRef};
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
 use super::handles::{
-    F32, gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_positions,
+    F32, RtRow, gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_positions,
     gmem_weight_ptr_raw, gmem_weight_ptr_raw_offset, page_as_byte_ptr, page_as_st_bf,
     page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem, scratch_as,
     scratch_as_st_bf,
@@ -1877,7 +1877,7 @@ pub fn render_fused_qkv_rope_cache<
 // canonical (which is the pre-S16 behavior).
 // ============================================================
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
 pub fn render_attention_via_cache<
     const M: u32,
     const HEAD_DIM: u32,
@@ -1889,22 +1889,37 @@ pub fn render_attention_via_cache<
     const NUM_LAYERS: u32,
     const ITERS: u32,
 >(
-    _q_in_page_id: u32,
-    _attn_out_page_id: u32,
-    _consumer_phase: u32,
-    _storer_phase: u32,
-    _layer: u32,
-    _q_in_act_slot: u32,
-    _attn_out_act_slot: u32,
+    q_in_page_id: u32,
+    attn_out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    q_in_act_slot: u32,
+    attn_out_act_slot: u32,
     _score_offset: u32,
     _pv_offset: u32,
-    _k_smem_offset: u32,
-    _v_smem_offset: u32,
-    _attn_scale: f32,
-    _attn_softcap: f32,
+    k_smem_offset: u32,
+    v_smem_offset: u32,
+    attn_scale: f32,
+    attn_softcap: f32,
     _interleaved: bool,
 ) -> RoleBodies {
-    RoleBodies::skipped("AttentionViaCache")
+    render_attention_via_cache_impl::<
+        M, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
+    >(
+        q_in_page_id,
+        attn_out_page_id,
+        consumer_phase,
+        storer_phase,
+        layer,
+        q_in_act_slot,
+        attn_out_act_slot,
+        k_smem_offset,
+        v_smem_offset,
+        attn_scale,
+        attn_softcap,
+        /*sliding_window=*/ None,
+    )
 }
 
 // ============================================================
@@ -1930,21 +1945,595 @@ pub fn render_sliding_attention_via_cache<
     const NUM_LAYERS: u32,
     const ITERS: u32,
 >(
-    _q_in_page_id: u32,
-    _attn_out_page_id: u32,
-    _consumer_phase: u32,
-    _storer_phase: u32,
-    _layer: u32,
-    _q_in_act_slot: u32,
-    _attn_out_act_slot: u32,
+    q_in_page_id: u32,
+    attn_out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    q_in_act_slot: u32,
+    attn_out_act_slot: u32,
     _score_offset: u32,
     _pv_offset: u32,
-    _k_smem_offset: u32,
-    _v_smem_offset: u32,
-    _attn_scale: f32,
-    _attn_softcap: f32,
+    k_smem_offset: u32,
+    v_smem_offset: u32,
+    attn_scale: f32,
+    attn_softcap: f32,
     _interleaved: bool,
-    _sliding_window: u32,
+    sliding_window: u32,
 ) -> RoleBodies {
-    RoleBodies::skipped("SlidingAttentionViaCache")
+    render_attention_via_cache_impl::<
+        M, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
+    >(
+        q_in_page_id,
+        attn_out_page_id,
+        consumer_phase,
+        storer_phase,
+        layer,
+        q_in_act_slot,
+        attn_out_act_slot,
+        k_smem_offset,
+        v_smem_offset,
+        attn_scale,
+        attn_softcap,
+        Some(sliding_window),
+    )
+}
+
+// ============================================================
+// FlashAttention-2 algorithm body. Shared between
+// `render_attention_via_cache` and
+// `render_sliding_attention_via_cache` — the sliding variant
+// passes `sliding_window = Some(w)` to splice an extra
+// `if (kv_pos < q_pos - w) continue;` predicate inside the
+// per-block consumer loop.
+//
+// Algorithm (per consumer warp, owns NUM_Q_HEADS / NCW Q-heads):
+//   load Q register tile from q_in_page subtile for owned q_head
+//   max_vec ← -INF, sum_vec ← 0, o_reg ← 0
+//   for p in 0..num_blocks:
+//       // Issue paged-KV TMA load (warp 0 only)
+//       wait k_arrived[p & 1]
+//       load K rt from k_smem[kv_head * HEAD_DIM .. + HEAD_DIM]
+//       att_block ← Q @ K^T
+//       att_block ← att_block * attn_scale
+//       att_block ← attn_softcap > 0 ? attn_softcap * tanh(att_block / attn_softcap) : att_block
+//       (if sliding) mask att_block where kv_pos < q_pos - w
+//       new_max ← row_max(att_block, max_vec)
+//       att_block ← exp(att_block - new_max) (broadcast row sub then exp)
+//       rescale ← exp(max_vec - new_max)
+//       sum_vec ← row_sum(att_block, rescale * sum_vec)
+//       o_reg ← o_reg * rescale (per row)
+//       max_vec ← new_max
+//       wait v_arrived[p & 1]
+//       load V rt
+//       att_bf ← bf16 cast of att_block
+//       o_reg ← att_bf @ V + o_reg
+//   o_reg ← o_reg / sum_vec (per row, via mul_row with reciprocal)
+//   bf16 cast o_reg, store to attn_out_page subtile for owned q_head
+//
+// Loader role TMA-loads Q from gmem (q_in_act_slot) into q_in_page.
+// Storer role TMA-stores attn_out_page to gmem (attn_out_act_slot).
+//
+// All TMA loads for K/V blocks issue from the consumer body; only
+// the warp-0 thread of warp 0 actually issues (TK 2.0's
+// `tma::load_async` self-gates on `laneid() == 0`, and the outer
+// `if (kittens::warpid() == 0)` further restricts to one warp).
+// Local `__shared__ kittens::semaphore` declarations carry the
+// per-block-iter handshake; phase parity toggles via `(p & 1)`.
+//
+// ITERS != 1 is currently unsupported; emits a SKIPPED marker.
+// MAX_SK is the proc-macro-time SK_BUCKET upper bound for
+// `num_blocks` (host-side launch caps `seq_lens[t] ≤ MAX_SK`).
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+fn render_attention_via_cache_impl<
+    const M: u32,
+    const HEAD_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const BLOCK_SIZE: u32,
+    const MAX_SK: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    q_in_page_id: u32,
+    attn_out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    q_in_act_slot: u32,
+    attn_out_act_slot: u32,
+    k_smem_offset: u32,
+    v_smem_offset: u32,
+    attn_scale: f32,
+    attn_softcap: f32,
+    sliding_window: Option<u32>,
+) -> RoleBodies {
+    if ITERS != 1 {
+        return RoleBodies::skipped("AttentionViaCache");
+    }
+    if NUM_Q_HEADS == 0 || NUM_KV_HEADS == 0 || HEAD_DIM == 0 || NCW == 0 {
+        return RoleBodies::skipped("AttentionViaCache");
+    }
+    if NUM_Q_HEADS % NCW != 0 {
+        return RoleBodies::skipped("AttentionViaCache");
+    }
+    if NUM_Q_HEADS % NUM_KV_HEADS != 0 {
+        return RoleBodies::skipped("AttentionViaCache");
+    }
+
+    const Q_HEAD_TILE_ROWS: u32 = 16;
+
+    let kv_dim: u32 = NUM_KV_HEADS * HEAD_DIM;
+    let q_dim: u32 = NUM_Q_HEADS * HEAD_DIM;
+    let kv_block_bytes: u32 = BLOCK_SIZE * kv_dim * BF16_BYTES;
+    let heads_per_warp: u32 = NUM_Q_HEADS / NCW;
+    let gqa_group: u32 = NUM_Q_HEADS / NUM_KV_HEADS;
+
+    let loader_phase = storer_phase;
+    let q_in_p = page(q_in_page_id);
+    let attn_out_p = page(attn_out_page_id);
+
+    // The const-generic shape parameters propagate from the top
+    // of this fn through every typed handle and `tk20::*` call
+    // below — there is no intermediate runtime u32 storage for
+    // any shape. nvcc-validation and E2E coherence on
+    // `unsloth/Llama-3.2-1B-Instruct` are the next named phase.
+
+    // -----------------------------------------------------------
+    // LOADER role — TMA-load Q from gmem into q_in_page.
+    // -----------------------------------------------------------
+    let mut loader = CuBlock::new();
+    let q_in_ready = page_ready_sem(q_in_p);
+    let q_in_consumed = page_consumed_sem(q_in_p);
+    let attn_out_consumed = page_consumed_sem(attn_out_p);
+    let q_in_gmem = gmem_act_ptr_raw(q_in_act_slot);
+    let q_bytes = M * q_dim * BF16_BYTES;
+    loader.push(tk20::group_wait::<1>(&q_in_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&attn_out_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&q_in_ready, q_bytes));
+    // Q tile shape in the page is `[M, Q_DIM]` where Q_DIM =
+    // NUM_Q_HEADS * HEAD_DIM. We load it as a flat [M, Q_DIM] tile.
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
+         ss.pages[{q_in_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(&__attn_q_tile), \
+         reinterpret_cast<void*>({q_gmem}), \
+         {q_bytes}, {q_ready}); \
+         }}",
+        m = M,
+        q_dim = q_dim,
+        q_in_id = q_in_page_id,
+        q_gmem = q_in_gmem.expr(),
+        q_bytes = q_bytes,
+        q_ready = q_in_ready.expr(),
+    )));
+
+    // -----------------------------------------------------------
+    // LAUNCHER role — empty (no per-iter scheduling beyond loader).
+    // -----------------------------------------------------------
+    let launcher = CuBlock::new();
+
+    // -----------------------------------------------------------
+    // CONSUMER role — FlashAttention-2 inner loop.
+    // -----------------------------------------------------------
+    let mut consumer = CuBlock::new();
+
+    // Local block-scope semaphores for per-block-iter K/V TMA
+    // handshake. Single-stage (no double buffering), reused across
+    // iterations via phase-parity (`p & 1`).
+    consumer.push(tk20::decl_shared_semaphore("__attn_k_arr"));
+    consumer.push(tk20::decl_shared_semaphore("__attn_v_arr"));
+    // Bars 3 and 4 are unused by other AttentionViaCache canonicals
+    // (FQRC lives in a separate Qkv-tier kernel; bars 1-2 are the
+    // existing intra-op cross-warp reduce/publish convention).
+    consumer.push(tk20::init_semaphore_warp0::<NCW>(
+        "__attn_k_arr", 1, /*bar_id=*/ 3,
+    ));
+    consumer.push(tk20::init_semaphore_warp0::<NCW>(
+        "__attn_v_arr", 1, /*bar_id=*/ 4,
+    ));
+
+    let k_arr = tk20::local_semaphore_ref("__attn_k_arr");
+    let v_arr = tk20::local_semaphore_ref("__attn_v_arr");
+
+    consumer.push(tk20::group_wait::<1>(&q_in_ready, consumer_phase));
+
+    // Bind Q tile typed view (page reinterpret) for downstream
+    // subtile slicing.
+    consumer.push(CuStmt::new(format!(
+        "auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
+         ss.pages[{q_in_id}]);",
+        m = M,
+        q_dim = q_dim,
+        q_in_id = q_in_page_id,
+    )));
+    consumer.push(CuStmt::new(format!(
+        "auto& __attn_o_tile = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
+         ss.pages[{out_id}]);",
+        m = M,
+        q_dim = q_dim,
+        out_id = attn_out_page_id,
+    )));
+
+    // K_smem / V_smem typed views (single-stage paged-KV staging).
+    consumer.push(CuStmt::new(format!(
+        "auto& __attn_k_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
+         ss.scratch + {ksoff});",
+        bs = BLOCK_SIZE,
+        kvd = kv_dim,
+        ksoff = k_smem_offset,
+    )));
+    consumer.push(CuStmt::new(format!(
+        "auto& __attn_v_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
+         ss.scratch + {vsoff});",
+        bs = BLOCK_SIZE,
+        kvd = kv_dim,
+        vsoff = v_smem_offset,
+    )));
+
+    // Per-token paged-KV walk parameters. `seq_lens[0]` is used
+    // for the bound; multi-token (M > 1) attention shares the
+    // same KV walk because all M tokens belong to the same
+    // sequence (vLLM's per-request attention).
+    consumer.push(tk20::decl_local_int(
+        "__attn_seq_len",
+        "static_cast<int>(seq_lens[0])",
+    ));
+    consumer.push(tk20::decl_local_int(
+        "__attn_num_blocks",
+        &format!("(__attn_seq_len + {bs} - 1) / {bs}", bs = BLOCK_SIZE),
+    ));
+    consumer.push(tk20::decl_local_int(
+        "__attn_consumer_warp_id",
+        "static_cast<int>(kittens::warpid())",
+    ));
+
+    // Per-Q-head outer loop — each consumer warp owns
+    // `heads_per_warp` Q-heads, indexed by q_head_in_warp ∈
+    // [0, heads_per_warp). Global Q-head id is
+    // `consumer_warp_id * heads_per_warp + q_head_in_warp`.
+    let mut q_head_body = CuBlock::new();
+    q_head_body.push(tk20::decl_local_int(
+        "__attn_q_head",
+        &format!("__attn_consumer_warp_id * {hpw} + __attn_qh", hpw = heads_per_warp),
+    ));
+    q_head_body.push(tk20::decl_local_int(
+        "__attn_kv_head",
+        &format!("__attn_q_head / {gg}", gg = gqa_group),
+    ));
+
+    // Q register tile: `[Q_HEAD_TILE_ROWS, HEAD_DIM]` (16 rows is
+    // TK 2.0's minimum tile-row granularity; M < 16 cases pad).
+    let (decl_q_rt, q_rt) =
+        tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_q_rt");
+    q_head_body.push(decl_q_rt);
+    // Sub-slice Q tile for this Q-head: column range
+    // [q_head * HEAD_DIM, (q_head + 1) * HEAD_DIM).
+    q_head_body.push(CuStmt::new(format!(
+        "auto __attn_q_sub = __attn_q_tile.template subtile<{m}, {hd}>(\
+         int2{{0, __attn_q_head}});",
+        m = M.max(Q_HEAD_TILE_ROWS),
+        hd = HEAD_DIM,
+    )));
+    q_head_body.push(CuStmt::new(
+        "kittens::warp::load(__attn_q_rt, __attn_q_sub);".to_string(),
+    ));
+
+    // Running state: max_vec, sum_vec (rv_fl<Q_HEAD_TILE_ROWS>),
+    // o_reg (rt_fl<Q_HEAD_TILE_ROWS, HEAD_DIM>).
+    let (decl_max, max_rv) =
+        tk20::decl_rv_fl_neg_infty::<Q_HEAD_TILE_ROWS>("__attn_max");
+    let (decl_sum, sum_rv) = tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_sum");
+    let (decl_o, o_rt) =
+        tk20::decl_rt_fl::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o");
+    q_head_body.push(decl_max);
+    q_head_body.push(decl_sum);
+    q_head_body.push(tk20::warp_zero_rv::<Q_HEAD_TILE_ROWS>(&sum_rv));
+    q_head_body.push(decl_o);
+    q_head_body.push(tk20::warp_zero_rt::<F32, RtRow, Q_HEAD_TILE_ROWS, HEAD_DIM>(
+        &o_rt,
+    ));
+
+    // Per-block inner loop.
+    let mut p_body = CuBlock::new();
+    p_body.push(tk20::decl_local_int(
+        "__attn_phase",
+        "(static_cast<int>(__attn_p)) & 1",
+    ));
+
+    // Issue paged-KV K block TMA load on warp-0 lane-0 only. The
+    // TK 2.0 `tma::load_async` helper self-gates on `laneid()
+    // == 0`, and the outer `if (kittens::warpid() == 0)` reduces
+    // to one warp. Net: single thread issues the TMA.
+    let (decl_k_ptr, _k_ptr) = tk20::decl_paged_kv_block_ptr(
+        "__attn_k_ptr",
+        "key_cache_ptrs",
+        layer,
+        "block_table[__attn_p]",
+        kv_block_bytes,
+    );
+    let (decl_v_ptr, _v_ptr) = tk20::decl_paged_kv_block_ptr(
+        "__attn_v_ptr",
+        "value_cache_ptrs",
+        layer,
+        "block_table[__attn_p]",
+        kv_block_bytes,
+    );
+    p_body.push(decl_k_ptr);
+    p_body.push(decl_v_ptr);
+
+    let mut warp0_block = CuBlock::new();
+    warp0_block.push(tk20::warp_tma_expect_bytes(
+        &k_arr,
+        &kv_block_bytes.to_string(),
+    ));
+    warp0_block.push(CuStmt::new(format!(
+        "kittens::tma::load_async(\
+         reinterpret_cast<void*>(&__attn_k_smem), \
+         reinterpret_cast<void*>(__attn_k_ptr), \
+         {bytes}, __attn_k_arr);",
+        bytes = kv_block_bytes,
+    )));
+    p_body.push(tk20::if_else(
+        "kittens::warpid() == 0",
+        &warp0_block,
+        None,
+    ));
+
+    p_body.push(tk20::warp_wait_sem(&k_arr, "__attn_phase"));
+
+    // K register tile: row layout, sub-sliced for this kv_head's
+    // HEAD_DIM-wide column range within the [BLOCK_SIZE, KV_DIM]
+    // K_smem block.
+    p_body.push(CuStmt::new(format!(
+        "auto __attn_k_sub = __attn_k_smem.template subtile<{bs}, {hd}>(\
+         int2{{0, __attn_kv_head}});",
+        bs = BLOCK_SIZE,
+        hd = HEAD_DIM,
+    )));
+    let (decl_k_rt, k_rt) =
+        tk20::decl_rt_bf_row::<BLOCK_SIZE, HEAD_DIM>("__attn_k_rt");
+    p_body.push(decl_k_rt);
+    p_body.push(CuStmt::new(
+        "kittens::warp::load(__attn_k_rt, __attn_k_sub);".to_string(),
+    ));
+
+    // att_block = Q @ K^T; shape `[Q_HEAD_TILE_ROWS, BLOCK_SIZE]`
+    // fp32, row layout. C accumulator initialized to zeros (we
+    // overwrite, not accumulate, since each block's contribution
+    // is its own `Q @ K^T_block`).
+    let (decl_att, att_rt) =
+        tk20::decl_rt_fl::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>("__attn_att");
+    p_body.push(decl_att);
+    p_body.push(tk20::warp_zero_rt::<F32, RtRow, Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_rt,
+    ));
+    p_body.push(tk20::warp_mma_ABt::<Q_HEAD_TILE_ROWS, HEAD_DIM, BLOCK_SIZE>(
+        &att_rt, &q_rt, &k_rt, &att_rt,
+    ));
+
+    // att *= attn_scale (runtime f32).
+    p_body.push(tk20::warp_mul_rt_scalar::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_rt,
+        &att_rt,
+        &format!("{:e}f", attn_scale),
+    ));
+
+    // Tanh softcap: att = softcap * tanh(att / softcap), iff
+    // softcap > 0. Skipped at proc-macro time when softcap == 0
+    // (the IR records exactly the f32 value the user set).
+    if attn_softcap > 0.0 {
+        let cap_lit = format!("{:e}f", attn_softcap);
+        let inv_cap_lit = format!("{:e}f", 1.0_f32 / attn_softcap);
+        p_body.push(tk20::warp_apply_f32_rt_lambda::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+            &att_rt,
+            &att_rt,
+            &format!("{cap} * tanhf(x * {inv})", cap = cap_lit, inv = inv_cap_lit),
+        ));
+    }
+
+    // Sliding-window mask: kv_pos = p * BLOCK_SIZE + col;
+    // q_pos = seq_len - 1 (decode) or token-relative (prefill).
+    // Set att = -INF where kv_pos < q_pos - sliding_window.
+    if let Some(w) = sliding_window {
+        p_body.push(tk20::warp_apply_f32_rt_lambda::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+            &att_rt,
+            &att_rt,
+            &format!(
+                "((static_cast<int>(__attn_p) * {bs} + col) < \
+                 (__attn_seq_len - 1 - {w})) ? -CUDART_INF_F : x",
+                bs = BLOCK_SIZE,
+                w = w,
+            ),
+        ));
+    }
+
+    // Beyond-seq mask: kv_pos >= seq_len → -INF.
+    p_body.push(tk20::warp_apply_f32_rt_lambda::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_rt,
+        &att_rt,
+        &format!(
+            "((static_cast<int>(__attn_p) * {bs} + col) >= __attn_seq_len) \
+             ? -CUDART_INF_F : x",
+            bs = BLOCK_SIZE,
+        ),
+    ));
+
+    // Online softmax update.
+    let (decl_new_max, new_max_rv) =
+        tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_new_max");
+    p_body.push(decl_new_max);
+    p_body.push(tk20::warp_row_max_running::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &new_max_rv,
+        &att_rt,
+        &max_rv,
+    ));
+    // att = exp(att - new_max) (broadcast row sub then exp).
+    p_body.push(tk20::warp_sub_row::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_rt,
+        &att_rt,
+        &new_max_rv,
+    ));
+    p_body.push(tk20::warp_exp_rt::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_rt, &att_rt,
+    ));
+    // rescale = exp(max_vec - new_max).
+    let (decl_rescale, rescale_rv) =
+        tk20::decl_rv_fl::<Q_HEAD_TILE_ROWS>("__attn_rescale");
+    p_body.push(decl_rescale);
+    p_body.push(tk20::warp_sub_rv_rv::<Q_HEAD_TILE_ROWS>(
+        &rescale_rv,
+        &max_rv,
+        &new_max_rv,
+    ));
+    p_body.push(tk20::warp_exp_rv::<Q_HEAD_TILE_ROWS>(&rescale_rv, &rescale_rv));
+    // sum_vec = row_sum(att, rescale * sum_vec).
+    p_body.push(tk20::warp_mul_rv_rv::<Q_HEAD_TILE_ROWS>(
+        &sum_rv,
+        &sum_rv,
+        &rescale_rv,
+    ));
+    p_body.push(tk20::warp_row_sum_running::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &sum_rv, &att_rt, &sum_rv,
+    ));
+    // o_reg *= rescale (per row).
+    p_body.push(tk20::warp_mul_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
+        &o_rt,
+        &o_rt,
+        &rescale_rv,
+    ));
+    // max_vec = new_max (reuse register).
+    p_body.push(tk20::warp_copy_rv::<F32, Q_HEAD_TILE_ROWS>(
+        &max_rv,
+        &new_max_rv,
+    ));
+
+    // V load — same dance as K.
+    let mut v_warp0_block = CuBlock::new();
+    v_warp0_block.push(tk20::warp_tma_expect_bytes(
+        &v_arr,
+        &kv_block_bytes.to_string(),
+    ));
+    v_warp0_block.push(CuStmt::new(format!(
+        "kittens::tma::load_async(\
+         reinterpret_cast<void*>(&__attn_v_smem), \
+         reinterpret_cast<void*>(__attn_v_ptr), \
+         {bytes}, __attn_v_arr);",
+        bytes = kv_block_bytes,
+    )));
+    p_body.push(tk20::if_else(
+        "kittens::warpid() == 0",
+        &v_warp0_block,
+        None,
+    ));
+    p_body.push(tk20::warp_wait_sem(&v_arr, "__attn_phase"));
+
+    p_body.push(CuStmt::new(format!(
+        "auto __attn_v_sub = __attn_v_smem.template subtile<{bs}, {hd}>(\
+         int2{{0, __attn_kv_head}});",
+        bs = BLOCK_SIZE,
+        hd = HEAD_DIM,
+    )));
+    // V register tile in COL layout — `mma_AB` wants B=col.
+    let (decl_v_rt, v_rt) =
+        tk20::decl_rt_bf_col::<BLOCK_SIZE, HEAD_DIM>("__attn_v_rt");
+    p_body.push(decl_v_rt);
+    p_body.push(CuStmt::new(
+        "kittens::warp::load(__attn_v_rt, __attn_v_sub);".to_string(),
+    ));
+
+    // bf16 cast of att_block for the PV matmul.
+    let (decl_att_bf, att_bf_rt) =
+        tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>("__attn_att_bf");
+    p_body.push(decl_att_bf);
+    p_body.push(tk20::warp_copy_rt_fl_to_bf::<Q_HEAD_TILE_ROWS, BLOCK_SIZE>(
+        &att_bf_rt,
+        &att_rt,
+    ));
+
+    // o_reg += att_bf @ V.
+    p_body.push(tk20::warp_mma_AB::<Q_HEAD_TILE_ROWS, BLOCK_SIZE, HEAD_DIM>(
+        &o_rt, &att_bf_rt, &v_rt, &o_rt,
+    ));
+
+    q_head_body.push(tk20::for_loop(
+        "uint32_t __attn_p = 0; __attn_p < static_cast<uint32_t>(__attn_num_blocks); ++__attn_p",
+        &p_body,
+    ));
+
+    // Finalize: o_reg /= sum_vec (per row).
+    q_head_body.push(tk20::warp_div_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
+        &o_rt, &o_rt, &sum_rv,
+    ));
+
+    // Cast o_reg fp32 → bf16 register tile, then store to
+    // attn_out subtile for this Q-head.
+    let (decl_o_bf, o_bf_rt) =
+        tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o_bf");
+    q_head_body.push(decl_o_bf);
+    q_head_body.push(tk20::warp_copy_rt_fl_to_bf::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
+        &o_bf_rt, &o_rt,
+    ));
+    q_head_body.push(CuStmt::new(format!(
+        "auto __attn_o_sub = __attn_o_tile.template subtile<{m}, {hd}>(\
+         int2{{0, __attn_q_head}});",
+        m = M.max(Q_HEAD_TILE_ROWS),
+        hd = HEAD_DIM,
+    )));
+    q_head_body.push(CuStmt::new(
+        "kittens::warp::store(__attn_o_sub, __attn_o_bf);".to_string(),
+    ));
+
+    consumer.push(tk20::for_loop(
+        &format!(
+            "uint32_t __attn_qh = 0; __attn_qh < {hpw}; ++__attn_qh",
+            hpw = heads_per_warp
+        ),
+        &q_head_body,
+    ));
+
+    let attn_out_done = page_done_sem(attn_out_p);
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive::<1>(&attn_out_done),
+        tk20::group_arrive::<1>(&q_in_consumed),
+    ]));
+
+    // -----------------------------------------------------------
+    // STORER role — TMA-store attn_out_page back to gmem.
+    // -----------------------------------------------------------
+    let mut storer = CuBlock::new();
+    let attn_out_gmem = gmem_act_ptr_raw(attn_out_act_slot);
+    let attn_out_bytes = M * q_dim * BF16_BYTES;
+    let attn_out_consumed = page_consumed_sem(attn_out_p);
+    storer.push(tk20::group_wait::<1>(&attn_out_done, storer_phase));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         auto& __attn_o_tile = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
+         ss.pages[{out_id}]); \
+         kittens::group<1>::tma::store_async(\
+         reinterpret_cast<void*>({out_gmem}), \
+         reinterpret_cast<void*>(&__attn_o_tile), \
+         {bytes}); \
+         }}",
+        m = M,
+        q_dim = q_dim,
+        out_id = attn_out_page_id,
+        out_gmem = attn_out_gmem.expr(),
+        bytes = attn_out_bytes,
+    )));
+    storer.push(tk20::group_tma_store_async_wait::<1>());
+    storer.push(tk20::group_arrive::<1>(&attn_out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
 }

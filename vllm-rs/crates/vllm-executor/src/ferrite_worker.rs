@@ -9866,11 +9866,30 @@ impl Worker for FerriteWorker {
             }
         }
 
-        // block_table padded to [num_reqs, max_blocks] u32.
-        let max_blocks = attn.block_ids.iter().map(|b| b.len()).max().unwrap_or(0);
-        let max_blocks_eff = max_blocks.max(1);
+        // block_table padded to [num_reqs, max_blocks_per_seq] u32.
+        //
+        // Row stride MUST match the ferrite-metal kernel's
+        // `ATTN_PAGED_MAX_BLOCKS_PER_SEQ` function constant (slot 5,
+        // baked from `W::MAX_BLOCKS_PER_SEQ` — default 128 in
+        // `instr.rs::CanonicalParams`). The kernel reads
+        // `block_table + seq_idx * MAX_BLOCKS_PER_SEQ`; if the host
+        // writes with a smaller `runtime_max_blocks` stride, every
+        // `seq_idx > 0` reads from the wrong row offset and pulls
+        // garbage K/V. Symptom: concurrent / batched-decode
+        // requests other than seq_idx=0 produce incoherent output;
+        // single-seq runs are unaffected because only row 0 is read.
+        //
+        // Plumbing the per-canonical `MAX_BLOCKS_PER_SEQ` through
+        // the worker would require the FerriteWeights trait to
+        // expose it; for now hardcode the trait default (128). The
+        // kernel constant 5 is set to this same value in
+        // `lowering.rs::AttentionPrefillPaged` /
+        // `AttentionViaCache` arms.
+        const KERNEL_BLOCK_TABLE_STRIDE: usize = 128;
+        let runtime_max_blocks = attn.block_ids.iter().map(|b| b.len()).max().unwrap_or(0);
+        let max_blocks_eff = KERNEL_BLOCK_TABLE_STRIDE.max(runtime_max_blocks).max(1);
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
-        if max_blocks > 0 {
+        if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {
                 for (j, &bid) in blocks.iter().enumerate() {
                     block_table_u32[i * max_blocks_eff + j] = bid as u32;

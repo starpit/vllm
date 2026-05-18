@@ -1419,6 +1419,10 @@ impl<
         const SCORE_BYTES: u32,
         const PV_OFF: u32,
         const PV_BYTES: u32,
+        const K_SMEM_OFF: u32,
+        const K_SMEM_BYTES: u32,
+        const V_SMEM_OFF: u32,
+        const V_SMEM_BYTES: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ITERS: u32,
@@ -1438,11 +1442,17 @@ impl<
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _q_in_page: crate::ir::substrate::PageId<Q_IN_ID, NUM_PAGES>,
         _attn_out_page: crate::ir::substrate::PageId<ATTN_OUT_ID, NUM_PAGES>,
-        _score_tile: crate::ir::substrate::ScratchRegion<
+        score_tile: crate::ir::substrate::ScratchRegion<
             SCORE_OFF, SCORE_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
         >,
-        _pv_tile: crate::ir::substrate::ScratchRegion<
+        pv_tile: crate::ir::substrate::ScratchRegion<
             PV_OFF, PV_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
+        >,
+        k_smem: crate::ir::substrate::ScratchRegion<
+            K_SMEM_OFF, K_SMEM_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
+        >,
+        v_smem: crate::ir::substrate::ScratchRegion<
+            V_SMEM_OFF, V_SMEM_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
         >,
         _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
         _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
@@ -1461,6 +1471,32 @@ impl<
         attn_scale: f32,
         attn_softcap: f32,
     ) -> &mut Self {
+        // Discharge proofs that make every const assert in
+        // `AttentionViaCacheNode::new` dead code:
+        //
+        // 1. All four `AttentionScope` regions pairwise disjoint
+        //    (6 pairs for n=4). Each `disjoint_with` returns the
+        //    pair so we can chain through the rest.
+        // 2. K_smem and V_smem each fit a `[BLOCK_SIZE,
+        //    NUM_KV_HEADS * HEAD_DIM]` bf16 paged-KV block.
+        // 3. CONSUMER_PHASE / STORER_PHASE parities match
+        //    the cumulative `ARRIVES` count (the
+        //    `AttentionViaCacheNode::new` parity asserts become
+        //    dead once these are discharged here).
+        let (score_tile, pv_tile) = score_tile.disjoint_with(pv_tile);
+        let (score_tile, k_smem) = score_tile.disjoint_with(k_smem);
+        let (score_tile, v_smem) = score_tile.disjoint_with(v_smem);
+        let (pv_tile, k_smem) = pv_tile.disjoint_with(k_smem);
+        let (pv_tile, v_smem) = pv_tile.disjoint_with(v_smem);
+        let (k_smem, v_smem) = k_smem.disjoint_with(v_smem);
+        let _k_smem = k_smem.fits_kv_block::<BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM>();
+        let _v_smem = v_smem.fits_kv_block::<BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM>();
+        let _ = score_tile;
+        let _ = pv_tile;
+        let _ = crate::ir::substrate::MbarrierPhase::<CONSUMER_PHASE>::assert_matches::<ARRIVES>();
+        let _ =
+            crate::ir::substrate::MbarrierPhase::<STORER_PHASE>::assert_matches_next::<ARRIVES>();
+
         self.verify_arrives(ARRIVES, "push_attention_via_cache");
         let _ = self.pool.take(Q_IN_ID);
         let _ = self.pool.take(ATTN_OUT_ID);
@@ -1473,6 +1509,10 @@ impl<
             SCORE_BYTES,
             PV_OFF,
             PV_BYTES,
+            K_SMEM_OFF,
+            K_SMEM_BYTES,
+            V_SMEM_OFF,
+            V_SMEM_BYTES,
             CONSUMER_PHASE,
             STORER_PHASE,
             ITERS,
@@ -1619,6 +1659,10 @@ mod tests {
     type Builder6 = MegaTapeBuilder<6, 8, 32_768, 8_192, 0>;
     type Builder8 = MegaTapeBuilder<8, 8, 32_768, 8_192, 0>;
     type BuilderD = MegaTapeBuilder<8, 8, 32_768, 32_768, 4>;
+    /// Larger-scratch builder used by attention tests that need to
+    /// fit two paged-KV blocks (16 * NUM_KV_HEADS * HEAD_DIM * 2 each)
+    /// plus the score and pv regions in `AttentionScope`.
+    type BuilderAttn = MegaTapeBuilder<8, 8, 32_768, 65_536, 4>;
 
     #[test]
     fn lowers_well_formed_rms_norm() {
@@ -2303,16 +2347,26 @@ mod tests {
             ActSlotConst, ArrivesCount, AttentionScope, BlockSize, HeadDim, IterCount, MaxSk,
             MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchRegion,
         };
-        let mut b = BuilderD::new();
+        let mut b = BuilderAttn::new();
+        // Scratch layout (AttentionScope, SCRATCH_BYTES=65536):
+        //   score    [0,    4096)
+        //   pv       [4096, 8192)
+        //   k_smem   [8192, 24576)   16 * 8 * 64 * 2 = 16384 bytes
+        //   v_smem   [24576, 40960)  same
         b.push_attention_via_cache::<
-            0, 1, 0, 4096, 4096, 4096, 0, 1, 8, 5, 16, 0,
+            0, 1,
+            0, 4096, 4096, 4096,
+            8192, 16384, 24576, 16384,
+            0, 1, 8, 5, 16, 0,
             64, 32, 8, 16, 8, 8192, 0, 1,
         >(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
-            ScratchRegion::<0, 4096, 32_768, AttentionScope>::new(),
-            ScratchRegion::<4096, 4096, 32_768, AttentionScope>::new(),
+            ScratchRegion::<0, 4096, 65_536, AttentionScope>::new(),
+            ScratchRegion::<4096, 4096, 65_536, AttentionScope>::new(),
+            ScratchRegion::<8192, 16384, 65_536, AttentionScope>::new(),
+            ScratchRegion::<24576, 16384, 65_536, AttentionScope>::new(),
             MbarrierPhase::<0>::new(),
             MbarrierPhase::<1>::new(),
             IterCount::<8>::new(),

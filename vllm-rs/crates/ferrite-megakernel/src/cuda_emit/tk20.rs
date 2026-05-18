@@ -732,6 +732,43 @@ pub fn warp_mma_AB<const M: u32, const K: u32, const N: u32>(
     ))
 }
 
+/// `kittens::warp::mma_ABt(d, a, b, c);` — `D = A * B^T + C` with
+/// D=fp32 row, A=bf16 row, B=bf16 row (note: row, not col — the
+/// transpose is the operation, not the storage layout), C=fp32 row.
+/// Used for FlashAttention's QK^T pass where Q is loaded into a
+/// row-layout register tile and K's per-block tile is similarly
+/// row-layout (the transpose folds into the WMMA instruction itself,
+/// not into the tile's data layout).
+///
+/// Const-generic shape contract:
+///   D: [M, N]   row,  fp32   (`Rt<F32, RtRow, M, N>`)
+///   A: [M, K]   row,  bf16   (`Rt<Bf16, RtRow, M, K>`)
+///   B: [N, K]   row,  bf16   (`Rt<Bf16, RtRow, N, K>`)
+///   C: [M, N]   row,  fp32   (`Rt<F32, RtRow, M, N>`)
+///
+/// TK 2.0's `static_assert`s in `mma_ABt` enforce the same
+/// invariants (`D::rows == A::rows && D::cols == B::rows`,
+/// `A::cols == B::cols`); the Rust const generics catch a wrong
+/// shape at `cargo check -p ferrite-megakernel` rather than at
+/// nvcc time.
+///
+/// Source: `include/ops/group/mma/warp.cuh:647-696`.
+#[allow(non_snake_case)]
+pub fn warp_mma_ABt<const M: u32, const K: u32, const N: u32>(
+    d: &Rt<F32, RtRow, M, N>,
+    a: &Rt<Bf16, RtRow, M, K>,
+    b: &Rt<Bf16, RtRow, N, K>,
+    c: &Rt<F32, RtRow, M, N>,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warp::mma_ABt({d}, {a}, {b}, {c});",
+        d = d.expr(),
+        a = a.expr(),
+        b = b.expr(),
+        c = c.expr()
+    ))
+}
+
 /// `auto <name> = <parent>.template subtile<rows, cols>(int2{row, col});`
 /// — declare a named local binding to a shared-tile soft-subtile
 /// view (`st_subtile`). Returns the bound `St<Bf16, ROWS, COLS>`

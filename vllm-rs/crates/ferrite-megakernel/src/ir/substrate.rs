@@ -261,6 +261,32 @@ impl<const OFFSET: u32, const BYTES: u32, const SCRATCH_BYTES: u32, Scope: IsScr
         (self, other)
     }
 
+    /// Discharge proof that this region fits a single-stage paged-KV
+    /// block of `[BLOCK_SIZE, NUM_KV_HEADS * HEAD_DIM]` bf16. Compile-
+    /// fails (E0080) if `BYTES < BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM
+    /// * 2`. Returns `self` so the caller can chain.
+    ///
+    /// Used by `push_attention_via_cache` to prove the K_smem and
+    /// V_smem regions are sized correctly for the paged-KV gather,
+    /// per [[feedback-end-to-end-compile-time-proofs]] (the assert
+    /// inside `AttentionViaCacheNode::new` against the same
+    /// invariant becomes dead code once this proof has been
+    /// discharged).
+    pub const fn fits_kv_block<
+        const BLOCK_SIZE: u32,
+        const NUM_KV_HEADS: u32,
+        const HEAD_DIM: u32,
+    >(self) -> Self {
+        const {
+            let needed = (BLOCK_SIZE as u64) * (NUM_KV_HEADS as u64) * (HEAD_DIM as u64) * 2;
+            assert!(
+                BYTES as u64 >= needed,
+                "ScratchRegion::fits_kv_block: BYTES < BLOCK_SIZE*NUM_KV_HEADS*HEAD_DIM*2",
+            );
+        }
+        self
+    }
+
     pub const fn offset(&self) -> u32 {
         OFFSET
     }
@@ -305,6 +331,23 @@ impl<const P: u32> MbarrierPhase<P> {
             assert!(
                 P == N & 1,
                 "MbarrierPhase: parity mismatch with cumulative arrive count",
+            );
+        }
+        Self
+    }
+
+    /// Assert this phase parity matches `N + 1` (the storer-side
+    /// phase that pairs with a consumer-phase `assert_matches::<N>`).
+    /// Compile-fails if `P != (N + 1) & 1`. Exists because Rust
+    /// without `generic_const_exprs` rejects `{ ARRIVES + 1 }` as a
+    /// const-generic argument; this fn lets callers pass the same
+    /// `ARRIVES` literal both arms ([[feedback-end-to-end-compile-time-proofs]]).
+    pub const fn assert_matches_next<const N: u32>() -> Self {
+        const {
+            assert!(P <= 1, "MbarrierPhase: P must be 0 or 1");
+            assert!(
+                P == (N.wrapping_add(1)) & 1,
+                "MbarrierPhase: parity mismatch with cumulative arrive count + 1",
             );
         }
         Self

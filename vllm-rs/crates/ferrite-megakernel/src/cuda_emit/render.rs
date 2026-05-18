@@ -1842,3 +1842,109 @@ pub fn render_fused_qkv_rope_cache<
         skipped: None,
     }
 }
+
+// ============================================================
+// AttentionViaCache — paged FlashAttention-2 over the global KV
+// cache. Const generics propagate every shape and lifecycle proof
+// from `AttentionViaCacheNode` end-to-end:
+//
+//   M           = NUM_TOKENS   (Q rows; vLLM's per-request token count)
+//   HEAD_DIM    = per-head dim (e.g. 64 for llama-3.2-1b)
+//   NUM_Q_HEADS / NUM_KV_HEADS / KV_DIM = NUM_KV_HEADS * HEAD_DIM
+//   BLOCK_SIZE  = paged-KV block size (16, fixed by Attn launch tier)
+//   NCW         = NUM_CONSUMER_WARPS (warp split of Q heads)
+//   NUM_LAYERS  = total transformer layers (for kv_cache_ptrs[layer])
+//
+// Scratch layout (proven disjoint at proc-macro time via four-way
+// `ScratchRegion::disjoint_with` chain in
+// [`crate::ir::lower::push_attention_via_cache`]):
+//   `score`    `[SCORE_OFF,  SCORE_OFF + SCORE_BYTES)`     — softmax stats
+//   `pv`       `[PV_OFF,     PV_OFF    + PV_BYTES)`        — partial PV accum
+//   `k_smem`   `[K_SMEM_OFF, K_SMEM_OFF + K_SMEM_BYTES)`   — single-stage K block
+//   `v_smem`   `[V_SMEM_OFF, V_SMEM_OFF + V_SMEM_BYTES)`   — single-stage V block
+//
+// The K_SMEM / V_SMEM regions are sized to fit one `[BLOCK_SIZE,
+// NUM_KV_HEADS * HEAD_DIM]` bf16 paged-KV block each (proof
+// discharged via `ScratchRegion::fits_kv_block` in the push path).
+//
+// **STATUS**: this fn is a *stub*. The AST-level wiring is complete —
+// IR fields, push-side substrate proofs, proc-macro dispatch, render
+// dispatch arm — but the role-body composition that emits the full
+// FlashAttention algorithm (Q@K^T, online softmax, PV) is the next
+// named phase. Returning `RoleBodies::skipped` emits a `// SKIPPED`
+// marker per role and lets `emit_for_canonical_<canonical>` succeed
+// for tapes containing this node, instead of skipping the entire
+// canonical (which is the pre-S16 behavior).
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_attention_via_cache<
+    const M: u32,
+    const HEAD_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const BLOCK_SIZE: u32,
+    const MAX_SK: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    _q_in_page_id: u32,
+    _attn_out_page_id: u32,
+    _consumer_phase: u32,
+    _storer_phase: u32,
+    _layer: u32,
+    _q_in_act_slot: u32,
+    _attn_out_act_slot: u32,
+    _score_offset: u32,
+    _pv_offset: u32,
+    _k_smem_offset: u32,
+    _v_smem_offset: u32,
+    _attn_scale: f32,
+    _attn_softcap: f32,
+    _interleaved: bool,
+) -> RoleBodies {
+    RoleBodies::skipped("AttentionViaCache")
+}
+
+// ============================================================
+// SlidingAttentionViaCache — same algorithm as
+// `AttentionViaCache` plus a runtime sliding-window mask
+// (`if (kv_token_pos < q_token_pos - SLIDING_WINDOW) continue;`
+// inside the per-block consumer loop).
+//
+// Same const-generic surface as `render_attention_via_cache` plus
+// the runtime `sliding_window` arg. STUB — same partial-landing
+// rationale documented above.
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_sliding_attention_via_cache<
+    const M: u32,
+    const HEAD_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const BLOCK_SIZE: u32,
+    const MAX_SK: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    _q_in_page_id: u32,
+    _attn_out_page_id: u32,
+    _consumer_phase: u32,
+    _storer_phase: u32,
+    _layer: u32,
+    _q_in_act_slot: u32,
+    _attn_out_act_slot: u32,
+    _score_offset: u32,
+    _pv_offset: u32,
+    _k_smem_offset: u32,
+    _v_smem_offset: u32,
+    _attn_scale: f32,
+    _attn_softcap: f32,
+    _interleaved: bool,
+    _sliding_window: u32,
+) -> RoleBodies {
+    RoleBodies::skipped("SlidingAttentionViaCache")
+}

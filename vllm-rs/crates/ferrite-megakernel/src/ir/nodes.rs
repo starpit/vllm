@@ -2767,6 +2767,18 @@ pub struct AttentionViaCacheNode {
     score_bytes: crate::ir::substrate::ScratchBytesRef,
     pv_offset: crate::ir::substrate::ScratchOffsetRef,
     pv_bytes: crate::ir::substrate::ScratchBytesRef,
+    // K_smem and V_smem staging buffers — single-stage paged-KV
+    // gather buffers used by the loader role to TMA-load one KV
+    // block at a time. Sized [BLOCK_SIZE, NUM_KV_HEADS * HEAD_DIM]
+    // bf16 = `BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * 2` bytes
+    // each. Live in `AttentionScope` and are disjoint from
+    // `score_*` / `pv_*` (proven via `ScratchRegion::disjoint_with`
+    // at proc-macro construction time, per
+    // [[feedback-end-to-end-compile-time-proofs]]).
+    k_smem_offset: crate::ir::substrate::ScratchOffsetRef,
+    k_smem_bytes: crate::ir::substrate::ScratchBytesRef,
+    v_smem_offset: crate::ir::substrate::ScratchOffsetRef,
+    v_smem_bytes: crate::ir::substrate::ScratchBytesRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
     storer_phase: crate::ir::substrate::MbarrierPhaseRef,
     iters: crate::ir::substrate::IterCountRef,
@@ -2794,6 +2806,10 @@ impl AttentionViaCacheNode {
         const SCORE_BYTES: u32,
         const PV_OFF: u32,
         const PV_BYTES: u32,
+        const K_SMEM_OFF: u32,
+        const K_SMEM_BYTES: u32,
+        const V_SMEM_OFF: u32,
+        const V_SMEM_BYTES: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ITERS: u32,
@@ -2831,6 +2847,8 @@ impl AttentionViaCacheNode {
             // No aliasing problem within the op.
             let s_end = (SCORE_OFF as u64) + (SCORE_BYTES as u64);
             let p_end = (PV_OFF as u64) + (PV_BYTES as u64);
+            let k_end = (K_SMEM_OFF as u64) + (K_SMEM_BYTES as u64);
+            let v_end = (V_SMEM_OFF as u64) + (V_SMEM_BYTES as u64);
             assert!(
                 s_end <= SCRATCH_BYTES as u64,
                 "AttentionViaCache: score_tile OOB"
@@ -2840,9 +2858,32 @@ impl AttentionViaCacheNode {
                 "AttentionViaCache: pv_tile OOB"
             );
             assert!(
-                s_end <= PV_OFF as u64 || p_end <= SCORE_OFF as u64,
-                "AttentionViaCache: score and PV tiles overlap within AttentionScope"
+                k_end <= SCRATCH_BYTES as u64,
+                "AttentionViaCache: k_smem OOB"
             );
+            assert!(
+                v_end <= SCRATCH_BYTES as u64,
+                "AttentionViaCache: v_smem OOB"
+            );
+            // All four AttentionScope regions must be pairwise
+            // disjoint. (n*(n-1)/2 = 6 pairs for n=4.)
+            let pairs: [(u64, u64, u64, u64); 6] = [
+                (SCORE_OFF as u64, s_end, PV_OFF as u64, p_end),
+                (SCORE_OFF as u64, s_end, K_SMEM_OFF as u64, k_end),
+                (SCORE_OFF as u64, s_end, V_SMEM_OFF as u64, v_end),
+                (PV_OFF as u64, p_end, K_SMEM_OFF as u64, k_end),
+                (PV_OFF as u64, p_end, V_SMEM_OFF as u64, v_end),
+                (K_SMEM_OFF as u64, k_end, V_SMEM_OFF as u64, v_end),
+            ];
+            let mut i = 0;
+            while i < pairs.len() {
+                let (a_off, a_end, b_off, b_end) = pairs[i];
+                assert!(
+                    a_end <= b_off || b_end <= a_off,
+                    "AttentionViaCache: AttentionScope regions overlap"
+                );
+                i += 1;
+            }
             assert!(ITERS > 0, "AttentionViaCache: ITERS must be > 0");
             assert!(LAYER < NUM_LAYERS, "AttentionViaCache: LAYER OOB");
             assert!(
@@ -2871,6 +2912,21 @@ impl AttentionViaCacheNode {
                 "AttentionViaCache: NUM_TOKENS must be > 0"
             );
             assert!(MAX_SK > 0, "AttentionViaCache: MAX_SK must be > 0");
+            // K_smem and V_smem must each fit
+            // `BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * sizeof(bf16)`
+            // bytes (one paged-KV block, single-stage, bf16).
+            let kv_block_bytes = (BLOCK_SIZE as u64)
+                * (NUM_KV_HEADS as u64)
+                * (HEAD_DIM as u64)
+                * 2;
+            assert!(
+                K_SMEM_BYTES as u64 >= kv_block_bytes,
+                "AttentionViaCache: K_SMEM_BYTES < BLOCK_SIZE*NUM_KV_HEADS*HEAD_DIM*2"
+            );
+            assert!(
+                V_SMEM_BYTES as u64 >= kv_block_bytes,
+                "AttentionViaCache: V_SMEM_BYTES < BLOCK_SIZE*NUM_KV_HEADS*HEAD_DIM*2"
+            );
         }
         // Runtime: SlidingWindow value > 0 was discharged by the
         // const-generic SlidingWindow<W> primitive; here we just
@@ -2886,6 +2942,10 @@ impl AttentionViaCacheNode {
             score_bytes: ScratchBytesRef::__new_for_erase(SCORE_BYTES),
             pv_offset: ScratchOffsetRef::__new_for_erase(PV_OFF),
             pv_bytes: ScratchBytesRef::__new_for_erase(PV_BYTES),
+            k_smem_offset: ScratchOffsetRef::__new_for_erase(K_SMEM_OFF),
+            k_smem_bytes: ScratchBytesRef::__new_for_erase(K_SMEM_BYTES),
+            v_smem_offset: ScratchOffsetRef::__new_for_erase(V_SMEM_OFF),
+            v_smem_bytes: ScratchBytesRef::__new_for_erase(V_SMEM_BYTES),
             consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
             storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
             iters: IterCount::<ITERS>::new().erase(),
@@ -2922,6 +2982,18 @@ impl AttentionViaCacheNode {
     }
     pub const fn pv_bytes(&self) -> crate::ir::substrate::ScratchBytesRef {
         self.pv_bytes
+    }
+    pub const fn k_smem_offset(&self) -> crate::ir::substrate::ScratchOffsetRef {
+        self.k_smem_offset
+    }
+    pub const fn k_smem_bytes(&self) -> crate::ir::substrate::ScratchBytesRef {
+        self.k_smem_bytes
+    }
+    pub const fn v_smem_offset(&self) -> crate::ir::substrate::ScratchOffsetRef {
+        self.v_smem_offset
+    }
+    pub const fn v_smem_bytes(&self) -> crate::ir::substrate::ScratchBytesRef {
+        self.v_smem_bytes
     }
     pub const fn consumer_phase(&self) -> crate::ir::substrate::MbarrierPhaseRef {
         self.consumer_phase

@@ -995,132 +995,26 @@ pub fn dispatch_instruction_to_push(
                 );
             })
         }
-        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
-            let q_id = lit(*q_slot);
-            let out_id = lit(*attn_out_slot);
-            let half = state.scratch_bytes / 2;
-            let score_off = lit(0u32);
-            let score_bytes = lit(half);
-            let pv_off = lit(half);
-            let pv_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32);
-            let arrives = lit(state.arrives);
-            let num_layers = lit(state.num_layers);
-            let layer_lit = lit(resolved_layer(*layer));
-            let head_dim = lit(state.head_dim);
-            let num_q_heads = lit(state.num_q_heads);
-            let num_kv_heads = lit(state.num_kv_heads);
-            let block_size = lit(16u32); // attention_partial.cuh fixed at 16
-            let num_tokens = lit(state.num_tokens);
-            let max_sk = lit(state.sk_bucket.max(1));
-            let q_in_act_slot = lit(*q_slot);
-            let attn_out_act_slot = lit(*attn_out_slot);
-            let interleaved_lit = *interleaved;
-            let sliding_window_val = if state.sliding_window > 0 {
-                state.sliding_window
-            } else {
-                4096
-            };
-            let sliding_window_lit = lit(sliding_window_val);
-            let attn_scale_lit = state.attn_scale;
-            let attn_softcap_lit = state.attn_softcap;
-            let num_pages_lit = lit(state.num_pages_budget);
-            let scratch_lit = lit(state.scratch_bytes);
-            state.arrives += 1;
-            Ok(quote! {
-                b.push_attention_via_cache(
-                    ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
-                    ::ferrite_megakernel::ir::PageId::<#q_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::ScratchRegion::<
-                        #score_off, #score_bytes, #scratch_lit,
-                        ::ferrite_megakernel::ir::AttentionScope,
-                    >::new(),
-                    ::ferrite_megakernel::ir::ScratchRegion::<
-                        #pv_off, #pv_bytes, #scratch_lit,
-                        ::ferrite_megakernel::ir::AttentionScope,
-                    >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
-                    ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
-                    ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
-                    ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
-                    ::ferrite_megakernel::ir::NumQHeads::<#num_q_heads>::new(),
-                    ::ferrite_megakernel::ir::NumKvHeads::<#num_kv_heads>::new(),
-                    ::ferrite_megakernel::ir::BlockSize::<#block_size>::new(),
-                    ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
-                    ::ferrite_megakernel::ir::MaxSk::<#max_sk>::new(),
-                    ::ferrite_megakernel::ir::ActSlotConst::<#q_in_act_slot, { u32::MAX }>::new(),
-                    ::ferrite_megakernel::ir::ActSlotConst::<#attn_out_act_slot, { u32::MAX }>::new(),
-                    ::ferrite_megakernel::ir::AttentionKind::Sliding(#sliding_window_lit),
-                    #interleaved_lit,
-                    #attn_scale_lit,
-                    #attn_softcap_lit,
-                );
-            })
-        }
-        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
-            let q_id = lit(*q_slot);
-            let out_id = lit(*attn_out_slot);
-            let half = state.scratch_bytes / 2;
-            let score_off = lit(0u32);
-            let score_bytes = lit(half);
-            let pv_off = lit(half);
-            let pv_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
-            let iters = lit(1u32);
-            let arrives = lit(state.arrives);
-            let num_layers = lit(state.num_layers);
-            let layer_lit = lit(resolved_layer(*layer));
-            let head_dim = lit(state.head_dim);
-            let num_q_heads = lit(state.num_q_heads);
-            let num_kv_heads = lit(state.num_kv_heads);
-            let block_size = lit(16u32);
-            let num_tokens = lit(state.num_tokens);
-            let max_sk = lit(state.sk_bucket.max(1));
-            let q_in_act_slot = lit(*q_slot);
-            let attn_out_act_slot = lit(*attn_out_slot);
-            let interleaved_lit = *interleaved;
-            let attn_scale_lit = state.attn_scale;
-            let attn_softcap_lit = state.attn_softcap;
-            let num_pages_lit = lit(state.num_pages_budget);
-            let scratch_lit = lit(state.scratch_bytes);
-            state.arrives += 1;
-            Ok(quote! {
-                b.push_attention_via_cache(
-                    ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
-                    ::ferrite_megakernel::ir::PageId::<#q_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::ScratchRegion::<
-                        #score_off, #score_bytes, #scratch_lit,
-                        ::ferrite_megakernel::ir::AttentionScope,
-                    >::new(),
-                    ::ferrite_megakernel::ir::ScratchRegion::<
-                        #pv_off, #pv_bytes, #scratch_lit,
-                        ::ferrite_megakernel::ir::AttentionScope,
-                    >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
-                    ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
-                    ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
-                    ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
-                    ::ferrite_megakernel::ir::NumQHeads::<#num_q_heads>::new(),
-                    ::ferrite_megakernel::ir::NumKvHeads::<#num_kv_heads>::new(),
-                    ::ferrite_megakernel::ir::BlockSize::<#block_size>::new(),
-                    ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
-                    ::ferrite_megakernel::ir::MaxSk::<#max_sk>::new(),
-                    ::ferrite_megakernel::ir::ActSlotConst::<#q_in_act_slot, { u32::MAX }>::new(),
-                    ::ferrite_megakernel::ir::ActSlotConst::<#attn_out_act_slot, { u32::MAX }>::new(),
-                    ::ferrite_megakernel::ir::AttentionKind::Full,
-                    #interleaved_lit,
-                    #attn_scale_lit,
-                    #attn_softcap_lit,
-                );
-            })
-        }
+        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(
+            emit_attention_via_cache_push(
+                *q_slot,
+                *attn_out_slot,
+                resolved_layer(*layer),
+                *interleaved,
+                /*is_sliding=*/ true,
+                state,
+            ),
+        ),
+        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(
+            emit_attention_via_cache_push(
+                *q_slot,
+                *attn_out_slot,
+                resolved_layer(*layer),
+                *interleaved,
+                /*is_sliding=*/ false,
+                state,
+            ),
+        ),
         I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
             let weight = weight_paths
                 .first()
@@ -1279,6 +1173,130 @@ pub fn dispatch_instruction_to_push(
             "no const-generic builder dispatch for variant `{}`",
             instruction_kind(other)
         )),
+    }
+}
+
+/// Build the `b.push_attention_via_cache::<…>(…)` token stream for
+/// either `I::AttentionViaCache` or `I::SlidingAttentionViaCache`.
+/// Both arms share the same const-generic + scratch-layout logic;
+/// only the `AttentionKind` runtime arg differs.
+///
+/// AttentionScope scratch layout (committed here, transcribed by the
+/// render fn):
+///   `score`   `[0,                       SCORE_BYTES)`
+///   `pv`      `[SCORE_BYTES,             SCORE_BYTES + PV_BYTES)`
+///   `k_smem`  `[SCORE_BYTES + PV_BYTES,  + KV_BLOCK_BYTES)`
+///   `v_smem`  next `KV_BLOCK_BYTES` bytes after k_smem
+/// where `KV_BLOCK_BYTES = BLOCK_SIZE * NUM_KV_HEADS * HEAD_DIM * 2`.
+/// Score / pv are sized `state.scratch_bytes` minus 2 KV blocks then
+/// split in half. The `disjoint_with` chain in
+/// `push_attention_via_cache` discharges all 6 pairwise-disjoint
+/// proofs at proc-macro construction time.
+fn emit_attention_via_cache_push(
+    q_slot: u32,
+    attn_out_slot: u32,
+    layer: u32,
+    interleaved: bool,
+    is_sliding: bool,
+    state: &mut MegaDispatchState,
+) -> TokenStream {
+    let lit = Literal::u32_unsuffixed;
+    let q_id = lit(q_slot);
+    let out_id = lit(attn_out_slot);
+
+    // BLOCK_SIZE is fixed at 16 by the Attn-tier kernel signature
+    // (block_table indexes into pages of 16-token granularity).
+    let block_size_const: u32 = 16;
+    let kv_block_bytes_const: u32 =
+        block_size_const * state.num_kv_heads * state.head_dim * 2;
+    let score_pv_total = state.scratch_bytes.saturating_sub(2 * kv_block_bytes_const);
+    let score_bytes_const = score_pv_total / 2;
+    let pv_bytes_const = score_pv_total - score_bytes_const;
+    let score_off_const: u32 = 0;
+    let pv_off_const: u32 = score_off_const + score_bytes_const;
+    let k_smem_off_const: u32 = pv_off_const + pv_bytes_const;
+    let v_smem_off_const: u32 = k_smem_off_const + kv_block_bytes_const;
+
+    let score_off = lit(score_off_const);
+    let score_bytes = lit(score_bytes_const);
+    let pv_off = lit(pv_off_const);
+    let pv_bytes = lit(pv_bytes_const);
+    let k_smem_off = lit(k_smem_off_const);
+    let k_smem_bytes = lit(kv_block_bytes_const);
+    let v_smem_off = lit(v_smem_off_const);
+    let v_smem_bytes = lit(kv_block_bytes_const);
+
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters = lit(1u32);
+    let arrives = lit(state.arrives);
+    let num_layers = lit(state.num_layers);
+    let layer_lit = lit(layer);
+    let head_dim = lit(state.head_dim);
+    let num_q_heads = lit(state.num_q_heads);
+    let num_kv_heads = lit(state.num_kv_heads);
+    let block_size = lit(block_size_const);
+    let num_tokens = lit(state.num_tokens);
+    let max_sk = lit(state.sk_bucket.max(1));
+    let q_in_act_slot = lit(q_slot);
+    let attn_out_act_slot = lit(attn_out_slot);
+    let interleaved_lit = interleaved;
+    let attn_scale_lit = state.attn_scale;
+    let attn_softcap_lit = state.attn_softcap;
+    let num_pages_lit = lit(state.num_pages_budget);
+    let scratch_lit = lit(state.scratch_bytes);
+
+    let kind_expr = if is_sliding {
+        let sliding_window_val = if state.sliding_window > 0 {
+            state.sliding_window
+        } else {
+            4096
+        };
+        let sliding_window_lit = lit(sliding_window_val);
+        quote! { ::ferrite_megakernel::ir::AttentionKind::Sliding(#sliding_window_lit) }
+    } else {
+        quote! { ::ferrite_megakernel::ir::AttentionKind::Full }
+    };
+
+    state.arrives += 1;
+    quote! {
+        b.push_attention_via_cache(
+            ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
+            ::ferrite_megakernel::ir::PageId::<#q_id, #num_pages_lit>::new(),
+            ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
+            ::ferrite_megakernel::ir::ScratchRegion::<
+                #score_off, #score_bytes, #scratch_lit,
+                ::ferrite_megakernel::ir::AttentionScope,
+            >::new(),
+            ::ferrite_megakernel::ir::ScratchRegion::<
+                #pv_off, #pv_bytes, #scratch_lit,
+                ::ferrite_megakernel::ir::AttentionScope,
+            >::new(),
+            ::ferrite_megakernel::ir::ScratchRegion::<
+                #k_smem_off, #k_smem_bytes, #scratch_lit,
+                ::ferrite_megakernel::ir::AttentionScope,
+            >::new(),
+            ::ferrite_megakernel::ir::ScratchRegion::<
+                #v_smem_off, #v_smem_bytes, #scratch_lit,
+                ::ferrite_megakernel::ir::AttentionScope,
+            >::new(),
+            ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
+            ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
+            ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
+            ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
+            ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
+            ::ferrite_megakernel::ir::NumQHeads::<#num_q_heads>::new(),
+            ::ferrite_megakernel::ir::NumKvHeads::<#num_kv_heads>::new(),
+            ::ferrite_megakernel::ir::BlockSize::<#block_size>::new(),
+            ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
+            ::ferrite_megakernel::ir::MaxSk::<#max_sk>::new(),
+            ::ferrite_megakernel::ir::ActSlotConst::<#q_in_act_slot, { u32::MAX }>::new(),
+            ::ferrite_megakernel::ir::ActSlotConst::<#attn_out_act_slot, { u32::MAX }>::new(),
+            #kind_expr,
+            #interleaved_lit,
+            #attn_scale_lit,
+            #attn_softcap_lit,
+        );
     }
 }
 
@@ -1973,11 +1991,133 @@ pub fn dispatch_instruction_to_render(
             weight_paths,
             state,
         )?)),
+        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(Some(
+            render_attention_via_cache_dispatch(
+                *q_slot,
+                *attn_out_slot,
+                resolved_layer(*layer),
+                *interleaved,
+                /*is_sliding=*/ false,
+                state,
+            ),
+        )),
+        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(Some(
+            render_attention_via_cache_dispatch(
+                *q_slot,
+                *attn_out_slot,
+                resolved_layer(*layer),
+                *interleaved,
+                /*is_sliding=*/ true,
+                state,
+            ),
+        )),
         // Variants wired in dispatch_to_push but whose render_*
         // counterpart hasn't been written yet — the proc-macro skips
         // emit_for_canonical for any tape that contains them.
-        // (TkAttentionViaCache, TkSlidingAttentionViaCache, RopeAppend.)
+        // (RopeAppend.)
         _ => Ok(None),
+    }
+}
+
+/// Build the
+/// `bodies.push(render_attention_via_cache::<…>(…))` /
+/// `bodies.push(render_sliding_attention_via_cache::<…>(…))`
+/// token stream. Mirrors the exact const-generic + scratch-layout
+/// arithmetic in [`emit_attention_via_cache_push`] (the proc-macro
+/// walks the Instruction list TWICE — once for push, once for
+/// render — sharing the same [`MegaDispatchState`] checkpoint, so
+/// the const-generic args must agree to the literal).
+fn render_attention_via_cache_dispatch(
+    q_slot: u32,
+    attn_out_slot: u32,
+    layer: u32,
+    interleaved: bool,
+    is_sliding: bool,
+    state: &mut MegaDispatchState,
+) -> TokenStream {
+    let lit = Literal::u32_unsuffixed;
+    let q_id = lit(q_slot);
+    let out_id = lit(attn_out_slot);
+
+    // Scratch layout — must match `emit_attention_via_cache_push`
+    // verbatim (offsets/sizes are baked into both the const-generic
+    // ScratchRegion args on the push side and the runtime-arg ints
+    // on the render side; mismatch is caught by the substrate's
+    // disjoint_with chain at proc-macro time).
+    let block_size_const: u32 = 16;
+    let kv_block_bytes_const: u32 =
+        block_size_const * state.num_kv_heads * state.head_dim * 2;
+    let score_pv_total = state.scratch_bytes.saturating_sub(2 * kv_block_bytes_const);
+    let score_bytes_const = score_pv_total / 2;
+    let pv_bytes_const = score_pv_total - score_bytes_const;
+    let score_off_const: u32 = 0;
+    let pv_off_const: u32 = score_off_const + score_bytes_const;
+    let k_smem_off_const: u32 = pv_off_const + pv_bytes_const;
+    let v_smem_off_const: u32 = k_smem_off_const + kv_block_bytes_const;
+
+    let score_off = lit(score_off_const);
+    let pv_off = lit(pv_off_const);
+    let k_smem_off = lit(k_smem_off_const);
+    let v_smem_off = lit(v_smem_off_const);
+
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit((state.arrives + 1) & 1);
+    let iters = lit(1u32);
+    let layer_lit = lit(layer);
+    let head_dim = lit(state.head_dim);
+    let num_q_heads = lit(state.num_q_heads);
+    let num_kv_heads = lit(state.num_kv_heads);
+    let block_size = lit(block_size_const);
+    let m_lit = lit(state.num_tokens);
+    let max_sk = lit(state.sk_bucket.max(1));
+    let q_in_act_slot = lit(q_slot);
+    let attn_out_act_slot = lit(attn_out_slot);
+    let interleaved_lit = interleaved;
+    let attn_scale_lit = state.attn_scale;
+    let attn_softcap_lit = state.attn_softcap;
+    let ncw = state.num_consumer_warps;
+    let ncw_lit = lit(ncw);
+    let num_layers = lit(state.num_layers);
+
+    state.arrives += 1;
+
+    if is_sliding {
+        let sliding_window_val = if state.sliding_window > 0 {
+            state.sliding_window
+        } else {
+            4096
+        };
+        let sliding_window_lit = lit(sliding_window_val);
+        quote! {
+            bodies.push(::ferrite_megakernel::cuda_emit::render::render_sliding_attention_via_cache::<
+                #m_lit, #head_dim, #num_q_heads, #num_kv_heads, #block_size,
+                #max_sk, #ncw_lit, #num_layers, #iters,
+            >(
+                #q_id, #out_id,
+                #consumer_phase, #storer_phase,
+                #layer_lit,
+                #q_in_act_slot, #attn_out_act_slot,
+                #score_off, #pv_off, #k_smem_off, #v_smem_off,
+                #attn_scale_lit, #attn_softcap_lit,
+                #interleaved_lit,
+                #sliding_window_lit,
+            ));
+        }
+    } else {
+        quote! {
+            bodies.push(::ferrite_megakernel::cuda_emit::render::render_attention_via_cache::<
+                #m_lit, #head_dim, #num_q_heads, #num_kv_heads, #block_size,
+                #max_sk, #ncw_lit, #num_layers, #iters,
+            >(
+                #q_id, #out_id,
+                #consumer_phase, #storer_phase,
+                #layer_lit,
+                #q_in_act_slot, #attn_out_act_slot,
+                #score_off, #pv_off, #k_smem_off, #v_smem_off,
+                #attn_scale_lit, #attn_softcap_lit,
+                #interleaved_lit,
+            ));
+        }
     }
 }
 

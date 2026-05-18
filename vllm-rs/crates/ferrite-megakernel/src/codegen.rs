@@ -2277,8 +2277,23 @@ pub fn launch_tier_for_instructions(
     let mut needs_attn = false;
     let mut needs_qkv = false;
     for instr in instructions {
+        // Both the host-interpreter (`AttentionViaCache`,
+        // `FusedQkvRopeCache`, ...) AND the TK 2.0-decode
+        // (`TkAttentionViaCache`, `TkFusedQkvRopeCache`, ...)
+        // variants emit the same kernel signature args at the
+        // megakernel boundary — the Tk* variants get normalized
+        // to their non-Tk equivalents in
+        // `dispatch_instruction_to_push` (see line 1436+).
+        // Missing the Tk variants here meant Attn-tier kernels
+        // were emitted at Qkv-tier signatures, surfacing as
+        // `seq_lens` / `block_table` undefined at nvcc time on
+        // llama and friends (their `attention(...)` lowers to
+        // `TkAttentionViaCache` for decode-role canonicals).
         match instr {
-            I::AttentionViaCache(..) | I::SlidingAttentionViaCache(..) => needs_attn = true,
+            I::AttentionViaCache(..)
+            | I::SlidingAttentionViaCache(..)
+            | I::TkAttentionViaCache(..)
+            | I::TkSlidingAttentionViaCache(..) => needs_attn = true,
             I::FusedQkvRopeCache(..) | I::TkFusedQkvRopeCache(..) | I::RopeAppend(..) => {
                 needs_qkv = true
             }

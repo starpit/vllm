@@ -3147,6 +3147,38 @@ pub struct ForwardDecodeConstants {
     pub vocab_size: u32,
 }
 
+/// Estimate the threadgroup-memory footprint (bytes) of the kernel
+/// `synthesize_forward_decode` produces for the given model shape.
+/// Mirrors the `threadgroup`-allocated buffers in the synthesized
+/// source — keep in sync if those allocations change.
+///
+/// Used by both the codegen-side emission gate (don't AOT-compile the
+/// kernel when it can't fit on any supported chip) and the matcher's
+/// runtime gate (don't claim the FUF when no kernel was emitted).
+pub fn forward_decode_tg_mem_bytes(hidden: u32, intermediate: u32, head_dim: u32) -> u32 {
+    // bf16 buffers
+    let x_norm = 2 * hidden;                    // __x_norm[HIDDEN]
+    let mlp_tg = 2 * intermediate;              // __mlp_tg[INTERMEDIATE]
+    // float buffers
+    let qmv_smem  = 4 * head_dim;               // __qmv_smem[HEAD_DIM]
+    let gate_smem = 4 * head_dim;               // __gate_smem[HEAD_DIM]
+    let up_smem   = 4 * head_dim;               // __up_smem[HEAD_DIM]
+    // bn8 attention atom (sized to MAX_HEAD_DIM=256 at synth time;
+    // see `bn8_attention_body_msl_atomic` MAX_HEAD_DIM).
+    let attn_partials = 4 * 8 * 256;            // BN=8 × MAX_HEAD_DIM=256, float
+    let attn_max_sum  = 4 * 8 * 2;              // BN=8 × {max, sum}, float
+    // small per-TG reduction scratch
+    let scratch = 4 * 16;                       // __scratch[SCRATCH_MAX], float
+    x_norm + mlp_tg + qmv_smem + gate_smem + up_smem
+        + attn_partials + attn_max_sum + scratch
+}
+
+/// Smallest threadgroup-memory cap across the M-series chips ferrite
+/// targets — see `ferrite-metal-targets::*::threadgroup_memory_bytes`,
+/// which is 32768 for every entry. Codegen runs cross-chip at macro
+/// expansion, so we gate on this conservative floor.
+pub const FORWARD_DECODE_TG_MEM_FLOOR: u32 = 32 * 1024;
+
 pub fn synthesize_forward_decode(
     backend: SynthesisBackend,
     t_act: &'static str,

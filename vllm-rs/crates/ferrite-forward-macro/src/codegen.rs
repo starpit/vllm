@@ -5617,9 +5617,29 @@ fn emit_synthesized_kernel_sources_override(
     let forward_dispatched_tgs = 48u32;
     // The synth function asserts head_dim % 64 == 0 and vocab/num_layers
     // are > 0. Filter inert models to skip emission rather than panic.
+    //
+    // Also skip if the kernel's threadgroup-memory footprint won't fit
+    // in the M-series chip-min TG memory floor. For Llama-3-8B
+    // (HIDDEN=4096, INTERMEDIATE=14336) the kernel asks for ~46 KiB >
+    // 32 KiB floor, and `MTLNewComputePipelineState` rejects the library
+    // at pool init — which blocks the baseline path too because every
+    // emitted pipeline is built up-front. (For 8B the matcher *also*
+    // happens to reject silently — the persistent matcher walks the
+    // residual chain looking for `Add` tiles, but 8B's m=1..2 bucket
+    // uses `SynthPreAttn`/`SynthMlpPreDown` which fold the residual
+    // Add into the synth tile, so num_adds=0 → no match — but we don't
+    // rely on that here. Sizes where the matcher would match but the
+    // TG mem won't fit are caught by this gate alone.) The estimate
+    // routes through `forward_decode_tg_mem_bytes` so it stays in sync
+    // with the synth's threadgroup allocations.
+    let tg_mem_estimate = crate::fuse_pass::forward_decode_tg_mem_bytes(
+        consts.hidden, intermediate as u32, consts.head_dim,
+    );
+    let tg_mem_fits = tg_mem_estimate <= crate::fuse_pass::FORWARD_DECODE_TG_MEM_FLOOR;
     let forward_decode = (head_dim % 64 == 0
         && vocab_size > 0 && num_layers > 0
-        && intermediate % consts.head_dim == 0)
+        && intermediate % consts.head_dim == 0
+        && tg_mem_fits)
         .then(|| {
             crate::fuse_pass::synthesize_forward_decode(
                 crate::fuse_pass::SynthesisBackend::Metal,

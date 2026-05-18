@@ -2450,17 +2450,23 @@ pub fn bn8_attention_body_msl_atomic(
             const uint __attn_physical_block = __attn_row_block_table[__attn_logical_block];
             const uint __attn_token_in_block = __i - __attn_logical_block * BLOCK_SIZE;
 
-            // Atomic K read: one uint32 word per thread per token,
-            // at bfloat offset (__simd_lid * 2). uint32 index =
-            // bfloat_offset / 2 = __simd_lid. size_t because the KV
-            // cache can exceed 4GiB on Llama-3.2-1B at high seq counts.
+            // Dataflow-derived: PLAIN load (not atomic). Producer of
+            // every K/V slot in [0, kv_len) is one of:
+            //   - a prior kernel dispatch (kernel completion fences L1→L2)
+            //   - RopeAppend in THIS kernel's pre_attn phase, separated
+            //     from this read by `barrier_after_pre_attn` which runs
+            //     `threadgroup_barrier(mem_flags::mem_device)` (the
+            //     existing cross-phase visibility primitive — see the
+            //     synth's own comment in `cross_tg_barrier_msl_with_target`).
+            // Both producers are barrier-fenced before this consumer, so
+            // atomic-load is redundant. Cast away atomic_uint typing via
+            // device const uint* to issue a plain load.
             const size_t __attn_kv_bfloat_base =
                   (size_t)__attn_physical_block * (size_t)__attn_kv_blk_stride
                 + (size_t)__attn_kv_head_idx    * (size_t)__attn_kv_head_stride
                 + (size_t)__attn_token_in_block * (size_t)__attn_kv_tok_stride;
             const size_t __attn_k_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
-            uint __attn_k_packed = atomic_load_explicit(
-                &{k_cache}[__attn_k_word_idx], memory_order_relaxed);
+            uint __attn_k_packed = ((device const uint*){k_cache})[__attn_k_word_idx];
             {t_act} __attn_k_lo = as_type<{t_act}>(ushort(__attn_k_packed & 0xFFFFu));
             {t_act} __attn_k_hi = as_type<{t_act}>(ushort((__attn_k_packed >> 16) & 0xFFFFu));
 
@@ -2474,10 +2480,9 @@ pub fn bn8_attention_body_msl_atomic(
             __attn_max_score      = __attn_new_max;
             __attn_sum_exp_score  = __attn_sum_exp_score * __attn_factor + __attn_exp_score;
 
-            // Atomic V read: same offset pattern as K.
+            // V plain load — same fencing argument as K above.
             const size_t __attn_v_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
-            uint __attn_v_packed = atomic_load_explicit(
-                &{v_cache}[__attn_v_word_idx], memory_order_relaxed);
+            uint __attn_v_packed = ((device const uint*){v_cache})[__attn_v_word_idx];
             {t_act} __attn_v_lo = as_type<{t_act}>(ushort(__attn_v_packed & 0xFFFFu));
             {t_act} __attn_v_hi = as_type<{t_act}>(ushort((__attn_v_packed >> 16) & 0xFFFFu));
 
@@ -3244,15 +3249,17 @@ pub fn synthesize_forward_decode(
     let emit_atomic_addrms = |rms_w_name: &str| -> String {
         format!(
             r#"
-    // --- inline atomic AddRmsNorm (init=true; reads __residual via atomic_load) ---
+    // --- inline AddRmsNorm (init=true) — plain residual read ---
+    // Dataflow: the residual was either written by the prior dispatch
+    // (kernel completion fences) or by o_proj/down_proj earlier this
+    // kernel and is barrier-fenced from this consumer by
+    // `barrier_after_o_proj` / `barrier_after_down`. Plain load is safe.
     {{
         float __local_sumsq = 0.0f;
         const uint __res_base = __t * __hidden;
         // Pair-loop: each thread processes one uint32 word (= 2 bfloats).
         for (uint __pair = __tid; __pair < __hidden / 2u; __pair += __threads_per_tg) {{
-            uint __packed = atomic_load_explicit(
-                &__residual_atomic[__res_base / 2u + __pair],
-                memory_order_relaxed);
+            uint __packed = ((device const uint*)__residual_atomic)[__res_base / 2u + __pair];
             {t_act} __lo = as_type<{t_act}>(ushort(__packed & 0xFFFFu));
             {t_act} __hi = as_type<{t_act}>(ushort((__packed >> 16) & 0xFFFFu));
             const float __fl = float(__lo);
@@ -3506,15 +3513,17 @@ pub fn synthesize_forward_decode(
         const uint __o_proj_tiles = __hidden / __head_dim;
         for (uint __head = __tg_id; __head < __o_proj_tiles; __head += num_tgs) {{
             {qmv_o_body}
-            // qmv_smem holds HEAD_DIM floats — atomic-add into residual
-            // at the tile's disjoint slice. Single-writer-per-uint32-word
-            // (head_dim=64 is even; head*head_dim is even) so no CAS
-            // needed — each thread fully owns its 2-bfloat pair.
+            // qmv_smem holds HEAD_DIM floats — RMW into residual at the
+            // tile's disjoint slice. Single-writer-per-uint32-word
+            // (head_dim=64 is even; head*head_dim is even). Load is
+            // plain (barrier-fenced producer); store stays atomic to
+            // preserve Apple's L2 write-through hint on relaxed
+            // atomic_store (empirically faster than plain store +
+            // mem_device barrier alone).
             const uint __res_base = __t * __hidden + __head * __head_dim;
             for (uint __pair = __tid; __pair < __head_dim / 2u; __pair += __threads_per_tg) {{
                 const uint __packed_idx = __res_base / 2u + __pair;
-                uint __old = atomic_load_explicit(
-                    &__residual_atomic[__packed_idx], memory_order_relaxed);
+                uint __old = ((device const uint*)__residual_atomic)[__packed_idx];
                 {t_act} __old_lo = as_type<{t_act}>(ushort(__old & 0xFFFFu));
                 {t_act} __old_hi = as_type<{t_act}>(ushort((__old >> 16) & 0xFFFFu));
                 {t_act} __new_lo = {t_act}(float(__old_lo) + {qmv_smem_name}[2u * __pair]);
@@ -3783,17 +3792,13 @@ pub fn synthesize_forward_decode(
             }}
             mk_sync();
 
-            // Atomically add qmv_smem (HEAD_DIM floats) to residual
-            // slice [__t * hidden + tile*head_dim, +head_dim).
-            // Single-writer-per-uint32-word (same pattern as o_proj's
-            // add). atomic_store required for cross-TG visibility of
-            // the updated residual at next layer's pre-attn AddRmsNorm
-            // (and the final RmsNorm after layer 15).
+            // RMW into residual: plain load (barrier-fenced producer),
+            // atomic store (keeps Apple's L2 write-through hint).
+            // Same dataflow as o_proj's add.
             const uint __dp_res_base = __t * __hidden + __head * __head_dim;
             for (uint __dp_pair = __tid; __dp_pair < __head_dim / 2u; __dp_pair += __threads_per_tg) {{
                 const uint __dp_packed_idx = __dp_res_base / 2u + __dp_pair;
-                uint __dp_old = atomic_load_explicit(
-                    &__residual_atomic[__dp_packed_idx], memory_order_relaxed);
+                uint __dp_old = ((device const uint*)__residual_atomic)[__dp_packed_idx];
                 {t_act} __dp_old_lo = as_type<{t_act}>(ushort(__dp_old & 0xFFFFu));
                 {t_act} __dp_old_hi = as_type<{t_act}>(ushort((__dp_old >> 16) & 0xFFFFu));
                 {t_act} __dp_new_lo = {t_act}(float(__dp_old_lo) + {qmv_smem}[2u * __dp_pair]);

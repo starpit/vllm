@@ -719,15 +719,18 @@ impl GpuWeights {
 
         let mut tensors = HashMap::new();
         let mut mmaps = Vec::with_capacity(shard_results.len());
-        for result in shard_results {
+        for (shard_name, result) in shard_files.iter().zip(shard_results) {
             let (shard_tensors, mmap) = result?;
             tensors.extend(shard_tensors);
             // Register every shard's mmap with the allocator so
             // metal `take()` can alias the safetensors pages directly
-            // (zero-copy weight load). No-op under cuda — only the
+            // (zero-copy weight load). `register_mmap` dispatches
+            // background `pread`s to populate a 16-aligned per-tensor
+            // layout; per-tensor join happens at `take()` time inside
+            // `alloc_and_copy_host`. No-op under cuda — only the
             // `MetalAllocator` exposes `register_mmap`.
             #[cfg(feature = "metal")]
-            allocator.register_mmap(Arc::clone(&mmap));
+            allocator.register_mmap(&dir.join(shard_name), Arc::clone(&mmap))?;
             mmaps.push(mmap);
         }
 
@@ -753,7 +756,7 @@ impl GpuWeights {
         // Register the mmap with the allocator so metal `take()` can
         // alias the safetensors pages directly. No-op under cuda.
         #[cfg(feature = "metal")]
-        self.allocator.register_mmap(Arc::clone(&mmap));
+        self.allocator.register_mmap(path, Arc::clone(&mmap))?;
         self._mmaps.push(mmap);
         Ok(())
     }

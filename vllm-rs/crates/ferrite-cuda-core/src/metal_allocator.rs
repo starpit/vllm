@@ -3,24 +3,20 @@
 
 #![cfg(feature = "metal")]
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::os::unix::io::AsRawFd;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLDevice, MTLResourceOptions,
-};
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 use crate::device_allocator::DeviceAllocator;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
-type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
@@ -34,38 +30,88 @@ struct MetalArena {
 unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
+/// Per-tensor record stored in the parent `MmapRegion`. Each tensor's
+/// bytes live at `aligned_buffer.contents() + dst_offset` (the
+/// `dst_offset` is 16-aligned by construction so kernel bindings
+/// pass the strict alignment gate). `ready` is signalled by the
+/// background loader thread that ran the `pread` for this tensor;
+/// `alloc_and_copy_host` joins on it before handing the pointer out.
+struct MmapTensor {
+    /// Byte offset within the mmap (i.e. file) where the tensor
+    /// starts. Used as the binary-search key when classifying an
+    /// incoming `src` pointer.
+    src_offset: usize,
+    len: usize,
+    /// 16-aligned offset within `aligned_buffer.contents()`.
+    dst_offset: usize,
+    ready: Arc<TensorReady>,
+}
+
+/// One-shot ready signal. Set by the background pread worker(s) for
+/// the tensor; `take()` waits on it before returning the
+/// destination pointer. Multiple chunks may share a single tensor's
+/// `TensorReady` via `chunks_remaining`.
+struct TensorReady {
+    done: AtomicBool,
+    chunks_remaining: AtomicUsize,
+    waiter: Mutex<()>,
+    cv: Condvar,
+}
+
+impl TensorReady {
+    fn new(n_chunks: usize) -> Self {
+        Self {
+            done: AtomicBool::new(n_chunks == 0),
+            chunks_remaining: AtomicUsize::new(n_chunks),
+            waiter: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Mark one chunk as done. The last chunk to complete flips
+    /// `done` and notifies any waiters.
+    fn signal_chunk(&self) {
+        if self.chunks_remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _g = self.waiter.lock().expect("TensorReady waiter mutex");
+            self.done.store(true, Ordering::Release);
+            self.cv.notify_all();
+        }
+    }
+
+    fn wait(&self) {
+        if self.done.load(Ordering::Acquire) {
+            return;
+        }
+        let mut g = self.waiter.lock().expect("TensorReady waiter mutex");
+        while !self.done.load(Ordering::Acquire) {
+            g = self.cv.wait(g).expect("TensorReady cv");
+        }
+    }
+}
+
 struct MmapRegion {
-    /// Original mmap base pointer + length. The mmap remains the
-    /// canonical *source* identity — callers hand us tensor pointers
-    /// computed from the safetensors data section, which are offsets
-    /// from `base`. Classification (is `src` in any region?) walks
-    /// `[base, base + len)`.
+    /// Original mmap base pointer + length. The mmap is kept alive
+    /// for **pointer identity only** — callers compute
+    /// `src = mmap.as_ptr() + data_offset` from the safetensors
+    /// header parse and we look up which `MmapTensor` corresponds
+    /// to that address. Tensor *data* pages of the mmap are never
+    /// touched after construction; the bytes live in
+    /// `aligned_buffer` after a background `pread` from the file.
     base: *const u8,
     len: usize,
-    /// **Pre-aligned destination buffer.** At `register_mmap` we
-    /// allocate a fresh 16-aligned `MTLBuffer` of size `len + shift`
-    /// and bulk-copy the mmap contents into it starting at offset
-    /// `shift`. After that, every tensor whose intra-mmap offset
-    /// matches the canonical safetensors layout (tensors at
-    /// `data_section_start + k * 16`) lands at
-    /// `aligned_base + offset + shift` where the trailing bits are
-    /// 0 mod 16 — letting the strict 16-byte zero-copy gate pass
-    /// for U32 packed weights, F32, F16, BF16, and any future SIMD-
-    /// wide binding type.
-    ///
-    /// All `alloc_and_copy_host{,_aligned}` zero-copy returns point
-    /// into this buffer (not into the mmap). `buffer_for` maps these
-    /// pointers back to `(aligned_buffer, aligned_offset)` for
-    /// `setBuffer:offset:atIndex:`.
+    /// **Pre-aligned destination buffer.** One `MTLBuffer`
+    /// (storageModeShared) sized to fit every tensor in the shard
+    /// laid out at 16-aligned offsets. The CPU-mappable
+    /// `.contents()` pointer is what the loader threads `pread`
+    /// into. All `alloc_and_copy_host{,_aligned}` zero-copy returns
+    /// and `buffer_for` lookups resolve into this buffer.
     aligned_buffer: Buffer,
     aligned_base: *mut u8,
-    /// Byte shift such that `(offset + shift) mod 16 == 0` for the
-    /// data-section-aligned safetensors layout. Computed from the
-    /// 8-byte little-endian header_size prefix of the mmap. Falls
-    /// back to `0` if the prefix doesn't look like safetensors —
-    /// in that case the zero-copy gate behaves identically to the
-    /// pre-bulk-copy world (just operating against the new buffer).
-    shift: usize,
+    aligned_capacity: usize,
+    /// Per-tensor records, sorted by `src_offset` for binary-search
+    /// lookup from the `src` pointer the caller passes to
+    /// `alloc_and_copy_host`.
+    tensors: Vec<MmapTensor>,
     _mmap: Arc<memmap2::Mmap>,
 }
 
@@ -98,12 +144,6 @@ pub struct MetalAllocator {
     on_new_arena: Arc<Mutex<Option<ArenaHook>>>,
     residency: ferrite_metal_kernels::residency::MetalResidencySet,
     mmaps: Arc<Mutex<Vec<MmapRegion>>>,
-    /// Command queue lazily allocated on first `register_mmap`, used
-    /// for the bulk MTLBlit DMA copy mmap → aligned_buffer. Held by
-    /// `Mutex<Option<...>>` so `Clone` shares the queue across
-    /// `MetalAllocator` handles and so the queue is dropped together
-    /// with the last handle.
-    bulk_copy_queue: Arc<Mutex<Option<CommandQueue>>>,
     /// Diagnostic counters for `alloc_and_copy_host` routing. Bumped
     /// once per call so the worker can print a one-shot "zero-copy
     /// vs memcpy" breakdown after `try_load` completes. Atomics are
@@ -175,7 +215,6 @@ impl Clone for MetalAllocator {
             on_new_arena: Arc::clone(&self.on_new_arena),
             residency: self.residency.clone(),
             mmaps: Arc::clone(&self.mmaps),
-            bulk_copy_queue: Arc::clone(&self.bulk_copy_queue),
             load_stats: Arc::clone(&self.load_stats),
         }
     }
@@ -191,7 +230,6 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
-            bulk_copy_queue: Arc::new(Mutex::new(None)),
             load_stats: Arc::new(LoadStats::default()),
         }
     }
@@ -205,7 +243,6 @@ impl MetalAllocator {
             on_new_arena: Arc::new(Mutex::new(None)),
             residency,
             mmaps: Arc::new(Mutex::new(Vec::new())),
-            bulk_copy_queue: Arc::new(Mutex::new(None)),
             load_stats: Arc::new(LoadStats::default()),
         }
     }
@@ -239,14 +276,13 @@ impl MetalAllocator {
             let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
             for region in mmaps.iter() {
                 // Zero-copy returns from `alloc_and_copy_host_aligned`
-                // point into the per-region pre-aligned MTLBuffer (not
-                // into the original mmap). The valid byte range is
-                // `[aligned_base + shift, aligned_base + shift + len)`
-                // — that's where the bulk-copy landed the mmap bytes.
-                let a_start = region.aligned_base as usize + region.shift;
-                let a_end = a_start + region.len;
+                // point into the per-region pre-aligned MTLBuffer that
+                // covers the packed-aligned tensor layout, valid range
+                // `[aligned_base, aligned_base + aligned_capacity)`.
+                let a_start = region.aligned_base as usize;
+                let a_end = a_start + region.aligned_capacity;
                 if p >= a_start && p < a_end {
-                    return Some((region.aligned_buffer.clone(), (p - a_start + region.shift) as u64));
+                    return Some((region.aligned_buffer.clone(), (p - a_start) as u64));
                 }
             }
         }
@@ -261,158 +297,184 @@ impl MetalAllocator {
         None
     }
 
-    /// Read the safetensors header prefix and compute the byte shift
-    /// such that the data section starts at a 16-aligned offset within
-    /// the pre-aligned destination buffer.
-    ///
-    /// Safetensors format: `[u64 header_size_le][header JSON
-    /// (header_size bytes)][data section]`. The data section starts at
-    /// `8 + header_size`. If we copy the mmap into a 16-aligned
-    /// destination buffer at offset `shift`, the data section lands at
-    /// `dest_base + shift + 8 + header_size`. We want that quantity to
-    /// be `mod 16 == 0`, so `shift = (-(8 + header_size)) mod 16`.
-    ///
-    /// Returns 0 on any of:
-    /// - mmap shorter than 8 bytes (no header to read)
-    /// - `header_size` would put the data section past EOF
-    /// - the bytes don't look like a safetensors prefix
-    ///
-    /// In those cases the bulk copy still happens (just without the
-    /// shift trick), so zero-copy on a future tensor offset is still
-    /// possible if that offset is naturally 16-aligned.
-    fn compute_safetensors_shift(base: *const u8, len: usize) -> usize {
+    /// Parse a safetensors header (`[u64 header_size_le][JSON header]
+    /// [data section]`) and return the list of tensors with their
+    /// **file-relative** byte offsets and sizes. Returns `None` if
+    /// the header doesn't parse — the caller treats that as an error
+    /// for safetensors shards (the load path only feeds safetensors
+    /// in).
+    fn parse_safetensors_tensors(base: *const u8, len: usize) -> Option<Vec<(usize, usize)>> {
         if len < 8 {
-            return 0;
+            return None;
         }
         // SAFETY: `base` points to at least 8 mapped bytes.
         let header_size =
             unsafe { std::ptr::read_unaligned(base as *const u64).to_le() } as usize;
         if header_size == 0 || header_size > len.saturating_sub(8) {
-            return 0;
+            return None;
         }
+        let header_bytes =
+            unsafe { std::slice::from_raw_parts(base.wrapping_add(8), header_size) };
+        let json: serde_json::Value = serde_json::from_slice(header_bytes).ok()?;
+        let obj = json.as_object()?;
         let data_section_start = 8 + header_size;
-        let r = data_section_start % Self::MIN_BIND_ALIGN;
-        if r == 0 {
-            0
-        } else {
-            Self::MIN_BIND_ALIGN - r
+        let mut tensors = Vec::with_capacity(obj.len());
+        for (key, val) in obj {
+            if key == "__metadata__" {
+                continue;
+            }
+            let offs = val.get("data_offsets")?.as_array()?;
+            let lo = offs.first()?.as_u64()? as usize;
+            let hi = offs.get(1)?.as_u64()? as usize;
+            if hi < lo {
+                return None;
+            }
+            tensors.push((data_section_start + lo, hi - lo));
         }
+        tensors.sort_by_key(|&(off, _)| off);
+        Some(tensors)
     }
 
-    /// Get-or-create the per-allocator command queue used for the bulk
-    /// MTLBlit copy. One queue is enough since `register_mmap` calls
-    /// `waitUntilCompleted` on every blit (the bulk copy is loader-
-    /// side, not on the hot path) — concurrent in-flight blits aren't
-    /// needed.
-    fn bulk_copy_queue(&self) -> CommandQueue {
-        let mut slot = self
-            .bulk_copy_queue
-            .lock()
-            .expect("MetalAllocator bulk_copy_queue Mutex");
-        if let Some(q) = slot.as_ref() {
-            return q.clone();
-        }
-        let q = self
-            .device
-            .newCommandQueue()
-            .expect("MTLDevice.newCommandQueue returned nil");
-        *slot = Some(q.clone());
-        q
-    }
-
-    pub fn register_mmap(&self, mmap: Arc<memmap2::Mmap>) {
+    /// Register a safetensors shard for zero-copy weight binding.
+    ///
+    /// Lays out every tensor at a 16-aligned `dst_offset` in a single
+    /// shared-storage `MTLBuffer`, then dispatches `pread` tasks to
+    /// the rayon global pool that read each tensor's bytes straight
+    /// from disk into `buffer.contents() + dst_offset`. This function
+    /// **returns before any tensor data has been read**: each
+    /// per-tensor `TensorReady` is signalled by the background
+    /// worker(s) once that tensor's bytes are in the destination
+    /// buffer. `take()`-side callers join on the corresponding
+    /// `TensorReady` before consuming the pointer.
+    ///
+    /// The mmap is retained only as a pointer-identity device: the
+    /// caller's `CpuTensorRef` holds `mmap.as_ptr() + data_offset`
+    /// values that we look up via the per-tensor `src_offset` table.
+    /// **Tensor-data pages of the mmap are never faulted in** — the
+    /// bytes come from `pread(fd, …)` straight into the destination.
+    pub fn register_mmap(&self, path: &Path, mmap: Arc<memmap2::Mmap>) -> Result<()> {
         let base = mmap.as_ptr();
         let len = mmap.len();
         if len == 0 {
-            return;
+            return Ok(());
         }
 
-        // Compute the shift so the safetensors data section lands at
-        // a 16-aligned offset in the destination buffer. Falls back
-        // to 0 on non-safetensors prefixes (still does the bulk copy
-        // but without the alignment trick).
-        let shift = Self::compute_safetensors_shift(base, len);
-        let dst_capacity = len + shift;
+        let tensors_src = Self::parse_safetensors_tensors(base, len).ok_or_else(|| {
+            anyhow::anyhow!(
+                "MetalAllocator::register_mmap: failed to parse safetensors header for {}",
+                path.display()
+            )
+        })?;
 
-        // Destination: fresh, 16-aligned (MTLDevice returns page-
-        // aligned buffers; pages are ≥ 16 bytes) `MTLBuffer`. Sized
-        // exactly to hold the mmap contents plus the shift prefix.
+        // Pack each tensor at the next 16-aligned offset.
+        let mut packed: Vec<(usize, usize, usize)> = Vec::with_capacity(tensors_src.len());
+        let mut running = 0usize;
+        for &(src_off, sz) in &tensors_src {
+            let dst_off = running.div_ceil(Self::MIN_BIND_ALIGN) * Self::MIN_BIND_ALIGN;
+            packed.push((src_off, sz, dst_off));
+            running = dst_off + sz;
+        }
+        let aligned_capacity = running
+            .div_ceil(Self::MIN_BIND_ALIGN)
+            .saturating_mul(Self::MIN_BIND_ALIGN)
+            .max(Self::MIN_BIND_ALIGN);
+
         let dst_buffer = self
             .device
-            .newBufferWithLength_options(dst_capacity, MTLResourceOptions::StorageModeShared)
-            .expect("MetalAllocator::register_mmap: newBufferWithLength returned nil");
+            .newBufferWithLength_options(aligned_capacity, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MetalAllocator::register_mmap: newBufferWithLength({} bytes) returned nil",
+                    aligned_capacity
+                )
+            })?;
         let aligned_base = dst_buffer.contents().as_ptr() as *mut u8;
-        assert!(
+        anyhow::ensure!(
             !aligned_base.is_null(),
-            "MetalAllocator::register_mmap: aligned destination buffer.contents() is null"
+            "MetalAllocator::register_mmap: destination buffer.contents() is null"
         );
 
-        // Source: transient `newBufferWithBytesNoCopy` view of the
-        // mmap, needed to give the blit encoder a `MTLBuffer` handle.
-        // Released as soon as the blit completes — the underlying
-        // bytes stay alive via `mmap`'s Arc on the caller's side, but
-        // the noCopy wrapper itself goes away.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let src_buffer_len = (len + page_size - 1) & !(page_size - 1);
-        // SAFETY: `base` covers `src_buffer_len` valid mapped pages
-        // (mmap over-maps to a page boundary). `deallocator: None`
-        // keeps Metal from trying to free the bytes; the Arc held by
-        // the caller keeps the pages alive until the blit completes.
-        let src_buffer = unsafe {
-            let bytes = NonNull::new(base as *mut c_void).expect("non-null mmap base");
-            self.device
-                .newBufferWithBytesNoCopy_length_options_deallocator(
-                    bytes,
-                    src_buffer_len,
-                    MTLResourceOptions::StorageModeShared,
-                    None,
-                )
-                .expect("newBufferWithBytesNoCopy returned nil")
-        };
+        // Validate that the file exists / is openable; per-task we
+        // re-open by path so each worker has its own fd (concurrent
+        // `pread` on a shared fd on macOS appears to interleave reads
+        // in practice — verified by bisect against sync-chunked).
+        std::fs::File::open(path).with_context(|| {
+            format!("MetalAllocator::register_mmap: open {}", path.display())
+        })?;
 
-        // Bulk-copy mmap → aligned_buffer at offset `shift` via the
-        // blit engine (~30 GB/s on Apple Silicon vs ~5 GB/s CPU
-        // memcpy_nonoverlapping on M2/M3 unified-memory hardware).
-        //
-        // CHUNKED to ≤2 GiB per `copyFromBuffer:...` call: a single
-        // blit >~4 GiB SILENTLY truncates on Apple Silicon — the
-        // destination bytes past the truncation point remain
-        // uninitialized (zeros from VM page allocation) and any GPU
-        // kernel reading from a binding offset that lands in that
-        // region produces output consistent with `W == 0`. Hit live
-        // by Qwen3-MoE-30B-A3B-4bit's `switch_mlp.down_proj.weight`
-        // at shard-offset 4.67 GiB in a 4.95 GiB shard. The cap
-        // appears to be hard, with no NSError surfaced by the
-        // command buffer (`status == Completed`, `error == nil`).
-        // Reproducer: `tests/large_buffer_offset_probe_test.rs::
-        // nocopy_source_blit_above_4_gib_round_trip`.
-        const BLIT_CHUNK: usize = 2 * 1024 * 1024 * 1024;
-        let queue = self.bulk_copy_queue();
-        let cmd_buf = queue
-            .commandBuffer()
-            .expect("MTLCommandQueue.commandBuffer returned nil");
-        let blit = cmd_buf
-            .blitCommandEncoder()
-            .expect("MTLCommandBuffer.blitCommandEncoder returned nil");
-        let mut copied = 0usize;
-        while copied < len {
-            let n = (len - copied).min(BLIT_CHUNK);
-            unsafe {
-                blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                    &src_buffer,
-                    copied,
-                    &dst_buffer,
-                    shift + copied,
-                    n,
-                );
+        // Wrap the aligned destination base as a Send/Sync usize for
+        // closure capture. Each worker writes into a disjoint chunk
+        // of the buffer; no two workers race on the same byte.
+        let dst_base_usize = aligned_base as usize;
+
+        // Chunk size targets ~16 MiB per `pread` so large tensors
+        // parallelize across rayon workers and small tensors remain
+        // a single dispatch.
+        const READ_CHUNK: usize = 16 * 1024 * 1024;
+
+        let mut tensors: Vec<MmapTensor> = Vec::with_capacity(packed.len());
+        for (src_off, sz, dst_off) in packed {
+            let n_chunks = if sz == 0 { 0 } else { sz.div_ceil(READ_CHUNK) };
+            let ready = Arc::new(TensorReady::new(n_chunks));
+            for chunk_idx in 0..n_chunks {
+                let off_in_tensor = chunk_idx * READ_CHUNK;
+                let chunk_sz = (sz - off_in_tensor).min(READ_CHUNK);
+                let chunk_src = src_off + off_in_tensor;
+                let chunk_dst = dst_off + off_in_tensor;
+                let ready_w = Arc::clone(&ready);
+                let path_w = path.to_path_buf();
+                rayon::spawn(move || {
+                    let file_w = std::fs::File::open(&path_w).unwrap_or_else(|e| {
+                        panic!("re-open {} failed: {e}", path_w.display())
+                    });
+                    let fd = file_w.as_raw_fd();
+                    let mut written = 0usize;
+                    while written < chunk_sz {
+                        // SAFETY: dst points to `chunk_sz - written`
+                        // bytes inside the destination MTLBuffer's
+                        // shared-storage contents (allocated above,
+                        // outlives the closure via the region's
+                        // ownership of `aligned_buffer`).
+                        let dst =
+                            (dst_base_usize + chunk_dst + written) as *mut libc::c_void;
+                        let n = unsafe {
+                            libc::pread(
+                                fd,
+                                dst,
+                                chunk_sz - written,
+                                (chunk_src + written) as libc::off_t,
+                            )
+                        };
+                        if n < 0 {
+                            let err = std::io::Error::last_os_error();
+                            panic!(
+                                "pread({}, off={}, len={}) failed: {}",
+                                path_w.display(),
+                                chunk_src + written,
+                                chunk_sz - written,
+                                err
+                            );
+                        }
+                        if n == 0 {
+                            panic!(
+                                "pread({}, off={}) returned 0 (unexpected EOF, want {} more bytes)",
+                                path_w.display(),
+                                chunk_src + written,
+                                chunk_sz - written
+                            );
+                        }
+                        written += n as usize;
+                    }
+                    ready_w.signal_chunk();
+                });
             }
-            copied += n;
+            tensors.push(MmapTensor {
+                src_offset: src_off,
+                len: sz,
+                dst_offset: dst_off,
+                ready,
+            });
         }
-        blit.endEncoding();
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-        // `src_buffer` drops here — the noCopy wrapper is gone, the
-        // mmap pages stay live via the caller's Arc.
 
         self.residency.insert(&dst_buffer);
 
@@ -424,9 +486,11 @@ impl MetalAllocator {
                 len,
                 aligned_buffer: dst_buffer,
                 aligned_base,
-                shift,
+                aligned_capacity,
+                tensors,
                 _mmap: mmap,
             });
+        Ok(())
     }
 
     /// Largest alignment the qmv / qmm_t / NAX kernels demand on a
@@ -442,22 +506,19 @@ impl MetalAllocator {
     /// and is cheap enough to gate the mmap-alias short-circuit on.
     const MIN_BIND_ALIGN: usize = 16;
 
-    /// `Some(aligned_ptr)` if `src` lies within a registered mmap AND
-    /// the shifted offset `offset + region.shift` is a multiple of
-    /// `min_align`. The returned pointer points into the per-region
-    /// pre-aligned destination buffer (not into the mmap) — the bulk
-    /// MTLBlit at `register_mmap` time copied the mmap bytes there at
-    /// offset `region.shift`, so reading from `aligned_ptr` produces
-    /// the same bytes the caller would have read from `src`.
+    /// `Some(aligned_ptr)` if `src` matches the start of a tensor in
+    /// a registered mmap. The returned pointer points into the
+    /// per-region pre-aligned destination buffer at the tensor's
+    /// 16-aligned `dst_offset`; blocks (per-tensor `Condvar`) until
+    /// the background `pread` for that tensor has completed.
     ///
-    /// `None` otherwise — either `src` is outside all registered
-    /// mmaps, or `(offset + shift)` doesn't meet the binding's
-    /// `min_align` requirement.
+    /// `min_align` is honored for visibility only — `dst_offset` is
+    /// always 16-aligned by construction, so any sane request passes
+    /// (the diagnostic counters still observe whether the relaxation
+    /// vs strict gate would have mattered).
     ///
-    /// `min_align` is clamped to `MIN_BIND_ALIGN` from above on the
-    /// trait `alloc_and_copy_host` path; the
-    /// `alloc_and_copy_host_aligned` path passes the per-binding-dtype
-    /// scalar alignment (2 for F16/BF16, 4 for U32/F32, etc.).
+    /// `None` if `src` is outside every registered mmap, or doesn't
+    /// match a tensor head (e.g. a CPU-cast scratch buffer).
     fn aligned_mmap_offset(
         &self,
         src: *const u8,
@@ -466,27 +527,32 @@ impl MetalAllocator {
     ) -> Option<*mut u8> {
         let p = src as usize;
         let end = p.saturating_add(bytes);
-        let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
-        for region in mmaps.iter() {
-            let r_start = region.base as usize;
-            let r_end = r_start + region.len;
-            if p >= r_start && end <= r_end {
-                let mmap_offset = p - r_start;
-                let shifted = mmap_offset + region.shift;
-                if min_align == 0 || shifted % min_align == 0 {
-                    let aligned_ptr =
-                        unsafe { region.aligned_base.add(shifted) };
-                    return Some(aligned_ptr);
-                }
+        let ready;
+        let aligned_ptr;
+        {
+            let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+            let region = mmaps
+                .iter()
+                .find(|r| p >= r.base as usize && end <= r.base as usize + r.len)?;
+            let mmap_offset = p - region.base as usize;
+            let tensor = match region
+                .tensors
+                .binary_search_by_key(&mmap_offset, |t| t.src_offset)
+            {
+                Ok(idx) => &region.tensors[idx],
+                Err(_) => return None,
+            };
+            if tensor.len != bytes {
                 return None;
             }
+            if min_align != 0 && tensor.dst_offset % min_align != 0 {
+                return None;
+            }
+            aligned_ptr = unsafe { region.aligned_base.add(tensor.dst_offset) };
+            ready = Arc::clone(&tensor.ready);
         }
-        None
-    }
-
-    fn src_in_registered_mmap(&self, src: *const u8, bytes: usize) -> bool {
-        self.aligned_mmap_offset(src, bytes, Self::MIN_BIND_ALIGN)
-            .is_some()
+        ready.wait();
+        Some(aligned_ptr)
     }
 
     /// As [`aligned_mmap_offset`] but also bumps the histogram /
@@ -500,29 +566,43 @@ impl MetalAllocator {
     ) -> MmapClassify {
         let p = src as usize;
         let end = p.saturating_add(bytes);
-        let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
-        for region in mmaps.iter() {
-            let r_start = region.base as usize;
-            let r_end = r_start + region.len;
-            if p >= r_start && end <= r_end {
-                let mmap_offset = p - r_start;
-                // Histogram still buckets by the RAW intra-mmap offset
-                // (pre-shift): it characterizes the safetensors file
-                // layout, not our routing. After this change the count
-                // at `tz == 4` (mod 16 = 0 post-shift) effectively
-                // tells you how successful the shift was.
-                let tz = mmap_offset.trailing_zeros();
-                self.load_stats.observe_offset_alignment(tz);
-                let shifted = mmap_offset + region.shift;
-                if min_align == 0 || shifted % min_align == 0 {
-                    let aligned_ptr =
-                        unsafe { region.aligned_base.add(shifted) };
-                    return MmapClassify::Aligned { aligned_ptr };
-                }
+        let ready;
+        let aligned_ptr;
+        {
+            let mmaps = self.mmaps.lock().expect("MetalAllocator mmaps Mutex");
+            let region = match mmaps
+                .iter()
+                .find(|r| p >= r.base as usize && end <= r.base as usize + r.len)
+            {
+                Some(r) => r,
+                None => return MmapClassify::Outside,
+            };
+            let mmap_offset = p - region.base as usize;
+            // Histogram still buckets by the raw intra-mmap offset:
+            // it characterizes the safetensors file layout, not our
+            // routing. With packed-aligned dst, every match becomes
+            // `Aligned` regardless of the source's trailing zeros —
+            // the histogram just documents that file-level fact.
+            let tz = mmap_offset.trailing_zeros();
+            self.load_stats.observe_offset_alignment(tz);
+            let tensor = match region
+                .tensors
+                .binary_search_by_key(&mmap_offset, |t| t.src_offset)
+            {
+                Ok(idx) => &region.tensors[idx],
+                Err(_) => return MmapClassify::Outside,
+            };
+            if tensor.len != bytes {
+                return MmapClassify::Outside;
+            }
+            if min_align != 0 && tensor.dst_offset % min_align != 0 {
                 return MmapClassify::Unaligned;
             }
+            aligned_ptr = unsafe { region.aligned_base.add(tensor.dst_offset) };
+            ready = Arc::clone(&tensor.ready);
         }
-        MmapClassify::Outside
+        ready.wait();
+        MmapClassify::Aligned { aligned_ptr }
     }
 
     pub fn arena_count(&self) -> usize {

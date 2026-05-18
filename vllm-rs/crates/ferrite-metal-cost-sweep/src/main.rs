@@ -29,7 +29,9 @@ mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod attention_sweep;
 mod barrier_bench;
+mod fused_cas_probe;
 mod persistent_vs_dispatched;
+mod single_tg_resident_probe;
 mod rmsnorm_sweep;
 mod synth_gate_up_silu_mul_sweep;
 mod single_tg_gemv_bench;
@@ -89,6 +91,12 @@ fn main() {
     }
     if want("synth_persistent_test") {
         synth_persistent_test::run(launch_overhead_us);
+    }
+    if want("fused_cas_probe") {
+        fused_cas_probe::run(launch_overhead_us);
+    }
+    if want("single_tg_resident") {
+        single_tg_resident_probe::run(launch_overhead_us);
     }
 
     eprintln!("metal_cost_sweep: done");

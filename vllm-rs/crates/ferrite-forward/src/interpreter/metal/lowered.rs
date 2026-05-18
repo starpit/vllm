@@ -357,6 +357,28 @@ pub struct MScaling {
     pub bucket_m: BucketM,
 }
 
+/// Runtime gate evaluated per dispatch — when `Some`, the worker
+/// skips the dispatch unless the live `num_seqs` matches the gate.
+/// `None` (the common case, used by every kernel except the
+/// lm_head slice / fallback pair) means "always dispatch."
+///
+/// Mirrors the way `barrier_before` is a per-command parallel Vec
+/// on [`LoweredMetalTape`]: cheap to encode, cheap to check at
+/// dispatch time, no impact on the hot path for the 99% of
+/// commands that aren't gated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RuntimeGate {
+    /// Run only when `num_seqs == 1` (single-sequence forward —
+    /// either pure-prefill of one seq or a single decode token).
+    /// Used by the lm_head slice trio (gather/qmv/scatter).
+    OnlyIfSingleSeq,
+    /// Run only when `num_seqs > 1` (batched decode or mixed
+    /// prefill+decode batch). Used by the full M=bucket_m lm_head
+    /// fallback so the slice's per-seq-incorrect logits get
+    /// overwritten by a correct multi-row GEMM.
+    OnlyIfMultiSeq,
+}
+
 impl DispatchShape {
     /// 1D dispatch helper: `total_threads` rounded up by
     /// `threads_per_group`.
@@ -738,6 +760,19 @@ pub struct LoweredMetalTape {
     /// pass propagates this into `Mtl4Step.barrier_before`; the
     /// runtime never re-derives the analysis.
     pub barrier_before: Vec<bool>,
+    /// Runtime-gate flag per command, mirroring `commands.len()`.
+    /// `None` (the common case) = always dispatch.
+    /// `Some(OnlyIfSingleSeq)` = dispatch only when
+    /// `cu_seqlens_q.len() - 1 == 1` (single-sequence forward).
+    /// `Some(OnlyIfMultiSeq)` = dispatch only when
+    /// `cu_seqlens_q.len() - 1 > 1` (batched / mixed forward).
+    /// Used by the lm_head slice path so the cheap M=1 slice
+    /// (gather/qmv/scatter) fires for single-seq prefill while a
+    /// parallel full M=bucket_m lm_head qmm fires only when the
+    /// bucket holds multiple sequences (the slice's gather/scatter
+    /// only handles row `num_tokens-1`, so it produces stale logits
+    /// for every seq except the last in a packed batch).
+    pub runtime_gate: Vec<Option<RuntimeGate>>,
     /// Byte size of the shared SplitK scratch buffer the worker
     /// allocates if any `Instruction::AffineQmm` in this tape was
     /// lowered to the SplitK two-command form. Computed as

@@ -833,6 +833,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         queue: &CommandQueue,
         bucket_idx: usize,
         num_tokens: usize,
+        num_seqs: u32,
     ) -> Result<(), ForwardError> {
         use ::objc2_metal::MTLCommandEncoder;
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
@@ -842,14 +843,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // reference. Returns early; slow but only used for parity.
         if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
             worker
-                .run_bucket_mtl3_with_dumps(bucket_idx, num_tokens as u32, queue)
+                .run_bucket_mtl3_with_dumps(bucket_idx, num_tokens as u32, num_seqs, queue)
                 .map_err(ForwardError::Worker)?;
             return Ok(());
         }
         let cb = queue.commandBuffer().expect("commandBuffer");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
         worker
-            .run_bucket_mtl3(bucket_idx, num_tokens as u32, &enc)
+            .run_bucket_mtl3(bucket_idx, num_tokens as u32, num_seqs, &enc)
             .map_err(ForwardError::Worker)?;
         enc.endEncoding();
         let encoded = t_pre.elapsed();
@@ -879,12 +880,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         worker: &MetalWorker<W>,
         bucket_idx: usize,
         num_tokens: usize,
+        num_seqs: u32,
     ) -> Result<(), ForwardError> {
         self.run_bucket_mtl4_with_tail::<fn(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
             usize,
-        ) -> Result<(), ForwardError>>(worker, bucket_idx, num_tokens, None)
+        ) -> Result<(), ForwardError>>(worker, bucket_idx, num_tokens, num_seqs, None)
     }
 
     /// MTL4 forward dispatch + optional encoder-tail hook.
@@ -900,6 +902,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         worker: &MetalWorker<W>,
         bucket_idx: usize,
         num_tokens: usize,
+        num_seqs: u32,
         tail: Option<F>,
     ) -> Result<(), ForwardError>
     where
@@ -944,11 +947,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .expect("MTL4 computeCommandEncoder returned nil");
             if let Some(ts) = timing_state.as_ref() {
                 worker
-                    .run_bucket_mtl4_with_timing(bucket_idx, num_tokens as u32, &enc, ts)
+                    .run_bucket_mtl4_with_timing(bucket_idx, num_tokens as u32, num_seqs, &enc, ts)
                     .map_err(ForwardError::Worker)?;
             } else {
                 worker
-                    .run_bucket_mtl4(bucket_idx, num_tokens as u32, &enc)
+                    .run_bucket_mtl4(bucket_idx, num_tokens as u32, num_seqs, &enc)
                     .map_err(ForwardError::Worker)?;
             }
             // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
@@ -1064,6 +1067,19 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         ) -> Result<(), ForwardError>,
     {
         let bucket_idx = self.pick_bucket(inputs.num_tokens)?;
+        // num_seqs = number of sequences packed into this forward.
+        // Computed once here from the staged `cu_seqlens_q` slice
+        // (`batch + 1` entries) and threaded through the dispatch
+        // path so the per-sub-dispatch `RuntimeGate` checks can
+        // pick the lm_head slice (single-seq) vs the full
+        // M=bucket_m fallback (multi-seq). Defaults to 1 when
+        // `cu_seqlens_q` is absent — those are the
+        // `Instruction::AttentionViaCache` decode buckets that
+        // always run a single-token forward, never the slice.
+        let num_seqs: u32 = inputs
+            .cu_seqlens_q
+            .map(|cu| (cu.len().saturating_sub(1)).max(1) as u32)
+            .unwrap_or(1);
 
         // Lazily commit + attach the allocator's residency set on the
         // first forward — both calls are idempotent per (queue, set),
@@ -1108,6 +1124,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 queue,
                 bucket_idx,
                 inputs.num_tokens as usize,
+                num_seqs,
             )?;
             // MTL3 path doesn't take an encoder tail (legacy path);
             // caller's separate sync dispatch still applies.
@@ -1123,6 +1140,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 &guard.worker,
                 bucket_idx,
                 inputs.num_tokens as usize,
+                num_seqs,
                 tail,
             )?;
         }

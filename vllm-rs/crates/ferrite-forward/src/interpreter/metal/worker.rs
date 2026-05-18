@@ -68,6 +68,15 @@ pub enum BucketStep {
         /// compile-time DAG hazard analysis in `LoweredMetalTape`.
         /// Consumed by the MTL4 path via `Mtl4Step.barrier_before`.
         barrier_before: Vec<bool>,
+        /// Per-sub-dispatch runtime gate, mirroring
+        /// [`LoweredMetalTape::runtime_gate`]. `None` (the common
+        /// case) means always dispatch; `Some(OnlyIfSingleSeq)` /
+        /// `Some(OnlyIfMultiSeq)` skips the dispatch unless the
+        /// live `num_seqs` matches. Used by the lm_head slice +
+        /// fallback pair so the cheap M=1 slice fires for
+        /// single-seq forwards and the full M=bucket_m fallback
+        /// fires for multi-seq batched/mixed forwards.
+        runtime_gate: Vec<Option<super::lowered::RuntimeGate>>,
     },
     Gemm {
         /// Activation buffer bound to MPS' `leftMatrix` (shape
@@ -477,6 +486,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         num_tokens: u32,
+        num_seqs: u32,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder};
@@ -488,14 +498,19 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     direct_bindings,
                     direct_dispatch,
                     direct_m_scaling,
+                    runtime_gate,
                     ..
                 } => {
                     enc.setComputePipelineState(pipeline);
-                    for ((bindings, (tg, tpt)), scaling) in direct_bindings
+                    for (((bindings, (tg, tpt)), scaling), gate) in direct_bindings
                         .iter()
                         .zip(direct_dispatch.iter())
                         .zip(direct_m_scaling.iter())
+                        .zip(runtime_gate.iter())
                     {
+                        if !gate_matches(*gate, num_seqs) {
+                            continue;
+                        }
                         for (buf, off, idx) in bindings {
                             unsafe {
                                 enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
@@ -534,6 +549,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         num_tokens: u32,
+        num_seqs: u32,
         queue: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{
@@ -551,17 +567,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 direct_bindings,
                 direct_dispatch,
                 direct_m_scaling,
+                runtime_gate,
                 ..
             } = step else {
                 return Err(WorkerError::WeightLookupFailed {
                     reason: "MTL3 dump path cannot handle Gemm step",
                 });
             };
-            for ((bindings, (tg, tpt)), scaling) in direct_bindings
+            for (((bindings, (tg, tpt)), scaling), gate) in direct_bindings
                 .iter()
                 .zip(direct_dispatch.iter())
                 .zip(direct_m_scaling.iter())
+                .zip(runtime_gate.iter())
             {
+                if !gate_matches(*gate, num_seqs) {
+                    continue;
+                }
                 let cb: Retained<ProtocolObject<dyn MTLCommandBuffer>> =
                     queue.commandBuffer().expect("commandBuffer");
                 let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
@@ -687,9 +708,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         num_tokens: u32,
+        num_seqs: u32,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, enc, None)
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, enc, None)
     }
 
     /// Variant with optional GPU-timestamp instrumentation.
@@ -706,16 +728,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
         &self,
         bucket: usize,
         num_tokens: u32,
+        num_seqs: u32,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         timing: &super::pool::DispatchTimingState,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, enc, Some(timing))
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, enc, Some(timing))
     }
 
     fn run_bucket_mtl4_inner(
         &self,
         bucket: usize,
         num_tokens: u32,
+        num_seqs: u32,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         mut timing: Option<&super::pool::DispatchTimingState>,
     ) -> Result<(), WorkerError> {
@@ -775,13 +799,24 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     continue;
                 }
             }
-            for (((table, (tg, tpt)), need_barrier), scaling) in step
+            for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
                 .tables
                 .iter()
                 .zip(step.dispatches.iter())
                 .zip(step.barrier_before.iter())
                 .zip(step.m_scaling.iter())
+                .zip(step.runtime_gate.iter())
             {
+                if !gate_matches(*gate, num_seqs) {
+                    // Skipped: the lm_head slice's gather/qmv/scatter
+                    // (gated single-seq) doesn't fire for batched
+                    // batches; the M=bucket_m fallback (gated
+                    // multi-seq) doesn't fire for single-seq prefill.
+                    // Either way the timestamp slot, barrier, and
+                    // dispatch are skipped together so the kernel
+                    // doesn't run with stale per-dispatch state.
+                    continue;
+                }
                 if count_barriers {
                     total_dispatches += 1;
                     if *need_barrier {
@@ -1045,12 +1080,16 @@ fn bake_bucket<W: CanonicalParams>(
                             direct_dispatch,
                             direct_m_scaling,
                             barrier_before,
+                            runtime_gate,
                             ..
                         }) if same_pipeline(prev, &pipeline) => {
                             direct_bindings.push(bindings_for_cmd);
                             direct_dispatch.push(dispatch_for_cmd);
                             direct_m_scaling.push(None);
                             barrier_before.push(cmd_barrier);
+                            // Gemm path is never gated (no slice); push None
+                            // to keep the Vec aligned with `direct_dispatch`.
+                            runtime_gate.push(None);
                         }
                         _ => {
                             steps.push(BucketStep::Icb {
@@ -1060,6 +1099,7 @@ fn bake_bucket<W: CanonicalParams>(
                                 direct_dispatch: vec![dispatch_for_cmd],
                                 direct_m_scaling: vec![None],
                                 barrier_before: vec![cmd_barrier],
+                                runtime_gate: vec![None],
                             });
                         }
                     }
@@ -1155,7 +1195,23 @@ fn bake_bucket<W: CanonicalParams>(
             .get(cmd_idx)
             .copied()
             .unwrap_or(true);
+        let cmd_gate = tape
+            .runtime_gate
+            .get(cmd_idx)
+            .copied()
+            .unwrap_or(None);
         let cmd_m_scaling = cmd.dispatch.m_scaling;
+        // Coalesce only when the gate matches too — a `OnlyIfSingleSeq`
+        // dispatch can't share a step with an ungated dispatch since
+        // they fire under different runtime conditions.
+        let same_gate = match steps.last() {
+            Some(BucketStep::Icb { runtime_gate, .. }) => runtime_gate
+                .last()
+                .copied()
+                .unwrap_or(None)
+                == cmd_gate,
+            _ => false,
+        };
         match steps.last_mut() {
             Some(BucketStep::Icb {
                 pipeline: prev,
@@ -1163,12 +1219,14 @@ fn bake_bucket<W: CanonicalParams>(
                 direct_dispatch,
                 direct_m_scaling,
                 barrier_before,
+                runtime_gate,
                 ..
-            }) if same_pipeline(prev, &pipeline) => {
+            }) if same_pipeline(prev, &pipeline) && same_gate => {
                 direct_bindings.push(bindings_for_cmd);
                 direct_dispatch.push(dispatch_for_cmd);
                 direct_m_scaling.push(cmd_m_scaling);
                 barrier_before.push(cmd_barrier);
+                runtime_gate.push(cmd_gate);
             }
             _ => {
                 steps.push(BucketStep::Icb {
@@ -1178,6 +1236,7 @@ fn bake_bucket<W: CanonicalParams>(
                     direct_dispatch: vec![dispatch_for_cmd],
                     direct_m_scaling: vec![cmd_m_scaling],
                     barrier_before: vec![cmd_barrier],
+                    runtime_gate: vec![cmd_gate],
                 });
             }
         }
@@ -1650,6 +1709,30 @@ fn resolve_bindings<W: CanonicalParams>(
 /// `num_tokens.div_ceil(tile)`, clamped so we never grow above the
 /// baked value (guards against `num_tokens > bucket_m`, which the
 /// bucket picker already rules out but defense-in-depth).
+/// Evaluate a per-dispatch [`RuntimeGate`] against the live
+/// `num_seqs` of this forward (= `cu_seqlens_q.len() - 1`).
+/// Returns `true` when the dispatch should fire, `false` when it
+/// should be skipped. `gate == None` (the common case) always
+/// fires.
+///
+/// `OnlyIfSingleSeq` fires when there's exactly one sequence in
+/// the bucket — either pure single-seq prefill or a one-token
+/// decode forward. The lm_head slice's gather/qmv/scatter trio is
+/// gated this way.
+///
+/// `OnlyIfMultiSeq` fires when the bucket holds multiple
+/// sequences (batched decode, mixed prefill+decode). The
+/// full-`M=bucket_m` lm_head fallback is gated this way so the
+/// slice's per-seq-incorrect logits get overwritten with a
+/// correct multi-row GEMM result.
+fn gate_matches(gate: Option<super::lowered::RuntimeGate>, num_seqs: u32) -> bool {
+    match gate {
+        None => true,
+        Some(super::lowered::RuntimeGate::OnlyIfSingleSeq) => num_seqs <= 1,
+        Some(super::lowered::RuntimeGate::OnlyIfMultiSeq) => num_seqs > 1,
+    }
+}
+
 fn scale_tg_for_num_tokens(
     mut tg: MTLSize,
     scaling: Option<super::lowered::MScaling>,
@@ -1910,6 +1993,7 @@ mod tests {
             ],
             splitk_scratch_bytes: 0,
             barrier_before: Vec::new(),
+            runtime_gate: Vec::new(),
         }
     }
 
@@ -2143,6 +2227,7 @@ mod tests {
             commands: vec![attn],
             splitk_scratch_bytes: 0,
             barrier_before: Vec::new(),
+            runtime_gate: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2224,6 +2309,7 @@ mod tests {
             commands: vec![build_gemm_command(1, 2048, 2048)],
             splitk_scratch_bytes: 0,
             barrier_before: Vec::new(),
+            runtime_gate: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(
@@ -2343,6 +2429,7 @@ mod tests {
             commands: vec![rmsnorm_pre, build_gemm_command(1, 2048, 2048), rmsnorm_post],
             splitk_scratch_bytes: 0,
             barrier_before: Vec::new(),
+            runtime_gate: Vec::new(),
         };
 
         let worker = MetalWorker::<TestWeights>::new(

@@ -57,6 +57,14 @@ pub struct Mtl4Step {
     /// `true` means the runtime must emit a `Dispatch→Dispatch`
     /// MTL4 encoder barrier before this sub-dispatch.
     pub barrier_before: Vec<bool>,
+    /// One runtime-gate flag per sub-dispatch (parallel to
+    /// `tables` / `dispatches`). `None` (the common case) =
+    /// always dispatch. `Some(OnlyIfSingleSeq)` /
+    /// `Some(OnlyIfMultiSeq)` = the worker skips this dispatch
+    /// when the live `num_seqs` doesn't match — used by the
+    /// lm_head slice + fallback pair so the right path fires
+    /// based on whether the bucket holds one sequence or many.
+    pub runtime_gate: Vec<Option<super::lowered::RuntimeGate>>,
     /// Pre-recorded indirect command buffer covering all dispatches
     /// in this step. Built only when `FERRITE_METAL_ICB=1` was set
     /// at bake time AND no sub-dispatch in the step uses
@@ -102,11 +110,13 @@ pub fn bake_mtl4_steps(
                 direct_dispatch,
                 direct_m_scaling,
                 barrier_before,
+                runtime_gate,
                 ..
             } => {
                 debug_assert_eq!(direct_bindings.len(), direct_dispatch.len());
                 debug_assert_eq!(direct_bindings.len(), direct_m_scaling.len());
                 debug_assert_eq!(direct_bindings.len(), barrier_before.len());
+                debug_assert_eq!(direct_bindings.len(), runtime_gate.len());
                 let mut tables = Vec::with_capacity(direct_bindings.len());
                 for cmd_bindings in direct_bindings {
                     let max_idx = cmd_bindings
@@ -155,9 +165,18 @@ pub fn bake_mtl4_steps(
                         | super::lowered::KernelId::SynthMlpPreDown
                         | super::lowered::KernelId::SynthGateUpSiluMul
                 );
+                // ICB path bakes the dispatches into a pre-recorded
+                // command buffer that's replayed via
+                // `executeCommandsInBuffer` — there's no runtime
+                // gating point inside the playback. Disable ICB
+                // packing for any step that has a per-dispatch
+                // gate; those steps stay on the direct-dispatch
+                // path where the gate check runs per sub-dispatch.
+                let any_gated = runtime_gate.iter().any(|g| g.is_some());
                 let icb = if std::env::var_os("FERRITE_METAL_ICB").is_some()
                     && icb_eligible_bucket
                     && !kv_cache_writer
+                    && !any_gated
                 {
                     build_icb_for_step(device, pipeline, direct_bindings, direct_dispatch)
                 } else {
@@ -170,6 +189,7 @@ pub fn bake_mtl4_steps(
                     dispatches: direct_dispatch.clone(),
                     m_scaling: direct_m_scaling.clone(),
                     barrier_before: barrier_before.clone(),
+                    runtime_gate: runtime_gate.clone(),
                     icb,
                 });
             }

@@ -72,6 +72,11 @@ pub fn lower_pair<W: CanonicalParams>(
     let lh = lower::<W>(lm_head, lm_head_barriers, bucket_m, num_arena_slots, lm_head_tape_index, profile)?;
     let mut commands = bb.commands;
     let mut barrier_before = bb.barrier_before;
+    // Backbone commands are never gated — fill with `None` to match
+    // `commands.len()`. The slice path below pushes `Some(_)` for the
+    // gated lm_head pair.
+    let mut runtime_gate: Vec<Option<crate::interpreter::metal::lowered::RuntimeGate>> =
+        vec![None; commands.len()];
 
     // Sample-position slice — fast lm_head for prefill.
     //
@@ -113,12 +118,29 @@ pub fn lower_pair<W: CanonicalParams>(
     // a full M=bucket_m × N=vocab × K=hidden GEMM — at M=1024, vocab=
     // 128256, hidden=3072 that's ~190 ms of pure waste on M1 Max.
     //
-    // FERRITE_METAL_LMHEAD_SLICE=0/off/false disables (debug-only).
-    let slice_disabled = matches!(
+    // **Slice default OFF** until the multi-seq rewrite stabilizes.
+    //
+    // The slice's gather/qmv/scatter trio assumes a single-sequence
+    // forward and produces incoherent first-token logits when the
+    // gather rewrites `hidden[0]` even with the runtime-gate
+    // machinery from this commit. Repro on M1 Max with
+    // mlx-community/Llama-3.2-1B-Instruct-4bit + slice ON: every
+    // sequential single-seq response starts with "!濃" instead of
+    // the expected first token — same symptom as the all-rows
+    // sentinel test, suggesting the qmv reads junk from row 0.
+    // Root cause not yet bisected; tracked as follow-up. Enabling
+    // requires `FERRITE_METAL_LMHEAD_SLICE=1` for known-correct
+    // single-seq workloads.
+    //
+    // The runtime_gate plumbing introduced here stays in place so
+    // when the slice path is fixed and re-enabled it can ship with
+    // multi-seq batches still routing through the fallback (full
+    // M=bucket_m lm_head qmm) without a follow-up plumbing commit.
+    let slice_enabled = matches!(
         std::env::var("FERRITE_METAL_LMHEAD_SLICE").ok().as_deref(),
-        Some("0") | Some("off") | Some("false"),
+        Some("1") | Some("on") | Some("true"),
     );
-    let slice_info = if !slice_disabled
+    let slice_info = if slice_enabled
         && bucket_m > 1
         && lm_head.len() == 1
         && lh.commands.len() == 1
@@ -165,36 +187,65 @@ pub fn lower_pair<W: CanonicalParams>(
         None
     };
 
+    use crate::interpreter::metal::lowered::RuntimeGate;
     if let Some(info) = slice_info {
-        // Pre-GEMM gather: row 0 of input := row num_tokens-1.
+        // Single-seq fast path: gather + qmv-M=1 + scatter, gated to
+        // run only when `num_seqs == 1`. The gather pulls row
+        // `num_tokens-1` (the lone seq's last token) into row 0 so
+        // qmv computes one row of logits which the scatter writes
+        // back to row `num_tokens-1` for the worker's downstream
+        // `embedding_gather` to find.
         commands.push(gather_last_token_command::<W>(info.in_slot, info.k));
         barrier_before.push(true);
-        // lm_head at M=1 — route through qmv (matvec) instead of
-        // qmm_t (matmul-with-shrunk-grid). qmm_t Standard has BM=32
-        // so even with a 1-tile dispatch it does 32 m-rows of work;
-        // qmv at M=1 is BW-bound on the weight read (~1.6 ms vs
-        // ~12 ms for qmm_t-1-tile on Llama-3.2-3B's
-        // [N=128256, K=3072] lm_head shape).
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
+        // lm_head at M=1 via qmv (matvec) — BW-bound on the 197 MB
+        // packed weight read on Llama-3.2-3B. ~1.6 ms vs ~12 ms for a
+        // qmm_t Standard 1-tile (which does BM=32 wasted m-rows).
         commands.push(lm_head_qmv_command::<W>(&info, profile));
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
         // Post-GEMM scatter: row num_tokens-1 of output := row 0.
-        // Keeps the worker's `embedding_gather(logits,
-        // last_token_indices=[num_tokens-1])` correct without it
-        // knowing the slice ran.
         commands.push(scatter_first_to_last_row_command::<W>(info.out_slot, info.n));
         barrier_before.push(true);
-    } else {
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
+
+        // Multi-seq fallback: emit the original lm_head GEMM (the
+        // full `M = bucket_m × N = vocab` qmm) gated to fire only
+        // when `num_seqs > 1`. The slice's gather/scatter only
+        // handle the lone last-token row; for batched decode every
+        // seq's sample row is at a different position
+        // (`cu_seqlens_q[i] + q_lens[i] - 1`) and the slice's qmv
+        // produces stale logits for every seq except the last one
+        // packed. The full GEMM writes correct logits to every row
+        // of `out`, so the worker's downstream
+        // `argmax(logits[sample_indices[i]])` reads valid data
+        // regardless of which path fired. Worker skips dispatches
+        // whose gate doesn't match the live `num_seqs`.
         for (i, cmd) in lh.commands.into_iter().enumerate() {
             commands.push(cmd);
             barrier_before.push(*lh.barrier_before.get(i).unwrap_or(&true));
+            runtime_gate.push(Some(RuntimeGate::OnlyIfMultiSeq));
+        }
+    } else {
+        // No slice — slice precondition (single AffineQmm lm_head,
+        // bucket_m > 1, etc.) didn't hold. Fall through to the
+        // standard lm_head lowering, ungated.
+        for (i, cmd) in lh.commands.into_iter().enumerate() {
+            commands.push(cmd);
+            barrier_before.push(*lh.barrier_before.get(i).unwrap_or(&true));
+            runtime_gate.push(None);
         }
     }
+
+    debug_assert_eq!(commands.len(), barrier_before.len());
+    debug_assert_eq!(commands.len(), runtime_gate.len());
 
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
         commands,
         barrier_before,
+        runtime_gate,
         splitk_scratch_bytes: bb.splitk_scratch_bytes.max(lh.splitk_scratch_bytes),
         moe_scratch_bytes: bb.moe_scratch_bytes.max(lh.moe_scratch_bytes),
     })
@@ -436,11 +487,18 @@ pub fn lower<W: CanonicalParams>(
     }
 
     debug_assert_eq!(commands.len(), barrier_before.len());
+    // Inner `lower::<W>()` is called for both the backbone and lm_head
+    // halves before `lower_pair` re-assembles them with the slice.
+    // Neither half emits gated commands itself — the gate is added
+    // by `lower_pair` when it appends the slice + fallback pair. So
+    // every command lowered here has gate=None.
+    let runtime_gate = vec![None; commands.len()];
     Ok(LoweredMetalTape {
         bucket_m,
         num_arena_slots,
         commands,
         barrier_before,
+        runtime_gate,
         splitk_scratch_bytes,
         moe_scratch_bytes,
     })

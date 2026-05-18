@@ -2107,6 +2107,447 @@ void {symbol}(
 //
 // Constraint: HEAD_DIM must be a multiple of 32 (qk_per_thread =
 // HEAD_DIM/32). Llama-3.2/Qwen/Mistral/Phi all satisfy.
+/// Atomic-IO variant of `bn8_attention_body_msl` — for use in the
+/// whole-forward persistent megakernel where attn_scratch and the KV
+/// cache must use atomic loads/stores for cross-TG visibility on
+/// Apple Metal. K/V reads use one atomic_load per thread per token
+/// (qk_per_thread=2 bfloats fit in one uint32 word at offset
+/// simd_lid). The output write packs simd_lid's qk_per_thread bfloats
+/// into one uint32 and atomic_stores it — single-writer per word
+/// (32 lanes × 2 bfloats per lane = 64 bfloats = HEAD_DIM, with one
+/// uint32 word per lane).
+///
+/// REQUIRES qk_per_thread == 2 (HEAD_DIM == 64) so the pack fits one
+/// uint32. For larger HEAD_DIM, generalize to multiple atomic ops
+/// per thread.
+/// Fused BN=8 attention + o_proj: each Q-head TG computes attention
+/// (output in registers) and then directly computes its head's
+/// contribution to the o_proj output (HIDDEN-dim) and CAS-adds each
+/// contribution into `__residual_atomic`. ELIMINATES the
+/// `__attn_scratch` device buffer — the attention output never lives
+/// outside per-thread registers within the simdgroup.
+///
+/// Per Q head (called once per TG-owned head):
+///   1. Standard BN=8 attention → `__attn_final_o[2]` per lane
+///      (qk_per_thread=2 for HEAD_DIM=64; lane `simd_lid` holds head
+///      positions `simd_lid*2` and `simd_lid*2+1` of HEAD_DIM=64).
+///   2. For each output position `i` in `[0, HIDDEN)`, assigned in
+///      simdgroup chunks (`__simd_gid * 256 + s` for s in 0..256 at
+///      HIDDEN=2048 / NUM_SIMDGROUPS=8):
+///        partial_lane = attn_final_o[0] * W_o[i, head*64 + simd_lid*2]
+///                     + attn_final_o[1] * W_o[i, head*64 + simd_lid*2 + 1]
+///        contrib = simd_sum(partial_lane)  // 32-lane reduce
+///        if (lane 0): CAS-add contrib into residual[i] (bf16 atomic add)
+///
+/// CAS contention: with N_active_q_heads TGs all CAS-adding to the
+/// same residual word, retry rate ≈ O(N). For Llama-1B (32 Q heads
+/// split across 16 TGs → 32 contributions per residual position),
+/// retries may dominate cost. Empirically measure before assuming the
+/// fusion wins.
+///
+/// REQUIRES: HEAD_DIM == 64, qk_per_thread == 2, NUM_SIMDGROUPS == 8,
+/// HIDDEN % NUM_SIMDGROUPS == 0, group_size == 64, bits == 4.
+pub fn bn8_attention_oproj_fused_body(
+    t_act: &str,
+    t_scale: &str,
+    q_buf: &str,
+    seq_used_k_buf: &str,
+    block_table_buf: &str,
+    k_cache_atomic: &str,
+    v_cache_atomic: &str,
+    residual_atomic: &str,
+    o_w_buf: &str,
+    o_s_buf: &str,
+    o_b_buf: &str,
+    head_for_o_proj_expr: &str,
+) -> String {
+    let _ = t_scale;  // reserved for future per-scale-type dispatch
+    const MAX_HEAD_DIM: u32 = 256;
+    format!(
+        r#"
+    // ── atom: BN=8 attention + o_proj FUSED (TG-resident attn_out) ──
+    // attn_out lives entirely in registers — no __attn_scratch device
+    // buffer. o_proj contribution is computed in-place per output
+    // position and CAS-added into __residual_atomic.
+    if (__head < NUM_Q) {{
+        constexpr int __ATTN_BN     = 8;
+        constexpr int __ATTN_BD     = 32;
+        constexpr uint __ATTN_MAX_HEAD_DIM = {MAX_HEAD_DIM}u;
+        typedef float __ATTN_U;
+
+        const uint __attn_seq_idx     = __t;
+        const uint __attn_q_head_idx  = __head;
+        const uint __attn_qk_per_thread = HEAD_DIM / uint(__ATTN_BD);
+        static_assert((HEAD_DIM / uint(__ATTN_BD)) == 2u,
+            "bn8_attention_oproj_fused_body requires qk_per_thread == 2");
+
+        const uint __attn_group_ratio = NUM_Q / NUM_KV;
+        const uint __attn_kv_head_idx = __attn_q_head_idx / __attn_group_ratio;
+        const uint __attn_kv_len      = {seq_used_k}[__attn_seq_idx];
+
+        const uint __attn_kv_blk_stride  = NUM_KV * BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_head_stride = BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_tok_stride  = HEAD_DIM;
+
+        thread __ATTN_U __attn_q_reg[8];
+        thread __ATTN_U __attn_o_reg[8];
+
+        threadgroup __ATTN_U __attn_partials[__ATTN_BN * __ATTN_MAX_HEAD_DIM];
+        threadgroup __ATTN_U __attn_max[__ATTN_BN];
+        threadgroup __ATTN_U __attn_sum[__ATTN_BN];
+
+        device const {t_act}* __attn_q_row = {q_buf}
+            + (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
+        device const uint*   __attn_row_block_table = {block_table}
+            + __attn_seq_idx * MAX_BLOCKS_PER_SEQ;
+
+        for (uint __i = 0u; __i < __attn_qk_per_thread; ++__i) {{
+            __attn_q_reg[__i] = __ATTN_U(ATTN_SCALE_BAKED)
+                              * __ATTN_U(__attn_q_row[__simd_lid * __attn_qk_per_thread + __i]);
+            __attn_o_reg[__i] = 0;
+        }}
+
+        __ATTN_U __attn_max_score     = -FLT_MAX;
+        __ATTN_U __attn_sum_exp_score = 0;
+
+        for (uint __i = __simd_gid; __i < __attn_kv_len; __i += uint(__ATTN_BN)) {{
+            const uint __attn_logical_block  = __i / BLOCK_SIZE;
+            const uint __attn_physical_block = __attn_row_block_table[__attn_logical_block];
+            const uint __attn_token_in_block = __i - __attn_logical_block * BLOCK_SIZE;
+
+            const size_t __attn_kv_bfloat_base =
+                  (size_t)__attn_physical_block * (size_t)__attn_kv_blk_stride
+                + (size_t)__attn_kv_head_idx    * (size_t)__attn_kv_head_stride
+                + (size_t)__attn_token_in_block * (size_t)__attn_kv_tok_stride;
+            const size_t __attn_k_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
+            uint __attn_k_packed = atomic_load_explicit(
+                &{k_cache}[__attn_k_word_idx], memory_order_relaxed);
+            {t_act} __attn_k_lo = as_type<{t_act}>(ushort(__attn_k_packed & 0xFFFFu));
+            {t_act} __attn_k_hi = as_type<{t_act}>(ushort((__attn_k_packed >> 16) & 0xFFFFu));
+
+            __ATTN_U __attn_score = __attn_q_reg[0] * __ATTN_U(__attn_k_lo)
+                                  + __attn_q_reg[1] * __ATTN_U(__attn_k_hi);
+            __attn_score = simd_sum(__attn_score);
+
+            __ATTN_U __attn_new_max  = max(__attn_max_score, __attn_score);
+            __ATTN_U __attn_factor   = metal::fast::exp(__attn_max_score - __attn_new_max);
+            __ATTN_U __attn_exp_score = metal::fast::exp(__attn_score - __attn_new_max);
+            __attn_max_score      = __attn_new_max;
+            __attn_sum_exp_score  = __attn_sum_exp_score * __attn_factor + __attn_exp_score;
+
+            const size_t __attn_v_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
+            uint __attn_v_packed = atomic_load_explicit(
+                &{v_cache}[__attn_v_word_idx], memory_order_relaxed);
+            {t_act} __attn_v_lo = as_type<{t_act}>(ushort(__attn_v_packed & 0xFFFFu));
+            {t_act} __attn_v_hi = as_type<{t_act}>(ushort((__attn_v_packed >> 16) & 0xFFFFu));
+
+            __attn_o_reg[0] = __attn_o_reg[0] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_lo);
+            __attn_o_reg[1] = __attn_o_reg[1] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_hi);
+        }}
+
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+            __attn_partials[__simd_gid * __ATTN_MAX_HEAD_DIM
+                            + __simd_lid * __attn_qk_per_thread + __j] = __attn_o_reg[__j];
+        }}
+        if (__simd_lid == 0u) {{
+            __attn_max[__simd_gid] = __attn_max_score;
+            __attn_sum[__simd_gid] = __attn_sum_exp_score;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        __ATTN_U __attn_global_max = -FLT_MAX;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_global_max = max(__attn_global_max, __attn_max[__g]);
+        }}
+        __ATTN_U __attn_global_sum = 0;
+        __ATTN_U __attn_factors[__ATTN_BN];
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_factors[__g] = metal::fast::exp(__attn_max[__g] - __attn_global_max);
+            __attn_global_sum  += __attn_sum[__g] * __attn_factors[__g];
+        }}
+
+        thread __ATTN_U __attn_final_o[8];
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] = 0;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            const __ATTN_U __attn_f = __attn_factors[__g];
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_final_o[__j] += __attn_partials[__g * __ATTN_MAX_HEAD_DIM
+                                                       + __simd_lid * __attn_qk_per_thread + __j]
+                                        * __attn_f;
+            }}
+        }}
+        if (__attn_global_sum != 0) {{
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] /= __attn_global_sum;
+        }}
+
+        // ── FUSED o_proj: each lane has 2 attn_final_o values (head
+        // positions simd_lid*2 and simd_lid*2+1). For each output i in
+        // simdgroup's 256-position chunk: compute simdgroup-cooperative
+        // 64-element dot product over W_o[i, head*64..(head+1)*64],
+        // simd_sum, CAS-add into residual[i].
+        //
+        // W_o layout: [HIDDEN_out, HIDDEN_in] quantized 4-bit packed.
+        // bytes_per_row = HIDDEN_in / 2. For our head's slice
+        // [head*64..(head+1)*64): 32 bytes per output row, starting
+        // at byte offset (head*64)/2 = head*32 within the row.
+        // Scales/biases: 1 per group_size=64 input elements; our
+        // head's slice is exactly one group → 1 scale + 1 bias per row.
+        constexpr uint __FUSED_HEAD_DIM = HEAD_DIM;
+        const uint __op_head = ({head_for_o_proj_expr});
+        const uint __op_outputs_per_simdgroup = HIDDEN / 8u;  // 8 simdgroups
+        const uint __op_out_base = __simd_gid * __op_outputs_per_simdgroup;
+
+        // Per-row weight stride (bytes) and scale/bias stride (groups).
+        constexpr uint __op_w_row_bytes = HIDDEN / 2u;
+        constexpr uint __op_sb_per_row  = HIDDEN / 64u;
+        constexpr uint __op_head_byte_off = 0u;  // set per-call below from head
+
+        for (uint __op_s = 0u; __op_s < __op_outputs_per_simdgroup; ++__op_s) {{
+            const uint __op_out = __op_out_base + __op_s;
+
+            // Each lane reads 1 byte of W_o = 2 nibbles (head_dim positions
+            // simd_lid*2 and simd_lid*2+1 within the head's slice).
+            const size_t __op_w_byte_idx =
+                  (size_t)__op_out * (size_t)__op_w_row_bytes
+                + (size_t)(__op_head * (__FUSED_HEAD_DIM / 2u))
+                + (size_t)__simd_lid;
+            const device uint8_t* __op_w_bytes = (const device uint8_t*){o_w};
+            const uchar __op_byte = __op_w_bytes[__op_w_byte_idx];
+            const float __op_n0 = float(__op_byte & 0x0Fu);
+            const float __op_n1 = float((__op_byte >> 4) & 0x0Fu);
+
+            // Scale + bias: our head's slice is one group (HEAD_DIM=64
+            // == group_size). 1 scale and 1 bias for this row × this
+            // group. group_idx = head (since input positions
+            // head*64..(head+1)*64 is group `head`).
+            const size_t __op_sb_idx =
+                (size_t)__op_out * (size_t)__op_sb_per_row + (size_t)__op_head;
+            const float __op_s_val = float({o_s}[__op_sb_idx]);
+            const float __op_b_val = float({o_b}[__op_sb_idx]);
+
+            // Per-lane partial: 2 quantized weights × 2 attn_final_o.
+            // Apply scale + bias once per lane (factored: result = scale * (n0*x0 + n1*x1) + bias * (x0 + x1))
+            // ...but with sum-of-x across the simdgroup we need to gather all 64 x's.
+            // Use mk_qdot's structure: result_lane = scale * (n0*x0 + n1*x1) + bias * (sum of x_thread)
+            const float __op_local_dot = __op_n0 * float(__attn_final_o[0])
+                                       + __op_n1 * float(__attn_final_o[1]);
+            const float __op_local_sum_x = float(__attn_final_o[0]) + float(__attn_final_o[1]);
+            // Reduce across simdgroup.
+            const float __op_dot_total = simd_sum(__op_local_dot);
+            const float __op_sumx_total = simd_sum(__op_local_sum_x);
+            const float __op_contrib = __op_s_val * __op_dot_total + __op_b_val * __op_sumx_total;
+
+            // CAS-add to residual[__op_out].
+            if (__simd_lid == 0u) {{
+                const size_t __op_pair_idx = ((size_t)__t * (size_t)HIDDEN + (size_t)__op_out) / (size_t)2u;
+                const uint __op_lane = __op_out & 1u;
+                uint __op_old = atomic_load_explicit(
+                    &{residual}[__op_pair_idx], memory_order_relaxed);
+                uint __op_new;
+                do {{
+                    {t_act} __op_old_lo = as_type<{t_act}>(ushort(__op_old & 0xFFFFu));
+                    {t_act} __op_old_hi = as_type<{t_act}>(ushort((__op_old >> 16) & 0xFFFFu));
+                    {t_act} __op_new_lo = __op_old_lo;
+                    {t_act} __op_new_hi = __op_old_hi;
+                    if (__op_lane == 0u) {{
+                        __op_new_lo = {t_act}(float(__op_old_lo) + __op_contrib);
+                    }} else {{
+                        __op_new_hi = {t_act}(float(__op_old_hi) + __op_contrib);
+                    }}
+                    __op_new = uint(as_type<ushort>(__op_new_lo))
+                             | (uint(as_type<ushort>(__op_new_hi)) << 16);
+                }} while (!atomic_compare_exchange_weak_explicit(
+                    &{residual}[__op_pair_idx], &__op_old, __op_new,
+                    memory_order_relaxed, memory_order_relaxed));
+            }}
+        }}
+    }}
+"#,
+        t_act = t_act,
+        q_buf = q_buf,
+        seq_used_k = seq_used_k_buf,
+        block_table = block_table_buf,
+        k_cache = k_cache_atomic,
+        v_cache = v_cache_atomic,
+        residual = residual_atomic,
+        o_w = o_w_buf,
+        o_s = o_s_buf,
+        o_b = o_b_buf,
+        head_for_o_proj_expr = head_for_o_proj_expr,
+        MAX_HEAD_DIM = MAX_HEAD_DIM,
+    )
+}
+
+pub fn bn8_attention_body_msl_atomic(
+    t_act: &str,
+    q_buf: &str,
+    out_buf_atomic: &str,
+    seq_used_k_buf: &str,
+    block_table_buf: &str,
+    k_cache_atomic: &str,
+    v_cache_atomic: &str,
+) -> String {
+    const MAX_HEAD_DIM: u32 = 256;
+    format!(
+        r#"
+    // ── atom: BN=8 paged-cache decode attention (ATOMIC-IO variant) ──
+    // attn_scratch + KV cache are device atomic_uint* (each uint32
+    // packs 2 bf16 values lo|hi<<16). Required for cross-TG visibility
+    // on Apple Metal. See synth_persistent_test.rs:52-58.
+    if (__head < NUM_Q) {{
+        constexpr int __ATTN_BN     = 8;
+        constexpr int __ATTN_BD     = 32;
+        constexpr uint __ATTN_MAX_HEAD_DIM = {MAX_HEAD_DIM}u;
+        typedef float __ATTN_U;
+
+        const uint __attn_seq_idx     = __t;
+        const uint __attn_q_head_idx  = __head;
+        const uint __attn_qk_per_thread = HEAD_DIM / uint(__ATTN_BD);
+        // HEAD_DIM/BD must equal 2 for the packed uint32 pair load to
+        // work (one uint32 per thread per token covers qk_per_thread
+        // bfloats). HEAD_DIM=64 with BD=32 → 2. Static assert via array
+        // sizing — emits a Metal compile error if violated.
+        static_assert((HEAD_DIM / uint(__ATTN_BD)) == 2u,
+            "bn8_attention_body_msl_atomic requires qk_per_thread == 2");
+
+        const uint __attn_group_ratio = NUM_Q / NUM_KV;
+        const uint __attn_kv_head_idx = __attn_q_head_idx / __attn_group_ratio;
+        const uint __attn_kv_len      = {seq_used_k}[__attn_seq_idx];
+
+        // All strides in BFLOAT units; converted to uint32 indices by
+        // dividing by 2 at the atomic_load call site (HEAD_DIM is even,
+        // BLOCK_SIZE is power-of-2 ≥ 2, so all bfloat offsets used are
+        // even and divide cleanly).
+        const uint __attn_kv_blk_stride  = NUM_KV * BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_head_stride = BLOCK_SIZE * HEAD_DIM;
+        const uint __attn_kv_tok_stride  = HEAD_DIM;
+
+        thread __ATTN_U __attn_q_reg[8];
+        thread __ATTN_U __attn_o_reg[8];
+
+        threadgroup __ATTN_U __attn_partials[__ATTN_BN * __ATTN_MAX_HEAD_DIM];
+        threadgroup __ATTN_U __attn_max[__ATTN_BN];
+        threadgroup __ATTN_U __attn_sum[__ATTN_BN];
+
+        // Q is single-writer per head (this TG wrote its own Q in
+        // RopeAppend, reads it back here). Non-atomic OK.
+        device const {t_act}* __attn_q_row = {q_buf}
+            + (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
+        device const uint*   __attn_row_block_table = {block_table}
+            + __attn_seq_idx * MAX_BLOCKS_PER_SEQ;
+
+        for (uint __i = 0u; __i < __attn_qk_per_thread; ++__i) {{
+            __attn_q_reg[__i] = __ATTN_U(ATTN_SCALE_BAKED)
+                              * __ATTN_U(__attn_q_row[__simd_lid * __attn_qk_per_thread + __i]);
+            __attn_o_reg[__i] = 0;
+        }}
+
+        __ATTN_U __attn_max_score     = -FLT_MAX;
+        __ATTN_U __attn_sum_exp_score = 0;
+
+        for (uint __i = __simd_gid; __i < __attn_kv_len; __i += uint(__ATTN_BN)) {{
+            const uint __attn_logical_block  = __i / BLOCK_SIZE;
+            const uint __attn_physical_block = __attn_row_block_table[__attn_logical_block];
+            const uint __attn_token_in_block = __i - __attn_logical_block * BLOCK_SIZE;
+
+            // Atomic K read: one uint32 word per thread per token,
+            // at bfloat offset (__simd_lid * 2). uint32 index =
+            // bfloat_offset / 2 = __simd_lid. size_t because the KV
+            // cache can exceed 4GiB on Llama-3.2-1B at high seq counts.
+            const size_t __attn_kv_bfloat_base =
+                  (size_t)__attn_physical_block * (size_t)__attn_kv_blk_stride
+                + (size_t)__attn_kv_head_idx    * (size_t)__attn_kv_head_stride
+                + (size_t)__attn_token_in_block * (size_t)__attn_kv_tok_stride;
+            const size_t __attn_k_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
+            uint __attn_k_packed = atomic_load_explicit(
+                &{k_cache}[__attn_k_word_idx], memory_order_relaxed);
+            {t_act} __attn_k_lo = as_type<{t_act}>(ushort(__attn_k_packed & 0xFFFFu));
+            {t_act} __attn_k_hi = as_type<{t_act}>(ushort((__attn_k_packed >> 16) & 0xFFFFu));
+
+            __ATTN_U __attn_score = __attn_q_reg[0] * __ATTN_U(__attn_k_lo)
+                                  + __attn_q_reg[1] * __ATTN_U(__attn_k_hi);
+            __attn_score = simd_sum(__attn_score);
+
+            __ATTN_U __attn_new_max  = max(__attn_max_score, __attn_score);
+            __ATTN_U __attn_factor   = metal::fast::exp(__attn_max_score - __attn_new_max);
+            __ATTN_U __attn_exp_score = metal::fast::exp(__attn_score - __attn_new_max);
+            __attn_max_score      = __attn_new_max;
+            __attn_sum_exp_score  = __attn_sum_exp_score * __attn_factor + __attn_exp_score;
+
+            // Atomic V read: same offset pattern as K.
+            const size_t __attn_v_word_idx = __attn_kv_bfloat_base / (size_t)2u + (size_t)__simd_lid;
+            uint __attn_v_packed = atomic_load_explicit(
+                &{v_cache}[__attn_v_word_idx], memory_order_relaxed);
+            {t_act} __attn_v_lo = as_type<{t_act}>(ushort(__attn_v_packed & 0xFFFFu));
+            {t_act} __attn_v_hi = as_type<{t_act}>(ushort((__attn_v_packed >> 16) & 0xFFFFu));
+
+            __attn_o_reg[0] = __attn_o_reg[0] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_lo);
+            __attn_o_reg[1] = __attn_o_reg[1] * __attn_factor + __attn_exp_score * __ATTN_U(__attn_v_hi);
+        }}
+
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+            __attn_partials[__simd_gid * __ATTN_MAX_HEAD_DIM
+                            + __simd_lid * __attn_qk_per_thread + __j] = __attn_o_reg[__j];
+        }}
+        if (__simd_lid == 0u) {{
+            __attn_max[__simd_gid] = __attn_max_score;
+            __attn_sum[__simd_gid] = __attn_sum_exp_score;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        __ATTN_U __attn_global_max = -FLT_MAX;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_global_max = max(__attn_global_max, __attn_max[__g]);
+        }}
+        __ATTN_U __attn_global_sum = 0;
+        __ATTN_U __attn_factors[__ATTN_BN];
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            __attn_factors[__g] = metal::fast::exp(__attn_max[__g] - __attn_global_max);
+            __attn_global_sum  += __attn_sum[__g] * __attn_factors[__g];
+        }}
+
+        thread __ATTN_U __attn_final_o[8];
+        for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] = 0;
+        for (uint __g = 0u; __g < uint(__ATTN_BN); ++__g) {{
+            const __ATTN_U __attn_f = __attn_factors[__g];
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) {{
+                __attn_final_o[__j] += __attn_partials[__g * __ATTN_MAX_HEAD_DIM
+                                                       + __simd_lid * __attn_qk_per_thread + __j]
+                                        * __attn_f;
+            }}
+        }}
+        if (__attn_global_sum != 0) {{
+            for (uint __j = 0u; __j < __attn_qk_per_thread; ++__j) __attn_final_o[__j] /= __attn_global_sum;
+        }}
+
+        // Atomic output write: only simdgroup 0 writes. Each lane
+        // packs 2 bfloats (qk_per_thread=2) into one uint32 and
+        // atomic_stores at out_atomic[(q_head_base + simd_lid*2)/2 =
+        // q_head_base/2 + simd_lid]. Single-writer per word — no CAS.
+        if (__simd_gid == 0u) {{
+            const uint __attn_out_bfloat_base =
+                (__attn_seq_idx * NUM_Q + __attn_q_head_idx) * HEAD_DIM;
+            const uint __attn_out_word_idx = __attn_out_bfloat_base / 2u + __simd_lid;
+            uint __attn_out_packed =
+                  uint(as_type<ushort>({t_act}(__attn_final_o[0])))
+                | (uint(as_type<ushort>({t_act}(__attn_final_o[1]))) << 16);
+            atomic_store_explicit(
+                &{out_atomic}[__attn_out_word_idx],
+                __attn_out_packed, memory_order_relaxed);
+        }}
+    }}
+"#,
+        t_act = t_act,
+        q_buf = q_buf,
+        out_atomic = out_buf_atomic,
+        seq_used_k = seq_used_k_buf,
+        block_table = block_table_buf,
+        k_cache = k_cache_atomic,
+        v_cache = v_cache_atomic,
+        MAX_HEAD_DIM = MAX_HEAD_DIM,
+    )
+}
+
 pub fn bn8_attention_body_msl(
     t_act: &str,
     q_buf: &str,
@@ -2713,13 +3154,19 @@ pub fn synthesize_forward_decode(
     // ── kernel-scope variable names (must match atom-body refs) ──
     let x_norm_name   = "__x_norm";
     let qmv_smem_name = "__qmv_smem";
-    let residual_io   = "__residual";
+    // `__residual` is no longer the bound name — the kernel signature
+    // now declares it as `__residual_atomic` (device atomic_uint*).
+    // Keep `residual_io` as the legacy name for any chunk-style atom
+    // refs that may still reach here (none today; reserved for the
+    // chunk-merge path).
+    let residual_io   = "__residual_atomic";
+    let _ = residual_io;
     // Bound by the atom signature but unused at the kernel level —
     // `addrms` runs in `init = true` mode (see comment below), which
     // never reads `delta`. Kept as a stable channel name so the
     // AtomCtx binding indices stay parallel to the per-chunk persistent
     // synth that DOES consume a separate delta buffer.
-    let delta_buf     = "__residual";
+    let delta_buf     = "__residual_atomic";
     let rms_wt_buf    = "__rms_w";
     let q_wt_buf      = "__q_w"; let q_sc_buf = "__q_s"; let q_bi_buf = "__q_b";
     let k_wt_buf      = "__k_w"; let k_sc_buf = "__k_s"; let k_bi_buf = "__k_b";
@@ -2779,23 +3226,187 @@ pub fn synthesize_forward_decode(
         group_size: c.group_size, local_head_expr: "(__head - __num_q - __num_kv)", has_linear_bias: false,
     };
 
-    let addrms_in  = vec![residual_io.to_string(), delta_buf.to_string(), rms_wt_buf.to_string()];
-    let addrms_out = vec![x_norm_name.to_string()];
-    let addrms_ctx = AtomCtx {
-        bound_inputs: &addrms_in, bound_outputs: &addrms_out,
-        constants: &constants_slice, t_act, t_scale,
+    let _ = (addrms, &delta_buf);  // atom replaced by inline atomic body below
+
+    // Atomic AddRmsNorm body emitter — init=true (no delta add), reads
+    // `__residual` via atomic_load_explicit on uint32 pairs (each
+    // packing two bf16/half values lo|hi<<16). Apple Metal needs
+    // atomic ops on the data ITSELF for cross-TG visibility — plain
+    // `device bfloat*` stores + threadgroup_barrier(mem_device) leaves
+    // other TGs reading stale L1 even after the cross-TG ticket-lock
+    // barrier (verified at
+    // crates/ferrite-metal-cost-sweep/src/synth_persistent_test.rs).
+    // The atomic-counter barrier provides ARRIVAL sync only.
+    //
+    // `rms_w_name` is the kernel-scope `device const half*` for the
+    // norm weight (per-site: pre-attn `__rms_w`, post-attn
+    // `__postattn_rms_w`, final `__final_rms_w`).
+    let emit_atomic_addrms = |rms_w_name: &str| -> String {
+        format!(
+            r#"
+    // --- inline atomic AddRmsNorm (init=true; reads __residual via atomic_load) ---
+    {{
+        float __local_sumsq = 0.0f;
+        const uint __res_base = __t * __hidden;
+        // Pair-loop: each thread processes one uint32 word (= 2 bfloats).
+        for (uint __pair = __tid; __pair < __hidden / 2u; __pair += __threads_per_tg) {{
+            uint __packed = atomic_load_explicit(
+                &__residual_atomic[__res_base / 2u + __pair],
+                memory_order_relaxed);
+            {t_act} __lo = as_type<{t_act}>(ushort(__packed & 0xFFFFu));
+            {t_act} __hi = as_type<{t_act}>(ushort((__packed >> 16) & 0xFFFFu));
+            const float __fl = float(__lo);
+            const float __fh = float(__hi);
+            __local_sumsq += __fl * __fl + __fh * __fh;
+            {x_norm}[2u * __pair]      = __lo;
+            {x_norm}[2u * __pair + 1u] = __hi;
+        }}
+        const float __scale = mk_tg_rmsnorm_scale(__local_sumsq, __hidden, __eps,
+                                                  __scratch, __num_simdgroups,
+                                                  __simd_gid, __simd_lid);
+        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
+            const float __v_pre = float({x_norm}[__i]);
+            const float __w     = float({rms_w_name}[__i]);
+            {x_norm}[__i] = {t_act}(__v_pre * __scale * __w);
+        }}
+        mk_sync();
+    }}
+"#,
+            t_act = t_act,
+            x_norm = x_norm_name,
+            rms_w_name = rms_w_name,
+        )
     };
-    let rope_in  = vec![
-        qmv_smem_name.to_string(), cos_sin_buf.to_string(),
-        positions_buf.to_string(), slot_map_buf.to_string(),
-    ];
-    let rope_out = vec![q_out_buf.to_string(), kv_cache_k.to_string(), kv_cache_v.to_string()];
-    let rope_ctx = AtomCtx {
-        bound_inputs: &rope_in, bound_outputs: &rope_out,
-        constants: &constants_slice, t_act, t_scale,
-    };
-    let addrms_body = addrms.emit_metal_body(&addrms_ctx).expect("AddRmsNormAtom Metal emit");
-    let rope_body   = rope.emit_metal_body(&rope_ctx).expect("RopeAppendAtom Metal emit");
+    let addrms_body = emit_atomic_addrms(rms_wt_buf);
+
+    let _ = rope;  // atom replaced by inline atomic RopeAppend below
+    // Inline RopeAppend + KvPagedWrite. Q write stays non-atomic
+    // (single Q-head TG reads its own Q in attention — no cross-TG).
+    // K/V writes use atomic_store on uint32 pairs so cross-Q-head TGs
+    // see them during attention reads. Each `(d, d+1)` adjacent pair
+    // packs into one uint32 (d=base_d+r with r in 0..8, base_d even
+    // → consecutive d's at even offset). Same for `(half_dim+d, half_dim+d+1)`.
+    let rope_body = format!(
+        r#"
+    // --- inline atomic RopeAppend + KvPagedWrite ---
+    {{
+        if (__simd_lid == 0) {{
+            const uint __rope_rows_per_pass = __num_simdgroups * MK_ROWS_PER_SIMDGROUP;
+            const uint __rope_num_passes    = __head_dim / __rope_rows_per_pass;
+            for (uint __rope_pass = 0u; __rope_pass < __rope_num_passes; ++__rope_pass) {{
+                const uint __base_d = __rope_pass * __rope_rows_per_pass
+                                    + __simd_gid * MK_ROWS_PER_SIMDGROUP;
+                const uint __kQ_END = __num_q;
+                const uint __kK_END = __num_q + __num_kv;
+                if (__head < __kQ_END) {{
+                    // Q write (non-atomic OK: single-Q-head-TG owns this row).
+                    device {t_act}* __q_row = {q_out}
+                        + (size_t)__t    * (size_t)(__num_q * __head_dim)
+                        + (size_t)__head * (size_t)__head_dim;
+                    if (__base_d < __half_dim) {{
+                        const uint __p = {positions}[__t];
+                        device const {t_act}* __cos_row = {cos_sin} + (size_t)__p * (size_t)__rot_dim;
+                        device const {t_act}* __sin_row = __cos_row + __half_dim;
+                        for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++) {{
+                            const uint __d = __base_d + __r;
+                            float __x0 = {qmv_smem}[__d];
+                            float __x1 = {qmv_smem}[__half_dim + __d];
+                            mk_rope_pair(__x0, __x1, float(__cos_row[__d]), float(__sin_row[__d]));
+                            __q_row[__d]              = {t_act}(__x0);
+                            __q_row[__half_dim + __d] = {t_act}(__x1);
+                        }}
+                    }} else if (__base_d >= __rot_dim) {{
+                        for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++)
+                            __q_row[__base_d + __r] = {t_act}({qmv_smem}[__base_d + __r]);
+                    }}
+                }} else if (__head < __kK_END) {{
+                    // K write — ATOMIC. size_t throughout — KV cache
+                    // can exceed 4GiB so block_id * blk_stride overflows
+                    // uint32 even for typical workloads.
+                    const uint __kv_head = __head - __num_q;
+                    const uint __slot    = {slot_map}[__t];
+                    if (__slot != 0xFFFFFFFFu) {{
+                        const uint __block_id     = __slot / __block_sz;
+                        const uint __block_offset = __slot % __block_sz;
+                        const size_t __k_row_base =
+                              (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                            + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
+                            + (size_t)__block_offset * (size_t)__head_dim;
+                        if (__base_d < __half_dim) {{
+                            const uint __p = {positions}[__t];
+                            device const {t_act}* __cos_row = {cos_sin} + (size_t)__p * (size_t)__rot_dim;
+                            device const {t_act}* __sin_row = __cos_row + __half_dim;
+                            for (int __r2 = 0; __r2 < MK_ROWS_PER_SIMDGROUP; __r2 += 2) {{
+                                const uint __d_a = __base_d + (uint)__r2;
+                                const uint __d_b = __base_d + (uint)__r2 + 1u;
+                                float __x0_a = {qmv_smem}[__d_a];
+                                float __x1_a = {qmv_smem}[__half_dim + __d_a];
+                                mk_rope_pair(__x0_a, __x1_a,
+                                    float(__cos_row[__d_a]), float(__sin_row[__d_a]));
+                                float __x0_b = {qmv_smem}[__d_b];
+                                float __x1_b = {qmv_smem}[__half_dim + __d_b];
+                                mk_rope_pair(__x0_b, __x1_b,
+                                    float(__cos_row[__d_b]), float(__sin_row[__d_b]));
+                                uint __lo_packed =
+                                      uint(as_type<ushort>({t_act}(__x0_a)))
+                                    | (uint(as_type<ushort>({t_act}(__x0_b))) << 16);
+                                uint __hi_packed =
+                                      uint(as_type<ushort>({t_act}(__x1_a)))
+                                    | (uint(as_type<ushort>({t_act}(__x1_b))) << 16);
+                                atomic_store_explicit(
+                                    &{kv_cache_k}[(__k_row_base + (size_t)__d_a) / (size_t)2u],
+                                    __lo_packed, memory_order_relaxed);
+                                atomic_store_explicit(
+                                    &{kv_cache_k}[(__k_row_base + (size_t)__half_dim + (size_t)__d_a) / (size_t)2u],
+                                    __hi_packed, memory_order_relaxed);
+                            }}
+                        }} else if (__base_d >= __rot_dim) {{
+                            for (int __r2 = 0; __r2 < MK_ROWS_PER_SIMDGROUP; __r2 += 2) {{
+                                const uint __d_a = __base_d + (uint)__r2;
+                                uint __packed =
+                                      uint(as_type<ushort>({t_act}({qmv_smem}[__d_a])))
+                                    | (uint(as_type<ushort>({t_act}({qmv_smem}[__d_a + 1u]))) << 16);
+                                atomic_store_explicit(
+                                    &{kv_cache_k}[(__k_row_base + (size_t)__d_a) / (size_t)2u],
+                                    __packed, memory_order_relaxed);
+                            }}
+                        }}
+                    }}
+                }} else {{
+                    // V write — ATOMIC. Same size_t treatment as K.
+                    const uint __kv_head = __head - __kK_END;
+                    const uint __slot    = {slot_map}[__t];
+                    if (__slot != 0xFFFFFFFFu) {{
+                        const uint __block_id     = __slot / __block_sz;
+                        const uint __block_offset = __slot % __block_sz;
+                        const size_t __v_row_base =
+                              (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                            + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
+                            + (size_t)__block_offset * (size_t)__head_dim;
+                        for (int __r2 = 0; __r2 < MK_ROWS_PER_SIMDGROUP; __r2 += 2) {{
+                            const uint __d_a = __base_d + (uint)__r2;
+                            uint __packed =
+                                  uint(as_type<ushort>({t_act}({qmv_smem}[__d_a])))
+                                | (uint(as_type<ushort>({t_act}({qmv_smem}[__d_a + 1u]))) << 16);
+                            atomic_store_explicit(
+                                &{kv_cache_v}[(__v_row_base + (size_t)__d_a) / (size_t)2u],
+                                __packed, memory_order_relaxed);
+                        }}
+                    }}
+                }}
+            }}  // end pass loop
+        }}  // end if simd_lid == 0
+    }}
+"#,
+        t_act = t_act,
+        q_out = q_out_buf,
+        cos_sin = cos_sin_buf,
+        positions = positions_buf,
+        slot_map = slot_map_buf,
+        qmv_smem = qmv_smem_name,
+        kv_cache_k = kv_cache_k,
+        kv_cache_v = kv_cache_v,
+    );
 
     let emit_band_body = |atom: &AffineQmvAtom, w: &str, s: &str, b: &str| -> String {
         let band_in = vec![
@@ -2824,7 +3435,11 @@ pub fn synthesize_forward_decode(
 "#,
     );
 
-    let attn_body = bn8_attention_body_msl(
+    // Non-fused attention: writes attn_scratch (device atomic_uint),
+    // o_proj reads it in the next phase. Restored after CAS-fused
+    // experiment regressed perf (see cost_sweep::single_tg_resident
+    // probe + persistent-decode-handoff for the bench).
+    let attn_body = bn8_attention_body_msl_atomic(
         t_act,
         q_out_buf, attn_out_buf,
         seq_used_k, block_table,
@@ -2851,6 +3466,14 @@ pub fn synthesize_forward_decode(
         local_head_expr: "__head",
         has_linear_bias: false,
     };
+    // Non-fused o_proj: each TG handles a disjoint output tile of
+    // o_proj, reads __attn_scratch (cross-TG via atomic_load) staged
+    // into __x_norm (TG mem), runs AffineQmvAtom, writes its tile of
+    // the residual via atomic_load+store (single-writer-per-word, no
+    // CAS — head-tile alignment guarantees no contention). This shape
+    // beat the fused-CAS variant in cost_sweep::single_tg_resident
+    // probe (A=20 ms vs D=42 ms at 16 TGs × 1024 threads on M4-base)
+    // because the disjoint-per-TG residual write avoids CAS overhead.
     let qmv_o_body = {
         let band_in = vec![
             x_norm_name.to_string(), o_wt_buf.to_string(),
@@ -2863,34 +3486,43 @@ pub fn synthesize_forward_decode(
         };
         qmv_o.emit_metal_body(&band_ctx).expect("AffineQmvAtom (o_proj) Metal emit")
     };
+    let _ = bn8_attention_oproj_fused_body;  // experimental fused variant — not used
     let o_proj_body = format!(
         r#"
         // Stage attn_out [hidden] from device → __x_norm (TG memory)
-        // so AffineQmvAtom can read it. Every TG stages independently
-        // (each only needs its tile's input, but the whole vector is
-        // cheap to stage and saves a per-tile re-stage). 256 t/TG cover
-        // 2048-element load in 8 strided reads.
-        for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
-            {x_norm_name}[__i] = {attn_out_buf}[__t * __hidden + __i];
+        // via atomic loads (cross-TG: phase-1 attention wrote
+        // attn_scratch in per-Q-head slices spread across multiple TGs).
+        for (uint __pair = __tid; __pair < __hidden / 2u; __pair += __threads_per_tg) {{
+            uint __atn_packed = atomic_load_explicit(
+                &{attn_out_buf}[(__t * __hidden) / 2u + __pair],
+                memory_order_relaxed);
+            {x_norm_name}[2u * __pair]      = as_type<{t_act}>(ushort(__atn_packed & 0xFFFFu));
+            {x_norm_name}[2u * __pair + 1u] = as_type<{t_act}>(ushort((__atn_packed >> 16) & 0xFFFFu));
         }}
         mk_sync();
 
         // Tile-loop: each TG owns `ceil((hidden/head_dim) / num_tgs)`
-        // tiles of HEAD_DIM output rows. `__head = __tile` aliases the
-        // qmv atom's per-band local-head index.
+        // tiles of HEAD_DIM output rows.
         const uint __o_proj_tiles = __hidden / __head_dim;
         for (uint __head = __tg_id; __head < __o_proj_tiles; __head += num_tgs) {{
             {qmv_o_body}
-            // qmv_smem now holds HEAD_DIM floats — add to residual at
-            // [__t * __hidden + __head * __head_dim, +HEAD_DIM).
-            // simd_lid==0 of each simdgroup wrote MK_ROWS_PER_SIMDGROUP
-            // slots (one pass per HEAD_DIM/64 chunks). Use all threads
-            // to read + add back to residual.
-            for (uint __i = __tid; __i < __head_dim; __i += __threads_per_tg) {{
-                const uint __out_idx = __t * __hidden + __head * __head_dim + __i;
-                {residual_io}[__out_idx] = {t_act}(
-                    float({residual_io}[__out_idx]) + {qmv_smem_name}[__i]
-                );
+            // qmv_smem holds HEAD_DIM floats — atomic-add into residual
+            // at the tile's disjoint slice. Single-writer-per-uint32-word
+            // (head_dim=64 is even; head*head_dim is even) so no CAS
+            // needed — each thread fully owns its 2-bfloat pair.
+            const uint __res_base = __t * __hidden + __head * __head_dim;
+            for (uint __pair = __tid; __pair < __head_dim / 2u; __pair += __threads_per_tg) {{
+                const uint __packed_idx = __res_base / 2u + __pair;
+                uint __old = atomic_load_explicit(
+                    &__residual_atomic[__packed_idx], memory_order_relaxed);
+                {t_act} __old_lo = as_type<{t_act}>(ushort(__old & 0xFFFFu));
+                {t_act} __old_hi = as_type<{t_act}>(ushort((__old >> 16) & 0xFFFFu));
+                {t_act} __new_lo = {t_act}(float(__old_lo) + {qmv_smem_name}[2u * __pair]);
+                {t_act} __new_hi = {t_act}(float(__old_hi) + {qmv_smem_name}[2u * __pair + 1u]);
+                uint __new = uint(as_type<ushort>(__new_lo))
+                           | (uint(as_type<ushort>(__new_hi)) << 16);
+                atomic_store_explicit(
+                    &__residual_atomic[__packed_idx], __new, memory_order_relaxed);
             }}
             mk_sync();
         }}
@@ -2966,17 +3598,8 @@ pub fn synthesize_forward_decode(
         ("EPS",          AtomConstantValue::Float(c.rms_norm_eps)),
     ];
 
-    let addrms_postattn_in = vec![
-        residual_io.to_string(), residual_io.to_string(),
-        postattn_rms_buf.to_string(),
-    ];
-    let addrms_postattn_out = vec![x_norm_name.to_string()];
-    let addrms_postattn_ctx = AtomCtx {
-        bound_inputs: &addrms_postattn_in, bound_outputs: &addrms_postattn_out,
-        constants: &mlp_constants_slice, t_act, t_scale,
-    };
-    let addrms_postattn_body = addrms_init.emit_metal_body(&addrms_postattn_ctx)
-        .expect("AddRmsNormAtom (post-attn init) Metal emit");
+    let _ = addrms_init;  // replaced by inline atomic emit
+    let addrms_postattn_body = emit_atomic_addrms(postattn_rms_buf);
 
     let emit_mlp_qmv_body = |atom: &AffineQmvAtom, w: &str, s: &str, b: &str, out_name: &str| -> String {
         let band_in = vec![
@@ -2992,14 +3615,42 @@ pub fn synthesize_forward_decode(
     let qmv_gate_body = emit_mlp_qmv_body(&qmv_gate, gate_wt_buf, gate_sc_buf, gate_bi_buf, gate_smem);
     let qmv_up_body   = emit_mlp_qmv_body(&qmv_up,   up_wt_buf,   up_sc_buf,   up_bi_buf,   up_smem);
 
-    let silu_mul_in  = vec![gate_smem.to_string(), up_smem.to_string()];
-    let silu_mul_out = vec![mlp_scratch.to_string()];
-    let silu_mul_ctx = AtomCtx {
-        bound_inputs: &silu_mul_in, bound_outputs: &silu_mul_out,
-        constants: &mlp_constants_slice, t_act, t_scale,
-    };
-    let silu_mul_body = silu_mul.emit_metal_body(&silu_mul_ctx)
-        .expect("SiluMulAtom Metal emit");
+    let _ = silu_mul;  // atom replaced by inline atomic SiluMul below
+    // Inline atomic SiluMul: each tile-owning TG writes HEAD_DIM=64
+    // bfloats to __mlp_scratch at byte offset (t*intermediate + head*head_dim).
+    // Single-writer per uint32 word (HEAD_DIM and head*HEAD_DIM both even),
+    // pair-loop one uint32 per thread. atomic_store required for phase-4
+    // down_proj reads on other TGs.
+    let silu_mul_body = format!(
+        r#"
+    // --- inline atomic SiluMul (writes __mlp_scratch via atomic_store) ---
+    {{
+        const uint __sm_base = __t * __intermediate + __head * __head_dim;
+        for (uint __sm_pair = __tid; __sm_pair < __head_dim / 2u; __sm_pair += __threads_per_tg) {{
+            const uint __d_lo = 2u * __sm_pair;
+            const uint __d_hi = 2u * __sm_pair + 1u;
+            const float __g_lo = {gate_smem}[__d_lo];
+            const float __g_hi = {gate_smem}[__d_hi];
+            const float __u_lo = {up_smem}[__d_lo];
+            const float __u_hi = {up_smem}[__d_hi];
+            const float __sg_lo = __g_lo / (1.0f + exp(-__g_lo));
+            const float __sg_hi = __g_hi / (1.0f + exp(-__g_hi));
+            {t_act} __out_lo = {t_act}(__sg_lo * __u_lo);
+            {t_act} __out_hi = {t_act}(__sg_hi * __u_hi);
+            uint __packed = uint(as_type<ushort>(__out_lo))
+                          | (uint(as_type<ushort>(__out_hi)) << 16);
+            atomic_store_explicit(
+                &{mlp_scratch}[__sm_base / 2u + __sm_pair],
+                __packed, memory_order_relaxed);
+        }}
+        mk_sync();
+    }}
+"#,
+        gate_smem = gate_smem,
+        up_smem = up_smem,
+        mlp_scratch = mlp_scratch,
+        t_act = t_act,
+    );
 
     let mlp_body = format!(
         r#"
@@ -3045,10 +3696,24 @@ pub fn synthesize_forward_decode(
     let down_wt_buf = "__down_w"; let down_sc_buf = "__down_s"; let down_bi_buf = "__down_b";
     let down_proj_body = format!(
         r#"
+        // Stage __mlp_scratch → __mlp_tg (TG mem). One bulk atomic-load
+        // pass per TG. After staging, the per-tile qmv reads __mlp_tg
+        // with the non-atomic threadgroup mk_load_vector overload —
+        // ~100x faster than per-iteration atomic device reads (Apple
+        // GPU atomic ops don't coalesce across simdgroup lanes).
+        for (uint __mlp_pair = __tid; __mlp_pair < __intermediate / 2u; __mlp_pair += __threads_per_tg) {{
+            uint __mlp_packed = atomic_load_explicit(
+                &{mlp_scratch}[(__t * __intermediate) / 2u + __mlp_pair],
+                memory_order_relaxed);
+            __mlp_tg[2u * __mlp_pair]      = as_type<{t_act}>(ushort(__mlp_packed & 0xFFFFu));
+            __mlp_tg[2u * __mlp_pair + 1u] = as_type<{t_act}>(ushort((__mlp_packed >> 16) & 0xFFFFu));
+        }}
+        mk_sync();
+
         // Tile-loop: each TG owns `ceil(hidden/head_dim / num_tgs)`
-        // tiles of HEAD_DIM output rows; per-tile qmv reads
-        // __mlp_scratch (intermediate-sized, device memory) and writes
-        // HEAD_DIM floats into __qmv_smem, then adds to residual.
+        // tiles of HEAD_DIM output rows; per-tile qmv reads __mlp_tg
+        // (staged from __mlp_scratch) and writes HEAD_DIM floats into
+        // __qmv_smem, then adds to residual.
         const uint __down_tiles = __hidden / __head_dim;
         for (uint __head = __tg_id; __head < __down_tiles; __head += num_tgs) {{
             constexpr int __dp_bits              = 4;
@@ -3082,16 +3747,21 @@ pub fn synthesize_forward_decode(
                 thread float __dp_x_thread[__dp_values_per_thread];
                 thread float __dp_result[MK_ROWS_PER_SIMDGROUP] = {{ 0 }};
                 const int __dp_block_size = __dp_values_per_thread * MK_SIMD_SIZE;
-                device const {t_act}* __dp_x_in = {mlp_scratch}
-                    + (size_t)__t * (size_t)__intermediate
+                // Read from __mlp_tg (TG mem, staged once at phase-4
+                // entry from __mlp_scratch via atomic_load). Lets the
+                // qmv use the non-atomic threadgroup mk_load_vector
+                // overload — simdgroup-coalesced loads instead of
+                // per-thread serial atomic_loads (Apple GPU atomic
+                // ops don't coalesce). ~100× speedup over inline
+                // atomic loads.
+                threadgroup const {t_act}* __dp_x_in = __mlp_tg
                     + (size_t)__simd_lid * (size_t)__dp_values_per_thread;
 
                 const device uint8_t* __dp_ws_iter = __dp_ws;
                 const device {t_scale}* __dp_sc_iter = __dp_sc;
                 const device {t_scale}* __dp_bi_iter = __dp_bi;
-                device const {t_act}* __dp_x_iter  = __dp_x_in;
+                threadgroup const {t_act}* __dp_x_iter = __dp_x_in;
                 for (int __dp_k = 0; __dp_k < (int)__intermediate; __dp_k += __dp_block_size) {{
-                    // device-source mk_load_vector overload.
                     float __dp_sum = mk_load_vector<{t_act}, float, __dp_values_per_thread, __dp_bits>(__dp_x_iter, __dp_x_thread);
                     for (int __dp_row = 0; __dp_row < MK_ROWS_PER_SIMDGROUP; __dp_row++) {{
                         const device uint8_t* __dp_wl = __dp_ws_iter + __dp_row * __dp_in_vec_size_w;
@@ -3113,13 +3783,25 @@ pub fn synthesize_forward_decode(
             }}
             mk_sync();
 
-            // Add qmv_smem (HEAD_DIM floats) to residual slice
-            // [__t * hidden + tile*head_dim, +head_dim).
-            for (uint __dp_i = __tid; __dp_i < __head_dim; __dp_i += __threads_per_tg) {{
-                const uint __dp_out_idx = __t * __hidden + __head * __head_dim + __dp_i;
-                {residual_io}[__dp_out_idx] = {t_act}(
-                    float({residual_io}[__dp_out_idx]) + {qmv_smem}[__dp_i]
-                );
+            // Atomically add qmv_smem (HEAD_DIM floats) to residual
+            // slice [__t * hidden + tile*head_dim, +head_dim).
+            // Single-writer-per-uint32-word (same pattern as o_proj's
+            // add). atomic_store required for cross-TG visibility of
+            // the updated residual at next layer's pre-attn AddRmsNorm
+            // (and the final RmsNorm after layer 15).
+            const uint __dp_res_base = __t * __hidden + __head * __head_dim;
+            for (uint __dp_pair = __tid; __dp_pair < __head_dim / 2u; __dp_pair += __threads_per_tg) {{
+                const uint __dp_packed_idx = __dp_res_base / 2u + __dp_pair;
+                uint __dp_old = atomic_load_explicit(
+                    &__residual_atomic[__dp_packed_idx], memory_order_relaxed);
+                {t_act} __dp_old_lo = as_type<{t_act}>(ushort(__dp_old & 0xFFFFu));
+                {t_act} __dp_old_hi = as_type<{t_act}>(ushort((__dp_old >> 16) & 0xFFFFu));
+                {t_act} __dp_new_lo = {t_act}(float(__dp_old_lo) + {qmv_smem}[2u * __dp_pair]);
+                {t_act} __dp_new_hi = {t_act}(float(__dp_old_hi) + {qmv_smem}[2u * __dp_pair + 1u]);
+                uint __dp_new = uint(as_type<ushort>(__dp_new_lo))
+                              | (uint(as_type<ushort>(__dp_new_hi)) << 16);
+                atomic_store_explicit(
+                    &__residual_atomic[__dp_packed_idx], __dp_new, memory_order_relaxed);
             }}
             mk_sync();
         }}
@@ -3129,7 +3811,6 @@ pub fn synthesize_forward_decode(
         down_w = down_wt_buf, down_s = down_sc_buf, down_b = down_bi_buf,
         mlp_scratch = mlp_scratch,
         qmv_smem = qmv_smem_name,
-        residual_io = residual_io,
     );
 
     // ── final: RmsNorm(residual) + lm_head ──
@@ -3155,17 +3836,7 @@ pub fn synthesize_forward_decode(
     let lm_wt_buf = "__lm_w"; let lm_sc_buf = "__lm_s"; let lm_bi_buf = "__lm_b";
     let logits_buf = "__logits_out";
 
-    let final_addrms_in = vec![
-        residual_io.to_string(), residual_io.to_string(),
-        final_rms_buf.to_string(),
-    ];
-    let final_addrms_out = vec![x_norm_name.to_string()];
-    let final_addrms_ctx = AtomCtx {
-        bound_inputs: &final_addrms_in, bound_outputs: &final_addrms_out,
-        constants: &constants_slice, t_act, t_scale,
-    };
-    let final_addrms_body = addrms_init.emit_metal_body(&final_addrms_ctx)
-        .expect("AddRmsNormAtom (final) Metal emit");
+    let final_addrms_body = emit_atomic_addrms(final_rms_buf);
 
     let lm_head_body = format!(
         r#"
@@ -3219,9 +3890,13 @@ pub fn synthesize_forward_decode(
     // pass and silently exit every subsequent iteration. See
     // `cross_tg_barrier_msl_with_target` for the gory details.
     //
-    // PHASES_PER_LAYER = 5 (pre_attn, attn, o_proj, mlp_pre_down,
-    // down_proj). MSL expression `__layer * 5u + N + 1u` gives the
-    // running per-iteration target for the N-th in-loop barrier.
+    // **PHASES_PER_LAYER = 5** — pre_attn, attn (separate), o_proj,
+    // mlp_pre_down, down_proj. Each layer increments the counter 5
+    // times → barrier N's target is `layer * 5 + N + 1`. If you change
+    // the phase count, update BOTH the per-phase multipliers below AND
+    // the final-barrier multiplier or barriers will spin forever
+    // (beach-balled the user's machine once during fusion — see
+    // [[persistent-decode-objective]] + handoff).
     let barrier_after_pre_attn = cross_tg_barrier_msl_with_target(
         0, "__layer * 5u + 1u", "__barrier_counter",
     );
@@ -3239,8 +3914,8 @@ pub fn synthesize_forward_decode(
     );
     // Cross-TG barrier BEFORE final rmsnorm: every TG must see all
     // layer-loop residual writes before the rmsnorm reduction reads
-    // __residual. This barrier runs ONCE after the layer loop
-    // completes, so the cumulative target is `NUM_LAYERS * 5 + 1`.
+    // __residual. After the layer loop, counter = NUM_LAYERS * 5. The
+    // final barrier adds 1 more → target NUM_LAYERS * 5 + 1.
     let barrier_before_final = cross_tg_barrier_msl_with_target(
         5,
         "NUM_LAYERS * 5u + 1u",
@@ -3277,8 +3952,11 @@ struct PerLayerWeights {{
     device const {t_scale}* v_scales          [[id(8)]];
     device const {t_scale}* v_biases          [[id(9)]];
     device const {t_act}*   cos_sin           [[id(10)]];
-    device       {t_act}*   kv_cache_k        [[id(11)]];
-    device       {t_act}*   kv_cache_v        [[id(12)]];
+    // KV caches are device atomic_uint (each uint32 = 2 bf16) for
+    // cross-TG visibility — RopeAppend writes by kv-head-owning TGs
+    // must be visible to attention reads by Q-head TGs.
+    device       atomic_uint*  kv_cache_k     [[id(11)]];
+    device       atomic_uint*  kv_cache_v     [[id(12)]];
     device const uint32_t*  o_weight          [[id(13)]];
     device const {t_scale}* o_scales          [[id(14)]];
     device const {t_scale}* o_biases          [[id(15)]];
@@ -3324,10 +4002,20 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
 void {symbol}(
     device atomic_uint*           __barrier_counter [[buffer(0)]],
     device const PerLayerWeights* __layer_table     [[buffer(1)]],
-    device       {t_act}*         {residual_io}        [[buffer(2)]],
+    // __residual_atomic: device atomic_uint view of the running
+    // residual stream. Each uint32 packs 2 bfloat values (lo|hi<<16).
+    // Apple Metal requires atomic_load/atomic_store on cross-TG-shared
+    // data — plain bfloat* stores leave readers seeing stale L1 even
+    // after threadgroup_barrier(mem_device). Single-writer-per-word
+    // (head-tile alignment) means no CAS contention.
+    device       atomic_uint*     __residual_atomic [[buffer(2)]],
+    // Q-scratch stays non-atomic: each Q-head TG writes its own row in
+    // RopeAppend and reads its own row in attention — no cross-TG.
     device       {t_act}*         {q_out_buf}      [[buffer(3)]],
-    device       {t_act}*         {attn_out_buf}    [[buffer(4)]],
-    device       {t_act}*         {mlp_scratch}    [[buffer(5)]],
+    // attn_scratch and mlp_scratch are atomic_uint (each uint32 packs
+    // 2 bf16) for the same cross-TG-visibility reason as __residual.
+    device       atomic_uint*     {attn_out_buf}    [[buffer(4)]],
+    device       atomic_uint*     {mlp_scratch}    [[buffer(5)]],
     device const uint*            {positions_buf}  [[buffer(6)]],
     device const uint*            {slot_map_buf}   [[buffer(7)]],
     device const uint*            {seq_used_k} [[buffer(8)]],
@@ -3374,6 +4062,15 @@ void {symbol}(
     // mlp_pre_down. Each holds HEAD_DIM floats per tile.
     threadgroup float   {gate_smem}[__HEAD_DIM_MAX];
     threadgroup float   {up_smem}[__HEAD_DIM_MAX];
+    // mlp_scratch TG-mem stage. Phase 4 down_proj qmv reads
+    // __mlp_scratch (intermediate-sized device atomic_uint*) in a tight
+    // inner loop. Atomic device reads don't coalesce on Apple Metal,
+    // so each thread serializes ~256 atomic_loads per tile → 32M
+    // atomic_loads per token → multi-second decode. Instead, stage
+    // mlp_scratch once per phase into this TG buffer (one bulk
+    // atomic-load pass = ~32 atomic_loads per thread) and let the qmv
+    // use the cheap non-atomic threadgroup-source mk_load_vector.
+    threadgroup {t_act} __mlp_tg[INTERMEDIATE];
 
     // For now `__t = 0` for single-token decode (M=1). When batched
     // decode lands, an outer tile loop covers the token axis too.
@@ -3393,8 +4090,8 @@ void {symbol}(
         device const {t_scale}* {v_sc_buf}   = __layer_table[__layer].v_scales;
         device const {t_scale}* {v_bi_buf}   = __layer_table[__layer].v_biases;
         device const {t_act}*   {cos_sin_buf} = __layer_table[__layer].cos_sin;
-        device       {t_act}*   {kv_cache_k} = __layer_table[__layer].kv_cache_k;
-        device       {t_act}*   {kv_cache_v} = __layer_table[__layer].kv_cache_v;
+        device       atomic_uint*  {kv_cache_k} = __layer_table[__layer].kv_cache_k;
+        device       atomic_uint*  {kv_cache_v} = __layer_table[__layer].kv_cache_v;
         device const uint32_t*  {o_wt_buf}   = __layer_table[__layer].o_weight;
         device const {t_scale}* {o_sc_buf}   = __layer_table[__layer].o_scales;
         device const {t_scale}* {o_bi_buf}   = __layer_table[__layer].o_biases;
@@ -3420,18 +4117,16 @@ void {symbol}(
         }}
         {barrier_after_pre_attn}
 
-        // ── phase 1: BN=8 in-kernel attention ──
-        // Heads with __head >= NUM_Q sit idle (guarded inside the
-        // attention body); the tile loop bounds skip them outright.
+        // ── phase 1: BN=8 paged-cache attention ──
+        // Heads ≥ NUM_Q sit idle (guarded inside the body). The atom
+        // writes attn_out to __attn_scratch (atomic device) for the
+        // o_proj phase to pick up.
         for (uint __head = __tg_id; __head < __num_q; __head += num_tgs) {{
             {attn_body}
         }}
         {barrier_after_attn}
 
-        // ── phase 2: o_proj (GEMV: hidden ← attn_out, into residual) ──
-        // Tile-loop over hidden/head_dim output tiles. Each tile is
-        // an AffineQmv producing HEAD_DIM rows that are added back
-        // into the residual stream.
+        // ── phase 2: o_proj — GEMV (hidden ← attn_out, into residual) ──
         {o_proj_body}
         {barrier_after_o_proj}
 
@@ -3457,7 +4152,11 @@ void {symbol}(
 }}
 "#,
         symbol = symbol, t_act = t_act, t_scale = t_scale,
-        residual_io = residual_io, q_out_buf = q_out_buf, attn_out_buf = attn_out_buf,
+        // __attn_scratch slot is bound by the worker but the fused
+        // attn+o_proj kernel no longer references it. Left in the
+        // signature so we don't have to change Binding / arena slot
+        // wiring; future cleanup.
+        q_out_buf = q_out_buf, attn_out_buf = attn_out_buf,
         positions_buf = positions_buf, slot_map_buf = slot_map_buf,
         seq_used_k = seq_used_k, block_table = block_table,
         rms_wt_buf = rms_wt_buf,

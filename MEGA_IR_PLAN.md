@@ -386,14 +386,41 @@ Concrete TK 2.0 contracts every emit must respect:
 
 **Workflow before emitting any new variant:**
 
-1. **Read the actual TK 2.0 primitive header for every call you'd
-   emit.** If a header doesn't exist or you can't find the signature,
-   the primitive doesn't exist — find another way or add an IR field.
-2. **Check the host-side ABI** in `crates/ferrite-forward/src/
+1. **Read existing emit fns first** (`emit_gemm`,
+   `emit_fused_gate_up_activate_mul`, `emit_tk_fused_norm_gemm`)
+   to understand the pattern of composing `tk20::*` Rust calls.
+   **Do NOT open TK 2.0 C++ headers as your first step** —
+   reading C++ headers when writing emit bodies is exactly how
+   the prior 9-sprint cuda_emit revision drifted into TK 1.0
+   patterns and was nuked (see §11).
+2. **The emit body MUST be a sequence of `tk20::*` Rust function
+   calls.** Every TK 2.0 primitive call (`kittens::warp::*`,
+   `kittens::group<>::*`) appears in the emitted `.cu` only via a
+   call to a `tk20::*` Rust function whose body contains the
+   single TK call as a `format!()`. Splicing TK calls inline as
+   raw strings — `format!("kittens::warp::mma_AB(...)")` — is
+   forbidden. The Rust API enforces shape/dtype/layout type
+   safety (typed handles `Rt<F32, RtRow>`, `St<Bf16>`, `Rv<F32>`,
+   `Sv<Bf16>` + `debug_assert_eq!` shape checks); inline splicing
+   gives all of that up. See [[feedback-dogfood-tk20-rust]] for
+   the full reasoning.
+3. **Runtime control flow** (`for` / `if` over kernel runtime args
+   like `positions[t]`, `seq_lens[t]`, `block_table[...]`) goes
+   through `tk20::for_loop(header, CuBlock)` /
+   `tk20::if_else(...)` helpers that wrap a `CuBlock` of
+   `tk20::*` calls. The helper itself lives in `tk20.rs`. The
+   loop framing AND the body together as a single inline
+   `format!()` is the same violation as splicing TK calls.
+4. **Missing a `tk20::*` binding?** Open the TK 2.0 header to add
+   the new binding, citing the header path + line in the doc-
+   comment on the binding. Add to `tk20.rs`. Then call the
+   binding from `roles.rs`. The header is opened ONLY for the
+   binding step.
+5. **Check the host-side ABI** in `crates/ferrite-forward/src/
    interpreter/mega/mod.rs` (`LaunchArgs*`, `launch*` fns). The
    kernel signature you emit must match what the host already
    constructs and passes.
-3. **If the emit needs a value not on the IR, STOP — extend the IR.**
+6. **If the emit needs a value not on the IR, STOP — extend the IR.**
    This rule is §8.0; the TK 2.0 constraint is §8.0a; both apply.
 
 ### 8.0. MEGAIR IS THE AST FOR THE EMITTED `.cu`.
@@ -413,20 +440,144 @@ The shape of every variant's emit body is determined by:
   scratch offsets, mbarrier phases, BAR IDs, weight-accessor
   indices, ...) — these are the *values* spliced in.
 - The TK 2.0 primitive surface (§8.0a) — these are the *function
-  calls* spliced in.
+  calls* spliced in. **Always via a `tk20::*` Rust function.**
 - Ferrite's substrate (`ferrite_substrate.cuh::SharedState<Config>`,
   `ferrite_warp_roles.cuh`, `ferrite_barrier.cuh`) — these define
   the per-CTA scaffolding the emit wraps the primitives in.
+- Runtime control flow (`for` / `if` over runtime kernel args)
+  goes through `tk20::for_loop` / `tk20::if_else` Rust helpers
+  that wrap a `CuBlock` of `tk20::*` calls. The framing is in the
+  Rust API; the body is `tk20::*` calls.
 
-There is no fourth source. There are no per-op `.cuh` wrappers
+There is no fifth source. There are no per-op `.cuh` wrappers
 (those were nuked); there is no hand-rolled scheduling logic; there
-is no "matvec_pipeline port." If you find yourself reaching for any
-of those, stop and re-read §8.0a.
+is no "matvec_pipeline port." A role body that contains a
+`format!()` with an inline `kittens::warp::*` substring is broken
+and must be rewritten through `tk20::*`. If you find yourself
+reaching for any of those, stop and re-read §8.0a.
 
 A scaffold that ships an emit pipeline whose data model can't reach
 the kernel ABI is not progress; it is structural debt that must be
 reverted. The shape of every variant's typed-field surface is
 determined by the kernel ABI it lowers to, full stop.
+
+### 8.0b. END-TO-END COMPILE-TIME PROOFS — `where` EVERYWHERE.
+
+The IR encodes critical numbers — page IDs, mbarrier phases,
+scratch offsets, warp roles, matmul shapes (M / K / N), head
+dims, num_tokens, num_q_heads, num_kv_heads, BAR sync IDs — as
+sealed const-generic proofs. A `MegaTape<S>` whose construction
+succeeded is provably free of the six bug classes in §1 because
+every wrong value is a Rust compile error at proc-macro time.
+
+**Those proofs MUST flow through to the emit.** Every `tk20::*`
+binding and every `handles::*` typed handle that touches an
+IR-proved value must take that value as a Rust **const generic**
+and use `where` clauses to propagate the invariant. A wrong shape
+on a `warp_mma_AB` call must fail the Rust type-check at
+`cargo check -p ferrite-megakernel` — NOT at unit-test runtime,
+NOT at nvcc time, and absolutely NOT at first kernel launch.
+
+The propagation chain:
+
+```
+ir/nodes.rs typed field
+   ↓ (typed getter, const-generic-bearing)
+handles.rs typed handle
+   ↓ (`Rt<T, L, const ROWS, const COLS>`,
+   ↓  `St<T, const ROWS, const COLS>`,
+   ↓  `Rv<T, const LEN>`, `Sv<T, const LEN>`)
+tk20.rs Rust function with `where` clauses
+   ↓ (`fn warp_mma_AB<const M, const K, const N>(...)
+   ↓     where (D::ROWS == M, A::ROWS == M, A::COLS == K,
+   ↓            B::ROWS == K, B::COLS == N, ...)`)
+emitted .cu (TK 2.0 C++ static_asserts back the Rust proof)
+```
+
+If a const generic stops being a const generic at any layer in
+that chain — if a typed handle stores its shape as a runtime
+`u32`, if a `tk20::*` fn checks shape compatibility via
+`debug_assert_eq!` instead of a `where` clause — the proof is
+broken and the bug class re-enters at the emit boundary.
+
+**Why this matters:** before MegaIR, the proc-macro went directly
+from the high-level instruction tape to CUDA. It failed because
+every important value (page IDs, phases, offsets, roles) was just
+a `u32`, but the values of those numbers were what determined
+whether the kernel deadlocks, writes out of bounds, or silently
+emits garbage. The whole purpose of MegaIR is that those numbers
+are **sealed types**, not bare `u32`s. If the cuda_emit layer
+decays back to bare `u32` at any step, the IR layer did nothing
+useful.
+
+**`where` everywhere.** Every shape, every dim, every offset, every
+phase, every role tag travels as a const generic with constraints
+that tie it to the values it has to match. Runtime values are
+permitted only for genuine runtime data (`positions[t]`,
+`seq_lens[t]`, `block_table[...]`, `input_ids[t]`) — never for the
+shape / layout / lifecycle invariants the IR proved.
+
+**If the TK 2.0 primitive doesn't expose a const-generic
+parameter** the binding needs to capture: read the C++ header more
+carefully (it's a template, the parameter exists). If after
+verification the TK 2.0 surface really is runtime-only for that
+arg, that is a TK 2.0 surface gap — STOP AND ASK before writing
+a binding that quietly drops the proof. A `tk20::*` fn that takes
+a runtime u32 where a const generic could carry it is a bug, not
+a workaround.
+
+See [[feedback-end-to-end-compile-time-proofs]] for concrete
+WRONG vs RIGHT shapes of typed handles, `tk20::*` signatures, and
+audit-checklist commands.
+
+#### Implementing end-to-end const generics: proc-macro-time dispatch
+
+The IR currently erases its const generics to runtime `u32`
+fields on `MegaNode` variants for storage. A runtime walk over
+`&MegaTape` in `lower_to_cuda(&MegaTape)` therefore cannot recover
+the const generics — `node.num_tokens().raw()` returns a bare
+`u32` that can't be passed as a `const` arg.
+
+The fix: **emit dispatch happens at proc-macro time**, not at
+runtime. The proc-macro already emits `build_mega_tape_<canonical>()`
+that calls `b.push_*::<const-generic-args>(...)` with const generics
+known literally per Instruction. The same proc-macro emits a
+parallel `emit_for_canonical_<canonical>()` whose body is a
+sequence of literal `render_*::<const-generic-args>(/* per-op
+runtime args */)` calls — same const generics, baked literally
+into the emit dispatch:
+
+```rust
+// proc-macro-emitted, per canonical:
+pub fn emit_for_canonical_xxx() -> String {
+    let mut s = String::new();
+    s.push_str(&render_rms_norm::<2048, 8>(/* per-op args */));
+    s.push_str(&render_gemm::<8, 2048, 4096>(/* */));
+    s.push_str(&render_fused_qkv_rope_cache::<8, 2048, 64, 32, 8, ...>(
+        /* per-op args */));
+    // ...
+    s
+}
+```
+
+Each `render_*` lives in `ferrite-megakernel::cuda_emit::render`
+and is const-generic in every shape its variant needs. The body
+of each `render_*` calls `tk20::*` and `handles::*` with the same
+const generics flowing through. Mismatch between any two shapes
+that should agree is a Rust type error at user-build time.
+
+The runtime `lower_to_cuda(&MegaTape)` walker is **deleted** as
+part of this refactor — the const-generic path supersedes it.
+Existing `emit_*` fns in `roles.rs` are renamed to `render_*` and
+made const-generic; their bodies preserve the per-variant logic
+but pass the const generics through to `tk20::*` calls.
+
+Proc-macro emit changes (`crates/ferrite-megakernel/src/codegen.rs`):
+the same per-Instruction dispatch arms that already produce
+`b.push_*::<...>(...)` token streams now also produce
+`render_*::<...>(...)` token streams that go into
+`emit_for_canonical_<canonical>()`. One source of truth for the
+const generics; both pushes and renders see the same values.
 
 ### 8.1. IF IT COMPILES, IT RUNS COHERENTLY.
 

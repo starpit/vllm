@@ -430,6 +430,50 @@ pub fn gmem_input_ids() -> CuExpr {
     CuExpr::new("input_ids".to_string())
 }
 
+/// `positions` — raw `const uint32_t*` to the per-token rotary
+/// position table. Sized `[NUM_TOKENS]`. Surfaced by the QKV / Attn
+/// tier kernel signatures (see
+/// `cuda_emit::LaunchTier` + the host `LaunchArgsQkv::positions`
+/// in `crates/ferrite-forward/src/interpreter/mega/mod.rs:295`).
+/// Used by `FusedQkvRopeCache`'s loader for per-token cos/sin
+/// gather: row index = `positions[t]`, row size = `head_dim *
+/// sizeof(bf16)` bytes.
+pub fn gmem_positions() -> CuExpr {
+    CuExpr::new("positions".to_string())
+}
+
+/// `slot_mapping` — raw `const int64_t*` to the per-token paged-KV
+/// slot index table. Sized `[NUM_TOKENS]`. Surfaced by QKV / Attn
+/// tier kernel signatures (host `LaunchArgsQkv::slot_mapping`
+/// at mod.rs:296). FQRC's in-kernel emit doesn't dereference it
+/// today (cache writes happen as a follow-up D2D outside the
+/// megakernel — see `feedback_ff_mega_cuda_emit_s15a_handoff`),
+/// but the accessor exists for future ops that fold the cache
+/// write inside.
+pub fn gmem_slot_mapping() -> CuExpr {
+    CuExpr::new("slot_mapping".to_string())
+}
+
+/// `key_cache_ptrs[<layer>]` — raw `__nv_bfloat16*` to layer
+/// `layer`'s paged K-cache base pointer. The host stages
+/// `[NUM_LAYERS]` device pointers (one per layer's paged KV
+/// block pool) in declaration order; the kernel indexes by the
+/// per-op compile-time layer constant. Layout per pointer:
+/// `[num_blocks, block_size, num_kv_heads, head_dim]` — same
+/// vLLM-NHD convention the vendored `flash_api` path uses.
+/// Returned as a `GmemPtrRaw<Bf16>` so TK 2.0 TMA primitives
+/// accept it without further casts.
+pub fn gmem_key_cache_ptr(layer: u32) -> GmemPtrRaw<Bf16> {
+    GmemPtrRaw::from_expr(CuExpr::new(format!("key_cache_ptrs[{layer}]")))
+}
+
+/// `value_cache_ptrs[<layer>]` — raw `__nv_bfloat16*` to layer
+/// `layer`'s paged V-cache base pointer. Same shape and indexing
+/// rules as [`gmem_key_cache_ptr`].
+pub fn gmem_value_cache_ptr(layer: u32) -> GmemPtrRaw<Bf16> {
+    GmemPtrRaw::from_expr(CuExpr::new(format!("value_cache_ptrs[{layer}]")))
+}
+
 /// `ss.pages[<page>]` — raw `uint8_t*` byte pointer to the page's
 /// shared-memory buffer. Used when the per-token TMA gather needs
 /// pointer arithmetic (`+ tok * row_bytes`) rather than a typed

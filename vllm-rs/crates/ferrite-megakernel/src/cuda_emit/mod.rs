@@ -31,14 +31,57 @@ pub mod handles;
 pub mod roles;
 pub mod tk20;
 
+use crate::ir::nodes::MegaNode;
 use crate::ir::tape::{MegaTape, TapeBudget};
 
 pub use cu::{CuBlock, CuExpr, CuStmt, CuVariant};
+
+/// Which host-side launch ABI tier the emitted megakernel exposes.
+///
+/// Mirror of `ferrite_forward::interpreter::mega::LaunchTier`. The
+/// emit step picks the tier from the tape (which variants it
+/// contains) and emits a kernel signature whose positional args
+/// match the host-side `LaunchArgs*` struct of the same tier per
+/// `MEGA_IR_PLAN.md` §8.0a item 2 ("the kernel signature you emit
+/// must match what the host already constructs and passes").
+///
+/// - `Base` — neither paged-KV nor rotary metadata.
+/// - `Qkv` — at least one `FusedQkvRopeCache`.
+/// - `Attn` — additionally at least one `AttentionViaCache`.
+///
+/// Nested: Attn ⊃ Qkv ⊃ Base. Sets the kernel arg list. The host
+/// pairs each variant with its matching `LaunchFn*` based on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchTier {
+    Base,
+    Qkv,
+    Attn,
+}
+
+fn launch_tier_for_tape(tape: &MegaTape) -> LaunchTier {
+    let mut needs_attn = false;
+    let mut needs_qkv = false;
+    for node in tape.nodes() {
+        match node {
+            MegaNode::AttentionViaCache(_) => needs_attn = true,
+            MegaNode::FusedQkvRopeCache(_) => needs_qkv = true,
+            _ => {}
+        }
+    }
+    if needs_attn {
+        LaunchTier::Attn
+    } else if needs_qkv {
+        LaunchTier::Qkv
+    } else {
+        LaunchTier::Base
+    }
+}
 
 /// Lower a typed [`MegaTape`] to a complete `.cu` translation unit
 /// for the named canonical, against TK 2.0 primitives only.
 pub fn lower_to_cuda(canonical: &str, tape: &MegaTape) -> CuVariant {
     let budget = tape.budget();
+    let tier = launch_tier_for_tape(tape);
 
     let mut loader_block = CuBlock::new();
     let mut launcher_block = CuBlock::new();
@@ -66,6 +109,7 @@ pub fn lower_to_cuda(canonical: &str, tape: &MegaTape) -> CuVariant {
     let source = render_source(
         canonical,
         &budget,
+        tier,
         &loader_block,
         &launcher_block,
         &consumer_block,
@@ -85,6 +129,7 @@ pub fn lower_to_cuda(canonical: &str, tape: &MegaTape) -> CuVariant {
 fn render_source(
     canonical: &str,
     budget: &TapeBudget,
+    tier: LaunchTier,
     loader: &CuBlock,
     launcher: &CuBlock,
     consumer: &CuBlock,
@@ -151,16 +196,62 @@ fn render_source(
 
     // Kernel entry. Args are referenced directly inside the role
     // blocks below (no aggregation struct). Signature matches the
-    // host-side base-tier `LaunchFn` ABI in
-    // `crates/ferrite-forward/src/interpreter/mega/mod.rs:370`.
+    // host-side `LaunchFn*` ABI for `tier` in
+    // `crates/ferrite-forward/src/interpreter/mega/mod.rs` per
+    // `MEGA_IR_PLAN.md` §8.0a item 2.
+    //
+    // Nested ABI: Attn ⊃ Qkv ⊃ Base. Higher tiers append args to the
+    // lower tier's prefix in declaration order. Variants whose tape
+    // doesn't reach a tier still receive the args at higher tiers
+    // (host passes null where unused) so the positional ABI stays
+    // linear.
     s.push_str(&format!("extern \"C\" __global__ void {kernel_name}(\n"));
     s.push_str("    __nv_bfloat16* const*       act_ptrs,\n");
     s.push_str("    const __nv_bfloat16* const* weight_ptrs,\n");
-    s.push_str("    int32_t*                    barrier_slots,\n");
-    s.push_str("    int32_t                     trace_level,\n");
-    s.push_str("    const uint32_t*             input_ids\n");
+    match tier {
+        LaunchTier::Base => {
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level,\n");
+            s.push_str("    const uint32_t*             input_ids\n");
+        }
+        LaunchTier::Qkv => {
+            s.push_str("    const uint32_t*             input_ids,\n");
+            s.push_str("    const uint32_t*             positions,\n");
+            s.push_str("    const int64_t*              slot_mapping,\n");
+            s.push_str("    __nv_bfloat16* const*       key_cache_ptrs,\n");
+            s.push_str("    __nv_bfloat16* const*       value_cache_ptrs,\n");
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level\n");
+        }
+        LaunchTier::Attn => {
+            s.push_str("    const uint32_t*             input_ids,\n");
+            s.push_str("    const uint32_t*             positions,\n");
+            s.push_str("    const int64_t*              slot_mapping,\n");
+            s.push_str("    __nv_bfloat16* const*       key_cache_ptrs,\n");
+            s.push_str("    __nv_bfloat16* const*       value_cache_ptrs,\n");
+            s.push_str("    const int32_t*             seq_lens,\n");
+            s.push_str("    const uint32_t*             block_table,\n");
+            s.push_str("    uint32_t                    block_table_stride,\n");
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level\n");
+        }
+    }
     s.push_str(") {\n");
     s.push_str("    (void)trace_level;\n");
+    if matches!(tier, LaunchTier::Qkv | LaunchTier::Attn) {
+        // Suppress unused-arg warnings in the .cu when the tape's
+        // FQRC ops don't use slot_mapping / KV cache pointers (cache
+        // writes happen outside the megakernel as a follow-up D2D —
+        // see `feedback_ff_mega_cuda_emit_s15a_handoff` design notes).
+        s.push_str("    (void)slot_mapping;\n");
+        s.push_str("    (void)key_cache_ptrs;\n");
+        s.push_str("    (void)value_cache_ptrs;\n");
+    }
+    if matches!(tier, LaunchTier::Attn) {
+        s.push_str("    (void)seq_lens;\n");
+        s.push_str("    (void)block_table;\n");
+        s.push_str("    (void)block_table_stride;\n");
+    }
     s.push_str("    extern __shared__ uint8_t shmem_buf[];\n");
     s.push_str("    auto& ss = *reinterpret_cast<ferrite::SharedState<ConfigT>*>(shmem_buf);\n");
     s.push_str("    ferrite::init_shared_state<ConfigT>(ss);\n");
@@ -1202,6 +1293,133 @@ mod tests {
             assert!(
                 !cu.source.contains(forbidden),
                 "forbidden {forbidden:?} appeared in passthrough emit:\n{}",
+                cu.source
+            );
+        }
+    }
+
+    /// Sprint 15: FusedQkvRopeCache — fused QKV linear projection +
+    /// RoPE rotation + (out-of-kernel) reshape_and_cache. Smoke
+    /// asserts the LaunchTier::Qkv kernel signature, per-token cos/
+    /// sin gather, per-head matmul + per-region routing, RoPE pair
+    /// rotation lambda, and Q/K/V output stores.
+    ///
+    /// Smoke config: M=16, HIDDEN_DIM=64, HEAD_DIM=16, NUM_Q_HEADS=4,
+    /// NUM_KV_HEADS=2, qkv_n=128, NCW=8 → tile_n=16 = head_dim →
+    /// heads_per_warp=1. Each warp processes one head; warp 0..3 hit
+    /// Q region, warp 4 hits K region (cols 64..80), warp 5 hits K
+    /// (cols 80..96), warp 6 hits V (cols 96..112), warp 7 hits V
+    /// (cols 112..128). Scratch: q_rope (0..512) + k_rope (512..1024)
+    /// + qkv_b_tile (1024..17408). Pages sized to fit the tile.
+    #[test]
+    fn fused_qkv_rope_cache_emits_tk20_calls() {
+        use crate::ir::substrate::{
+            BarSyncId, ChunkK, GemmScope, HeadDim, HiddenDim, IterCount, NumKvHeads,
+            NumQHeads, RopeScope, ScratchRegion, TileN,
+        };
+        let mut b = BuilderLg::new();
+        b.push_fused_qkv_rope_cache(
+            ArrivesCount::<0>::new(),
+            PageId::<0, 8>::new(), // in
+            PageId::<1, 8>::new(), // qkv_weight (page-ready barrier)
+            PageId::<2, 8>::new(), // cos_sin
+            PageId::<3, 8>::new(), // q_out
+            PageId::<4, 8>::new(), // k_out
+            PageId::<5, 8>::new(), // v_out
+            ScratchRegion::<0, 512, 65_536, RopeScope>::new(),
+            ScratchRegion::<512, 512, 65_536, RopeScope>::new(),
+            ScratchRegion::<1024, 16_384, 65_536, GemmScope>::new(),
+            MbarrierPhase::<0>::new(),
+            MbarrierPhase::<1>::new(),
+            IterCount::<1>::new(),
+            LayerIndex::<2, 16>::new(),
+            HiddenDim::<64>::new(),
+            HeadDim::<16>::new(),
+            NumQHeads::<4>::new(),
+            NumKvHeads::<2>::new(),
+            NumTokensConst::<16>::new(),
+            ActSlotConst::<0, { u32::MAX }>::new(), // in
+            ActSlotConst::<3, { u32::MAX }>::new(), // q_out
+            ActSlotConst::<4, { u32::MAX }>::new(), // k_out
+            ActSlotConst::<5, { u32::MAX }>::new(), // v_out
+            WeightAccessorConst::<7, { u32::MAX }>::new(), // qkv_weight
+            WeightAccessorConst::<8, { u32::MAX }>::new(), // rotary
+            TileN::<16>::new(),
+            ChunkK::<64>::new(),
+            BarSyncId::<1>::new(),
+            "W::qkv".to_string(),
+            "W::rot".to_string(),
+            true,
+            false,
+        );
+        let tape = b.finish(16);
+        let cu = lower_to_cuda("test_fqrc", &tape);
+        assert!(
+            cu.skipped_variants.is_empty(),
+            "skipped: {:?}",
+            cu.skipped_variants
+        );
+        std::fs::write("/tmp/fused_qkv_rope_cache_emit.cu", &cu.source).ok();
+
+        for needle in [
+            // QKV-tier kernel signature (LaunchTier::Qkv): the
+            // emitted megakernel takes positions/slot_mapping/
+            // key_cache_ptrs/value_cache_ptrs in addition to the
+            // base-tier args. (The kernel doesn't dereference cache
+            // ptrs today; the signature exists for ABI parity with
+            // the host's `LaunchArgsQkv`.)
+            "const uint32_t*             positions,",
+            "const int64_t*              slot_mapping,",
+            "__nv_bfloat16* const*       key_cache_ptrs,",
+            "__nv_bfloat16* const*       value_cache_ptrs,",
+            "(void)slot_mapping;",
+            "(void)key_cache_ptrs;",
+            "(void)value_cache_ptrs;",
+            // Loader: TMAs activation, qkv weight (-> b_tile scratch),
+            // cos_sin per-token gather indexed by positions[t].
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[0], 2048);", // act
+            "kittens::group<1>::tma::expect_bytes(ss.page_ready[1], 16384);", // qkv weight -> b_tile
+            "(*reinterpret_cast<kittens::st_bf<16, 64>*>(ss.pages[0]))",
+            "(*reinterpret_cast<kittens::st_bf<64, 128>*>(ss.scratch + 1024))",
+            "for (int __cs_t = 0; __cs_t < 16; ++__cs_t)",
+            "positions[__cs_t]",
+            // Consumer: A reg tile, qkv_b_tile views, per-head loop,
+            // per-region branching, RoPE apply lambda.
+            "kittens::rt_bf<16, 64> __qkv_a;",
+            "auto& __qkv_q_rope = *reinterpret_cast<kittens::st_bf<16, 64>*>(ss.scratch + 0);",
+            "auto& __qkv_k_rope = *reinterpret_cast<kittens::st_bf<16, 32>*>(ss.scratch + 512);",
+            "__nv_bfloat16* __qkv_cos_sin_ptr = reinterpret_cast<__nv_bfloat16*>(ss.pages[2]);",
+            "for (int __qkv_h = 0; __qkv_h < 1; ++__qkv_h)",
+            "kittens::rt_bf<64, 16, kittens::ducks::rt_layout::col> __qkv_b;",
+            "kittens::rt_fl<16, 16> __qkv_acc;",
+            "kittens::warp::mma_AB(__qkv_acc, __qkv_a, __qkv_b, __qkv_acc);",
+            "if (__qkv_col < 64)",       // Q region
+            "} else if (__qkv_col < 64 + 32)", // K region (q_dim + kv_dim)
+            "} else {",                  // V region
+            // RoPE pair rotation lambda.
+            "kittens::warp::apply(__qkv_rot, __qkv_acc,",
+            "constexpr int __half = 16 / 2;",
+            "__bfloat162float(__qkv_stg_ptr[row * 16 + __pc])",
+            "__bfloat162float(__qkv_cos_sin_ptr[row * 16 + __t])",
+            "__bfloat162float(__qkv_cos_sin_ptr[row * 16 + __half + __t])",
+            "return col < __half ? (x * __c - __paired * __s) : (x * __c + __paired * __s);",
+            // Cross-warp publish bar + per-warp arrives.
+            "kittens::group<8>::sync(1);",
+            "kittens::group<1>::arrive(ss.page_done[3]);", // q_out
+            "kittens::group<1>::arrive(ss.page_done[4]);", // k_out
+            "kittens::group<1>::arrive(ss.page_done[5]);", // v_out
+            // Storer: TMA Q/K/V outputs to act_ptrs[3..6].
+            "act_ptrs[3]",
+            "act_ptrs[4]",
+            "act_ptrs[5]",
+            "kittens::group<1>::tma::store_async_wait();",
+            "kittens::group<1>::arrive(ss.page_consumed[3]);",
+            "kittens::group<1>::arrive(ss.page_consumed[4]);",
+            "kittens::group<1>::arrive(ss.page_consumed[5]);",
+        ] {
+            assert!(
+                cu.source.contains(needle),
+                "expected {needle:?} in source, got:\n{}",
                 cu.source
             );
         }

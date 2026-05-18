@@ -396,6 +396,51 @@ pub fn embed_per_token_gather(
     ))
 }
 
+/// Per-token cos/sin gather for FusedQkvRopeCache. Emits a
+/// `kittens::group<1>::tma::expect_bytes` for the total cos_sin
+/// staging volume, then a per-token loop that issues one
+/// `kittens::group<1>::tma::load_async` per row. Row index is
+/// `positions[t]` (FQRC's rotary indirection), row size is
+/// `head_dim * sizeof(bf16)` bytes (one packed cos/sin row), and
+/// rows land contiguously in shared at `dst + t * row_bytes`.
+///
+/// Mirror of [`embed_per_token_gather`] with the row index source
+/// swapped from `input_ids` → `positions` and the row stride
+/// swapped from `hidden_dim` → `head_dim`. The cos_sin gmem table
+/// is shape `[max_pos, head_dim]` (packed `[cos[0..hd/2],
+/// sin[0..hd/2]]` per row) — same convention as
+/// `fused_qkv_rope_cache_bf16` in `crates/ferrite-kernels/src/
+/// kernels.rs:681`.
+///
+/// Source: `include/ops/group/util/tma.cuh:18` (expect_bytes) +
+/// `include/ops/group/util/tma.cuh:72` (load_async, raw).
+pub fn cos_sin_per_token_gather(
+    out_byte_ptr: &CuExpr,
+    cos_sin_table_ptr: &GmemPtrRaw<Bf16>,
+    positions_ptr: &CuExpr,
+    head_dim: u32,
+    num_tokens: u32,
+    page_ready: &Semaphore,
+) -> CuStmt {
+    let row_bytes = head_dim * 2;
+    let total_bytes = row_bytes * num_tokens;
+    CuStmt::new(format!(
+        "kittens::group<1>::tma::expect_bytes({sem}, {total_bytes});\n\
+         for (int __cs_t = 0; __cs_t < {num_tokens}; ++__cs_t) {{\n\
+         \x20   const uint32_t __cs_row = {pos}[__cs_t];\n\
+         \x20   void* __cs_dst = static_cast<void*>(\
+         reinterpret_cast<char*>({dst}) + __cs_t * {row_bytes});\n\
+         \x20   void* __cs_src = static_cast<void*>(\
+         {table} + static_cast<size_t>(__cs_row) * {head_dim});\n\
+         \x20   kittens::group<1>::tma::load_async(__cs_dst, __cs_src, {row_bytes}, {sem});\n\
+         }}",
+        sem = page_ready.expr(),
+        pos = positions_ptr,
+        dst = out_byte_ptr,
+        table = cos_sin_table_ptr.expr(),
+    ))
+}
+
 /// Per-token TMA store: emits a `for (int t = 0; t < NUM_TOKENS;
 /// ++t)` loop calling non-tensor `kittens::group<1>::tma::
 /// store_async` per row, target gmem at `out_gmem + t * HIDDEN_DIM`.

@@ -45,4 +45,4 @@ pub use substrate::{
     SubstrateBudget, TileN, TileNRef, VocabSize, VocabSizeRef, WarpRoleTag, WeightAccessorConst,
     WeightAccessorRef,
 };
-pub use tape::MegaTape;
+pub use tape::{MegaTape, TapeBudget};

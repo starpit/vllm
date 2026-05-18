@@ -51,7 +51,8 @@ use crate::solver::WorkloadAssignments;
 // what isolates ALL megakernel codegen to one mega-named place
 // (no megakernel logic in non-mega crates).
 use ferrite_megakernel::codegen::{
-    MegaDispatchState, count_barrier_edges, dispatch_instruction_to_push, instruction_kind,
+    MegaDispatchState, count_barrier_edges, dispatch_instruction_to_push,
+    dispatch_instruction_to_render, instruction_kind, launch_tier_for_instructions,
     max_loop_iter_count, normalize_tk_prefix,
 };
 
@@ -4979,7 +4980,78 @@ fn emit_canonical_build_fn(
     let lm_head_tokens = emit_slice_with_loop_expansion("lm_head", &lowered.lm_head, &mut state)?;
     body.extend(lm_head_tokens);
 
+    // Parallel render walk: re-walk both buckets with a fresh state
+    // calling `dispatch_instruction_to_render` instead of push. State
+    // semantics MIRROR the push walk (per
+    // `MEGA_IR_PLAN.md` §8.0b "Implementing end-to-end const
+    // generics: proc-macro-time dispatch") so the const-generic
+    // literals on `b.push_*::<...>` and
+    // `bodies.push(render_*::<...>)` agree per Instruction.
+    let mut render_state = MegaDispatchState::new(
+        NUM_PAGES,
+        NUM_CONSUMER_WARPS,
+        SCRATCH_BYTES,
+        effective_num_layers,
+        hidden_dim,
+        head_dim,
+        num_q_heads,
+        num_kv_heads,
+        intermediate_dim,
+        vocab_size,
+        wp_num_tokens,
+        rms_eps,
+        tanh_soft_cap,
+        attn_scale,
+        attn_softcap,
+        sliding_window,
+        wp_sk_bucket,
+        num_edges,
+    );
+    let render_backbone =
+        emit_slice_render_with_loop_expansion("backbone", &lowered.backbone, &mut render_state)?;
+    let render_lm_head =
+        emit_slice_render_with_loop_expansion("lm_head", &lowered.lm_head, &mut render_state)?;
+    // If either bucket has any Instruction whose `render_*` fn isn't
+    // wired yet (e.g. AttentionViaCache, TkFusedNormGemm), the whole
+    // canonical's emit fn is skipped. The push side still emits its
+    // `build_mega_tape_<canonical>` though — runtime tape construction
+    // works without emit, the legacy per-op `.cuh` runtime path
+    // serves the canonical until full render coverage lands.
+    let render_body_opt: Option<TokenStream> =
+        match (render_backbone, render_lm_head) {
+            (Some(b), Some(l)) => {
+                let mut all = TokenStream::new();
+                all.extend(b);
+                all.extend(l);
+                Some(all)
+            }
+            _ => None,
+        };
+
+    // Tier comes from the un-loop-expanded instruction list; Loop
+    // bodies that contain Attn / Qkv ops bubble up the tier.
+    let combined_instrs: Vec<ferrite_forward::Instruction> = lowered
+        .backbone
+        .instances
+        .iter()
+        .chain(lowered.lm_head.instances.iter())
+        .copied()
+        .collect();
+    let tier = launch_tier_for_instructions(&combined_instrs);
+    let tier_path = match tier {
+        ferrite_megakernel::cuda_emit::LaunchTier::Base => {
+            quote! { ::ferrite_megakernel::cuda_emit::LaunchTier::Base }
+        }
+        ferrite_megakernel::cuda_emit::LaunchTier::Qkv => {
+            quote! { ::ferrite_megakernel::cuda_emit::LaunchTier::Qkv }
+        }
+        ferrite_megakernel::cuda_emit::LaunchTier::Attn => {
+            quote! { ::ferrite_megakernel::cuda_emit::LaunchTier::Attn }
+        }
+    };
+
     let fn_name = format_ident!("build_mega_tape_{}", canonical_name);
+    let emit_fn_name = format_ident!("emit_for_canonical_{}", canonical_name);
     let num_pages_lit = proc_macro2::Literal::u32_unsuffixed(NUM_PAGES);
     let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(NUM_CONSUMER_WARPS);
     let num_layers_lit_for_finish =
@@ -4987,6 +5059,50 @@ fn emit_canonical_build_fn(
     let page_size_lit = proc_macro2::Literal::u32_unsuffixed(PAGE_SIZE);
     let scratch_lit = proc_macro2::Literal::u32_unsuffixed(SCRATCH_BYTES);
     let num_edges_lit = proc_macro2::Literal::u32_unsuffixed(num_edges);
+    let canonical_str = canonical_name.to_string();
+
+    let emit_fn_tokens = match render_body_opt {
+        Some(render_body) => quote! {
+            /// Compile-time-substrate-proof-bearing `.cu` emit.
+            /// `MEGA_IR_PLAN.md` §8.0b proc-macro-time dispatch:
+            /// every `render_*::<...>` call below shares its const-
+            /// generic literals with the parallel `b.push_*::<...>`
+            /// in `#fn_name`, so the IR's substrate proofs and the
+            /// emitted `.cu` shapes can't diverge. A wrong shape on
+            /// any tk20 binding inside a render fn is a Rust type
+            /// error at THIS user's compile time.
+            #[allow(dead_code, clippy::let_and_return)]
+            pub fn #emit_fn_name() -> ::ferrite_megakernel::cuda_emit::CuVariant {
+                let mut bodies: ::std::vec::Vec<
+                    ::ferrite_megakernel::cuda_emit::RoleBodies,
+                > = ::std::vec::Vec::new();
+                #render_body
+                let budget = ::ferrite_megakernel::ir::TapeBudget {
+                    num_pages: #num_pages_lit,
+                    num_consumer_warps: #num_warps_lit,
+                    page_size: #page_size_lit,
+                    scratch_bytes: #scratch_lit,
+                    num_edges: #num_edges_lit,
+                    num_layers: #num_layers_lit_for_finish,
+                };
+                ::ferrite_megakernel::cuda_emit::render_canonical(
+                    #canonical_str,
+                    &budget,
+                    #tier_path,
+                    &bodies,
+                )
+            }
+        },
+        None => quote! {
+            // emit_for_canonical_#canonical_name skipped: at least one
+            // Instruction has no render binding (e.g.
+            // AttentionViaCache, TkFusedNormGemm). Lift that variant's
+            // `render_*` fn in `ferrite-megakernel::cuda_emit::render`
+            // and add the corresponding arm to
+            // `dispatch_instruction_to_render`, then this canonical's
+            // `.cu` emit will be auto-emitted.
+        },
+    };
 
     Ok(quote! {
         /// Compile-time-substrate-proof-bearing MegaTape constructor.
@@ -5002,6 +5118,8 @@ fn emit_canonical_build_fn(
             #body
             b.finish(#num_layers_lit_for_finish)
         }
+
+        #emit_fn_tokens
     })
 }
 
@@ -5103,6 +5221,105 @@ fn emit_slice_with_loop_expansion(
         }
     }
     Ok(out)
+}
+
+/// Parallel of [`emit_slice_with_loop_expansion`] that walks the
+/// same Instruction list calling `dispatch_instruction_to_render`
+/// instead of `dispatch_instruction_to_push`. Returns `Ok(None)` if
+/// any Instruction has no render binding (the entire canonical's
+/// emit fn is skipped — see `emit_canonical_build_fn`). State
+/// semantics MIRROR the push walker so const-generic literals match
+/// per-Instruction.
+fn emit_slice_render_with_loop_expansion(
+    label: &str,
+    bucket: &crate::interpreter_codegen::LoweredBucket,
+    state: &mut MegaDispatchState,
+) -> Result<Option<TokenStream>, String> {
+    let mut out = TokenStream::new();
+    let mut i = 0;
+    while i < bucket.instances.len() {
+        let instr = bucket.instances[i];
+        match instr {
+            ferrite_forward::Instruction::Loop(count, body_len) => {
+                let body_start = i + 1;
+                let body_end = body_start + body_len as usize;
+                if body_end > bucket.instances.len() {
+                    return Err(format!(
+                        "{label}[{i}] Loop({count}, {body_len}): body extends past slice end"
+                    ));
+                }
+                for iter in 0..count {
+                    for body_off in 0..body_len as usize {
+                        let body_idx = body_start + body_off;
+                        let body_instr = bucket.instances[body_idx];
+                        if matches!(
+                            body_instr,
+                            ferrite_forward::Instruction::Alias(_, _)
+                                | ferrite_forward::Instruction::Free(_)
+                                | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+                                | ferrite_forward::Instruction::LoadPixels(_)
+                                | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+                                | ferrite_forward::Instruction::StripCls(_, _)
+                        ) {
+                            continue;
+                        }
+                        let weight_paths: Vec<String> = bucket
+                            .weight_slots
+                            .get(body_idx)
+                            .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                            .unwrap_or_default();
+                        let normalized = normalize_tk_prefix(body_instr);
+                        let render_opt = dispatch_instruction_to_render(
+                            &normalized,
+                            &weight_paths,
+                            state,
+                            Some(iter),
+                        )
+                        .map_err(|e| {
+                            format!(
+                                "{label}[loop iter {iter} body[{body_off}]] {}: {e}",
+                                instruction_kind(&normalized)
+                            )
+                        })?;
+                        match render_opt {
+                            Some(ts) => out.extend(ts),
+                            None => return Ok(None),
+                        }
+                    }
+                }
+                i = body_end;
+            }
+            ferrite_forward::Instruction::Alias(_, _)
+            | ferrite_forward::Instruction::Free(_)
+            | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+            | ferrite_forward::Instruction::LoadPixels(_)
+            | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+            | ferrite_forward::Instruction::StripCls(_, _) => {
+                i += 1;
+            }
+            _ => {
+                let weight_paths: Vec<String> = bucket
+                    .weight_slots
+                    .get(i)
+                    .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                    .unwrap_or_default();
+                let normalized = normalize_tk_prefix(instr);
+                let render_opt = dispatch_instruction_to_render(
+                    &normalized,
+                    &weight_paths,
+                    state,
+                    None,
+                )
+                .map_err(|e| format!("{label}[{i}] {}: {e}", instruction_kind(&normalized)))?;
+                match render_opt {
+                    Some(ts) => out.extend(ts),
+                    None => return Ok(None),
+                }
+                i += 1;
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 // `max_loop_iter_count`, `count_barrier_edges`, `instruction_kind`

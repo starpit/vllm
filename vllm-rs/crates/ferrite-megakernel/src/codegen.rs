@@ -316,6 +316,14 @@ pub fn instruction_kind(instr: &ferrite_forward::Instruction) -> &'static str {
 /// dispatch isn't wired yet (the caller skips the entire canonical
 /// to host fallback). Adding a variant here = lifting it for
 /// mega-IR emission.
+///
+/// Per `MEGA_IR_PLAN.md` §8.0b "Implementing end-to-end const
+/// generics: proc-macro-time dispatch", a parallel
+/// [`dispatch_instruction_to_render`] walks the same Instruction
+/// list and produces `render_*::<const-generic-args>(...)` token
+/// streams. Both walks must use the SAME state semantics so the
+/// IR's substrate proofs and the emitted `.cu` shapes share one
+/// source of truth.
 //
 // `layer_override`: when `Some(iter)`, the variant's `layer` field
 // is REPLACED by `iter` for the const-generic `LAYER` literal.
@@ -1718,5 +1726,498 @@ pub fn normalize_tk_prefix(
             I::Gemm(in_slot, out_slot, layer, 1, 1)
         }
         other => other,
+    }
+}
+
+/// Dispatch one `Instruction` to a `bodies.push(::ferrite_megakernel::
+/// cuda_emit::render::render_*::<...>(...))` token stream paralleling
+/// [`dispatch_instruction_to_push`]. The proc-macro emits these calls
+/// into a per-canonical `emit_for_canonical_<canonical>()` fn whose
+/// body is a sequence of literal `render_*` invocations sharing the
+/// same const-generic literals as the parallel `b.push_*::<...>(...)`
+/// tape builder calls.
+///
+/// Returns `Ok(None)` for variants whose `render_*` fn isn't yet
+/// written — the caller skips the entire canonical's emit fn when
+/// ANY Instruction returns `None` (the `.cu` artifact is only
+/// meaningful when every node has a render binding).
+///
+/// State semantics MIRROR [`dispatch_instruction_to_push`]: same
+/// `state.alloc_distinct` order, same `state.arrives` /
+/// `state.next_weight_accessor` bumps. The proc-macro walks the
+/// Instruction list TWICE — once for push (writes
+/// `build_mega_tape_<canonical>` body), once for render (writes
+/// `emit_for_canonical_<canonical>` body) — sharing a single
+/// [`MegaDispatchState`] checkpoint between walks.
+pub fn dispatch_instruction_to_render(
+    instr: &ferrite_forward::Instruction,
+    weight_paths: &[String],
+    state: &mut MegaDispatchState,
+    layer_override: Option<u32>,
+) -> Result<Option<TokenStream>, String> {
+    use ferrite_forward::Instruction as I;
+
+    let lit = Literal::u32_unsuffixed;
+    let resolved_layer = |default: u32| layer_override.unwrap_or(default);
+
+    match instr {
+        I::RmsNorm(in_slot, out_slot, layer) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_reduce = lit(1u32);
+            let bar_publish = lit(2u32);
+            let partial_offset = lit(0u32);
+            let eps_lit = state.rms_norm_eps;
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_rms_norm::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp, #num_layers,
+                >(
+                    #in_id, #weight_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #out_act_slot,
+                    #weight_accessor_idx,
+                    #bar_reduce, #bar_publish,
+                    #partial_offset,
+                    #eps_lit,
+                ));
+            }))
+        }
+        I::Add(delta_slot, residual_slot) => {
+            let delta_id = lit(*delta_slot);
+            let residual_id = lit(*residual_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let delta_act_slot = lit(*delta_slot);
+            let residual_act_slot = lit(*residual_slot);
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let bar_publish = lit(2u32);
+            state.arrives += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_add::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp,
+                >(
+                    #delta_id, #residual_id,
+                    #consumer_phase, #storer_phase,
+                    #delta_act_slot, #residual_act_slot,
+                    #bar_publish,
+                ));
+            }))
+        }
+        I::Embed(out_slot) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "Embed weight_paths empty".to_string())?;
+            let out_id = lit(*out_slot);
+            let _weight_id = lit(state.alloc_distinct(&[*out_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let num_layers = lit(state.num_layers);
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_embed::<
+                    #hidden_dim, #num_tokens, #num_layers,
+                >(
+                    #out_id,
+                    #consumer_phase, #storer_phase,
+                    #out_act_slot,
+                    #weight_accessor_idx,
+                ));
+            }))
+        }
+        I::ScalarMul(in_slot, out_slot, scale) => {
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let scale_lit = *scale;
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let bar_publish = lit(2u32);
+            state.arrives += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_scalar_mul::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp,
+                >(
+                    #in_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #in_act_slot, #out_act_slot,
+                    #bar_publish,
+                    #scale_lit,
+                ));
+            }))
+        }
+        I::TanhSoftCap(in_slot, out_slot) => {
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let cap_lit = state.tanh_soft_cap;
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let bar_publish = lit(2u32);
+            state.arrives += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_tanh_soft_cap::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp,
+                >(
+                    #in_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #in_act_slot, #out_act_slot,
+                    #bar_publish,
+                    #cap_lit,
+                ));
+            }))
+        }
+        I::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "ScalarOffsetRmsNorm weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let offset_lit = *offset;
+            let eps_lit = state.rms_norm_eps;
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_reduce = lit(1u32);
+            let bar_publish = lit(2u32);
+            let partial_offset = lit(0u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_scalar_offset_rms_norm::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp, #num_layers,
+                >(
+                    #in_id, #weight_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #out_act_slot,
+                    #weight_accessor_idx,
+                    #bar_reduce, #bar_publish,
+                    #partial_offset,
+                    #eps_lit, #offset_lit,
+                ));
+            }))
+        }
+        I::Gemm(in_slot, out_slot, layer, n, k) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "Gemm weight_paths empty".to_string())?;
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && n % ncw == 0 { n / ncw } else { *n };
+            let tile_n_lit = lit(tile_n_const);
+            let layer_lit = lit(resolved_layer(*layer));
+            let n_lit = lit(*n);
+            let k_lit = lit(*k);
+            let m_lit = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let num_layers = lit(state.num_layers);
+            let ncw_lit = lit(ncw);
+            let bar_publish = lit(1u32);
+            let b_tile_offset = lit(0u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_gemm::<
+                    #m_lit, #k_lit, #n_lit, #tile_n_lit, #ncw_lit, #num_layers, #iters,
+                >(
+                    #in_id, #weight_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #out_act_slot,
+                    #weight_accessor_idx,
+                    #bar_publish,
+                    #b_tile_offset,
+                ));
+            }))
+        }
+        I::FusedAddRmsNorm(delta_slot, residual_slot, layer) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "FusedAddRmsNorm weight_paths empty".to_string())?;
+            let delta_id = lit(*delta_slot);
+            let residual_id = lit(*residual_slot);
+            let weight_id = lit(state.alloc_distinct(&[*delta_slot, *residual_slot])?);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let num_tokens = lit(state.num_tokens);
+            let delta_act_slot = lit(*delta_slot);
+            let residual_act_slot = lit(*residual_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let eps_lit = state.rms_norm_eps;
+            let ncw = state.num_consumer_warps;
+            let k_per_warp = lit(state.hidden_dim / ncw.max(1));
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_reduce = lit(1u32);
+            let bar_publish = lit(2u32);
+            let partial_offset = lit(0u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_fused_add_rms_norm::<
+                    #hidden_dim, #num_tokens, #ncw_lit, #k_per_warp, #num_layers,
+                >(
+                    #delta_id, #residual_id, #weight_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #delta_act_slot, #residual_act_slot,
+                    #weight_accessor_idx,
+                    #bar_reduce, #bar_publish,
+                    #partial_offset,
+                    #eps_lit,
+                ));
+            }))
+        }
+        I::FusedGateUpSiluMul(in_slot, out_slot, layer)
+        | I::FusedGateUpGeluMul(in_slot, out_slot, layer) => {
+            let _weight = weight_paths
+                .first()
+                .ok_or_else(|| "FusedGateUp*Mul weight_paths empty".to_string())?;
+            let activation_path = match instr {
+                I::FusedGateUpSiluMul(..) => {
+                    quote! { ::ferrite_megakernel::ir::nodes::GateUpActivation::Silu }
+                }
+                I::FusedGateUpGeluMul(..) => {
+                    quote! { ::ferrite_megakernel::ir::nodes::GateUpActivation::Gelu }
+                }
+                _ => unreachable!(),
+            };
+            let in_id = lit(*in_slot);
+            let out_id = lit(*out_slot);
+            let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
+            let half = state.scratch_bytes / 2;
+            let gate_off = lit(0u32);
+            let gate_bytes = lit(half);
+            let up_off = lit(half);
+            let up_bytes = lit(half);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters = lit(1u32);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let intermediate_dim = lit(state.intermediate_dim);
+            let m_lit = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let out_act_slot = lit(*out_slot);
+            let weight_accessor_idx = lit(state.next_weight_accessor);
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && state.intermediate_dim % ncw == 0 {
+                state.intermediate_dim / ncw
+            } else {
+                state.intermediate_dim
+            };
+            let tile_n_lit = lit(tile_n_const);
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_publish = lit(1u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_fused_gate_up_activate_mul::<
+                    #m_lit, #hidden_dim, #intermediate_dim, #tile_n_lit, #ncw_lit, #num_layers, #iters,
+                >(
+                    #in_id, #weight_id, #out_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #out_act_slot,
+                    #weight_accessor_idx,
+                    #bar_publish,
+                    #gate_off, #up_off, #gate_bytes, #up_bytes,
+                    #activation_path,
+                ));
+            }))
+        }
+        I::FusedQkvRopeCache(in_slot, out_slot, layer, _biased, _interleaved) => {
+            if weight_paths.len() != 2 {
+                return Err(format!(
+                    "FusedQkvRopeCache expected 2 weight_paths (qkv, rotary), got {}",
+                    weight_paths.len()
+                ));
+            }
+            let in_id = lit(*in_slot);
+            let qkv_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let cs_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let q_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let k_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let v_id = lit(state.alloc_distinct(&[*in_slot])?);
+            let quarter = state.scratch_bytes / 4;
+            let q_off = lit(0u32);
+            let k_off = lit(quarter);
+            let b_tile_off = lit(2 * quarter);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let head_dim = lit(state.head_dim);
+            let num_q_heads_lit = lit(state.num_q_heads);
+            let num_kv_heads_lit = lit(state.num_kv_heads);
+            let q_dim_lit = lit(state.num_q_heads * state.head_dim);
+            let kv_dim_lit = lit(state.num_kv_heads * state.head_dim);
+            let qkv_n_val = (state.num_q_heads + 2 * state.num_kv_heads) * state.head_dim;
+            let qkv_n_lit = lit(qkv_n_val);
+            let m_lit = lit(state.num_tokens);
+            let in_act_slot = lit(*in_slot);
+            let q_out_act_slot = lit(*out_slot);
+            let k_out_act_slot = lit(out_slot.wrapping_add(1));
+            let v_out_act_slot = lit(out_slot.wrapping_add(2));
+            let qkv_weight_accessor = lit(state.next_weight_accessor);
+            let rotary_accessor = lit(state.next_weight_accessor + 1);
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && qkv_n_val % ncw == 0 {
+                qkv_n_val / ncw
+            } else {
+                qkv_n_val
+            };
+            let tile_n_lit = lit(tile_n_const);
+            let heads_per_warp_const = if state.head_dim > 0 {
+                tile_n_const / state.head_dim
+            } else {
+                0
+            };
+            let heads_per_warp_lit = lit(heads_per_warp_const);
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_publish = lit(1u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 2;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_fused_qkv_rope_cache::<
+                    #m_lit, #hidden_dim, #head_dim, #num_q_heads_lit, #num_kv_heads_lit,
+                    #q_dim_lit, #kv_dim_lit, #qkv_n_lit, #tile_n_lit, #heads_per_warp_lit,
+                    #ncw_lit, #num_layers, #iters,
+                >(
+                    #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #q_out_act_slot, #k_out_act_slot, #v_out_act_slot,
+                    #qkv_weight_accessor, #rotary_accessor,
+                    #bar_publish,
+                    #q_off, #k_off, #b_tile_off,
+                ));
+            }))
+        }
+        I::SpliceMmEmbeds(slot) => {
+            let slot_id = lit(*slot);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            state.arrives += 1;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_splice_mm_embeds(
+                    #slot_id, #consumer_phase, #storer_phase,
+                ));
+            }))
+        }
+        I::BarrierSignal(edge) => {
+            let edge_lit = lit(*edge);
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_barrier_signal(
+                    #edge_lit,
+                ));
+            }))
+        }
+        I::BarrierWait(edge, count) => {
+            let edge_lit = lit(*edge);
+            let count_lit = lit(*count);
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_barrier_wait(
+                    #edge_lit, #count_lit,
+                ));
+            }))
+        }
+        // Variants below are wired in dispatch_to_push but their
+        // render_* counterpart hasn't been written yet — the proc-
+        // macro skips emit_for_canonical for any tape that contains
+        // them. (TkFusedNormGemm, AttentionViaCache, RopeAppend,
+        // SlidingAttentionViaCache, FusedCublasGemmAdd, the Cutlass
+        // norm-gemm fusions.)
+        _ => Ok(None),
+    }
+}
+
+/// Compute the [`LaunchTier`](crate::cuda_emit::LaunchTier) implied
+/// by a list of Instructions — Attn ⊃ Qkv ⊃ Base. Used by the
+/// proc-macro at user-build time to pick the kernel signature for
+/// `emit_for_canonical_<canonical>`.
+pub fn launch_tier_for_instructions(
+    instructions: &[ferrite_forward::Instruction],
+) -> crate::cuda_emit::LaunchTier {
+    use ferrite_forward::Instruction as I;
+    let mut needs_attn = false;
+    let mut needs_qkv = false;
+    for instr in instructions {
+        match instr {
+            I::AttentionViaCache(..) | I::SlidingAttentionViaCache(..) => needs_attn = true,
+            I::FusedQkvRopeCache(..) | I::TkFusedQkvRopeCache(..) | I::RopeAppend(..) => {
+                needs_qkv = true
+            }
+            _ => {}
+        }
+    }
+    if needs_attn {
+        crate::cuda_emit::LaunchTier::Attn
+    } else if needs_qkv {
+        crate::cuda_emit::LaunchTier::Qkv
+    } else {
+        crate::cuda_emit::LaunchTier::Base
     }
 }

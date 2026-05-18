@@ -878,3 +878,229 @@ pub fn group_tma_store_async_raw_st_bf(
         src = src.expr()
     ))
 }
+
+// ============================================================
+// FlashAttention row-reduction + broadcast primitives.
+//
+// These cover the "Q @ K^T → online softmax → @ V" pattern of the
+// `AttentionViaCache` (S16) emit. Each call cited to its TK 2.0
+// header (`include/ops/group/register/tile/{maps,reductions}.cuh`).
+//
+// All operate at warp scope (`kittens::warp == kittens::group<1>`);
+// the row vector is stored in fp32 and the tile is fp32 (same as
+// FlashAttention's standard accumulator dtype).
+// ============================================================
+
+/// `kittens::warp::row_max(rv_dst, rt_src);` — per-row max reduce
+/// of a tile into a row vector. Initial pass (no running accum).
+///
+/// Source: `include/ops/group/register/tile/reductions.cuh:253`.
+pub fn warp_row_max_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+    CuStmt::new(format!(
+        "kittens::warp::row_max({rv}, {rt});",
+        rv = rv_dst.expr(),
+        rt = rt_src.expr()
+    ))
+}
+
+/// `kittens::warp::row_max(rv_dst, rt_src, rv_src_accum);` — per-row
+/// max reduce with a running accumulator. Used in the FlashAttention
+/// online-softmax loop to track `max(max_prev, row_max(scores))`
+/// across KV blocks.
+///
+/// Source: `include/ops/group/register/tile/reductions.cuh:303`.
+pub fn warp_row_max_running(
+    rv_dst: &Rv<F32>,
+    rt_src: &Rt<F32, RtRow>,
+    rv_src_accum: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+    debug_assert_eq!(rv_dst.len(), rv_src_accum.len());
+    CuStmt::new(format!(
+        "kittens::warp::row_max({rv}, {rt}, {acc});",
+        rv = rv_dst.expr(),
+        rt = rt_src.expr(),
+        acc = rv_src_accum.expr()
+    ))
+}
+
+/// `kittens::warp::row_sum(rv_dst, rt_src);` — per-row sum reduce.
+/// Initial pass.
+///
+/// Source: `include/ops/group/register/tile/reductions.cuh:277`.
+pub fn warp_row_sum_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+    CuStmt::new(format!(
+        "kittens::warp::row_sum({rv}, {rt});",
+        rv = rv_dst.expr(),
+        rt = rt_src.expr()
+    ))
+}
+
+/// `kittens::warp::row_sum(rv_dst, rt_src, rv_src_accum);` — per-row
+/// sum reduce with running accumulator. Used in FlashAttention to
+/// track `sum_prev * scale + row_sum(exp(scores))`.
+///
+/// Source: `include/ops/group/register/tile/reductions.cuh:329`.
+pub fn warp_row_sum_running(
+    rv_dst: &Rv<F32>,
+    rt_src: &Rt<F32, RtRow>,
+    rv_src_accum: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+    debug_assert_eq!(rv_dst.len(), rv_src_accum.len());
+    CuStmt::new(format!(
+        "kittens::warp::row_sum({rv}, {rt}, {acc});",
+        rv = rv_dst.expr(),
+        rt = rt_src.expr(),
+        acc = rv_src_accum.expr()
+    ))
+}
+
+/// `kittens::warp::exp(rt_dst, rt_src);` — elementwise exponential
+/// over a fp32 register tile. Used to emit `exp(scores - max)` in
+/// the online-softmax body.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:464`.
+pub fn warp_exp_rt(rt_dst: &Rt<F32, RtRow>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
+    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
+    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
+    CuStmt::new(format!(
+        "kittens::warp::exp({dst}, {src});",
+        dst = rt_dst.expr(),
+        src = rt_src.expr()
+    ))
+}
+
+/// `kittens::warp::exp(rv_dst, rv_src);` — elementwise exponential
+/// over a fp32 register vector. Used to compute the per-row scale
+/// `exp(max_prev - max_curr)` for FlashAttention rescale.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
+/// `unary_map<base_ops::exp>` analogous to the tile variant).
+pub fn warp_exp_rv(rv_dst: &Rv<F32>, rv_src: &Rv<F32>) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rv_src.len());
+    CuStmt::new(format!(
+        "kittens::warp::exp({dst}, {src});",
+        dst = rv_dst.expr(),
+        src = rv_src.expr()
+    ))
+}
+
+/// `kittens::warp::sub(rv_dst, rv_lhs, rv_rhs);` — elementwise
+/// subtract over fp32 register vectors. Used to compute
+/// `max_prev - max_curr` for the rescale exponent.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
+/// `bin_map<base_ops::sub>`).
+pub fn warp_sub_rv_rv(
+    rv_dst: &Rv<F32>,
+    rv_lhs: &Rv<F32>,
+    rv_rhs: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rv_lhs.len());
+    debug_assert_eq!(rv_dst.len(), rv_rhs.len());
+    CuStmt::new(format!(
+        "kittens::warp::sub({dst}, {lhs}, {rhs});",
+        dst = rv_dst.expr(),
+        lhs = rv_lhs.expr(),
+        rhs = rv_rhs.expr()
+    ))
+}
+
+/// `kittens::warp::sub_row(rt_dst, rt_src, rv_row_values);` —
+/// subtract a per-row column vector from each row of a tile.
+/// Used to emit `scores - max_curr` (broadcast) in the
+/// online-softmax body.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:758`.
+pub fn warp_sub_row(
+    rt_dst: &Rt<F32, RtRow>,
+    rt_src: &Rt<F32, RtRow>,
+    rv_row_values: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
+    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
+    debug_assert_eq!(rt_dst.rows(), rv_row_values.len());
+    CuStmt::new(format!(
+        "kittens::warp::sub_row({dst}, {src}, {rv});",
+        dst = rt_dst.expr(),
+        src = rt_src.expr(),
+        rv = rv_row_values.expr()
+    ))
+}
+
+/// `kittens::warp::mul_row(rt_dst, rt_src, rv_row_values);` —
+/// multiply each row of a tile by a per-row scalar from a column
+/// vector. Used to emit `acc *= scale` (per-row rescale) in the
+/// online-softmax body.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh` (mirror of
+/// `add_row` / `sub_row` at :736-784).
+pub fn warp_mul_row(
+    rt_dst: &Rt<F32, RtRow>,
+    rt_src: &Rt<F32, RtRow>,
+    rv_row_values: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
+    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
+    debug_assert_eq!(rt_dst.rows(), rv_row_values.len());
+    CuStmt::new(format!(
+        "kittens::warp::mul_row({dst}, {src}, {rv});",
+        dst = rt_dst.expr(),
+        src = rt_src.expr(),
+        rv = rv_row_values.expr()
+    ))
+}
+
+/// `kittens::warp::mul(rv_dst, rv_lhs, rv_rhs);` — elementwise
+/// multiply on register vectors. Used for `sum_prev * scale` in
+/// the running-sum update of online softmax.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh:359` (vec
+/// `bin_map<base_ops::mul>`). Distinct from the tile-flavored
+/// [`warp_mul_rt_rt`] at maps.cuh:707.
+pub fn warp_mul_rv_rv_f32(
+    rv_dst: &Rv<F32>,
+    rv_lhs: &Rv<F32>,
+    rv_rhs: &Rv<F32>,
+) -> CuStmt {
+    debug_assert_eq!(rv_dst.len(), rv_lhs.len());
+    debug_assert_eq!(rv_dst.len(), rv_rhs.len());
+    CuStmt::new(format!(
+        "kittens::warp::mul({dst}, {lhs}, {rhs});",
+        dst = rv_dst.expr(),
+        lhs = rv_lhs.expr(),
+        rhs = rv_rhs.expr()
+    ))
+}
+
+/// `float <name> = <init>; kittens::warp::row_max(__init_rv, ...);`
+/// — declare an fp32 row vector with each lane initialized to the
+/// same scalar (e.g. `-INFINITY` for the running-max accumulator
+/// before the first KV block).
+///
+/// The natural TK 2.0 idiom is `kittens::rv_fl<LEN> name; warp::fill(
+/// name, scalar)`, but `fill` for rv isn't currently bound. This
+/// helper emits a literal-broadcast init via `kittens::warp::add(rv,
+/// zeros_rv, scalar)` — equivalent to `dst[i] = 0 + scalar` per
+/// lane. Use when the rv is a running accumulator that needs a
+/// non-zero initial value.
+pub fn decl_rv_fl_init_scalar(name: &str, len: u32, init_scalar: &str) -> (CuStmt, Rv<F32>) {
+    let stmt = CuStmt::new(format!(
+        "kittens::rv_fl<{len}> {name};\n\
+         kittens::warp::zero({name});\n\
+         kittens::warp::add({name}, {name}, {init_scalar});"
+    ));
+    (stmt, Rv::from_expr(CuExpr::new(name.to_string()), len))
+}
+
+/// `kittens::warp::zero(rv);` — zero a register vector. Used to
+/// init the per-row sum accumulator at the start of FlashAttention.
+///
+/// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
+/// `kittens::warp::zero`).
+pub fn warp_zero_rv(rv: &Rv<F32>) -> CuStmt {
+    CuStmt::new(format!("kittens::warp::zero({});", rv.expr()))
+}

@@ -474,6 +474,40 @@ pub fn gmem_value_cache_ptr(layer: u32) -> GmemPtrRaw<Bf16> {
     GmemPtrRaw::from_expr(CuExpr::new(format!("value_cache_ptrs[{layer}]")))
 }
 
+/// `seq_lens` — raw `const int32_t*` to the per-token paged-KV
+/// sequence length table. Sized `[NUM_TOKENS]`. Surfaced by the
+/// Attn tier kernel-entry signature (host
+/// `LaunchArgsAttn::seq_lens` at
+/// `crates/ferrite-forward/src/interpreter/mega/mod.rs:339`).
+/// Used by `AttentionViaCache`'s consumer to bound the per-token
+/// page walk over the KV cache.
+pub fn gmem_seq_lens() -> CuExpr {
+    CuExpr::new("seq_lens".to_string())
+}
+
+/// `block_table` — raw `const uint32_t*` to the per-token paged-KV
+/// block-id table. Logically `[NUM_TOKENS, block_table_stride]`
+/// row-major. Surfaced by the Attn tier kernel-entry signature
+/// (host `LaunchArgsAttn::block_table` at mod.rs:340). The
+/// per-token row stride is a runtime arg
+/// ([`gmem_block_table_stride`]) since the host sizes
+/// `block_table` with the max page count across in-flight
+/// sequences (variable per launch).
+pub fn gmem_block_table() -> CuExpr {
+    CuExpr::new("block_table".to_string())
+}
+
+/// `block_table_stride` — `uint32_t` scalar row stride of
+/// `block_table` (number of uint32 entries per token's row).
+/// Surfaced by the Attn tier kernel-entry signature (host
+/// `LaunchArgsAttn::block_table_stride` at mod.rs:352). The
+/// emitted consumer indexes
+/// `block_table[token * block_table_stride + p]` for batched
+/// decode.
+pub fn gmem_block_table_stride() -> CuExpr {
+    CuExpr::new("block_table_stride".to_string())
+}
+
 /// `ss.pages[<page>]` — raw `uint8_t*` byte pointer to the page's
 /// shared-memory buffer. Used when the per-token TMA gather needs
 /// pointer arithmetic (`+ tok * row_bytes`) rather than a typed

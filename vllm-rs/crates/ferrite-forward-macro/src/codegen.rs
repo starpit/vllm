@@ -1471,6 +1471,26 @@ fn emit_fingerprint_check(
     );
     let fp8_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.weight_scale");
     let fp8_marker_tensor = fp8_marker_tensor.as_str();
+    // MLX-affine marker exclusion. `mlx_lm.convert` ships every
+    // quantized linear as a `.{weight,scales,biases}` triple. The
+    // packed `.weight` (U32) shares its suffix with dense bf16 and
+    // gptq's `.weight_packed`, so the only disjoint marker is the
+    // `.scales` sibling. Dense / AWQ / native-GPTQ / CT-INT4 / BNB4 /
+    // FP8 variants must reject when this sibling exists on layer.0
+    // q_proj — otherwise an MLX 4bit checkpoint with a dense
+    // `embed_tokens` (the untied case, e.g.
+    // `mlx-community/Meta-Llama-3-8B-Instruct-4bit`) fingerprint-
+    // matches the dense variant and silently corrupts decoding.
+    // The affine variant itself doesn't need this rejection — it
+    // keys off the embed shape (or, in the untied dense-embed case,
+    // off the same `.scales` sibling on q_proj via the per-Impl
+    // load-time gate).
+    let mlx_affine_exclusion = matches!(
+        model.quantization.as_ref().map(|qc| &qc.method),
+        Some(crate::quantization::QuantMethod::Affine { .. })
+    );
+    let mlx_marker_tensor = format!("{dec_root}.layers.0.{fp_leaf}.scales");
+    let mlx_marker_tensor = mlx_marker_tensor.as_str();
 
     let hidden_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size as usize);
     // GGUF's on-disk loader (`GgufGpuWeights::load`) pre-shards
@@ -1830,7 +1850,18 @@ fn emit_fingerprint_check(
     // both variants reject the affine checkpoint at the very first
     // shape check and `try_load` returns `Ok(None)`.
     let embed_hidden_lit: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
-        Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
+        // MLX-affine: `mlx_lm.convert` quantizes `embed_tokens` only
+        // when `tie_word_embeddings: true` (it has to, since the same
+        // buffer is also the lm_head and the user opted into 4bit).
+        // When untied, the convert utility keeps embed dense F16
+        // (verified on `mlx-community/Meta-Llama-3-8B-Instruct-4bit`)
+        // and the corresponding sibling tensor on disk is
+        // `[vocab, hidden]` — same shape as the dense variant. The
+        // discriminator vs Dense in that case is the per-layer
+        // `.scales`/`.biases` siblings on `q_proj` (handled by the
+        // affine-marker exclusion below); the embed shape alone can
+        // no longer disambiguate.
+        Some(crate::quantization::QuantMethod::Affine { bits, .. }) if model.tie_word_embeddings => {
             let pack_factor = 32u64 / (*bits as u64);
             let packed = hidden_size / pack_factor;
             let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
@@ -1881,6 +1912,12 @@ fn emit_fingerprint_check(
             // off `.weight_scale` as its positive suffix, so this
             // exclusion runs only for non-FP8 variants.
             if !#fp8_exclusion && gw.contains(#fp8_marker_tensor) {
+                return false;
+            }
+            // MLX-affine marker exclusion — every non-affine variant
+            // rejects checkpoints that ship `.scales` on layer.0
+            // q_proj. See `emit_fingerprint_check` for the rationale.
+            if !#mlx_affine_exclusion && gw.contains(#mlx_marker_tensor) {
                 return false;
             }
             #qweight_shape_gate

@@ -795,6 +795,24 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     }
 
+    // MLX-affine convention: when `tie_word_embeddings: false`,
+    // `mlx_lm.convert` keeps `embed_tokens` dense (F16) and only
+    // quantizes `lm_head` + the transformer linears. Verified against
+    // `mlx-community/Meta-Llama-3-8B-Instruct-4bit`:
+    //   - `model.embed_tokens.weight` is F16 [vocab, hidden]
+    //     (no `.scales`/`.biases` siblings)
+    //   - `lm_head.{weight,scales,biases}` is the full affine triple
+    //
+    // The tied path keeps the shared embed buffer Affine-packed (its
+    // dotted-name lm_head rule already returns Affine above), so this
+    // rule only fires for the untied case.
+    if dotted == "embed_tokens"
+        && !model.tie_word_embeddings
+        && matches!(qc.method, QuantMethod::Affine { .. })
+    {
+        return StorageFormat::Dense;
+    }
+
     // AutoGPTQ convention: `lm_head` is never quantized, even when
     // untied and not listed in `modules_to_not_convert`. Safetensors
     // ship it as dense `lm_head.weight`. Without this rule, the

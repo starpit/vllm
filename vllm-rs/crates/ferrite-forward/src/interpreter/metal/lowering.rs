@@ -1865,10 +1865,21 @@ fn lower_one<W: CanonicalParams>(
             };
             let n_q_heads = W::NUM_Q_HEADS;
             const BQ_STEEL: u32 = 32;
+            // Steel attention paged is only instantiated for HEAD_DIM=128
+            // in `attention_steel_paged.metal`. Routing a HEAD_DIM=64
+            // model (Llama-3.2-1B, TinyLlama-1.1B) through the steel
+            // kernel produces silently-wrong logits — verified on
+            // mlx-community/Llama-3.2-1B-Instruct-4bit prefill on M1
+            // and M4: coherent output ("2 + 2 = 4", "Paris") with
+            // SDPA, garbage ("Question 2.0...", "irrelevant.") with
+            // steel. Gate steel on HEAD_DIM == 128 unconditionally
+            // (including under the `force` override — the kernel
+            // simply isn't built for other head dims).
+            let steel_head_dim_ok = W::HEAD_DIM == 128;
             let use_steel = match std::env::var("FERRITE_METAL_STEEL_ATTN").ok().as_deref() {
                 Some("0") | Some("off") | Some("false") => false,
-                Some("force") | Some("always") => true,
-                _ => bucket_m >= BQ_STEEL,
+                Some("force") | Some("always") => steel_head_dim_ok,
+                _ => steel_head_dim_ok && bucket_m >= BQ_STEEL,
             };
             let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
                 let nq_blocks = bucket_m.div_ceil(BQ_STEEL);

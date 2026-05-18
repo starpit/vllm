@@ -15,6 +15,13 @@ ferrite-cuda-core = { path = "../ferrite-cuda-core" }
 ferrite-kernels = { path = "../ferrite-kernels" }
 ferrite-forward-macro = { path = "../ferrite-forward-macro" }
 ferrite-forward = { path = "../ferrite-forward" }
+# `ferrite-megakernel` is a direct dep so the `#[forward]` macro's
+# `::ferrite_megakernel::ir::*` path emits resolve at user-build time.
+# The cycle that historically prevented this (mega -> forward -> mega)
+# was broken when ferrite-forward dropped its re-export (see
+# ferrite-forward/Cargo.toml); model crates depend on ferrite-megakernel
+# directly instead of going through ferrite-forward.
+ferrite-megakernel = { path = "../ferrite-megakernel" }
 ferrite-vision = { path = "../ferrite-vision" }
 anyhow = { workspace = true }
 tracing = { workspace = true }

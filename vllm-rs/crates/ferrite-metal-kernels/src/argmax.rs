@@ -286,11 +286,45 @@ fn encode_argmax_into_mtl4_inner(
     batch: u32,
     name: &'static str,
 ) -> Result<(), MetalStreamError> {
+    use objc2_metal::{
+        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _,
+        MTL4VisibilityOptions, MTLStages,
+    };
+    // `barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions`
+    // is on the `MTL4CommandEncoder` super-trait; the `as _`
+    // imports above bring its methods into scope on the
+    // `&ProtocolObject<dyn MTL4ComputeCommandEncoder>` we received.
     if batch == 0 {
         return Err(MetalStreamError::ShaderCompilationFailed(format!(
             "{name} encode: batch=0"
         )));
     }
+    // **Barrier before argmax** — this kernel reads the lm_head output
+    // (the forward encoder's last write). MTL4 compute encoders do
+    // NOT auto-serialize same-encoder dispatches; without this
+    // barrier argmax can fire concurrently with the forward's tail
+    // dispatches and read stale logits. Pre-fusion (when argmax ran
+    // on a separate command buffer with host wait) the host
+    // wait_until_completed acted as the barrier; once argmax was
+    // fused onto the forward encoder
+    // (`vllm-executor::ferrite_worker::execute_model` followup hook),
+    // the implicit cross-CB sync was lost and the race surfaced as
+    // wrong first tokens for any forward whose tail writes target
+    // the lm_head output slot — most visibly the lm_head slice
+    // (`scatter_first_to_last_row`) at single-seq prefill.
+    //
+    // `Device` visibility (cache-coherent): the forward's last
+    // store may live in L2 only; argmax loads from `device` address
+    // space and needs the store visible. Mirrors the
+    // `FERRITE_METAL_BARRIER_DEVICE` path the worker exposes for
+    // diagnosis — but argmax always needs Device because it crosses
+    // the implicit producer/consumer boundary the worker's
+    // intra-tape `barrier_before` flags don't model.
+    encoder.barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
+        MTLStages::Dispatch,
+        MTLStages::Dispatch,
+        MTL4VisibilityOptions::Device,
+    );
     encoder.setComputePipelineState(pipeline);
     encoder.setArgumentTable(Some(arg_table));
     let threadgroups = MTLSize { width: batch as usize, height: 1, depth: 1 };

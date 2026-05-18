@@ -118,29 +118,12 @@ pub fn lower_pair<W: CanonicalParams>(
     // a full M=bucket_m × N=vocab × K=hidden GEMM — at M=1024, vocab=
     // 128256, hidden=3072 that's ~190 ms of pure waste on M1 Max.
     //
-    // **Slice default OFF** until the multi-seq rewrite stabilizes.
-    //
-    // The slice's gather/qmv/scatter trio assumes a single-sequence
-    // forward and produces incoherent first-token logits when the
-    // gather rewrites `hidden[0]` even with the runtime-gate
-    // machinery from this commit. Repro on M1 Max with
-    // mlx-community/Llama-3.2-1B-Instruct-4bit + slice ON: every
-    // sequential single-seq response starts with "!濃" instead of
-    // the expected first token — same symptom as the all-rows
-    // sentinel test, suggesting the qmv reads junk from row 0.
-    // Root cause not yet bisected; tracked as follow-up. Enabling
-    // requires `FERRITE_METAL_LMHEAD_SLICE=1` for known-correct
-    // single-seq workloads.
-    //
-    // The runtime_gate plumbing introduced here stays in place so
-    // when the slice path is fixed and re-enabled it can ship with
-    // multi-seq batches still routing through the fallback (full
-    // M=bucket_m lm_head qmm) without a follow-up plumbing commit.
-    let slice_enabled = matches!(
+    // FERRITE_METAL_LMHEAD_SLICE=0/off/false disables (debug-only).
+    let slice_disabled = matches!(
         std::env::var("FERRITE_METAL_LMHEAD_SLICE").ok().as_deref(),
-        Some("1") | Some("on") | Some("true"),
+        Some("0") | Some("off") | Some("false"),
     );
-    let slice_info = if slice_enabled
+    let slice_info = if !slice_disabled
         && bucket_m > 1
         && lm_head.len() == 1
         && lh.commands.len() == 1

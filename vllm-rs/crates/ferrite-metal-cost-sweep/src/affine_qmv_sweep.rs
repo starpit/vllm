@@ -184,29 +184,54 @@ fn bench_qmv_variant(
     let y = util::create_buffer(y_bytes);
 
     let mut stream = MetalStream::new(device);
-    util::time_kernel(launch_overhead_us, 3, 20, || {
+    let per_cb_us = util::time_kernel(launch_overhead_us, 3, 20, || {
         let cb = stream.get_command_buffer().expect("cmd buf").clone();
         let enc = cb.computeCommandEncoder().expect("encoder");
-        qmv.execute_with_kernel(
-            kernel,
-            &x as &Buffer,
-            &packed as &Buffer,
-            &scales as &Buffer,
-            &biases as &Buffer,
-            &y as &Buffer,
-            1,
-            n,
-            k,
-            1,
-            gs,
-            4,
-            dtype,
-            ScaleDtype::F16,
-            &enc,
-        )
-        .expect("qmv dispatch");
+        // BATCH back-to-back qmv dispatches on the SAME encoder —
+        // mirrors how production stacks many qmv calls per CB. All
+        // dispatches share I/O buffers; consecutive calls write to
+        // the same `y` so they serialize on `y` (Serial encoder),
+        // but timing isn't sensitive to that — the bench measures
+        // the steady-state per-dispatch cost paying ONE per-CB
+        // submit/wait fixed cost across BATCH dispatches, which is
+        // exactly what production does.
+        for _ in 0..BATCH {
+            qmv.execute_with_kernel(
+                kernel,
+                &x as &Buffer,
+                &packed as &Buffer,
+                &scales as &Buffer,
+                &biases as &Buffer,
+                &y as &Buffer,
+                1,
+                n,
+                k,
+                1,
+                gs,
+                4,
+                dtype,
+                ScaleDtype::F16,
+                &enc,
+            )
+            .expect("qmv dispatch");
+        }
         enc.endEncoding();
         stream.commit().expect("commit");
         stream.synchronize().expect("sync");
-    })
+    });
+    per_cb_us / (BATCH as f64)
 }
+
+/// Number of qmv dispatches encoded into a single command buffer per
+/// timing iteration. Production single-stream M=1 decode stacks
+/// 100+ qmv dispatches onto one MTL4 encoder per forward — per-CB
+/// submit/wait fixed cost is paid ONCE for the whole forward, not
+/// per kernel.
+///
+/// The original sweep dispatched one qmv per CB, so its measured
+/// cost was dominated by ~50-200 µs of per-CB overhead, swamping
+/// the actual ~1-2 µs of kernel time. That made cross-variant
+/// comparisons unstable: the picker was reading noise. This
+/// 64-batched version pays the overhead ONCE and divides — relative
+/// per-call timings now reflect what production actually pays.
+const BATCH: u32 = 64;

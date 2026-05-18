@@ -1917,14 +1917,28 @@ fn lower_one<W: CanonicalParams>(
             // the BN=8 attention atom). Lift when bn_attention is
             // BN-parameterized + MlpPreDown supports >1 pass per head.
             let threads_per_tg: u32 = 256;
-            // Dispatched grid: clamp at the chip's safe concurrent-TG
-            // cap when the profile is available; otherwise fall back to
-            // the conservative 48 used by the synth-time documentation
-            // arg. Both choices satisfy `< safe_max_concurrent_tgs(256)`
-            // on M4-base (118 TGs) and M4-Pro (≥118 TGs).
-            let dispatched_tgs: u32 = profile
-                .map(|p| p.safe_max_concurrent_tgs(threads_per_tg))
-                .unwrap_or(48);
+            // Dispatched grid: **NOT** safe_max_concurrent_tgs — that's
+            // the deadlock cap (≥120 on M4), and a TG count near the
+            // cap COLLAPSES perf because cross-TG atomic contention on
+            // the data buffers (residual, attn_scratch, mlp_scratch,
+            // KV cache) and on the barrier counter scales superlinearly
+            // with N. Measured on M4-base / Llama-3.2-1B-Instruct-4bit:
+            //   TGs=  1  →  49.6 ms ITL (parallelism-starved)
+            //   TGs=  4  →  13.8 ms ITL
+            //   TGs= 16  →   7.2 ms ITL  ← sweet spot (10% faster than baseline 7.9)
+            //   TGs= 32  → 127.7 ms ITL  ← perf collapses
+            //   TGs= 64  → 1016 ms ITL
+            //   TGs=118  → 2130 ms ITL  (the old default — catastrophic)
+            // 16 = roughly 2× the number of concurrent simdgroup slots
+            // on M4-base (10 cores × ~4 simdgroup launch slots / 8 SG-per-TG
+            // = 5; 16 = enough oversubscription to hide stalls without
+            // saturating atomic contention). Env override
+            // (`FERRITE_PERSISTENT_FORWARD_TGS`) for tuning per chip.
+            let dispatched_tgs: u32 = std::env::var("FERRITE_PERSISTENT_FORWARD_TGS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(16);
+            let _ = profile;  // see comment above re: NOT using cap-based sizing
             assert!(
                 dispatched_tgs > 0,
                 "metal lowering: ForwardDecodePersistent grid size resolved to 0 \

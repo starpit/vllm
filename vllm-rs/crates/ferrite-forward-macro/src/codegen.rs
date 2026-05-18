@@ -7035,6 +7035,12 @@ pub fn emit_model(
                 &inputs,
                 |worker, bucket_idx| {
                     let spec = &METAL_BUCKETS[bucket_idx];
+                    if ::std::env::var_os("FERRITE_PERSISTENT_FORWARD_DEBUG").is_some() {
+                        ::std::eprintln!(
+                            "[forward output] bucket={} terminal_slot={}",
+                            bucket_idx, spec.terminal_slot,
+                        );
+                    }
                     let buf = worker.arena[spec.terminal_slot as usize].clone();
                     let vocab = METAL_VOCAB_SIZE as usize;
                     let shape = [n, vocab];

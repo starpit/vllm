@@ -316,10 +316,14 @@ pub struct MetalWorker<W: CanonicalParams> {
     pub moe_scratch: Option<Buffer>,
     /// 4-byte shared atomic-counter buffer for persistent-envelope
     /// cross-TG barriers. Always allocated (cost is negligible); used
-    /// by `Binding::PersistentBarrierCounter`. The buffer is
-    /// zero-initialized at allocation time and re-zeroed by the worker
-    /// at each binding resolve so the counter starts at 0 for every
-    /// dispatch.
+    /// by `Binding::PersistentBarrierCounter`. Zero-initialized at
+    /// allocation and re-zeroed on host at the top of `run_bucket_*`
+    /// whenever the bucket dispatches a persistent kernel (gated on
+    /// `BucketBaking::forward_persistent_baking.is_some()`). The
+    /// in-kernel counter is cumulative across the layer loop, so it
+    /// ends each dispatch well above the next dispatch's first
+    /// barrier target — without the reset every barrier after token 1
+    /// passes immediately and the kernel runs unsynchronized.
     pub persistent_barrier_counter: Buffer,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
@@ -612,6 +616,22 @@ impl<W: CanonicalParams> MetalWorker<W> {
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder};
         let baking = &self.bucket_bakings[bucket];
+        // Persistent-envelope counter is cumulative across the in-
+        // kernel layer loop, so it ends each dispatch at
+        // `num_tgs * (NUM_LAYERS*5 + 1)`. Zero it here so the next
+        // dispatch's first barrier (target `1 * num_tgs`) actually
+        // waits instead of passing through immediately. The pool
+        // `waitUntilCompleted`s the previous cmdbuf before re-entering
+        // run_bucket, so a host-side write to the StorageModeShared
+        // buffer is correctly ordered against the GPU. Cost: one u32
+        // store, guarded on whether this bucket actually dispatches
+        // a persistent kernel.
+        if baking.forward_persistent_baking.is_some() {
+            unsafe {
+                let p = self.persistent_barrier_counter.contents().as_ptr() as *mut u32;
+                p.write(0);
+            }
+        }
         for step in &baking.steps {
             match step {
                 BucketStep::Icb {
@@ -869,6 +889,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
             MTL4TimestampGranularity, MTL4VisibilityOptions, MTLStages,
         };
         let baking = &self.bucket_bakings[bucket];
+        // See run_bucket_mtl3 for the rationale: zero the persistent
+        // barrier counter on host before each dispatch that uses it,
+        // because the in-kernel counter never resets and ends each
+        // dispatch above any subsequent dispatch's target.
+        if baking.forward_persistent_baking.is_some() {
+            unsafe {
+                let p = self.persistent_barrier_counter.contents().as_ptr() as *mut u32;
+                let old = p.read();
+                p.write(0);
+                if std::env::var_os("FERRITE_PERSISTENT_FORWARD_DEBUG").is_some() {
+                    eprintln!("[persistent reset] bucket={bucket} counter was {old} → 0");
+                }
+            }
+        }
         let mtl4_steps =
             baking
                 .mtl4_steps
@@ -2021,22 +2055,15 @@ fn resolve_bindings<W: CanonicalParams>(
                 (buf.clone(), *byte_offset as u64, *binding_index as u64)
             }
             Binding::PersistentBarrierCounter { binding_index } => {
-                // Zero-init at bind time so the counter starts at 0 for
-                // every dispatch. Cheap (4 bytes, shared memory). When
-                // Phase 2a Impl wires `SynthPreAttnPersistent` into the
-                // tape, dispatches re-enter this arm and the counter is
-                // freshly zeroed before each ICB exec records its
-                // setBuffer of this binding.
+                // Resolve only — the per-dispatch zeroing happens in
+                // `run_bucket_mtl{3,4}` so it actually runs every
+                // forward call (resolve_bindings is bake-time only).
                 let counter = persistent_barrier_counter.ok_or(
                     WorkerError::PersistentBarrierCounterMissing {
                         bucket_index,
                         command_index,
                     },
                 )?;
-                unsafe {
-                    let p = counter.contents().as_ptr() as *mut u32;
-                    p.write(0);
-                }
                 (counter.clone(), 0u64, *binding_index as u64)
             }
             Binding::PerLayerArgumentBuffer { binding_index, .. } => {

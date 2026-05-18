@@ -381,9 +381,25 @@ impl Implementation for MetalForwardDecodePersistentImpl {
         let embed_tile = *m.boundary_inputs.first()?;
         let residual_slot = slots.of(embed_tile, 0);
 
-        // logits_out_slot: lm_head Gemm output (= boundary_outputs[0]).
-        // The kernel writes the M*VOCAB final tensor here.
-        let lm_head_tile = *m.boundary_outputs.first()?;
+        // logits_out_slot: the terminal lm_head Gemm's output slot.
+        // NOTE: `boundary_outputs[0]` is NOT necessarily the lm_head
+        // Gemm — codegen invokes terminal-impl fan_out with
+        // `boundary_outputs = tiles_in_subgraph(terminal_sg)` (the
+        // entire claimed subgraph, not just the matcher's seed), and
+        // for our WIDE claim that list's first element is layer 0's
+        // RmsNorm. Find the terminal Gemm explicitly — the same way
+        // `output_alias` already does — so the slot we report matches
+        // `codegen::terminal_slot = slots.of(<lm_head Gemm>, 0)`. If
+        // they disagree, the sampler reads `arena[terminal_slot]`
+        // while the kernel writes `arena[logits_out_slot]` and the
+        // model produces stale logits.
+        let lm_head_tile = *m
+            .claimed_tiles
+            .iter()
+            .find(|&&t| {
+                let n = fuf.get(t);
+                n.op == OpKind::Gemm && !fuf.nodes.iter().any(|m| consumes_tile(m, t))
+            })?;
         let logits_out_slot = slots.of(lm_head_tile, 0);
 
         // q_scratch / attn_scratch / mlp_scratch are cross-layer

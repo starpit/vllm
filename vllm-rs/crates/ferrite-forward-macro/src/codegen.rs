@@ -6886,7 +6886,7 @@ fn emit_shim_model(
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
-            forward, METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
+            forward, forward_with_metal_followup, METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
         };
     }
 }

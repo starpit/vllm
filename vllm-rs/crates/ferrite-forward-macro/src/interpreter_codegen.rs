@@ -3296,14 +3296,43 @@ pub fn lower_bucket(
             // returning `required_weights` in the same order its
             // `fan_out` lays out its emits.
             let mut slots_cursor = 0usize;
+            let imp_name = imp.name();
             for inst in emits {
                 let n_w = instruction_weight_count(&inst);
-                let mut slots_this: Vec<WeightSlot> = slots_for_emit
+                let slots_this_vec: Vec<WeightSlot> = slots_for_emit
                     .iter()
                     .skip(slots_cursor)
                     .take(n_w)
                     .cloned()
                     .collect();
+                // Compile-time coverage check: the Impl's
+                // `required_weights` MUST supply at least
+                // `instruction_weight_count(inst)` accessors per emit,
+                // in the same order the runtime Instruction will resolve
+                // them through `WeightAccessors::*_at`. Silent
+                // under-supply here surfaces at worker-init time as
+                // `WeightAccessors::<method>: no match for ...` — a
+                // cryptic panic the user can't act on. Fail at macro
+                // expansion instead so the offending Impl is named
+                // directly. `slots_for_emit` length total is
+                // double-checked after the loop.
+                assert_eq!(
+                    slots_this_vec.len(),
+                    n_w,
+                    "Impl `{}` `required_weights` returned too few accessors for \
+                     Instruction `{}` at op_idx={} in this claim: \
+                     instruction_weight_count() = {}, but only {} slot(s) remain. \
+                     The Impl's `required_weights` MUST yield exactly the kinds \
+                     and count the emitted Instruction will resolve through \
+                     `WeightAccessors::*_at` at runtime — in the same order as \
+                     the emits.",
+                    imp_name,
+                    instruction_variant_name(&inst),
+                    instances.len(),
+                    n_w,
+                    slots_this_vec.len(),
+                );
+                let mut slots_this = slots_this_vec;
                 slots_cursor += n_w;
                 if instruction_consumes_rotary(&inst) {
                     slots_this.push(WeightSlot {
@@ -3314,6 +3343,22 @@ pub fn lower_bucket(
                 instances.push(inst);
                 weight_slots.push(slots_this);
             }
+            // Compile-time check #2: the Impl must not over-supply its
+            // `required_weights` either — any trailing accessors past
+            // the cumulative `instruction_weight_count` would be silently
+            // dropped, hiding a real authoring bug (e.g. an Impl that
+            // declared an unused LinearLayer accessor and then refactored
+            // its emits to one fewer Instruction).
+            assert_eq!(
+                slots_cursor,
+                slots_for_emit.len(),
+                "Impl `{}` `required_weights` returned {} accessors but its \
+                 emits only consume {}. Either trim `required_weights` or \
+                 split the extra accessor onto an additional Instruction emit.",
+                imp_name,
+                slots_for_emit.len(),
+                slots_cursor,
+            );
         }
     }
 
@@ -3460,6 +3505,17 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         | I::FusedQkvRopePrefill(..)
         | I::CutlassFusedQkvRopeCache(..)
         | I::CutlassFusedQkvRopePrefill(..) => 3,
+        // Dense + quant-flavored fused Gate/Up+SiluMul: a single
+        // packed `[gate|up]` LinearLayer accessor (loader concats the
+        // two source weights at load time). The Affine path decomposes
+        // into separate `AffineQmm` + `AffineQmm` + `SiluMul` emits via
+        // `affine_decomposed_fan_out` and never reaches this arm.
+        I::FusedGateUpSiluMul(..)
+        | I::CutlassFusedGateUpSiluMul(..)
+        | I::MarlinFusedGateUpSiluMul(..)
+        | I::Bnb4FusedGateUpSiluMul(..)
+        | I::GgmlFusedGateUpSiluMul(..)
+        | I::Fp8FusedGateUpSiluMul(..) => 1,
         // MoE Instructions consume one full MoE layer accessor
         // (`FusedMoELayer` / `SharedFusedMoELayer` enum). The Impl's
         // `required_weights` returns exactly one accessor per

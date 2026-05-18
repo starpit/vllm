@@ -4748,6 +4748,7 @@ fn emit_weight_accessors_impl(
         crate::solver::WorkloadPoint,
         (CanonicalLowered, u32, u32, u32, SlotMap),
     >,
+    variant_name: &str,
 ) -> TokenStream {
     use crate::impl_lib::WeightKind;
 
@@ -4776,6 +4777,10 @@ fn emit_weight_accessors_impl(
     // of the same kind at the same op.
     use std::collections::HashMap;
     let mut by_kind: HashMap<&'static str, Vec<TokenStream>> = HashMap::new();
+    // Parallel inventory used only to build the static diagnostic
+    // string baked into each `*_at` body — never compiled into runtime
+    // matching. `(tape_index, role, op_idx, slot, method, base)`.
+    let mut slot_inventory: Vec<(u32, &'static str, u32, u32, &'static str, String)> = Vec::new();
 
     // Walk EVERY canonical lowered entry. Each distinct tape_index
     // (workload point) gets a pair of tape_index ids: 2*ci (backbone)
@@ -4783,8 +4788,10 @@ fn emit_weight_accessors_impl(
     // run/run_backbone, which forward them to run_slice → eval →
     // the per-arch WeightAccessors match arms.
     let emit_for = |tape_index: u32,
+                    role: &'static str,
                     weight_slots: &[Vec<WeightSlot>],
-                    by_kind: &mut HashMap<&'static str, Vec<TokenStream>>| {
+                    by_kind: &mut HashMap<&'static str, Vec<TokenStream>>,
+                    inventory: &mut Vec<(u32, &'static str, u32, u32, &'static str, String)>| {
         let tape_index_lit = proc_macro2::Literal::u32_unsuffixed(tape_index);
         for (op_idx, slots) in weight_slots.iter().enumerate() {
             let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
@@ -4808,6 +4815,7 @@ fn emit_weight_accessors_impl(
                 };
                 let n = counts.entry(key).or_insert(0);
                 let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
+                inventory.push((tape_index, role, op_idx as u32, *n, key, slot.base.to_string()));
                 *n += 1;
                 let base = &slot.base;
                 // CosSin pulls from a `RotaryCache` field on the per-arch
@@ -4830,10 +4838,99 @@ fn emit_weight_accessors_impl(
     for (ci, (_wp, (cl, _, _, _, _))) in canonical_lowered.iter().enumerate() {
         let bb_id = (ci as u32) * 2;
         let lm_id = bb_id + 1;
-        emit_for(bb_id, &cl.backbone.weight_slots, &mut by_kind);
-        emit_for(lm_id, &cl.lm_head.weight_slots, &mut by_kind);
+        emit_for(
+            bb_id,
+            "backbone",
+            &cl.backbone.weight_slots,
+            &mut by_kind,
+            &mut slot_inventory,
+        );
+        emit_for(
+            lm_id,
+            "lm_head",
+            &cl.lm_head.weight_slots,
+            &mut by_kind,
+            &mut slot_inventory,
+        );
     }
+    // Build the per-method diagnostic summary baked into each `*_at`
+    // panic body. Sort by (method, tape_index, op_idx, slot) so the
+    // output reads top-to-bottom in the order the runtime resolves
+    // bindings.
+    let mut sorted_inv = slot_inventory.clone();
+    sorted_inv.sort_by(|a, b| {
+        a.4.cmp(b.4) // method
+            .then(a.0.cmp(&b.0)) // tape_index
+            .then(a.2.cmp(&b.2)) // op_idx
+            .then(a.3.cmp(&b.3)) // slot
+    });
+    let method_summaries: HashMap<&'static str, String> = {
+        let mut by_method: HashMap<&'static str, Vec<(u32, &'static str, u32, u32, String)>> =
+            HashMap::new();
+        for (tape, role, op, slot, method, base) in &sorted_inv {
+            by_method.entry(method).or_default().push((
+                *tape,
+                role,
+                *op,
+                *slot,
+                base.clone(),
+            ));
+        }
+        by_method
+            .into_iter()
+            .map(|(method, rows)| {
+                let mut s = String::new();
+                let mut cur_tape: Option<(u32, &'static str)> = None;
+                for (tape, role, op, slot, base) in rows {
+                    if cur_tape != Some((tape, role)) {
+                        if cur_tape.is_some() {
+                            s.push('\n');
+                        }
+                        s.push_str(&format!("    tape_index={tape} ({role}):"));
+                        cur_tape = Some((tape, role));
+                    }
+                    s.push_str(&format!(" (op={op},slot={slot})→{base}"));
+                }
+                (method, s)
+            })
+            .collect()
+    };
+    // All-methods inventory for cross-kind context at the same op_idx.
+    // Sorted by (tape_index, op_idx, method, slot).
+    let mut all_sorted = slot_inventory.clone();
+    all_sorted.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.2.cmp(&b.2))
+            .then(a.4.cmp(b.4))
+            .then(a.3.cmp(&b.3))
+    });
+    let all_summary: String = {
+        let mut s = String::new();
+        let mut cur_tape: Option<(u32, &'static str)> = None;
+        let mut cur_op: Option<u32> = None;
+        for (tape, role, op, slot, method, base) in &all_sorted {
+            if cur_tape != Some((*tape, role)) {
+                if cur_tape.is_some() {
+                    s.push('\n');
+                }
+                s.push_str(&format!("  tape_index={tape} ({role}):\n"));
+                cur_tape = Some((*tape, role));
+                cur_op = None;
+            }
+            if cur_op != Some(*op) {
+                if cur_op.is_some() {
+                    s.push('\n');
+                }
+                s.push_str(&format!("    op_idx={op}:"));
+                cur_op = Some(*op);
+            }
+            s.push_str(&format!(" {method}[slot={slot}]→{base}"));
+        }
+        s
+    };
 
+    let variant_lit = proc_macro2::Literal::string(variant_name);
+    let all_summary_lit = proc_macro2::Literal::string(&all_summary);
     let method_emit = |method: &str, ret_ty: TokenStream| -> TokenStream {
         let method_id = syn::Ident::new(method, proc_macro2::Span::call_site());
         let arms = by_kind.get(method).cloned().unwrap_or_default();
@@ -4842,6 +4939,11 @@ fn emit_weight_accessors_impl(
             // override needed when the arch never consumes this kind.
             return quote! {};
         }
+        let method_summary = method_summaries
+            .get(method)
+            .cloned()
+            .unwrap_or_else(|| "    (none recorded for this method)".to_string());
+        let method_summary_lit = proc_macro2::Literal::string(&method_summary);
         quote! {
             fn #method_id(
                 &self,
@@ -4857,9 +4959,41 @@ fn emit_weight_accessors_impl(
                 let _ = layer;
                 match (tape_index, op_idx, slot) {
                     #(#arms)*
-                    _ => unreachable!(
-                        "WeightAccessors::{}: no match for (tape_index={}, op_idx={}, slot={})",
-                        stringify!(#method_id), tape_index, op_idx, slot,
+                    _ => panic!(
+                        "\nferrite-forward weight-accessor coverage gap\n\
+                         \n\
+                         variant:  `{}::Weights`\n\
+                         method:   `{}`\n\
+                         asked:    (tape_index={}, op_idx={}, slot={}, layer={})\n\
+                         \n\
+                         This variant's recorded `{}` slots:\n\
+                         {}\n\
+                         \n\
+                         Every weight-accessor slot recorded for this variant \
+                         (any kind, at tape_index={}):\n\
+                         {}\n\
+                         \n\
+                         A 'no match' here means worker code resolved a \
+                         `Binding::Weight` whose `(tape_index, op_idx, slot)` \
+                         locator does not appear in the macro-emitted slot \
+                         table above. Two common causes:\n\
+                         \n\
+                         1. WRONG VARIANT WAS SELECTED at `ferrite_forward::try_load`.\n\
+                            The compiled-variant fingerprint matched but the live\n\
+                            checkpoint really wants a sibling (quantized) variant.\n\
+                            Re-check `emit_fingerprint_check` in \
+                            `crates/ferrite-forward-macro/src/codegen.rs`.\n\
+                         2. IMPL `required_weights` UNDER-SUPPLIED its emits.\n\
+                            The Impl that lowered op_idx={} declared fewer accessors\n\
+                            than its emitted Instruction consumes at runtime.\n\
+                            (Macro now panics at expansion when this is locally\n\
+                            detectable — see the slot-distribution assertion in\n\
+                            `interpreter_codegen::lower_bucket`.)\n",
+                        #variant_lit, stringify!(#method_id),
+                        tape_index, op_idx, slot, layer,
+                        stringify!(#method_id), #method_summary_lit,
+                        tape_index, #all_summary_lit,
+                        op_idx,
                     ),
                 }
             }
@@ -4930,6 +5064,11 @@ fn emit_weight_accessors_impl(
     let affine_quant_embedding = if aqe_arms.is_empty() {
         quote! {}
     } else {
+        let aqe_summary = method_summaries
+            .get("affine_quant_embedding_at")
+            .cloned()
+            .unwrap_or_else(|| "    (none recorded for this method)".to_string());
+        let aqe_summary_lit = proc_macro2::Literal::string(&aqe_summary);
         quote! {
             #[cfg(feature = "metal")]
             fn affine_quant_embedding_at(
@@ -4941,10 +5080,22 @@ fn emit_weight_accessors_impl(
             ) -> &::ferrite_kernels::layers::AffineQuantEmbedding {
                 match (tape_index, op_idx, slot) {
                     #(#aqe_arms)*
-                    _ => unreachable!(
-                        "WeightAccessors::affine_quant_embedding_at: no match for \
-                         (tape_index={}, op_idx={}, slot={})",
-                        tape_index, op_idx, slot,
+                    _ => panic!(
+                        "\nferrite-forward weight-accessor coverage gap\n\
+                         \n\
+                         variant:  `{}::Weights`\n\
+                         method:   `affine_quant_embedding_at`\n\
+                         asked:    (tape_index={}, op_idx={}, slot={}, layer={})\n\
+                         \n\
+                         Recorded `affine_quant_embedding_at` slots:\n\
+                         {}\n\
+                         \n\
+                         All slots at tape_index={}:\n\
+                         {}\n",
+                        #variant_lit,
+                        tape_index, op_idx, slot, layer,
+                        #aqe_summary_lit,
+                        tape_index, #all_summary_lit,
                     ),
                 }
             }
@@ -6023,7 +6174,8 @@ pub fn emit_model(
     // 3-4 lines per row).
     let has_bias_add = program_has_bias_add(program);
     let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, has_bias_add);
-    let weight_accessors_impl = emit_weight_accessors_impl(&canonical_lowered);
+    let weight_accessors_impl =
+        emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
     // Per-canonical: alias the generic `Instruction<Weights>` for
     // the slice element type AND glob-import the variant
     // constructors so each static-slice row reads `Embed(...)` /

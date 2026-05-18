@@ -1503,14 +1503,15 @@ pub fn render_tk_fused_norm_gemm<
 // ============================================================
 // FusedQkvRopeCache — fused QKV linear projection + RoPE rotation.
 //
-// The per-head body is a runtime if-else routing each head to Q
-// rope staging, K rope staging, or V output. We compose this via
-// a single `format!()` for the loop body — same pattern S15 used —
-// because the dogfood-tk20 rule's surface is the per-call wrapper
-// around `kittens::*` primitives, not the surrounding C++
-// scaffolding (`for`, `if`, `auto`, lambda). Step 5 will rewrite
-// the loop body via `tk20::for_loop` / `tk20::if_else` once those
-// helpers cover `auto __qkv_b_sub = ...subtile<>(...);` patterns.
+// The per-head body is a runtime for-loop with an inner if-else
+// routing each head to Q rope staging, K rope staging, or V
+// output. The loop scaffolding (for, if-else) goes through
+// `tk20::for_loop` / `tk20::if_else` per the dogfood-tk20 rule;
+// the leaf statements that need runtime-shape subtile coords
+// (e.g. `subtile<>(int2{0, col / head_dim})`) and a `__device__`
+// lambda for the RoPE rotation are emitted as scoped
+// `CuStmt::new(format!())` inside the CuBlocks (no const-generic
+// `tk20::*` binding can express a runtime subtile offset).
 // ============================================================
 
 pub fn render_fused_qkv_rope_cache<
@@ -1636,96 +1637,173 @@ pub fn render_fused_qkv_rope_cache<
         in_smem = in_smem.expr(),
     )));
 
+    // Pre-loop decls: scratch ST refs for Q/K rope staging, raw
+    // bf16 ptr for cos_sin gather, warp id, and the unroll pragma
+    // for the per-head loop. Each is a single-line CuStmt because
+    // none binds to a typed tk20 handle (refs to scratch with
+    // arbitrary offset; a bf16* cast of a void page; a builtin).
     consumer.push(CuStmt::new(format!(
         "auto& __qkv_q_rope = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
-         ss.scratch + {q_rope_offset});\n\
-         auto& __qkv_k_rope = *reinterpret_cast<kittens::st_bf<{m}, {kv_dim}>*>(\
-         ss.scratch + {k_rope_offset});\n\
-         __nv_bfloat16* __qkv_cos_sin_ptr = reinterpret_cast<__nv_bfloat16*>(\
-         ss.pages[{cos_sin_id}]);\n\
-         const int __qkv_warp_id = static_cast<int>(kittens::warpid());\n\
-         _Pragma(\"unroll\")\n\
-         for (int __qkv_h = 0; __qkv_h < {heads_per_warp}; ++__qkv_h) {{\n\
-         \x20   const int __qkv_col = __qkv_warp_id * {tile_n} + __qkv_h * {head_dim};\n\
-         \x20   kittens::rt_bf<{hidden_dim}, {head_dim}, kittens::ducks::rt_layout::col> __qkv_b;\n\
-         \x20   {{\n\
-         \x20       auto __qkv_b_sub = ({qkv_b_tile})\
-         .template subtile<{hidden_dim}, {head_dim}>(int2{{0, __qkv_col / {head_dim}}});\n\
-         \x20       kittens::warp::load(__qkv_b, __qkv_b_sub);\n\
-         \x20   }}\n\
-         \x20   kittens::rt_fl<{m}, {head_dim}> __qkv_acc;\n\
-         \x20   kittens::warp::zero(__qkv_acc);\n\
-         \x20   kittens::warp::mma_AB(__qkv_acc, __qkv_a, __qkv_b, __qkv_acc);\n\
-         \x20   if (__qkv_col < {q_dim}) {{\n\
-         \x20       const int __qkv_local = __qkv_col;\n\
-         \x20       auto __qkv_stg = __qkv_q_rope\
-         .template subtile<{m}, {head_dim}>(int2{{0, __qkv_local / {head_dim}}});\n\
-         \x20       kittens::warp::store(__qkv_stg, __qkv_acc);\n\
-         \x20       __syncwarp();\n\
-         \x20       __nv_bfloat16* __qkv_stg_ptr = reinterpret_cast<__nv_bfloat16*>(&__qkv_stg);\n\
-         \x20       kittens::rt_fl<{m}, {head_dim}> __qkv_rot;\n\
-         \x20       kittens::warp::apply(__qkv_rot, __qkv_acc, [=] __device__ \
-         (int row, int col, float x) {{\n\
-         \x20           constexpr int __half = {head_dim} / 2;\n\
-         \x20           int __pc = col < __half ? col + __half : col - __half;\n\
-         \x20           float __paired = __bfloat162float(\
-         __qkv_stg_ptr[row * {head_dim} + __pc]);\n\
-         \x20           int __t = col < __half ? col : col - __half;\n\
-         \x20           float __c = __bfloat162float(\
-         __qkv_cos_sin_ptr[row * {head_dim} + __t]);\n\
-         \x20           float __s = __bfloat162float(\
-         __qkv_cos_sin_ptr[row * {head_dim} + __half + __t]);\n\
-         \x20           return col < __half ? (x * __c - __paired * __s) \
-         : (x * __c + __paired * __s);\n\
-         \x20       }});\n\
-         \x20       auto __qkv_out = ({q_out_smem})\
-         .template subtile<{m}, {head_dim}>(int2{{0, __qkv_local / {head_dim}}});\n\
-         \x20       kittens::warp::store(__qkv_out, __qkv_rot);\n\
-         \x20   }} else if (__qkv_col < {q_dim} + {kv_dim}) {{\n\
-         \x20       const int __qkv_local = __qkv_col - {q_dim};\n\
-         \x20       auto __qkv_stg = __qkv_k_rope\
-         .template subtile<{m}, {head_dim}>(int2{{0, __qkv_local / {head_dim}}});\n\
-         \x20       kittens::warp::store(__qkv_stg, __qkv_acc);\n\
-         \x20       __syncwarp();\n\
-         \x20       __nv_bfloat16* __qkv_stg_ptr = reinterpret_cast<__nv_bfloat16*>(&__qkv_stg);\n\
-         \x20       kittens::rt_fl<{m}, {head_dim}> __qkv_rot;\n\
-         \x20       kittens::warp::apply(__qkv_rot, __qkv_acc, [=] __device__ \
-         (int row, int col, float x) {{\n\
-         \x20           constexpr int __half = {head_dim} / 2;\n\
-         \x20           int __pc = col < __half ? col + __half : col - __half;\n\
-         \x20           float __paired = __bfloat162float(\
-         __qkv_stg_ptr[row * {head_dim} + __pc]);\n\
-         \x20           int __t = col < __half ? col : col - __half;\n\
-         \x20           float __c = __bfloat162float(\
-         __qkv_cos_sin_ptr[row * {head_dim} + __t]);\n\
-         \x20           float __s = __bfloat162float(\
-         __qkv_cos_sin_ptr[row * {head_dim} + __half + __t]);\n\
-         \x20           return col < __half ? (x * __c - __paired * __s) \
-         : (x * __c + __paired * __s);\n\
-         \x20       }});\n\
-         \x20       auto __qkv_out = ({k_out_smem})\
-         .template subtile<{m}, {head_dim}>(int2{{0, __qkv_local / {head_dim}}});\n\
-         \x20       kittens::warp::store(__qkv_out, __qkv_rot);\n\
-         \x20   }} else {{\n\
-         \x20       const int __qkv_local = __qkv_col - {q_dim} - {kv_dim};\n\
-         \x20       auto __qkv_out = ({v_out_smem})\
-         .template subtile<{m}, {head_dim}>(int2{{0, __qkv_local / {head_dim}}});\n\
-         \x20       kittens::warp::store(__qkv_out, __qkv_acc);\n\
-         \x20   }}\n\
-         }}",
+         ss.scratch + {q_rope_offset});",
         m = M,
         q_dim = Q_DIM,
-        kv_dim = KV_DIM,
-        head_dim = HEAD_DIM,
-        hidden_dim = HIDDEN_DIM,
-        tile_n = TILE_N,
-        heads_per_warp = HEADS_PER_WARP,
-        cos_sin_id = cos_sin_page_id,
-        qkv_b_tile = qkv_b_tile.expr(),
-        q_out_smem = q_out_smem.expr(),
-        k_out_smem = k_out_smem.expr(),
-        v_out_smem = v_out_smem.expr(),
     )));
+    consumer.push(CuStmt::new(format!(
+        "auto& __qkv_k_rope = *reinterpret_cast<kittens::st_bf<{m}, {kv_dim}>*>(\
+         ss.scratch + {k_rope_offset});",
+        m = M,
+        kv_dim = KV_DIM,
+    )));
+    consumer.push(CuStmt::new(format!(
+        "__nv_bfloat16* __qkv_cos_sin_ptr = reinterpret_cast<__nv_bfloat16*>(\
+         ss.pages[{cos_sin_id}]);",
+        cos_sin_id = cos_sin_page_id,
+    )));
+    consumer.push(CuStmt::new(
+        "const int __qkv_warp_id = static_cast<int>(kittens::warpid());".to_string(),
+    ));
+    consumer.push(CuStmt::new("_Pragma(\"unroll\")".to_string()));
+
+    // Per-head loop body: declare __qkv_col, declare __qkv_b
+    // register tile, load via runtime-offset subtile, declare
+    // accumulator, zero + mma_AB, then route to Q / K / V via
+    // `tk20::if_else`.
+    let mut loop_body = CuBlock::new();
+    loop_body.push(CuStmt::new(format!(
+        "const int __qkv_col = __qkv_warp_id * {tile_n} + __qkv_h * {head_dim};",
+        tile_n = TILE_N,
+        head_dim = HEAD_DIM,
+    )));
+    loop_body.push(CuStmt::new(format!(
+        "kittens::rt_bf<{hidden_dim}, {head_dim}, kittens::ducks::rt_layout::col> __qkv_b;",
+        hidden_dim = HIDDEN_DIM,
+        head_dim = HEAD_DIM,
+    )));
+    // The original C++ wrapped __qkv_b_sub in a brace scope to
+    // tighten its lifetime; in a for-loop body each `auto` decl is
+    // already iter-local, so we drop the redundant brace.
+    loop_body.push(CuStmt::new(format!(
+        "auto __qkv_b_sub = ({qkv_b_tile})\
+         .template subtile<{hidden_dim}, {head_dim}>(\
+         int2{{0, __qkv_col / {head_dim}}});",
+        qkv_b_tile = qkv_b_tile.expr(),
+        hidden_dim = HIDDEN_DIM,
+        head_dim = HEAD_DIM,
+    )));
+    loop_body.push(CuStmt::new(
+        "kittens::warp::load(__qkv_b, __qkv_b_sub);".to_string(),
+    ));
+    loop_body.push(CuStmt::new(format!(
+        "kittens::rt_fl<{m}, {head_dim}> __qkv_acc;",
+        m = M,
+        head_dim = HEAD_DIM,
+    )));
+    loop_body.push(CuStmt::new(
+        "kittens::warp::zero(__qkv_acc);".to_string(),
+    ));
+    loop_body.push(CuStmt::new(
+        "kittens::warp::mma_AB(__qkv_acc, __qkv_a, __qkv_b, __qkv_acc);".to_string(),
+    ));
+
+    // Q rope branch: stage acc → scratch ST, sync, then apply RoPE
+    // device lambda reading paired half + cos_sin, store to q_out.
+    let make_rope_branch = |stg_ref: &str, out_smem_expr: &str, local_expr: &str| {
+        let mut block = CuBlock::new();
+        block.push(CuStmt::new(format!(
+            "const int __qkv_local = {local_expr};"
+        )));
+        block.push(CuStmt::new(format!(
+            "auto __qkv_stg = {stg_ref}\
+             .template subtile<{m}, {head_dim}>(\
+             int2{{0, __qkv_local / {head_dim}}});",
+            m = M,
+            head_dim = HEAD_DIM,
+        )));
+        block.push(CuStmt::new(
+            "kittens::warp::store(__qkv_stg, __qkv_acc);".to_string(),
+        ));
+        block.push(CuStmt::new("__syncwarp();".to_string()));
+        block.push(CuStmt::new(
+            "__nv_bfloat16* __qkv_stg_ptr = reinterpret_cast<__nv_bfloat16*>(&__qkv_stg);"
+                .to_string(),
+        ));
+        block.push(CuStmt::new(format!(
+            "kittens::rt_fl<{m}, {head_dim}> __qkv_rot;",
+            m = M,
+            head_dim = HEAD_DIM,
+        )));
+        block.push(CuStmt::new(format!(
+            "kittens::warp::apply(__qkv_rot, __qkv_acc, [=] __device__ \
+             (int row, int col, float x) {{\n\
+             \x20   constexpr int __half = {head_dim} / 2;\n\
+             \x20   int __pc = col < __half ? col + __half : col - __half;\n\
+             \x20   float __paired = __bfloat162float(\
+             __qkv_stg_ptr[row * {head_dim} + __pc]);\n\
+             \x20   int __t = col < __half ? col : col - __half;\n\
+             \x20   float __c = __bfloat162float(\
+             __qkv_cos_sin_ptr[row * {head_dim} + __t]);\n\
+             \x20   float __s = __bfloat162float(\
+             __qkv_cos_sin_ptr[row * {head_dim} + __half + __t]);\n\
+             \x20   return col < __half ? (x * __c - __paired * __s) \
+             : (x * __c + __paired * __s);\n\
+             }});",
+            head_dim = HEAD_DIM,
+        )));
+        block.push(CuStmt::new(format!(
+            "auto __qkv_out = ({out_smem_expr})\
+             .template subtile<{m}, {head_dim}>(\
+             int2{{0, __qkv_local / {head_dim}}});",
+            m = M,
+            head_dim = HEAD_DIM,
+        )));
+        block.push(CuStmt::new(
+            "kittens::warp::store(__qkv_out, __qkv_rot);".to_string(),
+        ));
+        block
+    };
+
+    let q_branch = make_rope_branch("__qkv_q_rope", q_out_smem.expr().as_str(), "__qkv_col");
+    let k_branch = make_rope_branch(
+        "__qkv_k_rope",
+        k_out_smem.expr().as_str(),
+        &format!("__qkv_col - {}", Q_DIM),
+    );
+
+    // V passthrough branch: store acc directly to v_out (no RoPE).
+    let mut v_branch = CuBlock::new();
+    v_branch.push(CuStmt::new(format!(
+        "const int __qkv_local = __qkv_col - {q_dim} - {kv_dim};",
+        q_dim = Q_DIM,
+        kv_dim = KV_DIM,
+    )));
+    v_branch.push(CuStmt::new(format!(
+        "auto __qkv_out = ({v_out_smem})\
+         .template subtile<{m}, {head_dim}>(\
+         int2{{0, __qkv_local / {head_dim}}});",
+        v_out_smem = v_out_smem.expr(),
+        m = M,
+        head_dim = HEAD_DIM,
+    )));
+    v_branch.push(CuStmt::new(
+        "kittens::warp::store(__qkv_out, __qkv_acc);".to_string(),
+    ));
+
+    // Compose the routing as an n-way if/else if/else chain:
+    // Q, K, V fallthrough.
+    let q_cond = format!("__qkv_col < {}", Q_DIM);
+    let k_cond = format!("__qkv_col < {} + {}", Q_DIM, KV_DIM);
+    loop_body.push(tk20::if_chain(
+        &[(&q_cond, &q_branch), (&k_cond, &k_branch)],
+        Some(&v_branch),
+    ));
+
+    consumer.push(tk20::for_loop(
+        &format!(
+            "int __qkv_h = 0; __qkv_h < {heads_per_warp}; ++__qkv_h",
+            heads_per_warp = HEADS_PER_WARP,
+        ),
+        &loop_body,
+    ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     consumer.push(tk20::block_warp_zero(&[

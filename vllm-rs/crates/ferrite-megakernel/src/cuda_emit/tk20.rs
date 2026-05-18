@@ -1067,3 +1067,28 @@ pub fn if_else(
         )),
     }
 }
+
+/// Emit an `if (c0) { b0 } else if (c1) { b1 } ... else { eb }`
+/// chain. Used when a per-iter loop body routes to one of N
+/// branches by a runtime predicate (e.g. FQRC's Q/K/V routing).
+/// The nested-`if_else` form is logically equivalent but emits
+/// `else { if ... }` which differs textually from the chain form
+/// readers expect.
+pub fn if_chain(
+    branches: &[(&str, &super::cu::CuBlock)],
+    else_block: Option<&super::cu::CuBlock>,
+) -> CuStmt {
+    debug_assert!(!branches.is_empty(), "if_chain needs at least one branch");
+    let mut out = String::new();
+    for (i, (cond, block)) in branches.iter().enumerate() {
+        if i == 0 {
+            out.push_str(&format!("if ({cond}) {{\n{}}}", block.render(4)));
+        } else {
+            out.push_str(&format!(" else if ({cond}) {{\n{}}}", block.render(4)));
+        }
+    }
+    if let Some(eb) = else_block {
+        out.push_str(&format!(" else {{\n{}}}", eb.render(4)));
+    }
+    CuStmt::new(out)
+}

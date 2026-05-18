@@ -489,6 +489,14 @@ impl RmsNorm {
 /// `page_done` — only a single bar (no cross-warp reduction; the
 /// per-warp [M, TILE_N] mma + per-row RoPE rotates each warp's
 /// disjoint output cols independently).
+///
+/// Sprint 15c (S15c) IR ext: `qkv_b_tile_offset` /
+/// `qkv_b_tile_bytes` carry the GemmScope scratch region for staging
+/// the QKV linear weight `[K, qkv_n]` as the mma_AB B operand.
+/// Mirrors `TkFusedNormGemm::b_tile_offset` / `Gemm::b_tile_offset`.
+/// `qkv_weight_page` was load-bearing for the page-handoff barrier
+/// only; the actual weight tile lives in scratch (the page is too
+/// small — typical `PAGE_SIZE=32KB` cannot fit a multi-MB weight).
 pub struct FusedQkvRopeCache {
     in_page: crate::ir::substrate::PageRef,
     qkv_weight_page: crate::ir::substrate::PageRef,
@@ -500,6 +508,14 @@ pub struct FusedQkvRopeCache {
     q_rope_bytes: crate::ir::substrate::ScratchBytesRef,
     k_rope_offset: crate::ir::substrate::ScratchOffsetRef,
     k_rope_bytes: crate::ir::substrate::ScratchBytesRef,
+    /// QKV linear weight b_tile staging region in `GemmScope` scratch.
+    /// Sized for one `[chunk_k, qkv_n] * sizeof(bf16)` tile (per-iter
+    /// b_tile when `iters > 1`; full weight when `iters == 1`).
+    /// Mirrors `TkFusedNormGemm::b_tile_offset` (S13a). Disjoint from
+    /// `q_rope` / `k_rope` by the scope tag (RopeScope vs GemmScope —
+    /// no within-scope overlap proof needed).
+    qkv_b_tile_offset: crate::ir::substrate::ScratchOffsetRef,
+    qkv_b_tile_bytes: crate::ir::substrate::ScratchBytesRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
     storer_phase: crate::ir::substrate::MbarrierPhaseRef,
     iters: crate::ir::substrate::IterCountRef,
@@ -565,6 +581,8 @@ impl FusedQkvRopeCache {
         const Q_BYTES: u32,
         const K_OFF: u32,
         const K_BYTES: u32,
+        const B_TILE_OFF: u32,
+        const B_TILE_BYTES: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ITERS: u32,
@@ -640,6 +658,7 @@ impl FusedQkvRopeCache {
             // Scratch within-budget.
             let q_end = (Q_OFF as u64) + (Q_BYTES as u64);
             let k_end = (K_OFF as u64) + (K_BYTES as u64);
+            let b_end = (B_TILE_OFF as u64) + (B_TILE_BYTES as u64);
             assert!(
                 q_end <= SCRATCH_BYTES as u64,
                 "FusedQkvRopeCache: Q rope buf out of scratch budget"
@@ -648,11 +667,18 @@ impl FusedQkvRopeCache {
                 k_end <= SCRATCH_BYTES as u64,
                 "FusedQkvRopeCache: K rope buf out of scratch budget"
             );
-            // Scratch disjoint.
+            assert!(
+                b_end <= SCRATCH_BYTES as u64,
+                "FusedQkvRopeCache: qkv b_tile out of scratch budget"
+            );
+            // Scratch disjoint within RopeScope (Q vs K rope bufs).
+            // The qkv b_tile lives in GemmScope, so cross-scope
+            // disjointness is by typed-tag, no offset proof needed.
             assert!(
                 q_end <= K_OFF as u64 || k_end <= Q_OFF as u64,
                 "FusedQkvRopeCache: Q and K rope bufs overlap within RopeScope"
             );
+            assert!(B_TILE_BYTES > 0, "FusedQkvRopeCache: B_TILE_BYTES must be > 0");
 
             assert!(ITERS > 0, "FusedQkvRopeCache: ITERS must be > 0");
             assert!(LAYER < NUM_LAYERS, "FusedQkvRopeCache: LAYER out of range");
@@ -717,6 +743,8 @@ impl FusedQkvRopeCache {
             q_rope_bytes: ScratchBytesRef::__new_for_erase(Q_BYTES),
             k_rope_offset: ScratchOffsetRef::__new_for_erase(K_OFF),
             k_rope_bytes: ScratchBytesRef::__new_for_erase(K_BYTES),
+            qkv_b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
+            qkv_b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
             consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
             storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
             iters: IterCount::<ITERS>::new().erase(),
@@ -776,6 +804,16 @@ impl FusedQkvRopeCache {
     }
     pub const fn k_rope_bytes(&self) -> crate::ir::substrate::ScratchBytesRef {
         self.k_rope_bytes
+    }
+    /// QKV b_tile staging region offset (GemmScope). The mma_AB B
+    /// operand is staged here as `[K, qkv_n] bf16` (or `[CHUNK_K,
+    /// qkv_n]` per iter once iters > 1). Mirrors
+    /// `TkFusedNormGemm::b_tile_offset` (S13a).
+    pub const fn qkv_b_tile_offset(&self) -> crate::ir::substrate::ScratchOffsetRef {
+        self.qkv_b_tile_offset
+    }
+    pub const fn qkv_b_tile_bytes(&self) -> crate::ir::substrate::ScratchBytesRef {
+        self.qkv_b_tile_bytes
     }
     pub const fn consumer_phase(&self) -> crate::ir::substrate::MbarrierPhaseRef {
         self.consumer_phase

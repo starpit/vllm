@@ -799,11 +799,19 @@ pub fn dispatch_instruction_to_push(
             let q_id = lit(state.alloc_distinct(&[*in_slot])?);
             let k_id = lit(state.alloc_distinct(&[*in_slot])?);
             let v_id = lit(state.alloc_distinct(&[*in_slot])?);
+            // S15c partition: scratch is split four ways. Q rope and
+            // K rope each get a quarter (RopeScope, disjoint within
+            // scope by offset proof); the qkv b_tile gets the other
+            // half (GemmScope, cross-scope so disjoint by tag, no
+            // offset proof needed against rope).
+            let quarter = state.scratch_bytes / 4;
             let half = state.scratch_bytes / 2;
             let q_off = lit(0u32);
-            let q_bytes = lit(half);
-            let k_off = lit(half);
-            let k_bytes = lit(half);
+            let q_bytes = lit(quarter);
+            let k_off = lit(quarter);
+            let k_bytes = lit(quarter);
+            let b_tile_off = lit(2 * quarter);
+            let b_tile_bytes = lit(half);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
@@ -858,6 +866,9 @@ pub fn dispatch_instruction_to_push(
                     >::new(),
                     ::ferrite_megakernel::ir::ScratchRegion::<
                         #k_off, #k_bytes, #scratch_lit, ::ferrite_megakernel::ir::RopeScope,
+                    >::new(),
+                    ::ferrite_megakernel::ir::ScratchRegion::<
+                        #b_tile_off, #b_tile_bytes, #scratch_lit, ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
                     ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
                     ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
@@ -930,11 +941,18 @@ pub fn dispatch_instruction_to_push(
             let cs_id = lit(cs_id_val);
             let k_id = lit(k_id_val);
             let v_id = lit(v_id_val);
+            // S15c partition (mirror of FusedQkvRopeCache arm). Even
+            // though RopeAppend doesn't run a QKV matmul (its qkv
+            // weight is the sentinel), the IR field is required, so
+            // the proc-macro reserves the same scratch layout.
+            let quarter = state.scratch_bytes / 4;
             let half = state.scratch_bytes / 2;
             let q_off = lit(0u32);
-            let q_bytes = lit(half);
-            let k_off = lit(half);
-            let k_bytes = lit(half);
+            let q_bytes = lit(quarter);
+            let k_off = lit(quarter);
+            let k_bytes = lit(quarter);
+            let b_tile_off = lit(2 * quarter);
+            let b_tile_bytes = lit(half);
             let consumer_phase = lit(state.arrives & 1);
             let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
@@ -984,6 +1002,9 @@ pub fn dispatch_instruction_to_push(
                     >::new(),
                     ::ferrite_megakernel::ir::ScratchRegion::<
                         #k_off, #k_bytes, #scratch_lit, ::ferrite_megakernel::ir::RopeScope,
+                    >::new(),
+                    ::ferrite_megakernel::ir::ScratchRegion::<
+                        #b_tile_off, #b_tile_bytes, #scratch_lit, ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
                     ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
                     ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),

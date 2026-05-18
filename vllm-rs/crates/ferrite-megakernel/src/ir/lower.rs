@@ -306,6 +306,8 @@ impl<
         const Q_BYTES: u32,
         const K_OFF: u32,
         const K_BYTES: u32,
+        const B_TILE_OFF: u32,
+        const B_TILE_BYTES: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ITERS: u32,
@@ -346,6 +348,12 @@ impl<
             K_BYTES,
             SCRATCH_BYTES,
             crate::ir::substrate::RopeScope,
+        >,
+        _b_tile: crate::ir::substrate::ScratchRegion<
+            B_TILE_OFF,
+            B_TILE_BYTES,
+            SCRATCH_BYTES,
+            crate::ir::substrate::GemmScope,
         >,
         _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
         _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
@@ -400,6 +408,8 @@ impl<
             Q_BYTES,
             K_OFF,
             K_BYTES,
+            B_TILE_OFF,
+            B_TILE_BYTES,
             CONSUMER_PHASE,
             STORER_PHASE,
             ITERS,
@@ -1743,16 +1753,22 @@ mod tests {
     fn lowers_fused_qkv_rope_cache() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, ChunkK, HeadDim, HiddenDim, IterCount,
-            MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId, RopeScope,
-            ScratchRegion, TileN, WeightAccessorConst,
+            ActSlotConst, ArrivesCount, BarSyncId, ChunkK, GemmScope, HeadDim, HiddenDim,
+            IterCount, MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId,
+            RopeScope, ScratchRegion, TileN, WeightAccessorConst,
         };
         let mut b = Builder8::new();
-        // 6 distinct page ids, q_rope (0,2048) + k_rope (2048,2048) —
-        // disjoint, within 8192 SCRATCH_BYTES. ITERS=4, LAYER=0,
-        // NUM_LAYERS=16, ARRIVES=0, CONSUMER_PHASE=0, STORER_PHASE=1.
-        // S15a: NUM_TOKENS=8, TILE_N=768 (qkv_n=3072 / 4 NCW),
-        // CHUNK_K=512 (HIDDEN_DIM=2048 / ITERS=4), bar_publish=1.
+        // 6 distinct page ids; scratch (8192 bytes total):
+        //   q_rope    [0   .. 2048) RopeScope
+        //   k_rope    [2048.. 4096) RopeScope (disjoint w/ q_rope)
+        //   qkv_b_tile[4096.. 8192) GemmScope (cross-scope: no
+        //                   sealed disjoint proof against rope by
+        //                   substrate; codegen places it after rope).
+        // ITERS=4, LAYER=0, NUM_LAYERS=16, ARRIVES=0,
+        // CONSUMER_PHASE=0, STORER_PHASE=1. S15a: NUM_TOKENS=8,
+        // TILE_N=768 (qkv_n=3072 / 4 NCW), CHUNK_K=512
+        // (HIDDEN_DIM=2048 / ITERS=4), bar_publish=1. S15c:
+        // qkv_b_tile sized for the full per-iter staging tile.
         b.push_fused_qkv_rope_cache(
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
@@ -1763,6 +1779,7 @@ mod tests {
             PageId::<5, 8>::new(),
             ScratchRegion::<0, 2048, 8192, RopeScope>::new(),
             ScratchRegion::<2048, 2048, 8192, RopeScope>::new(),
+            ScratchRegion::<4096, 4096, 8192, GemmScope>::new(),
             MbarrierPhase::<0>::new(),
             MbarrierPhase::<1>::new(),
             IterCount::<4>::new(),
@@ -1800,6 +1817,8 @@ mod tests {
         assert_eq!(n.q_rope_bytes().raw(), 2048);
         assert_eq!(n.k_rope_offset().raw(), 2048);
         assert_eq!(n.k_rope_bytes().raw(), 2048);
+        assert_eq!(n.qkv_b_tile_offset().raw(), 4096);
+        assert_eq!(n.qkv_b_tile_bytes().raw(), 4096);
         assert_eq!(n.iters().raw(), 4);
         assert_eq!(n.num_tokens().raw(), 8);
         assert_eq!(n.tile_n().raw(), 768);

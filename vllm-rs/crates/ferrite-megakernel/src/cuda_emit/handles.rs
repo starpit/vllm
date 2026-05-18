@@ -1,14 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Typed handles for emitted-CUDA values + ferrite substrate
 //! accessors. Each handle carries a [`CuExpr`](super::cu::CuExpr)
-//! plus phantom dtype tags + (where it matters) runtime length /
-//! shape stamps.
+//! plus phantom dtype tags + **const-generic shape**.
 //!
-//! Phantom dtypes catch wrong-dtype handle pass-through statically.
-//! Lengths come from the IR's typed getters at runtime — the Rust
-//! type system can't enumerate them, but the CUDA-side
-//! `static_assert`s inside `kittens::group<N>::load(rv, sv)` and
-//! `mma_AB(...)` will catch shape mismatches at TK 2.0 compile time.
+//! Per [[feedback-end-to-end-compile-time-proofs]] (`MEGA_IR_PLAN.md`
+//! §8.0b), every shape / dim / length the MegaIR encodes as a const
+//! generic flows through to the emit's `tk20::*` call sites at
+//! Rust compile time. A wrong shape on a typed handle is a Rust
+//! type error at `cargo check -p ferrite-megakernel`, not a runtime
+//! `debug_assert_eq!` panic and not a TK 2.0 nvcc `static_assert`
+//! failure later in the pipeline.
+//!
+//! `Sv<T, LEN>`, `Rv<T, LEN>`, `St<T, ROWS, COLS>`,
+//! `Rt<T, L, ROWS, COLS>` carry their shape in the type. The
+//! `tk20::*` bindings that take these handles are const-generic in
+//! the same shape parameters with `where` clauses tying matched
+//! shapes together (e.g. `mma_AB`'s `A.cols == B.rows == K`).
 //!
 //! Substrate accessors emit `ss.pages[N]` / `ss.page_ready[N]` /
 //! `ss.scratch + offset` references against the ferrite-owned
@@ -145,108 +152,93 @@ impl RtLayoutTag for RtCol {
 // Shared / register / pointer / semaphore handles
 // ============================================================
 
-/// Shared column vector — `kittens::sv_<dtype><len>`.
+/// Shared column vector — `kittens::sv_<dtype><LEN>`. `LEN` is a
+/// const generic; mismatched shapes between e.g. an `Sv<Bf16, 64>`
+/// and a `Rv<F32, 32>` argument to a `tk20::group_load_*` binding
+/// fail to typecheck.
 #[derive(Clone, Debug)]
-pub struct Sv<T> {
+pub struct Sv<T, const LEN: u32> {
     expr: CuExpr,
-    len: u32,
     _t: PhantomData<T>,
 }
-impl<T: DtypeName + SvCudaName> Sv<T> {
-    pub(super) fn from_expr(expr: CuExpr, len: u32) -> Self {
+impl<T: DtypeName + SvCudaName, const LEN: u32> Sv<T, LEN> {
+    pub(super) fn from_expr(expr: CuExpr) -> Self {
         Self {
             expr,
-            len,
             _t: PhantomData,
         }
     }
     pub(super) fn expr(&self) -> &CuExpr {
         &self.expr
     }
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-    pub fn cuda_type(&self) -> String {
-        format!("{}<{}>", T::sv_token(), self.len)
+    pub fn cuda_type() -> String {
+        format!("{}<{}>", T::sv_token(), LEN)
     }
 }
 
-/// Register column vector — `kittens::rv_<dtype><len>`.
+/// Register column vector — `kittens::rv_<dtype><LEN>`. `LEN` const
+/// generic.
 #[derive(Clone, Debug)]
-pub struct Rv<T> {
+pub struct Rv<T, const LEN: u32> {
     expr: CuExpr,
-    len: u32,
     _t: PhantomData<T>,
 }
-impl<T: DtypeName + RvCudaName> Rv<T> {
-    pub(super) fn from_expr(expr: CuExpr, len: u32) -> Self {
+impl<T: DtypeName + RvCudaName, const LEN: u32> Rv<T, LEN> {
+    pub(super) fn from_expr(expr: CuExpr) -> Self {
         Self {
             expr,
-            len,
             _t: PhantomData,
         }
     }
     pub(super) fn expr(&self) -> &CuExpr {
         &self.expr
     }
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-    pub fn cuda_type(&self) -> String {
-        format!("{}<{}>", T::rv_token(), self.len)
+    pub fn cuda_type() -> String {
+        format!("{}<{}>", T::rv_token(), LEN)
     }
 }
 
-/// Shared tile — `kittens::st_<dtype><rows, cols>`. Used for the
+/// Shared tile — `kittens::st_<dtype><ROWS, COLS>`. Used for the
 /// gemm activation tile (`[M, K]`), per-iter b_tile chunk
-/// (`[CHUNK_K, N]`), and accumulator landing.
+/// (`[CHUNK_K, N]`), and accumulator landing. `ROWS` and `COLS`
+/// const generics; mismatched shapes between e.g. a
+/// `St<Bf16, 16, 64>` and a `St<Bf16, 16, 128>` arg to a TMA load
+/// fail to typecheck.
 #[derive(Clone, Debug)]
-pub struct St<T> {
+pub struct St<T, const ROWS: u32, const COLS: u32> {
     expr: CuExpr,
-    rows: u32,
-    cols: u32,
     _t: PhantomData<T>,
 }
-impl<T: DtypeName + StCudaName> St<T> {
-    pub(super) fn from_expr(expr: CuExpr, rows: u32, cols: u32) -> Self {
+impl<T: DtypeName + StCudaName, const ROWS: u32, const COLS: u32> St<T, ROWS, COLS> {
+    pub(super) fn from_expr(expr: CuExpr) -> Self {
         Self {
             expr,
-            rows,
-            cols,
             _t: PhantomData,
         }
     }
     pub(super) fn expr(&self) -> &CuExpr {
         &self.expr
     }
-    pub fn rows(&self) -> u32 {
-        self.rows
-    }
-    pub fn cols(&self) -> u32 {
-        self.cols
-    }
-    pub fn cuda_type(&self) -> String {
-        format!("{}<{}, {}>", T::st_token(), self.rows, self.cols)
+    pub fn cuda_type() -> String {
+        format!("{}<{}, {}>", T::st_token(), ROWS, COLS)
     }
 }
 
-/// Register tile — `kittens::rt_<dtype><rows, cols, layout>`.
-/// Layout phantom catches mma_AB row/col mismatches at codegen
-/// build time.
+/// Register tile — `kittens::rt_<dtype><ROWS, COLS, layout>`.
+/// Layout phantom + const-generic shape catch mma_AB row/col +
+/// shape mismatches at Rust type-check time, before nvcc.
 #[derive(Clone, Debug)]
-pub struct Rt<T, L> {
+pub struct Rt<T, L, const ROWS: u32, const COLS: u32> {
     expr: CuExpr,
-    rows: u32,
-    cols: u32,
     _t: PhantomData<T>,
     _l: PhantomData<L>,
 }
-impl<T: DtypeName + RtCudaName, L: RtLayoutTag> Rt<T, L> {
-    pub(super) fn from_expr(expr: CuExpr, rows: u32, cols: u32) -> Self {
+impl<T: DtypeName + RtCudaName, L: RtLayoutTag, const ROWS: u32, const COLS: u32>
+    Rt<T, L, ROWS, COLS>
+{
+    pub(super) fn from_expr(expr: CuExpr) -> Self {
         Self {
             expr,
-            rows,
-            cols,
             _t: PhantomData,
             _l: PhantomData,
         }
@@ -254,18 +246,12 @@ impl<T: DtypeName + RtCudaName, L: RtLayoutTag> Rt<T, L> {
     pub(super) fn expr(&self) -> &CuExpr {
         &self.expr
     }
-    pub fn rows(&self) -> u32 {
-        self.rows
-    }
-    pub fn cols(&self) -> u32 {
-        self.cols
-    }
-    pub fn cuda_type(&self) -> String {
+    pub fn cuda_type() -> String {
         format!(
             "{}<{}, {}{}>",
             T::rt_token(),
-            self.rows,
-            self.cols,
+            ROWS,
+            COLS,
             L::cuda_layout_arg()
         )
     }
@@ -330,7 +316,7 @@ impl<T: DtypeName> ScratchPtr<T> {
 // Ferrite substrate accessors. Emit references against the
 // `SharedState<ConfigT>& ss` symbol and the kernel-entry args
 // (`act_ptrs`, `weight_ptrs`, `barrier_slots`, `input_ids`)
-// established by `lower_to_cuda::render_source`.
+// established by `render_canonical::render_source`.
 // ============================================================
 
 /// `ss.page_ready[<page>]` — loader-arrives / consumer-waits.
@@ -348,15 +334,16 @@ pub fn page_consumed_sem(page: PageRef) -> Semaphore {
     Semaphore::from_expr(CuExpr::new(format!("ss.page_consumed[{}]", page.raw())))
 }
 
-/// Reinterpret-cast a substrate page as a `kittens::sv_bf<len>`.
-pub fn page_as_sv_bf(page: PageRef, len: u32) -> Sv<Bf16> {
-    Sv::from_expr(
-        CuExpr::new(format!(
-            "(*reinterpret_cast<kittens::sv_bf<{len}>*>(ss.pages[{}]))",
-            page.raw()
-        )),
-        len,
-    )
+/// Reinterpret-cast a substrate page as a `kittens::sv_bf<LEN>`.
+/// `LEN` is a const generic; the returned `Sv<Bf16, LEN>` carries
+/// it in the type, so a downstream `tk20::*` call that requires a
+/// different LEN fails to typecheck (per
+/// [[feedback-end-to-end-compile-time-proofs]]).
+pub fn page_as_sv_bf<const LEN: u32>(page: PageRef) -> Sv<Bf16, LEN> {
+    Sv::<Bf16, LEN>::from_expr(CuExpr::new(format!(
+        "(*reinterpret_cast<kittens::sv_bf<{LEN}>*>(ss.pages[{}]))",
+        page.raw()
+    )))
 }
 
 /// `reinterpret_cast<T*>(ss.scratch + <offset>)`.
@@ -516,30 +503,31 @@ pub fn page_as_byte_ptr(page: PageRef) -> CuExpr {
     CuExpr::new(format!("ss.pages[{}]", page.raw()))
 }
 
-/// Reinterpret-cast a substrate page as a `kittens::st_bf<rows, cols>`.
-/// Used for the gemm activation tile view of in_page (shape `[M, K]`)
-/// and the gemm output tile view of out_page (shape `[M, N]`).
-pub fn page_as_st_bf(page: PageRef, rows: u32, cols: u32) -> St<Bf16> {
-    St::from_expr(
-        CuExpr::new(format!(
-            "(*reinterpret_cast<kittens::st_bf<{rows}, {cols}>*>(ss.pages[{}]))",
-            page.raw()
-        )),
-        rows,
-        cols,
-    )
+/// Reinterpret-cast a substrate page as a
+/// `kittens::st_bf<ROWS, COLS>`. `ROWS` and `COLS` are const
+/// generics; the returned `St<Bf16, ROWS, COLS>` carries them in
+/// the type so downstream `tk20::*` calls type-check the shape
+/// at Rust compile time. Used for the gemm activation tile view
+/// of in_page (shape `[M, K]`) and the gemm output tile view of
+/// out_page (shape `[M, N]`).
+pub fn page_as_st_bf<const ROWS: u32, const COLS: u32>(
+    page: PageRef,
+) -> St<Bf16, ROWS, COLS> {
+    St::<Bf16, ROWS, COLS>::from_expr(CuExpr::new(format!(
+        "(*reinterpret_cast<kittens::st_bf<{ROWS}, {COLS}>*>(ss.pages[{}]))",
+        page.raw()
+    )))
 }
 
-/// Reinterpret-cast a slice of substrate scratch starting at `offset`
-/// as a `kittens::st_bf<rows, cols>`. Used for gemm b_tile staging
-/// (`[CHUNK_K, N]` per iter).
-pub fn scratch_as_st_bf(offset: ScratchOffsetRef, rows: u32, cols: u32) -> St<Bf16> {
-    St::from_expr(
-        CuExpr::new(format!(
-            "(*reinterpret_cast<kittens::st_bf<{rows}, {cols}>*>(ss.scratch + {}))",
-            offset.raw()
-        )),
-        rows,
-        cols,
-    )
+/// Reinterpret-cast a slice of substrate scratch starting at
+/// `offset` as a `kittens::st_bf<ROWS, COLS>`. Used for gemm
+/// b_tile staging (`[CHUNK_K, N]` per iter). Const-generic shape
+/// parallel to [`page_as_st_bf`].
+pub fn scratch_as_st_bf<const ROWS: u32, const COLS: u32>(
+    offset: ScratchOffsetRef,
+) -> St<Bf16, ROWS, COLS> {
+    St::<Bf16, ROWS, COLS>::from_expr(CuExpr::new(format!(
+        "(*reinterpret_cast<kittens::st_bf<{ROWS}, {COLS}>*>(ss.scratch + {}))",
+        offset.raw()
+    )))
 }

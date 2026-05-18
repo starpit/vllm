@@ -3,27 +3,36 @@
 //!
 //! Each function below corresponds to exactly one TK 2.0 entry
 //! point in `third_party/thunderkittens/include/`. The Rust
-//! signature pins the typed handles (dtype-checked at codegen
-//! build time); the body emits the corresponding CUDA call as a
-//! [`CuStmt`](super::cu::CuStmt) (or returns a typed handle
-//! wrapping a [`CuExpr`](super::cu::CuExpr) for value-producing
-//! ops like `decl_rv_fl`).
+//! signature pins the typed handles (dtype + **const-generic
+//! shape**) at codegen build time; the body emits the corresponding
+//! CUDA call as a [`CuStmt`](super::cu::CuStmt) (or returns a typed
+//! handle wrapping a [`CuExpr`](super::cu::CuExpr) for value-
+//! producing ops like `decl_rv_fl`).
+//!
+//! Per [[feedback-end-to-end-compile-time-proofs]] (`MEGA_IR_PLAN.md`
+//! §8.0b), every shape / dim / length the MegaIR encodes as a const
+//! generic flows END-TO-END to the `tk20::*` call sites here as a
+//! Rust const generic. Wrong-shape handle pass-through (e.g. an
+//! `St<Bf16, 16, 64>` where an `St<Bf16, 16, 128>` is expected) is a
+//! Rust type error at `cargo check -p ferrite-megakernel` — never a
+//! runtime `debug_assert_eq!` panic, never a TK 2.0 nvcc
+//! `static_assert` failure later in the pipeline.
+//!
+//! The group-scope `N` arg (i.e. `kittens::group<N>::*`) is also a
+//! const generic. NCW is compile-time at the substrate layer
+//! (`SubstrateBudget<_, NUM_CONSUMER_WARPS, _, _, _>`), so flowing
+//! it as `<const N: u32>` here keeps the proof chain unbroken.
 //!
 //! "Calling" a TK 2.0 primitive from emit code is a Rust function
 //! call with type-checked args; the emitted CUDA is the function's
-//! body. Wrong dtype handles fail to typecheck. Length / shape
-//! mismatches surface as TK 2.0 `static_assert` failures at
-//! `nvcc` time on the pod (which is the DOD per
-//! `MEGA_IR_PLAN.md` §8.0a).
-//!
-//! Every function comments its TK 2.0 source citation. NEVER add
-//! a function here without first opening the TK 2.0 header and
+//! body. Every function comments its TK 2.0 source citation. NEVER
+//! add a function here without first opening the TK 2.0 header and
 //! confirming the signature.
 
 use super::cu::{CuExpr, CuStmt};
 use super::handles::{
     Bf16, F32, GmemPtrRaw, Rt, RtCol, RtCudaName, RtLayoutTag, RtRow, Rv, RvCudaName,
-    Semaphore, St, Sv,
+    Semaphore, ScratchPtr, St, Sv,
 };
 
 // ============================================================
@@ -37,9 +46,9 @@ use super::handles::{
 /// `kittens::group<N>::wait(sem, phase);`
 ///
 /// Source: `include/ops/group/util/sync.cuh:112`
-pub fn group_wait(n: u32, sem: &Semaphore, phase: u32) -> CuStmt {
+pub fn group_wait<const N: u32>(sem: &Semaphore, phase: u32) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::wait({sem}, {phase});",
+        "kittens::group<{N}>::wait({sem}, {phase});",
         sem = sem.expr()
     ))
 }
@@ -47,23 +56,26 @@ pub fn group_wait(n: u32, sem: &Semaphore, phase: u32) -> CuStmt {
 /// `kittens::group<N>::arrive(sem);` — auto-laneid-gates internally.
 ///
 /// Source: `include/ops/group/util/sync.cuh:69`
-pub fn group_arrive(n: u32, sem: &Semaphore) -> CuStmt {
+pub fn group_arrive<const N: u32>(sem: &Semaphore) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::arrive({sem});",
+        "kittens::group<{N}>::arrive({sem});",
         sem = sem.expr()
     ))
 }
 
 /// `kittens::group<N>::sync(int id);` — named PTX bar.sync,
-/// id ∈ 1..=15.
+/// id ∈ 1..=15. `bar_id` is a runtime u32 because the IR's
+/// `BarSyncId<ID>` is a 1..=15 sealed witness — the const-generic
+/// proof lives upstream at the IR builder; here we just splice the
+/// literal int the proc-macro extracted from the typed witness.
 ///
 /// Source: `include/ops/group/group.cuh:33`
-pub fn group_sync_named(n: u32, bar_id: u32) -> CuStmt {
+pub fn group_sync_named<const N: u32>(bar_id: u32) -> CuStmt {
     debug_assert!(
         (1..=15).contains(&bar_id),
         "group_sync_named: bar_id ({bar_id}) must be in 1..=15"
     );
-    CuStmt::new(format!("kittens::group<{n}>::sync({bar_id});"))
+    CuStmt::new(format!("kittens::group<{N}>::sync({bar_id});"))
 }
 
 // ============================================================
@@ -78,30 +90,29 @@ pub fn group_sync_named(n: u32, bar_id: u32) -> CuStmt {
 /// auto-laneid-gates internally.
 ///
 /// Source: `include/ops/group/util/tma.cuh:18`
-pub fn group_tma_expect_bytes(n: u32, sem: &Semaphore, bytes: u32) -> CuStmt {
+pub fn group_tma_expect_bytes<const N: u32>(sem: &Semaphore, bytes: u32) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::tma::expect_bytes({sem}, {bytes});",
+        "kittens::group<{N}>::tma::expect_bytes({sem}, {bytes});",
         sem = sem.expr()
     ))
 }
 
 /// `kittens::group<N>::tma::load_async(void* dst, void* src,
 /// uint32_t size_bytes, semaphore& bar);` — auto-laneid-gates.
-/// Casts the typed `Sv<Bf16>` dst and `GmemPtrRaw<Bf16>` src to
+/// Casts the typed `Sv<Bf16, LEN>` dst and `GmemPtrRaw<Bf16>` src to
 /// `void*` at the call site.
 ///
 /// Source: `include/ops/group/util/tma.cuh:72` (group-scope
 /// non-tensor variant; delegates to thread-scope at `:86` of
 /// `include/ops/thread/util/tma.cuh`).
-pub fn group_tma_load_async_raw(
-    n: u32,
-    dst: &Sv<Bf16>,
+pub fn group_tma_load_async_raw<const N: u32, const LEN: u32>(
+    dst: &Sv<Bf16, LEN>,
     src: &GmemPtrRaw<Bf16>,
     size_bytes: u32,
     sem: &Semaphore,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::tma::load_async(\
+        "kittens::group<{N}>::tma::load_async(\
          reinterpret_cast<void*>(&{dst}), \
          reinterpret_cast<void*>({src}), \
          {size_bytes}, \
@@ -117,14 +128,13 @@ pub fn group_tma_load_async_raw(
 /// shared vec to a raw gmem pointer.
 ///
 /// Source: `include/ops/group/util/tma.cuh:82`
-pub fn group_tma_store_async_raw(
-    n: u32,
+pub fn group_tma_store_async_raw<const N: u32, const LEN: u32>(
     dst: &GmemPtrRaw<Bf16>,
-    src: &Sv<Bf16>,
+    src: &Sv<Bf16, LEN>,
     size_bytes: u32,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::tma::store_async(\
+        "kittens::group<{N}>::tma::store_async(\
          reinterpret_cast<void*>({dst}), \
          reinterpret_cast<void*>(&{src}), \
          {size_bytes});",
@@ -137,8 +147,8 @@ pub fn group_tma_store_async_raw(
 /// outstanding TMA stores.
 ///
 /// Source: `include/ops/group/util/tma.cuh:46`
-pub fn group_tma_store_async_wait(n: u32) -> CuStmt {
-    CuStmt::new(format!("kittens::group<{n}>::tma::store_async_wait();"))
+pub fn group_tma_store_async_wait<const N: u32>() -> CuStmt {
+    CuStmt::new(format!("kittens::group<{N}>::tma::store_async_wait();"))
 }
 
 // ============================================================
@@ -146,49 +156,52 @@ pub fn group_tma_store_async_wait(n: u32) -> CuStmt {
 //
 // kittens::group<NCW>::load(rv, sv) and store(sv, rv) auto-slice
 // the shared vec into per-warp subvecs when NCW > 1. The
-// caller's responsibility: ensure `sv.len() == rv.len() * NCW`.
+// caller's responsibility: ensure `SV_LEN == RV_LEN * NCW`.
+//
+// Stable Rust can't express `SV_LEN = RV_LEN * NCW` as a `where`
+// clause without `feature(generic_const_exprs)`. The relation is
+// proved upstream: the IR's MegaTape const generics
+// (`SubstrateBudget::NUM_CONSUMER_WARPS`, the per-op
+// `HiddenDim<HD>`, etc.) flow through to roles.rs and produce
+// matching `SV_LEN` / `RV_LEN` / `NCW` literals at the call site.
+// A wrong relation here fails at TK 2.0 nvcc time via TK's
+// internal `static_assert(SV::length == RV::length * GROUP_WARPS)`.
 // ============================================================
 
-/// `kittens::group<N>::load(rv, sv);` — when N == 1 a direct
-/// load; when N > 1 the SV is auto-sliced into
+/// `kittens::group<NCW>::load(rv, sv);` — when NCW == 1 a direct
+/// load; when NCW > 1 the SV is auto-sliced into
 /// `subvec<RV::length>(warpid())` per-warp.
 ///
 /// Source: `include/ops/group/memory/vec/shared_to_register.cuh:14`
 /// (the `else` branch at line 84 does the auto-subvec).
-pub fn group_load_sv_to_rv_bf16_to_f32(
-    n: u32,
-    rv: &Rv<F32>,
-    sv: &Sv<Bf16>,
+pub fn group_load_sv_to_rv_bf16_to_f32<
+    const NCW: u32,
+    const RV_LEN: u32,
+    const SV_LEN: u32,
+>(
+    rv: &Rv<F32, RV_LEN>,
+    sv: &Sv<Bf16, SV_LEN>,
 ) -> CuStmt {
-    debug_assert!(
-        n > 0 && sv.len() == rv.len() * n,
-        "group_load_sv_to_rv_bf16_to_f32: sv.len ({}) must equal rv.len ({}) * N ({n})",
-        sv.len(),
-        rv.len()
-    );
     CuStmt::new(format!(
-        "kittens::group<{n}>::load({rv}, {sv});",
+        "kittens::group<{NCW}>::load({rv}, {sv});",
         rv = rv.expr(),
         sv = sv.expr()
     ))
 }
 
-/// `kittens::group<N>::store(sv, rv);` — symmetric to load.
+/// `kittens::group<NCW>::store(sv, rv);` — symmetric to load.
 ///
 /// Source: `include/ops/group/memory/vec/shared_to_register.cuh:101`
-pub fn group_store_rv_to_sv_f32_to_bf16(
-    n: u32,
-    sv: &Sv<Bf16>,
-    rv: &Rv<F32>,
+pub fn group_store_rv_to_sv_f32_to_bf16<
+    const NCW: u32,
+    const RV_LEN: u32,
+    const SV_LEN: u32,
+>(
+    sv: &Sv<Bf16, SV_LEN>,
+    rv: &Rv<F32, RV_LEN>,
 ) -> CuStmt {
-    debug_assert!(
-        n > 0 && sv.len() == rv.len() * n,
-        "group_store_rv_to_sv_f32_to_bf16: sv.len ({}) must equal rv.len ({}) * N ({n})",
-        sv.len(),
-        rv.len()
-    );
     CuStmt::new(format!(
-        "kittens::group<{n}>::store({sv}, {rv});",
+        "kittens::group<{NCW}>::store({sv}, {rv});",
         sv = sv.expr(),
         rv = rv.expr()
     ))
@@ -202,11 +215,10 @@ pub fn group_store_rv_to_sv_f32_to_bf16(
 /// copy.
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:176`
-pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName>(
-    dst: &Rv<T>,
-    src: &Rv<T>,
+pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName, const LEN: u32>(
+    dst: &Rv<T, LEN>,
+    src: &Rv<T, LEN>,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), src.len());
     CuStmt::new(format!(
         "kittens::warp::copy({dst}, {src});",
         dst = dst.expr(),
@@ -218,13 +230,11 @@ pub fn warp_copy_rv<T: super::handles::DtypeName + RvCudaName>(
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:359` (rv-rv
 /// overload via the `bin_op` template at `:35`).
-pub fn warp_mul_rv_rv(
-    dst: &Rv<F32>,
-    lhs: &Rv<F32>,
-    rhs: &Rv<F32>,
+pub fn warp_mul_rv_rv<const LEN: u32>(
+    dst: &Rv<F32, LEN>,
+    lhs: &Rv<F32, LEN>,
+    rhs: &Rv<F32, LEN>,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), lhs.len());
-    debug_assert_eq!(lhs.len(), rhs.len());
     CuStmt::new(format!(
         "kittens::warp::mul({dst}, {lhs}, {rhs});",
         dst = dst.expr(),
@@ -236,13 +246,11 @@ pub fn warp_mul_rv_rv(
 /// `kittens::warp::add(dst, lhs, rhs);` — rv-rv elementwise add.
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:333`
-pub fn warp_add_rv_rv(
-    dst: &Rv<F32>,
-    lhs: &Rv<F32>,
-    rhs: &Rv<F32>,
+pub fn warp_add_rv_rv<const LEN: u32>(
+    dst: &Rv<F32, LEN>,
+    lhs: &Rv<F32, LEN>,
+    rhs: &Rv<F32, LEN>,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), lhs.len());
-    debug_assert_eq!(lhs.len(), rhs.len());
     CuStmt::new(format!(
         "kittens::warp::add({dst}, {lhs}, {rhs});",
         dst = dst.expr(),
@@ -256,12 +264,11 @@ pub fn warp_add_rv_rv(
 /// Source: `include/ops/group/register/vec/maps.cuh:54-55` (the
 /// `bin_op(T &dst, const T &src, const typename T::dtype &param)`
 /// scalar overload — `add` reaches it via the same dispatch).
-pub fn warp_add_rv_scalar_f32(
-    dst: &Rv<F32>,
-    src: &Rv<F32>,
+pub fn warp_add_rv_scalar_f32<const LEN: u32>(
+    dst: &Rv<F32, LEN>,
+    src: &Rv<F32, LEN>,
     scalar: &CuExpr,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), src.len());
     CuStmt::new(format!(
         "kittens::warp::add({dst}, {src}, {scalar});",
         dst = dst.expr(),
@@ -274,12 +281,11 @@ pub fn warp_add_rv_scalar_f32(
 /// Source: `include/ops/group/register/vec/maps.cuh:54-55` (the
 /// `bin_op(T &dst, const T &src, const typename T::dtype &param)`
 /// scalar overload — `mul` reaches it via the same dispatch).
-pub fn warp_mul_rv_scalar_f32(
-    dst: &Rv<F32>,
-    src: &Rv<F32>,
+pub fn warp_mul_rv_scalar_f32<const LEN: u32>(
+    dst: &Rv<F32, LEN>,
+    src: &Rv<F32, LEN>,
     scalar: &CuExpr,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), src.len());
     CuStmt::new(format!(
         "kittens::warp::mul({dst}, {src}, {scalar});",
         dst = dst.expr(),
@@ -291,9 +297,9 @@ pub fn warp_mul_rv_scalar_f32(
 /// into a scalar mut-ref out arg.
 ///
 /// Source: `include/ops/group/register/vec/reductions.cuh:129`
-pub fn warp_sum_to_scalar_f32(
+pub fn warp_sum_to_scalar_f32<const LEN: u32>(
     scalar_out: &CuExpr,
-    src: &Rv<F32>,
+    src: &Rv<F32, LEN>,
 ) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::sum({scalar_out}, {src});",
@@ -315,11 +321,10 @@ pub fn warp_sum_to_scalar_f32(
 /// indexing and the for-loop are vanilla C++ wrapping those
 /// primitives — same pattern TK uses internally for cross-warp
 /// reductions.
-pub fn cross_warp_reduce_sum_f32(
+pub fn cross_warp_reduce_sum_f32<const NCW: u32>(
     scalar_out_name: &str,
     partial_in_name: &str,
-    scratch: &super::handles::ScratchPtr<F32>,
-    ncw: u32,
+    scratch: &ScratchPtr<F32>,
     bar_id: u32,
 ) -> CuStmt {
     debug_assert!(
@@ -328,9 +333,9 @@ pub fn cross_warp_reduce_sum_f32(
     );
     CuStmt::new(format!(
         "if (kittens::laneid() == 0) {{ {scratch}[kittens::warpid()] = {partial}; }}\n\
-         kittens::group<{ncw}>::sync({bar_id});\n\
+         kittens::group<{NCW}>::sync({bar_id});\n\
          #pragma unroll\n\
-         for (int __cw_i = 0; __cw_i < {ncw}; ++__cw_i) {{ {out} += {scratch}[__cw_i]; }}",
+         for (int __cw_i = 0; __cw_i < {NCW}; ++__cw_i) {{ {out} += {scratch}[__cw_i]; }}",
         scratch = scratch.expr(),
         partial = partial_in_name,
         out = scalar_out_name
@@ -341,15 +346,15 @@ pub fn cross_warp_reduce_sum_f32(
 /// + <eps>f);` — declare and bind the canonical RMS scale local.
 /// Wraps a CUDA math intrinsic + arithmetic; not a TK 2.0 primitive
 /// per se but the standard expression used in every RmsNorm-flavor
-/// op body.
-pub fn decl_rms_scale_local(
+/// op body. `HIDDEN_DIM` is const-generic (the IR's `HiddenDim<HD>`
+/// proof flowing through end-to-end).
+pub fn decl_rms_scale_local<const HIDDEN_DIM: u32>(
     name: &str,
     full_sum_name: &str,
-    hidden_dim: u32,
     eps: f32,
 ) -> (CuStmt, CuExpr) {
     let stmt = CuStmt::new(format!(
-        "const float {name} = rsqrtf({sum} / {hidden_dim}.0f + {eps:e}f);",
+        "const float {name} = rsqrtf({sum} / {HIDDEN_DIM}.0f + {eps:e}f);",
         sum = full_sum_name
     ));
     (stmt, CuExpr::new(name.to_string()))
@@ -369,24 +374,22 @@ pub fn decl_rms_scale_local(
 /// + a vanilla C++ `for` loop and `+= tok * row_bytes` pointer
 /// arithmetic. The arithmetic is the standard "stride per row"
 /// pattern used by every per-token gather; not invented scheduling.
-pub fn embed_per_token_gather(
+pub fn embed_per_token_gather<const HIDDEN_DIM: u32, const NUM_TOKENS: u32>(
     out_byte_ptr: &CuExpr,
     embed_table_ptr: &GmemPtrRaw<Bf16>,
     input_ids_ptr: &CuExpr,
-    hidden_dim: u32,
-    num_tokens: u32,
     page_ready: &Semaphore,
 ) -> CuStmt {
-    let row_bytes = hidden_dim * 2;
-    let total_bytes = row_bytes * num_tokens;
+    let row_bytes = HIDDEN_DIM * 2;
+    let total_bytes = row_bytes * NUM_TOKENS;
     CuStmt::new(format!(
         "kittens::group<1>::tma::expect_bytes({sem}, {total_bytes});\n\
-         for (int __embed_t = 0; __embed_t < {num_tokens}; ++__embed_t) {{\n\
+         for (int __embed_t = 0; __embed_t < {NUM_TOKENS}; ++__embed_t) {{\n\
          \x20   const uint32_t __embed_row = {ids}[__embed_t];\n\
          \x20   void* __embed_dst = static_cast<void*>(\
          reinterpret_cast<char*>({dst}) + __embed_t * {row_bytes});\n\
          \x20   void* __embed_src = static_cast<void*>(\
-         {table} + static_cast<size_t>(__embed_row) * {hidden_dim});\n\
+         {table} + static_cast<size_t>(__embed_row) * {HIDDEN_DIM});\n\
          \x20   kittens::group<1>::tma::load_async(__embed_dst, __embed_src, {row_bytes}, {sem});\n\
          }}",
         sem = page_ready.expr(),
@@ -401,37 +404,35 @@ pub fn embed_per_token_gather(
 /// staging volume, then a per-token loop that issues one
 /// `kittens::group<1>::tma::load_async` per row. Row index is
 /// `positions[t]` (FQRC's rotary indirection), row size is
-/// `head_dim * sizeof(bf16)` bytes (one packed cos/sin row), and
+/// `HEAD_DIM * sizeof(bf16)` bytes (one packed cos/sin row), and
 /// rows land contiguously in shared at `dst + t * row_bytes`.
 ///
 /// Mirror of [`embed_per_token_gather`] with the row index source
 /// swapped from `input_ids` → `positions` and the row stride
-/// swapped from `hidden_dim` → `head_dim`. The cos_sin gmem table
-/// is shape `[max_pos, head_dim]` (packed `[cos[0..hd/2],
+/// swapped from `HIDDEN_DIM` → `HEAD_DIM`. The cos_sin gmem table
+/// is shape `[max_pos, HEAD_DIM]` (packed `[cos[0..hd/2],
 /// sin[0..hd/2]]` per row) — same convention as
 /// `fused_qkv_rope_cache_bf16` in `crates/ferrite-kernels/src/
 /// kernels.rs:681`.
 ///
 /// Source: `include/ops/group/util/tma.cuh:18` (expect_bytes) +
 /// `include/ops/group/util/tma.cuh:72` (load_async, raw).
-pub fn cos_sin_per_token_gather(
+pub fn cos_sin_per_token_gather<const HEAD_DIM: u32, const NUM_TOKENS: u32>(
     out_byte_ptr: &CuExpr,
     cos_sin_table_ptr: &GmemPtrRaw<Bf16>,
     positions_ptr: &CuExpr,
-    head_dim: u32,
-    num_tokens: u32,
     page_ready: &Semaphore,
 ) -> CuStmt {
-    let row_bytes = head_dim * 2;
-    let total_bytes = row_bytes * num_tokens;
+    let row_bytes = HEAD_DIM * 2;
+    let total_bytes = row_bytes * NUM_TOKENS;
     CuStmt::new(format!(
         "kittens::group<1>::tma::expect_bytes({sem}, {total_bytes});\n\
-         for (int __cs_t = 0; __cs_t < {num_tokens}; ++__cs_t) {{\n\
+         for (int __cs_t = 0; __cs_t < {NUM_TOKENS}; ++__cs_t) {{\n\
          \x20   const uint32_t __cs_row = {pos}[__cs_t];\n\
          \x20   void* __cs_dst = static_cast<void*>(\
          reinterpret_cast<char*>({dst}) + __cs_t * {row_bytes});\n\
          \x20   void* __cs_src = static_cast<void*>(\
-         {table} + static_cast<size_t>(__cs_row) * {head_dim});\n\
+         {table} + static_cast<size_t>(__cs_row) * {HEAD_DIM});\n\
          \x20   kittens::group<1>::tma::load_async(__cs_dst, __cs_src, {row_bytes}, {sem});\n\
          }}",
         sem = page_ready.expr(),
@@ -450,17 +451,15 @@ pub fn cos_sin_per_token_gather(
 /// Single TMA store would also work for contiguous gmem regions,
 /// but per-token mirrors the loader's gather pattern and stays
 /// correct even if the gmem destination layout changes.
-pub fn per_token_tma_store(
+pub fn per_token_tma_store<const HIDDEN_DIM: u32, const NUM_TOKENS: u32>(
     out_gmem: &GmemPtrRaw<Bf16>,
     src_byte_ptr: &CuExpr,
-    hidden_dim: u32,
-    num_tokens: u32,
 ) -> CuStmt {
-    let row_bytes = hidden_dim * 2;
+    let row_bytes = HIDDEN_DIM * 2;
     CuStmt::new(format!(
-        "for (int __pt_t = 0; __pt_t < {num_tokens}; ++__pt_t) {{\n\
+        "for (int __pt_t = 0; __pt_t < {NUM_TOKENS}; ++__pt_t) {{\n\
          \x20   void* __pt_dst = static_cast<void*>(\
-         {gmem} + static_cast<size_t>(__pt_t) * {hidden_dim});\n\
+         {gmem} + static_cast<size_t>(__pt_t) * {HIDDEN_DIM});\n\
          \x20   void* __pt_src = static_cast<void*>(\
          reinterpret_cast<char*>({src}) + __pt_t * {row_bytes});\n\
          \x20   kittens::group<1>::tma::store_async(__pt_dst, __pt_src, {row_bytes});\n\
@@ -517,12 +516,11 @@ pub fn block_warp_zero(stmts: &[CuStmt]) -> CuStmt {
 /// 2.0 signature; we ignore the idx in lambda_body callers.
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh:79-112`
-pub fn warp_apply_f32_lambda(
-    dst: &Rv<F32>,
-    src: &Rv<F32>,
+pub fn warp_apply_f32_lambda<const LEN: u32>(
+    dst: &Rv<F32, LEN>,
+    src: &Rv<F32, LEN>,
     lambda_body: &str,
 ) -> CuStmt {
-    debug_assert_eq!(dst.len(), src.len());
     CuStmt::new(format!(
         "kittens::warp::apply({dst}, {src}, [] __device__ (int /*idx*/, float x) {{ return {body}; }});",
         dst = dst.expr(),
@@ -537,9 +535,9 @@ pub fn warp_apply_f32_lambda(
 
 /// `kittens::rv_fl<LEN> <name>;` — declare a local register vector
 /// + return a handle bound to it.
-pub fn decl_rv_fl(name: &str, len: u32) -> (CuStmt, Rv<F32>) {
-    let stmt = CuStmt::new(format!("kittens::rv_fl<{len}> {name};"));
-    (stmt, Rv::from_expr(CuExpr::new(name.to_string()), len))
+pub fn decl_rv_fl<const LEN: u32>(name: &str) -> (CuStmt, Rv<F32, LEN>) {
+    let stmt = CuStmt::new(format!("kittens::rv_fl<{LEN}> {name};"));
+    (stmt, Rv::<F32, LEN>::from_expr(CuExpr::new(name.to_string())))
 }
 
 /// `float <name> = 0.0f;` — declare a fp32 scalar accumulator;
@@ -559,18 +557,28 @@ pub fn decl_local_f32(name: &str, init: &str) -> (CuStmt, CuExpr) {
 /// row-layout-typed.
 ///
 /// Source: `include/types/register/rt.cuh:142` (rt_fl alias).
-pub fn decl_rt_fl(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<F32, RtRow>) {
-    let stmt = CuStmt::new(format!("kittens::rt_fl<{rows}, {cols}> {name};"));
-    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+pub fn decl_rt_fl<const ROWS: u32, const COLS: u32>(
+    name: &str,
+) -> (CuStmt, Rt<F32, RtRow, ROWS, COLS>) {
+    let stmt = CuStmt::new(format!("kittens::rt_fl<{ROWS}, {COLS}> {name};"));
+    (
+        stmt,
+        Rt::<F32, RtRow, ROWS, COLS>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `kittens::rt_bf<rows, cols> <name>;` — declare local bf16
 /// register tile in row layout (mma_AB A operand).
 ///
 /// Source: `include/types/register/rt.cuh:143` (rt_bf alias).
-pub fn decl_rt_bf_row(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<Bf16, RtRow>) {
-    let stmt = CuStmt::new(format!("kittens::rt_bf<{rows}, {cols}> {name};"));
-    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+pub fn decl_rt_bf_row<const ROWS: u32, const COLS: u32>(
+    name: &str,
+) -> (CuStmt, Rt<Bf16, RtRow, ROWS, COLS>) {
+    let stmt = CuStmt::new(format!("kittens::rt_bf<{ROWS}, {COLS}> {name};"));
+    (
+        stmt,
+        Rt::<Bf16, RtRow, ROWS, COLS>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `kittens::rt_bf<rows, cols, kittens::ducks::rt_layout::col>
@@ -578,19 +586,29 @@ pub fn decl_rt_bf_row(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<Bf16, RtR
 /// (mma_AB B operand).
 ///
 /// Source: `include/types/register/rt.cuh:143` + `rt_layout.cuh`.
-pub fn decl_rt_bf_col(name: &str, rows: u32, cols: u32) -> (CuStmt, Rt<Bf16, RtCol>) {
+pub fn decl_rt_bf_col<const ROWS: u32, const COLS: u32>(
+    name: &str,
+) -> (CuStmt, Rt<Bf16, RtCol, ROWS, COLS>) {
     let stmt = CuStmt::new(format!(
-        "kittens::rt_bf<{rows}, {cols}, kittens::ducks::rt_layout::col> {name};"
+        "kittens::rt_bf<{ROWS}, {COLS}, kittens::ducks::rt_layout::col> {name};"
     ));
-    (stmt, Rt::from_expr(CuExpr::new(name.to_string()), rows, cols))
+    (
+        stmt,
+        Rt::<Bf16, RtCol, ROWS, COLS>::from_expr(CuExpr::new(name.to_string())),
+    )
 }
 
 /// `kittens::warp::zero(rt);` — set every element of a register
 /// tile to zero (canonical accumulator init).
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:421-424`.
-pub fn warp_zero_rt<T: super::handles::DtypeName + RtCudaName, L: RtLayoutTag>(
-    rt: &Rt<T, L>,
+pub fn warp_zero_rt<
+    T: super::handles::DtypeName + RtCudaName,
+    L: RtLayoutTag,
+    const ROWS: u32,
+    const COLS: u32,
+>(
+    rt: &Rt<T, L, ROWS, COLS>,
 ) -> CuStmt {
     CuStmt::new(format!("kittens::warp::zero({});", rt.expr()))
 }
@@ -603,24 +621,10 @@ pub fn warp_zero_rt<T: super::handles::DtypeName + RtCudaName, L: RtLayoutTag>(
 /// internally — TK handles both.
 ///
 /// Source: `include/ops/group/memory/tile/shared_to_register.cuh:14-128`.
-pub fn warp_load_rt_from_st_bf<L: RtLayoutTag>(
-    rt: &Rt<Bf16, L>,
-    st: &St<Bf16>,
+pub fn warp_load_rt_from_st_bf<L: RtLayoutTag, const ROWS: u32, const COLS: u32>(
+    rt: &Rt<Bf16, L, ROWS, COLS>,
+    st: &St<Bf16, ROWS, COLS>,
 ) -> CuStmt {
-    debug_assert_eq!(
-        rt.rows(),
-        st.rows(),
-        "warp_load_rt_from_st_bf: rt.rows ({}) must equal st.rows ({})",
-        rt.rows(),
-        st.rows()
-    );
-    debug_assert_eq!(
-        rt.cols(),
-        st.cols(),
-        "warp_load_rt_from_st_bf: rt.cols ({}) must equal st.cols ({})",
-        rt.cols(),
-        st.cols()
-    );
     CuStmt::new(format!(
         "kittens::warp::load({rt}, {st});",
         rt = rt.expr(),
@@ -636,13 +640,11 @@ pub fn warp_load_rt_from_st_bf<L: RtLayoutTag>(
 /// (silu / gelu) in `FusedGateUpActivateMul`.
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:89-115`.
-pub fn warp_apply_f32_rt_lambda(
-    dst: &Rt<F32, RtRow>,
-    src: &Rt<F32, RtRow>,
+pub fn warp_apply_f32_rt_lambda<const ROWS: u32, const COLS: u32>(
+    dst: &Rt<F32, RtRow, ROWS, COLS>,
+    src: &Rt<F32, RtRow, ROWS, COLS>,
     lambda_body: &str,
 ) -> CuStmt {
-    debug_assert_eq!(dst.rows(), src.rows());
-    debug_assert_eq!(dst.cols(), src.cols());
     CuStmt::new(format!(
         "kittens::warp::apply({dst}, {src}, [] __device__ (int /*row*/, int /*col*/, float x) {{ return {body}; }});",
         dst = dst.expr(),
@@ -656,15 +658,11 @@ pub fn warp_apply_f32_rt_lambda(
 /// dtype/layout (TK 2.0's `bin_map<base_ops::mul, T>`).
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:707-710`.
-pub fn warp_mul_rt_rt(
-    dst: &Rt<F32, RtRow>,
-    lhs: &Rt<F32, RtRow>,
-    rhs: &Rt<F32, RtRow>,
+pub fn warp_mul_rt_rt<const ROWS: u32, const COLS: u32>(
+    dst: &Rt<F32, RtRow, ROWS, COLS>,
+    lhs: &Rt<F32, RtRow, ROWS, COLS>,
+    rhs: &Rt<F32, RtRow, ROWS, COLS>,
 ) -> CuStmt {
-    debug_assert_eq!(dst.rows(), lhs.rows());
-    debug_assert_eq!(dst.cols(), lhs.cols());
-    debug_assert_eq!(lhs.rows(), rhs.rows());
-    debug_assert_eq!(lhs.cols(), rhs.cols());
     CuStmt::new(format!(
         "kittens::warp::mul({dst}, {lhs}, {rhs});",
         dst = dst.expr(),
@@ -681,24 +679,10 @@ pub fn warp_mul_rt_rt(
 /// accumulator as the mma C operand (`acc = A*B + residual`).
 ///
 /// Source: `include/ops/group/memory/tile/shared_to_register.cuh:14-128`.
-pub fn warp_load_rt_fl_from_st_bf(
-    rt: &Rt<F32, RtRow>,
-    st: &St<Bf16>,
+pub fn warp_load_rt_fl_from_st_bf<const ROWS: u32, const COLS: u32>(
+    rt: &Rt<F32, RtRow, ROWS, COLS>,
+    st: &St<Bf16, ROWS, COLS>,
 ) -> CuStmt {
-    debug_assert_eq!(
-        rt.rows(),
-        st.rows(),
-        "warp_load_rt_fl_from_st_bf: rt.rows ({}) must equal st.rows ({})",
-        rt.rows(),
-        st.rows()
-    );
-    debug_assert_eq!(
-        rt.cols(),
-        st.cols(),
-        "warp_load_rt_fl_from_st_bf: rt.cols ({}) must equal st.cols ({})",
-        rt.cols(),
-        st.cols()
-    );
     CuStmt::new(format!(
         "kittens::warp::load({rt}, {st});",
         rt = rt.expr(),
@@ -710,27 +694,13 @@ pub fn warp_load_rt_fl_from_st_bf(
 /// store. Same shape constraints as
 /// [`warp_load_rt_from_st_bf`]. Used to land the gemm fp32
 /// accumulator (downcast to bf16 by TK's internal type-converter)
-/// back into a shared `st_bf<M, TILE_N>` slice of out_smem.
+/// back into a shared `st_bf<ROWS, COLS>` slice of out_smem.
 ///
 /// Source: `include/ops/group/memory/tile/shared_to_register.cuh:138-244`.
-pub fn warp_store_st_bf_from_rt_fl(
-    st: &St<Bf16>,
-    rt: &Rt<F32, RtRow>,
+pub fn warp_store_st_bf_from_rt_fl<const ROWS: u32, const COLS: u32>(
+    st: &St<Bf16, ROWS, COLS>,
+    rt: &Rt<F32, RtRow, ROWS, COLS>,
 ) -> CuStmt {
-    debug_assert_eq!(
-        rt.rows(),
-        st.rows(),
-        "warp_store_st_bf_from_rt_fl: rt.rows ({}) must equal st.rows ({})",
-        rt.rows(),
-        st.rows()
-    );
-    debug_assert_eq!(
-        rt.cols(),
-        st.cols(),
-        "warp_store_st_bf_from_rt_fl: rt.cols ({}) must equal st.cols ({})",
-        rt.cols(),
-        st.cols()
-    );
     CuStmt::new(format!(
         "kittens::warp::store({st}, {rt});",
         st = st.expr(),
@@ -740,53 +710,19 @@ pub fn warp_store_st_bf_from_rt_fl(
 
 /// `kittens::warp::mma_AB(d, a, b, c);` — `D = A * B + C` with
 /// D=fp32 row, A=bf16 row, B=bf16 col, C=fp32 row. Layouts and
-/// shape compat are enforced by TK 2.0 `static_assert`s
-/// (D::rows==A::rows, D::cols==B::cols, A::cols==B::rows,
-/// D::rows==C::rows, D::cols==C::cols).
+/// shape compat are enforced by Rust const generics:
+///   D: [M, N], A: [M, K], B: [K, N], C: [M, N].
+/// TK 2.0 `static_assert`s catch the same constraints later as a
+/// belt-and-braces check.
 ///
 /// Source: `include/ops/group/mma/warp.cuh:583-632`.
 #[allow(non_snake_case)]
-pub fn warp_mma_AB(
-    d: &Rt<F32, RtRow>,
-    a: &Rt<Bf16, RtRow>,
-    b: &Rt<Bf16, RtCol>,
-    c: &Rt<F32, RtRow>,
+pub fn warp_mma_AB<const M: u32, const K: u32, const N: u32>(
+    d: &Rt<F32, RtRow, M, N>,
+    a: &Rt<Bf16, RtRow, M, K>,
+    b: &Rt<Bf16, RtCol, K, N>,
+    c: &Rt<F32, RtRow, M, N>,
 ) -> CuStmt {
-    debug_assert_eq!(
-        d.rows(),
-        a.rows(),
-        "warp_mma_AB: D.rows ({}) must equal A.rows ({})",
-        d.rows(),
-        a.rows()
-    );
-    debug_assert_eq!(
-        d.cols(),
-        b.cols(),
-        "warp_mma_AB: D.cols ({}) must equal B.cols ({})",
-        d.cols(),
-        b.cols()
-    );
-    debug_assert_eq!(
-        a.cols(),
-        b.rows(),
-        "warp_mma_AB: A.cols ({}) must equal B.rows ({})",
-        a.cols(),
-        b.rows()
-    );
-    debug_assert_eq!(
-        d.rows(),
-        c.rows(),
-        "warp_mma_AB: D.rows ({}) must equal C.rows ({})",
-        d.rows(),
-        c.rows()
-    );
-    debug_assert_eq!(
-        d.cols(),
-        c.cols(),
-        "warp_mma_AB: D.cols ({}) must equal C.cols ({})",
-        d.cols(),
-        c.cols()
-    );
     CuStmt::new(format!(
         "kittens::warp::mma_AB({d}, {a}, {b}, {c});",
         d = d.expr(),
@@ -798,7 +734,8 @@ pub fn warp_mma_AB(
 
 /// `auto <name> = <parent>.template subtile<rows, cols>(int2{row, col});`
 /// — declare a named local binding to a shared-tile soft-subtile
-/// view (`st_subtile`). Returns the bound `St<Bf16>` handle.
+/// view (`st_subtile`). Returns the bound `St<Bf16, ROWS, COLS>`
+/// handle.
 ///
 /// `kittens::st<>::subtile<rows, cols>(int2)` is a non-const
 /// member returning the subtile by VALUE. Binding via `auto`
@@ -808,21 +745,28 @@ pub fn warp_mma_AB(
 ///
 /// `row_idx_expr` / `col_idx_expr` are CUDA expressions in scope
 /// (e.g. `"0"`, `"k_iter"`, `"static_cast<int>(kittens::warpid())"`).
+/// The PARENT_ROWS / PARENT_COLS const generics on the parent are
+/// existential here — any parent shape is valid as long as the
+/// requested subtile fits, which TK 2.0 catches via its own
+/// `static_assert`.
 ///
 /// Source: `include/types/shared/st.cuh:152-153,191-272`.
-pub fn decl_st_bf_subtile(
+pub fn decl_st_bf_subtile<
+    const PARENT_ROWS: u32,
+    const PARENT_COLS: u32,
+    const ROWS: u32,
+    const COLS: u32,
+>(
     name: &str,
-    parent: &St<Bf16>,
-    rows: u32,
-    cols: u32,
+    parent: &St<Bf16, PARENT_ROWS, PARENT_COLS>,
     row_idx_expr: &str,
     col_idx_expr: &str,
-) -> (CuStmt, St<Bf16>) {
+) -> (CuStmt, St<Bf16, ROWS, COLS>) {
     let stmt = CuStmt::new(format!(
-        "auto {name} = ({parent}).template subtile<{rows}, {cols}>(int2{{{row_idx_expr}, {col_idx_expr}}});",
+        "auto {name} = ({parent}).template subtile<{ROWS}, {COLS}>(int2{{{row_idx_expr}, {col_idx_expr}}});",
         parent = parent.expr()
     ));
-    let handle = St::from_expr(CuExpr::new(name.to_string()), rows, cols);
+    let handle = St::<Bf16, ROWS, COLS>::from_expr(CuExpr::new(name.to_string()));
     (stmt, handle)
 }
 
@@ -836,18 +780,21 @@ pub fn decl_st_bf_subtile(
 
 /// Tile-flavored `kittens::group<N>::tma::load_async(void* dst,
 /// void* src, uint32_t bytes, sem& bar);` — stages a contiguous
-/// `[rows, cols]` bf16 block from gmem into a shared tile.
+/// `[ROWS, COLS]` bf16 block from gmem into a shared tile.
 ///
 /// Source: `include/ops/group/util/tma.cuh:72`.
-pub fn group_tma_load_async_raw_st_bf(
-    n: u32,
-    dst: &St<Bf16>,
+pub fn group_tma_load_async_raw_st_bf<
+    const N: u32,
+    const ROWS: u32,
+    const COLS: u32,
+>(
+    dst: &St<Bf16, ROWS, COLS>,
     src: &GmemPtrRaw<Bf16>,
     size_bytes: u32,
     sem: &Semaphore,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::tma::load_async(\
+        "kittens::group<{N}>::tma::load_async(\
          reinterpret_cast<void*>(&{dst}), \
          reinterpret_cast<void*>({src}), \
          {size_bytes}, \
@@ -860,17 +807,20 @@ pub fn group_tma_load_async_raw_st_bf(
 
 /// Tile-flavored `kittens::group<N>::tma::store_async(void* dst,
 /// void* src, uint32_t bytes);` — stores a contiguous
-/// `[rows, cols]` bf16 block from a shared tile to gmem.
+/// `[ROWS, COLS]` bf16 block from a shared tile to gmem.
 ///
 /// Source: `include/ops/group/util/tma.cuh:82`.
-pub fn group_tma_store_async_raw_st_bf(
-    n: u32,
+pub fn group_tma_store_async_raw_st_bf<
+    const N: u32,
+    const ROWS: u32,
+    const COLS: u32,
+>(
     dst: &GmemPtrRaw<Bf16>,
-    src: &St<Bf16>,
+    src: &St<Bf16, ROWS, COLS>,
     size_bytes: u32,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::group<{n}>::tma::store_async(\
+        "kittens::group<{N}>::tma::store_async(\
          reinterpret_cast<void*>({dst}), \
          reinterpret_cast<void*>(&{src}), \
          {size_bytes});",
@@ -895,8 +845,10 @@ pub fn group_tma_store_async_raw_st_bf(
 /// of a tile into a row vector. Initial pass (no running accum).
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:253`.
-pub fn warp_row_max_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+pub fn warp_row_max_init<const ROWS: u32, const COLS: u32>(
+    rv_dst: &Rv<F32, ROWS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::row_max({rv}, {rt});",
         rv = rv_dst.expr(),
@@ -910,13 +862,11 @@ pub fn warp_row_max_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
 /// across KV blocks.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:303`.
-pub fn warp_row_max_running(
-    rv_dst: &Rv<F32>,
-    rt_src: &Rt<F32, RtRow>,
-    rv_src_accum: &Rv<F32>,
+pub fn warp_row_max_running<const ROWS: u32, const COLS: u32>(
+    rv_dst: &Rv<F32, ROWS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+    rv_src_accum: &Rv<F32, ROWS>,
 ) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rt_src.rows());
-    debug_assert_eq!(rv_dst.len(), rv_src_accum.len());
     CuStmt::new(format!(
         "kittens::warp::row_max({rv}, {rt}, {acc});",
         rv = rv_dst.expr(),
@@ -929,8 +879,10 @@ pub fn warp_row_max_running(
 /// Initial pass.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:277`.
-pub fn warp_row_sum_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rt_src.rows());
+pub fn warp_row_sum_init<const ROWS: u32, const COLS: u32>(
+    rv_dst: &Rv<F32, ROWS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::row_sum({rv}, {rt});",
         rv = rv_dst.expr(),
@@ -943,13 +895,11 @@ pub fn warp_row_sum_init(rv_dst: &Rv<F32>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
 /// track `sum_prev * scale + row_sum(exp(scores))`.
 ///
 /// Source: `include/ops/group/register/tile/reductions.cuh:329`.
-pub fn warp_row_sum_running(
-    rv_dst: &Rv<F32>,
-    rt_src: &Rt<F32, RtRow>,
-    rv_src_accum: &Rv<F32>,
+pub fn warp_row_sum_running<const ROWS: u32, const COLS: u32>(
+    rv_dst: &Rv<F32, ROWS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+    rv_src_accum: &Rv<F32, ROWS>,
 ) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rt_src.rows());
-    debug_assert_eq!(rv_dst.len(), rv_src_accum.len());
     CuStmt::new(format!(
         "kittens::warp::row_sum({rv}, {rt}, {acc});",
         rv = rv_dst.expr(),
@@ -963,9 +913,10 @@ pub fn warp_row_sum_running(
 /// the online-softmax body.
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:464`.
-pub fn warp_exp_rt(rt_dst: &Rt<F32, RtRow>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
-    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
-    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
+pub fn warp_exp_rt<const ROWS: u32, const COLS: u32>(
+    rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::exp({dst}, {src});",
         dst = rt_dst.expr(),
@@ -979,8 +930,7 @@ pub fn warp_exp_rt(rt_dst: &Rt<F32, RtRow>, rt_src: &Rt<F32, RtRow>) -> CuStmt {
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `unary_map<base_ops::exp>` analogous to the tile variant).
-pub fn warp_exp_rv(rv_dst: &Rv<F32>, rv_src: &Rv<F32>) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rv_src.len());
+pub fn warp_exp_rv<const LEN: u32>(rv_dst: &Rv<F32, LEN>, rv_src: &Rv<F32, LEN>) -> CuStmt {
     CuStmt::new(format!(
         "kittens::warp::exp({dst}, {src});",
         dst = rv_dst.expr(),
@@ -994,13 +944,11 @@ pub fn warp_exp_rv(rv_dst: &Rv<F32>, rv_src: &Rv<F32>) -> CuStmt {
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `bin_map<base_ops::sub>`).
-pub fn warp_sub_rv_rv(
-    rv_dst: &Rv<F32>,
-    rv_lhs: &Rv<F32>,
-    rv_rhs: &Rv<F32>,
+pub fn warp_sub_rv_rv<const LEN: u32>(
+    rv_dst: &Rv<F32, LEN>,
+    rv_lhs: &Rv<F32, LEN>,
+    rv_rhs: &Rv<F32, LEN>,
 ) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rv_lhs.len());
-    debug_assert_eq!(rv_dst.len(), rv_rhs.len());
     CuStmt::new(format!(
         "kittens::warp::sub({dst}, {lhs}, {rhs});",
         dst = rv_dst.expr(),
@@ -1015,14 +963,11 @@ pub fn warp_sub_rv_rv(
 /// online-softmax body.
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh:758`.
-pub fn warp_sub_row(
-    rt_dst: &Rt<F32, RtRow>,
-    rt_src: &Rt<F32, RtRow>,
-    rv_row_values: &Rv<F32>,
+pub fn warp_sub_row<const ROWS: u32, const COLS: u32>(
+    rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+    rv_row_values: &Rv<F32, ROWS>,
 ) -> CuStmt {
-    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
-    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
-    debug_assert_eq!(rt_dst.rows(), rv_row_values.len());
     CuStmt::new(format!(
         "kittens::warp::sub_row({dst}, {src}, {rv});",
         dst = rt_dst.expr(),
@@ -1038,14 +983,11 @@ pub fn warp_sub_row(
 ///
 /// Source: `include/ops/group/register/tile/maps.cuh` (mirror of
 /// `add_row` / `sub_row` at :736-784).
-pub fn warp_mul_row(
-    rt_dst: &Rt<F32, RtRow>,
-    rt_src: &Rt<F32, RtRow>,
-    rv_row_values: &Rv<F32>,
+pub fn warp_mul_row<const ROWS: u32, const COLS: u32>(
+    rt_dst: &Rt<F32, RtRow, ROWS, COLS>,
+    rt_src: &Rt<F32, RtRow, ROWS, COLS>,
+    rv_row_values: &Rv<F32, ROWS>,
 ) -> CuStmt {
-    debug_assert_eq!(rt_dst.rows(), rt_src.rows());
-    debug_assert_eq!(rt_dst.cols(), rt_src.cols());
-    debug_assert_eq!(rt_dst.rows(), rv_row_values.len());
     CuStmt::new(format!(
         "kittens::warp::mul_row({dst}, {src}, {rv});",
         dst = rt_dst.expr(),
@@ -1054,32 +996,11 @@ pub fn warp_mul_row(
     ))
 }
 
-/// `kittens::warp::mul(rv_dst, rv_lhs, rv_rhs);` — elementwise
-/// multiply on register vectors. Used for `sum_prev * scale` in
-/// the running-sum update of online softmax.
-///
-/// Source: `include/ops/group/register/vec/maps.cuh:359` (vec
-/// `bin_map<base_ops::mul>`). Distinct from the tile-flavored
-/// [`warp_mul_rt_rt`] at maps.cuh:707.
-pub fn warp_mul_rv_rv_f32(
-    rv_dst: &Rv<F32>,
-    rv_lhs: &Rv<F32>,
-    rv_rhs: &Rv<F32>,
-) -> CuStmt {
-    debug_assert_eq!(rv_dst.len(), rv_lhs.len());
-    debug_assert_eq!(rv_dst.len(), rv_rhs.len());
-    CuStmt::new(format!(
-        "kittens::warp::mul({dst}, {lhs}, {rhs});",
-        dst = rv_dst.expr(),
-        lhs = rv_lhs.expr(),
-        rhs = rv_rhs.expr()
-    ))
-}
-
-/// `float <name> = <init>; kittens::warp::row_max(__init_rv, ...);`
-/// — declare an fp32 row vector with each lane initialized to the
-/// same scalar (e.g. `-INFINITY` for the running-max accumulator
-/// before the first KV block).
+/// `kittens::rv_fl<LEN> name; kittens::warp::zero(name);
+/// kittens::warp::add(name, name, scalar);` — declare an fp32 row
+/// vector with each lane initialized to the same scalar (e.g.
+/// `-INFINITY` for the running-max accumulator before the first KV
+/// block).
 ///
 /// The natural TK 2.0 idiom is `kittens::rv_fl<LEN> name; warp::fill(
 /// name, scalar)`, but `fill` for rv isn't currently bound. This
@@ -1087,13 +1008,16 @@ pub fn warp_mul_rv_rv_f32(
 /// zeros_rv, scalar)` — equivalent to `dst[i] = 0 + scalar` per
 /// lane. Use when the rv is a running accumulator that needs a
 /// non-zero initial value.
-pub fn decl_rv_fl_init_scalar(name: &str, len: u32, init_scalar: &str) -> (CuStmt, Rv<F32>) {
+pub fn decl_rv_fl_init_scalar<const LEN: u32>(
+    name: &str,
+    init_scalar: &str,
+) -> (CuStmt, Rv<F32, LEN>) {
     let stmt = CuStmt::new(format!(
-        "kittens::rv_fl<{len}> {name};\n\
+        "kittens::rv_fl<{LEN}> {name};\n\
          kittens::warp::zero({name});\n\
          kittens::warp::add({name}, {name}, {init_scalar});"
     ));
-    (stmt, Rv::from_expr(CuExpr::new(name.to_string()), len))
+    (stmt, Rv::<F32, LEN>::from_expr(CuExpr::new(name.to_string())))
 }
 
 /// `kittens::warp::zero(rv);` — zero a register vector. Used to
@@ -1101,6 +1025,45 @@ pub fn decl_rv_fl_init_scalar(name: &str, len: u32, init_scalar: &str) -> (CuStm
 ///
 /// Source: `include/ops/group/register/vec/maps.cuh` (vec-flavored
 /// `kittens::warp::zero`).
-pub fn warp_zero_rv(rv: &Rv<F32>) -> CuStmt {
+pub fn warp_zero_rv<const LEN: u32>(rv: &Rv<F32, LEN>) -> CuStmt {
     CuStmt::new(format!("kittens::warp::zero({});", rv.expr()))
+}
+
+// ============================================================
+// Runtime control-flow helpers.
+//
+// Per [[feedback-dogfood-tk20-rust]] runtime control flow
+// (`for (...) { ... }`, `if (...) { ... } else { ... }`) inside
+// role bodies must go through these helpers — no inline `format!()`
+// in roles.rs. Both helpers compose the named CuBlock body into
+// the surrounding CuStmt without escaping it back to a raw string.
+// ============================================================
+
+/// Emit `for (<header>) { <body> }`. `header` is the full
+/// for-loop header (e.g. `"int h = 0; h < NUM_HEADS; ++h"`); the
+/// body is the supplied `CuBlock` (rendered with 4-space indent).
+/// Used by FQRC's per-head loop + any role-body runtime iteration
+/// that's not a tk20 primitive.
+pub fn for_loop(header: &str, body: &super::cu::CuBlock) -> CuStmt {
+    CuStmt::new(format!("for ({header}) {{\n{}}}", body.render(4)))
+}
+
+/// Emit `if (<cond>) { <then_block> } else { <else_block> }`. Used
+/// by FQRC's per-head Q/K/V routing (`if (col < q_off + qkv_q) {
+/// ... } else if (col < q_off + qkv_q + qkv_k) { ... } else { ...
+/// }`). The else block is optional — pass `None` for `if (...) {
+/// ... }`.
+pub fn if_else(
+    cond: &str,
+    then_block: &super::cu::CuBlock,
+    else_block: Option<&super::cu::CuBlock>,
+) -> CuStmt {
+    match else_block {
+        None => CuStmt::new(format!("if ({cond}) {{\n{}}}", then_block.render(4))),
+        Some(eb) => CuStmt::new(format!(
+            "if ({cond}) {{\n{}}} else {{\n{}}}",
+            then_block.render(4),
+            eb.render(4)
+        )),
+    }
 }

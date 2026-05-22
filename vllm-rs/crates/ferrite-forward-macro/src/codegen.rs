@@ -5636,19 +5636,41 @@ fn emit_synthesized_kernel_sources_override(
         consts.hidden, intermediate as u32, consts.head_dim,
     );
     let tg_mem_fits = tg_mem_estimate <= crate::fuse_pass::FORWARD_DECODE_TG_MEM_FLOOR;
+    // V2 selection: when FERRITE_PD_V2=1 at macro expansion time, swap
+    // synth to the per-TG-head-group, TG-mem-resident kernel. V2 gates
+    // on its own constraints (NUM_Q % NUM_KV == 0, HEAD_DIM ∈ {64,128},
+    // INTERMEDIATE % NUM_KV == 0).
+    let use_v2 = std::env::var("FERRITE_PD_V2")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let num_q = *model.bounds.get("num_attention_heads").unwrap_or(&0) as u32;
+    let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as u32;
+    let v2_compat = use_v2
+        && num_kv > 0 && num_q % num_kv == 0
+        && (consts.head_dim == 64 || consts.head_dim == 128)
+        && (intermediate as u32) % num_kv == 0;
     let forward_decode = (head_dim % 64 == 0
         && vocab_size > 0 && num_layers > 0
         && intermediate % consts.head_dim == 0
-        && tg_mem_fits)
+        && (v2_compat || tg_mem_fits))
         .then(|| {
-            crate::fuse_pass::synthesize_forward_decode(
-                crate::fuse_pass::SynthesisBackend::Metal,
-                t_act,
-                t_scale,
-                &forward_decode_consts,
-                forward_threads_per_tg,
-                forward_dispatched_tgs,
-            )
+            if v2_compat {
+                crate::fuse_pass::synthesize_forward_decode_v2(
+                    crate::fuse_pass::SynthesisBackend::Metal,
+                    t_act,
+                    t_scale,
+                    &forward_decode_consts,
+                )
+            } else {
+                crate::fuse_pass::synthesize_forward_decode(
+                    crate::fuse_pass::SynthesisBackend::Metal,
+                    t_act,
+                    t_scale,
+                    &forward_decode_consts,
+                    forward_threads_per_tg,
+                    forward_dispatched_tgs,
+                )
+            }
         });
     // AOT-compile each synth source to a `.metallib` blob at macro
     // expansion time. Same `xcrun metal -c` + `xcrun metallib`

@@ -433,15 +433,24 @@ impl Implementation for MetalForwardDecodePersistentImpl {
             return None;
         }
 
-        // Symbol name MUST match the one
-        // `synthesize_forward_decode` produces (see fuse_pass.rs's
-        // `format!("forward_decode_persistent_{t_act}_{t_scale}_gs{gs}_hd{hd}_t{t}_L{nl}", ...)`).
-        // threads_per_tg pinned at 256 — synth currently asserts
-        // NUM_SIMDGROUPS=8 / BN=8.
-        let symbol = format!(
-            "forward_decode_persistent_{}_{}_gs{}_hd{}_t256_L{}",
-            self.act_tag, self.scale_tag, self.group_size, head_dim, num_layers,
-        );
+        // Symbol must match the synth output. V1 vs V2 swap is keyed on
+        // FERRITE_PD_V2 env at proc-macro time (same key the codegen uses).
+        let use_v2 = std::env::var("FERRITE_PD_V2")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let v2_threads: u32 = std::env::var("FERRITE_PD_V2_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+        let symbol = if use_v2 {
+            format!(
+                "forward_decode_persistent_v2_{}_{}_gs{}_hd{}_t{}_L{}",
+                self.act_tag, self.scale_tag, self.group_size, head_dim, v2_threads, num_layers,
+            )
+        } else {
+            format!(
+                "forward_decode_persistent_{}_{}_gs{}_hd{}_t256_L{}",
+                self.act_tag, self.scale_tag, self.group_size, head_dim, num_layers,
+            )
+        };
         let kernel_symbol: &'static str = Box::leak(symbol.into_boxed_str());
 
         Some(vec![ferrite_forward::Instruction::ForwardDecodePersistent(

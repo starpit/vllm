@@ -4298,6 +4298,717 @@ void {symbol}(
     }
 }
 
+/// V2: per-TG-owns-(KV-head + Q-head-group) end-to-end. All
+/// intermediates live in threadgroup memory across phases. Cross-TG
+/// communication happens only via shared-residual atomic-adds at TWO
+/// sync points per layer (after attention block; after MLP block).
+///
+/// Dispatch: NUM_KV_HEADS TGs × 256 threads (8 simdgroups) each.
+/// TG t owns: 1 KV head (t), GQA_RATIO Q heads (t*GQA, ..., t*GQA+GQA-1).
+///
+/// Threadgroup buffers (1B = 4+4+0.5+0.25+1+2+2+0.25 ≈ 14 KiB; 3B
+/// borderline; 8B doesn't fit because INTERMEDIATE/8 ≈ 3.5 KiB but
+/// gate/up bumps it):
+///   __residual[HIDDEN]                  bf16  (kept TG-mem across layers)
+///   __x_norm[HIDDEN]                    bf16
+///   __q_local[GQA_RATIO * HEAD_DIM]     bf16  (this TG's Q heads)
+///   __kv_local[2 * HEAD_DIM]            bf16  (this TG's K and V)
+///   __attn_local[GQA_RATIO * HEAD_DIM]  float (this TG's attn outputs)
+///   __mlp_local[INTERMEDIATE / NUM_KV]  bf16  (this TG's mlp slice)
+///   __attn_partials[BN * HEAD_DIM]      float
+///   __scratch[NUM_SIMDGROUPS]           float (intra-TG reductions)
+///
+/// Device buffers used:
+///   - per-layer weights (read-only, unavoidable)
+///   - KV cache (this TG writes its own slot, reads its own head's
+///     history; no cross-TG within a dispatch)
+///   - __residual_partials[NUM_KV * HIDDEN] bf16 — shared scratch for
+///     residual aggregation. Each TG writes ITS row at sync points;
+///     all TGs read all rows on the read-back. ~48 KB at 3B; trivial.
+///   - logits (final lm_head output)
+///
+/// No __attn_scratch, no __mlp_scratch, no __q_scratch — those are the
+/// device intermediates the original PD got wrong.
+pub fn synthesize_forward_decode_v2(
+    backend: SynthesisBackend,
+    t_act: &'static str,
+    t_scale: &'static str,
+    consts: &ForwardDecodeConstants,
+) -> SynthesizedKernel {
+    assert_eq!(backend, SynthesisBackend::Metal, "MVP only emits Metal");
+    let c = &consts.chunk;
+    assert!(c.num_q_heads % c.num_kv_heads == 0,
+        "v2 requires NUM_Q divisible by NUM_KV; got {} / {}",
+        c.num_q_heads, c.num_kv_heads);
+    let gqa = c.num_q_heads / c.num_kv_heads;
+    assert!(c.head_dim == 64 || c.head_dim == 128,
+        "v2 currently supports HEAD_DIM ∈ {{64, 128}}; got {}", c.head_dim);
+    assert!(c.intermediate % c.num_kv_heads == 0,
+        "v2 requires INTERMEDIATE divisible by NUM_KV; got {} / {}",
+        c.intermediate, c.num_kv_heads);
+
+    // Tunable via env at synth time to A/B different SG counts.
+    let threads_per_tg: u32 = std::env::var("FERRITE_PD_V2_THREADS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(256);
+    assert!(threads_per_tg % MK_SIMD_SIZE == 0 && threads_per_tg <= 1024,
+        "threads_per_tg must be multiple of 32 and <= 1024");
+    let num_simdgroups = threads_per_tg / MK_SIMD_SIZE;
+    let attn_scale = 1.0_f64 / (c.head_dim as f64).sqrt();
+    let mlp_per_tg = c.intermediate / c.num_kv_heads;
+
+    let symbol = format!(
+        "forward_decode_persistent_v2_{t_act}_{t_scale}_gs{gs}_hd{hd}_t{t}_L{nl}",
+        gs = c.group_size, hd = c.head_dim, t = threads_per_tg, nl = consts.num_layers,
+    );
+
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
+
+    // Per-layer weights argument-buffer struct — same layout as v1 so
+    // worker-side encoding stays identical.
+    let arg_buf_struct = format!(
+        r#"
+struct PerLayerWeights {{
+    device const {t_scale}* rms_weight        [[id(0)]];
+    device const uint32_t*  q_weight          [[id(1)]];
+    device const {t_scale}* q_scales          [[id(2)]];
+    device const {t_scale}* q_biases          [[id(3)]];
+    device const uint32_t*  k_weight          [[id(4)]];
+    device const {t_scale}* k_scales          [[id(5)]];
+    device const {t_scale}* k_biases          [[id(6)]];
+    device const uint32_t*  v_weight          [[id(7)]];
+    device const {t_scale}* v_scales          [[id(8)]];
+    device const {t_scale}* v_biases          [[id(9)]];
+    device const {t_act}*   cos_sin           [[id(10)]];
+    device       atomic_uint*  kv_cache_k     [[id(11)]];
+    device       atomic_uint*  kv_cache_v     [[id(12)]];
+    device const uint32_t*  o_weight          [[id(13)]];
+    device const {t_scale}* o_scales          [[id(14)]];
+    device const {t_scale}* o_biases          [[id(15)]];
+    device const {t_scale}* postattn_rms_w    [[id(16)]];
+    device const uint32_t*  gate_weight       [[id(17)]];
+    device const {t_scale}* gate_scales       [[id(18)]];
+    device const {t_scale}* gate_biases       [[id(19)]];
+    device const uint32_t*  up_weight         [[id(20)]];
+    device const {t_scale}* up_scales         [[id(21)]];
+    device const {t_scale}* up_biases         [[id(22)]];
+    device const uint32_t*  down_weight       [[id(23)]];
+    device const {t_scale}* down_scales       [[id(24)]];
+    device const {t_scale}* down_biases       [[id(25)]];
+}};
+"#,
+        t_act = t_act, t_scale = t_scale,
+    );
+
+    let source = format!(
+        r#"// {symbol} — v2 per-TG-head-group, TG-mem-resident intermediates
+{mk_header}
+
+#include <metal_stdlib>
+#include <metal_atomic>
+using namespace metal;
+
+constant constexpr uint  HIDDEN       = {hidden}u;
+constant constexpr uint  NUM_Q        = {num_q}u;
+constant constexpr uint  NUM_KV       = {num_kv}u;
+constant constexpr uint  HEAD_DIM     = {head_dim}u;
+constant constexpr uint  ROT_DIM      = {rot_dim}u;
+constant constexpr uint  BLOCK_SIZE   = {block_size}u;
+constant constexpr uint  INTERMEDIATE = {intermediate}u;
+constant constexpr uint  VOCAB_SIZE   = {vocab_size}u;
+constant constexpr uint  NUM_LAYERS   = {num_layers}u;
+constant constexpr uint  GQA_RATIO    = {gqa}u;
+constant constexpr uint  MLP_PER_TG   = {mlp_per_tg}u;
+constant constexpr float EPS          = {eps}f;
+constant constexpr float ATTN_SCALE   = {attn_scale}f;
+constant constexpr uint  THREADS_PER_TG = {threads_per_tg}u;
+constant constexpr uint  NUM_SIMDGROUPS = {num_simdgroups}u;
+constant constexpr uint  SIMD_SIZE      = 32u;
+constant constexpr int   BITS           = 4;
+constant constexpr int   GROUP_SIZE     = {group_size};
+constant constexpr int   VALUES_PER_THREAD = 8;          // 4-bit, pack=8
+constant constexpr int   BYTES_PER_PACK    = 4;          // 32 lanes × 8 values × 4 bits / 8 = 16, but the qmv reads 4 bytes per pack of 8
+constant uint  M                  [[function_constant(0)]];
+constant uint  MAX_BLOCKS_PER_SEQ [[function_constant(1)]];
+
+{arg_buf_struct}
+
+// Spin-wait cross-TG ticket barrier. Used at the 2 sync points per
+// layer (after attention block; after MLP block). Counter target uses
+// the SAME cumulative pattern as v1 so it works across the layer loop.
+inline void cross_tg_sync(
+    device atomic_uint* counter,
+    uint target,
+    uint tid)
+{{
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0u) {{
+        atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+        while (atomic_load_explicit(counter, memory_order_relaxed) < target) {{
+            // spin
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_device);
+}}
+
+[[kernel, max_total_threads_per_threadgroup({threads_per_tg}u)]]
+void {symbol}(
+    device atomic_uint*           __barrier_counter [[buffer(0)]],
+    device const PerLayerWeights* __layer_table     [[buffer(1)]],
+    // __residual_atomic: device residual buffer holding initial
+    // embedding at kernel entry; used as the cross-TG residual-update
+    // staging surface (via __residual_partials below). After the layer
+    // loop, the final residual is read out for lm_head. Atomic-typed for
+    // typing compatibility with v1 dispatch wiring; we cast to plain
+    // const uint* for reads.
+    device       atomic_uint*     __residual_atomic [[buffer(2)]],
+    // v1's q_scratch / attn_scratch / mlp_scratch buffers — still bound
+    // for ABI compatibility with the existing Instruction shape; the v2
+    // kernel never touches them. (q_scratch repurposed: we DO use it as
+    // the per-TG residual-partials staging buffer, sized to
+    // NUM_KV * HIDDEN bf16 ≈ 48 KB at 3B. The host already allocates
+    // q_scratch at HIDDEN-bytes for the v1 path; for v2 we need
+    // NUM_KV × HIDDEN — caller MUST size accordingly.)
+    device       {t_act}*         __residual_partials [[buffer(3)]],
+    device       atomic_uint*     __attn_scratch_unused [[buffer(4)]],
+    device       atomic_uint*     __mlp_scratch_unused  [[buffer(5)]],
+    device const uint*            __positions  [[buffer(6)]],
+    device const uint*            __slot_mapping [[buffer(7)]],
+    device const uint*            __seq_used_k [[buffer(8)]],
+    device const uint*            __block_table [[buffer(9)]],
+    device const {t_scale}*       __final_rms_w  [[buffer(10)]],
+    device const uint32_t*        __lm_w    [[buffer(11)]],
+    device const {t_scale}*       __lm_s    [[buffer(12)]],
+    device const {t_scale}*       __lm_b    [[buffer(13)]],
+    device       {t_act}*         __logits  [[buffer(14)]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+    uint3 __tgs_per_grid [[threadgroups_per_grid]],
+    uint3 __tid_pos   [[thread_position_in_threadgroup]],
+    uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint  __simd_lid  [[thread_index_in_simdgroup]])
+{{
+    const uint __tg_id  = __tg_pos.x;
+    const uint __tid    = __tid_pos.x;
+    const uint num_tgs  = __tgs_per_grid.x;
+
+    // Per-TG ownership.
+    const uint MY_KV_HEAD     = __tg_id;
+    const uint MY_Q_HEAD_LO   = __tg_id * GQA_RATIO;
+    const uint MY_MLP_LO      = __tg_id * MLP_PER_TG;
+
+    // TG-memory intermediates. Persist across the whole forward.
+    threadgroup {t_act} __residual[HIDDEN];
+    threadgroup {t_act} __x_norm[HIDDEN];
+    threadgroup {t_act} __q_local[GQA_RATIO * HEAD_DIM];
+    threadgroup {t_act} __k_local[HEAD_DIM];
+    threadgroup {t_act} __v_local[HEAD_DIM];
+    threadgroup float   __attn_local[GQA_RATIO * HEAD_DIM];
+    threadgroup {t_act} __mlp_local[MLP_PER_TG];
+    // For attention softmax-online reduction across BN simdgroups.
+    threadgroup float   __attn_partials[NUM_SIMDGROUPS * HEAD_DIM];
+    threadgroup float   __attn_max[NUM_SIMDGROUPS];
+    threadgroup float   __attn_sum[NUM_SIMDGROUPS];
+    // Small reduction scratch (sumsq for RmsNorm, simd partials).
+    threadgroup float   __scratch[NUM_SIMDGROUPS];
+
+    // ── Load embedding into TG mem residual (one-time, from device) ──
+    {{
+        const uint __t = 0u;
+        device const {t_act}* __res_src = (device const {t_act}*)__residual_atomic
+                                        + __t * HIDDEN;
+        for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+            __residual[i] = __res_src[i];
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint __layer = 0u; __layer < NUM_LAYERS; ++__layer) {{
+        // Per-layer weight resolution.
+        device const PerLayerWeights& L = __layer_table[__layer];
+
+        // ───── Phase A: RmsNorm → Q/K/V qmv → rope → KV-write → attn → o_proj contribution ─────
+
+        // 1. Local sumsq (replicated across TGs; each TG sees the same TG-mem residual).
+        float __sumsq = 0.0f;
+        for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+            float v = float(__residual[i]);
+            __sumsq += v * v;
+        }}
+        __sumsq = simd_sum(__sumsq);
+        if (__simd_lid == 0u) __scratch[__simd_gid] = __sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float __global_sumsq = 0.0f;
+        for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) __global_sumsq += __scratch[g];
+        float __rms_scale = fast::rsqrt(__global_sumsq / float(HIDDEN) + EPS);
+
+        // 2. Apply RmsNorm: x_norm = residual * rms_scale * rms_weight.
+        for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+            __x_norm[i] = {t_act}(float(__residual[i]) * __rms_scale * float(L.rms_weight[i]));
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. Q / K / V qmv for this TG's owned heads.
+        //    Q: GQA_RATIO heads × HEAD_DIM = N_OUT rows. Each row's
+        //    output = dot(x_norm, W_q_row) with 4-bit quant.
+        //    Each row = HIDDEN/GROUP_SIZE groups of GROUP_SIZE inputs;
+        //    per group: scale*sum(deq(w[i])*x[i]) + bias*sum(x[i]).
+        //    Lane decomposition: 8 SG × 32 lanes = 256 threads. Output
+        //    rows distributed: each SG handles N_OUT/NUM_SIMDGROUPS rows.
+        // — Q / K / V qmv (all-lanes-active pattern) —
+        // Each simdgroup handles one output row. All 32 lanes load a
+        // distinct uint of packed weights (8 4-bit values each), spanning
+        // 256 inputs per simdgroup pass. Lanes within a single GROUP_SIZE
+        // (=64) range share scale/bias; lanes that span group boundaries
+        // load per-lane group metadata. simd_sum at end reduces 32 lane
+        // partials into the row's result.
+        //
+        // Loop: HIDDEN / (SIMD_SIZE * 8) passes per row. For 1B
+        // (HIDDEN=2048): 8 passes. For 3B (HIDDEN=3072): 12 passes.
+        #define QMV_ROW(WEIGHT_BUF, SCALES_BUF, BIASES_BUF, GLOBAL_ROW, OUT_EXPR)              \
+            do {{                                                                              \
+                const uint gr = (GLOBAL_ROW);                                                  \
+                float acc = 0.0f;                                                              \
+                for (uint k_in_row = __simd_lid * 8u; k_in_row < HIDDEN; k_in_row += SIMD_SIZE * 8u) {{ \
+                    const uint group_idx = k_in_row / uint(GROUP_SIZE);                        \
+                    const {t_scale} s = (SCALES_BUF)[gr * (HIDDEN/uint(GROUP_SIZE)) + group_idx];\
+                    const {t_scale} b = (BIASES_BUF)[gr * (HIDDEN/uint(GROUP_SIZE)) + group_idx];\
+                    const uint pack = (WEIGHT_BUF)[(gr * HIDDEN + k_in_row) / 8u];             \
+                    float gacc = 0.0f, sx = 0.0f;                                              \
+                    for (uint j = 0u; j < 8u; ++j) {{                                          \
+                        float w_q = float((pack >> (j * 4u)) & 0xFu);                          \
+                        float x_v = float(__x_norm[k_in_row + j]);                             \
+                        gacc += w_q * x_v;                                                     \
+                        sx   += x_v;                                                           \
+                    }}                                                                         \
+                    acc += float(s) * gacc + float(b) * sx;                                    \
+                }}                                                                             \
+                acc = simd_sum(acc);                                                           \
+                if (__simd_lid == 0u) {{ OUT_EXPR; }}                                          \
+            }} while (0)
+
+        // — Q —
+        {{
+            constexpr uint N_OUT = GQA_RATIO * HEAD_DIM;
+            for (uint row_base = __simd_gid; row_base < N_OUT; row_base += NUM_SIMDGROUPS) {{
+                const uint h_local   = row_base / HEAD_DIM;
+                const uint row_in_head = row_base % HEAD_DIM;
+                const uint global_row = (MY_Q_HEAD_LO + h_local) * HEAD_DIM + row_in_head;
+                QMV_ROW(L.q_weight, L.q_scales, L.q_biases, global_row,
+                        __q_local[h_local * HEAD_DIM + row_in_head] = {t_act}(acc * ATTN_SCALE));
+            }}
+        }}
+        // — K — (1 head, HEAD_DIM rows)
+        {{
+            for (uint row = __simd_gid; row < HEAD_DIM; row += NUM_SIMDGROUPS) {{
+                const uint global_row = MY_KV_HEAD * HEAD_DIM + row;
+                QMV_ROW(L.k_weight, L.k_scales, L.k_biases, global_row,
+                        __k_local[row] = {t_act}(acc));
+            }}
+        }}
+        // — V — (1 head, HEAD_DIM rows)
+        {{
+            for (uint row = __simd_gid; row < HEAD_DIM; row += NUM_SIMDGROUPS) {{
+                const uint global_row = MY_KV_HEAD * HEAD_DIM + row;
+                QMV_ROW(L.v_weight, L.v_scales, L.v_biases, global_row,
+                        __v_local[row] = {t_act}(acc));
+            }}
+        }}
+        #undef QMV_ROW
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4. Rope (in-place on q_local, k_local).
+        {{
+            const uint __t = 0u;
+            const uint pos = __positions[__t];
+            // Apply rope to Q (GQA_RATIO heads).
+            for (uint h_local = 0u; h_local < GQA_RATIO; ++h_local) {{
+                for (uint i2 = __tid; i2 < HEAD_DIM/2u; i2 += THREADS_PER_TG) {{
+                    if (i2 * 2u < ROT_DIM) {{
+                        const {t_act} cs0 = L.cos_sin[pos * ROT_DIM + i2 * 2u];
+                        const {t_act} cs1 = L.cos_sin[pos * ROT_DIM + i2 * 2u + 1u];
+                        const float c = float(cs0);
+                        const float s = float(cs1);
+                        const float x0 = float(__q_local[h_local * HEAD_DIM + i2]);
+                        const float x1 = float(__q_local[h_local * HEAD_DIM + i2 + HEAD_DIM/2u]);
+                        __q_local[h_local * HEAD_DIM + i2]                = {t_act}(x0 * c - x1 * s);
+                        __q_local[h_local * HEAD_DIM + i2 + HEAD_DIM/2u]  = {t_act}(x0 * s + x1 * c);
+                    }}
+                }}
+            }}
+            // Apply rope to K (1 head).
+            for (uint i2 = __tid; i2 < HEAD_DIM/2u; i2 += THREADS_PER_TG) {{
+                if (i2 * 2u < ROT_DIM) {{
+                    const {t_act} cs0 = L.cos_sin[pos * ROT_DIM + i2 * 2u];
+                    const {t_act} cs1 = L.cos_sin[pos * ROT_DIM + i2 * 2u + 1u];
+                    const float c = float(cs0);
+                    const float s = float(cs1);
+                    const float x0 = float(__k_local[i2]);
+                    const float x1 = float(__k_local[i2 + HEAD_DIM/2u]);
+                    __k_local[i2]                = {t_act}(x0 * c - x1 * s);
+                    __k_local[i2 + HEAD_DIM/2u]  = {t_act}(x0 * s + x1 * c);
+                }}
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 5. Write K, V to KV cache slot (own KV head only).
+        {{
+            const uint __t = 0u;
+            const uint slot = __slot_mapping[__t];
+            const uint logical_block  = slot / BLOCK_SIZE;
+            const uint physical_block = __block_table[__t * MAX_BLOCKS_PER_SEQ + logical_block];
+            const uint tok_in_block   = slot - logical_block * BLOCK_SIZE;
+            const size_t base = (size_t)physical_block * (size_t)(NUM_KV * BLOCK_SIZE * HEAD_DIM)
+                              + (size_t)MY_KV_HEAD     * (size_t)(BLOCK_SIZE * HEAD_DIM)
+                              + (size_t)tok_in_block   * (size_t)HEAD_DIM;
+            for (uint i = __tid; i < HEAD_DIM; i += THREADS_PER_TG) {{
+                ((device {t_act}*)L.kv_cache_k)[base + i] = __k_local[i];
+                ((device {t_act}*)L.kv_cache_v)[base + i] = __v_local[i];
+            }}
+        }}
+        // No barrier needed — only THIS TG reads this KV slot in attention below.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 6. Attention for this TG's GQA_RATIO Q heads against this TG's KV head's cache.
+        //    Output: __attn_local[GQA_RATIO * HEAD_DIM] (float).
+        for (uint h_local = 0u; h_local < GQA_RATIO; ++h_local) {{
+            const uint __t = 0u;
+            const uint kv_len = __seq_used_k[__t];
+            // BN=NUM_SIMDGROUPS parallel KV positions per simdgroup;
+            // each simdgroup_lane holds qk_per_thread Q values.
+            const uint qk_per_thread = HEAD_DIM / SIMD_SIZE;
+
+            // Per-lane Q values (this Q head, simd_lid's qk_per_thread slice).
+            float q_reg[8]; // sized for HEAD_DIM up to 256
+            for (uint i = 0u; i < qk_per_thread; ++i) {{
+                q_reg[i] = float(__q_local[h_local * HEAD_DIM + __simd_lid * qk_per_thread + i]);
+            }}
+
+            float max_score = -FLT_MAX;
+            float sum_exp = 0.0f;
+            float o_reg[8] = {{ 0.0f }};
+
+            device const {t_act}* k_cache_t = (device const {t_act}*)L.kv_cache_k;
+            device const {t_act}* v_cache_t = (device const {t_act}*)L.kv_cache_v;
+
+            for (uint kv_pos = __simd_gid; kv_pos < kv_len; kv_pos += NUM_SIMDGROUPS) {{
+                const uint logical_block  = kv_pos / BLOCK_SIZE;
+                const uint physical_block = __block_table[__t * MAX_BLOCKS_PER_SEQ + logical_block];
+                const uint tok_in_block   = kv_pos - logical_block * BLOCK_SIZE;
+                const size_t kvbase = (size_t)physical_block * (size_t)(NUM_KV * BLOCK_SIZE * HEAD_DIM)
+                                    + (size_t)MY_KV_HEAD     * (size_t)(BLOCK_SIZE * HEAD_DIM)
+                                    + (size_t)tok_in_block   * (size_t)HEAD_DIM;
+                // K dot Q.
+                float score = 0.0f;
+                for (uint i = 0u; i < qk_per_thread; ++i) {{
+                    float k_v = float(k_cache_t[kvbase + __simd_lid * qk_per_thread + i]);
+                    score += q_reg[i] * k_v;
+                }}
+                score = simd_sum(score);
+                // Online softmax update.
+                float new_max = max(max_score, score);
+                float factor  = fast::exp(max_score - new_max);
+                float exp_s   = fast::exp(score - new_max);
+                max_score = new_max;
+                sum_exp   = sum_exp * factor + exp_s;
+                // V accumulate.
+                for (uint i = 0u; i < qk_per_thread; ++i) {{
+                    float v_v = float(v_cache_t[kvbase + __simd_lid * qk_per_thread + i]);
+                    o_reg[i] = o_reg[i] * factor + exp_s * v_v;
+                }}
+            }}
+
+            // Reduce across the BN simdgroups via TG mem.
+            for (uint i = 0u; i < qk_per_thread; ++i) {{
+                __attn_partials[__simd_gid * HEAD_DIM + __simd_lid * qk_per_thread + i] = o_reg[i];
+            }}
+            if (__simd_lid == 0u) {{
+                __attn_max[__simd_gid] = max_score;
+                __attn_sum[__simd_gid] = sum_exp;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float gmax = -FLT_MAX;
+            for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) gmax = max(gmax, __attn_max[g]);
+            float gsum = 0.0f;
+            float facs[16];
+            for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) {{
+                facs[g] = fast::exp(__attn_max[g] - gmax);
+                gsum += __attn_sum[g] * facs[g];
+            }}
+            float inv_gsum = (gsum != 0.0f) ? (1.0f / gsum) : 0.0f;
+
+            // Each lane outputs its qk_per_thread slice of head output.
+            for (uint i = 0u; i < qk_per_thread; ++i) {{
+                float acc = 0.0f;
+                for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) {{
+                    acc += __attn_partials[g * HEAD_DIM + __simd_lid * qk_per_thread + i] * facs[g];
+                }}
+                acc *= inv_gsum;
+                __attn_local[h_local * HEAD_DIM + __simd_lid * qk_per_thread + i] = acc;
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // 7. O_proj contribution: this TG's GQA_RATIO heads contribute
+        //    to ALL HIDDEN output positions. CAS-add into __residual_atomic.
+        //    Each output i = sum over our heads h of W_o[i, h*HD + k] · attn_local[h*HD + k].
+        {{
+            for (uint i_pair = __tid; i_pair < HIDDEN / 2u; i_pair += THREADS_PER_TG) {{
+                // Compute deltas for two consecutive HIDDEN positions (one uint32 word).
+                float delta0 = 0.0f, delta1 = 0.0f;
+                for (uint pi = 0u; pi < 2u; ++pi) {{
+                    const uint i = i_pair * 2u + pi;
+                    float acc = 0.0f;
+                    for (uint h_local = 0u; h_local < GQA_RATIO; ++h_local) {{
+                        const uint h_global = MY_Q_HEAD_LO + h_local;
+                        const uint in_col_base = h_global * HEAD_DIM;
+                        const uint row_stride_packs = (NUM_Q * HEAD_DIM) / 8u;
+                        const uint row_stride_grp   = (NUM_Q * HEAD_DIM) / uint(GROUP_SIZE);
+                        for (uint kg = 0u; kg < HEAD_DIM; kg += uint(GROUP_SIZE)) {{
+                            const uint group_idx = (in_col_base + kg) / uint(GROUP_SIZE);
+                            const {t_scale} s = L.o_scales[i * row_stride_grp + group_idx];
+                            const {t_scale} b = L.o_biases[i * row_stride_grp + group_idx];
+                            float gacc = 0.0f, sx = 0.0f;
+                            const uint group_end = min(uint(GROUP_SIZE), HEAD_DIM - kg);
+                            for (uint ki = 0u; ki < group_end; ki += 8u) {{
+                                uint pack = L.o_weight[i * row_stride_packs + (in_col_base + kg + ki) / 8u];
+                                for (uint j = 0u; j < 8u && ki + j < group_end; ++j) {{
+                                    float w_q = float((pack >> (j*4u)) & 0xFu);
+                                    float a_v = __attn_local[h_local * HEAD_DIM + kg + ki + j];
+                                    gacc += w_q * a_v;
+                                    sx   += a_v;
+                                }}
+                            }}
+                            acc += float(s) * gacc + float(b) * sx;
+                        }}
+                    }}
+                    if (pi == 0u) delta0 = acc; else delta1 = acc;
+                }}
+                // CAS-add (delta0, delta1) bf16 into the packed uint32 word.
+                uint word_idx = i_pair;
+                uint old_w, new_w;
+                old_w = atomic_load_explicit(&__residual_atomic[word_idx], memory_order_relaxed);
+                do {{
+                    {t_act} lo = as_type<{t_act}>(ushort(old_w & 0xFFFFu));
+                    {t_act} hi = as_type<{t_act}>(ushort((old_w >> 16) & 0xFFFFu));
+                    {t_act} new_lo = {t_act}(float(lo) + delta0);
+                    {t_act} new_hi = {t_act}(float(hi) + delta1);
+                    new_w = uint(as_type<ushort>(new_lo))
+                          | (uint(as_type<ushort>(new_hi)) << 16);
+                }} while (!atomic_compare_exchange_weak_explicit(
+                    &__residual_atomic[word_idx], &old_w, new_w,
+                    memory_order_relaxed, memory_order_relaxed));
+            }}
+        }}
+
+        // ── SYNC #1: cross-TG ──
+        cross_tg_sync(
+            __barrier_counter,
+            num_tgs * (__layer * 2u + 1u),
+            __tid);
+
+        // Read updated residual from device into TG-mem.
+        {{
+            device const {t_act}* __res_src = (device const {t_act}*)__residual_atomic;
+            for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+                __residual[i] = __res_src[i];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ───── Phase B: RmsNorm2 → gate/up qmv → silu_mul → down_proj contribution ─────
+
+        // 8. RmsNorm2 (post-attn).
+        __sumsq = 0.0f;
+        for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+            float v = float(__residual[i]);
+            __sumsq += v * v;
+        }}
+        __sumsq = simd_sum(__sumsq);
+        if (__simd_lid == 0u) __scratch[__simd_gid] = __sumsq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        __global_sumsq = 0.0f;
+        for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) __global_sumsq += __scratch[g];
+        __rms_scale = fast::rsqrt(__global_sumsq / float(HIDDEN) + EPS);
+        for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+            __x_norm[i] = {t_act}(float(__residual[i]) * __rms_scale * float(L.postattn_rms_w[i]));
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 9. Gate/Up qmv → mlp_local via silu_mul.
+        //    Output rows: this TG's MLP_PER_TG slice.
+        //    For each output row j_local in [0, MLP_PER_TG):
+        //      gate = qmv(x_norm, W_gate[MY_MLP_LO+j_local, :])
+        //      up   = qmv(x_norm, W_up  [MY_MLP_LO+j_local, :])
+        //      mlp_local[j_local] = silu(gate) * up
+        {{
+            for (uint j_local = __simd_gid; j_local < MLP_PER_TG; j_local += NUM_SIMDGROUPS) {{
+                const uint j_global = MY_MLP_LO + j_local;
+                float g_acc = 0.0f;
+                float u_acc = 0.0f;
+                // All-lanes-active: each lane handles 1 uint = 8 4-bit
+                // values per pass; SIMD_SIZE lanes cover 256 inputs per
+                // simdgroup pass; HIDDEN/256 passes per row.
+                for (uint k_in_row = __simd_lid * 8u; k_in_row < HIDDEN; k_in_row += SIMD_SIZE * 8u) {{
+                    const uint group_idx = k_in_row / uint(GROUP_SIZE);
+                    const {t_scale} gs = L.gate_scales[j_global * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                    const {t_scale} gb = L.gate_biases[j_global * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                    const {t_scale} us = L.up_scales  [j_global * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                    const {t_scale} ub = L.up_biases  [j_global * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                    const uint pg = L.gate_weight[(j_global * HIDDEN + k_in_row) / 8u];
+                    const uint pu = L.up_weight  [(j_global * HIDDEN + k_in_row) / 8u];
+                    float ga = 0.0f, ua = 0.0f, sx = 0.0f;
+                    for (uint k = 0u; k < 8u; ++k) {{
+                        float xv = float(__x_norm[k_in_row + k]);
+                        ga += float((pg >> (k * 4u)) & 0xFu) * xv;
+                        ua += float((pu >> (k * 4u)) & 0xFu) * xv;
+                        sx += xv;
+                    }}
+                    g_acc += float(gs) * ga + float(gb) * sx;
+                    u_acc += float(us) * ua + float(ub) * sx;
+                }}
+                g_acc = simd_sum(g_acc);
+                u_acc = simd_sum(u_acc);
+                if (__simd_lid == 0u) {{
+                    float sig = 1.0f / (1.0f + fast::exp(-g_acc));
+                    __mlp_local[j_local] = {t_act}((g_acc * sig) * u_acc);
+                }}
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 10. Down_proj contribution: this TG's MLP slice contributes
+        //     to ALL HIDDEN output positions. CAS-add into __residual_atomic.
+        {{
+            for (uint i_pair = __tid; i_pair < HIDDEN / 2u; i_pair += THREADS_PER_TG) {{
+                float delta0 = 0.0f, delta1 = 0.0f;
+                for (uint pi = 0u; pi < 2u; ++pi) {{
+                    const uint i = i_pair * 2u + pi;
+                    float acc = 0.0f;
+                    const uint in_col_base = MY_MLP_LO;
+                    const uint row_stride_packs = INTERMEDIATE / 8u;
+                    const uint row_stride_grp   = INTERMEDIATE / uint(GROUP_SIZE);
+                    for (uint kg = 0u; kg < MLP_PER_TG; kg += uint(GROUP_SIZE)) {{
+                        const uint group_idx = (in_col_base + kg) / uint(GROUP_SIZE);
+                        const {t_scale} s = L.down_scales[i * row_stride_grp + group_idx];
+                        const {t_scale} b = L.down_biases[i * row_stride_grp + group_idx];
+                        float gacc = 0.0f, sx = 0.0f;
+                        const uint group_end = min(uint(GROUP_SIZE), MLP_PER_TG - kg);
+                        for (uint ki = 0u; ki < group_end; ki += 8u) {{
+                            uint pack = L.down_weight[i * row_stride_packs + (in_col_base + kg + ki) / 8u];
+                            for (uint j = 0u; j < 8u && ki + j < group_end; ++j) {{
+                                float w_q = float((pack >> (j*4u)) & 0xFu);
+                                float m_v = float(__mlp_local[kg + ki + j]);
+                                gacc += w_q * m_v;
+                                sx   += m_v;
+                            }}
+                        }}
+                        acc += float(s) * gacc + float(b) * sx;
+                    }}
+                    if (pi == 0u) delta0 = acc; else delta1 = acc;
+                }}
+                uint word_idx = i_pair;
+                uint old_w, new_w;
+                old_w = atomic_load_explicit(&__residual_atomic[word_idx], memory_order_relaxed);
+                do {{
+                    {t_act} lo = as_type<{t_act}>(ushort(old_w & 0xFFFFu));
+                    {t_act} hi = as_type<{t_act}>(ushort((old_w >> 16) & 0xFFFFu));
+                    {t_act} new_lo = {t_act}(float(lo) + delta0);
+                    {t_act} new_hi = {t_act}(float(hi) + delta1);
+                    new_w = uint(as_type<ushort>(new_lo))
+                          | (uint(as_type<ushort>(new_hi)) << 16);
+                }} while (!atomic_compare_exchange_weak_explicit(
+                    &__residual_atomic[word_idx], &old_w, new_w,
+                    memory_order_relaxed, memory_order_relaxed));
+            }}
+        }}
+
+        // ── SYNC #2: cross-TG ──
+        cross_tg_sync(
+            __barrier_counter,
+            num_tgs * (__layer * 2u + 2u),
+            __tid);
+
+        // Read updated residual from device into TG-mem.
+        {{
+            device const {t_act}* __res_src = (device const {t_act}*)__residual_atomic;
+            for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+                __residual[i] = __res_src[i];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // ───── Final: RmsNorm + lm_head (only TG 0 emits logits) ─────
+
+    // Final RmsNorm.
+    float __sumsq = 0.0f;
+    for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+        float v = float(__residual[i]);
+        __sumsq += v * v;
+    }}
+    __sumsq = simd_sum(__sumsq);
+    if (__simd_lid == 0u) __scratch[__simd_gid] = __sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float __global_sumsq = 0.0f;
+    for (uint g = 0u; g < NUM_SIMDGROUPS; ++g) __global_sumsq += __scratch[g];
+    float __rms_scale = fast::rsqrt(__global_sumsq / float(HIDDEN) + EPS);
+    for (uint i = __tid; i < HIDDEN; i += THREADS_PER_TG) {{
+        __x_norm[i] = {t_act}(float(__residual[i]) * __rms_scale * float(__final_rms_w[i]));
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // lm_head: y[i] = qmv(W_lm[i, :], x_norm) for i in [0, VOCAB_SIZE).
+    // Each TG handles a vocab-slice for parallelism.
+    {{
+        const uint vocab_per_tg = (VOCAB_SIZE + num_tgs - 1u) / num_tgs;
+        const uint vocab_lo = __tg_id * vocab_per_tg;
+        const uint vocab_hi = min(vocab_lo + vocab_per_tg, VOCAB_SIZE);
+        for (uint i = vocab_lo + __simd_gid; i < vocab_hi; i += NUM_SIMDGROUPS) {{
+            float acc = 0.0f;
+            // All-lanes-active.
+            for (uint k_in_row = __simd_lid * 8u; k_in_row < HIDDEN; k_in_row += SIMD_SIZE * 8u) {{
+                const uint group_idx = k_in_row / uint(GROUP_SIZE);
+                const {t_scale} s = __lm_s[i * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                const {t_scale} b = __lm_b[i * (HIDDEN/uint(GROUP_SIZE)) + group_idx];
+                const uint pack = __lm_w[(i * HIDDEN + k_in_row) / 8u];
+                float gacc = 0.0f, sx = 0.0f;
+                for (uint j = 0u; j < 8u; ++j) {{
+                    float w_q = float((pack >> (j * 4u)) & 0xFu);
+                    float x_v = float(__x_norm[k_in_row + j]);
+                    gacc += w_q * x_v;
+                    sx   += x_v;
+                }}
+                acc += float(s) * gacc + float(b) * sx;
+            }}
+            acc = simd_sum(acc);
+            if (__simd_lid == 0u) __logits[i] = {t_act}(acc);
+        }}
+    }}
+}}
+"#,
+        symbol = symbol,
+        mk_header = mk_header,
+        arg_buf_struct = arg_buf_struct,
+        t_act = t_act, t_scale = t_scale,
+        hidden = c.hidden, num_q = c.num_q_heads, num_kv = c.num_kv_heads,
+        head_dim = c.head_dim, rot_dim = c.rot_dim, block_size = c.block_size,
+        intermediate = c.intermediate, vocab_size = consts.vocab_size,
+        num_layers = consts.num_layers, gqa = gqa, mlp_per_tg = mlp_per_tg,
+        eps = c.rms_norm_eps, attn_scale = attn_scale,
+        threads_per_tg = threads_per_tg, num_simdgroups = num_simdgroups,
+        group_size = c.group_size,
+    );
+
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

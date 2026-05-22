@@ -868,13 +868,24 @@ pub fn render_gemm<
     if ITERS != 1 {
         return RoleBodies::skipped("Gemm");
     }
-    // M < 16 (or any M not a multiple of TILE_ROW_DIM=16 for bf16) violates
-    // TK 2.0's `st_bf<rows, cols>` static_assert(rows % TILE_ROW_DIM == 0).
-    // The decode-shape port (handoff phase 6+ item 4: "render_gemm at M=1
-    // pad to [16, K] in scratch — needs page-size bump or scratch-only
-    // bypass path") is a separate dedicated phase. Until then, skip these
-    // canonicals so the rest of the build compiles clean and the gap is
-    // explicit.
+    // M=1 → decode-shape (per-thread vec-mat).
+    // M=16 (or any other M%16==0) → prefill-shape (per-warp tile mma).
+    // Other M (8, 64, ...) still SKIPPED until per-shape ports land.
+    if M == 1 {
+        return render_gemm_decode::<K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id,
+            weight_page_id,
+            out_page_id,
+            consumer_phase,
+            storer_phase,
+            layer,
+            in_act_slot,
+            out_act_slot,
+            weight_accessor,
+            bar_publish,
+            b_tile_offset,
+        );
+    }
     if M % 16 != 0 {
         return RoleBodies::skipped("Gemm");
     }
@@ -959,6 +970,176 @@ pub fn render_gemm<
     storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, N>(
         &out_gmem, &out_smem, out_bytes,
     ));
+    storer.push(tk20::group_tma_store_async_wait::<1>());
+    storer.push(tk20::group_arrive::<1>(&out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// Gemm (decode shape, M=1).
+//
+// At M=1 the prefill render's `st_bf<M, K>` / `rt_bf<M, K>` tiles
+// fail TK 2.0's `static_assert(rows % TILE_ROW_DIM == 0)`. Padding
+// M to 16 in scratch doesn't fit (16 * K * 2 = 64 KB at K=2048
+// vs SCRATCH_BYTES=32 KB). The prefill K*N b_tile staging also
+// doesn't fit (8 MB at K=N=2048). So we emit a per-thread
+// vec-mat compute path: each thread owns `TILE_N / 32` output
+// columns, dot-products each col against the input row read
+// from the in-page (M=1 row, K bf16 elements = K bytes), reading
+// B directly from gmem (no scratch staging — bandwidth-bound on
+// decode anyway, ~8 MB B per GEMM ≈ 2.7 µs at H100's 3 TB/s).
+//
+// This is a correctness-first emit (no tensor cores), matching
+// the substrate's current sizing. When SCRATCH_BYTES / PAGE_SIZE
+// are right-sized for an actual H100 launch (228 KB shmem
+// budget), this can be re-emitted with TK warp::mma over a
+// split-K rt<16, K_CHUNK> path.
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_gemm_decode<
+    const K: u32,
+    const N: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    _weight_page_id: u32,
+    out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    _b_tile_offset: u32,
+) -> RoleBodies {
+    if ITERS != 1 {
+        return RoleBodies::skipped("GemmDecode");
+    }
+    if NCW == 0 || N % NCW != 0 {
+        return RoleBodies::skipped("GemmDecode");
+    }
+    if TILE_N != N / NCW {
+        return RoleBodies::skipped("GemmDecode");
+    }
+    if TILE_N % 32 != 0 {
+        return RoleBodies::skipped("GemmDecode");
+    }
+
+    let loader_phase = storer_phase;
+    let in_p = page(in_page_id);
+    let out_p = page(out_page_id);
+
+    let in_ready = page_ready_sem(in_p);
+    let out_done = page_done_sem(out_p);
+    let in_consumed = page_consumed_sem(in_p);
+    let out_consumed = page_consumed_sem(out_p);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
+
+    let act_bytes: u32 = K * BF16_BYTES; // M=1 → 1*K*2
+    let out_bytes: u32 = N * BF16_BYTES; // M=1 → 1*N*2
+
+    // -----------------------------------------------------------
+    // LOADER role — TMA-load A from gmem to in_page. Weights are
+    // read directly by the consumer (per-thread gmem loads), so
+    // no weight TMA stage here.
+    // -----------------------------------------------------------
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&out_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __gd_a_dst = reinterpret_cast<__nv_bfloat16*>(ss.pages[{in_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(__gd_a_dst), \
+         reinterpret_cast<void*>({a_gmem}), \
+         {act_bytes}, {a_ready}); \
+         }}",
+        in_id = in_page_id,
+        a_gmem = in_gmem.expr(),
+        act_bytes = act_bytes,
+        a_ready = in_ready.expr(),
+    )));
+
+    let launcher = CuBlock::new();
+
+    // -----------------------------------------------------------
+    // CONSUMER role — per-thread vec-mat compute.
+    // Each warp owns TILE_N output cols (= N / NCW); each thread
+    // owns `cols_per_thread = TILE_N / 32` cols. Direct gmem reads
+    // of B; reduce per-col sum in fp32; bf16 cast on store.
+    // -----------------------------------------------------------
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __gd_a_in = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{in_id}]); \
+         __nv_bfloat16* __gd_a_out = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{out_id}]); \
+         const __nv_bfloat16* __gd_b_gmem = {b_gmem}; \
+         int __gd_warp_id = static_cast<int>(kittens::warpid()); \
+         int __gd_lane = static_cast<int>(kittens::laneid()); \
+         int __gd_warp_col_base = __gd_warp_id * {tile_n}; \
+         constexpr int __gd_cols_per_thread = {tile_n} / 32; \
+         _Pragma(\"unroll\") \
+         for (int __gd_c = 0; __gd_c < __gd_cols_per_thread; __gd_c++) {{ \
+             int __gd_n = __gd_warp_col_base + __gd_c * 32 + __gd_lane; \
+             float __gd_acc = 0.0f; \
+             for (int __gd_k = 0; __gd_k < {k}; __gd_k++) {{ \
+                 float __gd_a = __bfloat162float(__gd_a_in[__gd_k]); \
+                 float __gd_b = __bfloat162float(__gd_b_gmem[__gd_k * {n} + __gd_n]); \
+                 __gd_acc += __gd_a * __gd_b; \
+             }} \
+             __gd_a_out[__gd_n] = __float2bfloat16(__gd_acc); \
+         }} \
+         }}",
+        in_id = in_page_id,
+        out_id = out_page_id,
+        b_gmem = weight_gmem.expr(),
+        tile_n = TILE_N,
+        k = K,
+        n = N,
+    )));
+
+    consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive::<1>(&out_done),
+        tk20::group_arrive::<1>(&in_consumed),
+    ]));
+
+    // -----------------------------------------------------------
+    // STORER role — TMA-store output row to gmem.
+    // -----------------------------------------------------------
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait::<1>(&out_done, storer_phase));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __gd_out_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{out_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({out_gmem}), \
+             reinterpret_cast<void*>(__gd_out_src), \
+             {bytes}); \
+         }}",
+        out_id = out_page_id,
+        out_gmem = out_gmem.expr(),
+        bytes = out_bytes,
+    )));
     storer.push(tk20::group_tma_store_async_wait::<1>());
     storer.push(tk20::group_arrive::<1>(&out_consumed));
 

@@ -52,10 +52,10 @@
 #![allow(dead_code)]
 
 use crate::ir::nodes::{
-    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, TkFusedNormGemm,
-    Embed, FiniteF32, FusedAddRmsNorm, TkFusedGemmAdd, FusedGateUpActivateMul,
-    FusedQkvRopeCache, GateUpActivation, Gemm, LmHeadNormKind, MegaNode, RmsNorm, RotaryRef,
-    ScalarMul, ScalarOffsetRmsNorm, SpliceMmEmbeds, TanhSoftCap, WeightRef,
+    TkAdd, AttentionKind, TkAttentionViaCacheNode, TkBarrierSignal, TkBarrierWait, TkFusedNormGemm,
+    TkEmbed, FiniteF32, TkFusedAddRmsNorm, TkFusedGemmAdd, TkFusedGateUpActivateMul,
+    TkFusedQkvRopeCache, GateUpActivation, TkGemm, LmHeadNormKind, MegaNode, TkRmsNorm, RotaryRef,
+    TkScalarMul, TkScalarOffsetRmsNorm, TkSpliceMmEmbeds, TkTanhSoftCap, WeightRef,
 };
 use crate::ir::substrate::{PagePool, SubstrateBudget};
 use crate::ir::tape::MegaTape;
@@ -260,7 +260,7 @@ impl<
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(weight_path);
         let eps = FiniteF32::new(eps);
-        let node = RmsNorm::new::<
+        let node = TkRmsNorm::new::<
             IN_ID,
             WEIGHT_ID,
             PARTIAL_OFF,
@@ -280,7 +280,7 @@ impl<
             CONSUMER_BAR_REDUCE,
             CONSUMER_BAR_PUBLISH,
         >(weight, eps);
-        self.nodes.push(MegaNode::RmsNorm(node));
+        self.nodes.push(MegaNode::TkRmsNorm(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.arrives.bump();
@@ -397,7 +397,7 @@ impl<
         let _ = self.pool.take(V_ID);
         let qkv_weight = WeightRef::new(qkv_weight_path);
         let rotary = RotaryRef::new(rotary_path);
-        let node = FusedQkvRopeCache::new::<
+        let node = TkFusedQkvRopeCache::new::<
             IN_ID,
             QKV_ID,
             COS_SIN_ID,
@@ -433,7 +433,7 @@ impl<
             CHUNK_K,
             CONSUMER_BAR_PUBLISH,
         >(qkv_weight, rotary, biased, interleaved);
-        self.nodes.push(MegaNode::FusedQkvRopeCache(node));
+        self.nodes.push(MegaNode::TkFusedQkvRopeCache(node));
         self.pool.release(IN_ID);
         self.pool.release(QKV_ID);
         self.pool.release(COS_SIN_ID);
@@ -478,7 +478,7 @@ impl<
         self.verify_arrives(ARRIVES, "push_add");
         let _ = self.pool.take(DELTA_ID);
         let _ = self.pool.take(RESIDUAL_ID);
-        let node = Add::new::<
+        let node = TkAdd::new::<
             DELTA_ID,
             RESIDUAL_ID,
             CONSUMER_PHASE,
@@ -491,7 +491,7 @@ impl<
             RESIDUAL_ACT_SLOT,
             CONSUMER_BAR_PUBLISH,
         >();
-        self.nodes.push(MegaNode::Add(node));
+        self.nodes.push(MegaNode::TkAdd(node));
         self.pool.release(DELTA_ID);
         self.pool.release(RESIDUAL_ID);
         self.arrives.bump();
@@ -559,7 +559,7 @@ impl<
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(weight_path);
         let eps = FiniteF32::new(eps);
-        let node = FusedAddRmsNorm::new::<
+        let node = TkFusedAddRmsNorm::new::<
             DELTA_ID,
             RESIDUAL_ID,
             WEIGHT_ID,
@@ -580,7 +580,7 @@ impl<
             CONSUMER_BAR_REDUCE,
             CONSUMER_BAR_PUBLISH,
         >(weight, eps);
-        self.nodes.push(MegaNode::FusedAddRmsNorm(node));
+        self.nodes.push(MegaNode::TkFusedAddRmsNorm(node));
         self.pool.release(DELTA_ID);
         self.pool.release(RESIDUAL_ID);
         self.pool.release(WEIGHT_ID);
@@ -654,7 +654,7 @@ impl<
         let _ = self.pool.take(WEIGHT_ID);
         let _ = self.pool.take(OUT_ID);
         let weight = WeightRef::new(weight_path);
-        let node = FusedGateUpActivateMul::new::<
+        let node = TkFusedGateUpActivateMul::new::<
             IN_ID,
             WEIGHT_ID,
             OUT_ID,
@@ -679,7 +679,7 @@ impl<
             TILE_N,
             CONSUMER_BAR_PUBLISH,
         >(weight, activation);
-        self.nodes.push(MegaNode::FusedGateUpActivateMul(node));
+        self.nodes.push(MegaNode::TkFusedGateUpActivateMul(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.pool.release(OUT_ID);
@@ -724,7 +724,7 @@ impl<
         let _ = self.pool.take(OUT_ID);
         let _ = self.pool.take(WEIGHT_ID);
         let weight = WeightRef::new(embed_weight_path);
-        let node = Embed::new::<
+        let node = TkEmbed::new::<
             OUT_ID,
             WEIGHT_ID,
             CONSUMER_PHASE,
@@ -737,7 +737,7 @@ impl<
             OUT_ACT_SLOT,
             WEIGHT_ACCESSOR_IDX,
         >(weight);
-        self.nodes.push(MegaNode::Embed(node));
+        self.nodes.push(MegaNode::TkEmbed(node));
         self.pool.release(OUT_ID);
         self.pool.release(WEIGHT_ID);
         self.arrives.bump();
@@ -779,7 +779,7 @@ impl<
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(OUT_ID);
         let scale = FiniteF32::new(scale);
-        let node = ScalarMul::new::<
+        let node = TkScalarMul::new::<
             IN_ID,
             OUT_ID,
             CONSUMER_PHASE,
@@ -792,7 +792,7 @@ impl<
             OUT_ACT_SLOT,
             CONSUMER_BAR_PUBLISH,
         >(scale);
-        self.nodes.push(MegaNode::ScalarMul(node));
+        self.nodes.push(MegaNode::TkScalarMul(node));
         self.pool.release(IN_ID);
         self.pool.release(OUT_ID);
         self.arrives.bump();
@@ -835,7 +835,7 @@ impl<
         let _ = self.pool.take(IN_ID);
         let _ = self.pool.take(OUT_ID);
         let cap = FiniteF32::new(cap);
-        let node = TanhSoftCap::new::<
+        let node = TkTanhSoftCap::new::<
             IN_ID,
             OUT_ID,
             CONSUMER_PHASE,
@@ -848,7 +848,7 @@ impl<
             OUT_ACT_SLOT,
             CONSUMER_BAR_PUBLISH,
         >(cap);
-        self.nodes.push(MegaNode::TanhSoftCap(node));
+        self.nodes.push(MegaNode::TkTanhSoftCap(node));
         self.pool.release(IN_ID);
         self.pool.release(OUT_ID);
         self.arrives.bump();
@@ -913,7 +913,7 @@ impl<
         let weight = WeightRef::new(weight_path);
         let offset = FiniteF32::new(offset);
         let eps = FiniteF32::new(eps);
-        let node = ScalarOffsetRmsNorm::new::<
+        let node = TkScalarOffsetRmsNorm::new::<
             IN_ID,
             WEIGHT_ID,
             PARTIAL_OFF,
@@ -933,7 +933,7 @@ impl<
             CONSUMER_BAR_REDUCE,
             CONSUMER_BAR_PUBLISH,
         >(weight, offset, eps);
-        self.nodes.push(MegaNode::ScalarOffsetRmsNorm(node));
+        self.nodes.push(MegaNode::TkScalarOffsetRmsNorm(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.arrives.bump();
@@ -1001,7 +1001,7 @@ impl<
         let _ = self.pool.take(WEIGHT_ID);
         let _ = self.pool.take(OUT_ID);
         let weight = WeightRef::new(weight_path);
-        let node = Gemm::new::<
+        let node = TkGemm::new::<
             IN_ID,
             WEIGHT_ID,
             OUT_ID,
@@ -1025,7 +1025,7 @@ impl<
             CHUNK_K,
             CONSUMER_BAR_PUBLISH,
         >(weight);
-        self.nodes.push(MegaNode::Gemm(node));
+        self.nodes.push(MegaNode::TkGemm(node));
         self.pool.release(IN_ID);
         self.pool.release(WEIGHT_ID);
         self.pool.release(OUT_ID);
@@ -1502,7 +1502,7 @@ impl<
         let _ = self.pool.take(ATTN_OUT_ID);
         let attn_scale = FiniteF32::new(attn_scale);
         let attn_softcap = FiniteF32::new(attn_softcap);
-        let node = AttentionViaCacheNode::new::<
+        let node = TkAttentionViaCacheNode::new::<
             Q_IN_ID,
             ATTN_OUT_ID,
             SCORE_OFF,
@@ -1530,7 +1530,7 @@ impl<
             Q_IN_ACT_SLOT,
             ATTN_OUT_ACT_SLOT,
         >(kind, interleaved, attn_scale, attn_softcap);
-        self.nodes.push(MegaNode::AttentionViaCache(node));
+        self.nodes.push(MegaNode::TkAttentionViaCache(node));
         self.pool.release(Q_IN_ID);
         self.pool.release(ATTN_OUT_ID);
         for _ in 0..ITERS {
@@ -1562,7 +1562,7 @@ impl<
     ) -> &mut Self {
         self.verify_arrives(ARRIVES, "push_splice_mm_embeds");
         let _ = self.pool.take(SLOT_ID);
-        let node = SpliceMmEmbeds::new::<
+        let node = TkSpliceMmEmbeds::new::<
             SLOT_ID,
             CONSUMER_PHASE,
             STORER_PHASE,
@@ -1572,7 +1572,7 @@ impl<
             NUM_TOKENS,
             TARGET_ACT_SLOT,
         >();
-        self.nodes.push(MegaNode::SpliceMmEmbeds(node));
+        self.nodes.push(MegaNode::TkSpliceMmEmbeds(node));
         self.pool.release(SLOT_ID);
         self.arrives.bump();
         self
@@ -1583,8 +1583,8 @@ impl<
         &mut self,
         _edge: crate::ir::substrate::EdgeId<IDX, NUM_EDGES>,
     ) -> &mut Self {
-        let node = BarrierSignal::new::<IDX, NUM_EDGES>();
-        self.nodes.push(MegaNode::BarrierSignal(node));
+        let node = TkBarrierSignal::new::<IDX, NUM_EDGES>();
+        self.nodes.push(MegaNode::TkBarrierSignal(node));
         self
     }
 
@@ -1594,8 +1594,8 @@ impl<
         _edge: crate::ir::substrate::EdgeId<IDX, NUM_EDGES>,
         _expected: crate::ir::substrate::ExpectedCount<COUNT>,
     ) -> &mut Self {
-        let node = BarrierWait::new::<IDX, COUNT, NUM_EDGES>();
-        self.nodes.push(MegaNode::BarrierWait(node));
+        let node = TkBarrierWait::new::<IDX, COUNT, NUM_EDGES>();
+        self.nodes.push(MegaNode::TkBarrierWait(node));
         self
     }
 
@@ -1699,7 +1699,7 @@ mod tests {
         );
         let tape = b.finish(16);
         assert_eq!(tape.nodes().len(), 1);
-        let MegaNode::RmsNorm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkRmsNorm(n) = &tape.nodes()[0] else {
             panic!("expected RmsNorm");
         };
         assert_eq!(n.in_page().raw(), 0);
@@ -1769,10 +1769,10 @@ mod tests {
             1.0e-5_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::RmsNorm(n0) = &tape.nodes()[0] else {
+        let MegaNode::TkRmsNorm(n0) = &tape.nodes()[0] else {
             panic!();
         };
-        let MegaNode::RmsNorm(n1) = &tape.nodes()[1] else {
+        let MegaNode::TkRmsNorm(n1) = &tape.nodes()[1] else {
             panic!();
         };
         assert_eq!(n0.consumer_phase().raw(), 0);
@@ -1848,7 +1848,7 @@ mod tests {
             false,
         );
         let tape = b.finish(16);
-        let MegaNode::FusedQkvRopeCache(n) = &tape.nodes()[0] else {
+        let MegaNode::TkFusedQkvRopeCache(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.in_page().raw(), 0);
@@ -1891,7 +1891,7 @@ mod tests {
             BarSyncId::<2>::new(),
         );
         let tape = b.finish(16);
-        let MegaNode::Add(n) = &tape.nodes()[0] else {
+        let MegaNode::TkAdd(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.delta_page().raw(), 0);
@@ -1931,7 +1931,7 @@ mod tests {
             1.0e-5_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::FusedAddRmsNorm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkFusedAddRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.layer().raw(), 3);
@@ -1971,7 +1971,7 @@ mod tests {
             GateUpActivation::Silu,
         );
         let tape = b.finish(16);
-        let MegaNode::FusedGateUpActivateMul(n) = &tape.nodes()[0] else {
+        let MegaNode::TkFusedGateUpActivateMul(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.iters().raw(), 8);
@@ -2005,7 +2005,7 @@ mod tests {
             "W::embed".to_string(),
         );
         let tape = b.finish(16);
-        let MegaNode::Embed(n) = &tape.nodes()[0] else {
+        let MegaNode::TkEmbed(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.out_page().raw(), 0);
@@ -2038,7 +2038,7 @@ mod tests {
             0.5,
         );
         let tape = b.finish(16);
-        let MegaNode::ScalarMul(n) = &tape.nodes()[0] else {
+        let MegaNode::TkScalarMul(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.scale.raw(), 0.5);
@@ -2091,7 +2091,7 @@ mod tests {
             30.0,
         );
         let tape = b.finish(16);
-        let MegaNode::TanhSoftCap(n) = &tape.nodes()[0] else {
+        let MegaNode::TkTanhSoftCap(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.cap.raw(), 30.0);
@@ -2128,7 +2128,7 @@ mod tests {
             1.0e-5_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::ScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkScalarOffsetRmsNorm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.layer().raw(), 5);
@@ -2172,7 +2172,7 @@ mod tests {
             "W::gemm".to_string(),
         );
         let tape = b.finish(16);
-        let MegaNode::Gemm(n) = &tape.nodes()[0] else {
+        let MegaNode::TkGemm(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.n().raw(), 4096);
@@ -2385,7 +2385,7 @@ mod tests {
             0.0_f32,
         );
         let tape = b.finish(16);
-        let MegaNode::AttentionViaCache(n) = &tape.nodes()[0] else {
+        let MegaNode::TkAttentionViaCache(n) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(n.kv_cache_layer().raw(), 5);
@@ -2400,11 +2400,11 @@ mod tests {
         b.push_barrier_signal::<0>(EdgeId::<0, 4>::new());
         b.push_barrier_wait::<0, 4>(EdgeId::<0, 4>::new(), ExpectedCount::<4>::new());
         let tape = b.finish(16);
-        let MegaNode::BarrierSignal(s) = &tape.nodes()[0] else {
+        let MegaNode::TkBarrierSignal(s) = &tape.nodes()[0] else {
             panic!();
         };
         assert_eq!(s.edge().raw(), 0);
-        let MegaNode::BarrierWait(w) = &tape.nodes()[1] else {
+        let MegaNode::TkBarrierWait(w) = &tape.nodes()[1] else {
             panic!();
         };
         assert_eq!(w.edge().raw(), 0);

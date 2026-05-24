@@ -25,10 +25,10 @@ pub mod tape;
 // crate-root re-exports in `lib.rs`.
 pub use lower::{ArriveCount, LowerError, MegaTapeBuilder};
 pub use nodes::{
-    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, Embed, FiniteF32,
-    FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, Gemm,
-    LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, RmsNorm, RotaryRef, ScalarMul,
-    ScalarOffsetRmsNorm, SlidingWindow, SpliceMmEmbeds, TanhSoftCap, TkFusedGemmAdd,
+    TkAdd, AttentionKind, TkAttentionViaCacheNode, TkBarrierSignal, TkBarrierWait, TkEmbed, FiniteF32,
+    TkFusedAddRmsNorm, TkFusedGateUpActivateMul, TkFusedQkvRopeCache, GateUpActivation, TkGemm,
+    LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, TkRmsNorm, RotaryRef, TkScalarMul,
+    TkScalarOffsetRmsNorm, SlidingWindow, TkSpliceMmEmbeds, TkTanhSoftCap, TkFusedGemmAdd,
     TkFusedNormGemm, WeightRef,
 };
 pub use substrate::{

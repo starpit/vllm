@@ -235,7 +235,7 @@ pub enum AttentionKind {
 /// - `in_act_slot` — `act_ptrs[in_act_slot]` (kernel input row).
 /// - `out_act_slot` — `act_ptrs[out_act_slot]` (storer output row).
 /// - `weight_accessor_idx` — `weight_ptrs[idx * NUM_LAYERS + layer]`.
-pub struct RmsNorm {
+pub struct TkRmsNorm {
     in_page: crate::ir::substrate::PageRef,
     weight_page: crate::ir::substrate::PageRef,
     partial_offset: crate::ir::substrate::ScratchOffsetRef,
@@ -267,7 +267,7 @@ pub struct RmsNorm {
     pub weight: WeightRef,
 }
 
-impl RmsNorm {
+impl TkRmsNorm {
     /// Const-generic constructor. Compile-time substrate proofs:
     /// - `IN_ID < NUM_PAGES`, `WEIGHT_ID < NUM_PAGES` (#1)
     /// - `IN_ID != WEIGHT_ID` (within-op alias #2)
@@ -497,7 +497,7 @@ impl RmsNorm {
 /// `qkv_weight_page` was load-bearing for the page-handoff barrier
 /// only; the actual weight tile lives in scratch (the page is too
 /// small — typical `PAGE_SIZE=32KB` cannot fit a multi-MB weight).
-pub struct FusedQkvRopeCache {
+pub struct TkFusedQkvRopeCache {
     in_page: crate::ir::substrate::PageRef,
     qkv_weight_page: crate::ir::substrate::PageRef,
     cos_sin_page: crate::ir::substrate::PageRef,
@@ -557,7 +557,7 @@ pub struct FusedQkvRopeCache {
     pub interleaved: bool,
 }
 
-impl FusedQkvRopeCache {
+impl TkFusedQkvRopeCache {
     /// Const-generic constructor with all substrate proofs at
     /// compile time. Six page bounds, six pairwise non-aliases,
     /// two scratch within-budget, two scratch disjoint, two phase
@@ -879,7 +879,7 @@ impl FusedQkvRopeCache {
 ///
 /// Kernel ABI: bf16 elementwise per-row residual add — emit splices a
 /// per-row load/add/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
-pub struct Add {
+pub struct TkAdd {
     delta_page: crate::ir::substrate::PageRef,
     residual_page: crate::ir::substrate::PageRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
@@ -894,7 +894,7 @@ pub struct Add {
     consumer_bar_publish: crate::ir::substrate::BarRef,
 }
 
-impl Add {
+impl TkAdd {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const DELTA_ID: u32,
@@ -980,7 +980,7 @@ impl Add {
 /// Codegen inlines the four role bodies directly into the kernel
 /// `.cu`. Template args `<HIDDEN_DIM, NUM_TOKENS>` come from typed
 /// getters; runtime arg `eps` from `eps()`.
-pub struct FusedAddRmsNorm {
+pub struct TkFusedAddRmsNorm {
     delta_page: crate::ir::substrate::PageRef,
     residual_page: crate::ir::substrate::PageRef,
     weight_page: crate::ir::substrate::PageRef,
@@ -1008,7 +1008,7 @@ pub struct FusedAddRmsNorm {
     pub weight: WeightRef,
 }
 
-impl FusedAddRmsNorm {
+impl TkFusedAddRmsNorm {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const DELTA_ID: u32,
@@ -1158,7 +1158,7 @@ impl FusedAddRmsNorm {
 /// pattern. The AlongN warp split needs `tile_n * NCW ==
 /// intermediate_dim`; the consumer's cross-warp publish before
 /// `page_done[out]` needs a `bar.sync` ID in 1..=15.
-pub struct FusedGateUpActivateMul {
+pub struct TkFusedGateUpActivateMul {
     in_page: crate::ir::substrate::PageRef,
     gate_up_weight_page: crate::ir::substrate::PageRef,
     out_page: crate::ir::substrate::PageRef,
@@ -1193,7 +1193,7 @@ pub struct FusedGateUpActivateMul {
     pub activation: GateUpActivation,
 }
 
-impl FusedGateUpActivateMul {
+impl TkFusedGateUpActivateMul {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -1375,7 +1375,7 @@ impl FusedGateUpActivateMul {
 /// (LAYER is always 0 for Embed). The vocab table is sized
 /// `VOCAB_SIZE × HIDDEN_DIM`. Loader needs `input_ids` (uint32_t*)
 /// as a kernel-level extra ptr (see `KernelExtras::needs_input_ids`).
-pub struct Embed {
+pub struct TkEmbed {
     out_page: crate::ir::substrate::PageRef,
     embed_weight_page: crate::ir::substrate::PageRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
@@ -1388,7 +1388,7 @@ pub struct Embed {
     pub embed_weight: WeightRef,
 }
 
-impl Embed {
+impl TkEmbed {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const OUT_ID: u32,
@@ -1468,7 +1468,7 @@ impl Embed {
 ///
 /// Kernel ABI: bf16 elementwise per-row scale — emit splices a per-row
 /// load/mul/store loop with `<HIDDEN_DIM, NUM_TOKENS>` shape.
-pub struct ScalarMul {
+pub struct TkScalarMul {
     in_page: crate::ir::substrate::PageRef,
     out_page: crate::ir::substrate::PageRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
@@ -1484,7 +1484,7 @@ pub struct ScalarMul {
     pub scale: FiniteF32,
 }
 
-impl ScalarMul {
+impl TkScalarMul {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -1566,7 +1566,7 @@ impl ScalarMul {
 /// `cap` value. Kernel: emit splices a per-row load/tanh-cap/store
 /// loop with `<HIDDEN_DIM, NUM_TOKENS>` shape and the runtime cap
 /// (Gemma2 final-logit softcap; 0.0 = identity for arches without).
-pub struct TanhSoftCap {
+pub struct TkTanhSoftCap {
     in_page: crate::ir::substrate::PageRef,
     out_page: crate::ir::substrate::PageRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
@@ -1581,7 +1581,7 @@ pub struct TanhSoftCap {
     pub cap: FiniteF32,
 }
 
-impl TanhSoftCap {
+impl TkTanhSoftCap {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -1664,7 +1664,7 @@ impl TanhSoftCap {
 /// Codegen inlines the role bodies. Same TK + substrate primitives
 /// as RmsNorm plus a `float offset` runtime arg in the consumer's
 /// scale-multiply step.
-pub struct ScalarOffsetRmsNorm {
+pub struct TkScalarOffsetRmsNorm {
     in_page: crate::ir::substrate::PageRef,
     weight_page: crate::ir::substrate::PageRef,
     partial_offset: crate::ir::substrate::ScratchOffsetRef,
@@ -1691,7 +1691,7 @@ pub struct ScalarOffsetRmsNorm {
     pub offset: FiniteF32,
 }
 
-impl ScalarOffsetRmsNorm {
+impl TkScalarOffsetRmsNorm {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -1834,7 +1834,7 @@ impl ScalarOffsetRmsNorm {
 /// M = NUM_TOKENS at the canonical's workload point. The consumer's
 /// inner-product loop uses TK `wgmma`/`mma_ABt` primitives (Hopper)
 /// or warp-level register tiles (Ampere).
-pub struct Gemm {
+pub struct TkGemm {
     in_page: crate::ir::substrate::PageRef,
     weight_page: crate::ir::substrate::PageRef,
     out_page: crate::ir::substrate::PageRef,
@@ -1870,7 +1870,7 @@ pub struct Gemm {
     pub weight: WeightRef,
 }
 
-impl Gemm {
+impl TkGemm {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const IN_ID: u32,
@@ -2760,7 +2760,7 @@ impl TkFusedNormGemm {
 /// HAS_SOFTCAP. SPLITS = 1 today; SPLITS > 1 fans through a
 /// reduction step that the codegen will splice as a second per-tile
 /// pass.
-pub struct AttentionViaCacheNode {
+pub struct TkAttentionViaCacheNode {
     q_in_page: crate::ir::substrate::PageRef,
     attn_out_page: crate::ir::substrate::PageRef,
     score_offset: crate::ir::substrate::ScratchOffsetRef,
@@ -2797,7 +2797,7 @@ pub struct AttentionViaCacheNode {
     pub kind: AttentionKind,
 }
 
-impl AttentionViaCacheNode {
+impl TkAttentionViaCacheNode {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const Q_IN_ID: u32,
@@ -3040,11 +3040,11 @@ impl AttentionViaCacheNode {
 }
 
 /// `BarrierSignal` variant.
-pub struct BarrierSignal {
+pub struct TkBarrierSignal {
     edge: crate::ir::substrate::EdgeIdRef,
 }
 
-impl BarrierSignal {
+impl TkBarrierSignal {
     pub fn new<const IDX: u32, const NUM_EDGES: u32>() -> Self {
         Self {
             edge: crate::ir::substrate::EdgeId::<IDX, NUM_EDGES>::new().erase(),
@@ -3057,12 +3057,12 @@ impl BarrierSignal {
 }
 
 /// `BarrierWait` variant.
-pub struct BarrierWait {
+pub struct TkBarrierWait {
     edge: crate::ir::substrate::EdgeIdRef,
     expected: crate::ir::substrate::ExpectedCountRef,
 }
 
-impl BarrierWait {
+impl TkBarrierWait {
     pub fn new<const IDX: u32, const COUNT: u32, const NUM_EDGES: u32>() -> Self {
         Self {
             edge: crate::ir::substrate::EdgeId::<IDX, NUM_EDGES>::new().erase(),
@@ -3085,7 +3085,7 @@ impl BarrierWait {
 ///
 /// AST shape: per-row D2D copy with `<HIDDEN_DIM, NUM_TOKENS>` shape
 /// and the target activation slot.
-pub struct SpliceMmEmbeds {
+pub struct TkSpliceMmEmbeds {
     slot: crate::ir::substrate::PageRef,
     consumer_phase: crate::ir::substrate::MbarrierPhaseRef,
     storer_phase: crate::ir::substrate::MbarrierPhaseRef,
@@ -3094,7 +3094,7 @@ pub struct SpliceMmEmbeds {
     target_act_slot: crate::ir::substrate::ActSlotRef,
 }
 
-impl SpliceMmEmbeds {
+impl TkSpliceMmEmbeds {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const SLOT_ID: u32,
@@ -3154,20 +3154,20 @@ impl SpliceMmEmbeds {
 
 /// The typed lowered MegaNode enum.
 pub enum MegaNode {
-    RmsNorm(RmsNorm),
-    FusedQkvRopeCache(FusedQkvRopeCache),
-    Add(Add),
-    FusedAddRmsNorm(FusedAddRmsNorm),
-    FusedGateUpActivateMul(FusedGateUpActivateMul),
-    Embed(Embed),
-    ScalarMul(ScalarMul),
-    TanhSoftCap(TanhSoftCap),
-    ScalarOffsetRmsNorm(ScalarOffsetRmsNorm),
-    Gemm(Gemm),
+    TkRmsNorm(TkRmsNorm),
+    TkFusedQkvRopeCache(TkFusedQkvRopeCache),
+    TkAdd(TkAdd),
+    TkFusedAddRmsNorm(TkFusedAddRmsNorm),
+    TkFusedGateUpActivateMul(TkFusedGateUpActivateMul),
+    TkEmbed(TkEmbed),
+    TkScalarMul(TkScalarMul),
+    TkTanhSoftCap(TkTanhSoftCap),
+    TkScalarOffsetRmsNorm(TkScalarOffsetRmsNorm),
+    TkGemm(TkGemm),
     TkFusedGemmAdd(TkFusedGemmAdd),
     TkFusedNormGemm(TkFusedNormGemm),
-    AttentionViaCache(AttentionViaCacheNode),
-    BarrierSignal(BarrierSignal),
-    BarrierWait(BarrierWait),
-    SpliceMmEmbeds(SpliceMmEmbeds),
+    TkAttentionViaCache(TkAttentionViaCacheNode),
+    TkBarrierSignal(TkBarrierSignal),
+    TkBarrierWait(TkBarrierWait),
+    TkSpliceMmEmbeds(TkSpliceMmEmbeds),
 }

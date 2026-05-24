@@ -866,13 +866,12 @@ pub fn render_gemm<
     b_tile_offset: u32,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("Gemm");
+        return RoleBodies::skipped("TkGemm");
     }
-    // M=1 → decode-shape (per-thread vec-mat).
-    // M=16 (or any other M%16==0) → prefill-shape (per-warp tile mma).
-    // Other M (8, 64, ...) still SKIPPED until per-shape ports land.
-    if M == 1 {
-        return render_gemm_decode::<K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+    // M%16!=0 → vec-mat decode-shape (small-batch decode, M ∈ {1, 8}).
+    // M%16==0 → tile-MMA prefill-shape (M ∈ {64, 512, 4096}).
+    if M % 16 != 0 {
+        return render_gemm_decode::<M, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
             in_page_id,
             weight_page_id,
             out_page_id,
@@ -885,9 +884,6 @@ pub fn render_gemm<
             bar_publish,
             b_tile_offset,
         );
-    }
-    if M % 16 != 0 {
-        return RoleBodies::skipped("Gemm");
     }
 
     let loader_phase = storer_phase;
@@ -983,18 +979,19 @@ pub fn render_gemm<
 }
 
 // ============================================================
-// Gemm (decode shape, M=1).
+// Gemm (decode shape, M%16!=0 — small-batch decode).
 //
-// At M=1 the prefill render's `st_bf<M, K>` / `rt_bf<M, K>` tiles
-// fail TK 2.0's `static_assert(rows % TILE_ROW_DIM == 0)`. Padding
-// M to 16 in scratch doesn't fit (16 * K * 2 = 64 KB at K=2048
-// vs SCRATCH_BYTES=32 KB). The prefill K*N b_tile staging also
-// doesn't fit (8 MB at K=N=2048). So we emit a per-thread
+// For M ∈ {1, 8} the prefill render's `st_bf<M, K>` / `rt_bf<M, K>`
+// tiles fail TK 2.0's `static_assert(rows % TILE_ROW_DIM == 0)`.
+// Padding M to 16 in scratch doesn't fit (16 * K * 2 = 64 KB at
+// K=2048 vs SCRATCH_BYTES=32 KB). The prefill K*N b_tile staging
+// also doesn't fit (8 MB at K=N=2048). So we emit a per-thread
 // vec-mat compute path: each thread owns `TILE_N / 32` output
-// columns, dot-products each col against the input row read
-// from the in-page (M=1 row, K bf16 elements = K bytes), reading
-// B directly from gmem (no scratch staging — bandwidth-bound on
-// decode anyway, ~8 MB B per GEMM ≈ 2.7 µs at H100's 3 TB/s).
+// columns and accumulates `M` floats per col, sharing each B-load
+// across the M rows. B is read directly from gmem (no scratch
+// staging — decode is bandwidth-bound, ~8 MB B per GEMM ≈ 2.7 µs
+// at H100's 3 TB/s, and the B-share across M rows still keeps
+// the pattern memory-bound at small M).
 //
 // This is a correctness-first emit (no tensor cores), matching
 // the substrate's current sizing. When SCRATCH_BYTES / PAGE_SIZE
@@ -1005,6 +1002,7 @@ pub fn render_gemm<
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_gemm_decode<
+    const M: u32,
     const K: u32,
     const N: u32,
     const TILE_N: u32,
@@ -1025,16 +1023,19 @@ pub fn render_gemm_decode<
     _b_tile_offset: u32,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("GemmDecode");
+        return RoleBodies::skipped("TkGemmDecode");
+    }
+    if M == 0 {
+        return RoleBodies::skipped("TkGemmDecode");
     }
     if NCW == 0 || N % NCW != 0 {
-        return RoleBodies::skipped("GemmDecode");
+        return RoleBodies::skipped("TkGemmDecode");
     }
     if TILE_N != N / NCW {
-        return RoleBodies::skipped("GemmDecode");
+        return RoleBodies::skipped("TkGemmDecode");
     }
     if TILE_N % 32 != 0 {
-        return RoleBodies::skipped("GemmDecode");
+        return RoleBodies::skipped("TkGemmDecode");
     }
 
     let loader_phase = storer_phase;
@@ -1050,8 +1051,8 @@ pub fn render_gemm_decode<
     let out_gmem = gmem_act_ptr_raw(out_act_slot);
     let weight_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
 
-    let act_bytes: u32 = K * BF16_BYTES; // M=1 → 1*K*2
-    let out_bytes: u32 = N * BF16_BYTES; // M=1 → 1*N*2
+    let act_bytes: u32 = M * K * BF16_BYTES;
+    let out_bytes: u32 = M * N * BF16_BYTES;
 
     // -----------------------------------------------------------
     // LOADER role — TMA-load A from gmem to in_page. Weights are
@@ -1097,22 +1098,31 @@ pub fn render_gemm_decode<
          int __gd_lane = static_cast<int>(kittens::laneid()); \
          int __gd_warp_col_base = __gd_warp_id * {tile_n}; \
          constexpr int __gd_cols_per_thread = {tile_n} / 32; \
-         _Pragma(\"unroll\") \
          for (int __gd_c = 0; __gd_c < __gd_cols_per_thread; __gd_c++) {{ \
              int __gd_n = __gd_warp_col_base + __gd_c * 32 + __gd_lane; \
-             float __gd_acc = 0.0f; \
+             float __gd_acc[{m}]; \
+             _Pragma(\"unroll\") \
+             for (int __gd_m = 0; __gd_m < {m}; __gd_m++) __gd_acc[__gd_m] = 0.0f; \
              for (int __gd_k = 0; __gd_k < {k}; __gd_k++) {{ \
-                 float __gd_a = __bfloat162float(__gd_a_in[__gd_k]); \
                  float __gd_b = __bfloat162float(__gd_b_gmem[__gd_k * {n} + __gd_n]); \
-                 __gd_acc += __gd_a * __gd_b; \
+                 _Pragma(\"unroll\") \
+                 for (int __gd_m = 0; __gd_m < {m}; __gd_m++) {{ \
+                     float __gd_a = __bfloat162float(\
+                         __gd_a_in[__gd_m * {k} + __gd_k]); \
+                     __gd_acc[__gd_m] += __gd_a * __gd_b; \
+                 }} \
              }} \
-             __gd_a_out[__gd_n] = __float2bfloat16(__gd_acc); \
+             _Pragma(\"unroll\") \
+             for (int __gd_m = 0; __gd_m < {m}; __gd_m++) {{ \
+                 __gd_a_out[__gd_m * {n} + __gd_n] = __float2bfloat16(__gd_acc[__gd_m]); \
+             }} \
          }} \
          }}",
         in_id = in_page_id,
         out_id = out_page_id,
         b_gmem = weight_gmem.expr(),
         tile_n = TILE_N,
+        m = M,
         k = K,
         n = N,
     )));
@@ -1153,6 +1163,183 @@ pub fn render_gemm_decode<
 }
 
 // ============================================================
+// TkFusedGemmAdd (decode shape, M%16!=0 — small-batch decode).
+//
+// Same per-thread vec-mat structure as `render_gemm_decode`, plus
+// a residual fold: TMA-load the residual into the out-page (which
+// is reused as the residual page in the prefill render), each
+// thread reads its M residual elements from the out-page (one per
+// row), folds in the M dot products, bf16-stores back to the
+// out-page. B-load is shared across the M rows (one fp32 mul-add
+// per (m, k, n)).
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_fused_gemm_add_decode<
+    const M: u32,
+    const K: u32,
+    const N: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    _weight_page_id: u32,
+    residual_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    residual_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    _b_tile_offset: u32,
+) -> RoleBodies {
+    if ITERS != 1 {
+        return RoleBodies::skipped("TkFusedGemmAddDecode");
+    }
+    if M == 0 {
+        return RoleBodies::skipped("TkFusedGemmAddDecode");
+    }
+    if NCW == 0 || N % NCW != 0 {
+        return RoleBodies::skipped("TkFusedGemmAddDecode");
+    }
+    if TILE_N != N / NCW {
+        return RoleBodies::skipped("TkFusedGemmAddDecode");
+    }
+    if TILE_N % 32 != 0 {
+        return RoleBodies::skipped("TkFusedGemmAddDecode");
+    }
+
+    let loader_phase = storer_phase;
+    let in_p = page(in_page_id);
+    let residual_p = page(residual_page_id);
+
+    let in_ready = page_ready_sem(in_p);
+    let residual_ready = page_ready_sem(residual_p);
+    let residual_done = page_done_sem(residual_p);
+    let in_consumed = page_consumed_sem(in_p);
+    let residual_consumed = page_consumed_sem(residual_p);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let residual_gmem = gmem_act_ptr_raw(residual_act_slot);
+    let weight_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
+
+    let act_bytes: u32 = M * K * BF16_BYTES;
+    let residual_bytes: u32 = M * N * BF16_BYTES;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&residual_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __ga_a_dst = reinterpret_cast<__nv_bfloat16*>(ss.pages[{in_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(__ga_a_dst), \
+         reinterpret_cast<void*>({a_gmem}), \
+         {act_bytes}, {a_ready}); \
+         }}",
+        in_id = in_page_id,
+        a_gmem = in_gmem.expr(),
+        act_bytes = act_bytes,
+        a_ready = in_ready.expr(),
+    )));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&residual_ready, residual_bytes));
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __ga_r_dst = reinterpret_cast<__nv_bfloat16*>(ss.pages[{res_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(__ga_r_dst), \
+         reinterpret_cast<void*>({r_gmem}), \
+         {res_bytes}, {r_ready}); \
+         }}",
+        res_id = residual_page_id,
+        r_gmem = residual_gmem.expr(),
+        res_bytes = residual_bytes,
+        r_ready = residual_ready.expr(),
+    )));
+
+    let launcher = CuBlock::new();
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
+    consumer.push(tk20::group_wait::<1>(&residual_ready, consumer_phase));
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __ga_a_in = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{in_id}]); \
+         __nv_bfloat16* __ga_r = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{res_id}]); \
+         const __nv_bfloat16* __ga_b_gmem = {b_gmem}; \
+         int __ga_warp_id = static_cast<int>(kittens::warpid()); \
+         int __ga_lane = static_cast<int>(kittens::laneid()); \
+         int __ga_warp_col_base = __ga_warp_id * {tile_n}; \
+         constexpr int __ga_cols_per_thread = {tile_n} / 32; \
+         for (int __ga_c = 0; __ga_c < __ga_cols_per_thread; __ga_c++) {{ \
+             int __ga_n = __ga_warp_col_base + __ga_c * 32 + __ga_lane; \
+             float __ga_acc[{m}]; \
+             _Pragma(\"unroll\") \
+             for (int __ga_m = 0; __ga_m < {m}; __ga_m++) \
+                 __ga_acc[__ga_m] = __bfloat162float(__ga_r[__ga_m * {n} + __ga_n]); \
+             for (int __ga_k = 0; __ga_k < {k}; __ga_k++) {{ \
+                 float __ga_b = __bfloat162float(__ga_b_gmem[__ga_k * {n} + __ga_n]); \
+                 _Pragma(\"unroll\") \
+                 for (int __ga_m = 0; __ga_m < {m}; __ga_m++) {{ \
+                     float __ga_a = __bfloat162float(\
+                         __ga_a_in[__ga_m * {k} + __ga_k]); \
+                     __ga_acc[__ga_m] += __ga_a * __ga_b; \
+                 }} \
+             }} \
+             _Pragma(\"unroll\") \
+             for (int __ga_m = 0; __ga_m < {m}; __ga_m++) {{ \
+                 __ga_r[__ga_m * {n} + __ga_n] = __float2bfloat16(__ga_acc[__ga_m]); \
+             }} \
+         }} \
+         }}",
+        in_id = in_page_id,
+        res_id = residual_page_id,
+        b_gmem = weight_gmem.expr(),
+        tile_n = TILE_N,
+        m = M,
+        k = K,
+        n = N,
+    )));
+
+    consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive::<1>(&residual_done),
+        tk20::group_arrive::<1>(&in_consumed),
+    ]));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait::<1>(&residual_done, storer_phase));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __ga_r_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{res_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({r_gmem}), \
+             reinterpret_cast<void*>(__ga_r_src), \
+             {bytes}); \
+         }}",
+        res_id = residual_page_id,
+        r_gmem = residual_gmem.expr(),
+        bytes = residual_bytes,
+    )));
+    storer.push(tk20::group_tma_store_async_wait::<1>());
+    storer.push(tk20::group_arrive::<1>(&residual_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
 // TkFusedGemmAdd — `residual += A * B` (in-place residual fold).
 // ============================================================
 
@@ -1180,10 +1367,22 @@ pub fn render_tk_fused_gemm_add<
     if ITERS != 1 {
         return RoleBodies::skipped("TkFusedGemmAdd");
     }
-    // See `render_gemm` for the M%16!=0 rationale. Same TK row-dim
-    // constraint, same deferred decode-shape port.
+    // M%16!=0 → vec-mat decode-shape (small-batch decode).
+    // M%16==0 → tile-MMA prefill-shape.
     if M % 16 != 0 {
-        return RoleBodies::skipped("TkFusedGemmAdd");
+        return render_fused_gemm_add_decode::<M, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id,
+            weight_page_id,
+            residual_page_id,
+            consumer_phase,
+            storer_phase,
+            layer,
+            in_act_slot,
+            residual_act_slot,
+            weight_accessor,
+            bar_publish,
+            b_tile_offset,
+        );
     }
 
     let loader_phase = storer_phase;
@@ -1285,6 +1484,186 @@ pub fn render_tk_fused_gemm_add<
 }
 
 // ============================================================
+// FusedGateUpActivateMul (decode shape, M%16!=0 — small-batch decode).
+//
+// Per-thread vec-mat with two output accs per row (gate, up), one
+// shared activation lambda on gate-acc, multiply by up-acc, bf16
+// store. Both gate and up weights are read directly from gmem
+// (gate at base offset, up at +gate_bytes — same layout the
+// prefill render uses with `gmem_weight_ptr_raw_offset`). Each
+// (gate_gmem, up_gmem) load is shared across the M rows.
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_fused_gate_up_activate_mul_decode<
+    const M: u32,
+    const HIDDEN_DIM: u32,
+    const INTERMEDIATE_DIM: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    _weight_page_id: u32,
+    out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    gate_bytes: u32,
+    activation: GateUpActivation,
+) -> RoleBodies {
+    if ITERS != 1 {
+        return RoleBodies::skipped("TkFusedGateUpActivateMulDecode");
+    }
+    if M == 0 {
+        return RoleBodies::skipped("TkFusedGateUpActivateMulDecode");
+    }
+    if NCW == 0 || INTERMEDIATE_DIM % NCW != 0 {
+        return RoleBodies::skipped("TkFusedGateUpActivateMulDecode");
+    }
+    if TILE_N != INTERMEDIATE_DIM / NCW {
+        return RoleBodies::skipped("TkFusedGateUpActivateMulDecode");
+    }
+    if TILE_N % 32 != 0 {
+        return RoleBodies::skipped("TkFusedGateUpActivateMulDecode");
+    }
+
+    let loader_phase = storer_phase;
+    let in_p = page(in_page_id);
+    let out_p = page(out_page_id);
+
+    let in_ready = page_ready_sem(in_p);
+    let out_done = page_done_sem(out_p);
+    let in_consumed = page_consumed_sem(in_p);
+    let out_consumed = page_consumed_sem(out_p);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let out_gmem = gmem_act_ptr_raw(out_act_slot);
+    let gate_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
+    let up_gmem = gmem_weight_ptr_raw_offset(weight_accessor, layer, NUM_LAYERS, gate_bytes);
+
+    let act_bytes: u32 = M * HIDDEN_DIM * BF16_BYTES;
+    let out_bytes: u32 = M * INTERMEDIATE_DIM * BF16_BYTES;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&out_consumed, loader_phase));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __gu_a_dst = reinterpret_cast<__nv_bfloat16*>(ss.pages[{in_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(__gu_a_dst), \
+         reinterpret_cast<void*>({a_gmem}), \
+         {act_bytes}, {a_ready}); \
+         }}",
+        in_id = in_page_id,
+        a_gmem = in_gmem.expr(),
+        act_bytes = act_bytes,
+        a_ready = in_ready.expr(),
+    )));
+
+    let launcher = CuBlock::new();
+
+    let activation_expr = match activation {
+        GateUpActivation::Silu => "__gu_x * (1.0f / (1.0f + __expf(-__gu_x)))",
+        GateUpActivation::Gelu => {
+            "0.5f * __gu_x * (1.0f + tanhf(0.7978845608028654f \
+             * (__gu_x + 0.044715f * __gu_x * __gu_x * __gu_x)))"
+        }
+    };
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __gu_a_in = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{in_id}]); \
+         __nv_bfloat16* __gu_a_out = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{out_id}]); \
+         const __nv_bfloat16* __gu_gate_gmem = {gate_gmem}; \
+         const __nv_bfloat16* __gu_up_gmem = {up_gmem}; \
+         int __gu_warp_id = static_cast<int>(kittens::warpid()); \
+         int __gu_lane = static_cast<int>(kittens::laneid()); \
+         int __gu_warp_col_base = __gu_warp_id * {tile_n}; \
+         constexpr int __gu_cols_per_thread = {tile_n} / 32; \
+         for (int __gu_c = 0; __gu_c < __gu_cols_per_thread; __gu_c++) {{ \
+             int __gu_n = __gu_warp_col_base + __gu_c * 32 + __gu_lane; \
+             float __gu_g[{m}]; \
+             float __gu_u[{m}]; \
+             _Pragma(\"unroll\") \
+             for (int __gu_m = 0; __gu_m < {m}; __gu_m++) {{ \
+                 __gu_g[__gu_m] = 0.0f; __gu_u[__gu_m] = 0.0f; \
+             }} \
+             for (int __gu_k = 0; __gu_k < {k}; __gu_k++) {{ \
+                 float __gu_gw = __bfloat162float(__gu_gate_gmem[__gu_k * {n} + __gu_n]); \
+                 float __gu_uw = __bfloat162float(__gu_up_gmem[__gu_k * {n} + __gu_n]); \
+                 _Pragma(\"unroll\") \
+                 for (int __gu_m = 0; __gu_m < {m}; __gu_m++) {{ \
+                     float __gu_a = __bfloat162float(\
+                         __gu_a_in[__gu_m * {k} + __gu_k]); \
+                     __gu_g[__gu_m] += __gu_a * __gu_gw; \
+                     __gu_u[__gu_m] += __gu_a * __gu_uw; \
+                 }} \
+             }} \
+             _Pragma(\"unroll\") \
+             for (int __gu_m = 0; __gu_m < {m}; __gu_m++) {{ \
+                 float __gu_x = __gu_g[__gu_m]; \
+                 float __gu_act = {act_expr}; \
+                 __gu_a_out[__gu_m * {n} + __gu_n] = \
+                     __float2bfloat16(__gu_act * __gu_u[__gu_m]); \
+             }} \
+         }} \
+         }}",
+        in_id = in_page_id,
+        out_id = out_page_id,
+        gate_gmem = gate_gmem.expr(),
+        up_gmem = up_gmem.expr(),
+        tile_n = TILE_N,
+        m = M,
+        k = HIDDEN_DIM,
+        n = INTERMEDIATE_DIM,
+        act_expr = activation_expr,
+    )));
+
+    consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive::<1>(&out_done),
+        tk20::group_arrive::<1>(&in_consumed),
+    ]));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait::<1>(&out_done, storer_phase));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __gu_out_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{out_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({out_gmem}), \
+             reinterpret_cast<void*>(__gu_out_src), \
+             {bytes}); \
+         }}",
+        out_id = out_page_id,
+        out_gmem = out_gmem.expr(),
+        bytes = out_bytes,
+    )));
+    storer.push(tk20::group_tma_store_async_wait::<1>());
+    storer.push(tk20::group_arrive::<1>(&out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
 // FusedGateUpActivateMul — out = activation(A @ W_gate) * (A @ W_up).
 // ============================================================
 
@@ -1314,11 +1693,27 @@ pub fn render_fused_gate_up_activate_mul<
     activation: GateUpActivation,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("FusedGateUpActivateMul");
+        return RoleBodies::skipped("TkFusedGateUpActivateMul");
     }
-    // See `render_gemm` for the M%16!=0 rationale.
+    // M%16!=0 → vec-mat decode-shape (small-batch decode).
+    // M%16==0 → tile-MMA prefill-shape.
     if M % 16 != 0 {
-        return RoleBodies::skipped("FusedGateUpActivateMul");
+        return render_fused_gate_up_activate_mul_decode::<
+            M, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id,
+            weight_page_id,
+            out_page_id,
+            consumer_phase,
+            storer_phase,
+            layer,
+            in_act_slot,
+            out_act_slot,
+            weight_accessor,
+            bar_publish,
+            gate_bytes,
+            activation,
+        );
     }
 
     let loader_phase = storer_phase;
@@ -1483,13 +1878,34 @@ pub fn render_tk_fused_norm_gemm<
     if ITERS != 1 {
         return RoleBodies::skipped("TkFusedNormGemm");
     }
-    // See `render_gemm` for the M%16!=0 rationale. lm_head also needs
-    // N-streaming (handoff phase 6+ item 5: "render_lm_head_gemm with
-    // N-streaming for vocab=128256") because [M, vocab] doesn't fit a
-    // single page. Both are deferred to a dedicated phase.
-    if M % 16 != 0 {
+    // lm_head decode: N-streaming with direct-gmem B reads and direct-
+    // gmem output writes. Output `[M, N]` (e.g. [1, 128256]) does not
+    // fit a substrate page (32 KB), so the prefill emit's `out_st =
+    // page_as_st_bf::<M, N>(out_p)` + `tma_store_async_raw_st_bf::<1,
+    // M, N>(out_gmem, out_st, M*N*2)` reads M*N*2 bytes from a 32 KB
+    // region (UB) and asks cicc to instantiate `rt_fl<M, N/NCW>` which
+    // blew up to ~36 GB / >60 min on H100 at M=512 N=128256 NCW=8.
+    //
+    // Decode-first scope: M=1 only. M>1 is gated on multi-row rmsnorm
+    // (Task #10) — the existing rmsnorm phase here partitions K across
+    // NCW warps but processes only the first row of `[M, K]`, so M>1
+    // would silently produce row-0 normalized × W for all rows.
+    if M != 1 {
         return RoleBodies::skipped("TkFusedNormGemm");
     }
+    // Per-thread vec-mat needs each warp to own a clean TILE_N=N/NCW
+    // slab divisible by 32 (lane-per-col).
+    if NCW == 0 || N % NCW != 0 {
+        return RoleBodies::skipped("TkFusedNormGemm");
+    }
+    let tile_n = N / NCW;
+    if tile_n == 0 || tile_n % 32 != 0 {
+        return RoleBodies::skipped("TkFusedNormGemm");
+    }
+    // A in `in_page` (post-rmsnorm) is M*K*2 bytes; must fit page.
+    // M=1 K=2048 → 4 KB. Holds.
+    let _ = TILE_N;
+    let _ = K_PER_WARP;
 
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
@@ -1499,15 +1915,12 @@ pub fn render_tk_fused_norm_gemm<
     let out_p = page(out_page_id);
 
     let in_sv = page_as_sv_bf::<K>(in_p);
-    let in_st = page_as_st_bf::<M, K>(in_p);
     let norm_weight_sv = page_as_sv_bf::<K>(norm_p);
-    let out_st = page_as_st_bf::<M, N>(out_p);
-    let b_tile = scratch_as_st_bf::<K, N>(off(b_tile_offset));
     let partial = scratch_as::<F32>(off(partial_offset));
+    let _ = b_tile_offset;
 
     let in_ready = page_ready_sem(in_p);
     let norm_weight_ready = page_ready_sem(norm_p);
-    let lin_weight_ready = page_ready_sem(lin_p);
     let out_done = page_done_sem(out_p);
     let in_consumed = page_consumed_sem(in_p);
     let norm_weight_consumed = page_consumed_sem(norm_p);
@@ -1521,14 +1934,19 @@ pub fn render_tk_fused_norm_gemm<
 
     let act_bytes = M * K * BF16_BYTES;
     let norm_weight_bytes = K * BF16_BYTES;
-    let lin_weight_bytes = K * N * BF16_BYTES;
-    let out_bytes = M * N * BF16_BYTES;
 
     let delta_sv_opt = delta_p_opt.map(page_as_sv_bf::<K>);
     let delta_ready_opt = delta_p_opt.map(page_ready_sem);
     let delta_consumed_opt = delta_p_opt.map(page_consumed_sem);
     let delta_gmem_opt = delta_act_slot.map(gmem_act_ptr_raw);
 
+    // LOADER: TMA-load A (4 KB at K=2048) + delta (if present, 4 KB)
+    // + norm_weight (4 KB). Linear weight `[K, N]` is read directly
+    // from gmem by the consumer's vec-mat — no TMA stage (would be
+    // ~512 MB at K=2048, N=128256, BF16). Consumer therefore does NOT
+    // wait on `lin_weight_ready`; we still arrive at
+    // `lin_weight_consumed` from the consumer below to keep the
+    // loader's cross-iteration `wait(lin_weight_consumed)` honest.
     let mut loader = CuBlock::new();
     loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
     if let Some(delta_consumed) = delta_consumed_opt.as_ref() {
@@ -1559,11 +1977,6 @@ pub fn render_tk_fused_norm_gemm<
         &norm_weight_sv, &norm_weight_gmem, norm_weight_bytes, &norm_weight_ready,
     ));
 
-    loader.push(tk20::group_tma_expect_bytes::<1>(&lin_weight_ready, lin_weight_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, K, N>(
-        &b_tile, &lin_weight_gmem, lin_weight_bytes, &lin_weight_ready,
-    ));
-
     let launcher = CuBlock::new();
 
     let mut consumer = CuBlock::new();
@@ -1572,7 +1985,8 @@ pub fn render_tk_fused_norm_gemm<
         consumer.push(tk20::group_wait::<1>(delta_ready, consumer_phase));
     }
     consumer.push(tk20::group_wait::<1>(&norm_weight_ready, consumer_phase));
-    consumer.push(tk20::group_wait::<1>(&lin_weight_ready, consumer_phase));
+    // No `lin_weight_ready` wait: linear weight is read direct from
+    // gmem by the per-thread vec-mat below.
 
     let (decl_act, act_rv) = tk20::decl_rv_fl::<K_PER_WARP>("__lmh_act_rv");
     let (decl_sq, sq_rv) = tk20::decl_rv_fl::<K_PER_WARP>("__lmh_sq_rv");
@@ -1654,28 +2068,56 @@ pub fn render_tk_fused_norm_gemm<
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
 
-    let (decl_a, a_rt) = tk20::decl_rt_bf_row::<M, K>("__lmh_a");
-    let (decl_b, b_rt) = tk20::decl_rt_bf_col::<K, TILE_N>("__lmh_b");
-    let (decl_acc, acc_rt) = tk20::decl_rt_fl::<M, TILE_N>("__lmh_acc");
-    consumer.push(decl_a);
-    consumer.push(decl_b);
-    consumer.push(decl_acc);
-
-    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
-    let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, TILE_N>(
-        "__lmh_b_sub", &b_tile, "0", warp_idx_expr,
-    );
-    let (decl_out_sub, out_sub) = tk20::decl_st_bf_subtile::<M, N, M, TILE_N>(
-        "__lmh_out_sub", &out_st, "0", warp_idx_expr,
-    );
-    consumer.push(decl_b_sub);
-    consumer.push(decl_out_sub);
-
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, M, K>(&a_rt, &in_st));
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, K, TILE_N>(&b_rt, &b_sub));
-    consumer.push(tk20::warp_zero_rt::<F32, _, M, TILE_N>(&acc_rt));
-    consumer.push(tk20::warp_mma_AB::<M, K, TILE_N>(&acc_rt, &a_rt, &b_rt, &acc_rt));
-    consumer.push(tk20::warp_store_st_bf_from_rt_fl::<M, TILE_N>(&out_sub, &acc_rt));
+    // -----------------------------------------------------------
+    // GEMM phase — per-thread vec-mat with N-streaming.
+    // Each warp owns `tile_n = N / NCW` output cols; each thread
+    // owns `cols_per_thread = tile_n / 32` cols. A is read from
+    // `ss.pages[in_page_id]` (post-rmsnorm bf16, K elements at M=1).
+    // B (`[K, N]` bf16) is read directly from gmem — no scratch /
+    // page staging (full B is ~512 MB at lm_head shape, doesn't fit
+    // a 32 KB scratch let alone a page). Output is written direct
+    // to `act_ptrs[out_act_slot]` (M*N*BF16_BYTES bytes; doesn't fit
+    // a page either at vocab=128256). cicc instantiates one `float`
+    // accumulator per thread per col-iter — bounded register usage,
+    // no fictional `rt_fl<512, 16032>`.
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __lmh_a_in = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{in_id}]); \
+         const __nv_bfloat16* __lmh_b_gmem = {b_gmem}; \
+         __nv_bfloat16* __lmh_out_gmem = {out_gmem}; \
+         int __lmh_warp_id = static_cast<int>(kittens::warpid()); \
+         int __lmh_lane = static_cast<int>(kittens::laneid()); \
+         int __lmh_warp_col_base = __lmh_warp_id * {tile_n}; \
+         constexpr int __lmh_cols_per_thread = {tile_n} / 32; \
+         for (int __lmh_c = 0; __lmh_c < __lmh_cols_per_thread; __lmh_c++) {{ \
+             int __lmh_n = __lmh_warp_col_base + __lmh_c * 32 + __lmh_lane; \
+             float __lmh_acc[{m}]; \
+             _Pragma(\"unroll\") \
+             for (int __lmh_m = 0; __lmh_m < {m}; __lmh_m++) __lmh_acc[__lmh_m] = 0.0f; \
+             for (int __lmh_k = 0; __lmh_k < {k}; __lmh_k++) {{ \
+                 float __lmh_b = __bfloat162float(__lmh_b_gmem[__lmh_k * {n} + __lmh_n]); \
+                 _Pragma(\"unroll\") \
+                 for (int __lmh_m = 0; __lmh_m < {m}; __lmh_m++) {{ \
+                     float __lmh_a = __bfloat162float(\
+                         __lmh_a_in[__lmh_m * {k} + __lmh_k]); \
+                     __lmh_acc[__lmh_m] += __lmh_a * __lmh_b; \
+                 }} \
+             }} \
+             _Pragma(\"unroll\") \
+             for (int __lmh_m = 0; __lmh_m < {m}; __lmh_m++) {{ \
+                 __lmh_out_gmem[__lmh_m * {n} + __lmh_n] = __float2bfloat16(__lmh_acc[__lmh_m]); \
+             }} \
+         }} \
+         }}",
+        in_id = in_page_id,
+        b_gmem = lin_weight_gmem.expr(),
+        out_gmem = out_gmem.expr(),
+        tile_n = tile_n,
+        m = M,
+        k = K,
+        n = N,
+    )));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
 
@@ -1690,13 +2132,373 @@ pub fn render_tk_fused_norm_gemm<
     }
     consumer.push(tk20::block_warp_zero(&arrives));
 
+    // STORER: output already lives in gmem (consumer wrote direct).
+    // We still bracket out_done -> out_consumed to keep the loader's
+    // cross-iteration `wait(out_consumed)` honest; no TMA store.
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait::<1>(&out_done, storer_phase));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, N>(
-        &out_gmem, &out_st, out_bytes,
-    ));
-    storer.push(tk20::group_tma_store_async_wait::<1>());
     storer.push(tk20::group_arrive::<1>(&out_consumed));
+
+    RoleBodies {
+        loader,
+        launcher,
+        consumer,
+        storer,
+        skipped: None,
+    }
+}
+
+// ============================================================
+// FusedQkvRopeCache (decode shape, M%16!=0 — small-batch decode).
+//
+// Per-thread vec-mat over the fused QKV weight tile (read directly
+// from gmem at QKV_N width), staging Q/K dot products into scratch
+// `q_rope_offset` / `k_rope_offset` (laid out [M, Q_DIM] / [M,
+// KV_DIM] bf16 row-major), then within the same warp re-reading
+// the paired column per row, applying per-row RoPE, and writing
+// to q_out_page / k_out_page. V columns bypass RoPE and are
+// stored directly into v_out_page in phase 1.
+//
+// Pair locality: TILE_N = HEADS_PER_WARP * HEAD_DIM, so every
+// `(col, paired_col)` pair lies within the same warp's TILE_N
+// range. Intra-warp `__syncwarp()` is sufficient; no cross-warp
+// barrier needed for the RoPE read.
+//
+// cos_sin layout: cos_sin_per_token_gather writes
+// `[cos[0..HEAD_DIM/2], sin[0..HEAD_DIM/2]]` for each of M tokens
+// at row `positions[t]` of the rotary table. cos_sin_page holds
+// M * HEAD_DIM bf16 (per-row cos/sin pair).
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_fused_qkv_rope_cache_decode<
+    const M: u32,
+    const HIDDEN_DIM: u32,
+    const HEAD_DIM: u32,
+    const Q_DIM: u32,
+    const KV_DIM: u32,
+    const QKV_N: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    _qkv_weight_page_id: u32,
+    cos_sin_page_id: u32,
+    q_out_page_id: u32,
+    k_out_page_id: u32,
+    v_out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    q_out_act_slot: u32,
+    k_out_act_slot: u32,
+    v_out_act_slot: u32,
+    qkv_weight_accessor: u32,
+    rotary_accessor: u32,
+    bar_publish: u32,
+    q_rope_offset: u32,
+    k_rope_offset: u32,
+    _qkv_b_tile_offset: u32,
+) -> RoleBodies {
+    if ITERS != 1 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    if M == 0 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    if HEAD_DIM == 0 || HEAD_DIM % 2 != 0 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    if NCW == 0 || QKV_N % NCW != 0 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    if TILE_N != QKV_N / NCW {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    if TILE_N % 32 != 0 || TILE_N % HEAD_DIM != 0 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    // Pair locality: every `(col, col ± HEAD_DIM/2)` pair must lie
+    // in the same warp's TILE_N. With TILE_N % HEAD_DIM == 0 and
+    // pairs always within the same head, this holds.
+    if Q_DIM % HEAD_DIM != 0 || KV_DIM % HEAD_DIM != 0 {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+
+    let loader_phase = storer_phase;
+    let in_p = page(in_page_id);
+    let cos_sin_p = page(cos_sin_page_id);
+    let q_out_p = page(q_out_page_id);
+    let k_out_p = page(k_out_page_id);
+    let v_out_p = page(v_out_page_id);
+
+    let cos_sin_byte = page_as_byte_ptr(cos_sin_p);
+
+    let in_ready = page_ready_sem(in_p);
+    let cos_sin_ready = page_ready_sem(cos_sin_p);
+    let q_out_done = page_done_sem(q_out_p);
+    let k_out_done = page_done_sem(k_out_p);
+    let v_out_done = page_done_sem(v_out_p);
+    let in_consumed = page_consumed_sem(in_p);
+    let cos_sin_consumed = page_consumed_sem(cos_sin_p);
+    let q_out_consumed = page_consumed_sem(q_out_p);
+    let k_out_consumed = page_consumed_sem(k_out_p);
+    let v_out_consumed = page_consumed_sem(v_out_p);
+
+    let in_gmem = gmem_act_ptr_raw(in_act_slot);
+    let q_out_gmem = gmem_act_ptr_raw(q_out_act_slot);
+    let k_out_gmem = gmem_act_ptr_raw(k_out_act_slot);
+    let v_out_gmem = gmem_act_ptr_raw(v_out_act_slot);
+    let qkv_weight_gmem = gmem_weight_ptr_raw(qkv_weight_accessor, layer, NUM_LAYERS);
+    let cos_sin_gmem = gmem_weight_ptr_raw(rotary_accessor, 0, NUM_LAYERS);
+    let positions = gmem_positions();
+
+    let act_bytes: u32 = M * HIDDEN_DIM * BF16_BYTES;
+    let q_out_bytes: u32 = M * Q_DIM * BF16_BYTES;
+    let k_out_bytes: u32 = M * KV_DIM * BF16_BYTES;
+    let v_out_bytes: u32 = M * KV_DIM * BF16_BYTES;
+
+    let mut loader = CuBlock::new();
+    loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&cos_sin_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&q_out_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&k_out_consumed, loader_phase));
+    loader.push(tk20::group_wait::<1>(&v_out_consumed, loader_phase));
+
+    loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
+    loader.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __qd_a_dst = reinterpret_cast<__nv_bfloat16*>(ss.pages[{in_id}]); \
+         kittens::group<1>::tma::load_async(\
+         reinterpret_cast<void*>(__qd_a_dst), \
+         reinterpret_cast<void*>({a_gmem}), \
+         {act_bytes}, {a_ready}); \
+         }}",
+        in_id = in_page_id,
+        a_gmem = in_gmem.expr(),
+        act_bytes = act_bytes,
+        a_ready = in_ready.expr(),
+    )));
+
+    loader.push(tk20::cos_sin_per_token_gather::<HEAD_DIM, M>(
+        &cos_sin_byte,
+        &cos_sin_gmem,
+        &positions,
+        &cos_sin_ready,
+    ));
+
+    let launcher = CuBlock::new();
+
+    let mut consumer = CuBlock::new();
+    consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
+    consumer.push(tk20::group_wait::<1>(&cos_sin_ready, consumer_phase));
+
+    // Phase 1 — per-thread vec-mat over QKV_N; stage Q/K results
+    // to scratch (q_rope_offset / k_rope_offset, laid out [M, Q_DIM]
+    // and [M, KV_DIM] row-major bf16), write V directly to
+    // v_out_page (also [M, KV_DIM]).
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __qd_a_in = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{in_id}]); \
+         const __nv_bfloat16* __qd_qkv_gmem = {qkv_gmem}; \
+         __nv_bfloat16* __qd_v_out = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{v_id}]); \
+         __nv_bfloat16* __qd_q_stage = reinterpret_cast<__nv_bfloat16*>(\
+             ss.scratch + {q_off}); \
+         __nv_bfloat16* __qd_k_stage = reinterpret_cast<__nv_bfloat16*>(\
+             ss.scratch + {k_off}); \
+         int __qd_warp_id = static_cast<int>(kittens::warpid()); \
+         int __qd_lane = static_cast<int>(kittens::laneid()); \
+         int __qd_warp_col_base = __qd_warp_id * {tile_n}; \
+         constexpr int __qd_cols_per_thread = {tile_n} / 32; \
+         for (int __qd_c = 0; __qd_c < __qd_cols_per_thread; __qd_c++) {{ \
+             int __qd_n = __qd_warp_col_base + __qd_c * 32 + __qd_lane; \
+             float __qd_acc[{m}]; \
+             _Pragma(\"unroll\") \
+             for (int __qd_m = 0; __qd_m < {m}; __qd_m++) __qd_acc[__qd_m] = 0.0f; \
+             for (int __qd_k = 0; __qd_k < {hidden}; __qd_k++) {{ \
+                 float __qd_w = __bfloat162float(\
+                     __qd_qkv_gmem[__qd_k * {qkv_n} + __qd_n]); \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     float __qd_a = __bfloat162float(\
+                         __qd_a_in[__qd_m * {hidden} + __qd_k]); \
+                     __qd_acc[__qd_m] += __qd_a * __qd_w; \
+                 }} \
+             }} \
+             if (__qd_n < {q_dim}) {{ \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     __qd_q_stage[__qd_m * {q_dim} + __qd_n] = \
+                         __float2bfloat16(__qd_acc[__qd_m]); \
+                 }} \
+             }} else if (__qd_n < {q_dim} + {kv_dim}) {{ \
+                 int __qd_kn = __qd_n - {q_dim}; \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     __qd_k_stage[__qd_m * {kv_dim} + __qd_kn] = \
+                         __float2bfloat16(__qd_acc[__qd_m]); \
+                 }} \
+             }} else {{ \
+                 int __qd_vn = __qd_n - {q_dim} - {kv_dim}; \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     __qd_v_out[__qd_m * {kv_dim} + __qd_vn] = \
+                         __float2bfloat16(__qd_acc[__qd_m]); \
+                 }} \
+             }} \
+         }} \
+         __syncwarp(); \
+         }}",
+        in_id = in_page_id,
+        v_id = v_out_page_id,
+        qkv_gmem = qkv_weight_gmem.expr(),
+        q_off = q_rope_offset,
+        k_off = k_rope_offset,
+        tile_n = TILE_N,
+        m = M,
+        hidden = HIDDEN_DIM,
+        qkv_n = QKV_N,
+        q_dim = Q_DIM,
+        kv_dim = KV_DIM,
+    )));
+
+    // Phase 2 — re-read paired col from scratch per row, apply
+    // per-row RoPE (cos_sin_page row m), store to q_out / k_out.
+    consumer.push(CuStmt::new(format!(
+        "{{ \
+         const __nv_bfloat16* __qd_q_stage = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.scratch + {q_off}); \
+         const __nv_bfloat16* __qd_k_stage = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.scratch + {k_off}); \
+         const __nv_bfloat16* __qd_cos_sin = reinterpret_cast<const __nv_bfloat16*>(\
+             ss.pages[{cs_id}]); \
+         __nv_bfloat16* __qd_q_out = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{q_id}]); \
+         __nv_bfloat16* __qd_k_out = reinterpret_cast<__nv_bfloat16*>(\
+             ss.pages[{k_id}]); \
+         int __qd_warp_id = static_cast<int>(kittens::warpid()); \
+         int __qd_lane = static_cast<int>(kittens::laneid()); \
+         int __qd_warp_col_base = __qd_warp_id * {tile_n}; \
+         constexpr int __qd_cols_per_thread = {tile_n} / 32; \
+         constexpr int __qd_half = {head_dim} / 2; \
+         for (int __qd_c = 0; __qd_c < __qd_cols_per_thread; __qd_c++) {{ \
+             int __qd_n = __qd_warp_col_base + __qd_c * 32 + __qd_lane; \
+             if (__qd_n < {q_dim}) {{ \
+                 int __qd_pos = __qd_n % {head_dim}; \
+                 int __qd_head_base = __qd_n - __qd_pos; \
+                 bool __qd_low = __qd_pos < __qd_half; \
+                 int __qd_paired = __qd_low ? __qd_pos + __qd_half : __qd_pos - __qd_half; \
+                 int __qd_t = __qd_low ? __qd_pos : __qd_pos - __qd_half; \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     float __qd_x = __bfloat162float(\
+                         __qd_q_stage[__qd_m * {q_dim} + __qd_n]); \
+                     float __qd_p = __bfloat162float(\
+                         __qd_q_stage[__qd_m * {q_dim} + __qd_head_base + __qd_paired]); \
+                     float __qd_co = __bfloat162float(\
+                         __qd_cos_sin[__qd_m * {head_dim} + __qd_t]); \
+                     float __qd_si = __bfloat162float(\
+                         __qd_cos_sin[__qd_m * {head_dim} + __qd_half + __qd_t]); \
+                     float __qd_r = __qd_low \
+                         ? (__qd_x * __qd_co - __qd_p * __qd_si) \
+                         : (__qd_x * __qd_co + __qd_p * __qd_si); \
+                     __qd_q_out[__qd_m * {q_dim} + __qd_n] = __float2bfloat16(__qd_r); \
+                 }} \
+             }} else if (__qd_n < {q_dim} + {kv_dim}) {{ \
+                 int __qd_kn = __qd_n - {q_dim}; \
+                 int __qd_pos = __qd_kn % {head_dim}; \
+                 int __qd_head_base = __qd_kn - __qd_pos; \
+                 bool __qd_low = __qd_pos < __qd_half; \
+                 int __qd_paired = __qd_low ? __qd_pos + __qd_half : __qd_pos - __qd_half; \
+                 int __qd_t = __qd_low ? __qd_pos : __qd_pos - __qd_half; \
+                 _Pragma(\"unroll\") \
+                 for (int __qd_m = 0; __qd_m < {m}; __qd_m++) {{ \
+                     float __qd_x = __bfloat162float(\
+                         __qd_k_stage[__qd_m * {kv_dim} + __qd_kn]); \
+                     float __qd_p = __bfloat162float(\
+                         __qd_k_stage[__qd_m * {kv_dim} + __qd_head_base + __qd_paired]); \
+                     float __qd_co = __bfloat162float(\
+                         __qd_cos_sin[__qd_m * {head_dim} + __qd_t]); \
+                     float __qd_si = __bfloat162float(\
+                         __qd_cos_sin[__qd_m * {head_dim} + __qd_half + __qd_t]); \
+                     float __qd_r = __qd_low \
+                         ? (__qd_x * __qd_co - __qd_p * __qd_si) \
+                         : (__qd_x * __qd_co + __qd_p * __qd_si); \
+                     __qd_k_out[__qd_m * {kv_dim} + __qd_kn] = __float2bfloat16(__qd_r); \
+                 }} \
+             }} \
+         }} \
+         }}",
+        q_off = q_rope_offset,
+        k_off = k_rope_offset,
+        cs_id = cos_sin_page_id,
+        q_id = q_out_page_id,
+        k_id = k_out_page_id,
+        tile_n = TILE_N,
+        m = M,
+        head_dim = HEAD_DIM,
+        q_dim = Q_DIM,
+        kv_dim = KV_DIM,
+    )));
+
+    consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
+    consumer.push(tk20::block_warp_zero(&[
+        tk20::group_arrive::<1>(&q_out_done),
+        tk20::group_arrive::<1>(&k_out_done),
+        tk20::group_arrive::<1>(&v_out_done),
+        tk20::group_arrive::<1>(&in_consumed),
+        tk20::group_arrive::<1>(&cos_sin_consumed),
+    ]));
+
+    let mut storer = CuBlock::new();
+    storer.push(tk20::group_wait::<1>(&q_out_done, storer_phase));
+    storer.push(tk20::group_wait::<1>(&k_out_done, storer_phase));
+    storer.push(tk20::group_wait::<1>(&v_out_done, storer_phase));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __qd_q_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{q_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({q_gmem}), \
+             reinterpret_cast<void*>(__qd_q_src), \
+             {bytes}); \
+         }}",
+        q_id = q_out_page_id,
+        q_gmem = q_out_gmem.expr(),
+        bytes = q_out_bytes,
+    )));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __qd_k_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{k_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({k_gmem}), \
+             reinterpret_cast<void*>(__qd_k_src), \
+             {bytes}); \
+         }}",
+        k_id = k_out_page_id,
+        k_gmem = k_out_gmem.expr(),
+        bytes = k_out_bytes,
+    )));
+    storer.push(CuStmt::new(format!(
+        "{{ \
+         __nv_bfloat16* __qd_v_src = reinterpret_cast<__nv_bfloat16*>(ss.pages[{v_id}]); \
+         kittens::group<1>::tma::store_async(\
+             reinterpret_cast<void*>({v_gmem}), \
+             reinterpret_cast<void*>(__qd_v_src), \
+             {bytes}); \
+         }}",
+        v_id = v_out_page_id,
+        v_gmem = v_out_gmem.expr(),
+        bytes = v_out_bytes,
+    )));
+    storer.push(tk20::group_tma_store_async_wait::<1>());
+    storer.push(tk20::group_arrive::<1>(&q_out_consumed));
+    storer.push(tk20::group_arrive::<1>(&k_out_consumed));
+    storer.push(tk20::group_arrive::<1>(&v_out_consumed));
 
     RoleBodies {
         loader,
@@ -1757,18 +2559,37 @@ pub fn render_fused_qkv_rope_cache<
     qkv_b_tile_offset: u32,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("FusedQkvRopeCache");
+        return RoleBodies::skipped("TkFusedQkvRopeCache");
     }
     if HEAD_DIM == 0 || TILE_N % HEAD_DIM != 0 {
-        return RoleBodies::skipped("FusedQkvRopeCache");
+        return RoleBodies::skipped("TkFusedQkvRopeCache");
     }
-    // See `render_gemm` for the M%16!=0 rationale. FQRC also feeds
-    // decode attention; a `TkFusedQkvRopeCacheDecode` variant (or a
-    // runtime layout flag) may be needed for heads-packed Q layout
-    // (handoff phase 6+ item 2). Deferred with the rest of the
-    // decode-shape port.
+    // M%16!=0 → vec-mat decode-shape (small-batch decode).
+    // M%16==0 → tile-MMA prefill-shape.
     if M % 16 != 0 {
-        return RoleBodies::skipped("FusedQkvRopeCache");
+        return render_fused_qkv_rope_cache_decode::<
+            M, HIDDEN_DIM, HEAD_DIM, Q_DIM, KV_DIM, QKV_N, TILE_N, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id,
+            qkv_weight_page_id,
+            cos_sin_page_id,
+            q_out_page_id,
+            k_out_page_id,
+            v_out_page_id,
+            consumer_phase,
+            storer_phase,
+            layer,
+            in_act_slot,
+            q_out_act_slot,
+            k_out_act_slot,
+            v_out_act_slot,
+            qkv_weight_accessor,
+            rotary_accessor,
+            bar_publish,
+            q_rope_offset,
+            k_rope_offset,
+            qkv_b_tile_offset,
+        );
     }
 
     let loader_phase = storer_phase;
@@ -2309,16 +3130,16 @@ fn render_attention_via_cache_impl<
     sliding_window: Option<u32>,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("AttentionViaCache");
+        return RoleBodies::skipped("TkAttentionViaCache");
     }
     if NUM_Q_HEADS == 0 || NUM_KV_HEADS == 0 || HEAD_DIM == 0 || NCW == 0 {
-        return RoleBodies::skipped("AttentionViaCache");
+        return RoleBodies::skipped("TkAttentionViaCache");
     }
     if NUM_Q_HEADS % NCW != 0 {
-        return RoleBodies::skipped("AttentionViaCache");
+        return RoleBodies::skipped("TkAttentionViaCache");
     }
     if NUM_Q_HEADS % NUM_KV_HEADS != 0 {
-        return RoleBodies::skipped("AttentionViaCache");
+        return RoleBodies::skipped("TkAttentionViaCache");
     }
     // The prefill `_impl` is correct at M=16 only. M=1 is dispatched
     // to `render_attention_via_cache_decode` by the wrappers
@@ -2330,7 +3151,7 @@ fn render_attention_via_cache_impl<
     // land, M ∉ {1, 16} emits a SKIPPED marker so nvcc compiles
     // the rest of the canonical clean.
     if M != 16 {
-        return RoleBodies::skipped("AttentionViaCache");
+        return RoleBodies::skipped("TkAttentionViaCache");
     }
 
     const Q_HEAD_TILE_ROWS: u32 = 16;
@@ -2904,22 +3725,22 @@ pub fn render_attention_via_cache_decode<
     sliding_window: Option<u32>,
 ) -> RoleBodies {
     if ITERS != 1 {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if NUM_Q_HEADS == 0 || NUM_KV_HEADS == 0 || HEAD_DIM == 0 || NCW == 0 {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if NUM_Q_HEADS % NUM_KV_HEADS != 0 {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if NCW != NUM_KV_HEADS {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if NUM_Q_HEADS % 16 != 0 {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if HEAD_DIM % 16 != 0 {
-        return RoleBodies::skipped("AttentionViaCacheDecode");
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
 
     const Q_HEAD_TILE_ROWS: u32 = 16;

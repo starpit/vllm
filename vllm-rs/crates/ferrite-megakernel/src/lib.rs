@@ -70,10 +70,10 @@ pub use inventory;
 // the structure is visible in expanded source.
 pub use ir::lower::{ArriveCount, LowerError, MegaTapeBuilder};
 pub use ir::nodes::{
-    Add, AttentionKind, AttentionViaCacheNode, BarrierSignal, BarrierWait, Embed, FiniteF32,
-    FusedAddRmsNorm, FusedGateUpActivateMul, FusedQkvRopeCache, GateUpActivation, Gemm,
-    LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, RmsNorm, RotaryRef, ScalarMul,
-    ScalarOffsetRmsNorm, SlidingWindow, SpliceMmEmbeds, TanhSoftCap, TkFusedGemmAdd,
+    TkAdd, AttentionKind, TkAttentionViaCacheNode, TkBarrierSignal, TkBarrierWait, TkEmbed, FiniteF32,
+    TkFusedAddRmsNorm, TkFusedGateUpActivateMul, TkFusedQkvRopeCache, GateUpActivation, TkGemm,
+    LayerIndex, LmHeadNormKind, MatmulShape, MegaNode, TkRmsNorm, RotaryRef, TkScalarMul,
+    TkScalarOffsetRmsNorm, SlidingWindow, TkSpliceMmEmbeds, TkTanhSoftCap, TkFusedGemmAdd,
     TkFusedNormGemm, WeightRef,
 };
 pub use ir::substrate::{

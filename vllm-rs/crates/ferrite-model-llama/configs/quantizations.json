@@ -8,6 +8,7 @@
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
     "mlx-affine-b4-g64",
+    "mlx-affine-b4-g64-qembed",
     {"ggml": {
       "qk_permute": true,
       "llama3_rope_scaling_inference": true

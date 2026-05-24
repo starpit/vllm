@@ -219,7 +219,27 @@ pub enum QuantMethod {
     /// via the absence of `quant_method` plus presence of `bits` +
     /// `group_size` directly under `quantization_config` (or the
     /// alternative top-level `quantization` key MLX also writes).
-    Affine { bits: u32, group_size: u32 },
+    ///
+    /// `quantize_embed` distinguishes two `mlx_lm.convert` conventions
+    /// for `tie_word_embeddings: false` checkpoints:
+    ///   * `false` (default, `mlx-affine-b<bits>-g<gs>` preset) —
+    ///     older convert behavior: `embed_tokens` is kept dense F16
+    ///     `[vocab, hidden]`, only `lm_head` + transformer linears
+    ///     are quantized. Verified against
+    ///     `mlx-community/Meta-Llama-3-8B-Instruct-4bit`.
+    ///   * `true` (`mlx-affine-b<bits>-g<gs>-qembed` preset) —
+    ///     newer convert behavior: `embed_tokens` is also quantized
+    ///     to the full affine triple `[vocab, hidden / pack_factor]`
+    ///     U32 + `.scales`/`.biases` F16. Verified against
+    ///     `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`.
+    /// When `tie_word_embeddings: true`, the embed always ships
+    /// quantized (because it's the same tensor as the quantized
+    /// lm_head) and this flag has no effect.
+    Affine {
+        bits: u32,
+        group_size: u32,
+        quantize_embed: bool,
+    },
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -361,7 +381,19 @@ fn parse_affine_no_method(
             reason: "MLX-affine supports group_size ∈ {32, 64, 128}",
         });
     }
-    Ok(QuantMethod::Affine { bits, group_size })
+    // Optional discriminator emitted by the
+    // `mlx-affine-b<bits>-g<gs>-qembed` preset. Default false — the
+    // original preset shape (embed_tokens dense F16 on untied
+    // checkpoints, e.g. Llama-3-8B-4bit) keeps the prior default.
+    let quantize_embed = obj
+        .get("quant_embed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok(QuantMethod::Affine {
+        bits,
+        group_size,
+        quantize_embed,
+    })
 }
 
 fn parse_awq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMethod, ParseError> {
@@ -789,28 +821,39 @@ pub fn storage_format_for_weight(
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
-        if let QuantMethod::Affine { bits, group_size } = qc.method {
+        if let QuantMethod::Affine { bits, group_size, .. } = qc.method {
             return StorageFormat::Affine { bits, group_size };
         }
         return StorageFormat::Dense;
     }
 
-    // MLX-affine convention: when `tie_word_embeddings: false`,
-    // `mlx_lm.convert` keeps `embed_tokens` dense (F16) and only
-    // quantizes `lm_head` + the transformer linears. Verified against
-    // `mlx-community/Meta-Llama-3-8B-Instruct-4bit`:
-    //   - `model.embed_tokens.weight` is F16 [vocab, hidden]
-    //     (no `.scales`/`.biases` siblings)
-    //   - `lm_head.{weight,scales,biases}` is the full affine triple
+    // MLX-affine convention for `tie_word_embeddings: false`:
+    //   * Older `mlx_lm.convert` keeps `embed_tokens` dense F16
+    //     `[vocab, hidden]` and only quantizes `lm_head` + the
+    //     transformer linears. Verified against
+    //     `mlx-community/Meta-Llama-3-8B-Instruct-4bit`.
+    //   * Newer convert runs ALSO quantize the embed —
+    //     `model.embed_tokens.{weight,scales,biases}` is the full
+    //     affine triple. Verified against
+    //     `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`.
+    //
+    // The choice is per-checkpoint and the macro can't see disk at
+    // expansion time, so it's encoded in the preset:
+    //   * `mlx-affine-b<bits>-g<gs>`        → quantize_embed=false (dense)
+    //   * `mlx-affine-b<bits>-g<gs>-qembed` → quantize_embed=true  (Affine)
     //
     // The tied path keeps the shared embed buffer Affine-packed (its
-    // dotted-name lm_head rule already returns Affine above), so this
-    // rule only fires for the untied case.
-    if dotted == "embed_tokens"
-        && !model.tie_word_embeddings
-        && matches!(qc.method, QuantMethod::Affine { .. })
-    {
-        return StorageFormat::Dense;
+    // dotted-name lm_head rule already returns Affine above), so the
+    // rule below only fires for untied checkpoints; tied checkpoints
+    // ignore `quantize_embed` entirely.
+    if dotted == "embed_tokens" && !model.tie_word_embeddings {
+        if let QuantMethod::Affine { bits, group_size, quantize_embed } = qc.method {
+            return if quantize_embed {
+                StorageFormat::Affine { bits, group_size }
+            } else {
+                StorageFormat::Dense
+            };
+        }
     }
 
     // AutoGPTQ convention: `lm_head` is never quantized, even when
@@ -923,7 +966,11 @@ pub fn storage_format_for_weight(
         },
         QuantMethod::Fp8 { scheme, block_size } => StorageFormat::Fp8 { scheme, block_size },
         QuantMethod::Ggml => StorageFormat::Ggml,
-        QuantMethod::Affine { bits, group_size } => StorageFormat::Affine { bits, group_size },
+        QuantMethod::Affine {
+            bits,
+            group_size,
+            quantize_embed: _,
+        } => StorageFormat::Affine { bits, group_size },
     }
 }
 

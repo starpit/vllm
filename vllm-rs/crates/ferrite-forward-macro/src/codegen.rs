@@ -1843,29 +1843,36 @@ fn emit_fingerprint_check(
         .unwrap_or_else(|| format!("{dec_root}.embed_tokens.weight"));
     let embed_path_lit = proc_macro2::Literal::string(embed_path.as_str());
 
-    // Hidden-size shape gate for the embedding fingerprint sniff. Dense
-    // variants see `[vocab, hidden_size]`; MLX-affine variants ship the
-    // packed U32 embedding as `[vocab, hidden_size / pack_factor]`
-    // (pack_factor = 32 / bits = 8 for bits=4). We accept EITHER
-    // shape on the affine variant — empirically `mlx_lm.convert`
-    // behavior varies per-checkpoint:
-    //   * tied embed (Llama-3.2-{1B,3B}-4bit): embed quantized
-    //     (must — it IS the lm_head). Shape [vocab, hidden/8].
-    //   * untied embed (Llama-3.1-8B-Instruct-4bit): embed ALSO
-    //     quantized, with sibling `.scales`/`.biases` on the embed
-    //     itself. Shape [vocab, hidden/8].
-    //   * untied embed (older Meta-Llama-3-8B-Instruct-4bit):
-    //     embed kept dense F16. Shape [vocab, hidden].
-    // Dual-accept on the affine variant covers all three. The
-    // `.scales` sibling on layer.0 q_proj (mlx_marker_tensor below)
-    // disambiguates affine vs dense.
-    let is_affine = matches!(
-        model.quantization.as_ref().map(|qc| &qc.method),
-        Some(crate::quantization::QuantMethod::Affine { .. })
-    );
-    let embed_packed_hidden_lit: TokenStream =
+    // Hidden-size shape gate for the embedding fingerprint sniff.
+    // Three on-disk shapes for `embed_tokens`:
+    //   * dense `[vocab, hidden]` — every non-affine variant, AND
+    //     the older mlx-affine convention for untied checkpoints
+    //     (e.g. Llama-3-8B-Instruct-4bit).
+    //   * packed `[vocab, hidden / pack_factor]` (pack_factor =
+    //     32 / bits, so 8 for bits=4) — every mlx-affine TIED
+    //     checkpoint (embed IS the quantized lm_head, e.g.
+    //     Llama-3.2-{1B,3B}-4bit) PLUS untied checkpoints whose
+    //     preset opted in via `quant_embed: true` (e.g.
+    //     Llama-3.1-8B-Instruct-4bit under the
+    //     `mlx-affine-b4-g64-qembed` preset).
+    //
+    // Per-variant the shape is unambiguous — we pick the single
+    // expected shape from (quant method, tie_word_embeddings,
+    // quantize_embed). The `.scales`/`.biases` sibling on layer.0
+    // q_proj (mlx_marker_tensor below) disambiguates affine-vs-dense;
+    // here we just need a precise embed-shape gate so a checkpoint
+    // doesn't false-positive against the wrong affine sub-variant.
+    let embed_expects_packed: bool = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Affine {
+            quantize_embed, ..
+        }) => model.tie_word_embeddings || *quantize_embed,
+        _ => false,
+    };
+    let embed_hidden_lit: TokenStream =
         match model.quantization.as_ref().map(|qc| &qc.method) {
-            Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
+            Some(crate::quantization::QuantMethod::Affine { bits, .. })
+                if embed_expects_packed =>
+            {
                 let pack_factor = 32u64 / (*bits as u64);
                 let packed = hidden_size / pack_factor;
                 let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
@@ -1873,26 +1880,13 @@ fn emit_fingerprint_check(
             }
             _ => quote! { #hidden_lit },
         };
-    let embed_shape_check: TokenStream = if is_affine {
-        quote! {
-            match gw.tensor_shape_any(#embed_path_lit) {
-                Some(ref shape)
-                    if shape.len() >= 2
-                        && shape[0] == #vocab_lit
-                        && (shape[1] == #hidden_lit
-                            || shape[1] == #embed_packed_hidden_lit) => {}
-                _ => return false,
-            }
-        }
-    } else {
-        quote! {
-            match gw.tensor_shape_any(#embed_path_lit) {
-                Some(ref shape)
-                    if shape.len() >= 2
-                        && shape[0] == #vocab_lit
-                        && shape[1] == #hidden_lit => {}
-                _ => return false,
-            }
+    let embed_shape_check: TokenStream = quote! {
+        match gw.tensor_shape_any(#embed_path_lit) {
+            Some(ref shape)
+                if shape.len() >= 2
+                    && shape[0] == #vocab_lit
+                    && shape[1] == #embed_hidden_lit => {}
+            _ => return false,
         }
     };
 
@@ -5494,7 +5488,7 @@ fn emit_synthesized_kernel_sources_override(
 ) -> TokenStream {
     use crate::quantization::QuantMethod;
     let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
-        Some(QuantMethod::Affine { bits, group_size }) => (*bits, *group_size),
+        Some(QuantMethod::Affine { bits, group_size, .. }) => (*bits, *group_size),
         _ => return quote! {},
     };
     if bits != 4 {

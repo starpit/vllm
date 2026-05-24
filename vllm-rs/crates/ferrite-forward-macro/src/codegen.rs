@@ -1846,28 +1846,54 @@ fn emit_fingerprint_check(
     // Hidden-size shape gate for the embedding fingerprint sniff. Dense
     // variants see `[vocab, hidden_size]`; MLX-affine variants ship the
     // packed U32 embedding as `[vocab, hidden_size / pack_factor]`
-    // (pack_factor = 32 / bits = 8 for bits=4). Without this branch
-    // both variants reject the affine checkpoint at the very first
-    // shape check and `try_load` returns `Ok(None)`.
-    let embed_hidden_lit: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
-        // MLX-affine: `mlx_lm.convert` quantizes `embed_tokens` only
-        // when `tie_word_embeddings: true` (it has to, since the same
-        // buffer is also the lm_head and the user opted into 4bit).
-        // When untied, the convert utility keeps embed dense F16
-        // (verified on `mlx-community/Meta-Llama-3-8B-Instruct-4bit`)
-        // and the corresponding sibling tensor on disk is
-        // `[vocab, hidden]` — same shape as the dense variant. The
-        // discriminator vs Dense in that case is the per-layer
-        // `.scales`/`.biases` siblings on `q_proj` (handled by the
-        // affine-marker exclusion below); the embed shape alone can
-        // no longer disambiguate.
-        Some(crate::quantization::QuantMethod::Affine { bits, .. }) if model.tie_word_embeddings => {
-            let pack_factor = 32u64 / (*bits as u64);
-            let packed = hidden_size / pack_factor;
-            let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
-            quote! { #lit }
+    // (pack_factor = 32 / bits = 8 for bits=4). We accept EITHER
+    // shape on the affine variant — empirically `mlx_lm.convert`
+    // behavior varies per-checkpoint:
+    //   * tied embed (Llama-3.2-{1B,3B}-4bit): embed quantized
+    //     (must — it IS the lm_head). Shape [vocab, hidden/8].
+    //   * untied embed (Llama-3.1-8B-Instruct-4bit): embed ALSO
+    //     quantized, with sibling `.scales`/`.biases` on the embed
+    //     itself. Shape [vocab, hidden/8].
+    //   * untied embed (older Meta-Llama-3-8B-Instruct-4bit):
+    //     embed kept dense F16. Shape [vocab, hidden].
+    // Dual-accept on the affine variant covers all three. The
+    // `.scales` sibling on layer.0 q_proj (mlx_marker_tensor below)
+    // disambiguates affine vs dense.
+    let is_affine = matches!(
+        model.quantization.as_ref().map(|qc| &qc.method),
+        Some(crate::quantization::QuantMethod::Affine { .. })
+    );
+    let embed_packed_hidden_lit: TokenStream =
+        match model.quantization.as_ref().map(|qc| &qc.method) {
+            Some(crate::quantization::QuantMethod::Affine { bits, .. }) => {
+                let pack_factor = 32u64 / (*bits as u64);
+                let packed = hidden_size / pack_factor;
+                let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
+                quote! { #lit }
+            }
+            _ => quote! { #hidden_lit },
+        };
+    let embed_shape_check: TokenStream = if is_affine {
+        quote! {
+            match gw.tensor_shape_any(#embed_path_lit) {
+                Some(ref shape)
+                    if shape.len() >= 2
+                        && shape[0] == #vocab_lit
+                        && (shape[1] == #hidden_lit
+                            || shape[1] == #embed_packed_hidden_lit) => {}
+                _ => return false,
+            }
         }
-        _ => quote! { #hidden_lit },
+    } else {
+        quote! {
+            match gw.tensor_shape_any(#embed_path_lit) {
+                Some(ref shape)
+                    if shape.len() >= 2
+                        && shape[0] == #vocab_lit
+                        && shape[1] == #hidden_lit => {}
+                _ => return false,
+            }
+        }
     };
 
     quote! {
@@ -1881,13 +1907,7 @@ fn emit_fingerprint_check(
             gw: &::ferrite_cuda_core::weights::GpuWeights,
             hf: ::ferrite_forward::HfFingerprint<'_>,
         ) -> bool {
-            match gw.tensor_shape_any(#embed_path_lit) {
-                Some(ref shape)
-                    if shape.len() >= 2
-                        && shape[0] == #vocab_lit
-                        && shape[1] == #embed_hidden_lit => {}
-                _ => return false,
-            }
+            #embed_shape_check
             if !gw.contains(#last_tensor) {
                 return false;
             }

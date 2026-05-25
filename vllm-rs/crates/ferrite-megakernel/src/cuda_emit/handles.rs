@@ -400,6 +400,21 @@ pub fn page_as_sv_bf<const LEN: u32>(page: PageRef) -> Sv<Bf16, LEN> {
     )))
 }
 
+/// Reinterpret-cast a substrate page as `kittens::sv_bf<LEN>` at
+/// runtime row offset `row_expr`, i.e. byte offset
+/// `row_expr * LEN * sizeof(__nv_bfloat16)` past the page base.
+/// Used by rmsnorm-family ops whose page holds `[NUM_TOKENS, LEN]`
+/// rows but whose per-row work iterates at runtime in a `for` loop.
+/// `LEN` is a const generic so downstream `tk20::*` calls still
+/// type-check the row width.
+pub fn page_row_as_sv_bf<const LEN: u32>(page: PageRef, row_expr: &str) -> Sv<Bf16, LEN> {
+    let row_bytes = LEN * 2;
+    Sv::<Bf16, LEN>::from_expr(CuExpr::new(format!(
+        "(*reinterpret_cast<kittens::sv_bf<{LEN}>*>(ss.pages[{}] + ({row_expr}) * {row_bytes}))",
+        page.raw()
+    )))
+}
+
 /// `reinterpret_cast<T*>(ss.scratch + <offset>)`.
 pub fn scratch_as<T: DtypeName>(offset: ScratchOffsetRef) -> ScratchPtr<T> {
     ScratchPtr::from_expr(CuExpr::new(format!(

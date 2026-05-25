@@ -25,7 +25,8 @@ use super::cu::{CuBlock, CuExpr, CuStmt};
 use super::handles::{
     F32, RtRow, gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_positions,
     gmem_weight_ptr_raw, gmem_weight_ptr_raw_offset, page_as_byte_ptr, page_as_st_bf,
-    page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem, scratch_as,
+    page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem, page_row_as_sv_bf,
+    scratch_as,
     scratch_as_st_bf,
 };
 use super::tk20;
@@ -152,6 +153,7 @@ pub fn render_rms_norm<
 
     let in_smem = page_as_sv_bf::<HIDDEN_DIM>(in_page_r);
     let weight_smem = page_as_sv_bf::<HIDDEN_DIM>(weight_page_r);
+    let in_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(in_page_r, "__row");
     let in_ready = page_ready_sem(in_page_r);
     let weight_ready = page_ready_sem(weight_page_r);
     let in_done = page_done_sem(in_page_r);
@@ -193,19 +195,25 @@ pub fn render_rms_norm<
     consumer.push(decl_sq);
     consumer.push(decl_w);
 
+    // Weight is shared across rows — load once outside the per-row loop.
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &act_rv, &in_smem,
+        &weight_rv,
+        &weight_smem,
     ));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &act_rv, &in_smem_row,
+    ));
+    per_row.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__rms_partial_sum", "0.0f");
-    consumer.push(decl_partial);
-    consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
+    per_row.push(decl_partial);
+    per_row.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
 
     let (decl_full, full_sum_expr) = tk20::decl_local_f32("__rms_full_sum", "0.0f");
-    consumer.push(decl_full);
-    consumer.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
+    per_row.push(decl_full);
+    per_row.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
         full_sum_expr.as_str(),
         partial_sum_expr.as_str(),
         &partial,
@@ -217,17 +225,18 @@ pub fn render_rms_norm<
         full_sum_expr.as_str(),
         eps,
     );
-    consumer.push(decl_scale);
+    per_row.push(decl_scale);
 
-    consumer.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_expr));
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &weight_rv,
-        &weight_smem,
+    per_row.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_expr));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
+
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &in_smem_row, &act_rv,
     ));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
 
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &in_smem, &act_rv,
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
     ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
@@ -277,6 +286,8 @@ pub fn render_add<
 
     let delta_smem = page_as_sv_bf::<HIDDEN_DIM>(delta_p);
     let residual_smem = page_as_sv_bf::<HIDDEN_DIM>(residual_p);
+    let delta_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(delta_p, "__row");
+    let residual_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(residual_p, "__row");
     let delta_ready = page_ready_sem(delta_p);
     let residual_ready = page_ready_sem(residual_p);
     let residual_done = page_done_sem(residual_p);
@@ -309,16 +320,24 @@ pub fn render_add<
     let (decl_res, res_rv) = tk20::decl_rv_fl::<K_PER_WARP>("__add_res_rv");
     consumer.push(decl_delta);
     consumer.push(decl_res);
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &delta_rv, &delta_smem,
+
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &delta_rv, &delta_smem_row,
     ));
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &res_rv, &residual_smem,
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &res_rv, &residual_smem_row,
     ));
-    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &residual_smem, &res_rv,
+    per_row.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &residual_smem_row, &res_rv,
     ));
+
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
+    ));
+
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     consumer.push(tk20::block_warp_zero(&[
         tk20::group_arrive::<1>(&residual_done),
@@ -368,6 +387,8 @@ pub fn render_scalar_mul<
 
     let in_smem = page_as_sv_bf::<HIDDEN_DIM>(in_p);
     let out_smem = page_as_sv_bf::<HIDDEN_DIM>(out_p);
+    let in_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(in_p, "__row");
+    let out_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(out_p, "__row");
     let in_ready = page_ready_sem(in_p);
     let out_done = page_done_sem(out_p);
     let in_consumed = page_consumed_sem(in_p);
@@ -390,15 +411,22 @@ pub fn render_scalar_mul<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     let (decl_act, act_rv) = tk20::decl_rv_fl::<K_PER_WARP>("__smul_rv");
     consumer.push(decl_act);
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &act_rv, &in_smem,
-    ));
+
     let scale_lit = CuExpr::new(format!("{:e}f", scale));
-    consumer.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_lit));
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        if in_place { &in_smem } else { &out_smem },
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &act_rv, &in_smem_row,
+    ));
+    per_row.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_lit));
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        if in_place { &in_smem_row } else { &out_smem_row },
         &act_rv,
     ));
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
+    ));
+
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     let mut publish_stmts = vec![tk20::group_arrive::<1>(&out_done)];
     if !in_place {
@@ -451,6 +479,8 @@ pub fn render_tanh_soft_cap<
 
     let in_smem = page_as_sv_bf::<HIDDEN_DIM>(in_p);
     let out_smem = page_as_sv_bf::<HIDDEN_DIM>(out_p);
+    let in_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(in_p, "__row");
+    let out_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(out_p, "__row");
     let in_ready = page_ready_sem(in_p);
     let out_done = page_done_sem(out_p);
     let in_consumed = page_consumed_sem(in_p);
@@ -473,15 +503,22 @@ pub fn render_tanh_soft_cap<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     let (decl_act, act_rv) = tk20::decl_rv_fl::<K_PER_WARP>("__tanh_rv");
     consumer.push(decl_act);
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &act_rv, &in_smem,
-    ));
+
     let lambda_body = format!("tanhf(x * (1.0f / {cap:e}f)) * {cap:e}f");
-    consumer.push(tk20::warp_apply_f32_lambda::<K_PER_WARP>(&act_rv, &act_rv, &lambda_body));
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        if in_place { &in_smem } else { &out_smem },
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &act_rv, &in_smem_row,
+    ));
+    per_row.push(tk20::warp_apply_f32_lambda::<K_PER_WARP>(&act_rv, &act_rv, &lambda_body));
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        if in_place { &in_smem_row } else { &out_smem_row },
         &act_rv,
     ));
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
+    ));
+
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     let mut publish_stmts = vec![tk20::group_arrive::<1>(&out_done)];
     if !in_place {
@@ -541,6 +578,8 @@ pub fn render_fused_add_rms_norm<
     let delta_smem = page_as_sv_bf::<HIDDEN_DIM>(delta_p);
     let residual_smem = page_as_sv_bf::<HIDDEN_DIM>(residual_p);
     let weight_smem = page_as_sv_bf::<HIDDEN_DIM>(weight_p);
+    let delta_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(delta_p, "__row");
+    let residual_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(residual_p, "__row");
     let delta_ready = page_ready_sem(delta_p);
     let residual_ready = page_ready_sem(residual_p);
     let weight_ready = page_ready_sem(weight_p);
@@ -589,23 +628,29 @@ pub fn render_fused_add_rms_norm<
     consumer.push(decl_sq);
     consumer.push(decl_w);
 
+    // Weight is shared across rows — load once outside the per-row loop.
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &delta_rv, &delta_smem,
+        &weight_rv, &weight_smem,
     ));
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &res_rv, &residual_smem,
-    ));
-    consumer.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &res_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &delta_rv, &delta_smem_row,
+    ));
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &res_rv, &residual_smem_row,
+    ));
+    per_row.push(tk20::warp_add_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &delta_rv));
+
+    per_row.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &res_rv));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__farn_partial_sum", "0.0f");
-    consumer.push(decl_partial);
-    consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
+    per_row.push(decl_partial);
+    per_row.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
 
     let (decl_full, full_sum_expr) = tk20::decl_local_f32("__farn_full_sum", "0.0f");
-    consumer.push(decl_full);
-    consumer.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
+    per_row.push(decl_full);
+    per_row.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
         full_sum_expr.as_str(),
         partial_sum_expr.as_str(),
         &partial,
@@ -616,16 +661,17 @@ pub fn render_fused_add_rms_norm<
         full_sum_expr.as_str(),
         eps,
     );
-    consumer.push(decl_scale);
-    consumer.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&res_rv, &res_rv, &scale_expr));
+    per_row.push(decl_scale);
+    per_row.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&res_rv, &res_rv, &scale_expr));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &weight_rv));
 
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &weight_rv, &weight_smem,
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &residual_smem_row, &res_rv,
     ));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&res_rv, &res_rv, &weight_rv));
 
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &residual_smem, &res_rv,
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
     ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
@@ -683,6 +729,7 @@ pub fn render_scalar_offset_rms_norm<
 
     let in_smem = page_as_sv_bf::<HIDDEN_DIM>(in_p);
     let weight_smem = page_as_sv_bf::<HIDDEN_DIM>(weight_p);
+    let in_smem_row = page_row_as_sv_bf::<HIDDEN_DIM>(in_p, "__row");
     let in_ready = page_ready_sem(in_p);
     let weight_ready = page_ready_sem(weight_p);
     let in_done = page_done_sem(in_p);
@@ -721,18 +768,25 @@ pub fn render_scalar_offset_rms_norm<
     consumer.push(decl_sq);
     consumer.push(decl_w);
 
+    // Weight + offset is shared across rows — load + bias once outside the per-row loop.
     consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &act_rv, &in_smem,
+        &weight_rv, &weight_smem,
     ));
+    let offset_lit = CuExpr::new(format!("{:e}f", offset));
+    consumer.push(tk20::warp_add_rv_scalar_f32::<K_PER_WARP>(&weight_rv, &weight_rv, &offset_lit));
 
-    consumer.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
+    let mut per_row = CuBlock::new();
+    per_row.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &act_rv, &in_smem_row,
+    ));
+    per_row.push(tk20::warp_copy_rv::<F32, K_PER_WARP, _>(&sq_rv, &act_rv));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&sq_rv, &sq_rv, &sq_rv));
     let (decl_partial, partial_sum_expr) = tk20::decl_local_f32("__sors_partial_sum", "0.0f");
-    consumer.push(decl_partial);
-    consumer.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
+    per_row.push(decl_partial);
+    per_row.push(tk20::warp_sum_to_scalar_f32::<K_PER_WARP>(&partial_sum_expr, &sq_rv));
     let (decl_full, full_sum_expr) = tk20::decl_local_f32("__sors_full_sum", "0.0f");
-    consumer.push(decl_full);
-    consumer.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
+    per_row.push(decl_full);
+    per_row.push(tk20::cross_warp_reduce_sum_f32::<NCW>(
         full_sum_expr.as_str(),
         partial_sum_expr.as_str(),
         &partial,
@@ -743,18 +797,16 @@ pub fn render_scalar_offset_rms_norm<
         full_sum_expr.as_str(),
         eps,
     );
-    consumer.push(decl_scale);
-    consumer.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_expr));
-
-    consumer.push(tk20::group_load_sv_to_rv_bf16_to_f32::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &weight_rv, &weight_smem,
+    per_row.push(decl_scale);
+    per_row.push(tk20::warp_mul_rv_scalar_f32::<K_PER_WARP>(&act_rv, &act_rv, &scale_expr));
+    per_row.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
+    per_row.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
+        &in_smem_row, &act_rv,
     ));
-    let offset_lit = CuExpr::new(format!("{:e}f", offset));
-    consumer.push(tk20::warp_add_rv_scalar_f32::<K_PER_WARP>(&weight_rv, &weight_rv, &offset_lit));
-    consumer.push(tk20::warp_mul_rv_rv::<K_PER_WARP, _>(&act_rv, &act_rv, &weight_rv));
 
-    consumer.push(tk20::group_store_rv_to_sv_f32_to_bf16::<NCW, K_PER_WARP, HIDDEN_DIM>(
-        &in_smem, &act_rv,
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __row = 0; __row < {NUM_TOKENS}; ++__row"),
+        &per_row,
     ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));

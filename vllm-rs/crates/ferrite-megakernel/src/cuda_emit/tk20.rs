@@ -1169,6 +1169,18 @@ pub fn for_loop(header: &str, body: &super::cu::CuBlock) -> CuStmt {
     CuStmt::new(format!("for ({header}) {{\n{}}}", body.render(4)))
 }
 
+/// Emit `#pragma unroll 1\nfor (<header>) { <body> }`. Forces nvcc
+/// to keep the loop as a runtime loop — no unrolling. Used by
+/// rmsnorm-family per-row loops where each iteration has hundreds
+/// of register-level ops; auto-unrolling at M=64 hangs cicc for
+/// 40+ minutes (observed 2026-05-24 on m_64_sk_128 canonical).
+pub fn for_loop_no_unroll(header: &str, body: &super::cu::CuBlock) -> CuStmt {
+    CuStmt::new(format!(
+        "#pragma unroll 1\nfor ({header}) {{\n{}}}",
+        body.render(4)
+    ))
+}
+
 /// Emit `if (<cond>) { <then_block> } else { <else_block> }`. Used
 /// by FQRC's per-head Q/K/V routing (`if (col < q_off + qkv_q) {
 /// ... } else if (col < q_off + qkv_q + qkv_k) { ... } else { ...

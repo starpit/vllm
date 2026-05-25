@@ -199,6 +199,19 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
         let intermediate = ctx.bounds.get("intermediate_size").copied().unwrap_or(0) as u32;
 
+        // SAFETY GATE — mirror `MetalSynthPreAttnImpl::cost_us`. This
+        // synth's kernel is decode-shaped (one threadgroup per token,
+        // no M-direction weight reuse). Measured 2026-05-25 on M4,
+        // Llama-3.2-3B-Instruct-4bit, M=1024: ~6940 µs/call — ~85% of
+        // all prefill GPU time and ~6× slower than the per-op M-tiled
+        // qmm_t gate/up/down chain. Both the swept CSV row and the
+        // analytical fallback below underprice it badly, so the gate
+        // must sit BEFORE the CSV lookup. Above M=64, force the per-op
+        // path; the M=1..64 decode/small-prefill win is unaffected.
+        if num_tokens > 64 {
+            return 1.0e15;
+        }
+
         let synth_name = format!(
             "synth_mlp_pre_down_{}_{}_gs{}",
             self.act_tag, self.scale_tag, self.group_size,

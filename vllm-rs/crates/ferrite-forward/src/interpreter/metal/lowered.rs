@@ -368,15 +368,19 @@ pub struct MScaling {
 /// commands that aren't gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeGate {
-    /// Run only when `num_seqs == 1` (single-sequence forward —
-    /// either pure-prefill of one seq or a single decode token).
-    /// Used by the lm_head slice trio (gather/qmv/scatter).
-    OnlyIfSingleSeq,
-    /// Run only when `num_seqs > 1` (batched decode or mixed
-    /// prefill+decode batch). Used by the full M=bucket_m lm_head
-    /// fallback so the slice's per-seq-incorrect logits get
-    /// overwritten by a correct multi-row GEMM.
-    OnlyIfMultiSeq,
+    /// Run only when `num_seqs == 1` AND `!has_spec_tokens`. Used by
+    /// the lm_head slice trio (gather/qmv/scatter) — the slice writes
+    /// only the LAST row of logits, which is correct for single-seq
+    /// prefill/decode (the only row that matters) but wrong for spec
+    /// verify (1 seq, K+1 sample positions, every row matters).
+    OnlyIfSingleSeqNoSpec,
+    /// Run when `num_seqs > 1` OR `has_spec_tokens`. Used by the full
+    /// `M=bucket_m` lm_head fallback so:
+    ///   * multi-seq batches get correct per-seq logits (slice's per-
+    ///     seq-incorrect output gets overwritten by the full GEMM)
+    ///   * single-seq spec verify gets every row of logits populated
+    ///     for greedy rejection sampling
+    OnlyIfMultiSeqOrSpec,
 }
 
 impl DispatchShape {

@@ -1547,6 +1547,24 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant dispatch arms for `forward_chain_with_encoder`.
+    // Phase 6 spec-decode K-step chain entry — each canonical's
+    // metal_emission emits its own `forward_chain_with_encoder` that
+    // wraps `pool.with_chain_encoder` with a per-canonical
+    // `ChainStepHandle` adapter.
+    let forward_chain_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward_chain_with_encoder(w, ctx, device, num_tokens, body)
+                },
+            }
+        })
+        .collect();
+
     // Per-variant `METAL_ARENA_PEAK_BYTES` reads. Each canonical mod
     // emits this const from the macro's per-canonical metal_emission;
     // shim variants re-export the canonical's. The trait impl below
@@ -1856,6 +1874,28 @@ fn emit_arch_dispatcher(
             }
         }
 
+        /// Phase 6 spec-decode K-step chain dispatcher. One MTL4 CB,
+        /// caller drives K bucket forwards + per-iter argmax +
+        /// chain_advance from inside `body`. See
+        /// `::ferrite_forward::MetalChainBody` for the body signature.
+        ///
+        /// # Safety
+        /// Same as [`forward`]; additionally, `body` must not retain
+        /// any references to the encoder past its return.
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_chain_with_encoder(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+            body: ::ferrite_forward::MetalChainBody<'_>,
+        ) -> ::core::result::Result<(), ::std::string::String> {
+            match w {
+                #(#forward_chain_arms)*
+            }
+        }
+
         /// Dispatching backbone-only forward (no lm_head). Returns
         /// `[num_tokens, hidden_size]` as an independently-owned
         /// `OwnedTensor`. For pipeline-parallel intermediate ranks
@@ -1941,6 +1981,17 @@ fn emit_arch_dispatcher(
                 followup: ::core::option::Option<::ferrite_forward::MetalForwardFollowup<'_>>,
             ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward_with_metal_followup(self, ctx, device, num_tokens, followup) }
+            }
+
+            #[cfg(feature = "metal")]
+            unsafe fn metal_chain_with_encoder(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
+                num_tokens: u64,
+                body: ::ferrite_forward::MetalChainBody<'_>,
+            ) -> ::core::result::Result<(), ::std::string::String> {
+                unsafe { forward_chain_with_encoder(self, ctx, device, num_tokens, body) }
             }
         }
 

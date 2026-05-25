@@ -6842,6 +6842,7 @@ pub fn emit_model(
                 cu_seqlens_q,
                 seq_used_k,
                 block_table,
+                has_spec_tokens: ctx.has_spec_tokens,
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -6911,6 +6912,211 @@ pub fn emit_model(
                 tail_adapter,
             )
             .expect("MetalWorkerPool::forward")
+        }
+
+        /// Phase 6 chain entry point. Opens ONE MTL4 cmdbuf on the
+        /// pool's MTL4 queue and invokes `body` with a
+        /// [`ChainStepHandle`] adapter + the worker's runtime + the
+        /// chain encoder. Caller drives K bucket forwards + per-iter
+        /// argmax + chain_advance dispatches onto the same encoder;
+        /// pool owns CB lifecycle (one commit, one host wait for
+        /// the entire chain). Falls back to a clear error string when
+        /// the bucket pick fails for the iter shape.
+        ///
+        /// `num_tokens` is the shape of EACH forward iter (constant
+        /// across iters because the K-step decode shape is fixed).
+        ///
+        /// [`ChainStepHandle`]: ::ferrite_forward::ChainStepHandle
+        #[cfg(feature = "metal")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_chain_with_encoder(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
+            num_tokens: u64,
+            body: ::ferrite_forward::MetalChainBody<'_>,
+        ) -> ::core::result::Result<(), ::std::string::String> {
+            use ::ferrite_forward::CanonicalParams as _;
+            use ::ferrite_forward::interpreter::metal::__re::{Buffer, MTLResourceOptions};
+
+            // Lazy pool init — mirrors `forward_with_metal_followup`
+            // so the chain path can fire as the first call against the
+            // draft model (it won't, in practice, because lockstep
+            // prefill runs first — but the pool is idempotent on
+            // get_or_init).
+            let pool = wm.metal_pool.get_or_init(|| {
+                let num_layers = ctx.kv_cache.num_layers;
+                let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.k_layer_mem(l).buffer().clone())
+                    .collect();
+                let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
+                    .map(|l| ctx.kv_cache.v_layer_mem(l).buffer().clone())
+                    .collect();
+                let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
+                    ::std::sync::Arc::new(move |dev| {
+                        let max_m = METAL_MAX_BUCKET_M as u64;
+                        let max_bps =
+                            <Weights as ::ferrite_forward::CanonicalParams>::MAX_BLOCKS_PER_SEQ
+                                as u64;
+                        let alloc = |bytes: u64| {
+                            use ::ferrite_forward::interpreter::metal::__re::MTLDevice as _;
+                            dev.newBufferWithLength_options(
+                                bytes.max(16) as usize,
+                                MTLResourceOptions::StorageModeShared,
+                            )
+                            .expect("newBufferWithLength_options returned nil")
+                        };
+                        ::ferrite_forward::interpreter::metal::RuntimeBindings {
+                            input_ids: alloc(max_m * 4),
+                            positions: alloc(max_m * 4),
+                            slot_mapping: alloc(max_m * 4),
+                            cu_seqlens_q: alloc((max_m + 1) * 4),
+                            seq_used_k: alloc(max_m * 4),
+                            block_table: alloc(max_m * max_bps * 4),
+                            kv_cache_k: kv_k.clone(),
+                            kv_cache_v: kv_v.clone(),
+                            num_tokens_u32: alloc(4),
+                        }
+                    });
+                ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
+                    device.device.clone(),
+                    wm,
+                    device.allocator.clone(),
+                    METAL_BUCKETS,
+                    factory,
+                    1,
+                )
+                .expect("MetalWorkerPool::for_buckets: pool init failed")
+            });
+
+            // Read host-visible iter-0 input slices off ctx (same
+            // pattern as `forward_with_metal_followup`).
+            let n = num_tokens as usize;
+            let input_ids = ::std::slice::from_raw_parts(
+                ctx.input_ids.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let positions = ::std::slice::from_raw_parts(
+                ctx.positions.as_raw().raw_ptr() as *const u32,
+                n,
+            );
+            let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
+                    n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let cu_seqlens_q = if !ctx.cu_seqlens_q.as_raw().raw_ptr().is_null() {
+                let cu_n = ctx.cu_seqlens_q.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.cu_seqlens_q.as_raw().raw_ptr() as *const u32,
+                    cu_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let seq_used_k = if !ctx.seqused_k.as_raw().raw_ptr().is_null() {
+                let su_n = ctx.seqused_k.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.seqused_k.as_raw().raw_ptr() as *const u32,
+                    su_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+            let block_table = if !ctx.block_table.as_raw().raw_ptr().is_null() {
+                let bt_n = ctx.block_table.as_raw().numel();
+                ::std::option::Option::Some(::std::slice::from_raw_parts(
+                    ctx.block_table.as_raw().raw_ptr() as *const u32,
+                    bt_n,
+                ))
+            } else {
+                ::std::option::Option::None
+            };
+
+            let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
+                num_tokens: num_tokens as u32,
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seq_used_k,
+                block_table,
+                has_spec_tokens: ctx.has_spec_tokens,
+            };
+
+            // Pre-pick the bucket from iter-0 num_tokens. The chain
+            // shape is constant across iters so this index is reused.
+            let bucket_idx = pool
+                .pick_bucket(inputs.num_tokens)
+                .map_err(|e| format!("MetalWorkerPool::pick_bucket: {e}"))?;
+            let terminal_slot =
+                METAL_BUCKETS[bucket_idx].terminal_slot as usize;
+            let vocab = METAL_VOCAB_SIZE as u32;
+
+            pool.with_chain_encoder(
+                wm,
+                &inputs,
+                &device.queue,
+                |worker, runtime, enc| {
+                    // Concrete adapter that satisfies the non-generic
+                    // `ChainStepHandle` trait. Holds the worker
+                    // borrow + the bucket_idx; calls
+                    // `worker.run_bucket_mtl4` to encode one iter onto
+                    // the encoder.
+                    struct Adapter<'a, W: ::ferrite_forward::CanonicalParams> {
+                        worker: &'a ::ferrite_forward::interpreter::metal::MetalWorker<W>,
+                        bucket_idx: usize,
+                        terminal_slot: usize,
+                        vocab: u32,
+                    }
+                    impl<W: ::ferrite_forward::CanonicalParams>
+                        ::ferrite_forward::ChainStepHandle for Adapter<'_, W>
+                    {
+                        fn run_forward_step(
+                            &self,
+                            encoder: &::ferrite_forward::metal_followup_reexports::ProtocolObject<
+                                dyn ::ferrite_forward::metal_followup_reexports::MTL4ComputeCommandEncoder,
+                            >,
+                            num_tokens: u32,
+                            num_seqs: u32,
+                            has_spec_tokens: bool,
+                        ) -> ::core::result::Result<(), ::std::string::String> {
+                            self.worker
+                                .run_bucket_mtl4(
+                                    self.bucket_idx,
+                                    num_tokens,
+                                    num_seqs,
+                                    has_spec_tokens,
+                                    encoder,
+                                )
+                                .map_err(|e| format!("run_bucket_mtl4: {e:?}"))
+                        }
+
+                        fn logits_buf(
+                            &self,
+                        ) -> &::ferrite_forward::metal_followup_reexports::ProtocolObject<
+                            dyn ::ferrite_forward::metal_followup_reexports::MTLBuffer,
+                        > {
+                            &self.worker.arena[self.terminal_slot]
+                        }
+
+                        fn vocab(&self) -> u32 { self.vocab }
+                    }
+                    let adapter = Adapter {
+                        worker,
+                        bucket_idx,
+                        terminal_slot,
+                        vocab,
+                    };
+                    body(&adapter, runtime, enc).map_err(
+                        ::ferrite_forward::interpreter::metal::ForwardError::Followup,
+                    )
+                },
+            )
+            .map_err(|e| format!("MetalWorkerPool::with_chain_encoder: {e}"))
         }
     };
 
@@ -7089,7 +7295,8 @@ fn emit_shim_model(
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
-            forward, forward_with_metal_followup, METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
+            forward, forward_chain_with_encoder, forward_with_metal_followup,
+            METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
         };
     }
 }

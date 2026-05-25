@@ -64,6 +64,13 @@ pub struct ModelRunnerOutput {
     /// Maps request ID to draft token sequences.
     pub draft_token_ids: Option<HashMap<String, Vec<u32>>>,
 
+    /// Owned-data seed bundle for `DraftModelProposer`'s K-step chain.
+    /// `Some` when the worker ran a target verify with a draft model
+    /// loaded; carries the lockstep-prefill inputs + per-req attn state
+    /// the chain needs. The proposer runs in `EngineCore::finalize_step`
+    /// against this bundle via `spec_decode_backend()`.
+    pub draft_seed_inputs: Option<crate::spec_decode::DraftSeedInputs>,
+
     /// Pooling output (embedding data) for requests in pooling mode.
     ///
     /// Maps request ID to the embedding data (single or multi-vector).
@@ -100,6 +107,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: None,
         }
@@ -159,6 +167,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: None,
         }
@@ -184,6 +193,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: None,
         }
@@ -207,6 +217,7 @@ impl ModelRunnerOutput {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: Some(resolver),
         }
@@ -289,6 +300,22 @@ pub trait Executor: Send {
         ))
     }
 
+    /// Mutable access to the spec-decode backend, if this executor
+    /// exposes one. Used by `EngineCore::finalize_step` to thread a
+    /// `&mut dyn SpecDecodeBackend` into `ProposerStepCtx::backend` so
+    /// `DraftModelProposer` can run the lockstep prefill + K-step
+    /// chain via `forward_argmax_blocking` against the executor's
+    /// driver worker.
+    ///
+    /// Default returns `None` — only single-worker executors that own
+    /// a `FerriteWorker` (UniProcExecutor, ThreadPoolExecutor's driver
+    /// shard) need to override.
+    fn spec_decode_backend(
+        &mut self,
+    ) -> Option<&mut dyn crate::spec_decode::SpecDecodeBackend> {
+        None
+    }
+
     /// Shut down the executor and all workers.
     fn shutdown(&mut self);
 }
@@ -343,6 +370,7 @@ impl Executor for NoopExecutor {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: None,
         })

@@ -136,6 +136,16 @@ pub struct FerriteWorkerConfig {
     /// decide `use_long_rope = max_model_len > original_max_pos`
     /// the same way Python vLLM does at init time.
     pub max_model_len: Option<usize>,
+    /// Optional draft-model path / HF repo ID for speculative decoding.
+    /// `Some(_)` triggers a second model + KV pool load inside the same
+    /// worker after the target loads (see
+    /// `DRAFT_SPEC_DECODE_PLAN.md` phase 3). `None` = no draft.
+    pub draft_model_path: Option<String>,
+    /// Optional dtype override for the draft model's weights ("auto",
+    /// "bfloat16", "float16", …). `None` inherits the target's dtype.
+    /// Currently passed through but the metal path always coerces to
+    /// bf16 to match the target — accepted for CLI parity with Python.
+    pub draft_model_dtype: Option<String>,
 }
 
 /// Per-image MRoPE metadata in seq space, used by
@@ -1707,6 +1717,16 @@ pub struct FerriteWorker {
     kv_cache: Option<KvCachePool>,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
+    /// Draft model's resolved snapshot dir, populated when
+    /// `config.draft_model_path` is set. See
+    /// `DRAFT_SPEC_DECODE_PLAN.md` phase 3.
+    draft_model_dir: Option<PathBuf>,
+    /// Draft model's `config.json`, populated alongside `draft_model_dir`.
+    draft_hf_config: Option<HfModelConfig>,
+    /// Second KV cache pool, sized for the draft model. Lives on the
+    /// same `MetalAllocator` / residency set as the target's pool —
+    /// one allocator covers all weights + both pools.
+    draft_kv_cache: Option<KvCachePool>,
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,
     is_shutdown: bool,
@@ -1849,29 +1869,36 @@ pub struct FerriteWorker {
     /// cfg(metal); the worker calls it through the trait vtable.
     #[cfg(feature = "metal")]
     model: Option<Box<dyn ferrite_forward::FerriteWeights>>,
+    /// Draft model for speculative decoding (loaded onto the same
+    /// device + allocator + command queue as the target). Idle until
+    /// `DRAFT_SPEC_DECODE_PLAN.md` phase 4 wires the proposer.
+    #[cfg(feature = "metal")]
+    draft_model: Option<Box<dyn ferrite_forward::FerriteWeights>>,
     /// Compiled greedy-sampling pipeline. Cached once at load_model
     /// to avoid recompiling the MSL kernel each step.
     #[cfg(feature = "metal")]
     argmax_kernels: Option<ferrite_metal_kernels::argmax::ArgmaxKernels>,
-    /// Persistent argmax output buffer (sized for the largest
-    /// `total_n` we've seen). Reused across decode steps and bound
-    /// into [`Self::argmax_arg_table`] at index 1. Resized in place
-    /// when `total_n` grows.
+    /// Phase 6 chain-advance kernel. One small kernel that bumps
+    /// per-req `runtime.positions` / `slot_mapping` / `seqused_k` in
+    /// place between K-step chain iters. Cached at load_model so the
+    /// pipeline is built once.
     #[cfg(feature = "metal")]
-    argmax_out_buf: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>>,
-    /// Persistent 8-byte buffer holding `[batch, vocab]` as two u32s.
-    /// Bound into [`Self::argmax_arg_table`] at indices 2 and 3 (with
-    /// offsets 0 and 4) for the kernel's `constant uint &batch` and
-    /// `constant uint &vocab` parameters. Updated per step.
+    chain_advance_kernel:
+        Option<ferrite_metal_kernels::chain_advance::ChainAdvanceKernel>,
+    /// Second `MTLCommandQueue` on the same device, dedicated to the
+    /// draft chain. Metal device-level parallelism: dispatches on
+    /// distinct queues run concurrently on Apple Silicon when they
+    /// don't contend for the same residency set / arena slots.
+    ///
+    /// Used by Phase 8: lockstep prefill submitted here in parallel
+    /// with target verify on the main queue. Lockstep's draft-KV
+    /// writes at target positions don't overlap with target's
+    /// target-KV writes (separate KV pools), so they're safe to run
+    /// concurrently. Allocated when the draft model loads.
     #[cfg(feature = "metal")]
-    argmax_consts_buf: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>>,
-    /// Persistent MTL4 argument table for the argmax dispatch. Built
-    /// lazily when first needed and reused across decode steps;
-    /// addresses at indices 0 (logits), 1 (output), 2 (batch), 3
-    /// (vocab) are rebound each step before the dispatch is encoded
-    /// onto the forward command encoder.
-    #[cfg(feature = "metal")]
-    argmax_arg_table: Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ArgumentTable>>>,
+    draft_queue: Option<::objc2::rc::Retained<
+        ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
+    >>,
 }
 
 // Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -2080,6 +2107,9 @@ impl FerriteWorker {
             kv_cache: None,
             model_dir: None,
             hf_config: None,
+            draft_model_dir: None,
+            draft_hf_config: None,
+            draft_kv_cache: None,
             model_dtype: GpuDType::BF16,
             resolved_architecture: None,
             is_shutdown: false,
@@ -3797,7 +3827,7 @@ impl FerriteWorker {
             let target_ids = &all_target_ids[flat_offset..flat_offset + n_tokens];
 
             let rejection =
-                crate::input_batch::greedy_rejection_sample(target_ids, &req_slice.spec_token_ids);
+                ::vllm_engine::spec_decode::greedy_rejection_sample(target_ids, &req_slice.spec_token_ids);
             let accepted_tokens = rejection.accepted_tokens;
 
             // 4. Commit step with accepted tokens.
@@ -5183,6 +5213,61 @@ impl FerriteWorker {
 // helpers that don't compile under metal. Per-method `#[cfg]` arms would
 // expand to ~2k lines of dead-under-metal code that still has to type-
 // check; cfg-gated blocks are the same shape with less surface.
+
+// Phase 5.2a stub: CUDA gets the `SpecDecodeBackend` trait surface so
+// downstream architecture can hold the worker behind `dyn
+// SpecDecodeBackend` from day one. Bodies stay `NotImplemented` —
+// phase 5.2b ports them (cudaMalloc + cuda forward +
+// `vllm_cuda::kernels::argmax_batched`, lifting the existing
+// `spec_decode_greedy_sample` logic).
+#[cfg(feature = "cuda")]
+impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
+    fn forward_argmax_blocking(
+        &mut self,
+        _model: ::vllm_engine::spec_decode::ModelHandle,
+        _kv_pool: ::vllm_engine::spec_decode::KvPoolHandle,
+        _req: &::vllm_engine::spec_decode::ForwardArgmaxRequest<'_>,
+    ) -> Result<Vec<u32>, ::vllm_engine::spec_decode::BackendError> {
+        Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
+            "cuda: forward_argmax_blocking (phase 5.2b)",
+        ))
+    }
+
+    fn load_secondary_model(
+        &mut self,
+        _path: &::std::path::Path,
+        _dtype: Option<&str>,
+    ) -> Result<
+        ::vllm_engine::spec_decode::ModelHandle,
+        ::vllm_engine::spec_decode::BackendError,
+    > {
+        Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
+            "cuda: load_secondary_model (phase 5.2b)",
+        ))
+    }
+
+    fn allocate_kv_pool(
+        &mut self,
+        _model: ::vllm_engine::spec_decode::ModelHandle,
+        _num_blocks: usize,
+    ) -> Result<
+        ::vllm_engine::spec_decode::KvPoolHandle,
+        ::vllm_engine::spec_decode::BackendError,
+    > {
+        Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
+            "cuda: allocate_kv_pool (phase 5.2b)",
+        ))
+    }
+
+    fn kv_per_block_bytes(
+        &self,
+        _model: ::vllm_engine::spec_decode::ModelHandle,
+    ) -> Result<usize, ::vllm_engine::spec_decode::BackendError> {
+        Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
+            "cuda: kv_per_block_bytes (phase 5.2b)",
+        ))
+    }
+}
 
 #[cfg(feature = "cuda")]
 impl Worker for FerriteWorker {
@@ -9135,6 +9220,19 @@ struct LogitsUpdateCtx<'a> {
     batch_req_ids: &'a [String],
 }
 
+/// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
+/// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
+#[cfg(feature = "metal")]
+fn kv_per_block_bytes(model: &dyn ferrite_forward::FerriteWeights, block_size: usize) -> usize {
+    let elt_bytes: usize = 2;
+    (model.num_hidden_layers() as usize)
+        .saturating_mul(2)
+        .saturating_mul(model.num_key_value_heads() as usize)
+        .saturating_mul(model.head_dim() as usize)
+        .saturating_mul(block_size)
+        .saturating_mul(elt_bytes)
+}
+
 /// Compute KV cache budget matching Python vLLM's formula exactly:
 ///   requested = total_memory * gpu_memory_utilization
 ///   non_kv_cache = weights_and_overhead + peak_activations + 150 MiB
@@ -9386,10 +9484,13 @@ impl FerriteWorker {
             metal_device: None,
             gpu_device: None,
             model: None,
+            draft_model: None,
+            draft_model_dir: None,
+            draft_hf_config: None,
+            draft_kv_cache: None,
             argmax_kernels: None,
-            argmax_out_buf: None,
-            argmax_consts_buf: None,
-            argmax_arg_table: None,
+            chain_advance_kernel: None,
+            draft_queue: None,
         }
     }
 
@@ -9416,6 +9517,990 @@ impl FerriteWorker {
     /// the worker uniformly.
     pub fn resolved_dtype_elem_bytes(&self) -> usize {
         self.model_dtype.size_bytes()
+    }
+}
+
+// Inherent impl block for metal-only helpers that aren't on the
+// `Worker` trait — kept separate from the trait impl below so non-
+// trait methods don't get implicitly added to `Worker`.
+#[cfg(feature = "metal")]
+impl FerriteWorker {
+    /// Load the speculative draft model onto the same Metal device +
+    /// allocator + command queue as the target. Called from
+    /// `load_model` after the target is fully loaded.
+    ///
+    /// Skips the metal device setup (reuses `self.gpu_device`), the
+    /// argmax kernel compile (per-device, not per-model — `self.argmax_*`
+    /// stays target-aligned for batch sizing), and the worker-pool /
+    /// SpecializedPipelineCache for the draft is created lazily inside
+    /// `ferrite_forward::try_load`. Two FerriteWeights instances on the
+    /// same device → two pipeline caches; that's fine because cache
+    /// keys include the library name and each model's synthesized
+    /// libraries are derived from its own per-arch macro expansion.
+    fn load_draft_model_metal(&mut self) -> ExecutorResult<()> {
+        let path = self
+            .config
+            .draft_model_path
+            .as_deref()
+            .ok_or_else(|| ExecutorError::WorkerInit(
+                "load_draft_model_metal called without draft_model_path".into(),
+            ))?;
+
+        let t_resolve = std::time::Instant::now();
+        let draft_dir = resolve_model_path(path, self.config.hf_token.as_deref(), None)?;
+        info!(
+            "FerriteWorker(metal): resolved draft model dir in {:?} ({})",
+            t_resolve.elapsed(),
+            draft_dir.display()
+        );
+
+        if draft_dir.is_file() && draft_dir.extension().is_some_and(|e| e == "gguf") {
+            return Err(ExecutorError::WorkerInit(
+                "draft GGUF not supported on metal (safetensors only)".into(),
+            ));
+        }
+
+        let draft_hf_config = HfModelConfig::from_path(&draft_dir).map_err(|e| {
+            ExecutorError::WorkerInit(format!("draft config parse failed: {e}"))
+        })?;
+        let draft_arch = draft_hf_config
+            .architectures
+            .first()
+            .cloned()
+            .unwrap_or_default();
+
+        // Reuse the target's gpu_device — its allocator owns the
+        // residency set the target weights live in, and the draft must
+        // share that set or attention reads will race the Apple pager.
+        // `MetalAllocator::clone` shares the underlying arena via
+        // Arc<Mutex<…>>, so a weight allocated through the draft clone
+        // is reachable via the target's clone too.
+        let gpu_device = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit(
+                "gpu_device not initialized — draft load must run after target load".into(),
+            ))?;
+        let allocator = (*gpu_device.allocator).clone();
+
+        let t_from_dir = std::time::Instant::now();
+        let mut draft_weights = GpuWeights::from_dir(&draft_dir, allocator).map_err(|e| {
+            ExecutorError::WorkerInit(format!("draft weight load failed: {e}"))
+        })?;
+        info!(
+            "FerriteWorker(metal): draft GpuWeights::from_dir in {:?} ({} tensors)",
+            t_from_dir.elapsed(),
+            draft_weights.len()
+        );
+        draft_weights.set_target_dtype(GpuDType::BF16);
+
+        let hf_fp = ferrite_forward::HfFingerprint {
+            rope_scaling_type: draft_hf_config
+                .extra
+                .get("rope_scaling")
+                .and_then(|rs| rs.get("rope_type").or_else(|| rs.get("type")))
+                .and_then(|v| v.as_str()),
+            rope_scaling_hash: draft_hf_config
+                .extra
+                .get("rope_scaling")
+                .map(ferrite_forward::hash_json_value),
+        };
+        let max_model_len = self
+            .config
+            .max_model_len
+            .or(draft_hf_config.max_position_embeddings)
+            .unwrap_or(4096);
+
+        let t_try_load = std::time::Instant::now();
+        let draft_model = ferrite_forward::try_load(
+            &mut draft_weights,
+            (),
+            draft_arch.as_str(),
+            1,
+            0,
+            max_model_len,
+            hf_fp,
+        )
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft try_load: {e}")))?
+        .ok_or_else(|| ExecutorError::ArchNotSupported(draft_arch.clone()))?;
+
+        info!(
+            "FerriteWorker(metal): draft try_load in {:?} ({} via ferrite-forward, {})",
+            t_try_load.elapsed(),
+            draft_arch,
+            draft_model.arch_name()
+        );
+
+        self.draft_model = Some(draft_model);
+        self.draft_model_dir = Some(draft_dir);
+        self.draft_hf_config = Some(draft_hf_config);
+
+        // Phase 8 foundation: dedicated MTLCommandQueue for the draft
+        // chain. Two queues on the same device run concurrently on
+        // Apple Silicon; this enables lockstep prefill to overlap
+        // with target verify (separate KV pools → no contention).
+        if self.draft_queue.is_none() {
+            let device = self
+                .gpu_device
+                .as_ref()
+                .expect("gpu_device must be initialized before draft model loads");
+            self.draft_queue = Some(
+                device
+                    .device
+                    .newCommandQueue()
+                    .expect("newCommandQueue for draft_queue returned nil"),
+            );
+            info!("FerriteWorker(metal): allocated dedicated draft MTLCommandQueue");
+        }
+        Ok(())
+    }
+
+    /// Allocate the draft model's KV pool. Mirrors `initialize_cache`'s
+    /// target-pool path: StorageModePrivate buffers pinned into the
+    /// allocator's shared residency set so attention reads don't race
+    /// the Apple pager.
+    fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
+        let model = self
+            .draft_model
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit(
+                "initialize_draft_cache_metal called before draft_model load".into(),
+            ))?;
+        // Phase 4 of DRAFT_SPEC_DECODE_PLAN.md: lockstep proposer needs a
+        // 1:1 mirror — every target block has a sibling draft block at the
+        // same index. `determine_available_memory` already carved off
+        // `draft / (target + draft)` of the KV budget for us, so the
+        // engine's `num_gpu_blocks` is the post-split target count and
+        // the draft can mirror it exactly. `FERRITE_DRAFT_KV_BLOCKS=<N>`
+        // remains as an explicit-testing override.
+        let draft_blocks = std::env::var("FERRITE_DRAFT_KV_BLOCKS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(num_gpu_blocks);
+        let device = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| ExecutorError::WorkerInit("gpu_device not initialized".into()))?;
+
+        let cache_dtype = match model.metal_dtype() {
+            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => GpuDType::BF16,
+            ferrite_forward::interpreter::metal::MetalDtype::F16 => GpuDType::F16,
+            ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                return Err(ExecutorError::WorkerInit(
+                    "draft KV cache cannot be int4-quantized".into(),
+                ));
+            }
+        };
+
+        let mtl_device = device.device.clone();
+        let residency = device.allocator.residency().clone();
+
+        let t_pool = std::time::Instant::now();
+        let pool = unsafe {
+            KvCachePool::new(
+                model.num_hidden_layers() as usize,
+                draft_blocks,
+                self.config.block_size,
+                model.num_key_value_heads() as usize,
+                model.head_dim() as usize,
+                cache_dtype,
+                |bytes| {
+                    let buffer = mtl_device
+                        .newBufferWithLength_options(
+                            bytes,
+                            ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                        )
+                        .expect("newBufferWithLength_options returned nil");
+                    residency.insert(&buffer);
+                    Ok(RawGpuMem::from_buffer(buffer))
+                },
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerInit(format!("draft KvCachePool: {e}")))?;
+        info!(
+            "FerriteWorker(metal): draft KV pool ready in {:?} ({} layers × {} blocks × {} tokens, \
+             1:1 mirror of target's {} blocks)",
+            t_pool.elapsed(),
+            model.num_hidden_layers(),
+            draft_blocks,
+            self.config.block_size,
+            num_gpu_blocks,
+        );
+        self.draft_kv_cache = Some(pool);
+        Ok(())
+    }
+
+    /// Allocate a `StorageModeShared` u32 buffer and memcpy `data` into it.
+    /// Shared between the verify path (via the `SpecDecodeBackend` trait
+    /// impl) and the K-step draft chain inlined in `execute_model`.
+    fn alloc_shared_u32_buf(
+        device: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLDevice>,
+        data: &[u32],
+    ) -> ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>> {
+        let bytes = (data.len().max(1)) * 4;
+        let buf = device
+            .newBufferWithLength_options(
+                bytes,
+                ::objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+            .expect("newBufferWithLength_options returned nil");
+        if !data.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    buf.contents().as_ptr() as *mut u32,
+                    data.len(),
+                );
+            }
+        }
+        buf
+    }
+}
+
+/// Phase 6 K-step chain dispatch — the actual work of
+/// [`FerriteWorker::forward_chain_k`] extracted into a free fn so the
+/// Phase 9 speculative path (worker's lockstep thread, parallel to
+/// target verify) can call it too without `&self` access. Caller
+/// supplies the model + KV cache + GpuDevice + kernel refs.
+///
+/// Allocates K argmax_dual_write argument tables + per-iter argmax
+/// output buffers + one stable chain_advance arg table + a packed
+/// 16-byte consts buffer, then drives K forwards on one MTL4 CB via
+/// `model.metal_chain_with_encoder`. After CB completion, host-reads
+/// the K argmax buffers and returns iter-major `[k][num_reqs]`
+/// argmax IDs.
+#[cfg(feature = "metal")]
+fn metal_chain_dispatch(
+    model_ref: &dyn ferrite_forward::FerriteWeights,
+    kv_cache_ref: &KvCachePool,
+    device_mut: &mut GpuDevice,
+    argmax_kernels: &ferrite_metal_kernels::argmax::ArgmaxKernels,
+    chain_kernel: &ferrite_metal_kernels::chain_advance::ChainAdvanceKernel,
+    req: &::vllm_engine::spec_decode::ForwardArgmaxRequest<'_>,
+    block_size: usize,
+    k: usize,
+) -> Result<Vec<Vec<u32>>, String> {
+    use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
+
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let num_reqs = req.cu_seqlens_q.len().saturating_sub(1);
+    if num_reqs == 0 || num_reqs != req.num_tokens {
+        return Err(format!(
+            "metal_chain_dispatch: K-step decode requires num_tokens == num_reqs \
+             (got num_tokens={}, num_reqs={})",
+            req.num_tokens, num_reqs
+        ));
+    }
+
+    let mtl_device = device_mut.device.clone();
+
+    // ── 1. Upload iter-0 inputs ─────────────────────────────────
+    let buf_input_ids = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.input_ids);
+    let buf_positions = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.positions);
+    let buf_slot_mapping =
+        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
+    let buf_cu_seqlens =
+        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
+    let buf_seqused_k = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
+    let buf_block_table =
+        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.block_table);
+
+    let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
+    let view_input_ids = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_input_ids.contents().as_ptr() as *mut u8,
+            &[req.num_tokens.max(1)],
+            dtype_u32,
+        ))
+    };
+    let view_positions = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_positions.contents().as_ptr() as *mut u8,
+            &[req.num_tokens.max(1)],
+            dtype_u32,
+        ))
+    };
+    let view_slot_mapping = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_slot_mapping.contents().as_ptr() as *mut u8,
+            &[req.num_tokens.max(1)],
+            dtype_u32,
+        ))
+    };
+    let view_cu_seqlens = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_cu_seqlens.contents().as_ptr() as *mut u8,
+            &[req.cu_seqlens_q.len().max(1)],
+            dtype_u32,
+        ))
+    };
+    let view_seqused_k = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_seqused_k.contents().as_ptr() as *mut u8,
+            &[req.seqused_k.len().max(1)],
+            dtype_u32,
+        ))
+    };
+    let view_block_table = unsafe {
+        TensorView::from_raw(GpuTensor::new(
+            buf_block_table.contents().as_ptr() as *mut u8,
+            &[num_reqs.max(1), req.block_table_stride.max(1)],
+            dtype_u32,
+        ))
+    };
+
+    // ── 2. Allocate K argmax output buffers (host-visible) ──────
+    let argmax_bytes = (req.num_tokens.max(1)) * 4;
+    let argmax_bufs: Vec<::objc2::rc::Retained<
+        ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
+    >> = (0..k)
+        .map(|_| {
+            mtl_device
+                .newBufferWithLength_options(
+                    argmax_bytes,
+                    ::objc2_metal::MTLResourceOptions::StorageModeShared,
+                )
+                .expect("argmax_buf alloc returned nil")
+        })
+        .collect();
+
+    // ── 3. Pack constants ───────────────────────────────────────
+    let consts_buf = mtl_device
+        .newBufferWithLength_options(
+            16,
+            ::objc2_metal::MTLResourceOptions::StorageModeShared,
+        )
+        .expect("consts_buf alloc returned nil");
+    let vocab_u32 = model_ref.vocab_size() as u32;
+    unsafe {
+        let p = consts_buf.contents().as_ptr() as *mut u32;
+        *p.add(0) = req.num_tokens as u32;
+        *p.add(1) = vocab_u32;
+        *p.add(2) = block_size as u32;
+        *p.add(3) = req.block_table_stride as u32;
+    }
+
+    // ── 4. Build K argmax_dual_write argument tables ────────────
+    let argmax_arg_tables: Vec<_> = (0..k)
+        .map(|_| {
+            use ::objc2_metal::MTL4ArgumentTableDescriptor;
+            let desc = MTL4ArgumentTableDescriptor::new();
+            desc.setMaxBufferBindCount(5);
+            mtl_device
+                .newArgumentTableWithDescriptor_error(&desc)
+                .expect("argmax dual_write arg_table alloc returned nil")
+        })
+        .collect();
+
+    // ── 5. Build chain_advance argument table ───────────────────
+    let chain_arg_table = {
+        use ::objc2_metal::MTL4ArgumentTableDescriptor;
+        let desc = MTL4ArgumentTableDescriptor::new();
+        desc.setMaxBufferBindCount(7);
+        mtl_device
+            .newArgumentTableWithDescriptor_error(&desc)
+            .expect("chain_advance arg_table alloc returned nil")
+    };
+
+    // ── 6. ForwardCtx ───────────────────────────────────────────
+    let ctx = ferrite_forward::ForwardCtx {
+        input_ids: view_input_ids,
+        positions: view_positions,
+        slot_mapping: view_slot_mapping,
+        cu_seqlens_q: view_cu_seqlens,
+        seqused_k: view_seqused_k,
+        block_table: view_block_table,
+        max_seqlen_q: req.max_seqlen_q,
+        max_seqlen_k: req.max_seqlen_k,
+        kv_cache: kv_cache_ref,
+        has_spec_tokens: false,
+    };
+
+    // SAFETY: kernel refs survive the synchronous call below.
+    let argmax_kernels_addr: usize =
+        argmax_kernels as *const ferrite_metal_kernels::argmax::ArgmaxKernels as usize;
+    let chain_kernel_addr: usize =
+        chain_kernel as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel
+            as usize;
+    let dtype = model_ref.metal_dtype();
+
+    let argmax_bufs_for_closure = argmax_bufs.clone();
+    let consts_buf_for_closure = consts_buf.clone();
+    let argmax_arg_tables_for_closure = argmax_arg_tables.clone();
+    let chain_arg_table_for_closure = chain_arg_table.clone();
+
+    let num_tokens_u32 = req.num_tokens as u32;
+    let num_reqs_u32 = num_reqs as u32;
+    let k_usize = k;
+
+    let body: ferrite_forward::MetalChainBody<'_> = Box::new(
+        move |handle, runtime, enc| -> Result<(), String> {
+            let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels =
+                unsafe {
+                    &*(argmax_kernels_addr
+                        as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
+                };
+            let chain_kernel_ref:
+                &ferrite_metal_kernels::chain_advance::ChainAdvanceKernel = unsafe {
+                &*(chain_kernel_addr
+                    as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel)
+            };
+
+            let logits_buf = handle.logits_buf();
+            let vocab = handle.vocab();
+            let logits_addr = logits_buf.gpuAddress();
+            let consts_addr = consts_buf_for_closure.gpuAddress();
+            let next_in_addr = runtime.input_ids.gpuAddress();
+
+            unsafe {
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    runtime.positions.gpuAddress(), 0);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    runtime.slot_mapping.gpuAddress(), 1);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    runtime.seq_used_k.gpuAddress(), 2);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    runtime.block_table.gpuAddress(), 3);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    consts_addr + 8, 4);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    consts_addr + 12, 5);
+                chain_arg_table_for_closure.setAddress_atIndex(
+                    consts_addr, 6);
+            }
+
+            for iter in 0..k_usize {
+                handle.run_forward_step(enc, num_tokens_u32, num_reqs_u32, false)?;
+
+                let table = &argmax_arg_tables_for_closure[iter];
+                let out_addr = argmax_bufs_for_closure[iter].gpuAddress();
+                unsafe {
+                    table.setAddress_atIndex(logits_addr, 0);
+                    table.setAddress_atIndex(out_addr, 1);
+                    table.setAddress_atIndex(consts_addr, 2);
+                    table.setAddress_atIndex(consts_addr + 4, 3);
+                    table.setAddress_atIndex(next_in_addr, 4);
+                }
+                let _ = vocab;
+                match dtype {
+                    ferrite_forward::interpreter::metal::MetalDtype::F16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_f16_dual_write_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            table,
+                            num_reqs_u32,
+                        )
+                        .map_err(|e| format!("encode argmax_f16_dual_write: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_bf16_dual_write_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            table,
+                            num_reqs_u32,
+                        )
+                        .map_err(|e| format!("encode argmax_bf16_dual_write: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                        return Err("argmax: int4 dtype has no direct kernel".into());
+                    }
+                }
+
+                if iter + 1 < k_usize {
+                    ferrite_metal_kernels::chain_advance::encode_chain_advance_into_mtl4(
+                        chain_kernel_ref,
+                        enc,
+                        &chain_arg_table_for_closure,
+                        num_reqs_u32,
+                    )
+                    .map_err(|e| format!("encode chain_advance: {e:?}"))?;
+                }
+            }
+            Ok(())
+        },
+    );
+
+    let prof = std::env::var_os("FERRITE_SPEC_PROFILE").is_some();
+    let t_chain = std::time::Instant::now();
+    unsafe {
+        model_ref.metal_chain_with_encoder(
+            &ctx,
+            device_mut,
+            req.num_tokens as u64,
+            body,
+        )?
+    };
+    let chain_us = t_chain.elapsed().as_micros();
+
+    let t_read = std::time::Instant::now();
+    let mut out: Vec<Vec<u32>> = Vec::with_capacity(k);
+    for buf in argmax_bufs.iter() {
+        let slice: &[u32] = unsafe {
+            std::slice::from_raw_parts(
+                buf.contents().as_ptr() as *const u32,
+                num_reqs.max(1),
+            )
+        };
+        out.push(slice[..num_reqs.max(1)].to_vec());
+    }
+    let read_us = t_read.elapsed().as_micros();
+
+    if prof {
+        eprintln!(
+            "[spec-prof chain] k={} num_reqs={} chain={}us read={}us",
+            k, num_reqs, chain_us, read_us,
+        );
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "metal")]
+impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
+    fn forward_argmax_blocking(
+        &mut self,
+        model: ::vllm_engine::spec_decode::ModelHandle,
+        kv_pool: ::vllm_engine::spec_decode::KvPoolHandle,
+        req: &::vllm_engine::spec_decode::ForwardArgmaxRequest<'_>,
+    ) -> Result<Vec<u32>, ::vllm_engine::spec_decode::BackendError> {
+        use ::vllm_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
+
+        // Resolve handles. 0 → target, 1 → draft; everything else is
+        // an unknown handle.
+        let model_ref: &dyn ferrite_forward::FerriteWeights = match model {
+            ModelHandle::TARGET => self
+                .model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("target model not loaded".into()))?,
+            ModelHandle(1) => self
+                .draft_model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
+            _ => return Err(BackendError::UnknownHandle("ModelHandle")),
+        };
+        let kv_cache_ref: &KvCachePool = match kv_pool {
+            KvPoolHandle::TARGET => self
+                .kv_cache
+                .as_ref()
+                .ok_or_else(|| BackendError::Backend("target kv_cache not initialized".into()))?,
+            KvPoolHandle(1) => self
+                .draft_kv_cache
+                .as_ref()
+                .ok_or_else(|| BackendError::Backend("draft kv_cache not initialized".into()))?,
+            _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
+        };
+
+        let device_buf = self
+            .gpu_device
+            .as_ref()
+            .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
+        let mtl_device = device_buf.device.clone();
+        let argmax_kernels = self
+            .argmax_kernels
+            .as_ref()
+            .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
+
+        // ── 1. Upload host slices to fresh shared-storage MTLBuffers ─────
+        let prof = std::env::var_os("FERRITE_SPEC_PROFILE").is_some();
+        let t_alloc = std::time::Instant::now();
+        let buf_input_ids = Self::alloc_shared_u32_buf(&mtl_device, req.input_ids);
+        let buf_positions = Self::alloc_shared_u32_buf(&mtl_device, req.positions);
+        let buf_slot_mapping = Self::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
+        let buf_cu_seqlens = Self::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
+        let buf_seqused_k = Self::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
+        let buf_block_table = Self::alloc_shared_u32_buf(&mtl_device, req.block_table);
+        let alloc_us = t_alloc.elapsed().as_micros();
+
+        // ── 2. Wrap MTLBuffers in TensorViews. Dtype is purely
+        //       descriptive; the macro-emitted forward only reads
+        //       `as_raw().raw_ptr()` and `numel()`.
+        let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
+        let num_reqs = req.cu_seqlens_q.len().saturating_sub(1);
+        let view_input_ids = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_input_ids.contents().as_ptr() as *mut u8,
+                &[req.num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_positions = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_positions.contents().as_ptr() as *mut u8,
+                &[req.num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_slot_mapping = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_slot_mapping.contents().as_ptr() as *mut u8,
+                &[req.num_tokens.max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_cu_seqlens = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_cu_seqlens.contents().as_ptr() as *mut u8,
+                &[req.cu_seqlens_q.len().max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_seqused_k = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_seqused_k.contents().as_ptr() as *mut u8,
+                &[req.seqused_k.len().max(1)],
+                dtype_u32,
+            ))
+        };
+        let view_block_table = unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_block_table.contents().as_ptr() as *mut u8,
+                &[num_reqs.max(1), req.block_table_stride.max(1)],
+                dtype_u32,
+            ))
+        };
+
+        // ── 3. Build ForwardCtx + run forward ────────────────────────────
+        // Disjoint borrows: `model_ref`/`kv_cache_ref`/`argmax_kernels`
+        // are immutable references into `self`; `device_mut` is a
+        // mutable borrow of `self.gpu_device`. NLL accepts the split.
+        //
+        // Phase 8 routing: when the call is for the draft model
+        // (ModelHandle(1)) and a dedicated `draft_queue` exists, we
+        // build a shadow `GpuDevice` wrapping the same `MTLDevice` +
+        // allocator but the draft queue, so the draft model's pool
+        // attaches its residency set to that queue (instead of the
+        // main queue). This lets target verify and draft work execute
+        // concurrently on Apple Silicon. The shadow device is local
+        // to this call; the worker's `gpu_device.queue` is untouched.
+        let use_draft_queue = matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
+        let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
+            let main_dev = self.gpu_device.as_ref().ok_or_else(|| {
+                BackendError::Backend("gpu_device not initialized".into())
+            })?;
+            let draft_q = self.draft_queue.as_ref().unwrap().clone();
+            Some(GpuDevice {
+                device: main_dev.device.clone(),
+                queue: draft_q,
+                allocator: main_dev.allocator.clone(),
+            })
+        } else {
+            None
+        };
+        let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
+            shadow
+        } else {
+            self.gpu_device
+                .as_mut()
+                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?
+        };
+
+        let ctx = ferrite_forward::ForwardCtx {
+            input_ids: view_input_ids,
+            positions: view_positions,
+            slot_mapping: view_slot_mapping,
+            cu_seqlens_q: view_cu_seqlens,
+            seqused_k: view_seqused_k,
+            block_table: view_block_table,
+            max_seqlen_q: req.max_seqlen_q,
+            max_seqlen_k: req.max_seqlen_k,
+            kv_cache: kv_cache_ref,
+            has_spec_tokens: req.has_spec_tokens,
+        };
+
+        // ── 4. Fused argmax via forward_with_metal_followup. ─────────────
+        // Phase 6a: argmax encodes onto the SAME MTL4 compute encoder
+        // as the forward — forward + argmax share one CB, one commit,
+        // one host wait. Pre-6a took the unfused path (separate dispatch
+        // + commit + wait + readback) for 5.2a simplicity; this re-folds
+        // it. Per call: 2 commit+waits → 1.
+        let t_argbuf = std::time::Instant::now();
+        let argmax_bytes = (req.num_tokens.max(1)) * 4;
+        let argmax_out = mtl_device
+            .newBufferWithLength_options(
+                argmax_bytes,
+                ::objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+            .expect("argmax_out alloc returned nil");
+        let consts_buf = mtl_device
+            .newBufferWithLength_options(
+                8,
+                ::objc2_metal::MTLResourceOptions::StorageModeShared,
+            )
+            .expect("argmax consts alloc returned nil");
+        let arg_table = {
+            use ::objc2_metal::MTL4ArgumentTableDescriptor;
+            let desc = MTL4ArgumentTableDescriptor::new();
+            desc.setMaxBufferBindCount(4);
+            mtl_device
+                .newArgumentTableWithDescriptor_error(&desc)
+                .expect("argmax arg_table alloc returned nil")
+        };
+        let argbuf_us = t_argbuf.elapsed().as_micros();
+        let dtype = model_ref.metal_dtype();
+        let argmax_out_for_closure = argmax_out.clone();
+        let consts_for_closure = consts_buf.clone();
+        let arg_table_for_closure = arg_table.clone();
+        // SAFETY: `argmax_kernels` is borrowed from `&self.argmax_kernels`;
+        // the closure runs synchronously inside `model_ref.forward_*` while
+        // that borrow is live. Cast to a raw pointer to keep the closure
+        // 'static + Send-safe per `MetalForwardFollowup`'s bound.
+        let argmax_kernels_ptr: *const ferrite_metal_kernels::argmax::ArgmaxKernels =
+            argmax_kernels;
+        let argmax_kernels_addr = argmax_kernels_ptr as usize;
+        let followup: ferrite_forward::MetalForwardFollowup<'_> = Box::new(
+            move |enc, logits_buf, total_n_actual, vocab_actual| -> Result<(), String> {
+                // Update consts buffer in-place (StorageModeShared).
+                let consts_ptr = consts_for_closure.contents().as_ptr() as *mut u32;
+                unsafe {
+                    *consts_ptr = total_n_actual;
+                    *consts_ptr.add(1) = vocab_actual;
+                }
+                use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
+                let logits_addr = logits_buf.gpuAddress();
+                let out_addr = argmax_out_for_closure.gpuAddress();
+                let consts_addr = consts_for_closure.gpuAddress();
+                unsafe {
+                    arg_table_for_closure.setAddress_atIndex(logits_addr, 0);
+                    arg_table_for_closure.setAddress_atIndex(out_addr, 1);
+                    arg_table_for_closure.setAddress_atIndex(consts_addr, 2);
+                    arg_table_for_closure.setAddress_atIndex(consts_addr + 4, 3);
+                }
+                let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels =
+                    unsafe {
+                        &*(argmax_kernels_addr
+                            as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
+                    };
+                match dtype {
+                    ferrite_forward::interpreter::metal::MetalDtype::F16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_f16_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            &arg_table_for_closure,
+                            total_n_actual,
+                        )
+                        .map_err(|e| format!("encode_argmax_f16: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
+                        ferrite_metal_kernels::argmax::encode_argmax_bf16_into_mtl4(
+                            argmax_kernels_ref,
+                            enc,
+                            &arg_table_for_closure,
+                            total_n_actual,
+                        )
+                        .map_err(|e| format!("encode_argmax_bf16: {e:?}"))?;
+                    }
+                    ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
+                        return Err(
+                            "argmax: int4 dtype has no direct kernel".into(),
+                        );
+                    }
+                }
+                Ok(())
+            },
+        );
+        let t_fwd = std::time::Instant::now();
+        let logits = unsafe {
+            model_ref.forward_with_metal_followup(
+                &ctx,
+                device_mut,
+                req.num_tokens as u64,
+                Some(followup),
+            )
+        };
+        let _ = logits; // argmax_out is what we read
+        let fwd_us = t_fwd.elapsed().as_micros();
+
+        // ── 5. Read host-visible argmax buffer + return. ─────────────────
+        let t_read = std::time::Instant::now();
+        let argmax_slice: &[u32] = unsafe {
+            std::slice::from_raw_parts(
+                argmax_out.contents().as_ptr() as *const u32,
+                req.num_tokens.max(1),
+            )
+        };
+        let out = argmax_slice[..req.num_tokens.max(1)].to_vec();
+        let read_us = t_read.elapsed().as_micros();
+        if prof {
+            eprintln!(
+                "[spec-prof] num_tokens={} num_seqs={} has_spec={} alloc={}us argbuf={}us fwd={}us read={}us",
+                req.num_tokens,
+                num_reqs,
+                req.has_spec_tokens,
+                alloc_us,
+                argbuf_us,
+                fwd_us,
+                read_us,
+            );
+        }
+        Ok(out)
+    }
+
+    /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward
+    /// + argmax_dual_write + chain_advance (advances positions /
+    /// slot_mapping / seqused_k in-place on the GPU between iters)
+    /// for K iters share one CB, one commit, and one host wait. Per
+    /// iter we spend ~kernel-time only — no host roundtrip, no per-
+    /// iter allocator reset.
+    ///
+    /// Thin wrapper that resolves handles → refs and delegates to the
+    /// free [`metal_chain_dispatch`] helper. The free fn is shared
+    /// with the Phase 9 speculative path (worker's lockstep thread),
+    /// which can't borrow `&self` while the main thread is mid-
+    /// `forward_argmax_blocking` for target verify.
+    fn forward_chain_k(
+        &mut self,
+        model: ::vllm_engine::spec_decode::ModelHandle,
+        kv_pool: ::vllm_engine::spec_decode::KvPoolHandle,
+        req: &::vllm_engine::spec_decode::ForwardArgmaxRequest<'_>,
+        block_size: usize,
+        k: usize,
+    ) -> Result<Vec<Vec<u32>>, ::vllm_engine::spec_decode::BackendError> {
+        use ::vllm_engine::spec_decode::{BackendError, KvPoolHandle, ModelHandle};
+
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Resolve target model + KV pool (handle 1 = draft, 0 = target).
+        let model_ref: &dyn ferrite_forward::FerriteWeights = match model {
+            ModelHandle::TARGET => self
+                .model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("target model not loaded".into()))?,
+            ModelHandle(1) => self
+                .draft_model
+                .as_deref()
+                .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
+            _ => return Err(BackendError::UnknownHandle("ModelHandle")),
+        };
+        let kv_cache_ref: &KvCachePool = match kv_pool {
+            KvPoolHandle::TARGET => self
+                .kv_cache
+                .as_ref()
+                .ok_or_else(|| BackendError::Backend("target kv_cache not initialized".into()))?,
+            KvPoolHandle(1) => self
+                .draft_kv_cache
+                .as_ref()
+                .ok_or_else(|| BackendError::Backend("draft kv_cache not initialized".into()))?,
+            _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
+        };
+
+        let argmax_kernels = self
+            .argmax_kernels
+            .as_ref()
+            .ok_or_else(|| BackendError::Backend("argmax_kernels not built".into()))?;
+        let chain_kernel = self
+            .chain_advance_kernel
+            .as_ref()
+            .ok_or_else(|| {
+                BackendError::Backend("chain_advance_kernel not built".into())
+            })?;
+
+        // Phase 8 routing: when the call is for the draft model AND a
+        // dedicated `draft_queue` exists, route through a shadow
+        // GpuDevice on the draft queue so target verify and draft
+        // chain stay disjoint.
+        let use_draft_queue =
+            matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
+        let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
+            let main_dev = self.gpu_device.as_ref().expect("checked above");
+            let draft_q = self.draft_queue.as_ref().unwrap().clone();
+            Some(GpuDevice {
+                device: main_dev.device.clone(),
+                queue: draft_q,
+                allocator: main_dev.allocator.clone(),
+            })
+        } else {
+            None
+        };
+        let device_mut: &mut GpuDevice = if let Some(ref mut shadow) = shadow_draft_device {
+            shadow
+        } else {
+            self.gpu_device
+                .as_mut()
+                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?
+        };
+
+        metal_chain_dispatch(
+            model_ref,
+            kv_cache_ref,
+            device_mut,
+            argmax_kernels,
+            chain_kernel,
+            req,
+            block_size,
+            k,
+        )
+        .map_err(BackendError::Backend)
+    }
+
+    // (legacy body folded into the free fn `metal_chain_dispatch` below)
+
+
+    fn load_secondary_model(
+        &mut self,
+        _path: &::std::path::Path,
+        _dtype: Option<&str>,
+    ) -> Result<
+        ::vllm_engine::spec_decode::ModelHandle,
+        ::vllm_engine::spec_decode::BackendError,
+    > {
+        // Thin wrapper: delegate to the existing helper which pulls
+        // path + dtype from `self.config`. Phase 5.4 will tighten this
+        // when `DraftModelProposer` takes ownership of the lifecycle and
+        // pushes the path/dtype through the trait surface directly.
+        self.load_draft_model_metal()
+            .map_err(|e| ::vllm_engine::spec_decode::BackendError::Backend(e.to_string()))?;
+        Ok(::vllm_engine::spec_decode::ModelHandle(1))
+    }
+
+    fn allocate_kv_pool(
+        &mut self,
+        model: ::vllm_engine::spec_decode::ModelHandle,
+        num_blocks: usize,
+    ) -> Result<
+        ::vllm_engine::spec_decode::KvPoolHandle,
+        ::vllm_engine::spec_decode::BackendError,
+    > {
+        if model != ::vllm_engine::spec_decode::ModelHandle(1) {
+            return Err(::vllm_engine::spec_decode::BackendError::UnknownHandle(
+                "ModelHandle (only the draft handle 1 supports allocate_kv_pool today)",
+            ));
+        }
+        self.initialize_draft_cache_metal(num_blocks)
+            .map_err(|e| ::vllm_engine::spec_decode::BackendError::Backend(e.to_string()))?;
+        Ok(::vllm_engine::spec_decode::KvPoolHandle(1))
+    }
+
+    fn kv_per_block_bytes(
+        &self,
+        model: ::vllm_engine::spec_decode::ModelHandle,
+    ) -> Result<usize, ::vllm_engine::spec_decode::BackendError> {
+        let model_ref: &dyn ferrite_forward::FerriteWeights = match model {
+            ::vllm_engine::spec_decode::ModelHandle::TARGET => self
+                .model
+                .as_deref()
+                .ok_or_else(|| {
+                    ::vllm_engine::spec_decode::BackendError::Backend(
+                        "target model not loaded".into(),
+                    )
+                })?,
+            ::vllm_engine::spec_decode::ModelHandle(1) => self
+                .draft_model
+                .as_deref()
+                .ok_or_else(|| {
+                    ::vllm_engine::spec_decode::BackendError::Backend(
+                        "draft model not loaded".into(),
+                    )
+                })?,
+            _ => {
+                return Err(::vllm_engine::spec_decode::BackendError::UnknownHandle(
+                    "ModelHandle",
+                ));
+            }
+        };
+        Ok(kv_per_block_bytes(model_ref, self.config.block_size))
     }
 }
 
@@ -9596,12 +10681,36 @@ impl Worker for FerriteWorker {
             t_argmax.elapsed()
         );
 
+        // Phase 6 chain-advance pipeline. Tiny kernel — one-time build
+        // alongside argmax so the K-step chain driver never falls into
+        // pipeline-compile latency on the first call.
+        let t_chain = std::time::Instant::now();
+        let chain_advance = ferrite_metal_kernels::chain_advance::ChainAdvanceKernel::new(
+            &gpu_device.device,
+        )
+        .map_err(|e| {
+            ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}"))
+        })?;
+        info!(
+            "FerriteWorker(metal): ChainAdvanceKernel::new in {:?}",
+            t_chain.elapsed()
+        );
+
         self.gpu_device = Some(gpu_device);
         self.model = Some(model);
         self.argmax_kernels = Some(argmax);
+        self.chain_advance_kernel = Some(chain_advance);
         self.model_dir = Some(model_dir);
         self.hf_config = Some(hf_config);
         self.resolved_architecture = Some(arch);
+
+        // Phase 3 of DRAFT_SPEC_DECODE_PLAN.md: load the speculative
+        // draft model onto the same gpu_device (shared allocator +
+        // residency set + command queue). KV pool for the draft is
+        // allocated separately in `initialize_cache`.
+        if self.config.draft_model_path.is_some() {
+            self.load_draft_model_metal()?;
+        }
 
         Ok(())
     }
@@ -9709,6 +10818,14 @@ impl Worker for FerriteWorker {
             self.config.block_size,
         );
         self.kv_cache = Some(pool);
+
+        // Phase 3 of DRAFT_SPEC_DECODE_PLAN.md: allocate the draft model's
+        // KV pool alongside the target's, sized to fit inside the same
+        // shared `recommendedMaxWorkingSetSize` budget.
+        if self.draft_model.is_some() {
+            self.initialize_draft_cache_metal(num_gpu_blocks)?;
+        }
+
         Ok(())
     }
 
@@ -9741,7 +10858,16 @@ impl Worker for FerriteWorker {
             .as_ref()
             .map(|m| m.metal_arena_peak_bytes() as usize)
             .unwrap_or(512 * 1024 * 1024);
-        let peak_activation_estimate = arena_peak.saturating_add(64 * 1024 * 1024);
+        // When a draft model is loaded we also need an activation arena for
+        // it. Decode-only forwards on a 1B model peak well below the target,
+        // but the target's prefill (M >> 1) arena is the worst case across
+        // the pair — use it for both as a safe upper bound.
+        let arena_peak_pair = if self.draft_model.is_some() {
+            arena_peak.saturating_mul(2)
+        } else {
+            arena_peak
+        };
+        let peak_activation_estimate = arena_peak_pair.saturating_add(64 * 1024 * 1024);
         let utilization = self.config.gpu_memory_utilization;
         let available = compute_available_kv_bytes(
             total,
@@ -9749,15 +10875,38 @@ impl Worker for FerriteWorker {
             peak_activation_estimate,
             utilization,
         );
+        // Per-pair split: when a draft model is loaded, every target KV
+        // block has a 1:1 mirror in the draft pool, so the engine should
+        // think it has only `target / (target + draft)` of the budget.
+        // After the engine divides by `target_per_block_bytes` to land on
+        // num_gpu_blocks, the same count of draft blocks fits inside the
+        // remaining `draft / (target + draft)` slice.
+        let (available_reported, draft_reservation) = if let Some(draft) = self.draft_model.as_ref()
+        {
+            let target = self.model.as_ref().expect("model loaded before draft");
+            let bs = self.config.block_size;
+            let t_pb = kv_per_block_bytes(target.as_ref(), bs);
+            let d_pb = kv_per_block_bytes(draft.as_ref(), bs);
+            let denom = t_pb.saturating_add(d_pb).max(1);
+            // available * t_pb / (t_pb + d_pb), in u128 to dodge overflow.
+            let scaled = (available as u128 * t_pb as u128 / denom as u128) as usize;
+            (scaled, available.saturating_sub(scaled))
+        } else {
+            (available, 0)
+        };
         info!(
             "FerriteWorker(metal): total={:.1} GiB, weights+overhead={:.1} GiB, \
-             arena_peak={:.1} MiB, kv_budget={:.1} GiB",
+             arena_peak={:.1} MiB (pair={:.1} MiB), kv_budget={:.1} GiB \
+             (target_share={:.1} GiB, draft_reserve={:.1} GiB)",
             total as f64 / 1_073_741_824.0,
             weights_and_overhead as f64 / 1_073_741_824.0,
             arena_peak as f64 / 1_048_576.0,
+            arena_peak_pair as f64 / 1_048_576.0,
             available as f64 / 1_073_741_824.0,
+            available_reported as f64 / 1_073_741_824.0,
+            draft_reservation as f64 / 1_073_741_824.0,
         );
-        Ok(available)
+        Ok(available_reported)
     }
 
     fn execute_model(
@@ -9838,9 +10987,14 @@ impl Worker for FerriteWorker {
         }
 
         // ── 4. Prepare flat batch inputs ─────────────────────────
-        // Metal has no spec decoding; pass an empty draft-token map.
-        let spec_tokens = HashMap::new();
-        let mut prepared = self.input_batch.prepare_inputs(&spec_tokens);
+        // Phase 4.6: forward the scheduler's spec drafts into
+        // `prepare_inputs` so verify batches get the
+        // `[last_token, draft_0..K-1]` flat shape per req. For non-spec
+        // batches `scheduled_spec_decode_tokens` is empty → existing
+        // q_len=1 path is unchanged.
+        let mut prepared = self
+            .input_batch
+            .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
         let attn = &prepared.attn_meta;
         let num_tokens = attn.total_tokens;
         let num_reqs = attn.num_reqs;
@@ -9909,395 +11063,511 @@ impl Worker for FerriteWorker {
         let input_ids_u32 = std::mem::take(&mut prepared.flat_token_ids);
         let positions_u32 = std::mem::take(&mut prepared.flat_positions);
 
-        // ── 5. Allocate host-visible Metal buffers + memcpy ──────
-        let device_buf = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
-        let mtl_device = device_buf.device.clone();
-        let alloc_u32 = |data: &[u32]| -> ::objc2::rc::Retained<
-            ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
-        > {
-            let bytes = (data.len().max(1)) * 4;
-            let buf = mtl_device
-                .newBufferWithLength_options(
-                    bytes,
-                    ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                )
-                .expect("newBufferWithLength_options returned nil");
-            if !data.is_empty() {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        buf.contents().as_ptr() as *mut u32,
-                        data.len(),
-                    );
-                }
-            }
-            buf
-        };
+        // ── 6. Forward + per-row argmax via SpecDecodeBackend trait ─
+        //
+        // Phase 5.2a routes the verify forward through
+        // `forward_argmax_blocking`. This loses the fused-CB argmax
+        // optimization (~0.5 ms / 5% per step) — phase 6 re-introduces
+        // it via a dedicated trait primitive. The K-step draft chain
+        // below stays inline until phase 5.4 moves it host-side into
+        // `DraftModelProposer::propose`.
+        // Spec verify? Any req carrying spec_token_ids flips the gate
+        // so the lm_head slice trio (OnlyIfSingleSeqNoSpec) skips and
+        // the full GEMM (OnlyIfMultiSeqOrSpec) writes every row of
+        // logits — required for rejection sampling on > 1 sample
+        // positions per seq.
+        let has_spec_tokens = prepared
+            .req_inputs
+            .iter()
+            .any(|r| !r.spec_token_ids.is_empty());
 
-        let buf_input_ids = alloc_u32(&input_ids_u32);
-        let buf_positions = alloc_u32(&positions_u32);
-        let buf_slot_mapping = alloc_u32(&slot_mapping_u32);
-        let buf_cu_seqlens = alloc_u32(&cu_seqlens_u32);
-        let buf_seqused_k = alloc_u32(&seqused_k_u32);
-        let buf_block_table = alloc_u32(&block_table_u32);
+        // Phase 8: when a draft model is loaded AND we're in lockstep+K
+        // mode (extended-batch disabled), kick off the lockstep prefill
+        // on the dedicated `draft_queue` in a scoped thread, in
+        // parallel with target verify on the main queue. Target writes
+        // target-KV, lockstep writes draft-KV — separate KV pools, no
+        // contention. Saves ~15-20 ms / step on the draft chain
+        // critical path.
+        let phase8_parallel_lockstep = self.draft_model.is_some()
+            && self.draft_kv_cache.is_some()
+            && self.draft_queue.is_some()
+            && std::env::var_os("FERRITE_DRAFT_EXTENDED_BATCH").is_none();
+        let mut async_lockstep_done = false;
+        // Phase-9 results from the lockstep thread (populated when
+        // enabled + eligible; empty otherwise).
+        let mut spec9_seeds_final: Vec<u32> = Vec::new();
+        let mut spec9_drafts_final: Vec<Vec<u32>> = Vec::new();
+        let argmax_vec: Vec<u32> = {
+            use ::vllm_engine::spec_decode::{
+                ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
+            };
+            let req = ForwardArgmaxRequest {
+                input_ids: &input_ids_u32,
+                positions: &positions_u32,
+                slot_mapping: &slot_mapping_u32,
+                cu_seqlens_q: &cu_seqlens_u32,
+                seqused_k: &seqused_k_u32,
+                block_table: &block_table_u32,
+                block_table_stride: max_blocks_eff,
+                max_seqlen_q,
+                max_seqlen_k,
+                num_tokens,
+                has_spec_tokens,
+            };
+            // Phase 9 gating: enable the worker-side speculative
+            // K-step chain (runs in the lockstep thread, overlapped
+            // with target verify). Gated by env var until baseline
+            // bench validates the projected ~13% TPOT win.
+            let phase9_speculative_chain = phase8_parallel_lockstep
+                && std::env::var_os("FERRITE_SPEC9_ENABLE").is_some();
 
-        // Build TensorViews. The macro-emitted forward only reads
-        // `as_raw().raw_ptr()` and `numel()` — dtype is purely
-        // descriptive here; we use U32 for every slice to match the
-        // `*const u32` cast inside the macro.
-        let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
-        let view_input_ids = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_input_ids.contents().as_ptr() as *mut u8,
-                &[num_tokens.max(1)],
-                dtype_u32,
-            ))
-        };
-        let view_positions = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_positions.contents().as_ptr() as *mut u8,
-                &[num_tokens.max(1)],
-                dtype_u32,
-            ))
-        };
-        let view_slot_mapping = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_slot_mapping.contents().as_ptr() as *mut u8,
-                &[num_tokens.max(1)],
-                dtype_u32,
-            ))
-        };
-        let view_cu_seqlens = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_cu_seqlens.contents().as_ptr() as *mut u8,
-                &[cu_seqlens_u32.len().max(1)],
-                dtype_u32,
-            ))
-        };
-        let view_seqused_k = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_seqused_k.contents().as_ptr() as *mut u8,
-                &[seqused_k_u32.len().max(1)],
-                dtype_u32,
-            ))
-        };
-        let view_block_table = unsafe {
-            TensorView::from_raw(GpuTensor::new(
-                buf_block_table.contents().as_ptr() as *mut u8,
-                &[num_reqs.max(1), max_blocks_eff],
-                dtype_u32,
-            ))
-        };
+            // Spec-9 eligibility, single-req case only for now.
+            // Derive K from q_lens[0] (= drafts + 1 bonus when the
+            // req was spec-decoded last step; = 1 otherwise). Skip
+            // first-step / multi-req / chunked-prefill cases — they
+            // fall through to the regular chain in the proposer.
+            let spec9_single_req_eligible: bool = phase9_speculative_chain
+                && num_reqs == 1
+                && prepared.req_inputs.first().map_or(false, |r| !r.spec_token_ids.is_empty())
+                && q_lens.first().copied().unwrap_or(0) >= 2;
+            let spec9_k: usize = if spec9_single_req_eligible {
+                q_lens[0] - 1
+            } else {
+                0
+            };
+            let spec9_tokens_before: usize = if spec9_single_req_eligible {
+                attn.tokens_before[0]
+            } else {
+                0
+            };
+            let spec9_block_ids: Vec<u32> = if spec9_single_req_eligible {
+                attn.block_ids[0].iter().map(|&b| b as u32).collect()
+            } else {
+                Vec::new()
+            };
+            let spec9_block_size: usize = self.config.block_size;
 
-        // ── 6. Forward + greedy sampling ─────────────────────────
-        let kv_cache = self
-            .kv_cache
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("kv_cache not initialized".into()))?;
-
-        // Disjoint borrows: `model` reads from `self.model`,
-        // `device_mut` borrows `self.gpu_device` mutably.
-        let model = self
-            .model
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("model not loaded".into()))?;
-        let argmax_kernels = self
-            .argmax_kernels
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("argmax_kernels not built".into()))?;
-        // SAFETY-NOTE: the immutable borrows above (kv_cache, model, argmax_kernels)
-        // and the mutable borrow of `gpu_device` below target disjoint fields,
-        // which the compiler accepts post-NLL.
-        let device_mut = self
-            .gpu_device
-            .as_mut()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu_device not initialized".into()))?;
-
-        let ctx = ferrite_forward::ForwardCtx {
-            input_ids: view_input_ids,
-            positions: view_positions,
-            slot_mapping: view_slot_mapping,
-            cu_seqlens_q: view_cu_seqlens,
-            seqused_k: view_seqused_k,
-            block_table: view_block_table,
-            max_seqlen_q,
-            max_seqlen_k,
-            kv_cache,
-        };
-
-        // Build / refresh the persistent argmax MTL4 argument table
-        // and dimension buffer, then pass an encoder-tail closure to
-        // `forward_with_metal_followup` so argmax encodes onto the
-        // SAME MTL4 forward command encoder. Forward + argmax run as
-        // one CB, one commit, one host wait — closes the
-        // ~0.5 ms / 5% argmax sync hole at single-stream M=1 decode.
-        let needed_argmax_bytes = (num_tokens as usize).max(1) * 4;
-        let argmax_out_ok = self
-            .argmax_out_buf
-            .as_ref()
-            .map(|b| b.length() >= needed_argmax_bytes)
-            .unwrap_or(false);
-        if !argmax_out_ok {
-            self.argmax_out_buf = Some(
-                mtl_device
-                    .newBufferWithLength_options(
-                        needed_argmax_bytes,
-                        ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                    )
-                    .expect("argmax_out_buf alloc"),
-            );
-        }
-        if self.argmax_consts_buf.is_none() {
-            self.argmax_consts_buf = Some(
-                mtl_device
-                    .newBufferWithLength_options(
-                        8,
-                        ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                    )
-                    .expect("argmax_consts_buf alloc"),
-            );
-        }
-        if self.argmax_arg_table.is_none() {
-            use ::objc2_metal::MTL4ArgumentTableDescriptor;
-            let desc = MTL4ArgumentTableDescriptor::new();
-            desc.setMaxBufferBindCount(4);
-            self.argmax_arg_table = Some(
-                mtl_device
-                    .newArgumentTableWithDescriptor_error(&desc)
-                    .expect("argmax_arg_table alloc"),
-            );
-        }
-        // Pre-compute vocab from the model to bake into the consts
-        // buffer ahead of the forward call. The persistent dim buffer
-        // is laid out as [batch:u32, vocab:u32] at offsets 0 and 4.
-        let metal_vocab: u32 = {
-            // We need vocab BEFORE forward returns; pull it from the
-            // last known logits column count. First call has no
-            // history — fall back to 0 and let the closure update it
-            // once `forward_with_metal_followup` is in flight (the
-            // closure runs after worker has resolved bucket_idx but
-            // before the dispatch is encoded; we can read it then).
-            // For now: stash a model-side accessor via the trait.
-            model.vocab_size() as u32
-        };
-        // Argmax kernels reference (passed into the closure).
-        let argmax_kernels_ref = argmax_kernels;
-        let dtype = model.metal_dtype();
-        // Closure captures by move; uses raw pointers cast to usize for
-        // Send safety on the small handles.
-        let argmax_out_buf = self.argmax_out_buf.as_ref().expect("just set").clone();
-        let argmax_consts_buf = self.argmax_consts_buf.as_ref().expect("just set").clone();
-        let argmax_arg_table = self.argmax_arg_table.as_ref().expect("just set").clone();
-        let followup: ferrite_forward::MetalForwardFollowup<'_> = Box::new(
-            move |enc, logits_buf, total_n_actual, vocab_actual| -> Result<(), String> {
-                // Update consts buffer in-place (StorageModeShared).
-                let consts_ptr = argmax_consts_buf.contents().as_ptr() as *mut u32;
-                unsafe {
-                    *consts_ptr = total_n_actual;
-                    *consts_ptr.add(1) = vocab_actual;
-                }
-                // Bind logits, output, batch (offset 0), vocab (offset 4)
-                // into the persistent argument table.
-                use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
-                let logits_addr = logits_buf.gpuAddress();
-                let out_addr = argmax_out_buf.gpuAddress();
-                let consts_addr = argmax_consts_buf.gpuAddress();
-                unsafe {
-                    argmax_arg_table.setAddress_atIndex(logits_addr, 0);
-                    argmax_arg_table.setAddress_atIndex(out_addr, 1);
-                    argmax_arg_table.setAddress_atIndex(consts_addr, 2);
-                    argmax_arg_table.setAddress_atIndex(consts_addr + 4, 3);
-                }
-                let _ = vocab_actual; // vocab is in consts buf via address
-                match dtype {
-                    ferrite_forward::interpreter::metal::MetalDtype::F16 => {
-                        ferrite_metal_kernels::argmax::encode_argmax_f16_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            &argmax_arg_table,
-                            total_n_actual,
-                        )
-                        .map_err(|e| format!("encode_argmax_f16: {e:?}"))?;
+            if phase8_parallel_lockstep {
+                // Snapshot of inputs the lockstep thread needs.
+                // Raw-pointer borrow of draft_model / draft_kv_cache is
+                // sound here: both are accessed ONLY by the lockstep
+                // thread (target verify uses self.model + self.kv_cache,
+                // disjoint fields) and the thread can't outlive the
+                // scope (scoped threads are joined before scope exit).
+                // Decompose the fat pointer to `dyn FerriteWeights`
+                // into two `usize` so the closure stays `Send`.
+                // `*const dyn T` is `[data, vtable]` on the supported
+                // targets; transmute to extract both.
+                let dm_pair: [usize; 2] = {
+                    let fat: *const dyn ferrite_forward::FerriteWeights =
+                        self.draft_model.as_deref().expect("checked above");
+                    unsafe {
+                        std::mem::transmute::<
+                            *const dyn ferrite_forward::FerriteWeights,
+                            [usize; 2],
+                        >(fat)
                     }
-                    ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
-                        ferrite_metal_kernels::argmax::encode_argmax_bf16_into_mtl4(
-                            argmax_kernels_ref,
-                            enc,
-                            &argmax_arg_table,
-                            total_n_actual,
-                        )
-                        .map_err(|e| format!("encode_argmax_bf16: {e:?}"))?;
-                    }
-                    ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
-                        return Err("argmax: int4 dtype has no direct kernel".into());
-                    }
-                }
-                Ok(())
-            },
-        );
-        // FERRITE_METAL_DISABLE_FUSED_ARGMAX=1 routes argmax back to the
-        // legacy separate-CB synchronous dispatch path for A/B benching
-        // and bisection. Default fuses argmax onto the forward CB.
-        let disable_fused_argmax =
-            std::env::var_os("FERRITE_METAL_DISABLE_FUSED_ARGMAX").is_some();
-        let logits = if disable_fused_argmax {
-            drop(followup);
-            unsafe { model.forward(&ctx, device_mut, num_tokens as u64) }
-        } else {
-            unsafe {
-                model.forward_with_metal_followup(
-                    &ctx,
-                    device_mut,
-                    num_tokens as u64,
-                    Some(followup),
-                )
-            }
-        };
-        let vocab = logits.dim(1) as u32;
-        let total_n = logits.dim(0) as u32;
-        let _ = metal_vocab;
-
-        // DIAGNOSTIC: peek at EACH row of logits. Tells us which
-        // rows have real values vs zeros.
-        if std::env::var_os("VLLM_DUMP_LOGITS").is_some() {
-            let buf = logits.metal_buffer();
-            for row_idx in 0..total_n.min(25) {
-                let row = unsafe {
-                    std::slice::from_raw_parts(
-                        (buf.contents().as_ptr() as *const half::f16)
-                            .add(row_idx as usize * vocab as usize),
-                        vocab as usize,
-                    )
                 };
-                let nonzero = row.iter().filter(|&&v| v.to_f32() != 0.0).count();
-                let head: Vec<f32> = row.iter().take(4).map(|v| v.to_f32()).collect();
-                eprintln!(
-                    "[diag-logits] row={} nonzero={}/{} first4={:?}",
-                    row_idx, nonzero, vocab, head,
-                );
-            }
-        }
+                let dkv_addr: usize =
+                    (self.draft_kv_cache.as_ref().expect("checked above")
+                        as *const KvCachePool) as usize;
+                // Spec-9: raw pointers for argmax + chain_advance
+                // kernels so the speculative chain can call
+                // `metal_chain_dispatch` from inside the thread
+                // (no `&self` access while target verify is in flight).
+                let spec9_argmax_addr: usize =
+                    self.argmax_kernels.as_ref().map_or(0, |k| {
+                        k as *const ferrite_metal_kernels::argmax::ArgmaxKernels
+                            as usize
+                    });
+                let spec9_chain_addr: usize =
+                    self.chain_advance_kernel.as_ref().map_or(0, |k| {
+                        k as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel
+                            as usize
+                    });
+                let main_dev = self.gpu_device.as_ref().expect("init");
+                let mtl_device_clone = main_dev.device.clone();
+                let allocator_clone = main_dev.allocator.clone();
+                let draft_queue_clone =
+                    self.draft_queue.as_ref().expect("checked above").clone();
+                // Snapshot host slices the lockstep thread reads.
+                let lock_input_ids = &input_ids_u32;
+                let lock_positions = &positions_u32;
+                let lock_slot_mapping = &slot_mapping_u32;
+                let lock_cu_seqlens = &cu_seqlens_u32;
+                let lock_seqused_k = &seqused_k_u32;
+                let lock_block_table = &block_table_u32;
+                let lock_block_table_stride = max_blocks_eff;
+                let lock_max_q = max_seqlen_q;
+                let lock_max_k = max_seqlen_k;
+                let lock_num_tokens = num_tokens;
+                let lock_num_reqs = num_reqs;
 
-        // Argmax was either encoded onto the forward CB via the
-        // followup (default), or — when `disable_fused_argmax` is
-        // set — needs a separate synchronous dispatch now.
-        let argmax_out = self
-            .argmax_out_buf
-            .as_ref()
-            .expect("argmax_out_buf was set above")
-            .clone();
-        if disable_fused_argmax {
-            match model.metal_dtype() {
-                ferrite_forward::interpreter::metal::MetalDtype::F16 => {
-                    ferrite_metal_kernels::argmax::dispatch_argmax_f16(
-                        argmax_kernels,
-                        &device_mut.queue,
-                        logits.metal_buffer(),
-                        &argmax_out,
-                        total_n,
-                        vocab,
-                    )
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_f16: {e:?}")))?;
-                }
-                ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {
-                    ferrite_metal_kernels::argmax::dispatch_argmax_bf16(
-                        argmax_kernels,
-                        &device_mut.queue,
-                        logits.metal_buffer(),
-                        &argmax_out,
-                        total_n,
-                        vocab,
-                    )
-                    .map_err(|e| ExecutorError::WorkerExecution(format!("argmax_bf16: {e:?}")))?;
-                }
-                ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
-                    return Err(ExecutorError::WorkerExecution(
-                        "argmax: int4 dtype has no direct argmax kernel".into(),
-                    ));
-                }
-            }
-        }
-        match model.metal_dtype() {
-            ferrite_forward::interpreter::metal::MetalDtype::F16 => {}
-            ferrite_forward::interpreter::metal::MetalDtype::Bf16 => {}
-            ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
-                return Err(ExecutorError::WorkerExecution(
-                    "argmax: int4 dtype has no direct argmax kernel — \
-                     dequantize logits to f16/bf16 first"
-                        .into(),
-                ));
-            }
-        }
+                // Stage-1 spec9 hypothesis probe: capture draft's
+                // last-row-per-req argmax inside the scoped lockstep
+                // thread so we can compare to target's actual bonus
+                // after the join. Pure measurement — no behavioral
+                // change yet.
+                let lock_cu_for_thread = lock_cu_seqlens.to_vec();
+                // Spec-9 captures (moved into thread closure).
+                let spec9_eligible_thread = spec9_single_req_eligible;
+                let spec9_k_thread = spec9_k;
+                let spec9_tokens_before_thread = spec9_tokens_before;
+                let spec9_block_ids_thread = spec9_block_ids.clone();
+                let spec9_block_size_thread = spec9_block_size;
+                let spec9_block_table_stride_thread = lock_block_table_stride;
+                let (v, spec9_seeds_out, spec9_drafts_out): (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) = std::thread::scope(|s| {
+                    let lockstep_handle =
+                        s.spawn(move || -> (Vec<u32>, Vec<Vec<u32>>) {
+                        // Build shadow GpuDevice on draft_queue.
+                        let mut shadow_device = GpuDevice {
+                            device: mtl_device_clone,
+                            queue: draft_queue_clone,
+                            allocator: allocator_clone,
+                        };
+                        // Upload host slices into fresh shared
+                        // MTLBuffers (thread-local, dropped at thread
+                        // exit).
+                        let dev = &shadow_device.device;
+                        let b_in = Self::alloc_shared_u32_buf(dev, lock_input_ids);
+                        let b_pos = Self::alloc_shared_u32_buf(dev, lock_positions);
+                        let b_slot = Self::alloc_shared_u32_buf(dev, lock_slot_mapping);
+                        let b_cu = Self::alloc_shared_u32_buf(dev, lock_cu_seqlens);
+                        let b_su = Self::alloc_shared_u32_buf(dev, lock_seqused_k);
+                        let b_bt = Self::alloc_shared_u32_buf(dev, lock_block_table);
 
-        let argmax_slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(
-                argmax_out.contents().as_ptr() as *const u32,
-                total_n as usize,
-            )
+                        let dt = ferrite_cuda_core::dtype::DType::U32;
+                        let v_in = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_in.contents().as_ptr() as *mut u8,
+                            &[lock_num_tokens.max(1)], dt)) };
+                        let v_pos = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_pos.contents().as_ptr() as *mut u8,
+                            &[lock_num_tokens.max(1)], dt)) };
+                        let v_slot = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_slot.contents().as_ptr() as *mut u8,
+                            &[lock_num_tokens.max(1)], dt)) };
+                        let v_cu = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_cu.contents().as_ptr() as *mut u8,
+                            &[lock_cu_seqlens.len().max(1)], dt)) };
+                        let v_su = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_su.contents().as_ptr() as *mut u8,
+                            &[lock_seqused_k.len().max(1)], dt)) };
+                        let v_bt = unsafe { TensorView::from_raw(GpuTensor::new(
+                            b_bt.contents().as_ptr() as *mut u8,
+                            &[lock_num_reqs.max(1), lock_block_table_stride.max(1)], dt)) };
+
+                        // Reassemble fat pointer from (data, vtable)
+                        // pair, then immutable-borrow.
+                        let dm_fat_reassembled: *const dyn ferrite_forward::FerriteWeights =
+                            unsafe {
+                                std::mem::transmute::<
+                                    [usize; 2],
+                                    *const dyn ferrite_forward::FerriteWeights,
+                                >(dm_pair)
+                            };
+                        let dm = unsafe { &*dm_fat_reassembled };
+                        let dkv: &KvCachePool =
+                            unsafe { &*(dkv_addr as *const KvCachePool) };
+                        let ctx = ferrite_forward::ForwardCtx {
+                            input_ids: v_in,
+                            positions: v_pos,
+                            slot_mapping: v_slot,
+                            cu_seqlens_q: v_cu,
+                            seqused_k: v_su,
+                            block_table: v_bt,
+                            max_seqlen_q: lock_max_q,
+                            max_seqlen_k: lock_max_k,
+                            kv_cache: dkv,
+                            has_spec_tokens: false,
+                        };
+                        let logits = unsafe {
+                            dm.forward(&ctx, &mut shadow_device, lock_num_tokens as u64)
+                        };
+
+                        // Phase-9: argmax of the last verify position
+                        // per req IS draft's prediction of what target
+                        // will sample as the step's bonus token.
+                        // Computed when EITHER the probe OR the
+                        // speculative chain is enabled. Bf16 only
+                        // (matches `metal_dtype()` for our test
+                        // models).
+                        let need_spec_seed =
+                            std::env::var_os("FERRITE_SPEC9_PROBE").is_some()
+                                || spec9_eligible_thread;
+                        let spec_seeds: Vec<u32> = if need_spec_seed {
+                            let logits_ptr =
+                                logits.as_gpu_tensor().raw_ptr() as *const u8;
+                            let vocab = dm.vocab_size() as usize;
+                            let mut out = Vec::with_capacity(lock_num_reqs);
+                            for i in 0..lock_num_reqs {
+                                let last_row =
+                                    lock_cu_for_thread[i + 1] as usize - 1;
+                                let row_off = last_row * vocab * 2;
+                                let row = unsafe {
+                                    std::slice::from_raw_parts(
+                                        logits_ptr.add(row_off) as *const u16,
+                                        vocab,
+                                    )
+                                };
+                                let mut best_idx: u32 = 0;
+                                let mut best_val: f32 = f32::NEG_INFINITY;
+                                for (j, &bits) in row.iter().enumerate() {
+                                    let v = f32::from_bits((bits as u32) << 16);
+                                    if v > best_val {
+                                        best_val = v;
+                                        best_idx = j as u32;
+                                    }
+                                }
+                                out.push(best_idx);
+                            }
+                            out
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Phase-9 speculative chain (single-req case):
+                        // dispatch the K-step chain on draft_queue using
+                        // spec_seeds[0] as the iter-0 input_ids. Runs
+                        // serially after lockstep on draft_queue, but
+                        // in parallel with target verify on main_queue.
+                        // If target's sampled bonus matches spec_seed
+                        // AND target accepted all K drafts, the proposer
+                        // returns these drafts directly and the chain
+                        // is hidden behind target verify. Otherwise,
+                        // proposer falls back to running the chain
+                        // with the corrected seed (re-overwrites
+                        // draft KV at the now-correct positions —
+                        // see `project-spec-decode-phase6-handoff`).
+                        let spec_drafts: Vec<Vec<u32>> = if spec9_eligible_thread
+                            && !spec_seeds.is_empty()
+                        {
+                            let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels = unsafe {
+                                &*(spec9_argmax_addr
+                                    as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
+                            };
+                            let chain_kernel_ref: &ferrite_metal_kernels::chain_advance::ChainAdvanceKernel = unsafe {
+                                &*(spec9_chain_addr
+                                    as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel)
+                            };
+                            // Single-req inputs assuming "all K drafts
+                            // accepted + bonus": position after bonus =
+                            // tokens_before + (q_lens-1) + 1 + 1 ...
+                            // Actually simpler — the K-step chain's
+                            // iter-0 position is `tokens_before + q_lens`
+                            // (= the slot after the bonus that target
+                            // will sample). For was_spec_decode this
+                            // ASSUMES all K drafts accepted (the
+                            // "all-hit" speculative case the proposer
+                            // validates).
+                            let chain_pos = spec9_tokens_before_thread
+                                + spec9_k_thread + 1;
+                            let block_idx = chain_pos / spec9_block_size_thread;
+                            let offset = chain_pos % spec9_block_size_thread;
+                            let slot = if block_idx
+                                < spec9_block_ids_thread.len()
+                            {
+                                spec9_block_ids_thread[block_idx] as u32
+                                    * spec9_block_size_thread as u32
+                                    + offset as u32
+                            } else {
+                                u32::MAX
+                            };
+                            let spec_input_ids: Vec<u32> = vec![spec_seeds[0]];
+                            let spec_positions: Vec<u32> = vec![chain_pos as u32];
+                            let spec_slot: Vec<u32> = vec![slot];
+                            let spec_cu: Vec<u32> = vec![0, 1];
+                            let spec_su: Vec<u32> = vec![(chain_pos + 1) as u32];
+                            let spec_req =
+                                ::vllm_engine::spec_decode::ForwardArgmaxRequest {
+                                    input_ids: &spec_input_ids,
+                                    positions: &spec_positions,
+                                    slot_mapping: &spec_slot,
+                                    cu_seqlens_q: &spec_cu,
+                                    seqused_k: &spec_su,
+                                    block_table: lock_block_table,
+                                    block_table_stride:
+                                        spec9_block_table_stride_thread,
+                                    max_seqlen_q: 1,
+                                    max_seqlen_k: chain_pos + 1,
+                                    num_tokens: 1,
+                                    has_spec_tokens: false,
+                                };
+                            metal_chain_dispatch(
+                                dm,
+                                dkv,
+                                &mut shadow_device,
+                                argmax_kernels_ref,
+                                chain_kernel_ref,
+                                &spec_req,
+                                spec9_block_size_thread,
+                                spec9_k_thread,
+                            )
+                            .unwrap_or_else(|e| {
+                                if std::env::var_os("FERRITE_SPEC9_PROBE")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[spec9] speculative chain dispatch \
+                                         failed (falling back): {e}"
+                                    );
+                                }
+                                Vec::new()
+                            })
+                        } else {
+                            Vec::new()
+                        };
+
+                        (spec_seeds, spec_drafts)
+                    });
+
+                    let r = self
+                        .forward_argmax_blocking(
+                            ModelHandle::TARGET,
+                            KvPoolHandle::TARGET,
+                            &req,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!(
+                                "spec verify forward: {e}"
+                            ))
+                        });
+                    // join propagates any panic the lockstep thread
+                    // raised; treat as worker execution failure.
+                    let (spec_seeds, spec_drafts) = lockstep_handle
+                        .join()
+                        .expect("lockstep thread panicked");
+                    let target_argmax = r.unwrap_or_else(|_| Vec::new());
+                    if !spec_seeds.is_empty() && !target_argmax.is_empty() {
+                        // Probe: compare draft's predicted bonus
+                        // vs target's actual bonus (per req).
+                        // cu_seqlens_q[i+1]-1 is the last verify row.
+                        let cu = &lock_cu_seqlens;
+                        for i in 0..lock_num_reqs {
+                            let target_bonus_idx = cu[i + 1] as usize - 1;
+                            if target_bonus_idx < target_argmax.len() {
+                                let target_bonus = target_argmax[target_bonus_idx];
+                                let spec_seed = spec_seeds[i];
+                                eprintln!(
+                                    "[spec9-probe] req={} spec_seed={} \
+                                     target_bonus={} match={}",
+                                    i,
+                                    spec_seed,
+                                    target_bonus,
+                                    spec_seed == target_bonus,
+                                );
+                            }
+                        }
+                    }
+                    (target_argmax, spec_seeds, spec_drafts)
+                });
+                async_lockstep_done = true;
+                spec9_seeds_final = spec9_seeds_out;
+                spec9_drafts_final = spec9_drafts_out;
+                v
+            } else {
+                self.forward_argmax_blocking(
+                    ModelHandle::TARGET,
+                    KvPoolHandle::TARGET,
+                    &req,
+                )
+                .map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
+                })?
+            }
         };
+        let total_n = argmax_vec.len() as u32;
+        let argmax_slice: &[u32] = &argmax_vec;
 
-        // DIAGNOSTIC: dump first 8 logits + top-5 + the argmax for the
-        // last token of each request when VLLM_DUMP_LOGITS=1. Helps
-        // bisect whether the lm_head GEMM is producing sensible logits
-        // or garbage.
-        if std::env::var_os("VLLM_DUMP_LOGITS").is_some() {
-            fn bf16_bits_to_f32(bits: u16) -> f32 {
-                f32::from_bits((bits as u32) << 16)
-            }
-            let logits_bytes = logits.metal_buffer().contents().as_ptr() as *const u8;
-            let logits_len = logits.metal_buffer().length() as usize;
-            for row in 0..total_n.min(2) {
-                let base = row as usize * vocab as usize * 2;
-                if base + 16 > logits_len {
-                    continue;
-                }
-                let head: Vec<f32> = (0..8)
-                    .map(|j| {
-                        let off = base + j * 2;
-                        let bits = unsafe {
-                            u16::from_le_bytes([*logits_bytes.add(off), *logits_bytes.add(off + 1)])
-                        };
-                        bf16_bits_to_f32(bits)
-                    })
-                    .collect();
-                let mut top5: Vec<(usize, f32)> = (0..vocab as usize)
-                    .map(|j| {
-                        let off = base + j * 2;
-                        let bits = unsafe {
-                            u16::from_le_bytes([*logits_bytes.add(off), *logits_bytes.add(off + 1)])
-                        };
-                        (j, bf16_bits_to_f32(bits))
-                    })
-                    .collect();
-                top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                top5.truncate(5);
-                eprintln!(
-                    "[diag-logits] row={} argmax={} head={:?} top5={:?}",
-                    row, argmax_slice[row as usize], head, top5
-                );
-            }
-        }
-
-        // ── 7. Build per-request sampled tokens + commit ─────────
+        // ── 6.6. Per-request rejection sampling (phase 4.6) ──
+        //
+        // Build `sampled_token_ids` + `was_spec_decode` BEFORE the
+        // draft phase so the K-step chain can seed from accepted
+        // (= argmax under greedy) tokens instead of raw target argmax.
+        // For non-spec batches (`ReqSlice.spec_token_ids` empty), grab
+        // the single argmax at the req's last sample position. For
+        // verify batches (K drafts), run `greedy_rejection_sample`
+        // over the K+1 contiguous argmax rows.
         let mut sampled_token_ids: Vec<Vec<u32>> = Vec::with_capacity(num_reqs);
+        let mut was_spec_decode: Vec<bool> = Vec::with_capacity(num_reqs);
         let mut req_id_to_index: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(num_reqs);
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
-            let row = sample_indices[i] as usize;
-            debug_assert!(row < total_n as usize);
-            let tok = argmax_slice[row];
-            sampled_token_ids.push(vec![tok]);
+            let req_slice = &prepared.req_inputs[i];
             req_id_to_index.insert(req_id.clone(), i);
+            if req_slice.spec_token_ids.is_empty() {
+                let row = sample_indices[i] as usize;
+                debug_assert!(row < total_n as usize);
+                sampled_token_ids.push(vec![argmax_slice[row]]);
+                was_spec_decode.push(false);
+            } else {
+                let start = req_slice.token_start;
+                let end = start + req_slice.token_count;
+                debug_assert!(end <= total_n as usize);
+                let target_ids = &argmax_slice[start..end];
+                let rejection = ::vllm_engine::spec_decode::greedy_rejection_sample(
+                    target_ids,
+                    &req_slice.spec_token_ids,
+                );
+                sampled_token_ids.push(rejection.accepted_tokens);
+                was_spec_decode.push(true);
+            }
         }
 
-        // Commit per-request state (positions, last_token, prefill→decode).
+        // ── 6.7. Draft seed bundle ──────────────────────────────
+        //
+        // Pre-5.4 the worker ran the lockstep prefill + K autoregressive
+        // draft decode chain inline here against `self.draft_model` +
+        // `self.draft_kv_cache`. As of phase 5.4 the chain lives in
+        // `vllm_engine::spec_decode::DraftModelProposer::propose_for_step`
+        // (host-side) and reaches the same GPU paths via the
+        // `SpecDecodeBackend` trait. The worker just pre-packages the
+        // owned-data the proposer needs into `draft_seed_inputs`; the
+        // engine pulls `executor.spec_decode_backend()` and drives the
+        // chain in `finalize_step`.
+        let draft_seed_inputs: Option<::vllm_engine::spec_decode::DraftSeedInputs> =
+            if self.draft_model.is_some() && self.draft_kv_cache.is_some() {
+                Some(::vllm_engine::spec_decode::DraftSeedInputs {
+                    input_ids: input_ids_u32,
+                    positions: positions_u32,
+                    slot_mapping: slot_mapping_u32,
+                    cu_seqlens_q: cu_seqlens_u32,
+                    seqused_k: seqused_k_u32,
+                    block_table: block_table_u32,
+                    block_table_stride: max_blocks_eff,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    num_tokens,
+                    req_ids: req_ids_in_order.clone(),
+                    block_ids: attn
+                        .block_ids
+                        .iter()
+                        .map(|v| v.iter().map(|&b| b as u32).collect())
+                        .collect(),
+                    tokens_before: attn.tokens_before.clone(),
+                    q_lens: q_lens.clone(),
+                    was_spec_decode: was_spec_decode.clone(),
+                    block_size,
+                    // Phase 8: when target verify ran in parallel
+                    // with lockstep prefill on draft_queue (above),
+                    // the worker has already waited for both — the
+                    // proposer skips its in-proposer lockstep call.
+                    async_lockstep_done,
+                    speculative_seeds: spec9_seeds_final.clone(),
+                    speculative_chain_drafts: spec9_drafts_final.clone(),
+                })
+            } else {
+                None
+            };
+
+        // ── 7. Commit per-request state ─────────────────────────
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let q_len = q_lens[i];
-            self.input_batch
-                .commit_step(req_id, &sampled_token_ids[i], q_len, false);
+            self.input_batch.commit_step(
+                req_id,
+                &sampled_token_ids[i],
+                q_len,
+                was_spec_decode[i],
+            );
         }
 
         Ok(ModelRunnerOutput {
@@ -10306,7 +11576,11 @@ impl Worker for FerriteWorker {
             sampled_token_ids,
             logprobs: None,
             prompt_logprobs_dict: std::collections::HashMap::new(),
+            // K-step draft chain runs host-side now; the proposer fills
+            // `set_spec_token_ids` directly. `draft_token_ids` stays
+            // `None` from the worker.
             draft_token_ids: None,
+            draft_seed_inputs,
             pooler_output: None,
             d2h_resolver: None,
         })
@@ -10348,5 +11622,11 @@ impl Worker for FerriteWorker {
 
     fn architecture(&self) -> Option<String> {
         self.resolved_architecture.clone()
+    }
+
+    fn spec_decode_backend(
+        &mut self,
+    ) -> Option<&mut dyn vllm_engine::spec_decode::SpecDecodeBackend> {
+        Some(self as &mut dyn vllm_engine::spec_decode::SpecDecodeBackend)
     }
 }

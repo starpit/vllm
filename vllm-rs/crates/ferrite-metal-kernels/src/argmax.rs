@@ -28,6 +28,14 @@ pub const ARGMAX_DEFAULT_TG_SIZE: usize = 256;
 pub struct ArgmaxKernels {
     pub f16: ComputePipelineState,
     pub bf16: ComputePipelineState,
+    /// Phase 6 dual-write variants. Each writes the argmax to BOTH
+    /// the per-iter output buffer (host-visible draft target) AND a
+    /// second buffer (the next K-step iter's `runtime.input_ids`).
+    /// Encoded into the same MTL4 compute encoder as the forward; the
+    /// next iter's embed kernel reads from `next_in` and Metal's
+    /// intra-encoder write→read hazard tracking serializes them.
+    pub f16_dual_write: ComputePipelineState,
+    pub bf16_dual_write: ComputePipelineState,
     _library: Library,
 }
 
@@ -39,9 +47,13 @@ impl ArgmaxKernels {
             })?;
         let f16 = build_pipeline(device, &library, "argmax_f16")?;
         let bf16 = build_pipeline(device, &library, "argmax_bf16")?;
+        let f16_dual_write = build_pipeline(device, &library, "argmax_f16_dual_write")?;
+        let bf16_dual_write = build_pipeline(device, &library, "argmax_bf16_dual_write")?;
         Ok(Self {
             f16,
             bf16,
+            f16_dual_write,
+            bf16_dual_write,
             _library: library,
         })
     }
@@ -277,6 +289,44 @@ pub fn encode_argmax_bf16_into_mtl4(
     batch: u32,
 ) -> Result<(), MetalStreamError> {
     encode_argmax_into_mtl4_inner(&kernels.bf16, encoder, arg_table, batch, "argmax_bf16")
+}
+
+/// Phase 6 dual-write argmax — writes argmax to TWO buffers in one
+/// dispatch. Bindings (must match `argmax_{bf16,f16}_dual_write` in
+/// `shaders/argmax.metal`):
+///   index 0: logits      (read)
+///   index 1: output      (write — host-visible draft buffer)
+///   index 2: batch       (read const u32)
+///   index 3: vocab       (read const u32)
+///   index 4: next_in     (write — next iter's input_ids buffer)
+pub fn encode_argmax_f16_dual_write_into_mtl4(
+    kernels: &ArgmaxKernels,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+    batch: u32,
+) -> Result<(), MetalStreamError> {
+    encode_argmax_into_mtl4_inner(
+        &kernels.f16_dual_write,
+        encoder,
+        arg_table,
+        batch,
+        "argmax_f16_dual_write",
+    )
+}
+
+pub fn encode_argmax_bf16_dual_write_into_mtl4(
+    kernels: &ArgmaxKernels,
+    encoder: &ProtocolObject<dyn objc2_metal::MTL4ComputeCommandEncoder>,
+    arg_table: &ProtocolObject<dyn objc2_metal::MTL4ArgumentTable>,
+    batch: u32,
+) -> Result<(), MetalStreamError> {
+    encode_argmax_into_mtl4_inner(
+        &kernels.bf16_dual_write,
+        encoder,
+        arg_table,
+        batch,
+        "argmax_bf16_dual_write",
+    )
 }
 
 fn encode_argmax_into_mtl4_inner(

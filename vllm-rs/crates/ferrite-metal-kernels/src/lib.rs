@@ -20,6 +20,7 @@ pub mod activation;
 pub mod allocator;
 pub mod argmax;
 pub mod argpartition;
+pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
 pub mod fused_kernels;

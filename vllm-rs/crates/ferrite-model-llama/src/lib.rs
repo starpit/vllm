@@ -12,7 +12,15 @@
 use ferrite_forward_macro::forward;
 
 #[forward(
-    workloads = [1, 8, 64, 512, 1024, 2048, 4096],
+    // Tiny buckets (2, 4) exist for the spec-decode draft chain's
+    // extended first iteration: target verify batch + 1 bonus slot
+    // per req lands at num_tokens in {2, 3, 4, 5, 6, ...}. Without
+    // these the smallest bucket above 1 is 8, forcing 8x the kernel
+    // work on non-spec decode (num_tokens=2) and rounding up the
+    // K=4 verify case (num_tokens=6) to 8 anyway. See Python's
+    // copy_and_expand_eagle_inputs_kernel approach mirrored by
+    // `DraftModelProposer::propose_for_step`.
+    workloads = [1, 2, 4, 8, 64, 512, 1024, 2048, 4096],
     sk_buckets = [128, 512, 2048, 8192],
 )]
 fn llama() {

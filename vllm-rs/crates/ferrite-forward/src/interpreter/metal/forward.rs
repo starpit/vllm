@@ -61,6 +61,14 @@ pub struct ForwardInputs<'a> {
     /// paged KV cache. Required wherever `AttentionViaCache` or
     /// `RopeAppend` references the paged pool.
     pub block_table: Option<&'a [u32]>,
+    /// `true` when this forward is a spec-decode verify batch (one
+    /// or more reqs carries `spec_token_ids`). Threaded into the
+    /// dispatch loop's `gate_matches` so the lm_head slice trio (gated
+    /// `OnlyIfSingleSeqNoSpec`) skips and the full-`M=bucket_m`
+    /// fallback (gated `OnlyIfMultiSeqOrSpec`) fires instead — the
+    /// slice writes only the LAST row of logits, which is wrong when
+    /// rejection sampling needs every row.
+    pub has_spec_tokens: bool,
 }
 
 /// Errors produced by [`super::pool::MetalWorkerPool::forward`] before

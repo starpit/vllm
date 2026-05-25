@@ -327,6 +327,16 @@ mod ctx {
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
         pub kv_cache: &'a KvCachePool,
+        /// `true` when at least one req in this forward carries
+        /// `spec_token_ids` (= it's a spec-decode verify batch).
+        /// Threaded through to `gate_matches` so the lm_head slice
+        /// trio (gated `OnlyIfSingleSeqNoSpec`) skips and the full
+        /// `M=bucket_m` lm_head fallback (gated
+        /// `OnlyIfMultiSeqOrSpec`) fires, giving rejection sampling
+        /// correct per-row logits. Caller sets `false` for prefill /
+        /// decode / lockstep prefill / K-step draft chain.
+        #[cfg(feature = "metal")]
+        pub has_spec_tokens: bool,
         /// Multimodal embed splice. `mm_embeds` carries the projected
         /// vision-encoder output `[total_mm_tokens, hidden]` produced by
         /// [`super::MultimodalForward::vision_forward`]; `embed_patches`
@@ -548,6 +558,33 @@ mod dispatcher {
         ) -> OwnedTensor {
             unsafe { self.forward(ctx, device, num_tokens) }
         }
+
+        /// Phase 6 spec-decode K-step chain entry point. Opens ONE MTL4
+        /// command buffer on the pool's MTL4 queue and invokes `body`
+        /// with a [`ChainStepHandle`] (callable K times to encode a
+        /// forward step onto the chain encoder), the worker's
+        /// `RuntimeBindings` (for runtime buffer addresses), and the
+        /// live compute encoder. Caller is responsible for encoding
+        /// per-iter argmax + `chain_advance` dispatches between
+        /// forwards. One commit, one host wait for the whole chain.
+        ///
+        /// Default impl returns `NotImplemented` so non-metal builds
+        /// and arches that haven't been re-emitted with the Phase 6
+        /// glue still build.
+        ///
+        /// # Safety
+        /// Same as [`Self::forward`]; additionally, `body` must not
+        /// retain any references to the encoder past its return.
+        #[cfg(feature = "metal")]
+        unsafe fn metal_chain_with_encoder(
+            &self,
+            _ctx: &ForwardCtx,
+            _device: &mut GpuDevice,
+            _num_tokens: u64,
+            _body: MetalChainBody<'_>,
+        ) -> Result<(), String> {
+            Err("metal_chain_with_encoder: not implemented for this arch".into())
+        }
     }
 
     /// Box for a Metal forward-encoder tail hook. Invoked on the same
@@ -569,6 +606,55 @@ mod dispatcher {
                 &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
                 u32,
                 u32,
+            ) -> Result<(), String>
+            + 'a,
+    >;
+
+    /// Non-generic view of the macro-emitted MetalWorker for the
+    /// spec-decode K-step chain body. The body holds an
+    /// `&dyn ChainStepHandle` and calls `run_forward_step` K times to
+    /// encode each iter's bucket forward onto the chain encoder.
+    /// `logits_buf()` returns the bucket's terminal arena slot —
+    /// the same MTLBuffer is reused across iters, so binding it as
+    /// argmax's input every iter is correct.
+    #[cfg(feature = "metal")]
+    pub trait ChainStepHandle {
+        /// Encode one bucket forward dispatch onto the chain encoder.
+        /// `num_tokens` is real (the bucket is fixed across iters
+        /// because the K-step decode shape doesn't change).
+        fn run_forward_step(
+            &self,
+            encoder: &::objc2::runtime::ProtocolObject<
+                dyn ::objc2_metal::MTL4ComputeCommandEncoder,
+            >,
+            num_tokens: u32,
+            num_seqs: u32,
+            has_spec_tokens: bool,
+        ) -> Result<(), String>;
+
+        /// The bucket's terminal arena slot (lm_head output). Stable
+        /// across iters within one chain CB.
+        fn logits_buf(
+            &self,
+        ) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+
+        /// Logits column count (= compiled-in `METAL_VOCAB_SIZE`).
+        fn vocab(&self) -> u32;
+    }
+
+    /// Box for the Phase 6 chain body. Invoked once per chain
+    /// invocation; drives K forward dispatches via the handle and
+    /// encodes argmax + chain_advance dispatches between forwards.
+    /// All dispatches share one MTL4 compute encoder ⇒ one CB ⇒ one
+    /// commit ⇒ one host wait.
+    #[cfg(feature = "metal")]
+    pub type MetalChainBody<'a> = Box<
+        dyn FnOnce(
+                &dyn ChainStepHandle,
+                &crate::interpreter::metal::RuntimeBindings,
+                &::objc2::runtime::ProtocolObject<
+                    dyn ::objc2_metal::MTL4ComputeCommandEncoder,
+                >,
             ) -> Result<(), String>
             + 'a,
     >;
@@ -934,7 +1020,7 @@ mod dispatcher {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
 #[cfg(feature = "metal")]
-pub use dispatcher::MetalForwardFollowup;
+pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup};
 /// Re-exports of the objc2/objc2_metal types referenced by macro-emitted
 /// `forward_with_metal_followup` / trait `MetalForwardFollowup` so consuming
 /// crates don't need direct `objc2`/`objc2_metal` deps.

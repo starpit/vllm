@@ -393,6 +393,22 @@ impl MetalAllocator {
             !aligned_base.is_null(),
             "MetalAllocator::register_mmap: destination buffer.contents() is null"
         );
+        // PROBE: dump shard size + buffer location to isolate large-shard
+        // loader regression (8B-4bit shard 4.21 GiB fails with EFAULT on
+        // pread; 3B-4bit 1.81 GiB works).
+        if std::env::var_os("FERRITE_LOADER_PROBE").is_some() {
+            let max_buf = self.device.maxBufferLength();
+            eprintln!(
+                "[loader-probe] path={} shard_bytes={} aligned_capacity={} aligned_base={:p} buffer_length={} max_buffer_length={} num_tensors={}",
+                path.display(),
+                len,
+                aligned_capacity,
+                aligned_base,
+                dst_buffer.length(),
+                max_buf,
+                tensors_src.len(),
+            );
+        }
 
         // Validate that the file exists / is openable; per-task we
         // re-open by path so each worker has its own fd (concurrent
@@ -407,10 +423,15 @@ impl MetalAllocator {
         // of the buffer; no two workers race on the same byte.
         let dst_base_usize = aligned_base as usize;
 
-        // Chunk size targets ~16 MiB per `pread` so large tensors
+        // Chunk size targets ~16 MiB per copy so large tensors
         // parallelize across rayon workers and small tensors remain
         // a single dispatch.
         const READ_CHUNK: usize = 16 * 1024 * 1024;
+
+        // mmap source base — usize for Send across rayon closures. The
+        // backing `Arc<Mmap>` is held alive in the `MmapRegion` below
+        // for the lifetime of every captured pointer.
+        let src_base_usize = base as usize;
 
         let mut tensors: Vec<MmapTensor> = Vec::with_capacity(packed.len());
         for (src_off, sz, dst_off) in packed {
@@ -422,51 +443,40 @@ impl MetalAllocator {
                 let chunk_src = src_off + off_in_tensor;
                 let chunk_dst = dst_off + off_in_tensor;
                 let ready_w = Arc::clone(&ready);
-                let path_w = path.to_path_buf();
-                rayon::spawn(move || {
-                    let file_w = std::fs::File::open(&path_w).unwrap_or_else(|e| {
-                        panic!("re-open {} failed: {e}", path_w.display())
-                    });
-                    let fd = file_w.as_raw_fd();
-                    let mut written = 0usize;
-                    while written < chunk_sz {
-                        // SAFETY: dst points to `chunk_sz - written`
-                        // bytes inside the destination MTLBuffer's
-                        // shared-storage contents (allocated above,
-                        // outlives the closure via the region's
-                        // ownership of `aligned_buffer`).
-                        let dst =
-                            (dst_base_usize + chunk_dst + written) as *mut libc::c_void;
-                        let n = unsafe {
-                            libc::pread(
-                                fd,
-                                dst,
-                                chunk_sz - written,
-                                (chunk_src + written) as libc::off_t,
-                            )
-                        };
-                        if n < 0 {
-                            let err = std::io::Error::last_os_error();
-                            panic!(
-                                "pread({}, off={}, len={}) failed: {}",
-                                path_w.display(),
-                                chunk_src + written,
-                                chunk_sz - written,
-                                err
-                            );
-                        }
-                        if n == 0 {
-                            panic!(
-                                "pread({}, off={}) returned 0 (unexpected EOF, want {} more bytes)",
-                                path_w.display(),
-                                chunk_src + written,
-                                chunk_sz - written
-                            );
-                        }
-                        written += n as usize;
-                    }
-                    ready_w.signal_chunk();
-                });
+                // Userspace memcpy from the mmap'd safetensors region
+                // into the StorageModeShared MTLBuffer.
+                //
+                // Why not `pread`: on macOS, `pread` into the
+                // `contents()` of a large StorageModeShared MTLBuffer
+                // fails with EFAULT — the kernel can't DMA into
+                // GPU-mapped pages. Empirically this hits any shard
+                // above ~2 GiB (3B-4bit 1.8 GiB works, 8B-4bit 4.2 GiB
+                // fails). The standalone `large_buffer_offset_probe_test`
+                // confirmed userspace memcpy into the same buffer at
+                // 4.68 GiB offset DOES work.
+                //
+                // Done synchronously instead of via `rayon::spawn` to
+                // avoid the lifetime puzzle of capturing the destination
+                // buffer's contents pointer in a 'static closure: the
+                // MTLBuffer is created here and moved into MmapRegion
+                // below, so a spawned task's address is only valid
+                // after MmapRegion is pushed into self.mmaps. memcpy
+                // is bandwidth-bound (kernel page-fault-in from mmap +
+                // cache fill); the extra parallelism rayon gave the
+                // old pread path mattered for kernel-side I/O
+                // dispatch, not for the actual byte movement.
+                //
+                // SAFETY: dst points to `chunk_sz` bytes inside the
+                // freshly-allocated destination MTLBuffer (alive in
+                // this scope, about to be moved into MmapRegion). src
+                // points to the mmap'd safetensors file region (Arc'd
+                // into MmapRegion's `_mmap`).
+                let dst = (dst_base_usize + chunk_dst) as *mut u8;
+                let src = (src_base_usize + chunk_src) as *const u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src, dst, chunk_sz);
+                }
+                ready_w.signal_chunk();
             }
             tensors.push(MmapTensor {
                 src_offset: src_off,

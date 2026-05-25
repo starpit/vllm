@@ -769,17 +769,32 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     /// the macro / model loader supplies whatever order it likes
     /// (typically ascending), and a linear scan over a handful of
     /// buckets is cheaper than maintaining a sorted invariant.
+    ///
+    /// **Safe-bucket floor:** the fused MLP / MLX-steel kernels at
+    /// `bucket_m >= 2` assume the steel BM=32 tile size; arenas sized
+    /// for `bucket_m < SAFE_MULTI_ROW_BUCKET_M` can be overrun by the
+    /// kernel writing beyond the slot. Until the small-bucket kernel
+    /// path is hardened, we refuse to select buckets in the
+    /// `(1, SAFE_MULTI_ROW_BUCKET_M)` range — `num_tokens=2..7` rounds
+    /// up to the safe-floor bucket (typically 8), at the cost of
+    /// padded compute for small batches.
     pub fn pick_bucket(&self, num_tokens: u32) -> Result<usize, ForwardError> {
+        const SAFE_MULTI_ROW_BUCKET_M: u32 = 8;
         if num_tokens == 0 {
             return Err(ForwardError::ZeroTokens);
         }
+        let effective_min = if num_tokens == 1 {
+            1
+        } else {
+            num_tokens.max(SAFE_MULTI_ROW_BUCKET_M)
+        };
         let mut best: Option<(usize, u32)> = None;
         let mut max_bucket: u32 = 0;
         for (i, tape) in self.bucket_tapes.iter().enumerate() {
             if tape.bucket_m > max_bucket {
                 max_bucket = tape.bucket_m;
             }
-            if tape.bucket_m >= num_tokens {
+            if tape.bucket_m >= effective_min {
                 best = match best {
                     Some((_, bm)) if bm <= tape.bucket_m => best,
                     _ => Some((i, tape.bucket_m)),
@@ -834,6 +849,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
+        has_spec_tokens: bool,
     ) -> Result<(), ForwardError> {
         use ::objc2_metal::MTLCommandEncoder;
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
@@ -843,14 +859,26 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // reference. Returns early; slow but only used for parity.
         if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
             worker
-                .run_bucket_mtl3_with_dumps(bucket_idx, num_tokens as u32, num_seqs, queue)
+                .run_bucket_mtl3_with_dumps(
+                    bucket_idx,
+                    num_tokens as u32,
+                    num_seqs,
+                    has_spec_tokens,
+                    queue,
+                )
                 .map_err(ForwardError::Worker)?;
             return Ok(());
         }
         let cb = queue.commandBuffer().expect("commandBuffer");
         let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
         worker
-            .run_bucket_mtl3(bucket_idx, num_tokens as u32, num_seqs, &enc)
+            .run_bucket_mtl3(
+                bucket_idx,
+                num_tokens as u32,
+                num_seqs,
+                has_spec_tokens,
+                &enc,
+            )
             .map_err(ForwardError::Worker)?;
         enc.endEncoding();
         let encoded = t_pre.elapsed();
@@ -881,12 +909,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
+        has_spec_tokens: bool,
     ) -> Result<(), ForwardError> {
         self.run_bucket_mtl4_with_tail::<fn(
             &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             &MetalWorker<W>,
             usize,
-        ) -> Result<(), ForwardError>>(worker, bucket_idx, num_tokens, num_seqs, None)
+        ) -> Result<(), ForwardError>>(
+            worker,
+            bucket_idx,
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            None,
+        )
     }
 
     /// MTL4 forward dispatch + optional encoder-tail hook.
@@ -903,6 +939,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_idx: usize,
         num_tokens: usize,
         num_seqs: u32,
+        has_spec_tokens: bool,
         tail: Option<F>,
     ) -> Result<(), ForwardError>
     where
@@ -947,11 +984,24 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .expect("MTL4 computeCommandEncoder returned nil");
             if let Some(ts) = timing_state.as_ref() {
                 worker
-                    .run_bucket_mtl4_with_timing(bucket_idx, num_tokens as u32, num_seqs, &enc, ts)
+                    .run_bucket_mtl4_with_timing(
+                        bucket_idx,
+                        num_tokens as u32,
+                        num_seqs,
+                        has_spec_tokens,
+                        &enc,
+                        ts,
+                    )
                     .map_err(ForwardError::Worker)?;
             } else {
                 worker
-                    .run_bucket_mtl4(bucket_idx, num_tokens as u32, num_seqs, &enc)
+                    .run_bucket_mtl4(
+                        bucket_idx,
+                        num_tokens as u32,
+                        num_seqs,
+                        has_spec_tokens,
+                        &enc,
+                    )
                     .map_err(ForwardError::Worker)?;
             }
             // Caller-supplied encoder-tail hook (e.g. argmax dispatch)
@@ -1017,6 +1067,129 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(())
     }
 
+    /// Phase 6 chain-driver primitive. Opens ONE MTL4 command buffer
+    /// on the pool's internal MTL4 queue and invokes `body` with the
+    /// checked-out worker, its `RuntimeBindings`, and the live compute
+    /// encoder. The body drives N forward dispatches (typically the
+    /// K-step draft chain) plus any caller-supplied dispatches
+    /// (e.g. `argmax_dual_write`, `chain_advance`) onto the same
+    /// encoder.
+    ///
+    /// The pool owns:
+    ///   * worker checkout / checkin (via the `WorkerGuard` drop),
+    ///   * iter-0 input upload (via `write_runtime_inputs`),
+    ///   * residency attach (idempotent),
+    ///   * MTL4 CB begin/end,
+    ///   * commit, signal, host wait,
+    ///   * allocator reset.
+    ///
+    /// One CB ⇒ one commit ⇒ one host wait for the entire chain.
+    /// `queue` here is the MTL3 `CommandQueue` used for residency
+    /// attach (same lazy-attach pattern as `forward_with_tail`); the
+    /// commit itself happens on the pool's internal MTL4 queue.
+    pub fn with_chain_encoder<F, R>(
+        &self,
+        weights: &W,
+        inputs: &ForwardInputs<'_>,
+        queue: &CommandQueue,
+        body: F,
+    ) -> Result<R, ForwardError>
+    where
+        F: FnOnce(
+            &MetalWorker<W>,
+            &RuntimeBindings,
+            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        ) -> Result<R, ForwardError>,
+    {
+        use objc2::runtime::AnyObject;
+        use std::ptr::NonNull;
+
+        self.ensure_mtl4();
+        let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
+
+        if !self
+            .residency_attached
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.allocator.residency().commit();
+            self.allocator.residency().attach_to_queue(queue);
+        }
+
+        let guard = self.checkout(weights)?;
+        write_runtime_inputs(&guard.runtime, inputs)?;
+
+        let t_pre = std::time::Instant::now();
+        let cb = self
+            .device
+            .newCommandBuffer()
+            .expect("newCommandBuffer returned nil");
+        let (signal_value, queue_clone, event_clone, body_result) = {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
+            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
+            let cb_ptr: *mut AnyObject =
+                ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
+            unsafe {
+                self.allocator
+                    .residency()
+                    .attach_to_mtl4_command_buffer(cb_ptr);
+            }
+            let enc = cb
+                .computeCommandEncoder()
+                .expect("MTL4 computeCommandEncoder returned nil");
+            // Caller's body encodes the entire chain onto `enc`.
+            let body_result = body(&guard.worker, &guard.runtime, &enc);
+            enc.endEncoding();
+            cb.endCommandBuffer();
+            mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
+            let val = mtl4.signal_counter;
+            let qc = mtl4.queue.clone();
+            let ec = mtl4.shared_event.clone();
+            (val, qc, ec, body_result)
+        };
+        // Propagate body errors AFTER the encoder/CB have been ended
+        // (so allocator state stays consistent) and BEFORE committing
+        // any half-encoded work to the GPU.
+        let body_result = body_result?;
+
+        let encoded = t_pre.elapsed();
+        let cb_protocol: &::objc2::runtime::ProtocolObject<
+            dyn ::objc2_metal::MTL4CommandBuffer,
+        > = &cb;
+        let cb_nn = NonNull::from(cb_protocol);
+        let mut cb_array = [cb_nn];
+        unsafe {
+            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+        }
+        queue_clone.signalEvent_value(
+            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
+            signal_value,
+        );
+        let committed = t_pre.elapsed();
+        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
+        if !ok {
+            return Err(ForwardError::ExecutionFailed(
+                MTLCommandBufferStatus::Error,
+            ));
+        }
+        {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            if let Some(mtl4) = slot.as_mut() {
+                mtl4.allocator.reset();
+            }
+        }
+        let waited = t_pre.elapsed();
+        if trace {
+            eprintln!(
+                "[chain encoder mtl4] encode={:?} commit={:?} wait={:?}",
+                encoded,
+                committed - encoded,
+                waited - committed,
+            );
+        }
+        Ok(body_result)
+    }
+
     /// Run one forward step via MTL4.
     ///
     /// Pipeline:
@@ -1080,6 +1253,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .cu_seqlens_q
             .map(|cu| (cu.len().saturating_sub(1)).max(1) as u32)
             .unwrap_or(1);
+        let has_spec_tokens = inputs.has_spec_tokens;
 
         // Lazily commit + attach the allocator's residency set on the
         // first forward — both calls are idempotent per (queue, set),
@@ -1125,6 +1299,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 bucket_idx,
                 inputs.num_tokens as usize,
                 num_seqs,
+                has_spec_tokens,
             )?;
             // MTL3 path doesn't take an encoder tail (legacy path);
             // caller's separate sync dispatch still applies.
@@ -1141,6 +1316,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 bucket_idx,
                 inputs.num_tokens as usize,
                 num_seqs,
+                has_spec_tokens,
                 tail,
             )?;
         }
@@ -1824,6 +2000,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_table: None,
+            has_spec_tokens: false,
         };
         // Closure runs *while* the worker is checked out — assertion
         // is that we got it (not on numerical correctness; that's
@@ -1856,6 +2033,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_table: None,
+            has_spec_tokens: false,
         };
         let err = pool
             .forward(&w, &queue, &inputs, |_, _| ())
@@ -1881,6 +2059,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_table: None,
+            has_spec_tokens: false,
         };
         match pool.forward(&w, &queue, &inputs, |_, _| ()) {
             Err(ForwardError::NoBucketFits {
@@ -1916,6 +2095,7 @@ mod tests {
             cu_seqlens_q: None,
             seq_used_k: None,
             block_table: None,
+            has_spec_tokens: false,
         };
         let err = pool
             .forward(&w, &queue, &inputs, |_, _| ())

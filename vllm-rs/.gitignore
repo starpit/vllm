@@ -2,8 +2,11 @@
 
 /target/
 **/*.rs.bk
+/bench_results/
 
 # Override root *.csv ignore for parity data
 !crates/vllm-parity/**/*.csv
 # Override root *.csv ignore for solver cost tables
 !crates/ferrite-solver/data/**/*.csv
+DRAFT_SPEC_DECODE_PLAN.md
+SPEC_DECODE_REFACTOR_PLAN.md

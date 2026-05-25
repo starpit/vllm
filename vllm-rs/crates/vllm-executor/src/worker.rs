@@ -130,6 +130,17 @@ pub trait Worker: Send {
         None
     }
 
+    /// Mutable access to the worker's spec-decode backend. Default
+    /// returns `None`; metal `FerriteWorker` overrides to return
+    /// `Some(&mut *self as &mut dyn SpecDecodeBackend)` so the
+    /// engine-side `DraftModelProposer` can issue lockstep prefill +
+    /// K-step decode calls against it.
+    fn spec_decode_backend(
+        &mut self,
+    ) -> Option<&mut dyn vllm_engine::spec_decode::SpecDecodeBackend> {
+        None
+    }
+
     /// Shut down the worker and release all resources.
     fn shutdown(&mut self);
 

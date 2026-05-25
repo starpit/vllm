@@ -18,6 +18,7 @@ use vllm_config::CudaGraphMode;
 use vllm_config::{CudaGraphConfig, SchedulerConfig, SchedulerPolicy};
 use vllm_engine::core_client::InprocClient;
 use vllm_engine::engine_core::EngineCoreConfig;
+use vllm_engine::spec_decode::{DraftModelProposerConfig, NgramProposerConfig, ProposerConfig};
 use vllm_executor::uniproc::UniProcExecutor;
 use vllm_executor::worker::Worker;
 use vllm_model::weight::HfModelConfig;
@@ -58,7 +59,10 @@ pub struct VllmConfig {
     pub hf_token: Option<String>,
     /// Specific GGUF filename to download from a HuggingFace repo.
     pub gguf_file: Option<String>,
-    /// Speculative model type (e.g. "ngram"). None = disabled.
+    /// Speculative model: `"ngram"` selects the n-gram proposer; any other
+    /// value is treated as a draft-model local path or HuggingFace repo ID
+    /// (wired in phase 4 of `DRAFT_SPEC_DECODE_PLAN.md`). `None` disables
+    /// speculative decoding.
     pub speculative_model: Option<String>,
     /// Number of speculative tokens to propose per step.
     pub num_speculative_tokens: usize,
@@ -66,6 +70,10 @@ pub struct VllmConfig {
     pub ngram_prompt_lookup_max: usize,
     /// Minimum n-gram size for prompt lookup.
     pub ngram_prompt_lookup_min: usize,
+    /// Optional dtype override for the draft model's weights ("auto",
+    /// "float16", "bfloat16", etc). `None` inherits the target's dtype.
+    /// Only meaningful when `speculative_model` points at a draft model.
+    pub draft_model_dtype: Option<String>,
     /// LoRA adapter path (local directory or HF repo ID). None = disabled.
     pub lora_adapter: Option<String>,
     /// Pooling strategy for embeddings: "auto", "last", "cls", "mean".
@@ -136,9 +144,14 @@ impl Default for VllmConfig {
             hf_token: None,
             gguf_file: None,
             speculative_model: None,
-            num_speculative_tokens: 5,
+            // K=2 is the empirical sweet spot for draft-model spec
+            // decode on Apple Silicon when the target dominates
+            // (e.g. 8B+1B). See `vllm-cli/src/args.rs` for the bench
+            // distribution that led to this default.
+            num_speculative_tokens: 2,
             ngram_prompt_lookup_max: 4,
             ngram_prompt_lookup_min: 1,
+            draft_model_dtype: None,
             lora_adapter: None,
             pooling_strategy: "auto".to_string(),
             tensor_parallel_size: 1,
@@ -354,6 +367,8 @@ fn create_worker(
             calculate_kv_scales: config.calculate_kv_scales,
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
+            draft_model_path: spec_decode_draft_model_path(config),
+            draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
         let mut ferrite = FerriteWorker::new(ferrite_config);
@@ -437,6 +452,8 @@ fn create_worker(
             calculate_kv_scales: config.calculate_kv_scales,
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
+            draft_model_path: spec_decode_draft_model_path(config),
+            draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
         let mut worker = FerriteWorker::new(cuda_config);
@@ -543,6 +560,353 @@ struct InitializedCore {
     max_model_len: usize,
     model_dir: Option<std::path::PathBuf>,
     hf_config: HfModelConfig,
+}
+
+/// `--speculative-model <repo>` as a draft-model path, or `None` for
+/// the n-gram proposer / no spec-decode case. Threaded into each
+/// `FerriteWorkerConfig` construction so the worker can load the draft
+/// alongside the target.
+fn spec_decode_draft_model_path(config: &VllmConfig) -> Option<String> {
+    match config.speculative_model.as_deref() {
+        Some("ngram") | None => None,
+        Some(path) => Some(path.to_string()),
+    }
+}
+
+/// Build the speculative-decoding proposer config from a `VllmConfig`.
+///
+/// Three outcomes:
+///   * `speculative_model == None` → `Ok(None)` (spec decode disabled).
+///   * `speculative_model == Some("ngram")` → `Ok(Some(Ngram(...)))`.
+///   * `speculative_model == Some(other)` → `Ok(Some(DraftModel(...)))` —
+///     but [`validate_speculative_decoding`] (called earlier from each
+///     `initialize_stack*` entry point) refuses to start an engine with
+///     this variant until phase 4 of `DRAFT_SPEC_DECODE_PLAN.md` lands.
+///
+/// Today this fn returns `Err` for the draft-model branch as a defense in
+/// depth in case the entry-point validator is bypassed. Phase 4 replaces
+/// that `Err` with the real draft-model wiring.
+fn build_proposer_config(
+    config: &VllmConfig,
+    max_model_len: usize,
+) -> Result<Option<ProposerConfig>> {
+    let Some(spec) = config.speculative_model.as_deref() else {
+        return Ok(None);
+    };
+    if spec == "ngram" {
+        return Ok(Some(ProposerConfig::Ngram(NgramProposerConfig {
+            num_speculative_tokens: config.num_speculative_tokens,
+            max_ngram_size: config.ngram_prompt_lookup_max,
+            min_ngram_size: config.ngram_prompt_lookup_min,
+            max_model_len,
+        })));
+    }
+    // Non-"ngram" value: treat as a draft-model path / HF repo. The
+    // engine logs the registration and proceeds as baseline until phase 4
+    // wires the real proposer (`EngineCore::new` handles this variant by
+    // leaving the proposer as `None`).
+    Ok(Some(ProposerConfig::DraftModel(DraftModelProposerConfig {
+        model: spec.to_string(),
+        num_speculative_tokens: config.num_speculative_tokens,
+        dtype: config.draft_model_dtype.clone(),
+        max_model_len,
+    })))
+}
+
+/// Validate `--speculative-model` against the phase guards before any
+/// model load. Called at the top of each `initialize_stack*` entry.
+///
+/// For draft-model speculative decoding (`--speculative-model <path>`):
+///   1. Vocab/tokenizer alignment (`validate_target_draft_pair`).
+///   2. Metal memory budget rough-check (metal feature only).
+///
+/// Phase 4 of DRAFT_SPEC_DECODE_PLAN.md: the worker runs a K-step draft
+/// chain after each target step and stashes the drafts on
+/// `ModelRunnerOutput.draft_token_ids`; the engine forwards them to the
+/// scheduler via `set_spec_token_ids`. The metal-side M>1 verify path
+/// is a follow-up — until it lands, drafts are proposed but discarded
+/// by the worker's next prepare_inputs, and the engine reports 0%
+/// acceptance.
+fn validate_speculative_decoding(config: &VllmConfig) -> Result<()> {
+    let Some(spec) = config.speculative_model.as_deref() else {
+        return Ok(());
+    };
+    if spec == "ngram" {
+        return Ok(());
+    }
+    validate_target_draft_pair(config, spec)?;
+    info!(
+        "spec-decode: draft model {:?} accepted; worker-side proposer runs a K-step \
+         decode chain per step.",
+        spec
+    );
+    Ok(())
+}
+
+/// Mirror Python vLLM (vllm/config/vllm.py:709-721): force-disable async
+/// scheduling for non-EAGLE spec-decode methods. Both ngram and draft-model
+/// paths seed K-step drafts from step N's output for step N+1's verify;
+/// async's 1-step lookahead skews that to N+2 and acceptance collapses to
+/// ~0. EAGLE/MTP methods (not yet ported) re-use hidden states directly
+/// and are compatible with async.
+fn spec_decode_requires_sync(config: &VllmConfig) -> bool {
+    config.speculative_model.is_some()
+}
+
+/// Phase-2 guards: vocab/tokenizer match + memory budget for the
+/// target + draft pair.
+///
+/// Resolves both models to their HF-cache snapshot dirs and asserts:
+///   * `target.vocab_size == draft.vocab_size` (mirrors Python vLLM's
+///     SpeculativeConfig vocab-size check).
+///   * `sha256(target/tokenizer.json) == sha256(draft/tokenizer.json)`
+///     (the cheapest "same tokenizer" assertion that survives metadata
+///     differences like padding-token whitespace).
+///   * On metal builds: weight bytes + a coarse KV estimate fit under
+///     `recommendedMaxWorkingSetSize`.
+///
+/// Files that don't exist locally trigger `resolve_model_path`'s normal
+/// HF download path — so a misconfigured draft URL surfaces here, not
+/// halfway through model load.
+fn validate_target_draft_pair(config: &VllmConfig, draft_spec: &str) -> Result<()> {
+    let target_dir = vllm_executor::ferrite_worker::resolve_model_path(
+        &config.model,
+        config.hf_token.as_deref(),
+        config.gguf_file.as_deref(),
+    )
+    .with_context(|| format!("resolving target model path {:?}", config.model))?;
+    let draft_dir = vllm_executor::ferrite_worker::resolve_model_path(
+        draft_spec,
+        config.hf_token.as_deref(),
+        None, // draft never uses target's --gguf-file
+    )
+    .with_context(|| format!("resolving draft model path {draft_spec:?}"))?;
+
+    let target_cfg = HfModelConfig::from_dir(&target_dir)
+        .with_context(|| format!("reading target config.json at {:?}", target_dir))?;
+    let draft_cfg = HfModelConfig::from_dir(&draft_dir)
+        .with_context(|| format!("reading draft config.json at {:?}", draft_dir))?;
+
+    if let (Some(tv), Some(dv)) = (target_cfg.vocab_size, draft_cfg.vocab_size) {
+        if tv != dv {
+            anyhow::bail!(
+                "target/draft vocab_size mismatch: target={} ({}), draft={} ({}). \
+                 Spec-decode requires matching vocabularies — the draft model must \
+                 emit token IDs the target can interpret. Pick a draft from the same \
+                 model family (e.g. Llama-3.2-1B paired with Llama-3.2-3B).",
+                tv, config.model, dv, draft_spec
+            );
+        }
+    }
+
+    let target_tok = target_dir.join("tokenizer.json");
+    let draft_tok = draft_dir.join("tokenizer.json");
+    if target_tok.is_file() && draft_tok.is_file() {
+        let tb = std::fs::read(&target_tok)
+            .with_context(|| format!("reading {:?}", target_tok))?;
+        let db = std::fs::read(&draft_tok)
+            .with_context(|| format!("reading {:?}", draft_tok))?;
+        if tb != db {
+            // Byte-equal failed. The two HF families that pair well
+            // for spec-decode (Llama-3.1 target + Llama-3.2 draft,
+            // Qwen-2.5 target + Qwen-2.5-0.5B draft, etc.) ship
+            // tokenizer.json files that are SEMANTICALLY identical
+            // but serialize merges differently (older `"a b"` strings
+            // vs newer `["a", "b"]` lists) or carry different
+            // whitespace/version metadata. Reject only if the
+            // SEMANTIC token table actually differs.
+            tokenizer_semantic_mismatch_check(&tb, &db, &target_tok, &draft_tok)?;
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    metal_memory_budget_check(config, &target_cfg, &target_dir, &draft_cfg, &draft_dir)?;
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (&target_cfg, &draft_cfg, &target_dir, &draft_dir);
+    }
+    Ok(())
+}
+
+/// Compare two `tokenizer.json` files semantically (not byte-equal).
+///
+/// Pairs from the same family (Llama-3.1-8B target + Llama-3.2-1B
+/// draft, Qwen-2.5-7B target + Qwen-2.5-0.5B draft, etc.) ship
+/// tokenizer.json files that produce identical token IDs but
+/// serialize the merges differently:
+///   * Older HF tokenizers write `model.merges` as
+///     `["a b", "c d", ...]` (space-separated strings).
+///   * Newer tokenizers write `[["a","b"], ["c","d"], ...]` (lists).
+/// Normalize before comparing so cosmetic format drift doesn't block
+/// spec-decode. The actual token IDs are identical iff
+/// (`model.vocab`, `added_tokens`, `normalized(model.merges)`) match.
+fn tokenizer_semantic_mismatch_check(
+    target_bytes: &[u8],
+    draft_bytes: &[u8],
+    target_path: &Path,
+    draft_path: &Path,
+) -> Result<()> {
+    let parse = |bytes: &[u8], path: &Path| -> Result<serde_json::Value> {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .with_context(|| format!("parsing {path:?} as JSON for spec-decode tokenizer check"))
+    };
+    let t = parse(target_bytes, target_path)?;
+    let d = parse(draft_bytes, draft_path)?;
+
+    let normalize_merges = |v: &serde_json::Value| -> Vec<(String, String)> {
+        let arr = match v.as_array() {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for m in arr {
+            if let Some(s) = m.as_str() {
+                if let Some((a, b)) = s.split_once(' ') {
+                    out.push((a.to_string(), b.to_string()));
+                }
+            } else if let Some(pair) = m.as_array()
+                && pair.len() == 2
+                && let (Some(a), Some(b)) = (pair[0].as_str(), pair[1].as_str())
+            {
+                out.push((a.to_string(), b.to_string()));
+            }
+        }
+        out
+    };
+
+    let tv = t.pointer("/model/vocab");
+    let dv = d.pointer("/model/vocab");
+    if tv != dv {
+        anyhow::bail!(
+            "target/draft tokenizer.json mismatch: model.vocab differs ({} vs {} bytes on disk). \
+             Spec-decode requires identical token IDs in both models. \
+             Pick a draft from the same model family as the target.",
+            target_bytes.len(),
+            draft_bytes.len(),
+        );
+    }
+    let ta = t.pointer("/added_tokens");
+    let da = d.pointer("/added_tokens");
+    if ta != da {
+        anyhow::bail!(
+            "target/draft tokenizer.json mismatch: added_tokens differs. \
+             Spec-decode requires identical token IDs in both models. \
+             Pick a draft from the same model family as the target.",
+        );
+    }
+    let tm = normalize_merges(t.pointer("/model/merges").unwrap_or(&serde_json::Value::Null));
+    let dm = normalize_merges(d.pointer("/model/merges").unwrap_or(&serde_json::Value::Null));
+    if tm != dm {
+        anyhow::bail!(
+            "target/draft tokenizer.json mismatch: model.merges differs (normalized {} vs {} entries). \
+             Spec-decode requires identical token IDs in both models. \
+             Pick a draft from the same model family as the target.",
+            tm.len(),
+            dm.len(),
+        );
+    }
+    // Vocab + added_tokens + merges all match semantically — the two
+    // tokenizers produce identical token IDs even though the file
+    // bytes differ. Safe for spec decode.
+    info!(
+        "spec-decode tokenizer.json byte-differs but is semantically identical \
+         (vocab + added_tokens + normalized merges match) — accepted."
+    );
+    Ok(())
+}
+
+/// Coarse memory-budget check for the target+draft pair on Metal.
+///
+/// Checks **resident weight bytes only** — KV cache is paged and sized
+/// dynamically at runtime against whatever the worker reports as
+/// available, so it's the wrong shape to compare against a static
+/// budget here. The goal is to catch obvious misconfigurations (e.g.
+/// 7B + 3B target+draft on a 24 GiB machine) before model load.
+///
+/// Asserts `target_weights + draft_weights <= recommendedMaxWorkingSetSize
+/// * gpu_memory_utilization * 0.6`, reserving ~40% for KV cache,
+/// activations, and other working-set overhead.
+#[cfg(feature = "metal")]
+fn metal_memory_budget_check(
+    config: &VllmConfig,
+    target_cfg: &HfModelConfig,
+    target_dir: &std::path::Path,
+    draft_cfg: &HfModelConfig,
+    draft_dir: &std::path::Path,
+) -> Result<()> {
+    let _ = (target_cfg, draft_cfg);
+    let Some(total) = vllm_executor::metal_info::recommended_max_working_set_size() else {
+        return Ok(()); // No Metal device — skip.
+    };
+    // Reserve at least 40% of the gpu-memory-utilization budget for KV +
+    // activations. Empirically the runtime sizes KV against
+    // `(working_set - currentAllocatedSize) * gpu_memory_utilization`,
+    // so weights consuming >60% leaves KV starved.
+    let weight_budget =
+        (total as f64 * config.gpu_memory_utilization * 0.6).round() as u64;
+
+    let target_weights = weight_bytes_on_disk(target_dir);
+    let draft_weights = weight_bytes_on_disk(draft_dir);
+    let total_w = target_weights + draft_weights;
+
+    if total_w > weight_budget {
+        anyhow::bail!(
+            "estimated combined weight footprint {} > {} (60% of \
+             recommendedMaxWorkingSetSize × gpu_memory_utilization={:.2}). \
+             Breakdown: target_weights={}, draft_weights={}. \
+             Either pick a smaller draft, reduce --gpu-memory-utilization, \
+             or run on a machine with more unified memory.",
+            human_bytes(total_w),
+            human_bytes(weight_budget),
+            config.gpu_memory_utilization,
+            human_bytes(target_weights),
+            human_bytes(draft_weights),
+        );
+    }
+    info!(
+        "spec-decode weight budget OK: target_w={} + draft_w={} = {} / {} weight budget \
+         (Metal working set = {})",
+        human_bytes(target_weights),
+        human_bytes(draft_weights),
+        human_bytes(total_w),
+        human_bytes(weight_budget),
+        human_bytes(total),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn weight_bytes_on_disk(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name();
+            let s = n.to_string_lossy();
+            s.ends_with(".safetensors")
+                || s.ends_with(".gguf")
+                || (s.starts_with("model") && s.ends_with(".bin"))
+        })
+        // `entry.metadata()` reports the *symlink's* own size; HF cache
+        // entries are symlinks into the blob store, so we have to call
+        // `fs::metadata(path)` to follow the link to the actual file.
+        .filter_map(|e| std::fs::metadata(e.path()).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+#[cfg(feature = "metal")]
+fn human_bytes(b: u64) -> String {
+    const GIB: f64 = 1_073_741_824.0;
+    const MIB: f64 = 1_048_576.0;
+    let f = b as f64;
+    if f >= GIB {
+        format!("{:.2} GiB", f / GIB)
+    } else {
+        format!("{:.0} MiB", f / MIB)
+    }
 }
 
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
@@ -671,7 +1035,7 @@ fn initialize_core(
         info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
-    let use_async_scheduling = !config.disable_async_scheduling;
+    let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
     let enable_prefix_caching = config.enable_prefix_caching;
 
     let engine_config = EngineCoreConfig {
@@ -696,16 +1060,7 @@ fn initialize_core(
         engine_index: 0,
         async_scheduling: use_async_scheduling,
         use_spec_decode: config.speculative_model.is_some(),
-        ngram_proposer_config: if config.speculative_model.as_deref() == Some("ngram") {
-            Some(vllm_engine::ngram::NgramProposerConfig {
-                num_speculative_tokens: config.num_speculative_tokens,
-                max_ngram_size: config.ngram_prompt_lookup_max,
-                min_ngram_size: config.ngram_prompt_lookup_min,
-                max_model_len,
-            })
-        } else {
-            None
-        },
+        proposer_config: build_proposer_config(config, max_model_len)?,
         eos_token_ids,
         is_pooling: config.runner == "pooling",
         enable_prefix_caching,
@@ -804,6 +1159,8 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
+                draft_model_path: spec_decode_draft_model_path(config),
+                draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
 
@@ -950,7 +1307,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
         let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
-        let use_async_scheduling = !config.disable_async_scheduling;
+        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
 
         let eos_token_ids: Vec<u32> = hf_config
@@ -989,7 +1346,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
             engine_index: 0,
             async_scheduling: use_async_scheduling,
             use_spec_decode: config.speculative_model.is_some(),
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
@@ -1029,6 +1386,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 /// Used by [`LLM`](crate::llm::LLM). Returns an [`InprocClient`] that the
 /// caller drives directly with `add_request()` + `get_output()`.
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
+    validate_speculative_decoding(config)?;
     let init_start = Instant::now();
 
     // Create progress bar if logging is below INFO level
@@ -1061,6 +1419,7 @@ pub fn initialize_stack(
     config: &VllmConfig,
     progress: Option<Arc<crate::progress::StartupProgress>>,
 ) -> Result<InitializedStack> {
+    validate_speculative_decoding(config)?;
     let init_start = Instant::now();
 
     // Create progress bar if not provided and logging is below INFO level
@@ -1135,7 +1494,7 @@ pub fn initialize_stack(
     };
 
     let mut engine = engine;
-    if !config.disable_async_scheduling {
+    if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
         engine.set_async_scheduling(true);
     }
     if config.runner == "pooling" {
@@ -1267,6 +1626,8 @@ fn initialize_stack_multinode(
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
+            draft_model_path: spec_decode_draft_model_path(config),
+            draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
         let mut worker = FerriteWorker::new(cuda_config);
@@ -1393,7 +1754,7 @@ fn initialize_stack_multinode(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = !config.disable_async_scheduling;
+        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -1415,7 +1776,7 @@ fn initialize_stack_multinode(
             engine_index: 0,
             async_scheduling: use_async_scheduling,
             use_spec_decode: config.speculative_model.is_some(),
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
@@ -1456,7 +1817,7 @@ fn initialize_stack_multinode(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling {
+        if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {
@@ -1486,6 +1847,8 @@ fn initialize_stack_multinode(
 #[cfg(feature = "nccl")]
 pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
     use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
+
+    validate_speculative_decoding(config)?;
 
     let tp_size = config.tensor_parallel_size;
     let node_rank = config.node_rank;
@@ -1539,6 +1902,8 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
             .unwrap_or(CudaGraphMode::Auto),
         eos_token_ids: vec![],
         max_model_len: config.max_model_len,
+        draft_model_path: spec_decode_draft_model_path(config),
+        draft_model_dtype: config.draft_model_dtype.clone(),
     };
 
     let mut worker = FerriteWorker::new(cuda_config);
@@ -1690,6 +2055,8 @@ fn initialize_stack_tp_pp(
                         .unwrap_or(CudaGraphMode::Auto),
                     eos_token_ids: vec![],
                     max_model_len: config.max_model_len,
+                    draft_model_path: spec_decode_draft_model_path(config),
+                    draft_model_dtype: config.draft_model_dtype.clone(),
                 }
             })
             .collect();
@@ -1916,7 +2283,7 @@ fn initialize_stack_tp_pp(
             engine_index: 0,
             async_scheduling: use_async_scheduling,
             use_spec_decode: config.speculative_model.is_some(),
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
@@ -2046,6 +2413,8 @@ fn initialize_stack_tp(
                     .unwrap_or(CudaGraphMode::Auto),
                 eos_token_ids: vec![],
                 max_model_len: config.max_model_len,
+                draft_model_path: spec_decode_draft_model_path(config),
+                draft_model_dtype: config.draft_model_dtype.clone(),
             })
             .collect();
 
@@ -2214,7 +2583,7 @@ fn initialize_stack_tp(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = !config.disable_async_scheduling;
+        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -2236,7 +2605,7 @@ fn initialize_stack_tp(
             engine_index: 0,
             async_scheduling: use_async_scheduling,
             use_spec_decode: config.speculative_model.is_some(),
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
@@ -2285,7 +2654,7 @@ fn initialize_stack_tp(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling {
+        if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {
@@ -2467,6 +2836,8 @@ fn initialize_stack_external(
                 .unwrap_or(CudaGraphMode::Auto),
             eos_token_ids: vec![],
             max_model_len: config.max_model_len,
+            draft_model_path: spec_decode_draft_model_path(config),
+            draft_model_dtype: config.draft_model_dtype.clone(),
         };
 
         let mut worker = FerriteWorker::new(cuda_config);
@@ -2567,7 +2938,7 @@ fn initialize_stack_external(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = !config.disable_async_scheduling;
+        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -2589,7 +2960,7 @@ fn initialize_stack_external(
             engine_index: 0,
             async_scheduling: use_async_scheduling,
             use_spec_decode: config.speculative_model.is_some(),
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids,
             is_pooling: config.runner == "pooling",
             enable_prefix_caching,
@@ -2630,7 +3001,7 @@ fn initialize_stack_external(
             AsyncEngine::new(client, model_name.clone(), max_model_len)
         };
 
-        if !config.disable_async_scheduling {
+        if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {

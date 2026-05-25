@@ -180,17 +180,17 @@ pub fn lower_pair<W: CanonicalParams>(
         // `embedding_gather` to find.
         commands.push(gather_last_token_command::<W>(info.in_slot, info.k));
         barrier_before.push(true);
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
         // lm_head at M=1 via qmv (matvec) — BW-bound on the 197 MB
         // packed weight read on Llama-3.2-3B. ~1.6 ms vs ~12 ms for a
         // qmm_t Standard 1-tile (which does BM=32 wasted m-rows).
         commands.push(lm_head_qmv_command::<W>(&info, profile));
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
         // Post-GEMM scatter: row num_tokens-1 of output := row 0.
         commands.push(scatter_first_to_last_row_command::<W>(info.out_slot, info.n));
         barrier_before.push(true);
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeq));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
 
         // Multi-seq fallback: emit the original lm_head GEMM (the
         // full `M = bucket_m × N = vocab` qmm) gated to fire only
@@ -207,7 +207,7 @@ pub fn lower_pair<W: CanonicalParams>(
         for (i, cmd) in lh.commands.into_iter().enumerate() {
             commands.push(cmd);
             barrier_before.push(*lh.barrier_before.get(i).unwrap_or(&true));
-            runtime_gate.push(Some(RuntimeGate::OnlyIfMultiSeq));
+            runtime_gate.push(Some(RuntimeGate::OnlyIfMultiSeqOrSpec));
         }
     } else {
         // No slice — slice precondition (single AffineQmm lm_head,

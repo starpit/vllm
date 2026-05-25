@@ -225,16 +225,29 @@ pub struct ServeArgs {
     #[arg(long, default_value = "auto")]
     pub pooling_strategy: String,
 
-    /// Speculative decoding model. Currently only "ngram" is supported.
-    /// When set, the engine proposes draft tokens from n-gram matches
-    /// in the request's token history and verifies them in a single
-    /// multi-token forward pass.
+    /// Speculative decoding model.
+    ///
+    /// `ngram` selects the n-gram proposer (matches in the request's own
+    /// token history). Any other value is treated as a draft-model local
+    /// path or HuggingFace repo ID; the draft-model proposer is wired in
+    /// phase 4 of `vllm-rs/DRAFT_SPEC_DECODE_PLAN.md` and the engine will
+    /// refuse to start until then.
     #[arg(long)]
     pub speculative_model: Option<String>,
 
-    /// Number of speculative tokens to propose per step (default: 5).
+    /// Number of speculative tokens to propose per step (default: 2).
     /// Only used when --speculative-model is set.
-    #[arg(long, default_value_t = 5)]
+    ///
+    /// K=2 is the empirical sweet spot for the realistic draft-model
+    /// regime (target much larger than draft, e.g. Llama-3.1-8B
+    /// target + Llama-3.2-1B draft on Apple Silicon). 5-run distribution
+    /// at 8B+1B, M4: baseline 45 ms TPOT → K=1 34, K=2 32, K=4 39,
+    /// K=6 53 (worse than baseline; chain cost overwhelms amortization
+    /// and acceptance drops past K=2). Raise this only after measuring
+    /// on the target+draft pair you care about; on smaller targets
+    /// (e.g. 3B+1B) spec decode loses at any K and the right answer
+    /// is no `--speculative-model`.
+    #[arg(long, default_value_t = 2)]
     pub num_speculative_tokens: usize,
 
     /// Maximum n-gram size for prompt lookup (default: 4).
@@ -246,6 +259,13 @@ pub struct ServeArgs {
     /// Only used when --speculative-model ngram.
     #[arg(long, default_value_t = 1)]
     pub ngram_prompt_lookup_min: usize,
+
+    /// Optional dtype override for the draft model's weights
+    /// ("auto", "float16", "bfloat16", "float32"). Mirrors Python's
+    /// `--speculative-config.draft_model_dtype`. Ignored unless
+    /// --speculative-model points at a draft model.
+    #[arg(long)]
+    pub draft_model_dtype: Option<String>,
 
     /// LoRA adapter to load. Path to a local directory containing
     /// adapter_config.json and adapter_model.safetensors, or a

@@ -487,6 +487,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
+        has_spec_tokens: bool,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder};
@@ -508,7 +509,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         .zip(direct_m_scaling.iter())
                         .zip(runtime_gate.iter())
                     {
-                        if !gate_matches(*gate, num_seqs) {
+                        if !gate_matches(*gate, num_seqs, has_spec_tokens) {
                             continue;
                         }
                         for (buf, off, idx) in bindings {
@@ -550,6 +551,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
+        has_spec_tokens: bool,
         queue: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{
@@ -580,7 +582,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(direct_m_scaling.iter())
                 .zip(runtime_gate.iter())
             {
-                if !gate_matches(*gate, num_seqs) {
+                if !gate_matches(*gate, num_seqs, has_spec_tokens) {
                     continue;
                 }
                 let cb: Retained<ProtocolObject<dyn MTLCommandBuffer>> =
@@ -709,9 +711,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
+        has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, enc, None)
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None)
     }
 
     /// Variant with optional GPU-timestamp instrumentation.
@@ -729,10 +732,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
+        has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         timing: &super::pool::DispatchTimingState,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, enc, Some(timing))
+        self.run_bucket_mtl4_inner(
+            bucket,
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            enc,
+            Some(timing),
+        )
     }
 
     fn run_bucket_mtl4_inner(
@@ -740,6 +751,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         bucket: usize,
         num_tokens: u32,
         num_seqs: u32,
+        has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         mut timing: Option<&super::pool::DispatchTimingState>,
     ) -> Result<(), WorkerError> {
@@ -807,7 +819,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(step.m_scaling.iter())
                 .zip(step.runtime_gate.iter())
             {
-                if !gate_matches(*gate, num_seqs) {
+                if !gate_matches(*gate, num_seqs, has_spec_tokens) {
                     // Skipped: the lm_head slice's gather/qmv/scatter
                     // (gated single-seq) doesn't fire for batched
                     // batches; the M=bucket_m fallback (gated
@@ -1725,11 +1737,19 @@ fn resolve_bindings<W: CanonicalParams>(
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
 /// correct multi-row GEMM result.
-fn gate_matches(gate: Option<super::lowered::RuntimeGate>, num_seqs: u32) -> bool {
+fn gate_matches(
+    gate: Option<super::lowered::RuntimeGate>,
+    num_seqs: u32,
+    has_spec_tokens: bool,
+) -> bool {
     match gate {
         None => true,
-        Some(super::lowered::RuntimeGate::OnlyIfSingleSeq) => num_seqs <= 1,
-        Some(super::lowered::RuntimeGate::OnlyIfMultiSeq) => num_seqs > 1,
+        Some(super::lowered::RuntimeGate::OnlyIfSingleSeqNoSpec) => {
+            num_seqs <= 1 && !has_spec_tokens
+        }
+        Some(super::lowered::RuntimeGate::OnlyIfMultiSeqOrSpec) => {
+            num_seqs > 1 || has_spec_tokens
+        }
     }
 }
 

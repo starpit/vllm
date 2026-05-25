@@ -91,13 +91,24 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
     print_banner(env!("CARGO_PKG_VERSION"), &model);
     info!("Device: {}, dtype: {}", args.device, args.dtype);
     if let Some(ref spec_model) = args.speculative_model {
-        info!(
-            "Speculative decoding: {} (k={}, ngram_max={}, ngram_min={})",
-            spec_model,
-            args.num_speculative_tokens,
-            args.ngram_prompt_lookup_max,
-            args.ngram_prompt_lookup_min
-        );
+        if spec_model == "ngram" {
+            info!(
+                "Speculative decoding (n-gram): k={}, ngram_max={}, ngram_min={}",
+                args.num_speculative_tokens,
+                args.ngram_prompt_lookup_max,
+                args.ngram_prompt_lookup_min,
+            );
+        } else {
+            info!(
+                "Speculative decoding (draft model): {} (k={})",
+                spec_model, args.num_speculative_tokens,
+            );
+            // Phase 5.5 superseded the global-disable env hack with a
+            // runtime gate (`RuntimeGate::OnlyIfSingleSeqNoSpec`) that
+            // skips the lm_head slice on the spec verify batch only;
+            // prefill/decode keep the ~10 ms TTFT win the slice gives.
+            // See ferrite-forward/src/interpreter/metal/lowering.rs.
+        }
     }
     if let Some(ref adapter) = args.lora_adapter {
         info!("LoRA adapter: {}", adapter);
@@ -120,6 +131,7 @@ pub async fn run_serve(args: ServeArgs) -> Result<()> {
         num_speculative_tokens: args.num_speculative_tokens,
         ngram_prompt_lookup_max: args.ngram_prompt_lookup_max,
         ngram_prompt_lookup_min: args.ngram_prompt_lookup_min,
+        draft_model_dtype: args.draft_model_dtype.clone(),
         lora_adapter: args.lora_adapter.clone(),
         pooling_strategy: args.pooling_strategy.clone(),
         tensor_parallel_size: args.tensor_parallel_size,

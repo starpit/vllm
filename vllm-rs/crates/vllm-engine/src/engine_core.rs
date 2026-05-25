@@ -35,7 +35,9 @@ use vllm_protocol::messages::PauseMode;
 
 use crate::error::{EngineError, EngineResult};
 use crate::executor::{Executor, ModelRunnerOutput};
-use crate::ngram::{NgramProposer, NgramProposerConfig};
+use crate::spec_decode::{
+    DraftModelProposer, NgramProposer, Proposer, ProposerConfig, ProposerStepCtx,
+};
 
 // ---------------------------------------------------------------------------
 // EngineCore
@@ -71,8 +73,10 @@ pub struct EngineCore {
     /// Whether async scheduling is enabled.
     async_scheduling: bool,
 
-    /// N-gram proposer for speculative decoding (None when disabled).
-    ngram_proposer: Option<NgramProposer>,
+    /// Speculative-decoding proposer (n-gram or draft-model). `None`
+    /// disables spec decode. Dispatched once per `finalize_step` via the
+    /// [`Proposer`] trait — see [`crate::spec_decode::proposer`].
+    proposer: Option<Box<dyn Proposer + Send>>,
 
     /// EOS token IDs for stop criteria (primary + additional from config).
     eos_token_ids: Vec<u32>,
@@ -104,9 +108,10 @@ pub struct EngineCoreConfig {
     pub async_scheduling: bool,
     /// Whether speculative decoding is enabled.
     pub use_spec_decode: bool,
-    /// N-gram proposer configuration (when `use_spec_decode` is true and
-    /// the speculative model is "ngram").
-    pub ngram_proposer_config: Option<NgramProposerConfig>,
+    /// Speculative-decoding proposer config. `None` disables speculative
+    /// decoding; the two variants (n-gram / draft-model) are routed in
+    /// [`EngineCore::new`].
+    pub proposer_config: Option<ProposerConfig>,
     /// EOS token IDs for stop criteria. Empty disables EOS-based stopping.
     /// Supports models with multiple EOS tokens (e.g. LLaMA 3:
     /// `<|end_of_text|>`, `<|eom_id|>`, `<|eot_id|>`).
@@ -142,13 +147,57 @@ impl EngineCore {
 
         let scheduler = Scheduler::new(&config.scheduler_config, config.max_model_len, kv_cache);
 
-        let ngram_proposer = config.ngram_proposer_config.map(|cfg| {
-            info!(
-                "N-gram speculative decoding enabled: num_speculative_tokens={}, max_ngram_size={}, min_ngram_size={}",
-                cfg.num_speculative_tokens, cfg.max_ngram_size, cfg.min_ngram_size
-            );
-            NgramProposer::new(cfg)
-        });
+        let mut async_scheduling = config.async_scheduling;
+        let proposer: Option<Box<dyn Proposer + Send>> =
+            config.proposer_config.map(|cfg| -> Box<dyn Proposer + Send> {
+                match cfg {
+                    ProposerConfig::Ngram(cfg) => {
+                        info!(
+                            "N-gram speculative decoding enabled: num_speculative_tokens={}, max_ngram_size={}, min_ngram_size={}",
+                            cfg.num_speculative_tokens, cfg.max_ngram_size, cfg.min_ngram_size
+                        );
+                        // Mirror Python vLLM (vllm/config/vllm.py:709-721): force
+                        // sync scheduling for non-EAGLE spec-decode methods. The
+                        // 1-step async lookahead skews proposer-to-verify position
+                        // alignment.
+                        if async_scheduling {
+                            info!(
+                                "N-gram spec decode forces sync scheduling \
+                                 (matches Python vLLM's auto-disable for non-EAGLE methods)."
+                            );
+                            async_scheduling = false;
+                        }
+                        Box::new(NgramProposer::new(cfg))
+                    }
+                    ProposerConfig::DraftModel(cfg) => {
+                        // Phase 4 of DRAFT_SPEC_DECODE_PLAN.md: the worker produces
+                        // K draft tokens per req and stashes them in
+                        // `ModelRunnerOutput.draft_token_ids`. `finalize_step` then
+                        // forwards them to the scheduler, same end-state as the
+                        // n-gram path but with the proposer running GPU-side
+                        // instead of CPU-side. Phase 5.4 will move the K-step
+                        // chain itself into [`DraftModelProposer::propose_for_step`].
+                        info!(
+                            "Draft-model speculative decoding enabled ({}, k={}): worker-side proposer \
+                             producing K drafts per step.",
+                            cfg.model, cfg.num_speculative_tokens,
+                        );
+                        // Async scheduling defers finalize_step by 1 step, so
+                        // drafts proposed in step N take effect in step N+2 — but
+                        // the K-step chain seeds for step N+1, so positions land
+                        // wrong and acceptance is ~0. Force sync scheduling until
+                        // the K-step chain learns to look 2 steps ahead.
+                        if async_scheduling {
+                            info!(
+                                "Draft-model spec decode forces sync scheduling \
+                                 (async would skew proposer-to-verify positions by 1 step)."
+                            );
+                            async_scheduling = false;
+                        }
+                        Box::new(DraftModelProposer::new(cfg))
+                    }
+                }
+            });
 
         info!(
             "EngineCore initialized: max_model_len={}, num_gpu_blocks={}, block_size={}, eos_token_ids={:?}, spec_decode={}, pooling={}",
@@ -156,7 +205,7 @@ impl EngineCore {
             config.num_gpu_blocks,
             config.block_size,
             config.eos_token_ids,
-            ngram_proposer.is_some(),
+            proposer.is_some(),
             config.is_pooling,
         );
 
@@ -167,8 +216,8 @@ impl EngineCore {
             is_shutdown: false,
             start_time: Instant::now(),
             aborts_queue: VecDeque::new(),
-            async_scheduling: config.async_scheduling,
-            ngram_proposer,
+            async_scheduling,
+            proposer,
             eos_token_ids: config.eos_token_ids,
             is_pooling: config.is_pooling,
             block_size: config.block_size,
@@ -395,26 +444,57 @@ impl EngineCore {
         // 3. Update scheduler state and build outputs.
         let mut outputs = self.update_from_output(scheduler_output, model_output);
 
-        // 4. Propose speculative draft tokens for running requests.
-        if let Some(ref proposer) = self.ngram_proposer {
-            for req_id in scheduler_output.num_scheduled_tokens.keys() {
-                let should_propose = self
-                    .scheduler
-                    .get_request(req_id)
-                    .is_some_and(|r| !r.status.is_finished() && !r.all_token_ids.is_empty());
-                if !should_propose {
+        // 4. Propose speculative draft tokens for running requests via
+        //    the Proposer trait. Two impls today: NgramProposer (CPU
+        //    n-gram lookup) reads per-request history; DraftModelProposer
+        //    reads worker-side drafts out of `model_output.draft_token_ids`.
+        //    Both shapes funnel through the same `propose_for_step` →
+        //    `set_spec_token_ids` flow here.
+        if let Some(ref mut proposer) = self.proposer {
+            let scheduled_req_ids: Vec<&str> = scheduler_output
+                .num_scheduled_tokens
+                .keys()
+                .map(String::as_str)
+                .collect();
+            // `get_all_tokens` borrows the scheduler immutably; the
+            // backend borrows the executor mutably. Resolve both into
+            // owned data / a separate borrow before building ctx so
+            // there's no overlap of scheduler + executor borrows.
+            let scheduler_ref = &self.scheduler;
+            let get_all_tokens = |req_id: &str| -> Option<Vec<u32>> {
+                scheduler_ref.get_request(req_id).and_then(|r| {
+                    if r.status.is_finished() {
+                        None
+                    } else {
+                        Some(r.all_token_ids.clone())
+                    }
+                })
+            };
+            let backend = self
+                .executor
+                .as_mut()
+                .and_then(|e| e.spec_decode_backend());
+            let mut ctx = ProposerStepCtx {
+                scheduled_req_ids: &scheduled_req_ids,
+                get_all_tokens: &get_all_tokens,
+                worker_drafts: model_output.draft_token_ids.as_ref(),
+                backend,
+                draft_seed: model_output.draft_seed_inputs.as_ref(),
+                sampled_token_ids: Some(&model_output.sampled_token_ids),
+            };
+            let drafts_map = proposer.propose_for_step(&mut ctx);
+            for (req_id, drafts) in drafts_map {
+                if drafts.is_empty() {
                     continue;
                 }
-                let all_token_ids: Vec<u32> = self
+                let still_running = self
                     .scheduler
-                    .get_request(req_id)
-                    .unwrap()
-                    .all_token_ids
-                    .clone();
-                let drafts = proposer.propose(&all_token_ids);
-                if !drafts.is_empty() {
-                    self.scheduler.set_spec_token_ids(req_id, drafts);
+                    .get_request(&req_id)
+                    .is_some_and(|r| !r.status.is_finished() && !r.all_token_ids.is_empty());
+                if !still_running {
+                    continue;
                 }
+                self.scheduler.set_spec_token_ids(&req_id, drafts);
             }
         }
 
@@ -926,7 +1006,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
             enable_prefix_caching: false,
@@ -1405,12 +1485,14 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: true,
-            ngram_proposer_config: Some(NgramProposerConfig {
-                num_speculative_tokens: 3,
-                max_ngram_size: 3,
-                min_ngram_size: 1,
-                max_model_len: 4096,
-            }),
+            proposer_config: Some(crate::spec_decode::ProposerConfig::Ngram(
+                crate::spec_decode::NgramProposerConfig {
+                    num_speculative_tokens: 3,
+                    max_ngram_size: 3,
+                    min_ngram_size: 1,
+                    max_model_len: 4096,
+                },
+            )),
             eos_token_ids: vec![],
             is_pooling: false,
             enable_prefix_caching: false,
@@ -1422,7 +1504,7 @@ mod tests {
         let config = make_spec_decode_config();
         let executor = Box::new(NoopExecutor::new(1024));
         let engine = EngineCore::new(config, executor);
-        assert!(engine.ngram_proposer.is_some());
+        assert!(engine.proposer.is_some());
     }
 
     #[test]
@@ -1430,7 +1512,7 @@ mod tests {
         let config = make_test_config();
         let executor = Box::new(NoopExecutor::new(1024));
         let engine = EngineCore::new(config, executor);
-        assert!(engine.ngram_proposer.is_none());
+        assert!(engine.proposer.is_none());
     }
 
     #[test]

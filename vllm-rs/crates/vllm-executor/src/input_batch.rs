@@ -489,66 +489,6 @@ pub struct ReqSlice {
 }
 
 // ---------------------------------------------------------------------------
-// Greedy rejection sampling (pure, no GPU dependency)
-// ---------------------------------------------------------------------------
-
-/// Result of greedy rejection sampling for a single request.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RejectionResult {
-    /// Accepted token IDs (target argmax values). Length is 1..=num_drafts+1.
-    /// On full acceptance: K target-verified tokens + 1 bonus token.
-    /// On partial acceptance: M target-verified tokens + 1 recovered token.
-    /// On first rejection: 1 recovered token.
-    pub accepted_tokens: Vec<u32>,
-    /// Number of draft tokens that were accepted (0..=num_drafts).
-    pub num_accepted_drafts: usize,
-}
-
-/// Perform greedy rejection sampling for one request.
-///
-/// Given `target_ids` (argmax of the model's logits at each position) and
-/// `draft_token_ids` (proposed draft tokens), accept the longest prefix of
-/// matching drafts and return the accepted tokens.
-///
-/// Layout:
-/// - `target_ids[0]` = argmax at the real token position (verifies draft[0])
-/// - `target_ids[i]` = argmax at draft[i-1] position (verifies draft[i])
-/// - `target_ids[K]` = bonus token (only used if all K drafts accepted)
-///
-/// This matches Python vLLM's `_rejection_sample_kernel` for greedy decoding.
-pub fn greedy_rejection_sample(target_ids: &[u32], draft_token_ids: &[u32]) -> RejectionResult {
-    if draft_token_ids.is_empty() {
-        // Normal request: no drafts, just 1 token.
-        return RejectionResult {
-            accepted_tokens: vec![target_ids[0]],
-            num_accepted_drafts: 0,
-        };
-    }
-
-    let mut accepted = Vec::with_capacity(draft_token_ids.len() + 1);
-
-    for i in 0..draft_token_ids.len() {
-        let target = target_ids[i];
-        accepted.push(target);
-        if target != draft_token_ids[i] {
-            // Mismatch: target is the recovered token. Stop.
-            return RejectionResult {
-                num_accepted_drafts: i,
-                accepted_tokens: accepted,
-            };
-        }
-    }
-
-    // All drafts accepted — append bonus token from the last logit position.
-    let bonus = target_ids[draft_token_ids.len()];
-    accepted.push(bonus);
-    RejectionResult {
-        num_accepted_drafts: draft_token_ids.len(),
-        accepted_tokens: accepted,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -861,93 +801,9 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Greedy rejection sampling tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_rejection_no_drafts() {
-        // Normal request: no draft tokens, single target token.
-        let result = greedy_rejection_sample(&[42], &[]);
-        assert_eq!(result.accepted_tokens, vec![42]);
-        assert_eq!(result.num_accepted_drafts, 0);
-    }
-
-    #[test]
-    fn test_rejection_all_accept() {
-        // All 3 draft tokens match target argmax → 3 accepted + 1 bonus = 4 tokens.
-        // Drafts:     [10, 20, 30]
-        // Target IDs: [10, 20, 30, 99]  (99 = bonus)
-        let result = greedy_rejection_sample(&[10, 20, 30, 99], &[10, 20, 30]);
-        assert_eq!(result.accepted_tokens, vec![10, 20, 30, 99]);
-        assert_eq!(result.num_accepted_drafts, 3);
-    }
-
-    #[test]
-    fn test_rejection_first_reject() {
-        // First draft doesn't match → output 1 recovered token.
-        // Drafts:     [10, 20, 30]
-        // Target IDs: [77, ...]  (77 != 10)
-        let result = greedy_rejection_sample(&[77, 20, 30, 99], &[10, 20, 30]);
-        assert_eq!(result.accepted_tokens, vec![77]);
-        assert_eq!(result.num_accepted_drafts, 0);
-    }
-
-    #[test]
-    fn test_rejection_partial_accept_middle() {
-        // First 2 drafts match, 3rd doesn't → 2 accepted + 1 recovered = 3 tokens.
-        // Drafts:     [10, 20, 30]
-        // Target IDs: [10, 20, 55, 99]  (55 != 30)
-        let result = greedy_rejection_sample(&[10, 20, 55, 99], &[10, 20, 30]);
-        assert_eq!(result.accepted_tokens, vec![10, 20, 55]);
-        assert_eq!(result.num_accepted_drafts, 2);
-    }
-
-    #[test]
-    fn test_rejection_partial_accept_second() {
-        // First draft matches, second doesn't → 1 accepted + 1 recovered = 2 tokens.
-        // Drafts:     [10, 20, 30]
-        // Target IDs: [10, 88, 30, 99]  (88 != 20)
-        let result = greedy_rejection_sample(&[10, 88, 30, 99], &[10, 20, 30]);
-        assert_eq!(result.accepted_tokens, vec![10, 88]);
-        assert_eq!(result.num_accepted_drafts, 1);
-    }
-
-    #[test]
-    fn test_rejection_single_draft_accept() {
-        // Single draft token, matches.
-        let result = greedy_rejection_sample(&[10, 99], &[10]);
-        assert_eq!(result.accepted_tokens, vec![10, 99]);
-        assert_eq!(result.num_accepted_drafts, 1);
-    }
-
-    #[test]
-    fn test_rejection_single_draft_reject() {
-        // Single draft token, doesn't match.
-        let result = greedy_rejection_sample(&[77, 99], &[10]);
-        assert_eq!(result.accepted_tokens, vec![77]);
-        assert_eq!(result.num_accepted_drafts, 0);
-    }
-
-    #[test]
-    fn test_rejection_five_drafts_all_accept() {
-        // 5 drafts, all match → 5 accepted + 1 bonus = 6 tokens.
-        let drafts = vec![1, 2, 3, 4, 5];
-        let targets = vec![1, 2, 3, 4, 5, 99];
-        let result = greedy_rejection_sample(&targets, &drafts);
-        assert_eq!(result.accepted_tokens, vec![1, 2, 3, 4, 5, 99]);
-        assert_eq!(result.num_accepted_drafts, 5);
-    }
-
-    #[test]
-    fn test_rejection_five_drafts_last_reject() {
-        // 5 drafts, last one doesn't match → 4 accepted + 1 recovered = 5 tokens.
-        let drafts = vec![1, 2, 3, 4, 5];
-        let targets = vec![1, 2, 3, 4, 77, 99];
-        let result = greedy_rejection_sample(&targets, &drafts);
-        assert_eq!(result.accepted_tokens, vec![1, 2, 3, 4, 77]);
-        assert_eq!(result.num_accepted_drafts, 4);
-    }
+    // Rejection-sample unit tests live with their owning module:
+    //   `vllm-engine/src/spec_decode/verify.rs`. Local copies removed
+    //   in phase 5.5 along with the `pub use` shim.
 
     /// Regression test for the super-fast graph path deferred commit bug.
     ///

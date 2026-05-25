@@ -105,6 +105,12 @@ impl Executor for UniProcExecutor {
             .map_err(|e| vllm_engine::error::EngineError::Executor(e.to_string()))
     }
 
+    fn spec_decode_backend(
+        &mut self,
+    ) -> Option<&mut dyn vllm_engine::spec_decode::SpecDecodeBackend> {
+        self.worker.spec_decode_backend()
+    }
+
     fn initialize_cache(
         &mut self,
         num_gpu_blocks: usize,
@@ -345,7 +351,7 @@ mod tests {
             engine_index: 0,
             async_scheduling: false,
             use_spec_decode: false,
-            ngram_proposer_config: None,
+            proposer_config: None,
             eos_token_ids: vec![],
             is_pooling: false,
             enable_prefix_caching: false,

@@ -6263,16 +6263,23 @@ pub fn emit_model(
         // by `lower_bucket` (one bool per `OpInstance`). Length
         // tracks the corresponding instructions static. Runtime
         // consumes via `MetalBucketSpec.{backbone,lm_head}_barriers`.
-        let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
-        let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
-        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
-            &bb_barriers_ident,
-            &lowered.backbone.barriers,
-        ));
-        static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
-            &lh_barriers_ident,
-            &lowered.lm_head.barriers,
-        ));
+        // The dataflow helper lives under `crate::metal`, which is
+        // itself `#[cfg(feature = "metal")]`, so the call sites must
+        // match — without the metal feature these statics aren't
+        // referenced (METAL_BUCKETS is also metal-gated).
+        #[cfg(feature = "metal")]
+        {
+            let bb_barriers_ident = bucket_static_ident("BACKBONE_BARRIERS_M", *wp);
+            let lh_barriers_ident = bucket_static_ident("LM_HEAD_BARRIERS_M", *wp);
+            static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+                &bb_barriers_ident,
+                &lowered.backbone.barriers,
+            ));
+            static_slices.push(crate::metal::dataflow::emit_bucket_barriers_static(
+                &lh_barriers_ident,
+                &lowered.lm_head.barriers,
+            ));
+        }
     }
 
     // `sk_axis_active`: true when the model declared `sk_buckets`;
@@ -6540,14 +6547,14 @@ pub fn emit_model(
 
     // Vocab size — baked from `model.bounds["vocab_size"]` at
     // macro-expansion time. The metal forward body needs it to
-    // shape the `OwnedTensor` it returns from the tape_index's terminal
-    // arena slot ([num_tokens, vocab_size] f16 logits).
+    // shape the `OwnedTensor` it returns from the tape_index's
+    // terminal arena slot ([num_tokens, vocab_size] f16 logits).
+    // Vision-only encoders (qwen2-vl, gemma3-mm, etc) don't carry a
+    // vocab and never reach the lm_head terminal, so default to 0 —
+    // the emitted `METAL_VOCAB_SIZE` is metal-gated and unreferenced
+    // on those archs. Cuda builds skip the constant entirely.
     let vocab_size_lit = {
-        let vocab = model
-            .bounds
-            .get("vocab_size")
-            .copied()
-            .expect("model.bounds must carry `vocab_size`");
+        let vocab = model.bounds.get("vocab_size").copied().unwrap_or(0);
         proc_macro2::Literal::u64_unsuffixed(vocab)
     };
 

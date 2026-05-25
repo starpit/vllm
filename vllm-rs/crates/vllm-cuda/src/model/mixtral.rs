@@ -883,7 +883,8 @@ impl MixtralForCausalLM {
             layer.self_attn.tp_group = Some(Arc::clone(&group));
             match &mut layer.block_sparse_moe {
                 MixtralMoE::Dense(moe) => {
-                    moe.tp_group = Some(Arc::clone(&group));
+                    let FusedMoELayer::Dense(inner) = moe;
+                    inner.tp_group = Some(Arc::clone(&group));
                 }
                 MixtralMoE::Quantized(moe) => {
                     moe.tp_group = Some(Arc::clone(&group));

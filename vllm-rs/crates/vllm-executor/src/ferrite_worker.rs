@@ -3857,6 +3857,7 @@ impl FerriteWorker {
             logprobs: None,
             prompt_logprobs_dict: HashMap::new(),
             draft_token_ids: None,
+            draft_seed_inputs: None,
             pooler_output: None,
             d2h_resolver: None,
         })

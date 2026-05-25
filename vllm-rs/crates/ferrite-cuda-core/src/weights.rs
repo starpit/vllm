@@ -731,6 +731,8 @@ impl GpuWeights {
             // `MetalAllocator` exposes `register_mmap`.
             #[cfg(feature = "metal")]
             allocator.register_mmap(&dir.join(shard_name), Arc::clone(&mmap))?;
+            #[cfg(not(feature = "metal"))]
+            let _ = shard_name;
             mmaps.push(mmap);
         }
 

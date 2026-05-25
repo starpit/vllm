@@ -3480,8 +3480,47 @@ pub fn weight_accessors_to_slots(accessors: &[crate::impl_lib::WeightAccessor]) 
 pub fn instruction_weight_count(inst: &Instruction) -> usize {
     use Instruction as I;
     match inst {
-        // Single LinearLayer per instance.
-        I::AffineQmm(..) | I::Gemm(..) => 1,
+        // Single LinearLayer / quant-sibling per instance — dense Gemm
+        // + every cutlass tile-zoo variant emits one `LinearLayer`
+        // accessor; the GEMM-then-bias / GEMM-then-add fusions wrap
+        // that single accessor in a richer epilogue. Quant flavors
+        // (Marlin / Bnb4 / Ggml / Fp8) hit the same eval shape via
+        // their own typed accessor (`marlin_at`, `bnb4_at`,
+        // `ggml_at`, `fp8_at`).
+        I::AffineQmm(..)
+        | I::Gemm(..)
+        | I::CutlassGemm(..)
+        | I::CutlassGemv(..)
+        | I::CutlassGemmSplitK(..)
+        | I::CutlassGemmAdd(..)
+        | I::CutlassFusedGemmBias(..)
+        | I::FusedCublasGemmAdd(..)
+        | I::FusedGemmBias(..)
+        | I::Fp8Gemm(..)
+        | I::Fp8FusedGemmBias(..)
+        | I::MarlinGemm(..)
+        | I::GgmlGemm(..)
+        | I::Bnb4Gemm(..) => 1,
+        // Singleton rmsnorm flavors. `ScalarOffsetRmsNorm` is Gemma2/
+        // Gemma3-style zero-init `(1 + w)`; `MeanSubRmsNorm` and
+        // `MeanSubRmsNormBiasAdd` are Cohere-style mean-subtract +
+        // rms; `FusedAddRmsNormWithOffset` is the Gemma-style
+        // residual-stream variant that folds the +offset into the
+        // norm. Each resolves one weight accessor at slot 0.
+        I::ScalarOffsetRmsNorm(..)
+        | I::MeanSubRmsNorm(..)
+        | I::MeanSubRmsNormBiasAdd(..)
+        | I::FusedAddRmsNormWithOffset(..) => 1,
+        // CUTLASS fused (RmsNorm-flavor + Gemm) — the norm weight and
+        // the GEMM weight ride as separate accessors because the
+        // CUTLASS epilogue still expects a contiguous `[M, K]` post-
+        // norm input. RmsNorm at slot 0 + Linear at slot 0.
+        I::CutlassFusedRmsNormGemm(..)
+        | I::CutlassFusedMeanSubRmsNormGemm(..)
+        | I::CutlassFusedAddRmsNormGemm(..) => 2,
+        // Vision positional embedding (LLaVA / Qwen2-VL family).
+        // Resolves one `Embedding` accessor at slot 0.
+        I::PosEmbed(..) => 1,
         // Singleton bias-add (Qwen2-style biased QKV when the synth
         // megakernel doesn't claim the chain). Resolves the upstream
         // Gemm's `LinearLayer::affine_linear_bias` via its own
@@ -3491,6 +3530,7 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         I::MetalBiasAdd(..) => 1,
         // Single typed embedding.
         I::Embed(..) => 1,
+        #[cfg(feature = "metal")]
         I::AffineEmbed(..) => 1,
         // Single RmsNorm.
         I::RmsNorm(..) | I::FusedAddRmsNorm(..) => 1,
@@ -3500,36 +3540,64 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         // rotary check, not counted here.
         I::SynthPreAttn(..) => 4,
         I::SynthMlpPreDown(..) => 3,
+        #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(..) => 2,
-        // Fused QKV+RoPE family (cuda). Same 3-LinearLayer shape as
-        // SynthPreAttn minus RmsNorm (RmsNorm is upstream/separate).
+        // Fused QKV+RoPE family (cuda). The dense + cutlass + quant
+        // (marlin / bnb4 / ggml / fp8) variants all run a SINGLE
+        // packed `[q | k | v]` GEMM through one accessor — the loader
+        // concats the three projection weights at load time and
+        // `required_weights` returns one `LinearLayer` (or quant
+        // sibling) covering the whole packed weight. The runtime
+        // eval reads exactly `linear_at(bucket, op_idx, 0, layer)`.
         I::FusedQkvRopeCache(..)
-        | I::FusedQkvQkNormRopeCache(..)
         | I::FusedQkvRopePrefill(..)
         | I::CutlassFusedQkvRopeCache(..)
-        | I::CutlassFusedQkvRopePrefill(..) => 3,
+        | I::CutlassFusedQkvRopePrefill(..)
+        | I::MarlinFusedQkvRopeCache(..)
+        | I::MarlinFusedQkvRopePrefill(..)
+        | I::Bnb4FusedQkvRopeCache(..)
+        | I::Bnb4FusedQkvRopePrefill(..)
+        | I::GgmlFusedQkvRopeCache(..)
+        | I::GgmlFusedQkvRopePrefill(..)
+        | I::Fp8FusedQkvRopeCache(..)
+        | I::Fp8FusedQkvRopePrefill(..) => 1,
+        // Qwen3-style fused QK-norm path can't fold the three
+        // projection weights together — `qk_norm_rope_inplace` needs
+        // contiguous `[T, num_heads, head_dim]` Q/K, which a packed
+        // cuBLAS output doesn't deliver — so this Impl emits three
+        // separate `LinearLayer` accessors plus two `RmsNorm`
+        // accessors (q_norm / k_norm). CosSin is auto-injected by
+        // the rotary check, not counted here.
+        I::FusedQkvQkNormRopeCache(..) => 5,
         // Dense + quant-flavored fused Gate/Up+SiluMul: a single
         // packed `[gate|up]` LinearLayer accessor (loader concats the
         // two source weights at load time). The Affine path decomposes
         // into separate `AffineQmm` + `AffineQmm` + `SiluMul` emits via
         // `affine_decomposed_fan_out` and never reaches this arm.
         I::FusedGateUpSiluMul(..)
+        | I::FusedGateUpGeluMul(..)
         | I::CutlassFusedGateUpSiluMul(..)
+        | I::CutlassFusedGateUpGeluMul(..)
         | I::MarlinFusedGateUpSiluMul(..)
+        | I::MarlinFusedGateUpGeluMul(..)
         | I::Bnb4FusedGateUpSiluMul(..)
+        | I::Bnb4FusedGateUpGeluMul(..)
         | I::GgmlFusedGateUpSiluMul(..)
-        | I::Fp8FusedGateUpSiluMul(..) => 1,
+        | I::GgmlFusedGateUpGeluMul(..)
+        | I::Fp8FusedGateUpSiluMul(..)
+        | I::Fp8FusedGateUpGeluMul(..) => 1,
         // MoE Instructions consume one full MoE layer accessor
-        // (`FusedMoELayer` / `SharedFusedMoELayer` enum). The Impl's
-        // `required_weights` returns exactly one accessor per
-        // Instruction; counting it here makes the macro register a
-        // (bucket, op_idx, 0) → wm.<base>(layer) arm on the
-        // appropriate accessor method (`fused_moe_at` or
-        // `shared_fused_moe_at`). Without this slot the per-arch
-        // `WeightAccessors` impl falls back to the trait's
-        // `unreachable!()` default and panics at first MoE forward.
+        // (`FusedMoELayer` / `SharedFusedMoELayer` / `DeepSeekV2MoELayer`
+        // / Fp8 / Ggml siblings). The Impl's `required_weights`
+        // returns exactly one accessor per Instruction; counting it
+        // here makes the macro register a (bucket, op_idx, 0) →
+        // wm.<base>(layer) arm on the appropriate accessor method.
+        // Without this slot the per-arch `WeightAccessors` impl falls
+        // back to the trait's `unreachable!()` default and panics at
+        // first MoE forward.
         I::FusedMoe(..) | I::MetalFusedMoe(..) => 1,
         I::SharedFusedMoe(..) | I::MetalSharedFusedMoe(..) => 1,
+        I::DeepSeekMoe(..) | I::DeepSeekMoeFp8Block(..) | I::DeepSeekMoeGgml(..) => 1,
         // Everything else: no codegen-time weight, or weight resolved
         // via a different path (MetalBiasAdd through the upstream
         // Linear's `AffineLinearBias` field, attention reads through

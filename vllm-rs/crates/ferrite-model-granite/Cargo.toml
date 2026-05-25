@@ -7,7 +7,7 @@ description = "Ferrite Granite architecture (one #[forward] body)"
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
 # Tensor-parallel: forwards through to ferrite-forward/nccl, which gates the
 # `Instruction::AllReduce` variant + `ForwardCtx::tp_group` field. Until task
 # #7 emits tp>1 variants, enabling this feature still produces a tp=1 build —

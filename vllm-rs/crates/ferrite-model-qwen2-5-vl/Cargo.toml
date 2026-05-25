@@ -7,7 +7,7 @@ description = "Ferrite Qwen2.5-VL vision tower (text decoder is shared via ferri
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda", "ferrite-forward-macro/cuda"]
 metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
 nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-vision/nccl"]
 

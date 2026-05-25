@@ -478,6 +478,15 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
             if cfg!(feature = "metal") && !preset_name.starts_with("mlx-affine-") {
                 continue;
             }
+            // CUDA: the mirror — `mlx-affine-*` weights are an Apple
+            // checkpoint format with no CUDA Impl in the pool (the
+            // Affine quant flow lives entirely in the metal kernels).
+            // Skip them so the cuda solver doesn't fail with
+            // `UnclaimedTile` on `Embed` / `Gemm` for the Affine
+            // storage tag.
+            if cfg!(feature = "cuda") && preset_name.starts_with("mlx-affine-") {
+                continue;
+            }
             let preset_path = preset_root.join(format!("{preset_name}.json"));
             let (_, preset_json) = read_json_file(&preset_path)?;
 

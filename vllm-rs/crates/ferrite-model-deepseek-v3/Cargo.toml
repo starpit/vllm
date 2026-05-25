@@ -7,7 +7,7 @@ description = "Ferrite DeepSeek V3 architecture (q_lora_rank Q path + sigmoid Mo
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
 metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
 # Tensor-parallel: forwards through to ferrite-forward/nccl, which gates the
 # `Instruction::AllReduce` variant + `ForwardCtx::tp_group` field. Until task

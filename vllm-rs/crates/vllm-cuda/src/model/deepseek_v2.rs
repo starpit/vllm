@@ -1830,7 +1830,8 @@ impl DeepSeekV2ForCausalLM {
             layer.self_attn.tp_group = Some(Arc::clone(&group));
             match &mut layer.mlp {
                 DeepSeekV2Mlp::MoE(moe) => {
-                    moe.moe.tp_group = Some(Arc::clone(&group));
+                    let FusedMoELayer::Dense(inner) = &mut moe.moe;
+                    inner.tp_group = Some(Arc::clone(&group));
                 }
                 DeepSeekV2Mlp::Dense(mlp) => {
                     mlp.tp_group = Some(Arc::clone(&group));

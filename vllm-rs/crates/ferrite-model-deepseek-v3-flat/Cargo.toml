@@ -7,7 +7,7 @@ description = "Ferrite DeepSeek V3 architecture, flat-Q variant (q_lora_rank=nul
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
 metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
 
 [dependencies]

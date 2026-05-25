@@ -3349,6 +3349,9 @@ impl Instruction {
                      never lift to forward-time (Marlin/Bnb keep dense embed)"
                 );
             }
+            Instruction::StripCls(_, _) => {
+                unimplemented!("Instruction::StripCls eval is unwired");
+            }
             Instruction::Loop(_, _) => {
                 unreachable!("Instruction::Loop should be handled by run(), not eval()");
             }

@@ -7,7 +7,7 @@ description = "Ferrite Qwen2-MoE / Qwen1.5-MoE architecture (one #[forward] body
 
 [features]
 default = []
-cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda"]
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
 metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
 nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
 

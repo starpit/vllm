@@ -1141,7 +1141,8 @@ impl Qwen2MoeForCausalLM {
                     mlp.tp_group = Some(Arc::clone(&group));
                 }
                 Qwen2MoeMlp::MoE { moe, .. } => {
-                    moe.tp_group = Some(Arc::clone(&group));
+                    let FusedMoELayer::Dense(inner) = moe;
+                    inner.tp_group = Some(Arc::clone(&group));
                 }
                 Qwen2MoeMlp::QuantizedMoE(layer) => {
                     layer.moe.tp_group = Some(Arc::clone(&group));

@@ -23,7 +23,7 @@ use crate::ir::substrate::{PageRef, ScratchOffsetRef};
 
 use super::cu::{CuBlock, CuExpr, CuStmt};
 use super::handles::{
-    F32, RtRow, gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_positions,
+    Bf16, F32, RtRow, St, gmem_act_ptr_raw, gmem_barrier_slot_ptr, gmem_input_ids, gmem_positions,
     gmem_weight_ptr_raw, gmem_weight_ptr_raw_offset, page_as_byte_ptr, page_as_st_bf,
     page_as_sv_bf, page_consumed_sem, page_done_sem, page_ready_sem, page_row_as_sv_bf,
     scratch_as,
@@ -2902,7 +2902,8 @@ pub fn render_fused_qkv_rope_cache<
         return RoleBodies::skipped("TkFusedQkvRopeCache");
     }
     // M%16!=0 → vec-mat decode-shape (small-batch decode).
-    // M%16==0 → tile-MMA prefill-shape.
+    // M%16==0 → tile-MMA prefill-shape, dispatch onto fixed
+    // M_BLOCKS so wgmma const-asserts only fire at those instantiations.
     if M % 16 != 0 {
         return render_fused_qkv_rope_cache_decode::<
             M, HIDDEN_DIM, HEAD_DIM, Q_DIM, KV_DIM, QKV_N, TILE_N, NCW, NUM_LAYERS, ITERS,
@@ -2928,6 +2929,113 @@ pub fn render_fused_qkv_rope_cache<
             qkv_b_tile_offset,
         );
     }
+    if M == 64 {
+        return render_fused_qkv_rope_cache_prefill_wgmma::<
+            1, 64, HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, Q_DIM, KV_DIM, QKV_N,
+            TILE_N, HEADS_PER_WARP, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, qkv_weight_page_id, cos_sin_page_id,
+            q_out_page_id, k_out_page_id, v_out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, q_out_act_slot, k_out_act_slot, v_out_act_slot,
+            qkv_weight_accessor, rotary_accessor, bar_publish,
+            q_rope_offset, k_rope_offset, qkv_b_tile_offset,
+        );
+    } else if M == 512 {
+        return render_fused_qkv_rope_cache_prefill_wgmma::<
+            8, 512, HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, Q_DIM, KV_DIM, QKV_N,
+            TILE_N, HEADS_PER_WARP, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, qkv_weight_page_id, cos_sin_page_id,
+            q_out_page_id, k_out_page_id, v_out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, q_out_act_slot, k_out_act_slot, v_out_act_slot,
+            qkv_weight_accessor, rotary_accessor, bar_publish,
+            q_rope_offset, k_rope_offset, qkv_b_tile_offset,
+        );
+    } else if M == 4096 {
+        return render_fused_qkv_rope_cache_prefill_wgmma::<
+            64, 4096, HIDDEN_DIM, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, Q_DIM, KV_DIM, QKV_N,
+            TILE_N, HEADS_PER_WARP, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, qkv_weight_page_id, cos_sin_page_id,
+            q_out_page_id, k_out_page_id, v_out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, q_out_act_slot, k_out_act_slot, v_out_act_slot,
+            qkv_weight_accessor, rotary_accessor, bar_publish,
+            q_rope_offset, k_rope_offset, qkv_b_tile_offset,
+        );
+    } else {
+        panic!("render_fused_qkv_rope_cache prefill: unsupported M (must be 64/512/4096); got {M}");
+    }
+}
+
+// ============================================================
+// FusedQkvRopeCache (prefill — TK 2.0 H100 wgmma SMEM+SMEM).
+//
+// Outer m-block loop wrapping a per-warpgroup, per-head inner
+// loop. Each (m_block, head) iteration:
+//   1. Computes the global N column for this head: warpgroup_id
+//      contributes the warpgroup's column block (HEADS_PER_WG * HEAD_DIM
+//      cols), inner head index __qkv_h adds HEAD_DIM cols.
+//   2. Subtiles A=st_bf<64, HIDDEN_DIM> at (m_block, 0) and
+//      B=st_bf<HIDDEN_DIM, HEAD_DIM> at (0, __qkv_col / HEAD_DIM).
+//   3. Zeros warpgroup-distributed acc rt_fl<16, HEAD_DIM>, mma_AB
+//      D = A*B, mma_async_wait.
+//   4. Routes by __qkv_col to one of three branches:
+//        Q (__qkv_col < Q_DIM): warpgroup::store acc → stg subtile
+//          of __qkv_q_rope; warpgroup::apply RoPE lambda on acc;
+//          warpgroup::store acc → out subtile of q_out_smem.
+//        K (Q_DIM ≤ __qkv_col < Q_DIM+KV_DIM): same RoPE flow into
+//          __qkv_k_rope and k_out_smem.
+//        V (otherwise): warpgroup::store acc → out subtile of
+//          v_out_smem (no RoPE).
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_fused_qkv_rope_cache_prefill_wgmma<
+    const M_BLOCKS: u32,
+    const M_TOTAL: u32,
+    const HIDDEN_DIM: u32,
+    const HEAD_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const Q_DIM: u32,
+    const KV_DIM: u32,
+    const QKV_N: u32,
+    const TILE_N: u32,
+    const HEADS_PER_WARP: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    qkv_weight_page_id: u32,
+    cos_sin_page_id: u32,
+    q_out_page_id: u32,
+    k_out_page_id: u32,
+    v_out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    q_out_act_slot: u32,
+    k_out_act_slot: u32,
+    v_out_act_slot: u32,
+    qkv_weight_accessor: u32,
+    rotary_accessor: u32,
+    bar_publish: u32,
+    q_rope_offset: u32,
+    k_rope_offset: u32,
+    qkv_b_tile_offset: u32,
+) -> RoleBodies {
+    const { assert!(NCW % 4 == 0, "render_fused_qkv_rope_cache prefill: NCW must be a multiple of 4 (warpgroup size)"); }
+    const { assert!(M_BLOCKS >= 1, "render_fused_qkv_rope_cache prefill: M_BLOCKS must be >= 1"); }
+    const { assert!(M_TOTAL == M_BLOCKS * 64, "render_fused_qkv_rope_cache prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+
+    const M_TILE: u32 = 64;
+    let num_warpgroups: u32 = NCW / 4;
+    let heads_per_wg: u32 = HEADS_PER_WARP * 4;
 
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
@@ -2937,10 +3045,10 @@ pub fn render_fused_qkv_rope_cache<
     let k_out_p = page(k_out_page_id);
     let v_out_p = page(v_out_page_id);
 
-    let in_smem = page_as_st_bf::<M, HIDDEN_DIM>(in_p);
-    let q_out_smem = page_as_st_bf::<M, Q_DIM>(q_out_p);
-    let k_out_smem = page_as_st_bf::<M, KV_DIM>(k_out_p);
-    let v_out_smem = page_as_st_bf::<M, KV_DIM>(v_out_p);
+    let in_smem = page_as_st_bf::<M_TOTAL, HIDDEN_DIM>(in_p);
+    let q_out_smem = page_as_st_bf::<M_TOTAL, Q_DIM>(q_out_p);
+    let k_out_smem = page_as_st_bf::<M_TOTAL, KV_DIM>(k_out_p);
+    let v_out_smem = page_as_st_bf::<M_TOTAL, KV_DIM>(v_out_p);
     let qkv_b_tile = scratch_as_st_bf::<HIDDEN_DIM, QKV_N>(off(qkv_b_tile_offset));
     let cos_sin_byte = page_as_byte_ptr(cos_sin_p);
 
@@ -2965,11 +3073,11 @@ pub fn render_fused_qkv_rope_cache<
     let cos_sin_gmem = gmem_weight_ptr_raw(rotary_accessor, 0, NUM_LAYERS);
     let positions = gmem_positions();
 
-    let act_bytes = M * HIDDEN_DIM * BF16_BYTES;
+    let act_bytes = M_TOTAL * HIDDEN_DIM * BF16_BYTES;
     let qkv_weight_bytes = HIDDEN_DIM * QKV_N * BF16_BYTES;
-    let q_out_bytes = M * Q_DIM * BF16_BYTES;
-    let k_out_bytes = M * KV_DIM * BF16_BYTES;
-    let v_out_bytes = M * KV_DIM * BF16_BYTES;
+    let q_out_bytes = M_TOTAL * Q_DIM * BF16_BYTES;
+    let k_out_bytes = M_TOTAL * KV_DIM * BF16_BYTES;
+    let v_out_bytes = M_TOTAL * KV_DIM * BF16_BYTES;
 
     let mut loader = CuBlock::new();
     loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
@@ -2980,7 +3088,7 @@ pub fn render_fused_qkv_rope_cache<
     loader.push(tk20::group_wait::<1>(&v_out_consumed, loader_phase));
 
     loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M, HIDDEN_DIM>(
+    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M_TOTAL, HIDDEN_DIM>(
         &in_smem, &in_gmem, act_bytes, &in_ready,
     ));
 
@@ -2989,7 +3097,7 @@ pub fn render_fused_qkv_rope_cache<
         &qkv_b_tile, &qkv_weight_gmem, qkv_weight_bytes, &qkv_weight_ready,
     ));
 
-    loader.push(tk20::cos_sin_per_token_gather::<HEAD_DIM, M>(
+    loader.push(tk20::cos_sin_per_token_gather::<HEAD_DIM, M_TOTAL>(
         &cos_sin_byte,
         &cos_sin_gmem,
         &positions,
@@ -3003,28 +3111,23 @@ pub fn render_fused_qkv_rope_cache<
     consumer.push(tk20::group_wait::<1>(&qkv_weight_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&cos_sin_ready, consumer_phase));
 
-    let (decl_a, _a_rt) = tk20::decl_rt_bf_row::<M, HIDDEN_DIM>("__qkv_a");
-    consumer.push(decl_a);
+    // Pre-loop decls: scratch ST refs for Q/K rope staging (sized
+    // M_TOTAL × Q_DIM / KV_DIM — over-committed at M_TOTAL > 64,
+    // matching the page over-commit pattern; prefill bodies are not
+    // launched at runtime in the persistent-decode substrate, so the
+    // overcommit exists only for nvcc-compile clean substrate proof),
+    // raw bf16 ptr for cos_sin gather, warpgroup id, heads_per_wg,
+    // and the unroll pragma for the per-head loop.
     consumer.push(CuStmt::new(format!(
-        "kittens::warp::load(__qkv_a, {in_smem});",
-        in_smem = in_smem.expr(),
-    )));
-
-    // Pre-loop decls: scratch ST refs for Q/K rope staging, raw
-    // bf16 ptr for cos_sin gather, warp id, and the unroll pragma
-    // for the per-head loop. Each is a single-line CuStmt because
-    // none binds to a typed tk20 handle (refs to scratch with
-    // arbitrary offset; a bf16* cast of a void page; a builtin).
-    consumer.push(CuStmt::new(format!(
-        "auto& __qkv_q_rope = *reinterpret_cast<kittens::st_bf<{m}, {q_dim}>*>(\
+        "auto& __qkv_q_rope = *reinterpret_cast<kittens::st_bf<{m_total}, {q_dim}>*>(\
          ss.scratch + {q_rope_offset});",
-        m = M,
+        m_total = M_TOTAL,
         q_dim = Q_DIM,
     )));
     consumer.push(CuStmt::new(format!(
-        "auto& __qkv_k_rope = *reinterpret_cast<kittens::st_bf<{m}, {kv_dim}>*>(\
+        "auto& __qkv_k_rope = *reinterpret_cast<kittens::st_bf<{m_total}, {kv_dim}>*>(\
          ss.scratch + {k_rope_offset});",
-        m = M,
+        m_total = M_TOTAL,
         kv_dim = KV_DIM,
     )));
     consumer.push(CuStmt::new(format!(
@@ -3032,30 +3135,40 @@ pub fn render_fused_qkv_rope_cache<
          ss.pages[{cos_sin_id}]);",
         cos_sin_id = cos_sin_page_id,
     )));
-    consumer.push(CuStmt::new(
-        "const int __qkv_warp_id = static_cast<int>(kittens::warpid());".to_string(),
-    ));
-    consumer.push(CuStmt::new("_Pragma(\"unroll\")".to_string()));
+    consumer.push(CuStmt::new(format!(
+        "const int __qkv_wg_id = {gid};",
+        gid = tk20::warpgroup_groupid_expr(),
+    )));
 
-    // Per-head loop body: declare __qkv_col, declare __qkv_b
-    // register tile, load via runtime-offset subtile, declare
-    // accumulator, zero + mma_AB, then route to Q / K / V via
-    // `tk20::if_else`.
-    let mut loop_body = CuBlock::new();
-    loop_body.push(CuStmt::new(format!(
-        "const int __qkv_col = __qkv_warp_id * {tile_n} + __qkv_h * {head_dim};",
-        tile_n = TILE_N,
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<HEAD_DIM>("__qkv_acc");
+    // __qkv_rot is referenced by name in the raw CuStmt RoPE apply;
+    // the typed handle exists only to materialize the decl statement.
+    let (decl_rot, _rot_rt) = tk20::decl_rt_fl_warpgroup::<HEAD_DIM>("__qkv_rot");
+    consumer.push(decl_acc);
+    consumer.push(decl_rot);
+
+    // Per-head loop body (one wgmma per head). Each warpgroup
+    // iterates `heads_per_wg = HEADS_PER_WARP * 4` heads, with col
+    // base `__qkv_wg_id * heads_per_wg * HEAD_DIM`.
+    let mut head_loop_body = CuBlock::new();
+    head_loop_body.push(CuStmt::new(format!(
+        "const int __qkv_col = __qkv_wg_id * {heads_per_wg} * {head_dim} + __qkv_h * {head_dim};",
+        heads_per_wg = heads_per_wg,
         head_dim = HEAD_DIM,
     )));
-    loop_body.push(CuStmt::new(format!(
-        "kittens::rt_bf<{hidden_dim}, {head_dim}, kittens::ducks::rt_layout::col> __qkv_b;",
-        hidden_dim = HIDDEN_DIM,
-        head_dim = HEAD_DIM,
-    )));
-    // The original C++ wrapped __qkv_b_sub in a brace scope to
-    // tighten its lifetime; in a for-loop body each `auto` decl is
-    // already iter-local, so we drop the redundant brace.
-    loop_body.push(CuStmt::new(format!(
+
+    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, HIDDEN_DIM, M_TILE, HIDDEN_DIM>(
+        "__qkv_a_sub", &in_smem, "__qkv_m_block", "0",
+    );
+    head_loop_body.push(decl_a_sub);
+    // B subtile coords are runtime (per-head); emit the subtile
+    // bind as a raw CuStmt and re-bind a typed handle for the
+    // wgmma call. The decl_st_bf_subtile helper assumes a fixed
+    // const-generic outer layout, but here the outer ST is
+    // `qkv_b_tile = st_bf<HIDDEN_DIM, QKV_N>` and we want a
+    // `st_bf<HIDDEN_DIM, HEAD_DIM>` subtile at column block
+    // `__qkv_col / HEAD_DIM` (runtime).
+    head_loop_body.push(CuStmt::new(format!(
         "auto __qkv_b_sub = ({qkv_b_tile})\
          .template subtile<{hidden_dim}, {head_dim}>(\
          int2{{0, __qkv_col / {head_dim}}});",
@@ -3063,23 +3176,18 @@ pub fn render_fused_qkv_rope_cache<
         hidden_dim = HIDDEN_DIM,
         head_dim = HEAD_DIM,
     )));
-    loop_body.push(CuStmt::new(
-        "kittens::warp::load(__qkv_b, __qkv_b_sub);".to_string(),
-    ));
-    loop_body.push(CuStmt::new(format!(
-        "kittens::rt_fl<{m}, {head_dim}> __qkv_acc;",
-        m = M,
-        head_dim = HEAD_DIM,
-    )));
-    loop_body.push(CuStmt::new(
-        "kittens::warp::zero(__qkv_acc);".to_string(),
-    ));
-    loop_body.push(CuStmt::new(
-        "kittens::warp::mma_AB(__qkv_acc, __qkv_a, __qkv_b, __qkv_acc);".to_string(),
-    ));
+    let b_sub_typed = St::<Bf16, HIDDEN_DIM, HEAD_DIM>::from_expr(CuExpr::new("__qkv_b_sub".to_string()));
 
-    // Q rope branch: stage acc → scratch ST, sync, then apply RoPE
-    // device lambda reading paired half + cos_sin, store to q_out.
+    head_loop_body.push(tk20::warpgroup_zero_rt_fl::<HEAD_DIM>(&acc_rt));
+    head_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, HEAD_DIM>(
+        &acc_rt, &a_sub, &b_sub_typed,
+    ));
+    head_loop_body.push(tk20::warpgroup_mma_async_wait());
+
+    // RoPE branch builder: stages acc into scratch (Q_rope or
+    // K_rope), syncs the warpgroup, applies the RoPE lambda over
+    // the warpgroup-distributed acc, then stores into the output
+    // smem subtile.
     let make_rope_branch = |stg_ref: &str, out_smem_expr: &str, local_expr: &str| {
         let mut block = CuBlock::new();
         block.push(CuStmt::new(format!(
@@ -3087,26 +3195,26 @@ pub fn render_fused_qkv_rope_cache<
         )));
         block.push(CuStmt::new(format!(
             "auto __qkv_stg = {stg_ref}\
-             .template subtile<{m}, {head_dim}>(\
-             int2{{0, __qkv_local / {head_dim}}});",
-            m = M,
+             .template subtile<{m_tile}, {head_dim}>(\
+             int2{{__qkv_m_block, __qkv_local / {head_dim}}});",
+            m_tile = M_TILE,
             head_dim = HEAD_DIM,
         )));
         block.push(CuStmt::new(
-            "kittens::warp::store(__qkv_stg, __qkv_acc);".to_string(),
+            "kittens::warpgroup::store(__qkv_stg, __qkv_acc);".to_string(),
         ));
-        block.push(CuStmt::new("__syncwarp();".to_string()));
+        // group sync (warpgroup) — all 4 warps must finish writing
+        // their 16-row slice of stg before any thread reads
+        // paired-half values back.
+        block.push(CuStmt::new(
+            "asm volatile(\"bar.sync 1, 128;\" ::: \"memory\");".to_string(),
+        ));
         block.push(CuStmt::new(
             "__nv_bfloat16* __qkv_stg_ptr = reinterpret_cast<__nv_bfloat16*>(&__qkv_stg);"
                 .to_string(),
         ));
         block.push(CuStmt::new(format!(
-            "kittens::rt_fl<{m}, {head_dim}> __qkv_rot;",
-            m = M,
-            head_dim = HEAD_DIM,
-        )));
-        block.push(CuStmt::new(format!(
-            "kittens::warp::apply(__qkv_rot, __qkv_acc, [=] __device__ \
+            "kittens::warpgroup::apply(__qkv_rot, __qkv_acc, [=] __device__ \
              (int row, int col, float x) {{\n\
              \x20   constexpr int __half = {head_dim} / 2;\n\
              \x20   int __pc = col < __half ? col + __half : col - __half;\n\
@@ -3124,13 +3232,13 @@ pub fn render_fused_qkv_rope_cache<
         )));
         block.push(CuStmt::new(format!(
             "auto __qkv_out = ({out_smem_expr})\
-             .template subtile<{m}, {head_dim}>(\
-             int2{{0, __qkv_local / {head_dim}}});",
-            m = M,
+             .template subtile<{m_tile}, {head_dim}>(\
+             int2{{__qkv_m_block, __qkv_local / {head_dim}}});",
+            m_tile = M_TILE,
             head_dim = HEAD_DIM,
         )));
         block.push(CuStmt::new(
-            "kittens::warp::store(__qkv_out, __qkv_rot);".to_string(),
+            "kittens::warpgroup::store(__qkv_out, __qkv_rot);".to_string(),
         ));
         block
     };
@@ -3142,7 +3250,7 @@ pub fn render_fused_qkv_rope_cache<
         &format!("__qkv_col - {}", Q_DIM),
     );
 
-    // V passthrough branch: store acc directly to v_out (no RoPE).
+    // V passthrough branch: store acc directly to v_out subtile (no RoPE).
     let mut v_branch = CuBlock::new();
     v_branch.push(CuStmt::new(format!(
         "const int __qkv_local = __qkv_col - {q_dim} - {kv_dim};",
@@ -3151,31 +3259,35 @@ pub fn render_fused_qkv_rope_cache<
     )));
     v_branch.push(CuStmt::new(format!(
         "auto __qkv_out = ({v_out_smem})\
-         .template subtile<{m}, {head_dim}>(\
-         int2{{0, __qkv_local / {head_dim}}});",
+         .template subtile<{m_tile}, {head_dim}>(\
+         int2{{__qkv_m_block, __qkv_local / {head_dim}}});",
         v_out_smem = v_out_smem.expr(),
-        m = M,
+        m_tile = M_TILE,
         head_dim = HEAD_DIM,
     )));
     v_branch.push(CuStmt::new(
-        "kittens::warp::store(__qkv_out, __qkv_acc);".to_string(),
+        "kittens::warpgroup::store(__qkv_out, __qkv_acc);".to_string(),
     ));
 
-    // Compose the routing as an n-way if/else if/else chain:
-    // Q, K, V fallthrough.
     let q_cond = format!("__qkv_col < {}", Q_DIM);
     let k_cond = format!("__qkv_col < {} + {}", Q_DIM, KV_DIM);
-    loop_body.push(tk20::if_chain(
+    head_loop_body.push(tk20::if_chain(
         &[(&q_cond, &q_branch), (&k_cond, &k_branch)],
         Some(&v_branch),
     ));
 
-    consumer.push(tk20::for_loop(
+    let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(tk20::for_loop(
         &format!(
-            "int __qkv_h = 0; __qkv_h < {heads_per_warp}; ++__qkv_h",
-            heads_per_warp = HEADS_PER_WARP,
+            "int __qkv_h = 0; __qkv_h < {heads_per_wg}; ++__qkv_h",
+            heads_per_wg = heads_per_wg,
         ),
-        &loop_body,
+        &head_loop_body,
+    ));
+
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __qkv_m_block = 0; __qkv_m_block < {M_BLOCKS}; ++__qkv_m_block"),
+        &m_loop_body,
     ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
@@ -3187,19 +3299,20 @@ pub fn render_fused_qkv_rope_cache<
         tk20::group_arrive::<1>(&qkv_weight_consumed),
         tk20::group_arrive::<1>(&cos_sin_consumed),
     ]));
+    let _ = num_warpgroups;
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait::<1>(&q_out_done, storer_phase));
     storer.push(tk20::group_wait::<1>(&k_out_done, storer_phase));
     storer.push(tk20::group_wait::<1>(&v_out_done, storer_phase));
 
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, Q_DIM>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, Q_DIM>(
         &q_out_gmem, &q_out_smem, q_out_bytes,
     ));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, KV_DIM>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, KV_DIM>(
         &k_out_gmem, &k_out_smem, k_out_bytes,
     ));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, KV_DIM>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, KV_DIM>(
         &v_out_gmem, &v_out_smem, v_out_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait::<1>());

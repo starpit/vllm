@@ -21,12 +21,12 @@ use ferrite_metal_kernels::specialized_pipeline_cache::{
 };
 use ferrite_metal_kernels::stream::MetalStream;
 use half::bf16;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
 };
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
 
 const HEAD_DIM: u32 = 128;
 const NUM_Q_HEADS: u32 = 24;
@@ -54,7 +54,9 @@ pub fn run(launch_overhead_us: f64) {
             ConstantValue::uint(5, MAX_BLOCKS_PER_SEQ),
         ],
     );
-    let pipeline_sdpa = cache.get_or_build(&key_sdpa).expect("build attention pipeline");
+    let pipeline_sdpa = cache
+        .get_or_build(&key_sdpa)
+        .expect("build attention pipeline");
 
     // Contiguous steel_attention (MLX FA-2 port, on-disk at
     // shaders/attention_steel.metal). Function constants:
@@ -150,7 +152,11 @@ pub fn run(launch_overhead_us: f64) {
     let max_diff_partial = verify_steel_correctness(device, &pipeline_steel, 10);
     eprintln!(
         "attention_steel_bf16 vs CPU SDPA @ M=10 (partial-Q tile): max |abs diff| = {max_diff_partial:.4} ({})",
-        if max_diff_partial < 0.02 { "PASS" } else { "FAIL" }
+        if max_diff_partial < 0.02 {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
 
     // Cross-check: steel_paged at M=1024 (kv_rem=0, partial-block path
@@ -194,13 +200,8 @@ pub fn run(launch_overhead_us: f64) {
     // [-1, 1) distribution; if the kernels disagree at higher
     // magnitudes that'd explain the production failure.
     for scale in [1.0_f32, 4.0, 10.0, 30.0] {
-        let diff = cross_check_paged_kernels(
-            device,
-            &pipeline_sdpa,
-            &pipeline_paged_steel,
-            36,
-            scale,
-        );
+        let diff =
+            cross_check_paged_kernels(device, &pipeline_sdpa, &pipeline_paged_steel, 36, scale);
         eprintln!(
             "CROSS-CHECK OLD vs NEW @ M=36 data_scale={scale}: max |abs diff| = {diff:.4} ({})",
             if diff < 0.05 { "AGREE" } else { "DISAGREE" }
@@ -225,9 +226,7 @@ pub fn run(launch_overhead_us: f64) {
     let ms: &[u32] = &[512, 1024, 2048];
     for &m in ms {
         let cost_us = bench_attention_prefill(device, &pipeline_sdpa, m, launch_overhead_us);
-        println!(
-            "attention_prefill_sdpa_v2_paged_bf16,{m},{NUM_Q_HEADS},{HEAD_DIM},{cost_us:.2}"
-        );
+        println!("attention_prefill_sdpa_v2_paged_bf16,{m},{NUM_Q_HEADS},{HEAD_DIM},{cost_us:.2}");
     }
     for &m in ms {
         let cost_us = bench_attention_steel(device, &pipeline_steel, m, launch_overhead_us);
@@ -513,8 +512,7 @@ fn bench_attention_prefill(
     let block_table_buf = upload_u32(device, &block_table);
     let k_cache_buf = upload_bf16(device, &k_cache_data);
     let v_cache_buf = upload_bf16(device, &v_cache_data);
-    let output_buf =
-        util::create_buffer(m_usz * num_q * head_dim * std::mem::size_of::<bf16>());
+    let output_buf = util::create_buffer(m_usz * num_q * head_dim * std::mem::size_of::<bf16>());
 
     let mut stream = MetalStream::new(device);
     util::time_kernel(launch_overhead_us, 3, 20, || {
@@ -851,15 +849,18 @@ fn diagnose_paged_frag_markers(
         for col in 0..8 {
             let dim = j * 8 + col;
             for q_pos in 0..m_usz {
-                let v = unsafe { *o_ptr.add(q_pos * num_q * head_dim + 0 * head_dim + dim) }.to_f32() as i32;
+                let v = unsafe { *o_ptr.add(q_pos * num_q * head_dim + 0 * head_dim + dim) }
+                    .to_f32() as i32;
                 *counts.entry(v).or_insert(0) += 1;
             }
         }
-        let summary: Vec<String> = counts
-            .iter()
-            .map(|(v, c)| format!("v={v}:{c}"))
-            .collect();
-        eprintln!("  dim-frag {j} (cols {}..{}): {}", j * 8, j * 8 + 7, summary.join(" "));
+        let summary: Vec<String> = counts.iter().map(|(v, c)| format!("v={v}:{c}")).collect();
+        eprintln!(
+            "  dim-frag {j} (cols {}..{}): {}",
+            j * 8,
+            j * 8 + 7,
+            summary.join(" ")
+        );
     }
     let _ = (num_kv, head_dim);
 }
@@ -951,8 +952,15 @@ fn diagnose_paged_zero_pattern(
         }
     }
     for j in 0..16 {
-        let row: Vec<String> = (0..8).map(|c| format!("{:>4}", by_dim[j * 8 + c])).collect();
-        eprintln!("  frag {j:>2} (cols {:>3}..{:>3}): [{}]", j * 8, j * 8 + 7, row.join(" "));
+        let row: Vec<String> = (0..8)
+            .map(|c| format!("{:>4}", by_dim[j * 8 + c]))
+            .collect();
+        eprintln!(
+            "  frag {j:>2} (cols {:>3}..{:>3}): [{}]",
+            j * 8,
+            j * 8 + 7,
+            row.join(" ")
+        );
     }
     // Bucket by dim-frag AND q_head to see if frag-coverage depends on head.
     let mut nonzero_per_dim_frag = [0usize; 16];
@@ -1111,12 +1119,8 @@ fn cross_check_paged_kernels(
         .map(|i| bf16::from_f32(mix(i, 257)))
         .collect();
     let kv_elts = num_blocks * num_kv * block_size * head_dim;
-    let k_cache_data: Vec<bf16> = (0..kv_elts)
-        .map(|i| bf16::from_f32(mix(i, 251)))
-        .collect();
-    let v_cache_data: Vec<bf16> = (0..kv_elts)
-        .map(|i| bf16::from_f32(mix(i, 241)))
-        .collect();
+    let k_cache_data: Vec<bf16> = (0..kv_elts).map(|i| bf16::from_f32(mix(i, 251))).collect();
+    let v_cache_data: Vec<bf16> = (0..kv_elts).map(|i| bf16::from_f32(mix(i, 241))).collect();
     let mut cu_seqlens_q: Vec<u32> = vec![0; m_usz + 2];
     cu_seqlens_q[1] = m;
     let seq_used_k: Vec<u32> = vec![m];
@@ -1244,12 +1248,8 @@ fn verify_paged_steel_correctness(
         .map(|i| bf16::from_f32(mix(i, 257)))
         .collect();
     let kv_elts = num_blocks * num_kv * block_size * head_dim;
-    let k_cache_data: Vec<bf16> = (0..kv_elts)
-        .map(|i| bf16::from_f32(mix(i, 251)))
-        .collect();
-    let v_cache_data: Vec<bf16> = (0..kv_elts)
-        .map(|i| bf16::from_f32(mix(i, 241)))
-        .collect();
+    let k_cache_data: Vec<bf16> = (0..kv_elts).map(|i| bf16::from_f32(mix(i, 251))).collect();
+    let v_cache_data: Vec<bf16> = (0..kv_elts).map(|i| bf16::from_f32(mix(i, 241))).collect();
 
     let mut cu_seqlens_q: Vec<u32> = vec![0; m_usz + 2];
     cu_seqlens_q[1] = m;
@@ -1390,7 +1390,11 @@ fn upload_bytes(device: &Device, data: &[u8]) -> Buffer {
         .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
         .expect("newBuffer");
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents().as_ptr() as *mut u8, data.len());
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            buf.contents().as_ptr() as *mut u8,
+            data.len(),
+        );
     }
     buf
 }

@@ -95,8 +95,8 @@ impl Atom for AddRmsNormAtom {
         // Per (token, output_head). Compatible with AffineQmvAtom,
         // RopeAppendAtom, etc.
         AtomDispatchShape {
-            threadgroups: (0, 0, 1),                // M and num_heads_total filled by fuse pass
-            threads_per_threadgroup: (0, 1, 1),     // 32 * HEAD_DIM / 4, filled by fuse pass
+            threadgroups: (0, 0, 1), // M and num_heads_total filled by fuse pass
+            threads_per_threadgroup: (0, 1, 1), // 32 * HEAD_DIM / 4, filled by fuse pass
         }
     }
 
@@ -107,7 +107,7 @@ impl Atom for AddRmsNormAtom {
     fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
         let res = &ctx.bound_inputs[0]; // residual_io
         let del = &ctx.bound_inputs[1]; // delta
-        let rw  = &ctx.bound_inputs[2]; // rms_weight
+        let rw = &ctx.bound_inputs[2]; // rms_weight
         let out = &ctx.bound_outputs[0]; // x_norm (TG memory)
 
         let t_act = ctx.t_act;
@@ -280,10 +280,10 @@ impl Atom for AffineQmvAtom {
     }
 
     fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
-        let x   = &ctx.bound_inputs[0];  // x_norm
-        let w   = &ctx.bound_inputs[1];  // weight_packed
-        let s   = &ctx.bound_inputs[2];  // scales
-        let b   = &ctx.bound_inputs[3];  // biases
+        let x = &ctx.bound_inputs[0]; // x_norm
+        let w = &ctx.bound_inputs[1]; // weight_packed
+        let s = &ctx.bound_inputs[2]; // scales
+        let b = &ctx.bound_inputs[3]; // biases
         let out = &ctx.bound_outputs[0]; // qmv_smem
 
         let t_act = ctx.t_act;
@@ -463,12 +463,12 @@ impl Atom for RopeAppendAtom {
 
     fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
         let qmv = &ctx.bound_inputs[0];
-        let cs  = &ctx.bound_inputs[1];
+        let cs = &ctx.bound_inputs[1];
         let pos = &ctx.bound_inputs[2];
         let slm = &ctx.bound_inputs[3];
-        let qo  = &ctx.bound_outputs[0];
-        let kc  = &ctx.bound_outputs[1];
-        let vc  = &ctx.bound_outputs[2];
+        let qo = &ctx.bound_outputs[0];
+        let kc = &ctx.bound_outputs[1];
+        let vc = &ctx.bound_outputs[2];
 
         let t_act = ctx.t_act;
 
@@ -616,8 +616,8 @@ impl Atom for SiluMulAtom {
     }
 
     fn emit_metal_body(&self, ctx: &AtomCtx) -> Option<String> {
-        let g   = &ctx.bound_inputs[0];  // gate_smem
-        let u   = &ctx.bound_inputs[1];  // up_smem
+        let g = &ctx.bound_inputs[0]; // gate_smem
+        let u = &ctx.bound_inputs[1]; // up_smem
         let out = &ctx.bound_outputs[0]; // silu_mul_out (device)
 
         let t_act = ctx.t_act;

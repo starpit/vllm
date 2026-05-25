@@ -24,9 +24,7 @@
 
 use std::collections::HashMap;
 
-use super::backend::{
-    ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend,
-};
+use super::backend::{ForwardArgmaxRequest, KvPoolHandle, ModelHandle, SpecDecodeBackend};
 use super::{DraftModelProposerConfig, NgramProposer};
 
 /// Owned-data seed bundle the worker hands to `DraftModelProposer` so
@@ -142,17 +140,11 @@ pub struct ProposerStepCtx<'a> {
 /// Takes `&mut` because draft-model proposers issue GPU work via
 /// `ctx.backend`; ngram impls treat it as `&self` effectively.
 pub trait Proposer {
-    fn propose_for_step(
-        &mut self,
-        ctx: &mut ProposerStepCtx<'_>,
-    ) -> HashMap<String, Vec<u32>>;
+    fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>>;
 }
 
 impl Proposer for NgramProposer {
-    fn propose_for_step(
-        &mut self,
-        ctx: &mut ProposerStepCtx<'_>,
-    ) -> HashMap<String, Vec<u32>> {
+    fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
         let mut out = HashMap::with_capacity(ctx.scheduled_req_ids.len());
         for &req_id in ctx.scheduled_req_ids {
             let Some(history) = (ctx.get_all_tokens)(req_id) else {
@@ -281,32 +273,30 @@ impl DraftModelProposer {
         // chain primitive (Phase 6) advances these on-device between
         // iters; the iter-0 values are still computed here from host
         // state. The host-loop fallback recomputes every iter.
-        let build_iter = |current_positions: &[usize]|
-            -> (Vec<u32>, Vec<u32>, Vec<u32>, usize) {
-                let mut positions = Vec::with_capacity(num_reqs);
-                let mut slot_mapping = Vec::with_capacity(num_reqs);
-                let mut seqused_k = Vec::with_capacity(num_reqs);
-                let mut max_k: usize = 0;
-                for i in 0..num_reqs {
-                    let pos = current_positions[i];
-                    positions.push(pos as u32);
-                    let block_idx = pos / seed.block_size;
-                    let offset = pos % seed.block_size;
-                    let blocks = &seed.block_ids[i];
-                    let slot = if block_idx < blocks.len() {
-                        (blocks[block_idx] as usize * seed.block_size + offset) as u32
-                    } else {
-                        u32::MAX
-                    };
-                    slot_mapping.push(slot);
-                    let seq_used = pos + 1;
-                    seqused_k.push(seq_used as u32);
-                    if seq_used > max_k {
-                        max_k = seq_used;
-                    }
+        let build_iter = |current_positions: &[usize]| -> (Vec<u32>, Vec<u32>, Vec<u32>, usize) {
+            let mut positions = Vec::with_capacity(num_reqs);
+            let mut slot_mapping = Vec::with_capacity(num_reqs);
+            let mut seqused_k = Vec::with_capacity(num_reqs);
+            let mut max_k: usize = 0;
+            for (i, &pos) in current_positions.iter().enumerate().take(num_reqs) {
+                positions.push(pos as u32);
+                let block_idx = pos / seed.block_size;
+                let offset = pos % seed.block_size;
+                let blocks = &seed.block_ids[i];
+                let slot = if block_idx < blocks.len() {
+                    (blocks[block_idx] as usize * seed.block_size + offset) as u32
+                } else {
+                    u32::MAX
+                };
+                slot_mapping.push(slot);
+                let seq_used = pos + 1;
+                seqused_k.push(seq_used as u32);
+                if seq_used > max_k {
+                    max_k = seq_used;
                 }
-                (positions, slot_mapping, seqused_k, max_k)
-            };
+            }
+            (positions, slot_mapping, seqused_k, max_k)
+        };
 
         // Iter-0 inputs (always needed: chain primitive consumes them
         // as the chain seed; loop fallback uses them as the first iter
@@ -337,11 +327,11 @@ impl DraftModelProposer {
             && seed.speculative_seeds.len() == num_reqs
         {
             let mut all_hit = true;
-            for i in 0..num_reqs {
+            for (i, sampled_i) in sampled.iter().enumerate().take(num_reqs) {
                 let was_spec = seed.was_spec_decode[i];
-                let accepted_count = sampled[i].len();
+                let accepted_count = sampled_i.len();
                 let expected_full_accept = seed.q_lens[i];
-                let bonus = *sampled[i].last().expect("sampled non-empty");
+                let bonus = *sampled_i.last().expect("sampled non-empty");
                 if !was_spec
                     || accepted_count != expected_full_accept
                     || bonus != seed.speculative_seeds[i]
@@ -357,11 +347,11 @@ impl DraftModelProposer {
                     if iter_drafts.len() != num_reqs {
                         return HashMap::new();
                     }
-                    for i in 0..num_reqs {
+                    for (i, &draft) in iter_drafts.iter().enumerate().take(num_reqs) {
                         drafts
                             .get_mut(&seed.req_ids[i])
                             .expect("inserted above")
-                            .push(iter_drafts[i]);
+                            .push(draft);
                     }
                 }
                 return drafts;
@@ -386,13 +376,7 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
             };
-            match backend.forward_chain_k(
-                DRAFT_MODEL,
-                DRAFT_KV,
-                &iter0_req,
-                seed.block_size,
-                k,
-            ) {
+            match backend.forward_chain_k(DRAFT_MODEL, DRAFT_KV, &iter0_req, seed.block_size, k) {
                 Ok(per_iter) => {
                     if per_iter.len() != k {
                         return drafts;
@@ -401,11 +385,11 @@ impl DraftModelProposer {
                         if iter_argmax.len() != num_reqs {
                             return drafts;
                         }
-                        for i in 0..num_reqs {
+                        for (i, &argmax) in iter_argmax.iter().enumerate().take(num_reqs) {
                             drafts
                                 .get_mut(&seed.req_ids[i])
                                 .expect("inserted above")
-                                .push(iter_argmax[i]);
+                                .push(argmax);
                         }
                     }
                     return drafts;
@@ -453,14 +437,11 @@ impl DraftModelProposer {
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
             };
-            let step_argmax = match backend.forward_argmax_blocking(
-                DRAFT_MODEL,
-                DRAFT_KV,
-                &step_req,
-            ) {
-                Ok(v) => v,
-                Err(_) => return drafts,
-            };
+            let step_argmax =
+                match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {
+                    Ok(v) => v,
+                    Err(_) => return drafts,
+                };
             if step_argmax.len() != num_reqs {
                 return drafts;
             }
@@ -479,10 +460,7 @@ impl DraftModelProposer {
 }
 
 impl Proposer for DraftModelProposer {
-    fn propose_for_step(
-        &mut self,
-        ctx: &mut ProposerStepCtx<'_>,
-    ) -> HashMap<String, Vec<u32>> {
+    fn propose_for_step(&mut self, ctx: &mut ProposerStepCtx<'_>) -> HashMap<String, Vec<u32>> {
         let Some(seed) = ctx.draft_seed else {
             return HashMap::new();
         };
@@ -507,8 +485,7 @@ impl Proposer for DraftModelProposer {
         // Python-shape extended-batch path (1 fat + K-1 skinny
         // forwards, no async overlap possible — first iter depends on
         // target's bonus).
-        let use_extended_batch =
-            std::env::var_os("FERRITE_DRAFT_EXTENDED_BATCH").is_some();
+        let use_extended_batch = std::env::var_os("FERRITE_DRAFT_EXTENDED_BATCH").is_some();
         if !use_extended_batch {
             return self.propose_lockstep_k(seed, sampled, backend, k, num_reqs);
         }
@@ -542,7 +519,7 @@ impl Proposer for DraftModelProposer {
         let mut new_max_seqlen_q: usize = 0;
         let mut new_max_seqlen_k: usize = 0;
 
-        for i in 0..num_reqs {
+        for (i, sampled_i) in sampled.iter().enumerate().take(num_reqs) {
             let old_start = seed.cu_seqlens_q[i] as usize;
             let old_end = seed.cu_seqlens_q[i + 1] as usize;
             let q_len_old = old_end - old_start;
@@ -554,10 +531,9 @@ impl Proposer for DraftModelProposer {
             //   non-spec prefill/decode → bonus_pos = tokens_before + q_len
             //   spec verify             → bonus_pos = tokens_before + sampled.len()
             //                          = tb + num_accepted + 1
-            let bonus_token =
-                *sampled[i].last().expect("sampled_token_ids[i] non-empty");
+            let bonus_token = *sampled_i.last().expect("sampled_token_ids[i] non-empty");
             let advance = if seed.was_spec_decode[i] {
-                sampled[i].len()
+                sampled_i.len()
             } else {
                 seed.q_lens[i]
             };
@@ -619,7 +595,10 @@ impl Proposer for DraftModelProposer {
         for i in 0..num_reqs {
             let bonus_row = new_cu_seqlens_q[i + 1] as usize - 1;
             let d = first_argmaxes[bonus_row];
-            drafts.get_mut(&seed.req_ids[i]).expect("inserted above").push(d);
+            drafts
+                .get_mut(&seed.req_ids[i])
+                .expect("inserted above")
+                .push(d);
             current_tokens.push(d);
         }
 
@@ -642,8 +621,7 @@ impl Proposer for DraftModelProposer {
             let mut step_slot_mapping: Vec<u32> = Vec::with_capacity(num_reqs);
             let mut step_seqused_k: Vec<u32> = Vec::with_capacity(num_reqs);
             let mut step_max_k: usize = 0;
-            for i in 0..num_reqs {
-                let pos = current_positions[i];
+            for (i, &pos) in current_positions.iter().enumerate().take(num_reqs) {
                 step_positions.push(pos as u32);
                 let block_idx = pos / seed.block_size;
                 let offset = pos % seed.block_size;
@@ -675,14 +653,11 @@ impl Proposer for DraftModelProposer {
                 // Each K-step is M=1 per req — slice gate is fine.
                 has_spec_tokens: false,
             };
-            let step_argmax = match backend.forward_argmax_blocking(
-                DRAFT_MODEL,
-                DRAFT_KV,
-                &step_req,
-            ) {
-                Ok(v) => v,
-                Err(_) => return drafts, // bail; return what we have so far
-            };
+            let step_argmax =
+                match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {
+                    Ok(v) => v,
+                    Err(_) => return drafts, // bail; return what we have so far
+                };
             if step_argmax.len() != num_reqs {
                 return drafts;
             }

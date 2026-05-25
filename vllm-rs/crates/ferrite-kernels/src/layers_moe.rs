@@ -500,11 +500,11 @@ impl AffineFusedMoELayer {
             "AffineFusedMoELayer: only bits=4 supported (got {bits})"
         );
         anyhow::ensure!(
-            hidden_size % group_size as usize == 0,
+            hidden_size.is_multiple_of(group_size as usize),
             "AffineFusedMoELayer: hidden_size={hidden_size} not divisible by group_size={group_size}"
         );
         anyhow::ensure!(
-            intermediate_size % group_size as usize == 0,
+            intermediate_size.is_multiple_of(group_size as usize),
             "AffineFusedMoELayer: intermediate_size={intermediate_size} not divisible by \
              group_size={group_size}"
         );
@@ -519,19 +519,13 @@ impl AffineFusedMoELayer {
         // weight — same shape contract as the cuda Dense path.
         // Choose dequant dtype from the model's target_dtype (BF16
         // on every metal build path today).
-        let router_dtype = gw
-            .target_dtype()
-            .unwrap_or(DType::BF16);
+        let router_dtype = gw.target_dtype().unwrap_or(DType::BF16);
         anyhow::ensure!(
             matches!(router_dtype, DType::BF16 | DType::F16),
             "AffineFusedMoELayer: router dequant target must be BF16 or F16, got {router_dtype}"
         );
-        let router_gate = gw.take_affine_dequant_b4(
-            &format!("{prefix}.gate"),
-            group_size,
-            bits,
-            router_dtype,
-        )?;
+        let router_gate =
+            gw.take_affine_dequant_b4(&format!("{prefix}.gate"), group_size, bits, router_dtype)?;
 
         // Probe for the switch_mlp pre-stacked layout. Qwen3-MoE-4bit
         // and newer mlx-community repos ship one stacked tensor per
@@ -541,16 +535,16 @@ impl AffineFusedMoELayer {
 
         let scales_dtype = if use_switch_mlp {
             let first = format!("{prefix}.switch_mlp.gate_proj.scales");
-            let (_, dt) = gw.tensor_info(&first).ok_or_else(|| {
-                anyhow::anyhow!("affine MoE: weight not found: {first}")
-            })?;
+            let (_, dt) = gw
+                .tensor_info(&first)
+                .ok_or_else(|| anyhow::anyhow!("affine MoE: weight not found: {first}"))?;
             dt
         } else {
             let (g_name_gate, _, _) = naming.proj_names();
             let first = format!("{prefix}.experts.0.{g_name_gate}.scales");
-            let (_, dt) = gw.tensor_info(&first).ok_or_else(|| {
-                anyhow::anyhow!("affine MoE: weight not found: {first}")
-            })?;
+            let (_, dt) = gw
+                .tensor_info(&first)
+                .ok_or_else(|| anyhow::anyhow!("affine MoE: weight not found: {first}"))?;
             dt
         };
 
@@ -591,14 +585,13 @@ impl AffineFusedMoELayer {
             let per_down_w = hidden_size * (intermediate_size / pack_factor);
             let per_down_sb = hidden_size * (intermediate_size / gs);
 
-            let alloc_kind = |per_expert_elems: usize,
-                              elem_size: usize|
-             -> anyhow::Result<*mut u8> {
-                let bytes = num_experts * per_expert_elems * elem_size;
-                gw.metal_allocator()
-                    .alloc_uninit(bytes)
-                    .map_err(|e| anyhow::anyhow!("alloc_uninit({bytes}) failed: {e}"))
-            };
+            let alloc_kind =
+                |per_expert_elems: usize, elem_size: usize| -> anyhow::Result<*mut u8> {
+                    let bytes = num_experts * per_expert_elems * elem_size;
+                    gw.metal_allocator()
+                        .alloc_uninit(bytes)
+                        .map_err(|e| anyhow::anyhow!("alloc_uninit({bytes}) failed: {e}"))
+                };
 
             let gate_w_ptr = alloc_kind(per_gate_w, elem_w)?;
             let gate_s_ptr = alloc_kind(per_gate_sb, elem_sb)?;
@@ -661,13 +654,31 @@ impl AffineFusedMoELayer {
                 GpuTensor::new(ptr, &[num_experts, n_out, n_in / div], dt)
             };
             (
-                mk(gate_w_ptr, intermediate_size, hidden_size, pack_factor, DType::U32),
+                mk(
+                    gate_w_ptr,
+                    intermediate_size,
+                    hidden_size,
+                    pack_factor,
+                    DType::U32,
+                ),
                 mk(gate_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
                 mk(gate_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-                mk(up_w_ptr, intermediate_size, hidden_size, pack_factor, DType::U32),
+                mk(
+                    up_w_ptr,
+                    intermediate_size,
+                    hidden_size,
+                    pack_factor,
+                    DType::U32,
+                ),
                 mk(up_s_ptr, intermediate_size, hidden_size, gs, scales_dtype),
                 mk(up_b_ptr, intermediate_size, hidden_size, gs, scales_dtype),
-                mk(down_w_ptr, hidden_size, intermediate_size, pack_factor, DType::U32),
+                mk(
+                    down_w_ptr,
+                    hidden_size,
+                    intermediate_size,
+                    pack_factor,
+                    DType::U32,
+                ),
                 mk(down_s_ptr, hidden_size, intermediate_size, gs, scales_dtype),
                 mk(down_b_ptr, hidden_size, intermediate_size, gs, scales_dtype),
             )
@@ -733,7 +744,7 @@ pub enum FusedMoELayer {
     /// reference path. Stacked `[E, 2*inter, hidden]` gate+up plus
     /// `[E, hidden, inter]` down, fed through
     /// `kernels::fused_moe_gemm`.
-    Dense(DenseFusedMoELayer),
+    Dense(Box<DenseFusedMoELayer>),
     /// MLX-affine int4 MoE (Metal-only). Per-expert (W, scales,
     /// biases) triples + dense fp router; lowered to a 10-step ICB
     /// decomposition by `lower_metal_moe`.
@@ -757,7 +768,7 @@ impl FusedMoELayer {
         hidden_size: usize,
         stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
-        Ok(Self::Dense(DenseFusedMoELayer::load(
+        Ok(Self::Dense(Box::new(DenseFusedMoELayer::load(
             gw,
             prefix,
             num_experts,
@@ -765,7 +776,7 @@ impl FusedMoELayer {
             intermediate_size,
             hidden_size,
             stream,
-        )?))
+        )?)))
     }
 
     /// Metal load stub for Dense MoE checkpoints. Bails at load time
@@ -835,9 +846,11 @@ impl FusedMoELayer {
             Self::Dense(d) => unsafe { d.forward(hidden_states, device) },
             #[cfg(feature = "metal")]
             Self::Affine(_) => {
-                unreachable!("FusedMoELayer::forward called on Affine variant — \
+                unreachable!(
+                    "FusedMoELayer::forward called on Affine variant — \
                               Metal MoE is dispatched via the ICB tape, not the \
-                              cuda forward path")
+                              cuda forward path"
+                )
             }
         }
     }
@@ -929,7 +942,7 @@ impl DenseSharedFusedMoELayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * inter, hidden_size], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden_size, inter], dtype) };
 
-        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
+        let moe = FusedMoELayer::Dense(Box::new(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -944,7 +957,7 @@ impl DenseSharedFusedMoELayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        });
+        }));
 
         let (shared_gate_up, shared_down, shared_expert_gate) = if shared_expert_intermediate_size
             > 0
@@ -1147,9 +1160,7 @@ impl AffineSharedFusedMoELayer {
             // `[2*shared_inter, hidden / pack_factor]` triple, so we
             // stack split-on-disk variants by allocating and copying
             // gate then up into adjacent halves.
-            let has_fused = gw.contains(&format!(
-                "{prefix}.shared_expert.gate_up_proj.weight"
-            ));
+            let has_fused = gw.contains(&format!("{prefix}.shared_expert.gate_up_proj.weight"));
 
             // Sample scales dtype the same way as the routed path.
             let probe_name = if has_fused {
@@ -1157,10 +1168,9 @@ impl AffineSharedFusedMoELayer {
             } else {
                 format!("{prefix}.shared_expert.gate_proj.scales")
             };
-            let (_, scales_dtype) =
-                gw.tensor_info(&probe_name).ok_or_else(|| {
-                    anyhow::anyhow!("affine MoE shared: weight not found: {probe_name}")
-                })?;
+            let (_, scales_dtype) = gw.tensor_info(&probe_name).ok_or_else(|| {
+                anyhow::anyhow!("affine MoE shared: weight not found: {probe_name}")
+            })?;
             let elem_w = DType::U32.size_bytes();
             let elem_sb = scales_dtype.size_bytes();
             let gs = group_size as usize;
@@ -1248,18 +1258,12 @@ impl AffineSharedFusedMoELayer {
             }
 
             let gu_w = unsafe {
-                GpuTensor::new(
-                    gu_w_ptr,
-                    &[two_si, hidden_size / pack_factor],
-                    DType::U32,
-                )
+                GpuTensor::new(gu_w_ptr, &[two_si, hidden_size / pack_factor], DType::U32)
             };
-            let gu_s = unsafe {
-                GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype)
-            };
-            let gu_b = unsafe {
-                GpuTensor::new(gu_b_ptr, &[two_si, hidden_size / gs], scales_dtype)
-            };
+            let gu_s =
+                unsafe { GpuTensor::new(gu_s_ptr, &[two_si, hidden_size / gs], scales_dtype) };
+            let gu_b =
+                unsafe { GpuTensor::new(gu_b_ptr, &[two_si, hidden_size / gs], scales_dtype) };
             let d_w = unsafe {
                 GpuTensor::new(
                     down_w_ptr,
@@ -1268,18 +1272,10 @@ impl AffineSharedFusedMoELayer {
                 )
             };
             let d_s = unsafe {
-                GpuTensor::new(
-                    down_s_ptr,
-                    &[hidden_size, shared_inter / gs],
-                    scales_dtype,
-                )
+                GpuTensor::new(down_s_ptr, &[hidden_size, shared_inter / gs], scales_dtype)
             };
             let d_b = unsafe {
-                GpuTensor::new(
-                    down_b_ptr,
-                    &[hidden_size, shared_inter / gs],
-                    scales_dtype,
-                )
+                GpuTensor::new(down_b_ptr, &[hidden_size, shared_inter / gs], scales_dtype)
             };
             let sgate = gw.take(&format!("{prefix}.shared_expert_gate.weight"))?;
 
@@ -1315,7 +1311,7 @@ impl AffineSharedFusedMoELayer {
 // ---------------------------------------------------------------------------
 
 pub enum SharedFusedMoELayer {
-    Dense(DenseSharedFusedMoELayer),
+    Dense(Box<DenseSharedFusedMoELayer>),
     #[cfg(feature = "metal")]
     Affine(Box<AffineSharedFusedMoELayer>),
 }
@@ -1334,7 +1330,7 @@ impl SharedFusedMoELayer {
         hidden_size: usize,
         stream: ferrite_cuda_core::CUstream,
     ) -> anyhow::Result<Self> {
-        Ok(Self::Dense(DenseSharedFusedMoELayer::load(
+        Ok(Self::Dense(Box::new(DenseSharedFusedMoELayer::load(
             gw,
             prefix,
             num_experts,
@@ -1343,7 +1339,7 @@ impl SharedFusedMoELayer {
             shared_expert_intermediate_size,
             hidden_size,
             stream,
-        )?))
+        )?)))
     }
 
     /// Metal load stub — same rationale as
@@ -1549,7 +1545,7 @@ impl DeepSeekV2MoELayer {
             None
         };
 
-        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
+        let moe = FusedMoELayer::Dense(Box::new(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -1568,7 +1564,7 @@ impl DeepSeekV2MoELayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        });
+        }));
 
         // Shared expert: concat gate_proj + up_proj → [2*shared_inter, hidden].
         let shared_inter = n_shared_experts * moe_intermediate_size;

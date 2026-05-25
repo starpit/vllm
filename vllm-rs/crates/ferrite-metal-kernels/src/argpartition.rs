@@ -72,12 +72,21 @@ impl ArgsortKernels {
                     "load `argpartition.metallib`: {e}"
                 ))
             })?;
-        let f32_bn32_tn4 = build_pipeline(device, &library, "c_arg_block_sort_float32_uint32_bn32_tn4")?;
-        let f16_bn32_tn4 = build_pipeline(device, &library, "c_arg_block_sort_float16_uint32_bn32_tn4")?;
-        let bf16_bn32_tn4 = build_pipeline(device, &library, "c_arg_block_sort_bfloat16_uint32_bn32_tn4")?;
-        let u32_bn32_tn4 = build_pipeline(device, &library, "c_arg_block_sort_uint32_uint32_bn32_tn4")?;
-        let f32_bn64_tn4 = build_pipeline(device, &library, "c_arg_block_sort_float32_uint32_bn64_tn4")?;
-        let u32_bn64_tn4 = build_pipeline(device, &library, "c_arg_block_sort_uint32_uint32_bn64_tn4")?;
+        let f32_bn32_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_float32_uint32_bn32_tn4")?;
+        let f16_bn32_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_float16_uint32_bn32_tn4")?;
+        let bf16_bn32_tn4 = build_pipeline(
+            device,
+            &library,
+            "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
+        )?;
+        let u32_bn32_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_uint32_uint32_bn32_tn4")?;
+        let f32_bn64_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_float32_uint32_bn64_tn4")?;
+        let u32_bn64_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_uint32_uint32_bn64_tn4")?;
         Ok(Self {
             f32_bn32_tn4,
             f16_bn32_tn4,

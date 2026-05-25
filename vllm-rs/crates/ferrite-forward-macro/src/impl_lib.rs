@@ -29,7 +29,7 @@ use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
 use crate::quantization::StorageFormat;
 use crate::shape::{Dim, Shape};
-use crate::target::{Backend, TargetProfile};
+use crate::target::TargetProfile;
 
 /// Ambient context for [`Implementation::applies_to`]. Carries the
 /// per-canonical model config + the resolved program so per-arch
@@ -575,11 +575,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// assignments, calls `as_atom` on each Impl, and groups
     /// adjacent atoms whose dispatch shape and data-flow are
     /// compatible into one synthesized kernel.
-    fn as_atom(
-        &self,
-        _m: &MatchInfo,
-        _fuf: &Fuf,
-    ) -> Option<Box<dyn crate::atom::Atom>> {
+    fn as_atom(&self, _m: &MatchInfo, _fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
         None
     }
 
@@ -710,11 +706,7 @@ pub trait Implementation: fmt::Debug + Send + Sync {
     /// sub-tile.
     ///
     /// Default: `(None, None)` — no KV cache interaction.
-    fn kv_layer_io(
-        &self,
-        _claimed_tiles: &[TileId],
-        _fuf: &Fuf,
-    ) -> (Option<u32>, Option<u32>) {
+    fn kv_layer_io(&self, _claimed_tiles: &[TileId], _fuf: &Fuf) -> (Option<u32>, Option<u32>) {
         (None, None)
     }
 
@@ -1550,13 +1542,28 @@ impl Implementation for RmsNormRefImpl {
         let hidden = *bounds.get("hidden_size").unwrap_or(&0) as u32;
         let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
         let num_q_heads = bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
-        let num_kv_heads = bounds.get("num_key_value_heads").copied().unwrap_or(num_q_heads as u64) as u32;
-        let hidden_size = if is_head_norm && head_dim > 0 { head_dim } else { hidden };
-        let m_multiplier = if is_q_norm { num_q_heads.max(1) }
-            else if is_k_norm { num_kv_heads.max(1) }
-            else { 1 };
+        let num_kv_heads = bounds
+            .get("num_key_value_heads")
+            .copied()
+            .unwrap_or(num_q_heads as u64) as u32;
+        let hidden_size = if is_head_norm && head_dim > 0 {
+            head_dim
+        } else {
+            hidden
+        };
+        let m_multiplier = if is_q_norm {
+            num_q_heads.max(1)
+        } else if is_k_norm {
+            num_kv_heads.max(1)
+        } else {
+            1
+        };
         Some(vec![Instruction::RmsNorm(
-            in_slot_idx, out_slot_idx, layer, hidden_size, m_multiplier,
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            hidden_size,
+            m_multiplier,
         )])
     }
 }
@@ -1985,8 +1992,8 @@ pub fn starter_library() -> ImplementationLibrary {
         // a more-specific Impl with a matching target gate wins by
         // the existing impl-priority ordering (see `MetalGemmImpl`
         // for the same pattern at the Gemm site).
-        lib.push(Box::new(crate::metal::MetalFusedMoeImpl::default()));
-        lib.push(Box::new(crate::metal::MetalSharedFusedMoeImpl::default()));
+        lib.push(Box::new(crate::metal::MetalFusedMoeImpl));
+        lib.push(Box::new(crate::metal::MetalSharedFusedMoeImpl));
         // Solver-side claim for the synth pre-attn megakernel. With
         // no swept `synth_pre_attn_*` rows in the chip's cost CSV,
         // `cost_us` returns +infinity and the solver never picks
@@ -1995,7 +2002,9 @@ pub fn starter_library() -> ImplementationLibrary {
         // pluck-in is ready when the sweep wires through.
         // F16-scale variants — claim on Llama-3.x / Qwen2.5 / SmolLM
         // mlx-community 4bit (their `.scales` / `.biases` ship F16).
-        lib.push(Box::new(crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64()));
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64(),
+        ));
         lib.push(Box::new(
             crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_init(),
         ));
@@ -2009,7 +2018,9 @@ pub fn starter_library() -> ImplementationLibrary {
         // `.scales` / `.biases` ship BF16). The Impl `applies_to`
         // gate keys on the canonical's `architectures` so exactly
         // one of the two scale variants ever fires per model.
-        lib.push(Box::new(crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_s_bf16()));
+        lib.push(Box::new(
+            crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_s_bf16(),
+        ));
         lib.push(Box::new(
             crate::metal::synth_pre_attn::MetalSynthPreAttnImpl::bf16_gs64_s_bf16_init(),
         ));
@@ -4731,11 +4742,7 @@ impl Implementation for FusedAddRmsNormImpl {
         )
     }
 
-    fn as_atom(
-        &self,
-        _m: &MatchInfo,
-        _fuf: &Fuf,
-    ) -> Option<Box<dyn crate::atom::Atom>> {
+    fn as_atom(&self, _m: &MatchInfo, _fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
         Some(Box::new(crate::atom_lib::AddRmsNormAtom::default()))
     }
 
@@ -6733,11 +6740,7 @@ impl Implementation for FusedQkvRopeCacheImpl {
         "fused_qkv_rope_cache"
     }
 
-    fn kv_layer_io(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-    ) -> (Option<u32>, Option<u32>) {
+    fn kv_layer_io(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> (Option<u32>, Option<u32>) {
         // Fused QKV+rope+cache writes per-layer KV cache.
         (kv_cache_extern_layer(claimed_tiles, fuf), None)
     }

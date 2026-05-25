@@ -68,9 +68,9 @@ pub use instr::Instruction;
 // metal interpreter (`interpreter::metal::worker::resolve_weight`)
 // invokes both, mirroring the cuda eval body's pattern.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub use instr::{CanonicalParams, WeightAccessors};
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use backend_compat::{BackendCompat, Cuda, Metal, Wgpu};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use instr::{CanonicalParams, WeightAccessors};
 // CUDA-only runtime entry points.
 #[cfg(feature = "cuda")]
 pub use instr::{InterpreterCtx, run, run_backbone};
@@ -596,13 +596,12 @@ mod dispatcher {
     ///   - the MTL4 compute encoder to append dispatches onto;
     ///   - the logits MTLBuffer (the bucket's terminal arena slot);
     ///   - `total_n` (logits row count) and `vocab` (column count).
+    ///
     /// MTL4 only.
     #[cfg(feature = "metal")]
     pub type MetalForwardFollowup<'a> = Box<
         dyn FnOnce(
-                &::objc2::runtime::ProtocolObject<
-                    dyn ::objc2_metal::MTL4ComputeCommandEncoder,
-                >,
+                &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
                 &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
                 u32,
                 u32,
@@ -634,9 +633,7 @@ mod dispatcher {
 
         /// The bucket's terminal arena slot (lm_head output). Stable
         /// across iters within one chain CB.
-        fn logits_buf(
-            &self,
-        ) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
+        fn logits_buf(&self) -> &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>;
 
         /// Logits column count (= compiled-in `METAL_VOCAB_SIZE`).
         fn vocab(&self) -> u32;
@@ -652,9 +649,7 @@ mod dispatcher {
         dyn FnOnce(
                 &dyn ChainStepHandle,
                 &crate::interpreter::metal::RuntimeBindings,
-                &::objc2::runtime::ProtocolObject<
-                    dyn ::objc2_metal::MTL4ComputeCommandEncoder,
-                >,
+                &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
             ) -> Result<(), String>
             + 'a,
     >;
@@ -1017,10 +1012,10 @@ mod dispatcher {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
-pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
 #[cfg(feature = "metal")]
 pub use dispatcher::{ChainStepHandle, MetalChainBody, MetalForwardFollowup};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub use dispatcher::{FerriteArchRegistration, FerriteWeights, HfFingerprint, try_load};
 /// Re-exports of the objc2/objc2_metal types referenced by macro-emitted
 /// `forward_with_metal_followup` / trait `MetalForwardFollowup` so consuming
 /// crates don't need direct `objc2`/`objc2_metal` deps.

@@ -113,17 +113,29 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
 #[test]
 fn argsort_f32_mixtral_topk() {
     // E=8, top_k=2 (Mixtral default).
-    run_f32(/*rows=*/ 11, /*cols=*/ 8, /*top_k=*/ 2, 0xC0FFEE);
+    run_f32(
+        /*rows=*/ 11, /*cols=*/ 8, /*top_k=*/ 2, 0xC0FFEE,
+    );
 }
 
 #[test]
 fn argsort_f32_qwen2_moe_topk() {
-    run_f32(/*rows=*/ 7, /*cols=*/ 60, /*top_k=*/ 4, 0xBEEF_F00D);
+    run_f32(
+        /*rows=*/ 7,
+        /*cols=*/ 60,
+        /*top_k=*/ 4,
+        0xBEEF_F00D,
+    );
 }
 
 #[test]
 fn argsort_f32_qwen3_moe_topk() {
-    run_f32(/*rows=*/ 13, /*cols=*/ 128, /*top_k=*/ 8, 0xDEAD_BEEF);
+    run_f32(
+        /*rows=*/ 13,
+        /*cols=*/ 128,
+        /*top_k=*/ 8,
+        0xDEAD_BEEF,
+    );
 }
 
 #[test]

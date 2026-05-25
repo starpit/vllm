@@ -71,19 +71,19 @@ fn inline_header(header: &str) -> String {
 
 #[derive(Clone, Debug)]
 pub struct ChunkConstants {
-    pub hidden:        u32,
-    pub num_q_heads:   u32,
-    pub num_kv_heads:  u32,
-    pub head_dim:      u32,
-    pub rot_dim:       u32,
-    pub block_size:    u32,
+    pub hidden: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub rot_dim: u32,
+    pub block_size: u32,
     /// MLP intermediate size (TP-divided). Used only by
     /// `synthesize_mlp_pre_down_chunk` for the `INTERMEDIATE`
     /// `constant constexpr` bake. Set to 0 for pre-attn chunks.
-    pub intermediate:  u32,
-    pub m:             u32,
-    pub group_size:    u32,
-    pub rms_norm_eps:  f32,
+    pub intermediate: u32,
+    pub m: u32,
+    pub group_size: u32,
+    pub rms_norm_eps: f32,
     /// When `true`, `synthesize_pre_attn_chunk` emits a `_bias` symbol
     /// variant: the kernel signature gains three extra device-pointer
     /// bindings (`__q_linear_bias`, `__k_linear_bias`,
@@ -152,54 +152,54 @@ fn synthesize_pre_attn_chunk_impl(
     //                by AffineQmv.
     // - "qmv_smem" : TG-mem dot-product results produced by AffineQmv,
     //                consumed by RopeAppend.
-    let x_norm_name   = "__x_norm".to_string();
+    let x_norm_name = "__x_norm".to_string();
     let qmv_smem_name = "__qmv_smem".to_string();
-    let residual_io   = "__residual_io".to_string();
-    let delta_buf     = "__delta".to_string();
-    let rms_wt_buf    = "__rms_weight".to_string();
+    let residual_io = "__residual_io".to_string();
+    let delta_buf = "__delta".to_string();
+    let rms_wt_buf = "__rms_weight".to_string();
     // Per-projection weight triples — the chain emits ONE
     // SynthPreAttn that binds three separate `LinearLayer::AffineQuant`s
     // (Q, K, V). The kernel branches on head index to pick the right
     // triple for its qmv. Avoids the load-time packed-concat
     // infrastructure that would be needed for a single-buffer design.
-    let q_wt_buf      = "__q_weight".to_string();
-    let q_sc_buf      = "__q_scales".to_string();
-    let q_bi_buf      = "__q_biases".to_string();
-    let k_wt_buf      = "__k_weight".to_string();
-    let k_sc_buf      = "__k_scales".to_string();
-    let k_bi_buf      = "__k_biases".to_string();
-    let v_wt_buf      = "__v_weight".to_string();
-    let v_sc_buf      = "__v_scales".to_string();
-    let v_bi_buf      = "__v_biases".to_string();
+    let q_wt_buf = "__q_weight".to_string();
+    let q_sc_buf = "__q_scales".to_string();
+    let q_bi_buf = "__q_biases".to_string();
+    let k_wt_buf = "__k_weight".to_string();
+    let k_sc_buf = "__k_scales".to_string();
+    let k_bi_buf = "__k_biases".to_string();
+    let v_wt_buf = "__v_weight".to_string();
+    let v_sc_buf = "__v_scales".to_string();
+    let v_bi_buf = "__v_biases".to_string();
     // Per-row linear biases (Qwen2 QKV). Bound at buffers 18/19/20
     // only when `consts.has_linear_bias == true`; otherwise the
     // signature stops at buffer 17 (kv_cache_v) like the bias-free
     // variant.
-    let q_lb_buf      = "__q_linear_bias".to_string();
-    let k_lb_buf      = "__k_linear_bias".to_string();
-    let v_lb_buf      = "__v_linear_bias".to_string();
-    let cos_sin_buf   = "__cos_sin".to_string();
+    let q_lb_buf = "__q_linear_bias".to_string();
+    let k_lb_buf = "__k_linear_bias".to_string();
+    let v_lb_buf = "__v_linear_bias".to_string();
+    let cos_sin_buf = "__cos_sin".to_string();
     let positions_buf = "__positions".to_string();
-    let slot_map_buf  = "__slot_mapping".to_string();
-    let q_out_buf     = "__q_out".to_string();
-    let kv_cache_k    = "__kv_cache_k".to_string();
-    let kv_cache_v    = "__kv_cache_v".to_string();
+    let slot_map_buf = "__slot_mapping".to_string();
+    let q_out_buf = "__q_out".to_string();
+    let kv_cache_k = "__kv_cache_k".to_string();
+    let kv_cache_v = "__kv_cache_v".to_string();
 
     // Build the per-atom AtomCtx (constants slice is shared across atoms
     // for the MVP; production fuse pass will tighten this).
     let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
-        ("HIDDEN",      AtomConstantValue::Uint(consts.hidden)),
-        ("NUM_Q",       AtomConstantValue::Uint(consts.num_q_heads)),
-        ("NUM_KV",      AtomConstantValue::Uint(consts.num_kv_heads)),
-        ("HEAD_DIM",    AtomConstantValue::Uint(consts.head_dim)),
-        ("ROT_DIM",     AtomConstantValue::Uint(consts.rot_dim)),
-        ("BLOCK_SIZE",  AtomConstantValue::Uint(consts.block_size)),
-        ("M",           AtomConstantValue::Uint(consts.m)),
-        ("EPS",         AtomConstantValue::Float(consts.rms_norm_eps)),
+        ("HIDDEN", AtomConstantValue::Uint(consts.hidden)),
+        ("NUM_Q", AtomConstantValue::Uint(consts.num_q_heads)),
+        ("NUM_KV", AtomConstantValue::Uint(consts.num_kv_heads)),
+        ("HEAD_DIM", AtomConstantValue::Uint(consts.head_dim)),
+        ("ROT_DIM", AtomConstantValue::Uint(consts.rot_dim)),
+        ("BLOCK_SIZE", AtomConstantValue::Uint(consts.block_size)),
+        ("M", AtomConstantValue::Uint(consts.m)),
+        ("EPS", AtomConstantValue::Float(consts.rms_norm_eps)),
     ];
 
     let addrms = AddRmsNormAtom { init };
-    let rope   = RopeAppendAtom;
+    let rope = RopeAppendAtom;
     // One AffineQmvAtom per QKV band — the only thing that varies
     // between bands is the local-head expression (each band's weight
     // buffer is row 0..) and the W/S/B channel triple bound below.
@@ -220,7 +220,7 @@ fn synthesize_pre_attn_chunk_impl(
     };
 
     // Bind channel names for each atom.
-    let addrms_in  = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
+    let addrms_in = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
     let addrms_out = vec![x_norm_name.clone()];
     let addrms_ctx = AtomCtx {
         bound_inputs: &addrms_in,
@@ -236,7 +236,7 @@ fn synthesize_pre_attn_chunk_impl(
     // the three weight buffers stay separate (avoids load-time concat).
     let _ = qmv_smem_name;
 
-    let rope_in  = vec![
+    let rope_in = vec![
         qmv_smem_name.clone(),
         cos_sin_buf.clone(),
         positions_buf.clone(),
@@ -251,9 +251,11 @@ fn synthesize_pre_attn_chunk_impl(
         t_scale,
     };
 
-    let addrms_body = addrms.emit_metal_body(&addrms_ctx)
+    let addrms_body = addrms
+        .emit_metal_body(&addrms_ctx)
         .expect("AddRmsNormAtom Metal emit");
-    let rope_body   = rope.emit_metal_body(&rope_ctx)
+    let rope_body = rope
+        .emit_metal_body(&rope_ctx)
         .expect("RopeAppendAtom Metal emit");
 
     // Per-band QKV qmv: three AffineQmvAtom calls, each with its own
@@ -527,30 +529,30 @@ pub fn synthesize_mlp_pre_down_chunk(
         "MVP only emits Metal; CUDA emission lands in a later phase",
     );
 
-    let x_norm_name    = "__x_norm".to_string();
+    let x_norm_name = "__x_norm".to_string();
     let gate_smem_name = "__gate_smem".to_string();
-    let up_smem_name   = "__up_smem".to_string();
-    let residual_io    = "__residual_io".to_string();
-    let delta_buf      = "__delta".to_string();
-    let rms_wt_buf     = "__rms_weight".to_string();
-    let gate_wt_buf    = "__gate_weight".to_string();
-    let gate_sc_buf    = "__gate_scales".to_string();
-    let gate_bi_buf    = "__gate_biases".to_string();
-    let up_wt_buf      = "__up_weight".to_string();
-    let up_sc_buf      = "__up_scales".to_string();
-    let up_bi_buf      = "__up_biases".to_string();
-    let silu_mul_out   = "__silu_mul_out".to_string();
+    let up_smem_name = "__up_smem".to_string();
+    let residual_io = "__residual_io".to_string();
+    let delta_buf = "__delta".to_string();
+    let rms_wt_buf = "__rms_weight".to_string();
+    let gate_wt_buf = "__gate_weight".to_string();
+    let gate_sc_buf = "__gate_scales".to_string();
+    let gate_bi_buf = "__gate_biases".to_string();
+    let up_wt_buf = "__up_weight".to_string();
+    let up_sc_buf = "__up_scales".to_string();
+    let up_bi_buf = "__up_biases".to_string();
+    let silu_mul_out = "__silu_mul_out".to_string();
 
     // Per-atom AtomCtx constants. The shape parameters arrive at
     // kernel launch time as function constants; this slice only
     // contributes to the symbol-name hashing for atoms that look at
     // group_size (AffineQmvAtom does).
     let constants_slice: Vec<(&'static str, AtomConstantValue)> = vec![
-        ("HIDDEN",       AtomConstantValue::Uint(consts.hidden)),
+        ("HIDDEN", AtomConstantValue::Uint(consts.hidden)),
         ("INTERMEDIATE", AtomConstantValue::Uint(consts.num_q_heads)), // overloaded — unused by atoms
-        ("HEAD_DIM",     AtomConstantValue::Uint(consts.head_dim)),
-        ("M",            AtomConstantValue::Uint(consts.m)),
-        ("EPS",          AtomConstantValue::Float(consts.rms_norm_eps)),
+        ("HEAD_DIM", AtomConstantValue::Uint(consts.head_dim)),
+        ("M", AtomConstantValue::Uint(consts.m)),
+        ("EPS", AtomConstantValue::Float(consts.rms_norm_eps)),
     ];
 
     let addrms = AddRmsNormAtom::default();
@@ -565,7 +567,7 @@ pub fn synthesize_mlp_pre_down_chunk(
         has_linear_bias: false,
     };
 
-    let addrms_in  = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
+    let addrms_in = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
     let addrms_out = vec![x_norm_name.clone()];
     let addrms_ctx = AtomCtx {
         bound_inputs: &addrms_in,
@@ -574,7 +576,8 @@ pub fn synthesize_mlp_pre_down_chunk(
         t_act,
         t_scale,
     };
-    let addrms_body = addrms.emit_metal_body(&addrms_ctx)
+    let addrms_body = addrms
+        .emit_metal_body(&addrms_ctx)
         .expect("AddRmsNormAtom Metal emit");
 
     let emit_qmv_body = |w: &str, s: &str, b: &str, out_smem: &str| -> String {
@@ -596,9 +599,9 @@ pub fn synthesize_mlp_pre_down_chunk(
             .expect("AffineQmvAtom Metal emit")
     };
     let gate_qmv_body = emit_qmv_body(&gate_wt_buf, &gate_sc_buf, &gate_bi_buf, &gate_smem_name);
-    let up_qmv_body   = emit_qmv_body(&up_wt_buf,   &up_sc_buf,   &up_bi_buf,   &up_smem_name);
+    let up_qmv_body = emit_qmv_body(&up_wt_buf, &up_sc_buf, &up_bi_buf, &up_smem_name);
 
-    let sm_in  = vec![gate_smem_name.clone(), up_smem_name.clone()];
+    let sm_in = vec![gate_smem_name.clone(), up_smem_name.clone()];
     let sm_out = vec![silu_mul_out.clone()];
     let sm_ctx = AtomCtx {
         bound_inputs: &sm_in,
@@ -607,14 +610,13 @@ pub fn synthesize_mlp_pre_down_chunk(
         t_act,
         t_scale,
     };
-    let silu_mul_body = silu_mul.emit_metal_body(&sm_ctx)
+    let silu_mul_body = silu_mul
+        .emit_metal_body(&sm_ctx)
         .expect("SiluMulAtom Metal emit");
 
     let symbol = format!(
         "synth_mlp_pre_down_{}_{}_gs{}",
-        t_act,
-        t_scale,
-        consts.group_size,
+        t_act, t_scale, consts.group_size,
     );
 
     let source_tail = format!(
@@ -765,18 +767,19 @@ pub fn synthesize_gate_up_silu_mul_large_chunk(
 
     let gs = consts.group_size;
     let silu_mul_out = "__silu_mul_out";
-    let x_norm       = "__x_norm";
-    let gate_wt      = "__gate_weight";
-    let gate_sc      = "__gate_scales";
-    let gate_bi      = "__gate_biases";
-    let up_wt        = "__up_weight";
-    let up_sc        = "__up_scales";
-    let up_bi        = "__up_biases";
+    let x_norm = "__x_norm";
+    let gate_wt = "__gate_weight";
+    let gate_sc = "__gate_scales";
+    let gate_bi = "__gate_biases";
+    let up_wt = "__up_weight";
+    let up_sc = "__up_scales";
+    let up_bi = "__up_biases";
 
-    let bk_pad = 40u32;  // BK(32) + 8 (bfloat bank-conflict pad)
+    let bk_pad = 40u32; // BK(32) + 8 (bfloat bank-conflict pad)
     let group_steps = consts.group_size / 32; // gs/BK; gs=64 → 2
 
-    let source_tail = format!(r#"
+    let source_tail = format!(
+        r#"
 // BM=BN=BK=32, WM=WN=2, TM=TN=2, TGP=128. Mirrors MLX affine_qmm_t.
 constant constexpr int BM_SG   = 32;
 constant constexpr int BN_SG   = 32;
@@ -963,26 +966,43 @@ void {symbol}(
     }}
 }}
 "#,
-        symbol = symbol, t_act = t_act, t_scale = t_scale, gs = gs,
-        bk_pad = bk_pad, group_steps = group_steps,
-        silu_mul_out = silu_mul_out, x_norm = x_norm,
-        gate_wt = gate_wt, gate_sc = gate_sc, gate_bi = gate_bi,
-        up_wt = up_wt, up_sc = up_sc, up_bi = up_bi,
-        hidden = consts.hidden, intermediate = consts.intermediate,
+        symbol = symbol,
+        t_act = t_act,
+        t_scale = t_scale,
+        gs = gs,
+        bk_pad = bk_pad,
+        group_steps = group_steps,
+        silu_mul_out = silu_mul_out,
+        x_norm = x_norm,
+        gate_wt = gate_wt,
+        gate_sc = gate_sc,
+        gate_bi = gate_bi,
+        up_wt = up_wt,
+        up_sc = up_sc,
+        up_bi = up_bi,
+        hidden = consts.hidden,
+        intermediate = consts.intermediate,
     );
 
     // metal_kittens.h is included unchanged — do NOT add simdgroup_matrix
     // code to that header or all synth kernels will be recompiled.
     // This kernel includes <metal_simdgroup_matrix> directly in its header.
-    let mk_header = inline_header(include_str!("../../ferrite-metal-kernels/shaders/metal_kittens.h"));
+    let mk_header = inline_header(include_str!(
+        "../../ferrite-metal-kernels/shaders/metal_kittens.h"
+    ));
     let source = format!(
         "// SPDX-License-Identifier: Apache-2.0\n// SYNTHESIZED KERNEL — do not hand-edit.\n\n\
          #include <metal_stdlib>\n#include <metal_simdgroup_matrix>\nusing namespace metal;\n\n\
          // === inlined metal_kittens.h ===\n{mk_header}\n// === end inlined metal_kittens.h ===\n\n{source_tail}",
-        mk_header = mk_header, source_tail = source_tail,
+        mk_header = mk_header,
+        source_tail = source_tail,
     );
 
-    SynthesizedKernel { symbol, source, backend: SynthesisBackend::Metal }
+    SynthesizedKernel {
+        symbol,
+        source,
+        backend: SynthesisBackend::Metal,
+    }
 }
 
 /// Public helper for the synth-kernel dump probe (`bin/dump_synth.rs`).
@@ -991,16 +1011,16 @@ void {symbol}(
 /// pipeline.
 pub fn dump_llama_3_2_3b_4bit_pre_attn() -> SynthesizedKernel {
     let consts = ChunkConstants {
-        hidden:        3072,
-        num_q_heads:   24,
-        num_kv_heads:  8,
-        head_dim:      128,
-        rot_dim:       128,
-        block_size:    16,
-        intermediate:  8192,
-        m:             1,
-        group_size:    64,
-        rms_norm_eps:  1e-5,
+        hidden: 3072,
+        num_q_heads: 24,
+        num_kv_heads: 8,
+        head_dim: 128,
+        rot_dim: 128,
+        block_size: 16,
+        intermediate: 8192,
+        m: 1,
+        group_size: 64,
+        rms_norm_eps: 1e-5,
         has_linear_bias: false,
     };
     synthesize_pre_attn_chunk(SynthesisBackend::Metal, "bfloat", "half", &consts)
@@ -1014,16 +1034,16 @@ mod tests {
         // Llama-3.2-3B-Instruct-4bit: hidden=3072, q_heads=24, kv_heads=8,
         // head_dim=128, rot_dim=128, group_size=64, block_size=16.
         ChunkConstants {
-            hidden:        3072,
-            num_q_heads:   24,
-            num_kv_heads:  8,
-            head_dim:      128,
-            rot_dim:       128,
-            block_size:    16,
-            intermediate:  8192,
-            m:             1,
-            group_size:    64,
-            rms_norm_eps:  1e-5,
+            hidden: 3072,
+            num_q_heads: 24,
+            num_kv_heads: 8,
+            head_dim: 128,
+            rot_dim: 128,
+            block_size: 16,
+            intermediate: 8192,
+            m: 1,
+            group_size: 64,
+            rms_norm_eps: 1e-5,
             has_linear_bias: false,
         }
     }

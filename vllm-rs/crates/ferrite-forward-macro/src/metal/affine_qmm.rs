@@ -24,8 +24,6 @@ use crate::impl_lib::{
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
-use quote::quote;
-
 /// Solver-side singleton claim for MLX-affine int4 GEMMs. Mirrors
 /// `MetalGemmImpl` shape; differs only in the storage gate (Affine vs
 /// Dense) and the emitted opcode (`AffineQmm` vs `Gemm`).
@@ -93,10 +91,7 @@ impl Implementation for MetalAffineQmmImpl {
     fn cost_us(&self, m: &MatchInfo, ctx: &CostCtx) -> f64 {
         let tile = m.claimed_tiles[0];
         let node = ctx.fuf.get(tile);
-        let output_dims = node
-            .outputs
-            .first()
-            .and_then(|s| ctx.eval_shape(s));
+        let output_dims = node.outputs.first().and_then(|s| ctx.eval_shape(s));
         if let Some(dims) = output_dims
             && dims.len() >= 2
         {
@@ -178,11 +173,7 @@ impl Implementation for MetalAffineQmmImpl {
         affine_qmm_opcode_shape()
     }
 
-    fn as_atom(
-        &self,
-        m: &MatchInfo,
-        fuf: &Fuf,
-    ) -> Option<Box<dyn crate::atom::Atom>> {
+    fn as_atom(&self, m: &MatchInfo, fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
         // Only the decode branch (M < vector_limit) participates in
         // synthesis today. Prefill stays on the qmm_t hand-written
         // kernels until Phase 5 (mk_mma) lands.
@@ -278,8 +269,7 @@ pub(crate) fn empirical_cost_us(
     ctx: &CostCtx,
 ) -> Option<f64> {
     use ferrite_metal_kernels::quantized::{
-        pick_qmm_t_kernel, pick_qmv_kernel_by_cost, qmv_csv_kernel_name, DequantDtype,
-        QmmTKernel,
+        DequantDtype, QmmTKernel, pick_qmm_t_kernel, pick_qmv_kernel_by_cost, qmv_csv_kernel_name,
     };
 
     let dtype_str = match dtype {

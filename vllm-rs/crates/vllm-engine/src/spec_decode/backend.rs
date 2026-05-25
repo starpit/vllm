@@ -112,11 +112,11 @@ impl Error for BackendError {}
 ///   * `slot_mapping[i]` — `block_id * block_size + offset_within_block`
 ///     where the K/V for `input_ids[i]` is written into the KV pool.
 ///   * `cu_seqlens_q`  — exclusive prefix sum over per-seq `q_len`s,
-///                      length `num_reqs + 1`.
+///     length `num_reqs + 1`.
 ///   * `seqused_k[i]`  — total KV length the attention kernel reads for
-///                      seq `i` (= existing KV + new tokens this step).
+///     seq `i` (= existing KV + new tokens this step).
 ///   * `block_table`   — flat `[num_reqs, block_table_stride]` u32 of block
-///                      IDs in the chosen KV pool.
+///     IDs in the chosen KV pool.
 pub struct ForwardArgmaxRequest<'a> {
     pub input_ids: &'a [u32],
     pub positions: &'a [u32],
@@ -174,10 +174,7 @@ pub trait SpecDecodeBackend {
     /// Block on a previously-submitted forward+argmax. Default impl
     /// returns `NotImplemented` — only meaningful if the backend
     /// overrides [`submit_forward_argmax`].
-    fn await_forward_argmax(
-        &mut self,
-        _handle: ForwardHandle,
-    ) -> Result<Vec<u32>, BackendError> {
+    fn await_forward_argmax(&mut self, _handle: ForwardHandle) -> Result<Vec<u32>, BackendError> {
         Err(BackendError::NotImplemented("await_forward_argmax"))
     }
 
@@ -207,8 +204,8 @@ pub trait SpecDecodeBackend {
 
     /// Phase 6: K-step draft chain in ONE GPU submission. Replaces the
     /// proposer's K-iter `forward_argmax_blocking` loop with a single
-    /// call. Backends that override this fuse forward + per-row argmax
-    /// + per-req position/slot/seqused_k advance into one command
+    /// call. Backends that override this fuse forward, per-row argmax,
+    /// and per-req position/slot/seqused_k advance into one command
     /// buffer with a single host wait. Returns `[k][num_reqs]` argmax
     /// IDs (iter-major).
     ///

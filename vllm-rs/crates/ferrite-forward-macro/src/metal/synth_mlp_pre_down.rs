@@ -23,13 +23,11 @@ use crate::classified::{OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, CostCtx, Handoff, Implementation, LaunchKind,
-    Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
-
-use quote::quote;
 
 fn weight_storage_of(node: &crate::fuf::FufNode) -> Option<&StorageFormat> {
     for input in &node.inputs {
@@ -54,11 +52,21 @@ pub struct MetalSynthMlpPreDownImpl {
 
 impl MetalSynthMlpPreDownImpl {
     pub fn bf16_gs64() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4 }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "half",
+            group_size: 64,
+            bits: 4,
+        }
     }
     /// Qwen3-family BF16-scale variant.
     pub fn bf16_gs64_s_bf16() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4 }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "bfloat",
+            group_size: 64,
+            bits: 4,
+        }
     }
 }
 
@@ -93,11 +101,10 @@ impl Implementation for MetalSynthMlpPreDownImpl {
 
     fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
         let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
-        match (is_qwen3, self.scale_tag) {
-            (true, "bfloat") => true,
-            (false, "half") => true,
-            _ => false,
-        }
+        matches!(
+            (is_qwen3, self.scale_tag),
+            (true, "bfloat") | (false, "half")
+        )
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
@@ -146,9 +153,10 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         }
 
         // Silu consumes exactly one of the Gemms (the gate).
-        let silu_node = fuf.nodes.iter().find(|n| {
-            n.op == OpKind::Silu && gemms.iter().any(|g| consumes_tile(n, *g))
-        })?;
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && gemms.iter().any(|g| consumes_tile(n, *g)))?;
         let silu_tile = silu_node.id;
         // Mul consumes the Silu and the other (up) Gemm.
         let mul_node = fuf.nodes.iter().find(|n| {
@@ -374,14 +382,10 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         // gate = the Gemm consumed by Silu. up = the other Gemm
         // (Mul's other tile input). Matches the field-ordering
         // `apply_synth_replacement_mlp` produces (gate then up).
-        let silu_in = fuf
-            .get(silu_tile)
-            .inputs
-            .iter()
-            .find_map(|i| match i {
-                FufInput::Tile { id, .. } => Some(*id),
-                _ => None,
-            })?;
+        let silu_in = fuf.get(silu_tile).inputs.iter().find_map(|i| match i {
+            FufInput::Tile { id, .. } => Some(*id),
+            _ => None,
+        })?;
         if !gemm_tiles.contains(&silu_in) {
             return None;
         }

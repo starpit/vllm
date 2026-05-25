@@ -22,8 +22,7 @@ use dispatch2::DispatchData;
 use ferrite_fusion_synth::{
     aot::aot_compile_metallib,
     fuse_pass::{
-        synthesize_pre_attn_chunk, synthesize_pre_attn_init_chunk, ChunkConstants,
-        SynthesisBackend,
+        ChunkConstants, SynthesisBackend, synthesize_pre_attn_chunk, synthesize_pre_attn_init_chunk,
     },
 };
 use ferrite_metal_kernels::stream::MetalStream;
@@ -40,13 +39,13 @@ use std::ptr::NonNull;
 /// the CSV key, so we cover the per-arch (num_q, num_kv, head_dim,
 /// rot_dim) combos that actually ship.
 struct ModelShape {
-    name:     &'static str,
-    hidden:   u32,
-    num_q:    u32,
-    num_kv:   u32,
+    name: &'static str,
+    hidden: u32,
+    num_q: u32,
+    num_kv: u32,
     head_dim: u32,
-    rot_dim:  u32,
-    rms_eps:  f32,
+    rot_dim: u32,
+    rms_eps: f32,
 }
 
 const BLOCK_SIZE: u32 = 16;
@@ -54,16 +53,31 @@ const GROUP_SIZE: u32 = 64;
 
 const SHAPES: &[ModelShape] = &[
     ModelShape {
-        name: "llama_3_2_1b", hidden: 2048, num_q: 32, num_kv: 8,
-        head_dim: 64, rot_dim: 64, rms_eps: 1.0e-5,
+        name: "llama_3_2_1b",
+        hidden: 2048,
+        num_q: 32,
+        num_kv: 8,
+        head_dim: 64,
+        rot_dim: 64,
+        rms_eps: 1.0e-5,
     },
     ModelShape {
-        name: "llama_3_2_3b", hidden: 3072, num_q: 24, num_kv: 8,
-        head_dim: 128, rot_dim: 128, rms_eps: 1.0e-5,
+        name: "llama_3_2_3b",
+        hidden: 3072,
+        num_q: 24,
+        num_kv: 8,
+        head_dim: 128,
+        rot_dim: 128,
+        rms_eps: 1.0e-5,
     },
     ModelShape {
-        name: "llama_3_1_8b", hidden: 4096, num_q: 32, num_kv: 8,
-        head_dim: 128, rot_dim: 128, rms_eps: 1.0e-5,
+        name: "llama_3_1_8b",
+        hidden: 4096,
+        num_q: 32,
+        num_kv: 8,
+        head_dim: 128,
+        rot_dim: 128,
+        rms_eps: 1.0e-5,
     },
 ];
 
@@ -95,15 +109,15 @@ pub fn run(launch_overhead_us: f64) {
 
 fn bench_one(s: &ModelShape, m: u32, init: bool, launch_overhead_us: f64) -> f64 {
     let consts = ChunkConstants {
-        hidden:       s.hidden,
-        num_q_heads:  s.num_q,
+        hidden: s.hidden,
+        num_q_heads: s.num_q,
         num_kv_heads: s.num_kv,
-        head_dim:     s.head_dim,
-        rot_dim:      s.rot_dim,
-        block_size:   BLOCK_SIZE,
+        head_dim: s.head_dim,
+        rot_dim: s.rot_dim,
+        block_size: BLOCK_SIZE,
         intermediate: 0,
         m,
-        group_size:   GROUP_SIZE,
+        group_size: GROUP_SIZE,
         rms_norm_eps: s.rms_eps,
         // Sweep covers the bias-free variant only; the biased
         // Qwen2 path's CSV rows will land in a separate sweep.
@@ -115,7 +129,11 @@ fn bench_one(s: &ModelShape, m: u32, init: bool, launch_overhead_us: f64) -> f64
         synthesize_pre_attn_chunk(SynthesisBackend::Metal, "bfloat", "half", &consts)
     };
     let bytes = aot_compile_metallib(&synth.symbol, &synth.source);
-    assert!(!bytes.is_empty(), "AOT compile produced empty metallib for {}", synth.symbol);
+    assert!(
+        !bytes.is_empty(),
+        "AOT compile produced empty metallib for {}",
+        synth.symbol
+    );
 
     let device = util::device();
     // The DispatchData wrapper expects a 'static slice. The sweep is
@@ -145,32 +163,32 @@ fn bench_one(s: &ModelShape, m: u32, init: bool, launch_overhead_us: f64) -> f64
 
     // Per-buffer size analysis — mirrors the binding layout in
     // `interpreter/metal/lowering.rs::SynthPreAttn`.
-    let act = 2usize;          // bf16
-    let scale = 2usize;        // f16
-    let q_n   = (s.num_q  * s.head_dim) as usize;
-    let kv_n  = (s.num_kv * s.head_dim) as usize;
-    let hid   = s.hidden as usize;
-    let mu    = m as usize;
-    let gs    = GROUP_SIZE as usize;
+    let act = 2usize; // bf16
+    let scale = 2usize; // f16
+    let q_n = (s.num_q * s.head_dim) as usize;
+    let kv_n = (s.num_kv * s.head_dim) as usize;
+    let hid = s.hidden as usize;
+    let mu = m as usize;
+    let gs = GROUP_SIZE as usize;
 
-    let q_out      = util::create_buffer(mu * q_n * act);
-    let residual   = util::create_buffer(mu * hid * act);
-    let delta      = util::create_buffer(mu * hid * act);
-    let rms_w      = util::create_buffer(hid * scale);
-    let q_packed   = util::create_buffer(q_n * hid / 2);
-    let q_scales   = util::create_buffer(q_n * hid / gs * scale);
-    let q_biases   = util::create_buffer(q_n * hid / gs * scale);
-    let k_packed   = util::create_buffer(kv_n * hid / 2);
-    let k_scales   = util::create_buffer(kv_n * hid / gs * scale);
-    let k_biases   = util::create_buffer(kv_n * hid / gs * scale);
-    let v_packed   = util::create_buffer(kv_n * hid / 2);
-    let v_scales   = util::create_buffer(kv_n * hid / gs * scale);
-    let v_biases   = util::create_buffer(kv_n * hid / gs * scale);
+    let q_out = util::create_buffer(mu * q_n * act);
+    let residual = util::create_buffer(mu * hid * act);
+    let delta = util::create_buffer(mu * hid * act);
+    let rms_w = util::create_buffer(hid * scale);
+    let q_packed = util::create_buffer(q_n * hid / 2);
+    let q_scales = util::create_buffer(q_n * hid / gs * scale);
+    let q_biases = util::create_buffer(q_n * hid / gs * scale);
+    let k_packed = util::create_buffer(kv_n * hid / 2);
+    let k_scales = util::create_buffer(kv_n * hid / gs * scale);
+    let k_biases = util::create_buffer(kv_n * hid / gs * scale);
+    let v_packed = util::create_buffer(kv_n * hid / 2);
+    let v_scales = util::create_buffer(kv_n * hid / gs * scale);
+    let v_biases = util::create_buffer(kv_n * hid / gs * scale);
     // RoPE cos/sin cache: production cache is (max_seq, rot_dim) — 4096
     // tokens × rot_dim × act dtype is enough headroom for any positions[t]=0.
-    let cos_sin    = util::create_buffer(4096 * (s.rot_dim as usize) * act);
-    let positions  = util::create_buffer(mu * 4);
-    let slot_map   = util::create_buffer(mu * 4);
+    let cos_sin = util::create_buffer(4096 * (s.rot_dim as usize) * act);
+    let positions = util::create_buffer(mu * 4);
+    let slot_map = util::create_buffer(mu * 4);
     util::zero_buffer(&positions);
     util::zero_buffer(&slot_map);
     // KV cache: at minimum one block per layer. slot_mapping is zeroed
@@ -180,16 +198,28 @@ fn bench_one(s: &ModelShape, m: u32, init: bool, launch_overhead_us: f64) -> f64
     let kv_cache_v = util::create_buffer(kv_cache_bytes);
 
     let bufs: [&Buffer; 18] = [
-        &q_out, &residual, &delta, &rms_w,
-        &q_packed, &q_scales, &q_biases,
-        &k_packed, &k_scales, &k_biases,
-        &v_packed, &v_scales, &v_biases,
-        &cos_sin, &positions, &slot_map,
-        &kv_cache_k, &kv_cache_v,
+        &q_out,
+        &residual,
+        &delta,
+        &rms_w,
+        &q_packed,
+        &q_scales,
+        &q_biases,
+        &k_packed,
+        &k_scales,
+        &k_biases,
+        &v_packed,
+        &v_scales,
+        &v_biases,
+        &cos_sin,
+        &positions,
+        &slot_map,
+        &kv_cache_k,
+        &kv_cache_v,
     ];
 
     let num_heads_total = s.num_q + 2 * s.num_kv;
-    let threads_per_tg  = 32 * s.head_dim / 4; // MK_SIMD_SIZE * HEAD_DIM / MK_ROWS_PER_SIMDGROUP
+    let threads_per_tg = 32 * s.head_dim / 4; // MK_SIMD_SIZE * HEAD_DIM / MK_ROWS_PER_SIMDGROUP
 
     let mut stream = MetalStream::new(device);
     util::time_kernel(launch_overhead_us, 3, 20, || {
@@ -202,14 +232,14 @@ fn bench_one(s: &ModelShape, m: u32, init: bool, launch_overhead_us: f64) -> f64
             }
         }
         let tg = MTLSize {
-            width:  m as usize,
+            width: m as usize,
             height: num_heads_total as usize,
-            depth:  1,
+            depth: 1,
         };
         let tpt = MTLSize {
-            width:  threads_per_tg as usize,
+            width: threads_per_tg as usize,
             height: 1,
-            depth:  1,
+            depth: 1,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(tg, tpt);
         enc.endEncoding();

@@ -122,15 +122,24 @@ fn run_bf16(rows: usize, top_k: usize, hidden: usize, seed: u64) {
 
 #[test]
 fn moe_weighted_sum_bf16_mixtral_decode() {
-    run_bf16(/*rows=*/ 1, /*top_k=*/ 2, /*hidden=*/ 4096, 0xC0FFEE);
+    run_bf16(
+        /*rows=*/ 1, /*top_k=*/ 2, /*hidden=*/ 4096, 0xC0FFEE,
+    );
 }
 
 #[test]
 fn moe_weighted_sum_bf16_qwen3_moe_decode() {
-    run_bf16(/*rows=*/ 1, /*top_k=*/ 8, /*hidden=*/ 2048, 0xDEAD_BEEF);
+    run_bf16(
+        /*rows=*/ 1,
+        /*top_k=*/ 8,
+        /*hidden=*/ 2048,
+        0xDEAD_BEEF,
+    );
 }
 
 #[test]
 fn moe_weighted_sum_bf16_prefill_batch() {
-    run_bf16(/*rows=*/ 32, /*top_k=*/ 8, /*hidden=*/ 2048, 0x12345);
+    run_bf16(
+        /*rows=*/ 32, /*top_k=*/ 8, /*hidden=*/ 2048, 0x12345,
+    );
 }

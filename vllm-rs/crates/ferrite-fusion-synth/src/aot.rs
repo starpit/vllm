@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! AOT-compile MSL source to a `.metallib` blob via `xcrun metal -c`
-//! + `xcrun metallib`. Shared by `ferrite-forward-macro` (proc-macro
+//! and `xcrun metallib`. Shared by `ferrite-forward-macro` (proc-macro
 //! expansion baking) and `ferrite-metal-cost-sweep` (benchmark of
 //! the synthesized kernels).
 //!
@@ -15,17 +15,14 @@ use std::process::Command;
 pub fn aot_compile_metallib(symbol: &str, source: &str) -> Vec<u8> {
     // Skip on non-macOS hosts (no `xcrun`). The synth metallibs are
     // only ever consumed by the metal backend.
-    let host_os = std::env::var("CARGO_CFG_TARGET_OS")
-        .unwrap_or_else(|_| std::env::consts::OS.to_string());
+    let host_os =
+        std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_else(|_| std::env::consts::OS.to_string());
     if host_os != "macos" {
         return Vec::new();
     }
 
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "ferrite-synth-{}-{}",
-        symbol,
-        std::process::id()
-    ));
+    let tmp_dir =
+        std::env::temp_dir().join(format!("ferrite-synth-{}-{}", symbol, std::process::id()));
     std::fs::create_dir_all(&tmp_dir)
         .unwrap_or_else(|e| panic!("synth: create tmp dir {tmp_dir:?}: {e}"));
 
@@ -40,16 +37,21 @@ pub fn aot_compile_metallib(symbol: &str, source: &str) -> Vec<u8> {
     drop(f);
 
     let status = Command::new("xcrun")
-        .args(["-sdk", "macosx", "metal", "-O3", "-frecord-sources=flat", "-c"])
+        .args([
+            "-sdk",
+            "macosx",
+            "metal",
+            "-O3",
+            "-frecord-sources=flat",
+            "-c",
+        ])
         .arg(&metal_path)
         .arg("-o")
         .arg(&air_path)
         .status()
         .unwrap_or_else(|e| panic!("synth: spawn xcrun metal: {e}"));
     if !status.success() {
-        panic!(
-            "synth: `xcrun metal` failed for `{symbol}` (source at {metal_path:?})"
-        );
+        panic!("synth: `xcrun metal` failed for `{symbol}` (source at {metal_path:?})");
     }
 
     let status = Command::new("xcrun")

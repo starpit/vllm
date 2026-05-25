@@ -137,9 +137,9 @@ pub fn dispatch_take_along_axis(
     let src_axis_i = src_axis_size as i32;
     let idx_axis_i = idx_axis_size as i32;
 
-    let cmdbuf = queue.commandBuffer().ok_or_else(|| {
-        MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into())
-    })?;
+    let cmdbuf = queue
+        .commandBuffer()
+        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into()))?;
     let enc = cmdbuf.computeCommandEncoder().ok_or_else(|| {
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder nil".into())
     })?;

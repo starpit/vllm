@@ -74,8 +74,8 @@ pub struct SoftmaxKernels {
 
 impl SoftmaxKernels {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library =
-            load_library_from_bytes(device, crate::embedded_metallib!("softmax")).map_err(|e| {
+        let library = load_library_from_bytes(device, crate::embedded_metallib!("softmax"))
+            .map_err(|e| {
                 MetalStreamError::ShaderCompilationFailed(format!("load `softmax.metallib`: {e}"))
             })?;
         let precise_f16 = build_pipeline(device, &library, "block_softmax_precise_float16")?;

@@ -11,10 +11,7 @@ use quote::quote;
 /// Emit a `static <ident>: &[bool] = &[…];` slice. Length matches
 /// the corresponding `emit_bucket_static_slice` instruction static
 /// (pre-loop-compression — one flag per `OpInstance`).
-pub fn emit_bucket_barriers_static(
-    static_ident: &syn::Ident,
-    barriers: &[bool],
-) -> TokenStream {
+pub fn emit_bucket_barriers_static(static_ident: &syn::Ident, barriers: &[bool]) -> TokenStream {
     let elements = barriers.iter().map(|b| {
         if *b {
             quote! { true }

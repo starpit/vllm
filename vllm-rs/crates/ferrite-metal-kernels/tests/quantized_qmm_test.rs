@@ -256,7 +256,8 @@ fn affine_qmm_t_aligned_b4_bf16_matches_cpu_reference() {
     let k = 512;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -302,7 +303,8 @@ fn affine_qmm_t_unaligned_b4_bf16_matches_cpu_reference() {
     let k = 64;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -349,7 +351,8 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_q_proj_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
         "Llama-1B q_proj prefill shape should route to SplitK(4), got {:?}",
@@ -360,11 +363,18 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_q_proj_prefill_shape() {
         make_inputs_bf16(0x11B_u64 ^ group_size as u64, n, k, m, group_size);
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmm_t_bf16(
-        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+        &packed,
+        &scales,
+        &biases,
+        &x,
+        m,
+        n,
+        k,
+        group_size as u32,
+        expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     let allowed = allowed * 2.0;
     assert!(
         abs_err <= allowed,
@@ -382,7 +392,8 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_kv_proj_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 16, .. }),
         "Llama-1B kv_proj prefill shape should route to SplitK(16), got {:?}",
@@ -393,11 +404,18 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_kv_proj_prefill_shape() {
         make_inputs_bf16(0x11C_u64 ^ group_size as u64, n, k, m, group_size);
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmm_t_bf16(
-        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+        &packed,
+        &scales,
+        &biases,
+        &x,
+        m,
+        n,
+        k,
+        group_size as u32,
+        expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     let allowed = allowed * 2.0;
     assert!(
         abs_err <= allowed,
@@ -415,7 +433,8 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_gate_up_prefill_shape() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert_eq!(
         expected_kernel,
         QmmTKernel::Standard,
@@ -426,11 +445,18 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_gate_up_prefill_shape() {
         make_inputs_bf16(0x11D_u64 ^ group_size as u64, n, k, m, group_size);
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmm_t_bf16(
-        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+        &packed,
+        &scales,
+        &biases,
+        &x,
+        m,
+        n,
+        k,
+        group_size as u32,
+        expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmm_t Llama-1B gate/up_proj Standard (M=64, N=8192, K=2048, gs=64): \
@@ -447,7 +473,8 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_down_proj_prefill_shape() {
     let k = 8192;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { split_k: 4, .. }),
         "Llama-1B down_proj prefill shape should route to SplitK(4), got {:?}",
@@ -458,11 +485,18 @@ fn affine_qmm_t_b4_bf16_llama_3_2_1b_down_proj_prefill_shape() {
         make_inputs_bf16(0x11E_u64 ^ group_size as u64, n, k, m, group_size);
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmm_t_bf16(
-        &packed, &scales, &biases, &x, m, n, k, group_size as u32, expected_kernel,
+        &packed,
+        &scales,
+        &biases,
+        &x,
+        m,
+        n,
+        k,
+        group_size as u32,
+        expected_kernel,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     let allowed = allowed * 2.0;
     assert!(
         abs_err <= allowed,
@@ -484,7 +518,8 @@ fn affine_qmm_t_splitk_b4_bf16_matches_cpu_reference() {
     let k = 2048;
     let group_size = 64;
 
-    let expected_kernel = pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
+    let expected_kernel =
+        pick_qmm_t_kernel(m as u32, n as u32, k as u32, 1, group_size as u32, false);
     assert!(
         matches!(expected_kernel, QmmTKernel::SplitK { .. }),
         "test shape should route to SplitK, got {:?}",
@@ -576,17 +611,25 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
     let expected = cpu_qmm_t_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
 
     // Force NAX kernel via execute_with_kernel.
-    let device = ferrite_metal_kernels::device::detect_device().expect("Metal device").device;
+    let device = ferrite_metal_kernels::device::detect_device()
+        .expect("Metal device")
+        .device;
     let mut stream = ferrite_metal_kernels::stream::MetalStream::new(&device);
     let qmm = ferrite_metal_kernels::quantized::MetalAffineQmmT::new(device.clone())
         .expect("MetalAffineQmmT");
 
     let packed_buf = buffer_from_bytes(&device, &packed);
     let scales_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(scales.as_ptr() as *const u8, std::mem::size_of_val(&scales[..]))
+        std::slice::from_raw_parts(
+            scales.as_ptr() as *const u8,
+            std::mem::size_of_val(&scales[..]),
+        )
     };
     let biases_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(biases.as_ptr() as *const u8, std::mem::size_of_val(&biases[..]))
+        std::slice::from_raw_parts(
+            biases.as_ptr() as *const u8,
+            std::mem::size_of_val(&biases[..]),
+        )
     };
     let x_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(&x[..]))
@@ -629,8 +672,9 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
         for j in 0..n {
             let idx = i * n + j;
             let abs_err = (metal[idx].to_f32() - expected[idx].to_f32()).abs();
-            let allowed = 4.0 * ((k as f32).sqrt() * 0.5 * (1.0 / 128.0) * 0.5
-                + expected[idx].to_f32().abs() * (1.0 / 128.0));
+            let allowed = 4.0
+                * ((k as f32).sqrt() * 0.5 * (1.0 / 128.0) * 0.5
+                    + expected[idx].to_f32().abs() * (1.0 / 128.0));
             // simd_gid: 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
             let sg = (i / 32) * 2 + (j / 32);
             if abs_err > allowed {
@@ -640,11 +684,17 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
             }
         }
     }
-    eprintln!("simdgroup mismatches: TL(0)={}/{} TR(1)={}/{} BL(2)={}/{} BR(3)={}/{}",
-        sg_bad[0], sg_ok[0] + sg_bad[0],
-        sg_bad[1], sg_ok[1] + sg_bad[1],
-        sg_bad[2], sg_ok[2] + sg_bad[2],
-        sg_bad[3], sg_ok[3] + sg_bad[3]);
+    eprintln!(
+        "simdgroup mismatches: TL(0)={}/{} TR(1)={}/{} BL(2)={}/{} BR(3)={}/{}",
+        sg_bad[0],
+        sg_ok[0] + sg_bad[0],
+        sg_bad[1],
+        sg_ok[1] + sg_bad[1],
+        sg_bad[2],
+        sg_ok[2] + sg_bad[2],
+        sg_bad[3],
+        sg_ok[3] + sg_bad[3]
+    );
 
     // Print first row of each simdgroup, metal vs cpu
     for &sg_row in &[0, 32] {
@@ -652,14 +702,20 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
             let i = sg_row;
             let j = sg_col;
             let pairs: Vec<String> = (0..8)
-                .map(|d| format!("[{}]m={:.2}/c={:.2}", j + d, metal[i*n+j+d].to_f32(), expected[i*n+j+d].to_f32()))
+                .map(|d| {
+                    format!(
+                        "[{}]m={:.2}/c={:.2}",
+                        j + d,
+                        metal[i * n + j + d].to_f32(),
+                        expected[i * n + j + d].to_f32()
+                    )
+                })
                 .collect();
             eprintln!("row{} col{}+: {}", i, j, pairs.join(" "));
         }
     }
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmm_t NAX gs={group_size}: worst abs_err={abs_err:.5} at idx {idx} \
@@ -678,16 +734,23 @@ fn affine_qmm_t_nax_b4_bf16_matches_cpu_reference() {
 #[ignore = "Timing diagnostic — run manually with --ignored --nocapture"]
 fn qmm_t_timing_at_prefill_shapes() {
     use std::time::Instant;
-    let device = ferrite_metal_kernels::device::detect_device().expect("Metal device").device;
+    let device = ferrite_metal_kernels::device::detect_device()
+        .expect("Metal device")
+        .device;
     let mut stream = ferrite_metal_kernels::stream::MetalStream::new(&device);
     let qmm = ferrite_metal_kernels::quantized::MetalAffineQmmT::new(device.clone())
         .expect("MetalAffineQmmT");
 
     let shapes = [
-        ("Q/O (M=1024, N=3072, K=3072)", 1024_usize, 3072_usize, 3072_usize),
-        ("K/V (M=1024, N=1024, K=3072)", 1024,        1024,        3072),
-        ("Gate/Up (M=1024, N=8192, K=3072)", 1024,    8192,        3072),
-        ("Down (M=1024, N=3072, K=8192)",   1024,     3072,        8192),
+        (
+            "Q/O (M=1024, N=3072, K=3072)",
+            1024_usize,
+            3072_usize,
+            3072_usize,
+        ),
+        ("K/V (M=1024, N=1024, K=3072)", 1024, 1024, 3072),
+        ("Gate/Up (M=1024, N=8192, K=3072)", 1024, 8192, 3072),
+        ("Down (M=1024, N=3072, K=8192)", 1024, 3072, 8192),
     ];
     let gs: u32 = 64;
     let warmups: u32 = 5;
@@ -711,20 +774,34 @@ fn qmm_t_timing_at_prefill_shapes() {
             let cb = stream.get_command_buffer().expect("cmd buf").clone();
             let enc = cb.computeCommandEncoder().expect("encoder");
             qmm.execute(
-                &x, &packed, &scales, &biases, &y,
-                m as u32, n as u32, k as u32, 1, gs, 4,
+                &x,
+                &packed,
+                &scales,
+                &biases,
+                &y,
+                m as u32,
+                n as u32,
+                k as u32,
+                1,
+                gs,
+                4,
                 ferrite_metal_kernels::quantized::DequantDtype::Bf16,
                 ferrite_metal_kernels::quantized::ScaleDtype::F16,
                 &enc,
-            ).expect("qmm_t dispatch");
+            )
+            .expect("qmm_t dispatch");
             enc.endEncoding();
             stream.commit().expect("commit");
             stream.synchronize().expect("sync");
         };
 
-        for _ in 0..warmups { run(); }
+        for _ in 0..warmups {
+            run();
+        }
         let t0 = Instant::now();
-        for _ in 0..iters { run(); }
+        for _ in 0..iters {
+            run();
+        }
         let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
         eprintln!("{label}: {per_call_us:>9.2} µs/call");
     }
@@ -744,9 +821,11 @@ fn qmm_t_timing_at_prefill_shapes() {
 #[test]
 #[ignore = "Chain-overhead diagnostic — run manually with --ignored --nocapture"]
 fn qmm_t_chain_per_call_timing() {
-    use std::time::Instant;
     use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLDevice};
-    let device = ferrite_metal_kernels::device::detect_device().expect("Metal device").device;
+    use std::time::Instant;
+    let device = ferrite_metal_kernels::device::detect_device()
+        .expect("Metal device")
+        .device;
     let qmm = ferrite_metal_kernels::quantized::MetalAffineQmmT::new(device.clone())
         .expect("MetalAffineQmmT");
     let queue = device.newCommandQueue().expect("queue");
@@ -768,28 +847,56 @@ fn qmm_t_chain_per_call_timing() {
     for _ in 0..5 {
         let cb = queue.commandBuffer().expect("cb");
         let enc = cb.computeCommandEncoder().expect("enc");
-        qmm.execute(&x, &packed, &scales, &biases, &y,
-            m, n, k, 1, gs, 4,
+        qmm.execute(
+            &x,
+            &packed,
+            &scales,
+            &biases,
+            &y,
+            m,
+            n,
+            k,
+            1,
+            gs,
+            4,
             ferrite_metal_kernels::quantized::DequantDtype::Bf16,
             ferrite_metal_kernels::quantized::ScaleDtype::F16,
-            &enc).expect("dispatch");
+            &enc,
+        )
+        .expect("dispatch");
         enc.endEncoding();
         cb.commit();
-        unsafe { cb.waitUntilCompleted(); }
+        unsafe {
+            cb.waitUntilCompleted();
+        }
     }
     let t0 = Instant::now();
     let iters: usize = 20;
     for _ in 0..iters {
         let cb = queue.commandBuffer().expect("cb");
         let enc = cb.computeCommandEncoder().expect("enc");
-        qmm.execute(&x, &packed, &scales, &biases, &y,
-            m, n, k, 1, gs, 4,
+        qmm.execute(
+            &x,
+            &packed,
+            &scales,
+            &biases,
+            &y,
+            m,
+            n,
+            k,
+            1,
+            gs,
+            4,
             ferrite_metal_kernels::quantized::DequantDtype::Bf16,
             ferrite_metal_kernels::quantized::ScaleDtype::F16,
-            &enc).expect("dispatch");
+            &enc,
+        )
+        .expect("dispatch");
         enc.endEncoding();
         cb.commit();
-        unsafe { cb.waitUntilCompleted(); }
+        unsafe {
+            cb.waitUntilCompleted();
+        }
     }
     let iso_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
     eprintln!("isolated (1 call / cmdbuf / sync): {iso_us:.2} µs/call");
@@ -805,29 +912,57 @@ fn qmm_t_chain_per_call_timing() {
         let cb = queue.commandBuffer().expect("cb");
         let enc = cb.computeCommandEncoder().expect("enc");
         for _ in 0..chain_n {
-            qmm.execute(&x, &packed, &scales, &biases, &y,
-                m, n, k, 1, gs, 4,
+            qmm.execute(
+                &x,
+                &packed,
+                &scales,
+                &biases,
+                &y,
+                m,
+                n,
+                k,
+                1,
+                gs,
+                4,
                 ferrite_metal_kernels::quantized::DequantDtype::Bf16,
                 ferrite_metal_kernels::quantized::ScaleDtype::F16,
-                &enc).expect("dispatch");
+                &enc,
+            )
+            .expect("dispatch");
         }
         enc.endEncoding();
         cb.commit();
-        unsafe { cb.waitUntilCompleted(); }
+        unsafe {
+            cb.waitUntilCompleted();
+        }
 
         let t = Instant::now();
         let cb = queue.commandBuffer().expect("cb");
         let enc = cb.computeCommandEncoder().expect("enc");
         for _ in 0..chain_n {
-            qmm.execute(&x, &packed, &scales, &biases, &y,
-                m, n, k, 1, gs, 4,
+            qmm.execute(
+                &x,
+                &packed,
+                &scales,
+                &biases,
+                &y,
+                m,
+                n,
+                k,
+                1,
+                gs,
+                4,
                 ferrite_metal_kernels::quantized::DequantDtype::Bf16,
                 ferrite_metal_kernels::quantized::ScaleDtype::F16,
-                &enc).expect("dispatch");
+                &enc,
+            )
+            .expect("dispatch");
         }
         enc.endEncoding();
         cb.commit();
-        unsafe { cb.waitUntilCompleted(); }
+        unsafe {
+            cb.waitUntilCompleted();
+        }
         let elapsed_us = t.elapsed().as_secs_f64() * 1e6;
         let per_call_us = elapsed_us / chain_n as f64;
         let overhead_per_call_us = per_call_us - iso_us;
@@ -853,15 +988,12 @@ fn qmm_t_chain_per_call_timing() {
 fn nax_probe_dump_layout() {
     use objc2::runtime::ProtocolObject;
     use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLCommandQueue, MTLComputeCommandEncoder, MTLLibrary, MTLSize,
-    };
+    use objc2_metal::{MTLCommandQueue, MTLComputeCommandEncoder, MTLLibrary, MTLSize};
 
     let dev = ferrite_metal_kernels::device::detect_device().expect("Metal device");
     let device = dev.device;
 
-    let bytes: &'static [u8] =
-        ferrite_metal_kernels::embedded_metallib!("nax_probe");
+    let bytes: &'static [u8] = ferrite_metal_kernels::embedded_metallib!("nax_probe");
     let library = ferrite_metal_kernels::shader_cache::load_library_from_bytes(&device, bytes)
         .expect("nax_probe metallib");
     let function = library
@@ -885,8 +1017,16 @@ fn nax_probe_dump_layout() {
         cmdbuf.computeCommandEncoder().expect("encoder");
     encoder.setComputePipelineState(&pipeline);
     unsafe { encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 0) };
-    let threadgroups = MTLSize { width: 1, height: 1, depth: 1 };
-    let threads = MTLSize { width: 32, height: 1, depth: 1 };
+    let threadgroups = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let threads = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
     encoder.endEncoding();
     cmdbuf.commit();
@@ -895,8 +1035,13 @@ fn nax_probe_dump_layout() {
     let ptr = out_buf.contents().as_ptr() as *const i32;
     let out = unsafe { std::slice::from_raw_parts(ptr, OPS * LANES * CAP * FIELDS) };
 
-    for (op_idx, op_name) in ["ct_a (16x16 bf16)", "ct_b (16x32 bf16)", "ct_c (16x32 float)"]
-        .iter().enumerate()
+    for (op_idx, op_name) in [
+        "ct_a (16x16 bf16)",
+        "ct_b (16x32 bf16)",
+        "ct_c (16x32 float)",
+    ]
+    .iter()
+    .enumerate()
     {
         let base = op_idx * LANES * CAP * FIELDS;
         let cap = out[base];
@@ -908,7 +1053,10 @@ fn nax_probe_dump_layout() {
                 let valid = out[p + 1];
                 let row = out[p + 2];
                 let col = out[p + 3];
-                entries.push(format!("[{idx}]({row},{col}){}", if valid == 0 {"!"} else {""}));
+                entries.push(format!(
+                    "[{idx}]({row},{col}){}",
+                    if valid == 0 { "!" } else { "" }
+                ));
             }
             eprintln!("lane{lane:2}: {}", entries.join(" "));
         }
@@ -924,9 +1072,7 @@ fn nax_probe_dump_layout() {
 fn nax_ones_mma_sanity() {
     use objc2::runtime::ProtocolObject;
     use objc2_foundation::NSString;
-    use objc2_metal::{
-        MTLCommandQueue, MTLComputeCommandEncoder, MTLLibrary, MTLSize,
-    };
+    use objc2_metal::{MTLCommandQueue, MTLComputeCommandEncoder, MTLLibrary, MTLSize};
 
     let dev = ferrite_metal_kernels::device::detect_device().expect("Metal device");
     let device = dev.device;
@@ -953,8 +1099,16 @@ fn nax_ones_mma_sanity() {
     unsafe { encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 0) };
     // 32x16 = 512 bf16 = 1024 bytes for b_ws
     unsafe { encoder.setThreadgroupMemoryLength_atIndex(1024, 0) };
-    let threadgroups = MTLSize { width: 1, height: 1, depth: 1 };
-    let threads = MTLSize { width: 32, height: 1, depth: 1 };
+    let threadgroups = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let threads = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
     encoder.endEncoding();
     cmdbuf.commit();

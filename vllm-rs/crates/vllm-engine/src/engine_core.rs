@@ -470,10 +470,7 @@ impl EngineCore {
                     }
                 })
             };
-            let backend = self
-                .executor
-                .as_mut()
-                .and_then(|e| e.spec_decode_backend());
+            let backend = self.executor.as_mut().and_then(|e| e.spec_decode_backend());
             let mut ctx = ProposerStepCtx {
                 scheduled_req_ids: &scheduled_req_ids,
                 get_all_tokens: &get_all_tokens,

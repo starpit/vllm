@@ -12,21 +12,19 @@
 
 use std::collections::BTreeMap;
 
-use quote::quote;
-
 use crate::classified::{OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, weight_storage_of, CostCtx, Handoff, Implementation,
-    LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor,
-    WorkloadConstraint,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights,
+    weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
 use ::ferrite_fusion_synth::fuse_pass::{
-    synthesize_gate_up_silu_mul_large_chunk, ChunkConstants, SynthesisBackend,
+    ChunkConstants, SynthesisBackend, synthesize_gate_up_silu_mul_large_chunk,
 };
 
 #[derive(Debug)]
@@ -40,11 +38,21 @@ pub struct MetalSynthGateUpSiluMulImpl {
 impl MetalSynthGateUpSiluMulImpl {
     /// Llama-3.x / Qwen2.5 / SmolLM mlx-community 4bit: F16 scales.
     pub fn bf16_gs64() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4 }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "half",
+            group_size: 64,
+            bits: 4,
+        }
     }
     /// Qwen3 family mlx-community 4bit: BF16 scales.
     pub fn bf16_gs64_s_bf16() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4 }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "bfloat",
+            group_size: 64,
+            bits: 4,
+        }
     }
 }
 
@@ -54,9 +62,10 @@ impl MetalSynthGateUpSiluMulImpl {
 /// across cached HF snapshots) while Llama-3.x / Qwen2.5 / SmolLM
 /// ship F16 — drives the synth Impl's `applies_to` gate.
 pub(crate) fn is_qwen3_arch(model: &crate::config::ModelParams) -> bool {
-    model.architectures.iter().any(|a| {
-        matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM")
-    })
+    model
+        .architectures
+        .iter()
+        .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"))
 }
 
 impl Implementation for MetalSynthGateUpSiluMulImpl {
@@ -74,15 +83,17 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         // claims a tile. The other variant returns false so the
         // solver doesn't see a duplicate match.
         let is_qwen3 = is_qwen3_arch(ctx.model);
-        match (is_qwen3, self.scale_tag) {
-            (true,  "bfloat") => true,
-            (false, "half")   => true,
-            _                 => false,
-        }
+        matches!(
+            (is_qwen3, self.scale_tag),
+            (true, "bfloat") | (false, "half")
+        )
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        WorkloadConstraint::NumTokensRange { min: 8, max: u32::MAX }
+        WorkloadConstraint::NumTokensRange {
+            min: 8,
+            max: u32::MAX,
+        }
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -98,14 +109,16 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
             return None;
         }
 
-        let silu_node = fuf.nodes.iter().find(|n| {
-            n.op == OpKind::Silu && consumes_tile(n, seed)
-        })?;
+        let silu_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
         let silu_tile = silu_node.id;
 
-        let mul_node = fuf.nodes.iter().find(|n| {
-            n.op == OpKind::Mul && consumes_tile(n, silu_tile)
-        })?;
+        let mul_node = fuf
+            .nodes
+            .iter()
+            .find(|n| n.op == OpKind::Mul && consumes_tile(n, silu_tile))?;
         let mul_tile = mul_node.id;
 
         let up_tile = mul_node.inputs.iter().find_map(|i| match i {
@@ -183,13 +196,23 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
     }
 
     fn resources(&self, _m: &MatchInfo) -> Resources {
-        Resources { shmem_bytes: 8 * 9 * 2 * 3, regs_per_thread: 64, threads_per_cta: 32 }
+        Resources {
+            shmem_bytes: 8 * 9 * 2 * 3,
+            regs_per_thread: 64,
+            threads_per_cta: 32,
+        }
     }
 
-    fn launch_kind(&self) -> LaunchKind { LaunchKind::HostCallback }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
 
-    fn supported_input_handoffs(&self) -> &[Handoff] { &[Handoff::StreamOrder] }
-    fn supported_output_handoffs(&self) -> &[Handoff] { &[Handoff::StreamOrder] }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder]
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder]
+    }
 
     fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
         vec![Layout::Any; m.boundary_inputs.len()]
@@ -212,10 +235,10 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
             "SynthGateUpSiluMul",
             vec![
                 ("x_norm_slot", syn::parse_quote!(u32)),
-                ("out_slot",    syn::parse_quote!(u32)),
-                ("layer",       syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
                 ("group_size", syn::parse_quote!(u32)),
-                ("bits",       syn::parse_quote!(u32)),
+                ("bits", syn::parse_quote!(u32)),
                 ("kernel_symbol", syn::parse_quote!(&'static str)),
             ],
         )
@@ -230,11 +253,11 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
         let mut silu_tile_id = None;
-        let mut mul_tile     = None;
+        let mut mul_tile = None;
         for &t in &m.claimed_tiles {
             match fuf.get(t).op {
                 OpKind::Silu => silu_tile_id = Some(t),
-                OpKind::Mul  => mul_tile = Some(t),
+                OpKind::Mul => mul_tile = Some(t),
                 _ => {}
             }
         }
@@ -242,52 +265,62 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
         let mul_tile: TileId = mul_tile?;
 
         let gate_tile = fuf.get(silu_tile_id).inputs.iter().find_map(|i| match i {
-            FufInput::Tile { id, .. }
-                if fuf.get(*id).op == OpKind::Gemm => Some(*id),
+            FufInput::Tile { id, .. } if fuf.get(*id).op == OpKind::Gemm => Some(*id),
             _ => None,
         })?;
         let up_tile = fuf.get(mul_tile).inputs.iter().find_map(|i| match i {
-            FufInput::Tile { id, .. }
-                if *id != silu_tile_id && fuf.get(*id).op == OpKind::Gemm => Some(*id),
+            FufInput::Tile { id, .. } if *id != silu_tile_id && fuf.get(*id).op == OpKind::Gemm => {
+                Some(*id)
+            }
             _ => None,
         })?;
         let x_norm_slot = slots.of(m.boundary_inputs[0], 0);
-        let out_slot    = slots.of(mul_tile, 0);
+        let out_slot = slots.of(mul_tile, 0);
 
         let layer = m.claimed_tiles.iter().find_map(|&t| {
             fuf.get(t).inputs.iter().find_map(|i| {
-                if let FufInput::Weight { index: Some(l), .. } = i { Some(*l as u32) }
-                else { None }
+                if let FufInput::Weight { index: Some(l), .. } = i {
+                    Some(*l as u32)
+                } else {
+                    None
+                }
             })
         })?;
 
         let acc_for = |tile: TileId| -> Option<WeightAccessor> {
-            default_required_weights(&[tile], fuf, program).into_iter().next()
+            default_required_weights(&[tile], fuf, program)
+                .into_iter()
+                .next()
         };
         let gate_acc = acc_for(gate_tile)?;
-        let up_acc   = acc_for(up_tile)?;
+        let up_acc = acc_for(up_tile)?;
 
         let to_base = |acc: &WeightAccessor| -> syn::Ident {
             let (base, _) = split_base_layer(&acc.name.to_string());
             syn::Ident::new(&base, proc_macro2::Span::call_site())
         };
         let gate_base = to_base(&gate_acc);
-        let up_base   = to_base(&up_acc);
+        let up_base = to_base(&up_acc);
 
         let (gs, bits) = match weight_storage_of(fuf.get(gate_tile)) {
             Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
             _ => return None,
         };
 
-        let hidden       = *bounds.get("hidden_size").unwrap_or(&0) as u32;
+        let hidden = *bounds.get("hidden_size").unwrap_or(&0) as u32;
         let intermediate = *bounds.get("intermediate_size").unwrap_or(&0) as u32;
-        let head_dim     = *bounds.get("head_dim").unwrap_or(&128) as u32;
-        let eps          = 1e-5_f32;
+        let head_dim = *bounds.get("head_dim").unwrap_or(&128) as u32;
+        let eps = 1e-5_f32;
         let consts = ChunkConstants {
-            hidden, intermediate, head_dim,
-            num_q_heads: 0, num_kv_heads: 0,
-            rot_dim: 0, block_size: 0,
-            m: 0, group_size: gs,
+            hidden,
+            intermediate,
+            head_dim,
+            num_q_heads: 0,
+            num_kv_heads: 0,
+            rot_dim: 0,
+            block_size: 0,
+            m: 0,
+            group_size: gs,
             rms_norm_eps: eps,
             // MLP gate/up have no per-row linear bias on any model
             // ferrite-metal supports; only the QKV `bias_add` is wired
@@ -295,7 +328,10 @@ impl Implementation for MetalSynthGateUpSiluMulImpl {
             has_linear_bias: false,
         };
         let kernel = synthesize_gate_up_silu_mul_large_chunk(
-            SynthesisBackend::Metal, self.act_tag, self.scale_tag, &consts,
+            SynthesisBackend::Metal,
+            self.act_tag,
+            self.scale_tag,
+            &consts,
         );
         let _ = bits;
         // Gate/up LinearLayers flow through `required_weights()`;

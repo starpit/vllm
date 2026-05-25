@@ -125,9 +125,7 @@ impl Fuf {
             for input in &node.inputs {
                 if let FufInput::Weight { id, .. } = input {
                     cache.entry(*id).or_insert_with(|| {
-                        crate::quantization::storage_format_for_weight(
-                            program, self, *id, model,
-                        )
+                        crate::quantization::storage_format_for_weight(program, self, *id, model)
                     });
                 }
             }

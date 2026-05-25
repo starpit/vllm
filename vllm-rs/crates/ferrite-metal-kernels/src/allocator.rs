@@ -16,7 +16,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::Mutex;
 
 pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 pub type Device = Retained<ProtocolObject<dyn MTLDevice>>;
@@ -66,7 +67,7 @@ impl std::error::Error for AllocatorError {}
 pub struct PooledBuffer {
     buffer: Buffer,
     size: usize,
-    pool: Arc<Mutex<BufferPool>>,
+    pool: Rc<Mutex<BufferPool>>,
 }
 
 impl PooledBuffer {
@@ -155,7 +156,7 @@ impl BufferPool {
     fn allocate(
         &mut self,
         size: usize,
-        pool_ref: Arc<Mutex<BufferPool>>,
+        pool_ref: Rc<Mutex<BufferPool>>,
     ) -> Result<PooledBuffer, AllocatorError> {
         if size == 0 {
             return Err(AllocatorError::InvalidSize(size));
@@ -237,19 +238,19 @@ impl BufferPool {
 
 /// Thread-safe buffer allocator
 pub struct MetalAllocator {
-    pool: Arc<Mutex<BufferPool>>,
+    pool: Rc<Mutex<BufferPool>>,
 }
 
 impl MetalAllocator {
     pub fn new(device: &Device) -> Self {
         Self {
-            pool: Arc::new(Mutex::new(BufferPool::new(device))),
+            pool: Rc::new(Mutex::new(BufferPool::new(device))),
         }
     }
 
     pub fn with_limits(device: &Device, max_bytes: usize, max_pooled_per_size: usize) -> Self {
         Self {
-            pool: Arc::new(Mutex::new(BufferPool::with_limits(
+            pool: Rc::new(Mutex::new(BufferPool::with_limits(
                 device,
                 max_bytes,
                 max_pooled_per_size,
@@ -258,7 +259,7 @@ impl MetalAllocator {
     }
 
     pub fn allocate(&self, size: usize) -> Result<PooledBuffer, AllocatorError> {
-        let pool_ref = Arc::clone(&self.pool);
+        let pool_ref = Rc::clone(&self.pool);
         self.pool
             .lock()
             .map_err(|_| AllocatorError::AllocationFailed(size))?

@@ -11,13 +11,13 @@
 //! and exposes one definition of the four strides that address into it:
 //!
 //! * `kv_blk_stride`   — elements between block_id and block_id + 1
-//!                       (= `num_kv_heads * BLOCK_SIZE * head_dim`)
+//!   (= `num_kv_heads * BLOCK_SIZE * head_dim`)
 //! * `kv_head_stride`  — elements between kv_head and kv_head + 1
-//!                       within one block (= `BLOCK_SIZE * head_dim`)
+//!   within one block (= `BLOCK_SIZE * head_dim`)
 //! * `per_token_stride`— elements between slot_in_block S and S + 1
-//!                       (= `head_dim`)
+//!   (= `head_dim`)
 //! * `buffer_elems`    — total elements per K (or V) buffer
-//!                       (= `num_blocks * kv_blk_stride`)
+//!   (= `num_blocks * kv_blk_stride`)
 //!
 //! Catches bug class #5 — the four-call-site stride-math drift the
 //! plan calls out (`cpu_golden::rope_append_paged`,
@@ -56,9 +56,7 @@ impl PagedKvLayout {
         block_size: u32,
         head_dim: u32,
     ) -> Self {
-        let blk_stride = (num_kv_heads as usize)
-            * (block_size as usize)
-            * (head_dim as usize);
+        let blk_stride = (num_kv_heads as usize) * (block_size as usize) * (head_dim as usize);
         assert!(blk_stride > 0, "PagedKvLayout: zero-size block stride");
         assert_eq!(
             buffer_elems % blk_stride,
@@ -76,9 +74,7 @@ impl PagedKvLayout {
     /// Elements per block: `num_kv_heads * block_size * head_dim`.
     /// Equivalently, the stride along the leading "block_id" axis.
     pub fn kv_blk_stride(&self) -> usize {
-        (self.num_kv_heads as usize)
-            * (self.block_size as usize)
-            * (self.head_dim as usize)
+        (self.num_kv_heads as usize) * (self.block_size as usize) * (self.head_dim as usize)
     }
 
     /// Elements per kv-head within one block: `block_size * head_dim`.
@@ -99,12 +95,7 @@ impl PagedKvLayout {
     /// Element offset of
     /// `cache[physical_block, kv_head, slot_in_block, dim=0]`. Add
     /// the per-dim index (`0..head_dim`) to address one element.
-    pub fn elem_offset(
-        &self,
-        physical_block: u32,
-        kv_head: u32,
-        slot_in_block: u32,
-    ) -> usize {
+    pub fn elem_offset(&self, physical_block: u32, kv_head: u32, slot_in_block: u32) -> usize {
         (physical_block as usize) * self.kv_blk_stride()
             + (kv_head as usize) * self.kv_head_stride()
             + (slot_in_block as usize) * self.per_token_stride()

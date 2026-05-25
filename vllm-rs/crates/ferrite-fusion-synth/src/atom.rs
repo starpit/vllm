@@ -106,7 +106,7 @@ pub struct AtomChannel {
 
 #[derive(Clone, Debug, Default)]
 pub struct AtomSignature {
-    pub inputs:  Vec<AtomChannel>,
+    pub inputs: Vec<AtomChannel>,
     pub outputs: Vec<AtomChannel>,
 }
 

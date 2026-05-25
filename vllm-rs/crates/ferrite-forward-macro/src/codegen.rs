@@ -862,14 +862,13 @@ fn plan_field_load(
         // `affine_gs_bits`. Source weights all share storage format
         // (the macro asserts this elsewhere for AffineQuantLinear).
         let only_src = accessor.source_weights[0].0;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                Some((group_size, bits))
-            }
-            _ => None,
-        };
+        let affine =
+            match crate::quantization::storage_format_for_weight(program, fuf, only_src, model) {
+                crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                    Some((group_size, bits))
+                }
+                _ => None,
+            };
         return FieldLoad::FusedMoe {
             prefix,
             num_experts,
@@ -931,14 +930,13 @@ fn plan_field_load(
             });
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
         let only_src = accessor.source_weights[0].0;
-        let affine = match crate::quantization::storage_format_for_weight(
-            program, fuf, only_src, model,
-        ) {
-            crate::quantization::StorageFormat::Affine { group_size, bits } => {
-                Some((group_size, bits))
-            }
-            _ => None,
-        };
+        let affine =
+            match crate::quantization::storage_format_for_weight(program, fuf, only_src, model) {
+                crate::quantization::StorageFormat::Affine { group_size, bits } => {
+                    Some((group_size, bits))
+                }
+                _ => None,
+            };
         return FieldLoad::SharedFusedMoe {
             prefix,
             num_experts,
@@ -1863,23 +1861,20 @@ fn emit_fingerprint_check(
     // here we just need a precise embed-shape gate so a checkpoint
     // doesn't false-positive against the wrong affine sub-variant.
     let embed_expects_packed: bool = match model.quantization.as_ref().map(|qc| &qc.method) {
-        Some(crate::quantization::QuantMethod::Affine {
-            quantize_embed, ..
-        }) => model.tie_word_embeddings || *quantize_embed,
+        Some(crate::quantization::QuantMethod::Affine { quantize_embed, .. }) => {
+            model.tie_word_embeddings || *quantize_embed
+        }
         _ => false,
     };
-    let embed_hidden_lit: TokenStream =
-        match model.quantization.as_ref().map(|qc| &qc.method) {
-            Some(crate::quantization::QuantMethod::Affine { bits, .. })
-                if embed_expects_packed =>
-            {
-                let pack_factor = 32u64 / (*bits as u64);
-                let packed = hidden_size / pack_factor;
-                let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
-                quote! { #lit }
-            }
-            _ => quote! { #hidden_lit },
-        };
+    let embed_hidden_lit: TokenStream = match model.quantization.as_ref().map(|qc| &qc.method) {
+        Some(crate::quantization::QuantMethod::Affine { bits, .. }) if embed_expects_packed => {
+            let pack_factor = 32u64 / (*bits as u64);
+            let packed = hidden_size / pack_factor;
+            let lit = proc_macro2::Literal::usize_unsuffixed(packed as usize);
+            quote! { #lit }
+        }
+        _ => quote! { #hidden_lit },
+    };
     let embed_shape_check: TokenStream = quote! {
         match gw.tensor_shape_any(#embed_path_lit) {
             Some(ref shape)
@@ -2452,7 +2447,7 @@ fn emit_weights_struct(
             .map(|(_, dt)| dt)
             .unwrap_or(#rope_dtype_fallback);
     };
-    let rope_dtype: TokenStream = quote! { __rope_dtype };
+    let _rope_dtype: TokenStream = quote! { __rope_dtype };
 
     let rotary_local_field: TokenStream = if uses_rotary_local {
         quote! { pub rotary_local: ::ferrite_kernels::rotary::RotaryCache, }
@@ -3889,8 +3884,6 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let group_size = group_size as u32;
-                let bits = bits as u32;
                 quote! {
                     let #name = ::ferrite_kernels::layers_moe::FusedMoELayer::load_affine(
                         gw,
@@ -3932,8 +3925,6 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let group_size = group_size as u32;
-                let bits = bits as u32;
                 quote! {
                     let #name = ::ferrite_kernels::layers_moe::SharedFusedMoELayer::load_affine(
                         gw,
@@ -4608,8 +4599,6 @@ fn emit_layered_load_body(
             let intermediate_size = *intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let group_size = group_size as u32;
-                let bits = bits as u32;
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
@@ -4664,8 +4653,6 @@ fn emit_layered_load_body(
             let shared_expert_intermediate_size = *shared_expert_intermediate_size;
             let hidden_size = *hidden_size;
             if let Some((group_size, bits)) = *affine {
-                let group_size = group_size as u32;
-                let bits = bits as u32;
                 quote! {
                     (0u32..#n_lit)
                         .map(|layer: u32| -> ::anyhow::Result<_> {
@@ -4838,54 +4825,62 @@ fn emit_weight_accessors_impl(
     // and 2*ci+1 (lm_head). FORWARD_TABLE rows pass these ids into
     // run/run_backbone, which forward them to run_slice → eval →
     // the per-arch WeightAccessors match arms.
-    let emit_for = |tape_index: u32,
-                    role: &'static str,
-                    weight_slots: &[Vec<WeightSlot>],
-                    by_kind: &mut HashMap<&'static str, Vec<TokenStream>>,
-                    inventory: &mut Vec<(u32, &'static str, u32, u32, &'static str, String)>| {
-        let tape_index_lit = proc_macro2::Literal::u32_unsuffixed(tape_index);
-        for (op_idx, slots) in weight_slots.iter().enumerate() {
-            let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
-            let mut counts: HashMap<&'static str, u32> = HashMap::new();
-            for slot in slots {
-                let key = match slot.kind {
-                    WeightKind::RmsNorm => "rms_norm_at",
-                    WeightKind::Embedding => "embedding_at",
-                    WeightKind::Linear => "linear_at",
-                    WeightKind::LayerNorm => "layer_norm_at",
-                    WeightKind::Marlin => "marlin_at",
-                    WeightKind::Bnb4 => "bnb4_at",
-                    WeightKind::Fp8 => "fp8_at",
-                    WeightKind::DeepSeekMoe => "deepseek_moe_at",
-                    WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
-                    WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
-                    WeightKind::FusedMoe => "fused_moe_at",
-                    WeightKind::SharedFusedMoe => "shared_fused_moe_at",
-                    WeightKind::CosSin => "cos_sin_at",
-                    WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
-                };
-                let n = counts.entry(key).or_insert(0);
-                let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
-                inventory.push((tape_index, role, op_idx as u32, *n, key, slot.base.to_string()));
-                *n += 1;
-                let base = &slot.base;
-                // CosSin pulls from a `RotaryCache` field on the per-arch
-                // `Weights` struct (`wm.rotary` or `wm.rotary_local`),
-                // not from a `fn <base>(layer) -> &T` getter — rotary is
-                // shared across layers, and the cache itself owns a
-                // single `cos_sin_cache: GpuTensor`. The trait method
-                // returns `GpuTensor` by value, so `.clone()` produces
-                // a cheap handle copy.
-                let arm_body = match slot.kind {
-                    WeightKind::CosSin => quote! { self.#base.cos_sin_cache.clone() },
-                    _ => quote! { self.#base(layer) },
-                };
-                by_kind.entry(key).or_default().push(quote! {
-                    (#tape_index_lit, #op_lit, #slot_lit) => #arm_body,
-                });
+    let emit_for =
+        |tape_index: u32,
+         role: &'static str,
+         weight_slots: &[Vec<WeightSlot>],
+         by_kind: &mut HashMap<&'static str, Vec<TokenStream>>,
+         inventory: &mut Vec<(u32, &'static str, u32, u32, &'static str, String)>| {
+            let tape_index_lit = proc_macro2::Literal::u32_unsuffixed(tape_index);
+            for (op_idx, slots) in weight_slots.iter().enumerate() {
+                let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
+                let mut counts: HashMap<&'static str, u32> = HashMap::new();
+                for slot in slots {
+                    let key = match slot.kind {
+                        WeightKind::RmsNorm => "rms_norm_at",
+                        WeightKind::Embedding => "embedding_at",
+                        WeightKind::Linear => "linear_at",
+                        WeightKind::LayerNorm => "layer_norm_at",
+                        WeightKind::Marlin => "marlin_at",
+                        WeightKind::Bnb4 => "bnb4_at",
+                        WeightKind::Fp8 => "fp8_at",
+                        WeightKind::DeepSeekMoe => "deepseek_moe_at",
+                        WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
+                        WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
+                        WeightKind::FusedMoe => "fused_moe_at",
+                        WeightKind::SharedFusedMoe => "shared_fused_moe_at",
+                        WeightKind::CosSin => "cos_sin_at",
+                        WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
+                    };
+                    let n = counts.entry(key).or_insert(0);
+                    let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
+                    inventory.push((
+                        tape_index,
+                        role,
+                        op_idx as u32,
+                        *n,
+                        key,
+                        slot.base.to_string(),
+                    ));
+                    *n += 1;
+                    let base = &slot.base;
+                    // CosSin pulls from a `RotaryCache` field on the per-arch
+                    // `Weights` struct (`wm.rotary` or `wm.rotary_local`),
+                    // not from a `fn <base>(layer) -> &T` getter — rotary is
+                    // shared across layers, and the cache itself owns a
+                    // single `cos_sin_cache: GpuTensor`. The trait method
+                    // returns `GpuTensor` by value, so `.clone()` produces
+                    // a cheap handle copy.
+                    let arm_body = match slot.kind {
+                        WeightKind::CosSin => quote! { self.#base.cos_sin_cache.clone() },
+                        _ => quote! { self.#base(layer) },
+                    };
+                    by_kind.entry(key).or_default().push(quote! {
+                        (#tape_index_lit, #op_lit, #slot_lit) => #arm_body,
+                    });
+                }
             }
-        }
-    };
+        };
     for (ci, (_wp, (cl, _, _, _, _))) in canonical_lowered.iter().enumerate() {
         let bb_id = (ci as u32) * 2;
         let lm_id = bb_id + 1;
@@ -4916,16 +4911,16 @@ fn emit_weight_accessors_impl(
             .then(a.3.cmp(&b.3)) // slot
     });
     let method_summaries: HashMap<&'static str, String> = {
-        let mut by_method: HashMap<&'static str, Vec<(u32, &'static str, u32, u32, String)>> =
-            HashMap::new();
+        #[allow(clippy::type_complexity)]
+        let mut by_method: HashMap<
+            &'static str,
+            Vec<(u32, &'static str, u32, u32, String)>,
+        > = HashMap::new();
         for (tape, role, op, slot, method, base) in &sorted_inv {
-            by_method.entry(method).or_default().push((
-                *tape,
-                role,
-                *op,
-                *slot,
-                base.clone(),
-            ));
+            by_method
+                .entry(method)
+                .or_default()
+                .push((*tape, role, *op, *slot, base.clone()));
         }
         by_method
             .into_iter()
@@ -5488,7 +5483,9 @@ fn emit_synthesized_kernel_sources_override(
 ) -> TokenStream {
     use crate::quantization::QuantMethod;
     let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
-        Some(QuantMethod::Affine { bits, group_size, .. }) => (*bits, *group_size),
+        Some(QuantMethod::Affine {
+            bits, group_size, ..
+        }) => (*bits, *group_size),
         _ => return quote! {},
     };
     if bits != 4 {
@@ -5504,9 +5501,10 @@ fn emit_synthesized_kernel_sources_override(
     // must match the corresponding `MetalSynth*Impl` instantiation
     // registered in `starter_library` (otherwise the solver's pick and
     // the runtime pipeline cache disagree on the library key).
-    let is_qwen3 = model.architectures.iter().any(|a| {
-        matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM")
-    });
+    let is_qwen3 = model
+        .architectures
+        .iter()
+        .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"));
     let t_scale = if is_qwen3 { "bfloat" } else { "half" };
 
     // Model dims baked as MSL `constant constexpr` literals at synth
@@ -5549,7 +5547,7 @@ fn emit_synthesized_kernel_sources_override(
         rot_dim,
         block_size: 16, // ferrite_forward::CanonicalParams::BLOCK_SIZE default
         intermediate,
-        m:            0,
+        m: 0,
         group_size,
         rms_norm_eps: eps,
         // Pre-attn synth gains 3 extra `__{q,k,v}_linear_bias` buffer
@@ -5592,7 +5590,8 @@ fn emit_synthesized_kernel_sources_override(
         t_scale,
         &consts,
     );
-    let gu_bytes = ::ferrite_fusion_synth::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
+    let gu_bytes =
+        ::ferrite_fusion_synth::aot::aot_compile_metallib(&gate_up.symbol, &gate_up.source);
 
     let pa_bytes =
         ::ferrite_fusion_synth::aot::aot_compile_metallib(&pre_attn.symbol, &pre_attn.source);
@@ -5606,14 +5605,11 @@ fn emit_synthesized_kernel_sources_override(
     );
 
     let gu_symbol_lit = syn::LitStr::new(&gate_up.symbol, proc_macro2::Span::call_site());
-    let gu_bytes_lit  = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
+    let gu_bytes_lit = syn::LitByteStr::new(&gu_bytes, proc_macro2::Span::call_site());
 
-    let pa_symbol_lit =
-        syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
-    let pi_symbol_lit =
-        syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
-    let md_symbol_lit =
-        syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
+    let pa_symbol_lit = syn::LitStr::new(&pre_attn.symbol, proc_macro2::Span::call_site());
+    let pi_symbol_lit = syn::LitStr::new(&pre_attn_init.symbol, proc_macro2::Span::call_site());
+    let md_symbol_lit = syn::LitStr::new(&mlp_pre_down.symbol, proc_macro2::Span::call_site());
 
     let pa_bytes_lit = syn::LitByteStr::new(&pa_bytes, proc_macro2::Span::call_site());
     let pi_bytes_lit = syn::LitByteStr::new(&pi_bytes, proc_macro2::Span::call_site());
@@ -5654,9 +5650,7 @@ pub fn program_has_bias_add(program: &Program) -> bool {
     }
     fn scan_expr(expr: &Expr) -> bool {
         match expr {
-            Expr::Call { op, args } => {
-                matches!(op, OpKind::BiasAdd) || args.iter().any(scan_expr)
-            }
+            Expr::Call { op, args } => matches!(op, OpKind::BiasAdd) || args.iter().any(scan_expr),
             Expr::Add { lhs, rhs } | Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
             Expr::Local(_)
             | Expr::Extern { .. }
@@ -5856,12 +5850,10 @@ fn emit_canonical_params_impl(
     // `_s_bf16_` symbol arms. Match on the HF `architectures` strings
     // baked into `model.architectures`.
     let scale_dtype_override = {
-        let is_qwen3 = model.architectures.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"
-            )
-        });
+        let is_qwen3 = model
+            .architectures
+            .iter()
+            .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"));
         if is_qwen3 {
             quote! {
                 #[cfg(feature = "metal")]

@@ -129,7 +129,9 @@ impl SpecializedPipelines {
             // they're requested. Useful for verifying the symbol
             // pickers route to the right kernel instantiations on
             // new arch/quant combos.
-            static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(&'static str, &'static str)>>> = std::sync::OnceLock::new();
+            static SEEN: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashSet<(&'static str, &'static str)>>,
+            > = std::sync::OnceLock::new();
             let seen = SEEN.get_or_init(Default::default);
             let mut guard = seen.lock().unwrap();
             if guard.insert((cmd.library, cmd.function)) {
@@ -3093,8 +3095,7 @@ mod tests {
             buf
         }
         fn alloc_f16(device: &Device, data: &[f32]) -> Buffer {
-            let half_data: Vec<half::f16> =
-                data.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let half_data: Vec<half::f16> = data.iter().map(|&v| half::f16::from_f32(v)).collect();
             let bytes = std::mem::size_of_val(half_data.as_slice());
             let buf = device
                 .newBufferWithLength_options(

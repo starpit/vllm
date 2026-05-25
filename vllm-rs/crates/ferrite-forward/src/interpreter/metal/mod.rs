@@ -18,14 +18,20 @@ pub mod pipelines;
 #[cfg(feature = "metal")]
 pub mod forward;
 #[cfg(feature = "metal")]
+pub mod mtl4;
+#[cfg(feature = "metal")]
 pub mod pool;
 #[cfg(feature = "metal")]
 pub mod runtime;
 #[cfg(feature = "metal")]
 pub mod worker;
-#[cfg(feature = "metal")]
-pub mod mtl4;
 
+/// Re-export of `ferrite_metal_kernels::quantized::ScaleDtype` so the
+/// macro-emitted `impl CanonicalParams for Weights` block can name it
+/// without per-arch crates pulling `ferrite-metal-kernels` directly.
+/// Mirrors the [`MetalDtype`] re-export above.
+#[cfg(feature = "metal")]
+pub use ferrite_metal_kernels::quantized::ScaleDtype;
 pub use ids::{
     ArenaSlotIdx, BindingIdx, BucketM, ConstSlot, LayerId, LogicalBlockIdx, NumTokens,
     PhysicalBlockIdx, QTokenIdx, SeqIdx, SlotInBlock,
@@ -36,12 +42,6 @@ pub use lowered::{
 };
 pub use lowering::{lower, lower_pair};
 pub use pipelines::{PipelineLookupError, SpecializedPipelines};
-/// Re-export of `ferrite_metal_kernels::quantized::ScaleDtype` so the
-/// macro-emitted `impl CanonicalParams for Weights` block can name it
-/// without per-arch crates pulling `ferrite-metal-kernels` directly.
-/// Mirrors the [`MetalDtype`] re-export above.
-#[cfg(feature = "metal")]
-pub use ferrite_metal_kernels::quantized::ScaleDtype;
 
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};
@@ -77,9 +77,8 @@ pub mod __re {
     // `device.newMTL4CommandQueue()` once and stores the result.
     pub use ::objc2_metal::{
         MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
-        MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap,
-        MTL4CounterHeapDescriptor, MTL4CounterHeapType, MTL4TimestampGranularity,
-        MTLEvent, MTLSharedEvent,
+        MTL4CommandQueue, MTL4ComputeCommandEncoder, MTL4CounterHeap, MTL4CounterHeapDescriptor,
+        MTL4CounterHeapType, MTL4TimestampGranularity, MTLEvent, MTLSharedEvent,
     };
     pub type Mtl4CounterHeap = Retained<ProtocolObject<dyn MTL4CounterHeap>>;
     pub type Mtl4Queue = Retained<ProtocolObject<dyn MTL4CommandQueue>>;

@@ -26,14 +26,12 @@ use crate::classified::{ExternKind, OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    consumes_tile, default_required_weights, first_tile_input, kv_cache_extern_layer,
-    weight_storage_of, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
-    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    SlotMap, WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights,
+    first_tile_input, kv_cache_extern_layer, weight_storage_of,
 };
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
-
-use quote::quote;
 
 /// SynthPreAttn megakernel claim. `init=false` matches the 6-tile
 /// chain headed by `Add` (layers ≥1); `init=true` matches the 5-tile
@@ -58,17 +56,41 @@ pub struct MetalSynthPreAttnImpl {
 
 impl MetalSynthPreAttnImpl {
     pub fn bf16_gs64() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4, init: false }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "half",
+            group_size: 64,
+            bits: 4,
+            init: false,
+        }
     }
     pub fn bf16_gs64_init() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "half", group_size: 64, bits: 4, init: true }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "half",
+            group_size: 64,
+            bits: 4,
+            init: true,
+        }
     }
     /// Qwen3-family BF16-scale variant. See [`is_qwen3_arch`] for the gate.
     pub fn bf16_gs64_s_bf16() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4, init: false }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "bfloat",
+            group_size: 64,
+            bits: 4,
+            init: false,
+        }
     }
     pub fn bf16_gs64_s_bf16_init() -> Self {
-        Self { act_tag: "bfloat", scale_tag: "bfloat", group_size: 64, bits: 4, init: true }
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "bfloat",
+            group_size: 64,
+            bits: 4,
+            init: true,
+        }
     }
 }
 
@@ -87,11 +109,10 @@ impl Implementation for MetalSynthPreAttnImpl {
 
     fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
         let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
-        match (is_qwen3, self.scale_tag) {
-            (true, "bfloat") => true,
-            (false, "half") => true,
-            _ => false,
-        }
+        matches!(
+            (is_qwen3, self.scale_tag),
+            (true, "bfloat") | (false, "half")
+        )
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
@@ -184,6 +205,7 @@ impl Implementation for MetalSynthPreAttnImpl {
             }
         };
         let (rope_node, resolved): (&crate::fuf::FufNode, [(TileId, Option<TileId>); 3]) = {
+            #[allow(clippy::type_complexity)]
             let mut found: Option<(_, [(TileId, Option<TileId>); 3])> = None;
             for n in &fuf.nodes {
                 if n.op != OpKind::RopeAppend {
@@ -209,7 +231,10 @@ impl Implementation for MetalSynthPreAttnImpl {
                     ])
                 })();
                 let Some(resolved) = resolved else { continue };
-                if !gemms.iter().all(|g| resolved.iter().any(|(gid, _)| gid == g)) {
+                if !gemms
+                    .iter()
+                    .all(|g| resolved.iter().any(|(gid, _)| gid == g))
+                {
                     continue;
                 }
                 let bias_count = resolved.iter().filter(|(_, b)| b.is_some()).count();
@@ -224,10 +249,7 @@ impl Implementation for MetalSynthPreAttnImpl {
             found?
         };
         let rope_tile = rope_node.id;
-        let bias_tiles: Vec<TileId> = resolved
-            .iter()
-            .filter_map(|(_, b)| *b)
-            .collect();
+        let bias_tiles: Vec<TileId> = resolved.iter().filter_map(|(_, b)| *b).collect();
 
         let mut claimed: Vec<TileId> = Vec::with_capacity(6 + bias_tiles.len());
         if let Some(a) = add_tile {
@@ -284,11 +306,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
         let head_dim = ctx.bounds.get("head_dim").copied().unwrap_or(0) as u32;
         let num_q = ctx.bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
-        let num_kv = ctx
-            .bounds
-            .get("num_key_value_heads")
-            .copied()
-            .unwrap_or(0) as u32;
+        let num_kv = ctx.bounds.get("num_key_value_heads").copied().unwrap_or(0) as u32;
         let q_n = num_q.saturating_mul(head_dim);
         let kv_n = num_kv.saturating_mul(head_dim);
 
@@ -415,11 +433,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         vec![((rope_id, 0), None)]
     }
 
-    fn kv_layer_io(
-        &self,
-        claimed_tiles: &[TileId],
-        fuf: &Fuf,
-    ) -> (Option<u32>, Option<u32>) {
+    fn kv_layer_io(&self, claimed_tiles: &[TileId], fuf: &Fuf) -> (Option<u32>, Option<u32>) {
         // SynthPreAttn writes the per-layer paged KV cache (its
         // RopeAppend sub-tile carries the `ExternKind::KvCache`
         // extern). Reads nothing from KV. Without this override the
@@ -520,10 +534,7 @@ impl Implementation for MetalSynthPreAttnImpl {
                 }
                 let delta = tile_inputs[0];
                 let residual = tile_inputs[1];
-                (
-                    slots.of(residual.0, residual.1),
-                    slots.of(delta.0, delta.1),
-                )
+                (slots.of(residual.0, residual.1), slots.of(delta.0, delta.1))
             }
             None => {
                 let (norm_in, norm_slot) = first_tile_input(fuf.get(rmsnorm_tile))?;
@@ -578,8 +589,7 @@ impl Implementation for MetalSynthPreAttnImpl {
         // Uniform-bias check (same gate the matcher applied — guards
         // against a stale match → fan_out shape mismatch).
         let has_linear_bias = q_bias_tile.is_some();
-        if has_linear_bias
-            != (k_bias_tile.is_some() && v_bias_tile.is_some())
+        if has_linear_bias != (k_bias_tile.is_some() && v_bias_tile.is_some())
             || k_bias_tile.is_some() != v_bias_tile.is_some()
         {
             return None;

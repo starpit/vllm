@@ -6,6 +6,14 @@
 //! Provides Metal device management, shader compilation, and kernel dispatch
 //! primitives for Apple Silicon GPUs.
 
+// Kernel-launch / dispatch / record entry points pass the full set of
+// buffers, dims, scales, and offsets positionally — bundling them into
+// param structs would only obscure the 1:1 mapping to the MSL kernel
+// signatures, so `too_many_arguments` is expected here. Likewise the
+// CPU-reference helpers mirror those wide signatures. `type_complexity`
+// is allowed for the same shader-table lookup return tuples.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 /// Compile-time-generated kernel instantiation tables. The
 /// `STEEL_PAGED_HEAD_DIMS` slice and `steel_paged_symbol()` lookup
 /// in here are emitted by `build.rs` from the same head-dim list
@@ -13,7 +21,10 @@
 /// dispatcher in `ferrite-forward/.../lowering.rs` must consume
 /// these — never hand-list head dims at the call site.
 pub mod steel_paged {
-    include!(concat!(env!("OUT_DIR"), "/steel_paged_kernels_generated.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/steel_paged_kernels_generated.rs"
+    ));
 }
 
 pub mod activation;

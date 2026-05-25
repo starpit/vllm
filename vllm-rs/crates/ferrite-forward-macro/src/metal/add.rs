@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
-    AddRefImpl, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
-    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
+    AddRefImpl, CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape,
+    Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 

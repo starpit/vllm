@@ -687,25 +687,26 @@ fn validate_target_draft_pair(config: &VllmConfig, draft_spec: &str) -> Result<(
     let draft_cfg = HfModelConfig::from_dir(&draft_dir)
         .with_context(|| format!("reading draft config.json at {:?}", draft_dir))?;
 
-    if let (Some(tv), Some(dv)) = (target_cfg.vocab_size, draft_cfg.vocab_size) {
-        if tv != dv {
-            anyhow::bail!(
-                "target/draft vocab_size mismatch: target={} ({}), draft={} ({}). \
+    if let (Some(tv), Some(dv)) = (target_cfg.vocab_size, draft_cfg.vocab_size)
+        && tv != dv
+    {
+        anyhow::bail!(
+            "target/draft vocab_size mismatch: target={} ({}), draft={} ({}). \
                  Spec-decode requires matching vocabularies — the draft model must \
                  emit token IDs the target can interpret. Pick a draft from the same \
                  model family (e.g. Llama-3.2-1B paired with Llama-3.2-3B).",
-                tv, config.model, dv, draft_spec
-            );
-        }
+            tv,
+            config.model,
+            dv,
+            draft_spec
+        );
     }
 
     let target_tok = target_dir.join("tokenizer.json");
     let draft_tok = draft_dir.join("tokenizer.json");
     if target_tok.is_file() && draft_tok.is_file() {
-        let tb = std::fs::read(&target_tok)
-            .with_context(|| format!("reading {:?}", target_tok))?;
-        let db = std::fs::read(&draft_tok)
-            .with_context(|| format!("reading {:?}", draft_tok))?;
+        let tb = std::fs::read(&target_tok).with_context(|| format!("reading {:?}", target_tok))?;
+        let db = std::fs::read(&draft_tok).with_context(|| format!("reading {:?}", draft_tok))?;
         if tb != db {
             // Byte-equal failed. The two HF families that pair well
             // for spec-decode (Llama-3.1 target + Llama-3.2 draft,
@@ -737,6 +738,7 @@ fn validate_target_draft_pair(config: &VllmConfig, draft_spec: &str) -> Result<(
 ///   * Older HF tokenizers write `model.merges` as
 ///     `["a b", "c d", ...]` (space-separated strings).
 ///   * Newer tokenizers write `[["a","b"], ["c","d"], ...]` (lists).
+///
 /// Normalize before comparing so cosmetic format drift doesn't block
 /// spec-decode. The actual token IDs are identical iff
 /// (`model.vocab`, `added_tokens`, `normalized(model.merges)`) match.
@@ -794,8 +796,14 @@ fn tokenizer_semantic_mismatch_check(
              Pick a draft from the same model family as the target.",
         );
     }
-    let tm = normalize_merges(t.pointer("/model/merges").unwrap_or(&serde_json::Value::Null));
-    let dm = normalize_merges(d.pointer("/model/merges").unwrap_or(&serde_json::Value::Null));
+    let tm = normalize_merges(
+        t.pointer("/model/merges")
+            .unwrap_or(&serde_json::Value::Null),
+    );
+    let dm = normalize_merges(
+        d.pointer("/model/merges")
+            .unwrap_or(&serde_json::Value::Null),
+    );
     if tm != dm {
         anyhow::bail!(
             "target/draft tokenizer.json mismatch: model.merges differs (normalized {} vs {} entries). \
@@ -823,9 +831,10 @@ fn tokenizer_semantic_mismatch_check(
 /// budget here. The goal is to catch obvious misconfigurations (e.g.
 /// 7B + 3B target+draft on a 24 GiB machine) before model load.
 ///
-/// Asserts `target_weights + draft_weights <= recommendedMaxWorkingSetSize
-/// * gpu_memory_utilization * 0.6`, reserving ~40% for KV cache,
-/// activations, and other working-set overhead.
+/// Asserts that `target_weights + draft_weights` stays under
+/// `recommendedMaxWorkingSetSize * gpu_memory_utilization * 0.6`,
+/// reserving ~40% for KV cache, activations, and other working-set
+/// overhead.
 #[cfg(feature = "metal")]
 fn metal_memory_budget_check(
     config: &VllmConfig,
@@ -842,8 +851,7 @@ fn metal_memory_budget_check(
     // activations. Empirically the runtime sizes KV against
     // `(working_set - currentAllocatedSize) * gpu_memory_utilization`,
     // so weights consuming >60% leaves KV starved.
-    let weight_budget =
-        (total as f64 * config.gpu_memory_utilization * 0.6).round() as u64;
+    let weight_budget = (total as f64 * config.gpu_memory_utilization * 0.6).round() as u64;
 
     let target_weights = weight_bytes_on_disk(target_dir);
     let draft_weights = weight_bytes_on_disk(draft_dir);
@@ -1035,7 +1043,8 @@ fn initialize_core(
         info!("EOS token IDs: {:?}", eos_token_ids);
     }
 
-    let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
+    let use_async_scheduling =
+        !config.disable_async_scheduling && !spec_decode_requires_sync(config);
     let enable_prefix_caching = config.enable_prefix_caching;
 
     let engine_config = EngineCoreConfig {
@@ -1307,7 +1316,8 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
         let parallel_config = ResolvedParallelConfig::tensor_parallel(tp_size, 0);
         let executor = ThreadPoolExecutor::new(workers, parallel_config);
 
-        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
+        let use_async_scheduling =
+            (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
 
         let eos_token_ids: Vec<u32> = hf_config
@@ -1494,7 +1504,7 @@ pub fn initialize_stack(
     };
 
     let mut engine = engine;
-    if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
+    if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
         engine.set_async_scheduling(true);
     }
     if config.runner == "pooling" {
@@ -1754,7 +1764,8 @@ fn initialize_stack_multinode(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
+        let use_async_scheduling =
+            (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -2583,7 +2594,8 @@ fn initialize_stack_tp(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
+        let use_async_scheduling =
+            (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {
@@ -2938,7 +2950,8 @@ fn initialize_stack_external(
             })
             .unwrap_or_default();
 
-        let use_async_scheduling = (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
+        let use_async_scheduling =
+            (!config.disable_async_scheduling && !spec_decode_requires_sync(config));
         let enable_prefix_caching = config.enable_prefix_caching;
         let engine_config = EngineCoreConfig {
             scheduler_config: SchedulerConfig {

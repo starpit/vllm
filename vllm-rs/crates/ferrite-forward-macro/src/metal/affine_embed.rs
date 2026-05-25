@@ -20,9 +20,9 @@
 use std::collections::BTreeMap;
 
 use crate::classified::{OpKind, Program};
-use crate::fuf::{Fuf, TileId};
 use crate::codegen::split_base_layer;
 use crate::emit::weight_field_name;
+use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
     CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
     SlotMap, WeightAccessor, WorkloadConstraint, weight_storage_of,
@@ -234,9 +234,7 @@ impl Implementation for MetalAffineEmbedImpl {
         // `WeightAccessors::affine_quant_embedding_at`.
         let _ = base_ident;
         Some(vec![ferrite_forward::Instruction::AffineEmbed(
-            out_slot,
-            group_size,
-            bits,
+            out_slot, group_size, bits,
         )])
     }
 }

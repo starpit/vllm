@@ -21,7 +21,7 @@
 
 use crate::util::{self, Buffer, Device};
 use ferrite_metal_kernels::quantized::{
-    valid_qmv_kernels, DequantDtype, MetalAffineQmv, QmvKernel, ScaleDtype,
+    DequantDtype, MetalAffineQmv, QmvKernel, ScaleDtype, valid_qmv_kernels,
 };
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder};

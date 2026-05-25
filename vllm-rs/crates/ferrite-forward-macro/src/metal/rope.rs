@@ -8,9 +8,8 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape,
-    Resources, RopeAppendRefImpl, SlotMap, WeightAccessor, WorkloadConstraint,
-    default_required_weights,
+    CostCtx, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources,
+    RopeAppendRefImpl, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
 };
 use crate::target::{Backend, TargetProfile};
 
@@ -73,7 +72,10 @@ impl Implementation for MetalRopeAppendImpl {
         fuf: &crate::fuf::Fuf,
     ) -> (Option<u32>, Option<u32>) {
         // RopeAppend writes the per-layer paged KV cache.
-        (crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf), None)
+        (
+            crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf),
+            None,
+        )
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
@@ -186,11 +188,7 @@ impl Implementation for MetalRopeAppendImpl {
         RopeAppendRefImpl.fan_out(m, fuf, program, bounds, slots)
     }
 
-    fn as_atom(
-        &self,
-        _m: &MatchInfo,
-        _fuf: &Fuf,
-    ) -> Option<Box<dyn crate::atom::Atom>> {
+    fn as_atom(&self, _m: &MatchInfo, _fuf: &Fuf) -> Option<Box<dyn crate::atom::Atom>> {
         Some(Box::new(crate::atom_lib::RopeAppendAtom))
     }
 }
@@ -245,7 +243,10 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
         claimed_tiles: &[crate::fuf::TileId],
         fuf: &crate::fuf::Fuf,
     ) -> (Option<u32>, Option<u32>) {
-        (crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf), None)
+        (
+            crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf),
+            None,
+        )
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {

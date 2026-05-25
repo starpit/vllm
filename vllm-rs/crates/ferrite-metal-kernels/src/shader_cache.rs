@@ -89,7 +89,10 @@ impl ShaderCache {
             ),
             ("silu_mul", &crate::embedded_metallib!("silu_mul")[..]),
             ("softmax", &crate::embedded_metallib!("softmax")[..]),
-            ("argpartition", &crate::embedded_metallib!("argpartition")[..]),
+            (
+                "argpartition",
+                &crate::embedded_metallib!("argpartition")[..],
+            ),
             (
                 "take_along_axis",
                 &crate::embedded_metallib!("take_along_axis")[..],
@@ -312,10 +315,7 @@ impl ShaderCache {
 /// library. The bytes typically come from `include_bytes!` so we keep the
 /// destructor as no-op (default behavior of `DispatchData::from`'s
 /// implementation copies into a managed buffer).
-pub fn load_library_from_bytes(
-    device: &Device,
-    bytes: &'static [u8],
-) -> Result<Library, String> {
+pub fn load_library_from_bytes(device: &Device, bytes: &'static [u8]) -> Result<Library, String> {
     let data = DispatchData::from_static_bytes(bytes);
     device
         .newLibraryWithData_error(&data)

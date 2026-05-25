@@ -240,7 +240,7 @@ impl MixtralDecoderLayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * ipp, hidden], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, ipp], dtype) };
 
-        Ok(FusedMoELayer::Dense(DenseFusedMoELayer {
+        Ok(FusedMoELayer::Dense(Box::new(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -255,7 +255,7 @@ impl MixtralDecoderLayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        }))
+        })))
     }
 
     /// Load an FP8 decoder layer.

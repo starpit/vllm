@@ -1063,7 +1063,7 @@ impl DeepSeekV2DecoderLayer {
             None
         };
 
-        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
+        let moe = FusedMoELayer::Dense(Box::new(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -1078,7 +1078,7 @@ impl DeepSeekV2DecoderLayer {
             routed_scaling_factor: config.routed_scaling_factor,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        });
+        }));
 
         // Shared expert: n_shared_experts * moe_intermediate_size
         let shared_inter = config.n_shared_experts * config.moe_intermediate_size;

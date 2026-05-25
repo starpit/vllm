@@ -7,15 +7,13 @@
 
 use std::collections::BTreeMap;
 
-use quote::quote;
-
 use crate::classified::{OpKind, Program};
 use crate::codegen::split_base_layer;
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
     CostCtx, FusedAddRmsNormImpl, FusedGateUpGeluMulImpl, FusedGateUpSiluMulImpl, Handoff,
-    Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap,
-    WeightAccessor, WorkloadConstraint, consumes_tile, default_required_weights, first_tile_input,
+    Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape, Resources, SlotMap, WeightAccessor,
+    WorkloadConstraint, consumes_tile, default_required_weights, first_tile_input,
     first_weight_ref, gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::metal::affine_qmm::{affine_qmm_opcode_shape, affine_qmm_vector_limit};
@@ -263,8 +261,8 @@ impl MetalFusedGateUpSiluMulImpl {
     }
 
     /// Decomposed cost for Affine 4-bit Gate-Up-SiLU-Mul. `fan_out`
-    /// emits 3 separate Instructions for this storage (gate AffineQmm
-    /// + up AffineQmm + SiluMul) — there is no fused affine kernel —
+    /// emits 3 separate Instructions for this storage (gate AffineQmm,
+    /// up AffineQmm, SiluMul) — there is no fused affine kernel —
     /// so the cost must equal `cost(qmm gate) + cost(qmm up) + cost(silu_and_mul)`,
     /// not the analytical "single fused bandwidth pass" estimate that
     /// applies to the Dense path. Without this branch the impl claims
@@ -296,9 +294,7 @@ impl MetalFusedGateUpSiluMulImpl {
             })
             .unwrap_or(2048);
 
-        let qmm = crate::metal::affine_qmm::empirical_cost_us(
-            self.dtype, m, n, k, gate_node, ctx,
-        );
+        let qmm = crate::metal::affine_qmm::empirical_cost_us(self.dtype, m, n, k, gate_node, ctx);
         let one_qmm = qmm.unwrap_or_else(|| {
             // Analytical fallback (compute-bound roofline for the gemm).
             let flops = 2.0 * (m as f64) * (n as f64) * (k as f64);
@@ -308,8 +304,7 @@ impl MetalFusedGateUpSiluMulImpl {
         // SiluMul: bandwidth-bound, reads gate+up [M,N] and writes [M,N].
         let act_bytes = 2.0_f64;
         let silu_bytes = 3.0 * (m as f64) * (n as f64) * act_bytes;
-        let silu_us =
-            silu_bytes / 1e9 / ctx.profile.memory_bandwidth_gbps * 1e6;
+        let silu_us = silu_bytes / 1e9 / ctx.profile.memory_bandwidth_gbps * 1e6;
 
         2.0 * one_qmm + silu_us
     }
@@ -459,9 +454,7 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             let gate_node = ctx.fuf.get(gate_tile);
             let storage = weight_storage_of(gate_node);
             if let Some(StorageFormat::Affine { group_size, bits }) = storage {
-                return self.affine_decomposed_cost_us(
-                    gate_node, m, n, *group_size, *bits, ctx,
-                );
+                return self.affine_decomposed_cost_us(gate_node, m, n, *group_size, *bits, ctx);
             }
 
             // Dense path: existing fused-kernel cost model.

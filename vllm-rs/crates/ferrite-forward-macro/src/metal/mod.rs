@@ -8,14 +8,11 @@
 
 pub mod activation;
 pub mod add;
-pub mod dataflow;
-pub mod synth_gate_up_silu_mul;
-pub mod synth_mlp_pre_down;
-pub mod synth_pre_attn;
 pub mod affine_embed;
 pub mod affine_qmm;
 pub mod attention;
 pub mod bias_add;
+pub mod dataflow;
 pub mod embed;
 pub mod fused_kernels;
 pub mod gemm;
@@ -27,6 +24,9 @@ pub mod rope;
 pub mod scalar_mul;
 pub mod softcap;
 pub mod sub;
+pub mod synth_gate_up_silu_mul;
+pub mod synth_mlp_pre_down;
+pub mod synth_pre_attn;
 
 // Re-export the main implementation types
 pub use activation::MetalActivationImpl;

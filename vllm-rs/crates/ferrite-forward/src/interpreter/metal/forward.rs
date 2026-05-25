@@ -129,7 +129,9 @@ impl std::fmt::Display for ForwardError {
                 f,
                 "MetalWorkerPool::forward: command buffer status = {status:?} (expected Completed)"
             ),
-            Self::Followup(msg) => write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}"),
+            Self::Followup(msg) => {
+                write!(f, "MetalWorkerPool::forward: followup hook failed: {msg}")
+            }
         }
     }
 }

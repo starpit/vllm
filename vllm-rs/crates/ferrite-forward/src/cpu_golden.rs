@@ -429,11 +429,8 @@ pub fn attention_via_cache(
                 let logical_block = t / block_size;
                 let block_offset = t % block_size;
                 let physical_block = row_blocks[logical_block] as usize;
-                let k_base = layout.elem_offset(
-                    physical_block as u32,
-                    kv_h as u32,
-                    block_offset as u32,
-                );
+                let k_base =
+                    layout.elem_offset(physical_block as u32, kv_h as u32, block_offset as u32);
                 let mut dot = 0.0_f32;
                 for d in 0..head_dim {
                     dot += q[q_off + d] * kv_cache_k[k_base + d];
@@ -456,11 +453,8 @@ pub fn attention_via_cache(
                     let logical_block = t / block_size;
                     let block_offset = t % block_size;
                     let physical_block = row_blocks[logical_block] as usize;
-                    let v_base = layout.elem_offset(
-                        physical_block as u32,
-                        kv_h as u32,
-                        block_offset as u32,
-                    );
+                    let v_base =
+                        layout.elem_offset(physical_block as u32, kv_h as u32, block_offset as u32);
                     acc += scores[t] * inv_sum * kv_cache_v[v_base + d];
                 }
                 output[q_off + d] = acc;
@@ -678,11 +672,8 @@ pub fn attention_prefill_paged(
                     let logical_block = t / block_size;
                     let block_offset = t % block_size;
                     let physical_block = row_blocks[logical_block] as usize;
-                    let k_base = layout.elem_offset(
-                        physical_block as u32,
-                        kv_h as u32,
-                        block_offset as u32,
-                    );
+                    let k_base =
+                        layout.elem_offset(physical_block as u32, kv_h as u32, block_offset as u32);
                     let mut dot = 0.0_f32;
                     for d in 0..head_dim {
                         dot += q[q_off + d] * kv_cache_k[k_base + d];

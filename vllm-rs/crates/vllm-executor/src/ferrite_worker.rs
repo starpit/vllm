@@ -1883,8 +1883,7 @@ pub struct FerriteWorker {
     /// place between K-step chain iters. Cached at load_model so the
     /// pipeline is built once.
     #[cfg(feature = "metal")]
-    chain_advance_kernel:
-        Option<ferrite_metal_kernels::chain_advance::ChainAdvanceKernel>,
+    chain_advance_kernel: Option<ferrite_metal_kernels::chain_advance::ChainAdvanceKernel>,
     /// Second `MTLCommandQueue` on the same device, dedicated to the
     /// draft chain. Metal device-level parallelism: dispatches on
     /// distinct queues run concurrently on Apple Silicon when they
@@ -1896,9 +1895,9 @@ pub struct FerriteWorker {
     /// target-KV writes (separate KV pools), so they're safe to run
     /// concurrently. Allocated when the draft model loads.
     #[cfg(feature = "metal")]
-    draft_queue: Option<::objc2::rc::Retained<
-        ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
-    >>,
+    draft_queue: Option<
+        ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>>,
+    >,
 }
 
 // Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -3826,8 +3825,10 @@ impl FerriteWorker {
             let n_tokens = req_slice.token_count; // 1 + num_drafts for spec, 1 for normal
             let target_ids = &all_target_ids[flat_offset..flat_offset + n_tokens];
 
-            let rejection =
-                ::vllm_engine::spec_decode::greedy_rejection_sample(target_ids, &req_slice.spec_token_ids);
+            let rejection = ::vllm_engine::spec_decode::greedy_rejection_sample(
+                target_ids,
+                &req_slice.spec_token_ids,
+            );
             let accepted_tokens = rejection.accepted_tokens;
 
             // 4. Commit step with accepted tokens.
@@ -5237,10 +5238,8 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         &mut self,
         _path: &::std::path::Path,
         _dtype: Option<&str>,
-    ) -> Result<
-        ::vllm_engine::spec_decode::ModelHandle,
-        ::vllm_engine::spec_decode::BackendError,
-    > {
+    ) -> Result<::vllm_engine::spec_decode::ModelHandle, ::vllm_engine::spec_decode::BackendError>
+    {
         Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
             "cuda: load_secondary_model (phase 5.2b)",
         ))
@@ -5250,10 +5249,8 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         &mut self,
         _model: ::vllm_engine::spec_decode::ModelHandle,
         _num_blocks: usize,
-    ) -> Result<
-        ::vllm_engine::spec_decode::KvPoolHandle,
-        ::vllm_engine::spec_decode::BackendError,
-    > {
+    ) -> Result<::vllm_engine::spec_decode::KvPoolHandle, ::vllm_engine::spec_decode::BackendError>
+    {
         Err(::vllm_engine::spec_decode::BackendError::NotImplemented(
             "cuda: allocate_kv_pool (phase 5.2b)",
         ))
@@ -9538,13 +9535,11 @@ impl FerriteWorker {
     /// keys include the library name and each model's synthesized
     /// libraries are derived from its own per-arch macro expansion.
     fn load_draft_model_metal(&mut self) -> ExecutorResult<()> {
-        let path = self
-            .config
-            .draft_model_path
-            .as_deref()
-            .ok_or_else(|| ExecutorError::WorkerInit(
+        let path = self.config.draft_model_path.as_deref().ok_or_else(|| {
+            ExecutorError::WorkerInit(
                 "load_draft_model_metal called without draft_model_path".into(),
-            ))?;
+            )
+        })?;
 
         let t_resolve = std::time::Instant::now();
         let draft_dir = resolve_model_path(path, self.config.hf_token.as_deref(), None)?;
@@ -9560,9 +9555,8 @@ impl FerriteWorker {
             ));
         }
 
-        let draft_hf_config = HfModelConfig::from_path(&draft_dir).map_err(|e| {
-            ExecutorError::WorkerInit(format!("draft config parse failed: {e}"))
-        })?;
+        let draft_hf_config = HfModelConfig::from_path(&draft_dir)
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft config parse failed: {e}")))?;
         let draft_arch = draft_hf_config
             .architectures
             .first()
@@ -9575,18 +9569,16 @@ impl FerriteWorker {
         // `MetalAllocator::clone` shares the underlying arena via
         // Arc<Mutex<…>>, so a weight allocated through the draft clone
         // is reachable via the target's clone too.
-        let gpu_device = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerInit(
+        let gpu_device = self.gpu_device.as_ref().ok_or_else(|| {
+            ExecutorError::WorkerInit(
                 "gpu_device not initialized — draft load must run after target load".into(),
-            ))?;
+            )
+        })?;
         let allocator = (*gpu_device.allocator).clone();
 
         let t_from_dir = std::time::Instant::now();
-        let mut draft_weights = GpuWeights::from_dir(&draft_dir, allocator).map_err(|e| {
-            ExecutorError::WorkerInit(format!("draft weight load failed: {e}"))
-        })?;
+        let mut draft_weights = GpuWeights::from_dir(&draft_dir, allocator)
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft weight load failed: {e}")))?;
         info!(
             "FerriteWorker(metal): draft GpuWeights::from_dir in {:?} ({} tensors)",
             t_from_dir.elapsed(),
@@ -9660,12 +9652,11 @@ impl FerriteWorker {
     /// allocator's shared residency set so attention reads don't race
     /// the Apple pager.
     fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
-        let model = self
-            .draft_model
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerInit(
+        let model = self.draft_model.as_ref().ok_or_else(|| {
+            ExecutorError::WorkerInit(
                 "initialize_draft_cache_metal called before draft_model load".into(),
-            ))?;
+            )
+        })?;
         // Phase 4 of DRAFT_SPEC_DECODE_PLAN.md: lockstep proposer needs a
         // 1:1 mirror — every target block has a sibling draft block at the
         // same index. `determine_available_memory` already carved off
@@ -9770,6 +9761,7 @@ impl FerriteWorker {
 /// the K argmax buffers and returns iter-major `[k][num_reqs]`
 /// argmax IDs.
 #[cfg(feature = "metal")]
+#[allow(clippy::too_many_arguments)]
 fn metal_chain_dispatch(
     model_ref: &dyn ferrite_forward::FerriteWeights,
     kv_cache_ref: &KvCachePool,
@@ -9799,13 +9791,10 @@ fn metal_chain_dispatch(
     // ── 1. Upload iter-0 inputs ─────────────────────────────────
     let buf_input_ids = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.input_ids);
     let buf_positions = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.positions);
-    let buf_slot_mapping =
-        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
-    let buf_cu_seqlens =
-        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
+    let buf_slot_mapping = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
+    let buf_cu_seqlens = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
     let buf_seqused_k = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
-    let buf_block_table =
-        FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.block_table);
+    let buf_block_table = FerriteWorker::alloc_shared_u32_buf(&mtl_device, req.block_table);
 
     let dtype_u32 = ferrite_cuda_core::dtype::DType::U32;
     let view_input_ids = unsafe {
@@ -9853,9 +9842,9 @@ fn metal_chain_dispatch(
 
     // ── 2. Allocate K argmax output buffers (host-visible) ──────
     let argmax_bytes = (req.num_tokens.max(1)) * 4;
-    let argmax_bufs: Vec<::objc2::rc::Retained<
-        ::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>,
-    >> = (0..k)
+    let argmax_bufs: Vec<
+        ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>,
+    > = (0..k)
         .map(|_| {
             mtl_device
                 .newBufferWithLength_options(
@@ -9868,10 +9857,7 @@ fn metal_chain_dispatch(
 
     // ── 3. Pack constants ───────────────────────────────────────
     let consts_buf = mtl_device
-        .newBufferWithLength_options(
-            16,
-            ::objc2_metal::MTLResourceOptions::StorageModeShared,
-        )
+        .newBufferWithLength_options(16, ::objc2_metal::MTLResourceOptions::StorageModeShared)
         .expect("consts_buf alloc returned nil");
     let vocab_u32 = model_ref.vocab_size() as u32;
     unsafe {
@@ -9922,8 +9908,7 @@ fn metal_chain_dispatch(
     let argmax_kernels_addr: usize =
         argmax_kernels as *const ferrite_metal_kernels::argmax::ArgmaxKernels as usize;
     let chain_kernel_addr: usize =
-        chain_kernel as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel
-            as usize;
+        chain_kernel as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel as usize;
     let dtype = model_ref.metal_dtype();
 
     let argmax_bufs_for_closure = argmax_bufs.clone();
@@ -9937,13 +9922,10 @@ fn metal_chain_dispatch(
 
     let body: ferrite_forward::MetalChainBody<'_> = Box::new(
         move |handle, runtime, enc| -> Result<(), String> {
-            let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels =
-                unsafe {
-                    &*(argmax_kernels_addr
-                        as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
-                };
-            let chain_kernel_ref:
-                &ferrite_metal_kernels::chain_advance::ChainAdvanceKernel = unsafe {
+            let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels = unsafe {
+                &*(argmax_kernels_addr as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
+            };
+            let chain_kernel_ref: &ferrite_metal_kernels::chain_advance::ChainAdvanceKernel = unsafe {
                 &*(chain_kernel_addr
                     as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel)
             };
@@ -9955,20 +9937,14 @@ fn metal_chain_dispatch(
             let next_in_addr = runtime.input_ids.gpuAddress();
 
             unsafe {
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    runtime.positions.gpuAddress(), 0);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    runtime.slot_mapping.gpuAddress(), 1);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    runtime.seq_used_k.gpuAddress(), 2);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    runtime.block_table.gpuAddress(), 3);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    consts_addr + 8, 4);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    consts_addr + 12, 5);
-                chain_arg_table_for_closure.setAddress_atIndex(
-                    consts_addr, 6);
+                chain_arg_table_for_closure.setAddress_atIndex(runtime.positions.gpuAddress(), 0);
+                chain_arg_table_for_closure
+                    .setAddress_atIndex(runtime.slot_mapping.gpuAddress(), 1);
+                chain_arg_table_for_closure.setAddress_atIndex(runtime.seq_used_k.gpuAddress(), 2);
+                chain_arg_table_for_closure.setAddress_atIndex(runtime.block_table.gpuAddress(), 3);
+                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 8, 4);
+                chain_arg_table_for_closure.setAddress_atIndex(consts_addr + 12, 5);
+                chain_arg_table_for_closure.setAddress_atIndex(consts_addr, 6);
             }
 
             for iter in 0..k_usize {
@@ -10024,24 +10000,14 @@ fn metal_chain_dispatch(
 
     let prof = std::env::var_os("FERRITE_SPEC_PROFILE").is_some();
     let t_chain = std::time::Instant::now();
-    unsafe {
-        model_ref.metal_chain_with_encoder(
-            &ctx,
-            device_mut,
-            req.num_tokens as u64,
-            body,
-        )?
-    };
+    unsafe { model_ref.metal_chain_with_encoder(&ctx, device_mut, req.num_tokens as u64, body)? };
     let chain_us = t_chain.elapsed().as_micros();
 
     let t_read = std::time::Instant::now();
     let mut out: Vec<Vec<u32>> = Vec::with_capacity(k);
     for buf in argmax_bufs.iter() {
         let slice: &[u32] = unsafe {
-            std::slice::from_raw_parts(
-                buf.contents().as_ptr() as *const u32,
-                num_reqs.max(1),
-            )
+            std::slice::from_raw_parts(buf.contents().as_ptr() as *const u32, num_reqs.max(1))
         };
         out.push(slice[..num_reqs.max(1)].to_vec());
     }
@@ -10079,17 +10045,16 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
             _ => return Err(BackendError::UnknownHandle("ModelHandle")),
         };
-        let kv_cache_ref: &KvCachePool = match kv_pool {
-            KvPoolHandle::TARGET => self
-                .kv_cache
-                .as_ref()
-                .ok_or_else(|| BackendError::Backend("target kv_cache not initialized".into()))?,
-            KvPoolHandle(1) => self
-                .draft_kv_cache
-                .as_ref()
-                .ok_or_else(|| BackendError::Backend("draft kv_cache not initialized".into()))?,
-            _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
-        };
+        let kv_cache_ref: &KvCachePool =
+            match kv_pool {
+                KvPoolHandle::TARGET => self.kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("target kv_cache not initialized".into())
+                })?,
+                KvPoolHandle(1) => self.draft_kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("draft kv_cache not initialized".into())
+                })?,
+                _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
+            };
 
         let device_buf = self
             .gpu_device
@@ -10175,9 +10140,10 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         // to this call; the worker's `gpu_device.queue` is untouched.
         let use_draft_queue = matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
         let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
-            let main_dev = self.gpu_device.as_ref().ok_or_else(|| {
-                BackendError::Backend("gpu_device not initialized".into())
-            })?;
+            let main_dev = self
+                .gpu_device
+                .as_ref()
+                .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
             let draft_q = self.draft_queue.as_ref().unwrap().clone();
             Some(GpuDevice {
                 device: main_dev.device.clone(),
@@ -10223,10 +10189,7 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
             )
             .expect("argmax_out alloc returned nil");
         let consts_buf = mtl_device
-            .newBufferWithLength_options(
-                8,
-                ::objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
+            .newBufferWithLength_options(8, ::objc2_metal::MTLResourceOptions::StorageModeShared)
             .expect("argmax consts alloc returned nil");
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
@@ -10266,11 +10229,9 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                     arg_table_for_closure.setAddress_atIndex(consts_addr, 2);
                     arg_table_for_closure.setAddress_atIndex(consts_addr + 4, 3);
                 }
-                let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels =
-                    unsafe {
-                        &*(argmax_kernels_addr
-                            as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
-                    };
+                let argmax_kernels_ref: &ferrite_metal_kernels::argmax::ArgmaxKernels = unsafe {
+                    &*(argmax_kernels_addr as *const ferrite_metal_kernels::argmax::ArgmaxKernels)
+                };
                 match dtype {
                     ferrite_forward::interpreter::metal::MetalDtype::F16 => {
                         ferrite_metal_kernels::argmax::encode_argmax_f16_into_mtl4(
@@ -10291,9 +10252,7 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                         .map_err(|e| format!("encode_argmax_bf16: {e:?}"))?;
                     }
                     ferrite_forward::interpreter::metal::MetalDtype::Int4 => {
-                        return Err(
-                            "argmax: int4 dtype has no direct kernel".into(),
-                        );
+                        return Err("argmax: int4 dtype has no direct kernel".into());
                     }
                 }
                 Ok(())
@@ -10324,20 +10283,14 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         if prof {
             eprintln!(
                 "[spec-prof] num_tokens={} num_seqs={} has_spec={} alloc={}us argbuf={}us fwd={}us read={}us",
-                req.num_tokens,
-                num_reqs,
-                req.has_spec_tokens,
-                alloc_us,
-                argbuf_us,
-                fwd_us,
-                read_us,
+                req.num_tokens, num_reqs, req.has_spec_tokens, alloc_us, argbuf_us, fwd_us, read_us,
             );
         }
         Ok(out)
     }
 
-    /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward
-    /// + argmax_dual_write + chain_advance (advances positions /
+    /// Phase 6: K-step draft chain in ONE MTL4 command buffer. Forward,
+    /// argmax_dual_write, and chain_advance (advances positions /
     /// slot_mapping / seqused_k in-place on the GPU between iters)
     /// for K iters share one CB, one commit, and one host wait. Per
     /// iter we spend ~kernel-time only — no host roundtrip, no per-
@@ -10374,17 +10327,16 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 .ok_or_else(|| BackendError::Backend("draft model not loaded".into()))?,
             _ => return Err(BackendError::UnknownHandle("ModelHandle")),
         };
-        let kv_cache_ref: &KvCachePool = match kv_pool {
-            KvPoolHandle::TARGET => self
-                .kv_cache
-                .as_ref()
-                .ok_or_else(|| BackendError::Backend("target kv_cache not initialized".into()))?,
-            KvPoolHandle(1) => self
-                .draft_kv_cache
-                .as_ref()
-                .ok_or_else(|| BackendError::Backend("draft kv_cache not initialized".into()))?,
-            _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
-        };
+        let kv_cache_ref: &KvCachePool =
+            match kv_pool {
+                KvPoolHandle::TARGET => self.kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("target kv_cache not initialized".into())
+                })?,
+                KvPoolHandle(1) => self.draft_kv_cache.as_ref().ok_or_else(|| {
+                    BackendError::Backend("draft kv_cache not initialized".into())
+                })?,
+                _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
+            };
 
         let argmax_kernels = self
             .argmax_kernels
@@ -10393,16 +10345,13 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         let chain_kernel = self
             .chain_advance_kernel
             .as_ref()
-            .ok_or_else(|| {
-                BackendError::Backend("chain_advance_kernel not built".into())
-            })?;
+            .ok_or_else(|| BackendError::Backend("chain_advance_kernel not built".into()))?;
 
         // Phase 8 routing: when the call is for the draft model AND a
         // dedicated `draft_queue` exists, route through a shadow
         // GpuDevice on the draft queue so target verify and draft
         // chain stay disjoint.
-        let use_draft_queue =
-            matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
+        let use_draft_queue = matches!(model, ModelHandle(1)) && self.draft_queue.is_some();
         let mut shadow_draft_device: Option<GpuDevice> = if use_draft_queue {
             let main_dev = self.gpu_device.as_ref().expect("checked above");
             let draft_q = self.draft_queue.as_ref().unwrap().clone();
@@ -10437,15 +10386,12 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
 
     // (legacy body folded into the free fn `metal_chain_dispatch` below)
 
-
     fn load_secondary_model(
         &mut self,
         _path: &::std::path::Path,
         _dtype: Option<&str>,
-    ) -> Result<
-        ::vllm_engine::spec_decode::ModelHandle,
-        ::vllm_engine::spec_decode::BackendError,
-    > {
+    ) -> Result<::vllm_engine::spec_decode::ModelHandle, ::vllm_engine::spec_decode::BackendError>
+    {
         // Thin wrapper: delegate to the existing helper which pulls
         // path + dtype from `self.config`. Phase 5.4 will tighten this
         // when `DraftModelProposer` takes ownership of the lifecycle and
@@ -10459,10 +10405,8 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         &mut self,
         model: ::vllm_engine::spec_decode::ModelHandle,
         num_blocks: usize,
-    ) -> Result<
-        ::vllm_engine::spec_decode::KvPoolHandle,
-        ::vllm_engine::spec_decode::BackendError,
-    > {
+    ) -> Result<::vllm_engine::spec_decode::KvPoolHandle, ::vllm_engine::spec_decode::BackendError>
+    {
         if model != ::vllm_engine::spec_decode::ModelHandle(1) {
             return Err(::vllm_engine::spec_decode::BackendError::UnknownHandle(
                 "ModelHandle (only the draft handle 1 supports allocate_kv_pool today)",
@@ -10478,22 +10422,20 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         model: ::vllm_engine::spec_decode::ModelHandle,
     ) -> Result<usize, ::vllm_engine::spec_decode::BackendError> {
         let model_ref: &dyn ferrite_forward::FerriteWeights = match model {
-            ::vllm_engine::spec_decode::ModelHandle::TARGET => self
-                .model
-                .as_deref()
-                .ok_or_else(|| {
+            ::vllm_engine::spec_decode::ModelHandle::TARGET => {
+                self.model.as_deref().ok_or_else(|| {
                     ::vllm_engine::spec_decode::BackendError::Backend(
                         "target model not loaded".into(),
                     )
-                })?,
-            ::vllm_engine::spec_decode::ModelHandle(1) => self
-                .draft_model
-                .as_deref()
-                .ok_or_else(|| {
+                })?
+            }
+            ::vllm_engine::spec_decode::ModelHandle(1) => {
+                self.draft_model.as_deref().ok_or_else(|| {
                     ::vllm_engine::spec_decode::BackendError::Backend(
                         "draft model not loaded".into(),
                     )
-                })?,
+                })?
+            }
             _ => {
                 return Err(::vllm_engine::spec_decode::BackendError::UnknownHandle(
                     "ModelHandle",
@@ -10685,12 +10627,11 @@ impl Worker for FerriteWorker {
         // alongside argmax so the K-step chain driver never falls into
         // pipeline-compile latency on the first call.
         let t_chain = std::time::Instant::now();
-        let chain_advance = ferrite_metal_kernels::chain_advance::ChainAdvanceKernel::new(
-            &gpu_device.device,
-        )
-        .map_err(|e| {
-            ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}"))
-        })?;
+        let chain_advance =
+            ferrite_metal_kernels::chain_advance::ChainAdvanceKernel::new(&gpu_device.device)
+                .map_err(|e| {
+                    ExecutorError::WorkerInit(format!("chain_advance kernel compile: {e:?}"))
+                })?;
         info!(
             "FerriteWorker(metal): ChainAdvanceKernel::new in {:?}",
             t_chain.elapsed()
@@ -10852,7 +10793,7 @@ impl Worker for FerriteWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
         let total = metal_device.device.recommendedMaxWorkingSetSize() as usize;
-        let weights_and_overhead = metal_device.device.currentAllocatedSize() as usize;
+        let weights_and_overhead = metal_device.device.currentAllocatedSize();
         let arena_peak = self
             .model
             .as_ref()
@@ -11118,8 +11059,8 @@ impl Worker for FerriteWorker {
             // K-step chain (runs in the lockstep thread, overlapped
             // with target verify). Gated by env var until baseline
             // bench validates the projected ~13% TPOT win.
-            let phase9_speculative_chain = phase8_parallel_lockstep
-                && std::env::var_os("FERRITE_SPEC9_ENABLE").is_some();
+            let phase9_speculative_chain =
+                phase8_parallel_lockstep && std::env::var_os("FERRITE_SPEC9_ENABLE").is_some();
 
             // Spec-9 eligibility, single-req case only for now.
             // Derive K from q_lens[0] (= drafts + 1 bonus when the
@@ -11128,7 +11069,10 @@ impl Worker for FerriteWorker {
             // fall through to the regular chain in the proposer.
             let spec9_single_req_eligible: bool = phase9_speculative_chain
                 && num_reqs == 1
-                && prepared.req_inputs.first().map_or(false, |r| !r.spec_token_ids.is_empty())
+                && prepared
+                    .req_inputs
+                    .first()
+                    .is_some_and(|r| !r.spec_token_ids.is_empty())
                 && q_lens.first().copied().unwrap_or(0) >= 2;
             let spec9_k: usize = if spec9_single_req_eligible {
                 q_lens[0] - 1
@@ -11162,34 +11106,27 @@ impl Worker for FerriteWorker {
                     let fat: *const dyn ferrite_forward::FerriteWeights =
                         self.draft_model.as_deref().expect("checked above");
                     unsafe {
-                        std::mem::transmute::<
-                            *const dyn ferrite_forward::FerriteWeights,
-                            [usize; 2],
-                        >(fat)
+                        std::mem::transmute::<*const dyn ferrite_forward::FerriteWeights, [usize; 2]>(
+                            fat,
+                        )
                     }
                 };
-                let dkv_addr: usize =
-                    (self.draft_kv_cache.as_ref().expect("checked above")
-                        as *const KvCachePool) as usize;
+                let dkv_addr: usize = (self.draft_kv_cache.as_ref().expect("checked above")
+                    as *const KvCachePool) as usize;
                 // Spec-9: raw pointers for argmax + chain_advance
                 // kernels so the speculative chain can call
                 // `metal_chain_dispatch` from inside the thread
                 // (no `&self` access while target verify is in flight).
-                let spec9_argmax_addr: usize =
-                    self.argmax_kernels.as_ref().map_or(0, |k| {
-                        k as *const ferrite_metal_kernels::argmax::ArgmaxKernels
-                            as usize
-                    });
-                let spec9_chain_addr: usize =
-                    self.chain_advance_kernel.as_ref().map_or(0, |k| {
-                        k as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel
-                            as usize
-                    });
+                let spec9_argmax_addr: usize = self.argmax_kernels.as_ref().map_or(0, |k| {
+                    k as *const ferrite_metal_kernels::argmax::ArgmaxKernels as usize
+                });
+                let spec9_chain_addr: usize = self.chain_advance_kernel.as_ref().map_or(0, |k| {
+                    k as *const ferrite_metal_kernels::chain_advance::ChainAdvanceKernel as usize
+                });
                 let main_dev = self.gpu_device.as_ref().expect("init");
                 let mtl_device_clone = main_dev.device.clone();
                 let allocator_clone = main_dev.allocator.clone();
-                let draft_queue_clone =
-                    self.draft_queue.as_ref().expect("checked above").clone();
+                let draft_queue_clone = self.draft_queue.as_ref().expect("checked above").clone();
                 // Snapshot host slices the lockstep thread reads.
                 let lock_input_ids = &input_ids_u32;
                 let lock_positions = &positions_u32;
@@ -11216,8 +11153,9 @@ impl Worker for FerriteWorker {
                 let spec9_block_ids_thread = spec9_block_ids.clone();
                 let spec9_block_size_thread = spec9_block_size;
                 let spec9_block_table_stride_thread = lock_block_table_stride;
-                let (v, spec9_seeds_out, spec9_drafts_out): (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) = std::thread::scope(|s| {
-                    let lockstep_handle =
+                let (v, spec9_seeds_out, spec9_drafts_out): (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) =
+                    std::thread::scope(|s| {
+                        let lockstep_handle =
                         s.spawn(move || -> (Vec<u32>, Vec<Vec<u32>>) {
                         // Build shadow GpuDevice on draft_queue.
                         let mut shadow_device = GpuDevice {
@@ -11366,7 +11304,7 @@ impl Worker for FerriteWorker {
                             let slot = if block_idx
                                 < spec9_block_ids_thread.len()
                             {
-                                spec9_block_ids_thread[block_idx] as u32
+                                spec9_block_ids_thread[block_idx]
                                     * spec9_block_size_thread as u32
                                     + offset as u32
                             } else {
@@ -11420,59 +11358,52 @@ impl Worker for FerriteWorker {
                         (spec_seeds, spec_drafts)
                     });
 
-                    let r = self
-                        .forward_argmax_blocking(
-                            ModelHandle::TARGET,
-                            KvPoolHandle::TARGET,
-                            &req,
-                        )
-                        .map_err(|e| {
-                            ExecutorError::WorkerExecution(format!(
-                                "spec verify forward: {e}"
-                            ))
-                        });
-                    // join propagates any panic the lockstep thread
-                    // raised; treat as worker execution failure.
-                    let (spec_seeds, spec_drafts) = lockstep_handle
-                        .join()
-                        .expect("lockstep thread panicked");
-                    let target_argmax = r.unwrap_or_else(|_| Vec::new());
-                    if !spec_seeds.is_empty() && !target_argmax.is_empty() {
-                        // Probe: compare draft's predicted bonus
-                        // vs target's actual bonus (per req).
-                        // cu_seqlens_q[i+1]-1 is the last verify row.
-                        let cu = &lock_cu_seqlens;
-                        for i in 0..lock_num_reqs {
-                            let target_bonus_idx = cu[i + 1] as usize - 1;
-                            if target_bonus_idx < target_argmax.len() {
-                                let target_bonus = target_argmax[target_bonus_idx];
-                                let spec_seed = spec_seeds[i];
-                                eprintln!(
-                                    "[spec9-probe] req={} spec_seed={} \
+                        let r = self
+                            .forward_argmax_blocking(
+                                ModelHandle::TARGET,
+                                KvPoolHandle::TARGET,
+                                &req,
+                            )
+                            .map_err(|e| {
+                                ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
+                            });
+                        // join propagates any panic the lockstep thread
+                        // raised; treat as worker execution failure.
+                        let (spec_seeds, spec_drafts) =
+                            lockstep_handle.join().expect("lockstep thread panicked");
+                        let target_argmax = r.unwrap_or_else(|_| Vec::new());
+                        if !spec_seeds.is_empty() && !target_argmax.is_empty() {
+                            // Probe: compare draft's predicted bonus
+                            // vs target's actual bonus (per req).
+                            // cu_seqlens_q[i+1]-1 is the last verify row.
+                            let cu = &lock_cu_seqlens;
+                            for i in 0..lock_num_reqs {
+                                let target_bonus_idx = cu[i + 1] as usize - 1;
+                                if target_bonus_idx < target_argmax.len() {
+                                    let target_bonus = target_argmax[target_bonus_idx];
+                                    let spec_seed = spec_seeds[i];
+                                    eprintln!(
+                                        "[spec9-probe] req={} spec_seed={} \
                                      target_bonus={} match={}",
-                                    i,
-                                    spec_seed,
-                                    target_bonus,
-                                    spec_seed == target_bonus,
-                                );
+                                        i,
+                                        spec_seed,
+                                        target_bonus,
+                                        spec_seed == target_bonus,
+                                    );
+                                }
                             }
                         }
-                    }
-                    (target_argmax, spec_seeds, spec_drafts)
-                });
+                        (target_argmax, spec_seeds, spec_drafts)
+                    });
                 async_lockstep_done = true;
                 spec9_seeds_final = spec9_seeds_out;
                 spec9_drafts_final = spec9_drafts_out;
                 v
             } else {
-                self.forward_argmax_blocking(
-                    ModelHandle::TARGET,
-                    KvPoolHandle::TARGET,
-                    &req,
-                )
-                .map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
-                })?
+                self.forward_argmax_blocking(ModelHandle::TARGET, KvPoolHandle::TARGET, &req)
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("spec verify forward: {e}"))
+                    })?
             }
         };
         let total_n = argmax_vec.len() as u32;
@@ -11562,12 +11493,8 @@ impl Worker for FerriteWorker {
         // ── 7. Commit per-request state ─────────────────────────
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let q_len = q_lens[i];
-            self.input_batch.commit_step(
-                req_id,
-                &sampled_token_ids[i],
-                q_len,
-                was_spec_decode[i],
-            );
+            self.input_batch
+                .commit_step(req_id, &sampled_token_ids[i], q_len, was_spec_decode[i]);
         }
 
         Ok(ModelRunnerOutput {

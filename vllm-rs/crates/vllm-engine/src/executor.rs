@@ -310,9 +310,7 @@ pub trait Executor: Send {
     /// Default returns `None` — only single-worker executors that own
     /// a `FerriteWorker` (UniProcExecutor, ThreadPoolExecutor's driver
     /// shard) need to override.
-    fn spec_decode_backend(
-        &mut self,
-    ) -> Option<&mut dyn crate::spec_decode::SpecDecodeBackend> {
+    fn spec_decode_backend(&mut self) -> Option<&mut dyn crate::spec_decode::SpecDecodeBackend> {
         None
     }
 

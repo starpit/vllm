@@ -44,10 +44,7 @@ const STEEL_PAGED_HEAD_DIMS: &[u32] = &[64, 96, 128, 256];
 /// Activation dtypes the steel kernel is instantiated for. Tag is the
 /// Rust/symbol-side spelling; type is the MSL spelling used in the
 /// `INST_STEEL_PAGED` macro expansion.
-const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[
-    ("f16",  "half"),
-    ("bf16", "bfloat"),
-];
+const STEEL_PAGED_DTYPES: &[(&str, &str)] = &[("f16", "half"), ("bf16", "bfloat")];
 
 fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -137,11 +134,8 @@ fn write_steel_paged_instantiations_h(out_dir: &std::path::Path) {
             s.push_str(&format!("INST_STEEL_PAGED({tag}, {ty}, {bd})\n"));
         }
     }
-    std::fs::write(
-        out_dir.join("attention_steel_paged_instantiations.h"),
-        s,
-    )
-    .expect("write attention_steel_paged_instantiations.h");
+    std::fs::write(out_dir.join("attention_steel_paged_instantiations.h"), s)
+        .expect("write attention_steel_paged_instantiations.h");
 }
 
 /// Emit the Rust-side mirror: a slice of head-dims (for the runtime
@@ -177,19 +171,12 @@ fn write_steel_paged_kernels_rs(out_dir: &std::path::Path) {
     );
     for &bd in STEEL_PAGED_HEAD_DIMS {
         for &(tag, _ty) in STEEL_PAGED_DTYPES {
-            let sym = format!(
-                "attention_steel_paged_{tag}_bq32_bk16_bd{bd}_wm4_wn1_bs16"
-            );
-            s.push_str(&format!(
-                "        ({tag:?}, {bd}) => Some({sym:?}),\n"
-            ));
+            let sym = format!("attention_steel_paged_{tag}_bq32_bk16_bd{bd}_wm4_wn1_bs16");
+            s.push_str(&format!("        ({tag:?}, {bd}) => Some({sym:?}),\n"));
         }
     }
     s.push_str("        _ => None,\n    }\n}\n");
 
-    std::fs::write(
-        out_dir.join("steel_paged_kernels_generated.rs"),
-        s,
-    )
-    .expect("write steel_paged_kernels_generated.rs");
+    std::fs::write(out_dir.join("steel_paged_kernels_generated.rs"), s)
+        .expect("write steel_paged_kernels_generated.rs");
 }

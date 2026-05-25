@@ -464,7 +464,11 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let h = lit_u32(h);
             let i = lit_u32(i);
             let j = lit_u32(j);
-            let k = if k { quote! { true } } else { quote! { false } };
+            let k = if k {
+                quote! { true }
+            } else {
+                quote! { false }
+            };
             quote! { MetalSharedFusedMoe(#a, #b, #c, #d, #e, #f, #g, #h, #i, #j, #k) }
         }
         I::CutlassGemm(a, b, c, d, e, f, g, h) => {
@@ -2422,13 +2426,13 @@ pub fn colored_slot_map(
         for tile in sfuf.tiles_in_subgraph(sg) {
             let consumer_pos = tile_position[&tile];
             for input in &fuf.get(tile).inputs {
-                if let FufInput::Tile { id, slot } = input {
-                    if alias_to_owner.contains_key(&(*id, *slot)) {
-                        view_last_use
-                            .entry((*id, *slot))
-                            .and_modify(|p| *p = (*p).max(consumer_pos))
-                            .or_insert(consumer_pos);
-                    }
+                if let FufInput::Tile { id, slot } = input
+                    && alias_to_owner.contains_key(&(*id, *slot))
+                {
+                    view_last_use
+                        .entry((*id, *slot))
+                        .and_modify(|p| *p = (*p).max(consumer_pos))
+                        .or_insert(consumer_pos);
                 }
             }
         }
@@ -2782,7 +2786,6 @@ fn parse_u32_literal(ts: &TokenStream) -> Option<u32> {
     let s = s.strip_suffix("u32").unwrap_or(s);
     s.parse::<u32>().ok()
 }
-
 
 /// OpcodeShape for `Instruction::SynthPreAttn`. Must match the
 /// variant declared in `ferrite-forward::instr` field-for-field
@@ -4287,7 +4290,10 @@ mod tests {
     fn loop_detection_rejects_non_iter_field_drift() {
         let mut map = std::collections::HashMap::new();
         map.insert("RmsNorm".to_string(), 2usize);
-        let v = vec![Instruction::RmsNorm(0, 1, 0, 2048, 1), Instruction::RmsNorm(7, 1, 1, 2048, 1)];
+        let v = vec![
+            Instruction::RmsNorm(0, 1, 0, 2048, 1),
+            Instruction::RmsNorm(7, 1, 1, 2048, 1),
+        ];
         let r = detect_repeating_run(&v, &map);
         assert_eq!(r, None);
     }

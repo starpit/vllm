@@ -18,9 +18,7 @@ use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
 
 use ferrite_metal_kernels::instruction_executor::RecordingContext;
 
-use super::__re::{
-    ComputePipelineState, Device, MTL4ArgumentTableDescriptor, MTLDevice, MTLSize,
-};
+use super::__re::{ComputePipelineState, Device, MTL4ArgumentTableDescriptor, MTLDevice, MTLSize};
 use super::worker::BucketStep;
 
 /// MTL4 argument-table buffer-binding slot cap. The Metal runtime
@@ -129,9 +127,7 @@ pub fn bake_mtl4_steps(
                     }
                     let desc = MTL4ArgumentTableDescriptor::new();
                     desc.setMaxBufferBindCount(max_idx + 1);
-                    let table = device
-                        .newArgumentTableWithDescriptor_error(&desc)
-                        .ok()?;
+                    let table = device.newArgumentTableWithDescriptor_error(&desc).ok()?;
                     for (buf, off, idx) in cmd_bindings {
                         // GPU virtual address + caller-supplied byte
                         // offset; the MTL3 ICB path's
@@ -235,7 +231,9 @@ fn build_icb_for_step(
     };
     let _ = pipeline; // pipeline is set on the encoder before executeCommandsInBuffer.
     for (cmd_bindings, (tg, tpt)) in direct_bindings.iter().zip(direct_dispatch.iter()) {
-        let cmd = ctx.icb.indirect_compute_command_at(ctx.command_index as u64);
+        let cmd = ctx
+            .icb
+            .indirect_compute_command_at(ctx.command_index as u64);
         for (buf, off, idx) in cmd_bindings {
             let buf_ptr: *mut ::objc2::runtime::AnyObject =
                 Retained::as_ptr(buf) as *const ::objc2::runtime::AnyObject as *mut _;

@@ -35,25 +35,14 @@
 // `MAX_DIMS` is needed by the `Instruction::Reshape` variant which is
 // ungated, so this import stays at the module level.
 use ferrite_cuda_core::tensor::MAX_DIMS;
-// Layer types appear in `WeightAccessors` trait return types and the
-// cuda eval body's local bindings. Gated on `any(cuda, metal)`
-// because ferrite-kernels' own layer types only compile under one of
-// those features — without them, `ferrite_kernels::layers` is empty.
-// `Instruction` enum itself is ungated and references only `u32` /
-// scalar fields after the lift.
-#[cfg(any(feature = "cuda", feature = "metal"))]
-use ferrite_cuda_core::tensor::GpuTensor;
-#[cfg(feature = "metal")]
-use ferrite_kernels::layers::AffineQuantEmbedding;
-#[cfg(any(feature = "cuda", feature = "metal"))]
-use ferrite_kernels::layers::{
-    Bnb4bitLinear, Embedding, Fp8AnyLinear, LayerNorm, LinearLayer, MarlinLinear, RmsNorm,
-};
-#[cfg(any(feature = "cuda", feature = "metal"))]
-use ferrite_kernels::layers_moe::{
-    DeepSeekV2Fp8BlockMoELayer, DeepSeekV2GgmlMoELayer, DeepSeekV2MoELayer, FusedMoELayer,
-    SharedFusedMoELayer,
-};
+// `GpuTensor`, `AffineQuantEmbedding`, and the `ferrite_kernels` layer
+// structs are referenced exclusively through fully-qualified paths
+// (`::ferrite_cuda_core::tensor::GpuTensor`,
+// `::ferrite_kernels::layers::LinearLayer`, etc.) in the
+// `WeightAccessors` trait return types and the cuda eval body, so no
+// `use` import is needed here. The `Instruction` enum itself is ungated
+// and references only `u32` / scalar fields after the lift.
+//
 // Cuda-only imports (eval body, runtime entry points) — gated
 // individually below so the metal-feature / no-backend builds only
 // pull in the cross-backend pieces above.
@@ -264,10 +253,10 @@ pub trait CanonicalParams: WeightAccessors {
     /// `BackendCompat<Metal>` at compile time.
     const HAS_BIAS_ADD: bool = false;
 
-    /// True iff the arch's DSL emits `OpKind::Moe` (router softmax
-    /// + top-k + experts gather + SwitchGLU bundled into one tile).
-    /// MoE-on-Metal isn't landed yet — the router prereqs (softmax
-    /// + argpartition + take_along_axis) ported in
+    /// True iff the arch's DSL emits `OpKind::Moe` (router softmax,
+    /// top-k, experts gather, and SwitchGLU bundled into one tile).
+    /// MoE-on-Metal isn't landed yet — the router prereqs (softmax,
+    /// argpartition, take_along_axis) ported in
     /// `project_metal_moe_router_kernels`, but `gather_qmm_rhs` and
     /// the pure-ICB SwitchGLU decomposition
     /// (`project_metal_moe_switchglu`) are open. MoE arches block
@@ -1270,7 +1259,13 @@ impl Instruction {
                 }
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             }
-            Instruction::FusedAddRmsNorm(delta_slot, residual_slot, layer, _hidden_size, _m_multiplier) => unsafe {
+            Instruction::FusedAddRmsNorm(
+                delta_slot,
+                residual_slot,
+                layer,
+                _hidden_size,
+                _m_multiplier,
+            ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);

@@ -293,8 +293,8 @@ impl Implementation for MetalFusedMoeImpl {
         let top_k = bound_or_die(bounds, "num_experts_per_tok", "MetalFusedMoe") as u32;
         let moe_inter = read_moe_intermediate(bounds, "MetalFusedMoe") as u32;
         let hidden = bound_or_die(bounds, "hidden_size", "MetalFusedMoe") as u32;
-        let (group_size, bits) = affine_gs_bits(node)
-            .expect("MetalFusedMoe: matches() admitted a non-Affine MoE tile");
+        let (group_size, bits) =
+            affine_gs_bits(node).expect("MetalFusedMoe: matches() admitted a non-Affine MoE tile");
 
         Some(vec![ferrite_forward::Instruction::MetalFusedMoe(
             in_slot_idx,
@@ -445,17 +445,12 @@ impl Implementation for MetalSharedFusedMoeImpl {
             .get("shared_expert_intermediate_size")
             .copied()
             .unwrap_or(0) as u32;
-        let (group_size, bits) = affine_gs_bits(node).expect(
-            "MetalSharedFusedMoe: matches() admitted a non-Affine MoE tile",
-        );
+        let (group_size, bits) = affine_gs_bits(node)
+            .expect("MetalSharedFusedMoe: matches() admitted a non-Affine MoE tile");
         // norm_topk_prob is a Qwen3-MoE config knob. Older Qwen2-MoE
         // configs omit it; treat as false there. HF stores booleans
         // as 0/1 in the bounds u64 map.
-        let norm_topk_prob = bounds
-            .get("norm_topk_prob")
-            .copied()
-            .unwrap_or(0)
-            != 0;
+        let norm_topk_prob = bounds.get("norm_topk_prob").copied().unwrap_or(0) != 0;
 
         Some(vec![ferrite_forward::Instruction::MetalSharedFusedMoe(
             in_slot_idx,

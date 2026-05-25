@@ -6,15 +6,12 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use ferrite_metal_kernels::cpu_reference::{
-    affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16,
-};
+use ferrite_metal_kernels::cpu_reference::{affine_qmv_b4_bf16, affine_qmv_b4_bf16_s_bf16};
 use ferrite_metal_kernels::device::detect_device;
 use ferrite_metal_kernels::quantized::{DequantDtype, MetalAffineGatherQmv, ScaleDtype};
 use half::{bf16, f16};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice,
-    MTLResourceOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLResourceOptions,
 };
 
 fn buf_from_bytes(
@@ -41,7 +38,10 @@ fn zeros_buf(
         .expect("newBufferWithLength nil")
 }
 
-fn read_bf16(buf: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>, n: usize) -> Vec<bf16> {
+fn read_bf16(
+    buf: &objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLBuffer>>,
+    n: usize,
+) -> Vec<bf16> {
     let ptr = buf.contents().as_ptr() as *const bf16;
     unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
 }
@@ -92,24 +92,21 @@ fn affine_gather_qmv_bf16_mixtral_decode_fast() {
     // Indices: each token picks `top_k` distinct experts; choices
     // span the expert range.
     let indices: Vec<u32> = vec![
-        0, 5,  // token 0
-        2, 7,  // token 1
-        1, 4,  // token 2
+        0, 5, // token 0
+        2, 7, // token 1
+        1, 4, // token 2
     ];
 
     let mdev = detect_device().expect("device");
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_f16 = |s: &[f16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_f16 =
+        |s: &[f16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
 
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of_f16(&scales_f16));
@@ -218,15 +215,12 @@ fn affine_gather_qmv_bf16_generic() {
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_f16 = |s: &[f16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_f16 =
+        |s: &[f16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
 
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of_f16(&scales_f16));
@@ -306,10 +300,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
     // gate_proj shape (n_out=moe_intermediate, k=hidden) at a
     // group_size of 64 (Qwen3 mlx-affine-b4-g64).
     let num_experts = 8usize;
-    let n_out = 768usize;   // moe_intermediate (multiple of 8)
-    let k = 2048usize;       // hidden (multiple of 512)
+    let n_out = 768usize; // moe_intermediate (multiple of 8)
+    let k = 2048usize; // hidden (multiple of 512)
     let group_size = 64usize;
-    let top_k = 4usize;      // top-4 like Mixtral, fine for parity
+    let top_k = 4usize; // top-4 like Mixtral, fine for parity
     let num_tokens = 1usize; // M=1 decode
 
     let mut seed = 0xC0DE_BA5E_DEAD_BEEFu64;
@@ -339,12 +333,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
     let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
@@ -356,10 +348,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
     let enc = cmdbuf.computeCommandEncoder().expect("enc");
     executor
         .execute(
-            &x_buf, &w_buf, &s_buf, &b_buf, &idx_buf, &y_buf,
-            num_tokens as u32, top_k as u32, n_out as u32, k as u32,
-            group_size as u32, 4,
-            DequantDtype::Bf16, ScaleDtype::Bf16, &enc,
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
+            num_tokens as u32,
+            top_k as u32,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
         )
         .expect("execute");
     enc.endEncoding();
@@ -378,7 +381,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
                 &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
                 &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
                 &x_bf16[n * k..(n + 1) * k],
-                1, n_out, k, group_size,
+                1,
+                n_out,
+                k,
+                group_size,
             );
             let base = (n * top_k + slot) * n_out;
             // K=2048 inflates bf16 accumulation noise: stdev grows as
@@ -392,7 +398,9 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_decode_fast() {
                 let g = got[base + c].to_f32();
                 let w = want[c].to_f32();
                 let err = (g - w).abs();
-                if err > max_err { max_err = err; }
+                if err > max_err {
+                    max_err = err;
+                }
                 assert!(
                     err < allowed_abs || err / w.abs().max(1e-3) < allowed_rel,
                     "qwen3-shape n={n} slot={slot} expert={expert} c={c} got={g} want={w} err={err}",
@@ -446,12 +454,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
     let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
@@ -463,10 +469,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
     let enc = cmdbuf.computeCommandEncoder().expect("enc");
     executor
         .execute(
-            &x_buf, &w_buf, &s_buf, &b_buf, &idx_buf, &y_buf,
-            num_tokens as u32, top_k as u32, n_out as u32, k as u32,
-            group_size as u32, 4,
-            DequantDtype::Bf16, ScaleDtype::Bf16, &enc,
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
+            num_tokens as u32,
+            top_k as u32,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
         )
         .expect("execute");
     enc.endEncoding();
@@ -485,16 +502,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_shape() {
                 &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
                 &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
                 &x_bf16[n * k..(n + 1) * k],
-                1, n_out, k, group_size,
+                1,
+                n_out,
+                k,
+                group_size,
             );
             let base = (n * top_k + slot) * n_out;
-            let allowed_abs = 0.3_f32;  // K=768 with bf16 accumulation tolerance
+            let allowed_abs = 0.3_f32; // K=768 with bf16 accumulation tolerance
             let allowed_rel = 0.25_f32;
             for c in 0..n_out {
                 let g = got[base + c].to_f32();
                 let w = want[c].to_f32();
                 let err = (g - w).abs();
-                if err > max_err { max_err = err; }
+                if err > max_err {
+                    max_err = err;
+                }
                 assert!(
                     err < allowed_abs || err / w.abs().max(1e-3) < allowed_rel,
                     "down_proj_shape n={n} slot={slot} expert={expert} c={c} got={g} want={w} err={err}",
@@ -553,12 +575,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
     let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
@@ -573,12 +593,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
     // set to m_rows = T*top_k so total dispatched rows = m_rows.
     executor
         .execute(
-            &x_buf, &w_buf, &s_buf, &b_buf, &idx_buf, &y_buf,
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
             m_rows as u32, // num_tokens, but in workaround we pass T*top_k
             1u32,          // top_k_in_kernel = 1 (workaround)
-            n_out as u32, k as u32,
-            group_size as u32, 4,
-            DequantDtype::Bf16, ScaleDtype::Bf16, &enc,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
         )
         .expect("execute");
     enc.endEncoding();
@@ -596,7 +625,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
             &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
             &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
             &x_bf16[nk * k..(nk + 1) * k],
-            1, n_out, k, group_size,
+            1,
+            n_out,
+            k,
+            group_size,
         );
         let base = nk * n_out;
         let allowed_abs = 0.3_f32;
@@ -605,14 +637,19 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_top_k_1_workaround() {
             let g = got[base + c].to_f32();
             let w = want[c].to_f32();
             let err = (g - w).abs();
-            if err > max_err { max_err = err; }
+            if err > max_err {
+                max_err = err;
+            }
             assert!(
                 err < allowed_abs || err / w.abs().max(1e-3) < allowed_rel,
                 "top_k_1 nk={nk} expert={expert} c={c} got={g} want={w} err={err}",
             );
         }
     }
-    eprintln!("affine_gather_qmv top_k=1 workaround down_proj: max_err={:.3e}", max_err);
+    eprintln!(
+        "affine_gather_qmv top_k=1 workaround down_proj: max_err={:.3e}",
+        max_err
+    );
 }
 
 #[test]
@@ -670,12 +707,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
     let queue = mdev.device.newCommandQueue().expect("queue");
     let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
 
-    let bytes_of = |s: &[bf16]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2)
-    };
-    let bytes_of_u32 = |s: &[u32]| unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4)
-    };
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
     let w_buf = buf_from_bytes(&mdev.device, &packed);
     let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
     let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
@@ -687,12 +722,21 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
     let enc = cmdbuf.computeCommandEncoder().expect("enc");
     executor
         .execute(
-            &x_buf, &w_buf, &s_buf, &b_buf, &idx_buf, &y_buf,
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
             m_rows as u32, // num_tokens param == m_rows (workaround)
             1u32,          // top_k_in_kernel = 1 (workaround)
-            n_out as u32, k as u32,
-            group_size as u32, 4,
-            DequantDtype::Bf16, ScaleDtype::Bf16, &enc,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
         )
         .expect("execute");
     enc.endEncoding();
@@ -712,7 +756,10 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
             &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
             &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
             &x_bf16[nk * k..(nk + 1) * k],
-            1, n_out, k, group_size,
+            1,
+            n_out,
+            k,
+            group_size,
         );
         let base = nk * n_out;
         let allowed_abs = 0.3_f32;
@@ -722,8 +769,12 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
             let w = want[c].to_f32();
             let err = (g - w).abs();
             let rel = err / w.abs().max(1e-3);
-            if err > max_err { max_err = err; }
-            if rel > max_rel { max_rel = rel; }
+            if err > max_err {
+                max_err = err;
+            }
+            if rel > max_rel {
+                max_rel = rel;
+            }
             if err > allowed_abs && rel > allowed_rel {
                 fail_count += 1;
                 if fail_count < 8 {
@@ -738,5 +789,8 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
         "affine_gather_qmv production dispatch m_rows={m_rows}: max_err={max_err:.3e} \
          max_rel={max_rel:.3e} fail_count={fail_count}",
     );
-    assert_eq!(fail_count, 0, "production dispatch produced {fail_count} out-of-tolerance elements");
+    assert_eq!(
+        fail_count, 0,
+        "production dispatch produced {fail_count} out-of-tolerance elements"
+    );
 }

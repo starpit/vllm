@@ -32,21 +32,17 @@ pub struct SliceTrailingColsKernels {
 
 impl SliceTrailingColsKernels {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library = load_library_from_bytes(
-            device,
-            crate::embedded_metallib!("slice_trailing_cols"),
-        )
-        .map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!(
-                "load `slice_trailing_cols.metallib`: {e}"
-            ))
-        })?;
+        let library =
+            load_library_from_bytes(device, crate::embedded_metallib!("slice_trailing_cols"))
+                .map_err(|e| {
+                    MetalStreamError::ShaderCompilationFailed(format!(
+                        "load `slice_trailing_cols.metallib`: {e}"
+                    ))
+                })?;
         let ns = NSString::from_str("slice_trailing_cols_u32");
-        let func = library
-            .newFunctionWithName(&ns)
-            .ok_or_else(|| {
-                MetalStreamError::ShaderCompilationFailed("slice_trailing_cols_u32 fn missing".into())
-            })?;
+        let func = library.newFunctionWithName(&ns).ok_or_else(|| {
+            MetalStreamError::ShaderCompilationFailed("slice_trailing_cols_u32 fn missing".into())
+        })?;
         let pipeline = device
             .newComputePipelineStateWithFunction_error(&func)
             .map_err(|e| {
@@ -92,9 +88,9 @@ pub fn dispatch_slice_trailing_cols_u32(
 
     let axis = axis_size as i32;
     let k = top_k as i32;
-    let cmdbuf = queue.commandBuffer().ok_or_else(|| {
-        MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into())
-    })?;
+    let cmdbuf = queue
+        .commandBuffer()
+        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into()))?;
     let enc = cmdbuf.computeCommandEncoder().ok_or_else(|| {
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder nil".into())
     })?;

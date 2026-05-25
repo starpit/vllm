@@ -8,8 +8,6 @@
 
 use std::collections::BTreeMap;
 
-use quote::quote;
-
 use crate::classified::{ExternKind, Program};
 use crate::fuf::{Fuf, FufInput, TileId};
 use crate::impl_lib::{
@@ -164,7 +162,10 @@ impl Implementation for MetalAttentionImpl {
         // Attention reads the per-layer paged KV cache (the rope+
         // append upstream wrote it). All variants (paged decode,
         // paged prefill, sliding) read from `ExternKind::KvCache`.
-        (None, crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf))
+        (
+            None,
+            crate::impl_lib::kv_cache_extern_layer(claimed_tiles, fuf),
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -379,7 +380,10 @@ impl Implementation for MetalAttentionImpl {
                 // the FUF (`layer_rope_is_interleaved`) instead.
                 let interleaved = false;
                 Some(vec![ferrite_forward::Instruction::AttentionPrefillPaged(
-                    q_slot, out_slot, layer, interleaved,
+                    q_slot,
+                    out_slot,
+                    layer,
+                    interleaved,
                 )])
             }
             (true, false) => SlidingAttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),

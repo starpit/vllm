@@ -447,8 +447,7 @@ fn affine_qmv_fast_b4_bf16_unaligned_packed_offset_1_byte_prefix() {
         /*prefix_bytes=*/ 1,
     );
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmv_fast UNALIGNED packed offset (prefix=1, q_proj shape M=1 N=2048 K=2048 gs=64): \
@@ -476,8 +475,7 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_q_proj_shape() {
     let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmv_fast Llama-1B q_proj (M=1, N=2048, K=2048, gs=64): \
@@ -497,8 +495,7 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_kv_proj_shape() {
     let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmv_fast Llama-1B kv_proj (M=1, N=512, K=2048, gs=64): \
@@ -518,8 +515,7 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_gate_up_shape() {
     let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmv_fast Llama-1B gate/up_proj (M=1, N=8192, K=2048, gs=64): \
@@ -540,8 +536,7 @@ fn affine_qmv_fast_b4_bf16_llama_3_2_1b_down_proj_shape() {
     let expected = cpu_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size);
     let metal = run_qmv_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
 
-    let (idx, mv, ev, abs_err, allowed) =
-        worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
+    let (idx, mv, ev, abs_err, allowed) = worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
     assert!(
         abs_err <= allowed,
         "qmv_fast Llama-1B down_proj (M=1, N=2048, K=8192, gs=64): \
@@ -644,9 +639,20 @@ fn run_qmv_bf16_s_bf16(
     let cmd_buf = stream.get_command_buffer().expect("command buffer").clone();
     let encoder = cmd_buf.computeCommandEncoder().expect("encoder");
     qmv.execute(
-        &x_buf, &packed_buf, &scales_buf, &biases_buf, &y_buf,
-        m as u32, n as u32, k as u32, 1, group_size, 4,
-        DequantDtype::Bf16, ScaleDtype::Bf16, &encoder,
+        &x_buf,
+        &packed_buf,
+        &scales_buf,
+        &biases_buf,
+        &y_buf,
+        m as u32,
+        n as u32,
+        k as u32,
+        1,
+        group_size,
+        4,
+        DequantDtype::Bf16,
+        ScaleDtype::Bf16,
+        &encoder,
     )
     .expect("qmv dispatch");
     encoder.endEncoding();
@@ -664,10 +670,9 @@ fn affine_qmv_quad_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xC0DE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected =
-            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-                &packed, &scales, &biases, &x, m, n, k, group_size,
-            );
+        let expected = ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+            &packed, &scales, &biases, &x, m, n, k, group_size,
+        );
         let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
         let (idx, mv, ev, abs_err, allowed) =
             worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
@@ -687,10 +692,9 @@ fn affine_qmv_fast_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xBEEF_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected =
-            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-                &packed, &scales, &biases, &x, m, n, k, group_size,
-            );
+        let expected = ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+            &packed, &scales, &biases, &x, m, n, k, group_size,
+        );
         let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
         let (idx, mv, ev, abs_err, allowed) =
             worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);
@@ -710,10 +714,9 @@ fn affine_qmv_generic_b4_bf16_s_bf16_matches_cpu_reference() {
     for &group_size in &[32usize, 64, 128] {
         let (packed, scales, biases, x) =
             make_inputs_bf16_s_bf16(0xFACE_u64 ^ group_size as u64, n, k, m, group_size);
-        let expected =
-            ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
-                &packed, &scales, &biases, &x, m, n, k, group_size,
-            );
+        let expected = ferrite_metal_kernels::cpu_reference::affine_qmv_b4_bf16_s_bf16(
+            &packed, &scales, &biases, &x, m, n, k, group_size,
+        );
         let metal = run_qmv_bf16_s_bf16(&packed, &scales, &biases, &x, m, n, k, group_size as u32);
         let (idx, mv, ev, abs_err, allowed) =
             worst_abs_error_vs_noise_floor(&metal, &expected, k, 0.5);

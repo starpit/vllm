@@ -1057,7 +1057,9 @@ impl GpuWeights {
         // the on-disk view. (Metal has no precast.)
         #[cfg(feature = "cuda")]
         if let Some(entry) = self.take_precast(name) {
-            unsafe { driver::mem_free_host(entry.pinned_ptr).ok(); }
+            unsafe {
+                driver::mem_free_host(entry.pinned_ptr).ok();
+            }
         }
         let gpu_ptr = unsafe {
             self.allocator.alloc_and_copy_host_aligned(
@@ -1068,7 +1070,6 @@ impl GpuWeights {
         };
         Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, cpu_ref.dtype) })
     }
-
 
     /// Same as [`take`] but creates the returned `GpuTensor` with a
     /// caller-provided shape instead of the on-disk shape. The two

@@ -1174,10 +1174,7 @@ impl Instruction {
             #[cfg(feature = "metal")]
             Instruction::AffineEmbed(out_slot, _group_size, _bits) => (
                 "AffineEmbed",
-                vec![
-                    F::Slot(out_slot),
-                    F::LayerKind("AffineQuantEmbedding"),
-                ],
+                vec![F::Slot(out_slot), F::LayerKind("AffineQuantEmbedding")],
             ),
             Instruction::Loop(count, body_len) => {
                 ("Loop", vec![F::LoopCount(count), F::LoopBodyLen(body_len)])

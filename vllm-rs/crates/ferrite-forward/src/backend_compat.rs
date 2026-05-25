@@ -86,10 +86,9 @@ impl<W: CanonicalParams> BackendCompat<Metal> for W {
 
 impl<W: CanonicalParams> BackendCompat<Wgpu> for W {
     const COMPAT_CHECK: () = {
-        assert!(
-            false,
+        panic!(
             "BackendCompat<Wgpu>: no arches are wired to the WGPU backend yet. \
-             Land per-arch WGPU Impls before instantiating this constraint.",
+             Land per-arch WGPU Impls before instantiating this constraint."
         );
     };
 }

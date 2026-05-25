@@ -21,9 +21,7 @@
 //! size, and the visual inspection is trivial.
 
 use super::ids::{ArenaSlotIdx, LayerId};
-use super::lowered::{
-    Binding, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor,
-};
+use super::lowered::{Binding, RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor};
 
 // ── AttentionPrefillSdpaPaged (both sdpa_vector and steel variants) ─
 

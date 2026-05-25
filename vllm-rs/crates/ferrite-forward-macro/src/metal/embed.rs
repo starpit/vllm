@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use crate::classified::{OpKind, Program};
 use crate::fuf::{Fuf, TileId};
 use crate::impl_lib::{
-    CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo,
-    OpcodeShape, Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
+    CostCtx, EmbedRefImpl, Handoff, Implementation, LaunchKind, Layout, MatchInfo, OpcodeShape,
+    Resources, SlotMap, WeightAccessor, WorkloadConstraint, default_required_weights,
     weight_storage_of,
 };
 use crate::quantization::StorageFormat;

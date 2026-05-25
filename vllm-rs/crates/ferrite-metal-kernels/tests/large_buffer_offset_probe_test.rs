@@ -30,8 +30,8 @@ use std::ptr::NonNull;
 
 use ferrite_metal_kernels::device::detect_device;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
-    MTLCommandQueue, MTLDevice, MTLResourceOptions,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLDevice, MTLResourceOptions,
 };
 
 const GIB: usize = 1024 * 1024 * 1024;
@@ -44,7 +44,11 @@ fn shared_buffer_above_4_gib_offset_round_trip() {
     let queue = device.newCommandQueue().expect("newCommandQueue");
 
     let max_len = device.maxBufferLength() as usize;
-    eprintln!("device.maxBufferLength = {} bytes ({:.2} GiB)", max_len, max_len as f64 / GIB as f64);
+    eprintln!(
+        "device.maxBufferLength = {} bytes ({:.2} GiB)",
+        max_len,
+        max_len as f64 / GIB as f64
+    );
 
     let big_len: usize = 5 * GIB + 256 * 1024 * 1024; // 5.25 GiB
     if max_len < big_len {
@@ -189,8 +193,14 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
     if needs_create {
         eprintln!("creating {path} ({} bytes, this may take a moment)", len);
         let mut f = OpenOptions::new()
-            .create(true).write(true).truncate(true).open(path).unwrap();
-        let chunk: Vec<u8> = (0..(1024 * 1024)).map(|i| (i as u8) ^ ((i >> 8) as u8)).collect();
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        let chunk: Vec<u8> = (0..(1024 * 1024))
+            .map(|i| (i as u8) ^ ((i >> 8) as u8))
+            .collect();
         for off in (0..len).step_by(chunk.len()) {
             let remain = (len - off).min(chunk.len());
             f.write_all(&chunk[..remain]).unwrap();
@@ -207,7 +217,14 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
     let prot_read: i32 = 0x01;
     let map_private: i32 = 0x0002;
     let mmap_addr = unsafe {
-        let addr = mmap_libc(std::ptr::null_mut(), mmap_len, prot_read, map_private, fd, 0);
+        let addr = mmap_libc(
+            std::ptr::null_mut(),
+            mmap_len,
+            prot_read,
+            map_private,
+            fd,
+            0,
+        );
         assert!(addr as isize != -1, "mmap failed");
         addr as *const u8
     };
@@ -236,7 +253,11 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
     let dst = device
         .newBufferWithLength_options(dst_capacity, MTLResourceOptions::StorageModeShared)
         .expect("dst alloc");
-    eprintln!("dst length={} contents()={:p}", dst.length(), dst.contents().as_ptr());
+    eprintln!(
+        "dst length={} contents()={:p}",
+        dst.length(),
+        dst.contents().as_ptr()
+    );
 
     // Blit src[0..len] → dst[shift..shift+len], CHUNKED to ≤2 GiB
     // per call to dodge Apple's silent ~4 GiB blit-size cap on
@@ -249,7 +270,11 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
         let n = (mmap_len - copied).min(CHUNK);
         unsafe {
             blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &src_buffer, copied, &dst, shift + copied, n,
+                &src_buffer,
+                copied,
+                &dst,
+                shift + copied,
+                n,
             );
         }
         copied += n;
@@ -258,7 +283,10 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
     cmdbuf.commit();
     cmdbuf.waitUntilCompleted();
     let status = cmdbuf.status();
-    let err = cmdbuf.error().map(|e| format!("{:?}", e)).unwrap_or_else(|| "(no error)".into());
+    let err = cmdbuf
+        .error()
+        .map(|e| format!("{:?}", e))
+        .unwrap_or_else(|| "(no error)".into());
     eprintln!("blit cmdbuf status={:?} error={}", status, err);
 
     // Sample several offsets and compare CPU readbacks of dst to the
@@ -284,7 +312,9 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
             std::ptr::copy_nonoverlapping(dst_base.add(off + shift), dst_buf.as_mut_ptr(), 32);
         }
         let matches = file_buf == dst_buf;
-        if !matches { any_mismatch = true; }
+        if !matches {
+            any_mismatch = true;
+        }
         eprintln!(
             "  mmap_off=0x{:x} ({:.2} GiB) cpu_dst_matches_file={} file_first8={:02x?} dst_first8={:02x?}",
             off, off as f64 / GIB as f64, matches, &file_buf[..8], &dst_buf[..8]
@@ -300,7 +330,11 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
     for (i, &off) in mmap_offsets.iter().enumerate() {
         unsafe {
             blit2.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &dst, off + shift, &small, i * 64, 32,
+                &dst,
+                off + shift,
+                &small,
+                i * 64,
+                32,
             );
         }
     }
@@ -319,14 +353,19 @@ fn nocopy_source_blit_above_4_gib_round_trip() {
             std::ptr::copy_nonoverlapping(small_base.add(i * 64), small_buf.as_mut_ptr(), 32);
         }
         let matches = file_buf == small_buf;
-        if !matches { any_mismatch = true; }
+        if !matches {
+            any_mismatch = true;
+        }
         eprintln!(
             "  mmap_off=0x{:x} ({:.2} GiB) gpu_dst_matches_file={} file_first8={:02x?} gpu_first8={:02x?}",
             off, off as f64 / GIB as f64, matches, &file_buf[..8], &small_buf[..8]
         );
     }
 
-    assert!(!any_mismatch, "blit-from-NoCopy round trip failed at some offset");
+    assert!(
+        !any_mismatch,
+        "blit-from-NoCopy round trip failed at some offset"
+    );
 }
 
 // Raw mmap binding (avoids pulling in libc/memmap2 as dev-deps).

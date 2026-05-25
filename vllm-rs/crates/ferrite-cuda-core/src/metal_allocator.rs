@@ -3,7 +3,6 @@
 
 #![cfg(feature = "metal")]
 
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -308,13 +307,11 @@ impl MetalAllocator {
             return None;
         }
         // SAFETY: `base` points to at least 8 mapped bytes.
-        let header_size =
-            unsafe { std::ptr::read_unaligned(base as *const u64).to_le() } as usize;
+        let header_size = unsafe { std::ptr::read_unaligned(base as *const u64).to_le() } as usize;
         if header_size == 0 || header_size > len.saturating_sub(8) {
             return None;
         }
-        let header_bytes =
-            unsafe { std::slice::from_raw_parts(base.wrapping_add(8), header_size) };
+        let header_bytes = unsafe { std::slice::from_raw_parts(base.wrapping_add(8), header_size) };
         let json: serde_json::Value = serde_json::from_slice(header_bytes).ok()?;
         let obj = json.as_object()?;
         let data_section_start = 8 + header_size;
@@ -414,9 +411,8 @@ impl MetalAllocator {
         // re-open by path so each worker has its own fd (concurrent
         // `pread` on a shared fd on macOS appears to interleave reads
         // in practice — verified by bisect against sync-chunked).
-        std::fs::File::open(path).with_context(|| {
-            format!("MetalAllocator::register_mmap: open {}", path.display())
-        })?;
+        std::fs::File::open(path)
+            .with_context(|| format!("MetalAllocator::register_mmap: open {}", path.display()))?;
 
         // Wrap the aligned destination base as a Send/Sync usize for
         // closure capture. Each worker writes into a disjoint chunk
@@ -568,12 +564,7 @@ impl MetalAllocator {
     /// As [`aligned_mmap_offset`] but also bumps the histogram /
     /// classification counters and returns `Unaligned` vs `Outside`
     /// distinctly for the diagnostic log.
-    fn classify_mmap_offset(
-        &self,
-        src: *const u8,
-        bytes: usize,
-        min_align: usize,
-    ) -> MmapClassify {
+    fn classify_mmap_offset(&self, src: *const u8, bytes: usize, min_align: usize) -> MmapClassify {
         let p = src as usize;
         let end = p.saturating_add(bytes);
         let ready;
@@ -691,8 +682,7 @@ impl MetalAllocator {
         // bound there would hit the same unaligned-binding UB we
         // gate against on the mmap-alias path. Wastes at most 15
         // bytes per allocation; negligible against tensor sizes.
-        let aligned_bytes =
-            bytes.div_ceil(Self::MIN_BIND_ALIGN) * Self::MIN_BIND_ALIGN;
+        let aligned_bytes = bytes.div_ceil(Self::MIN_BIND_ALIGN) * Self::MIN_BIND_ALIGN;
         let idx = if let Some(idx) = arenas
             .iter()
             .rposition(|a| a.capacity - a.used >= aligned_bytes)
@@ -724,9 +714,7 @@ impl MetalAllocator {
 
 impl DeviceAllocator for MetalAllocator {
     unsafe fn alloc_and_copy_host(&mut self, src_host: *const u8, bytes: usize) -> Result<*mut u8> {
-        unsafe {
-            self.alloc_and_copy_host_aligned(src_host, bytes, Self::MIN_BIND_ALIGN)
-        }
+        unsafe { self.alloc_and_copy_host_aligned(src_host, bytes, Self::MIN_BIND_ALIGN) }
     }
 
     unsafe fn alloc_and_copy_host_aligned(
@@ -751,7 +739,7 @@ impl DeviceAllocator for MetalAllocator {
         // RMSNorm-gain tensors take this path — those kernel bindings
         // read scalar (`sl[0]`, `weight[i]`) and 2-byte alignment is
         // safe.
-        let effective_min_align = min_align.min(Self::MIN_BIND_ALIGN).max(1);
+        let effective_min_align = min_align.clamp(1, Self::MIN_BIND_ALIGN);
         if bytes > 0 {
             match self.classify_mmap_offset(src_host, bytes, effective_min_align) {
                 MmapClassify::Aligned { aligned_ptr } => {
@@ -770,8 +758,8 @@ impl DeviceAllocator for MetalAllocator {
                     // canonical-layout tensor passes the strict gate
                     // already).
                     if effective_min_align < Self::MIN_BIND_ALIGN {
-                        let strict = self
-                            .aligned_mmap_offset(src_host, bytes, Self::MIN_BIND_ALIGN);
+                        let strict =
+                            self.aligned_mmap_offset(src_host, bytes, Self::MIN_BIND_ALIGN);
                         if strict.is_none() {
                             self.load_stats
                                 .zero_copy_relaxed_calls
@@ -841,9 +829,7 @@ impl DeviceAllocator for MetalAllocator {
         let dst = unsafe { arena.base.add(offset) };
         unsafe { std::ptr::copy_nonoverlapping(src_host, dst, bytes) };
         arena.used = offset + aligned_bytes;
-        self.load_stats
-            .memcpy_calls
-            .fetch_add(1, Ordering::Relaxed);
+        self.load_stats.memcpy_calls.fetch_add(1, Ordering::Relaxed);
         self.load_stats
             .memcpy_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -887,8 +873,8 @@ mod tests {
         // `used_bytes` reports the padded request (rounded up to
         // `MIN_BIND_ALIGN` so the *next* allocation lands at an
         // aligned offset). 12 bytes round up to 16.
-        let expected_used = src.len().div_ceil(MetalAllocator::MIN_BIND_ALIGN)
-            * MetalAllocator::MIN_BIND_ALIGN;
+        let expected_used =
+            src.len().div_ceil(MetalAllocator::MIN_BIND_ALIGN) * MetalAllocator::MIN_BIND_ALIGN;
         assert_eq!(alloc.used_bytes(), expected_used);
         assert_eq!(alloc.arena_count(), 1);
 

@@ -327,8 +327,10 @@ impl DispatchTimingState {
         use super::__re::{MTL4CounterHeapDescriptor, MTL4CounterHeapType};
         let desc = MTL4CounterHeapDescriptor::new();
         desc.setType(MTL4CounterHeapType::Timestamp);
-        unsafe { desc.setCount(count); }
-        let heap = unsafe { device.newCounterHeapWithDescriptor_error(&desc).ok()? };
+        unsafe {
+            desc.setCount(count);
+        }
+        let heap = device.newCounterHeapWithDescriptor_error(&desc).ok()?;
 
         // Calibrate GPU-tick → ns. `sampleTimestamps:gpuTimestamp:`
         // writes a synchronized pair: CPU timestamp in
@@ -365,9 +367,7 @@ impl DispatchTimingState {
             heap,
             heap_capacity: count,
             pipeline_ptr: std::cell::RefCell::new(vec![0usize; count]),
-            pipeline_kernel: std::cell::RefCell::new(
-                vec![super::lowered::KernelId::Embed; count],
-            ),
+            pipeline_kernel: std::cell::RefCell::new(vec![super::lowered::KernelId::Embed; count]),
             dispatch_shape: std::cell::RefCell::new(vec![(0u32, 0u32, 0u32); count]),
             dispatch_count: std::cell::Cell::new(0),
             ns_per_gpu_tick,
@@ -381,8 +381,7 @@ impl DispatchTimingState {
         kernel: super::lowered::KernelId,
         tg: (u32, u32, u32),
     ) {
-        let ptr =
-            ::objc2::rc::Retained::as_ptr(pipeline) as *const () as usize;
+        let ptr = ::objc2::rc::Retained::as_ptr(pipeline) as *const () as usize;
         if let Some(slot) = self.pipeline_ptr.borrow_mut().get_mut(idx) {
             *slot = ptr;
         }
@@ -399,14 +398,18 @@ impl DispatchTimingState {
     }
 
     fn resolve_and_print(&self, bucket_idx: usize, num_tokens: usize, _device: &Device) {
-        use objc2::AnyThread;
         use objc2_foundation::{NSData, NSRange};
         use objc2_metal::MTL4CounterHeap as _;
         let n = self.dispatch_count.get();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
         // Resolve [0, n+1) — n+1 timestamps for n dispatches.
         let data: Option<::objc2::rc::Retained<NSData>> = unsafe {
-            self.heap.resolveCounterRange(NSRange { location: 0, length: n + 1 })
+            self.heap.resolveCounterRange(NSRange {
+                location: 0,
+                length: n + 1,
+            })
         };
         let Some(data) = data else {
             eprintln!("[dispatch-timing] resolveCounterRange returned nil");
@@ -414,9 +417,8 @@ impl DispatchTimingState {
         };
         let raw: &[u8] = unsafe { data.as_bytes_unchecked() };
         let n_u64 = raw.len() / 8;
-        let bytes: &[u64] = unsafe {
-            std::slice::from_raw_parts(raw.as_ptr() as *const u64, n_u64)
-        };
+        let bytes: &[u64] =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u64, n_u64) };
         eprintln!(
             "\n[dispatch-timing bucket={} num_tokens={}] {} dispatches",
             bucket_idx, num_tokens, n
@@ -472,8 +474,12 @@ impl DispatchTimingState {
                 let pid = labels[i];
                 let kid = kernels[i];
                 let (tgx, tgy, tgz) = dispatch_shapes[i];
-                let prev_pid = if i > 0 { labels[i-1] } else { 0 };
-                let switch = if i > 0 && pid != prev_pid { "*SW*" } else { "    " };
+                let prev_pid = if i > 0 { labels[i - 1] } else { 0 };
+                let switch = if i > 0 && pid != prev_pid {
+                    "*SW*"
+                } else {
+                    "    "
+                };
                 eprintln!(
                     "      [{:>3}] {} {:?}  pipe=0x{:016x}  tg=({:>3},{:>3},{:>2})  dt={:>10.3} µs",
                     i, switch, kid, pid, tgx, tgy, tgz, dt_us
@@ -609,9 +615,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // hand-written shader. NOT `newLibraryWithSource`.
         for (name, bytes) in W::synthesized_kernel_metallibs() {
             cache.register_metallib_library(name, bytes).map_err(|e| {
-                PoolBuildError::PipelineCacheBuild(format!(
-                    "synthesized kernel `{name}`: {e:?}"
-                ))
+                PoolBuildError::PipelineCacheBuild(format!("synthesized kernel `{name}`: {e:?}"))
             })?;
         }
         let pipelines = Arc::new(SpecializedPipelines::new(Arc::new(cache)));
@@ -622,8 +626,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // we're on an uncalibrated chip — `detect_device` returns
         // the populated profile for M4 + M1 Max and an empty-cost
         // table for everything else.
-        let target_profile =
-            ferrite_metal_kernels::detect_device().map(|d| d.profile);
+        let target_profile = ferrite_metal_kernels::detect_device().map(|d| d.profile);
         let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let tape = lower_pair::<W>(
@@ -903,28 +906,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         Ok(())
     }
 
-    fn run_bucket_mtl4(
-        &self,
-        worker: &MetalWorker<W>,
-        bucket_idx: usize,
-        num_tokens: usize,
-        num_seqs: u32,
-        has_spec_tokens: bool,
-    ) -> Result<(), ForwardError> {
-        self.run_bucket_mtl4_with_tail::<fn(
-            &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
-            &MetalWorker<W>,
-            usize,
-        ) -> Result<(), ForwardError>>(
-            worker,
-            bucket_idx,
-            num_tokens,
-            num_seqs,
-            has_spec_tokens,
-            None,
-        )
-    }
-
     /// MTL4 forward dispatch + optional encoder-tail hook.
     ///
     /// When `tail = Some(f)`, after the worker has encoded the bucket's
@@ -1021,9 +1002,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             (val, qc, ec)
         };
         let encoded = t_pre.elapsed();
-        let cb_protocol: &::objc2::runtime::ProtocolObject<
-            dyn ::objc2_metal::MTL4CommandBuffer,
-        > = &cb;
+        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
+            &cb;
         let cb_nn = NonNull::from(cb_protocol);
         let mut cb_array = [cb_nn];
         unsafe {
@@ -1031,16 +1011,17 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         // Signal AFTER the cmdbuf so the wait fires only once GPU work
         // is fully drained.
-        queue_clone.signalEvent_value(::objc2::runtime::ProtocolObject::from_ref(&*event_clone), signal_value);
+        queue_clone.signalEvent_value(
+            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
+            signal_value,
+        );
         let committed = t_pre.elapsed();
         // 60s timeout — same order of magnitude as the longest single
         // bucket we'd ever expect; any wait approaching this is a
         // hang and we'd rather panic than spin forever.
         let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
         if !ok {
-            return Err(ForwardError::ExecutionFailed(
-                MTLCommandBufferStatus::Error,
-            ));
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
         // Reset the allocator now that the GPU is done. Holds the
         // mutex briefly.
@@ -1153,9 +1134,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let body_result = body_result?;
 
         let encoded = t_pre.elapsed();
-        let cb_protocol: &::objc2::runtime::ProtocolObject<
-            dyn ::objc2_metal::MTL4CommandBuffer,
-        > = &cb;
+        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
+            &cb;
         let cb_nn = NonNull::from(cb_protocol);
         let mut cb_array = [cb_nn];
         unsafe {
@@ -1168,9 +1148,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let committed = t_pre.elapsed();
         let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
         if !ok {
-            return Err(ForwardError::ExecutionFailed(
-                MTLCommandBufferStatus::Error,
-            ));
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
         {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");

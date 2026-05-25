@@ -16,11 +16,11 @@
 pub mod error;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod ferrite_worker;
-#[cfg(feature = "metal")]
-pub mod metal_info;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod gpu_worker_base;
 pub mod input_batch;
+#[cfg(feature = "metal")]
+pub mod metal_info;
 #[cfg(feature = "nccl")]
 pub mod multinode;
 pub mod parallel;

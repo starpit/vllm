@@ -491,9 +491,7 @@ pub fn qmv_kernel_name(
     let batch = if batched { 1 } else { 0 };
     match kernel {
         QmvKernel::Quad { d } => {
-            format!(
-                "affine_qmv_quad_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_d_{d}_batch_{batch}",
-            )
+            format!("affine_qmv_quad_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_d_{d}_batch_{batch}",)
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype}_s_{sdt}_gs_{group_size}_b_{bits}_batch_{batch}",)
@@ -528,7 +526,9 @@ pub fn qmv_kernel_static_name(
     let key = (kernel, dtype, scale_dtype, group_size);
     use std::collections::HashMap;
     use std::sync::OnceLock;
-    static CACHE: OnceLock<std::sync::Mutex<HashMap<(QmvKernel, DequantDtype, ScaleDtype, u32), &'static str>>> = OnceLock::new();
+    static CACHE: OnceLock<
+        std::sync::Mutex<HashMap<(QmvKernel, DequantDtype, ScaleDtype, u32), &'static str>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache.lock().expect("qmv_kernel_static_name cache poisoned");
     if let Some(&v) = guard.get(&key) {
@@ -618,8 +618,21 @@ impl MetalAffineQmv {
     ) -> Result<(), MetalStreamError> {
         let kernel = pick_qmv_kernel(n, k, bits);
         self.execute_with_kernel(
-            kernel, x, packed_w, scales, biases, y, m, n, k, b, group_size, bits, dtype,
-            scale_dtype, encoder,
+            kernel,
+            x,
+            packed_w,
+            scales,
+            biases,
+            y,
+            m,
+            n,
+            k,
+            b,
+            group_size,
+            bits,
+            dtype,
+            scale_dtype,
+            encoder,
         )
     }
 
@@ -961,7 +974,14 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 /// specialized QuantizedBlockLoader path (different scale-indexing
 /// semantics) which we haven't ported. gs=32 quants fall through to
 /// the Standard qmm_t kernel instead.
-pub fn pick_qmm_t_kernel(m: u32, n: u32, k: u32, b: u32, group_size: u32, is_nax: bool) -> QmmTKernel {
+pub fn pick_qmm_t_kernel(
+    m: u32,
+    n: u32,
+    k: u32,
+    b: u32,
+    group_size: u32,
+    is_nax: bool,
+) -> QmmTKernel {
     if is_nax && k.is_multiple_of(64) && group_size != 32 {
         return QmmTKernel::Nax;
     }
@@ -1068,7 +1088,9 @@ pub fn qmm_t_kernel_static_name(
     );
     static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("qmm_t_kernel_static_name cache poisoned");
+    let mut guard = cache
+        .lock()
+        .expect("qmm_t_kernel_static_name cache poisoned");
     if let Some(&v) = guard.get(&key) {
         return v;
     }
@@ -1107,26 +1129,67 @@ pub fn qmm_t_kernel_static_name_with_compute(
     aligned_n: bool,
 ) -> &'static str {
     if compute_dtype == act_dtype {
-        return qmm_t_kernel_static_name(kernel, act_dtype, scale_dtype, bits, group_size, aligned_n);
+        return qmm_t_kernel_static_name(
+            kernel,
+            act_dtype,
+            scale_dtype,
+            bits,
+            group_size,
+            aligned_n,
+        );
     }
-    debug_assert_eq!(bits, 4, "qmm_t_kernel_static_name_with_compute: only bits=4");
+    debug_assert_eq!(
+        bits, 4,
+        "qmm_t_kernel_static_name_with_compute: only bits=4"
+    );
     use DequantDtype::*;
     use ScaleDtype as S;
-    match (kernel, act_dtype, compute_dtype, scale_dtype, group_size, aligned_n) {
+    match (
+        kernel,
+        act_dtype,
+        compute_dtype,
+        scale_dtype,
+        group_size,
+        aligned_n,
+    ) {
         // ── qmm_t Standard, bf16-act + f16-compute ───────────────
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, true)   => "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_true_batch_0",
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, false)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_false_batch_0",
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, true)   => "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_true_batch_0",
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, false)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_false_batch_0",
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, true)  => "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_true_batch_0",
-        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, false) => "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_false_batch_0",
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, true) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_true_batch_0"
+        }
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 32, false) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_32_b_4_alN_false_batch_0"
+        }
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, true) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_true_batch_0"
+        }
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 64, false) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_64_b_4_alN_false_batch_0"
+        }
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, true) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_true_batch_0"
+        }
+        (QmmTKernel::Standard, Bf16, F16, S::F16, 128, false) => {
+            "affine_qmm_t_bf16_c_f16_s_f16_gs_128_b_4_alN_false_batch_0"
+        }
         // ── qmm_t SplitK, bf16-act + f16-compute ─────────────────
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, true)   => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, false)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, true)   => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, false)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_false",
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, true)  => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_true",
-        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, false) => "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_false",
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, true) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 32, false) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_32_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, true) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 64, false) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_64_b_4_alN_false"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, true) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_true"
+        }
+        (QmmTKernel::SplitK { .. }, Bf16, F16, S::F16, 128, false) => {
+            "affine_qmm_t_splitk_bf16_c_f16_s_f16_gs_128_b_4_alN_false"
+        }
         // NAX path: don't override compute dtype — Apple9 has hardware
         // bf16 acceleration via the matrix unit, no fast-path needed.
         (QmmTKernel::Nax, _, _, _, _, _) => panic!(
@@ -1221,9 +1284,21 @@ impl MetalAffineQmmT {
 
         let kernel = pick_qmm_t_kernel(m, n, k, b, group_size, /*is_nax=*/ false);
         self.execute_with_kernel(
-            x, packed_w, scales, biases, y,
-            m, n, k, b, group_size, bits,
-            dtype, scale_dtype, kernel, encoder,
+            x,
+            packed_w,
+            scales,
+            biases,
+            y,
+            m,
+            n,
+            k,
+            b,
+            group_size,
+            bits,
+            dtype,
+            scale_dtype,
+            kernel,
+            encoder,
         )
     }
 
@@ -1253,7 +1328,8 @@ impl MetalAffineQmmT {
             QmmTKernel::Nax => n.is_multiple_of(64),
             _ => n.is_multiple_of(32),
         };
-        let kernel_name = qmm_t_kernel_name(kernel, dtype, scale_dtype, group_size, bits, aligned_n);
+        let kernel_name =
+            qmm_t_kernel_name(kernel, dtype, scale_dtype, group_size, bits, aligned_n);
         // K / N / M (and `k_partition_size` for splitk) ride as
         // function constants 0/1/2 (and 3) in `quantized_qmm.metal`
         // — see the `QMM_K` / `QMM_N` / `QMM_M` /
@@ -1462,7 +1538,9 @@ pub fn qmm_n_kernel_static_name(
     type Key = (DequantDtype, ScaleDtype, u32);
     static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().expect("qmm_n_kernel_static_name cache poisoned");
+    let mut guard = cache
+        .lock()
+        .expect("qmm_n_kernel_static_name cache poisoned");
     let key = (dtype, scale_dtype, group_size);
     if let Some(&v) = guard.get(&key) {
         return v;
@@ -1926,11 +2004,25 @@ mod tests {
         // Decoded against the actual exported symbols in
         // shaders/quantized_qmv.metal's INST_QMV_* macros.
         assert_eq!(
-            qmv_kernel_name(QmvKernel::Fast, DequantDtype::Bf16, ScaleDtype::F16, 64, 4, false),
+            qmv_kernel_name(
+                QmvKernel::Fast,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                64,
+                4,
+                false
+            ),
             "affine_qmv_fast_bf16_s_f16_gs_64_b_4_batch_0"
         );
         assert_eq!(
-            qmv_kernel_name(QmvKernel::Generic, DequantDtype::F16, ScaleDtype::F16, 32, 4, true),
+            qmv_kernel_name(
+                QmvKernel::Generic,
+                DequantDtype::F16,
+                ScaleDtype::F16,
+                32,
+                4,
+                true
+            ),
             "affine_qmv_f16_s_f16_gs_32_b_4_batch_1"
         );
         assert_eq!(
@@ -1986,11 +2078,25 @@ mod tests {
     #[test]
     fn qmm_t_kernel_name_matches_metallib_symbols() {
         assert_eq!(
-            qmm_t_kernel_name(QmmTKernel::Standard, DequantDtype::Bf16, ScaleDtype::F16, 64, 4, true),
+            qmm_t_kernel_name(
+                QmmTKernel::Standard,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                64,
+                4,
+                true
+            ),
             "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_true_batch_0"
         );
         assert_eq!(
-            qmm_t_kernel_name(QmmTKernel::Standard, DequantDtype::F16, ScaleDtype::F16, 32, 4, false),
+            qmm_t_kernel_name(
+                QmmTKernel::Standard,
+                DequantDtype::F16,
+                ScaleDtype::F16,
+                32,
+                4,
+                false
+            ),
             "affine_qmm_t_f16_s_f16_gs_32_b_4_alN_false_batch_0"
         );
         assert_eq!(
@@ -2095,7 +2201,13 @@ mod tests {
     #[test]
     fn qvm_kernel_name_matches_metallib_symbols() {
         assert_eq!(
-            qvm_kernel_name(QvmKernel::Standard, DequantDtype::Bf16, ScaleDtype::F16, 64, 4),
+            qvm_kernel_name(
+                QvmKernel::Standard,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                64,
+                4
+            ),
             "affine_qvm_bf16_s_f16_gs_64_b_4_batch_0"
         );
         assert_eq!(

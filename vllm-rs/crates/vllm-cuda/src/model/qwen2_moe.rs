@@ -347,7 +347,7 @@ impl Qwen2MoeDecoderLayer {
         let w1 = unsafe { GpuTensor::new(w1_ptr, &[num_experts, 2 * ipp, hidden], dtype) };
         let w2 = unsafe { GpuTensor::new(w2_ptr, &[num_experts, hidden, ipp], dtype) };
 
-        let moe = FusedMoELayer::Dense(DenseFusedMoELayer {
+        let moe = FusedMoELayer::Dense(Box::new(DenseFusedMoELayer {
             gate,
             w1,
             w2,
@@ -362,7 +362,7 @@ impl Qwen2MoeDecoderLayer {
             routed_scaling_factor: 1.0,
             #[cfg(feature = "nccl")]
             tp_group: None,
-        });
+        }));
 
         // Shared expert.
         let shared_inter = config.shared_expert_intermediate_size;

@@ -31,8 +31,7 @@ use crate::{CanonicalParams, Instruction};
 use ferrite_metal_kernels::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
     qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
-    qmv_dispatch_shape, qmv_kernel_static_name,
-    splitk_reduce_kernel_static_name,
+    qmv_dispatch_shape, qmv_kernel_static_name, splitk_reduce_kernel_static_name,
 };
 use ferrite_metal_kernels::specialized_pipeline_cache::ConstantValue;
 
@@ -57,6 +56,7 @@ use super::lowered::{
 /// strictly inside one half), but if one ever shows up the malformed-
 /// loop check fires inside the offending half and surfaces the
 /// per-half index.
+#[allow(clippy::too_many_arguments)]
 pub fn lower_pair<W: CanonicalParams>(
     backbone: &[Instruction],
     lm_head: &[Instruction],
@@ -68,8 +68,22 @@ pub fn lower_pair<W: CanonicalParams>(
     lm_head_tape_index: u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
 ) -> Result<LoweredMetalTape, LoweringError> {
-    let bb = lower::<W>(backbone, backbone_barriers, bucket_m, num_arena_slots, backbone_tape_index, profile)?;
-    let lh = lower::<W>(lm_head, lm_head_barriers, bucket_m, num_arena_slots, lm_head_tape_index, profile)?;
+    let bb = lower::<W>(
+        backbone,
+        backbone_barriers,
+        bucket_m,
+        num_arena_slots,
+        backbone_tape_index,
+        profile,
+    )?;
+    let lh = lower::<W>(
+        lm_head,
+        lm_head_barriers,
+        bucket_m,
+        num_arena_slots,
+        lm_head_tape_index,
+        profile,
+    )?;
     let mut commands = bb.commands;
     let mut barrier_before = bb.barrier_before;
     // Backbone commands are never gated — fill with `None` to match
@@ -123,52 +137,49 @@ pub fn lower_pair<W: CanonicalParams>(
         std::env::var("FERRITE_METAL_LMHEAD_SLICE").ok().as_deref(),
         Some("0") | Some("off") | Some("false"),
     );
-    let slice_info = if !slice_disabled
-        && bucket_m > 1
-        && lm_head.len() == 1
-        && lh.commands.len() == 1
-    {
-        if let Instruction::AffineQmm(
-            in_slot,
-            out_slot,
-            layer,
-            n,
-            k,
-            group_size,
-            bits,
-            _vector_limit,
-        ) = &lm_head[0]
-        {
-            if matches!(
-                lh.commands[0].kernel,
-                KernelId::AffineQmmT | KernelId::AffineQmmTNax
-            ) {
-                Some(LmHeadSliceInfo {
-                    in_slot: *in_slot,
-                    out_slot: *out_slot,
-                    layer: *layer,
-                    // The lm_head AffineQmm is the LAST instruction in
-                    // the lm_head slice (lm_head.len() == 1 here), so
-                    // its op_idx is 0 inside the lm_head tape.
-                    locator: WeightLocator {
-                        bucket: lm_head_tape_index,
-                        op_idx: 0,
-                        slot: 0,
-                    },
-                    n: *n,
-                    k: *k,
-                    group_size: *group_size,
-                    bits: *bits,
-                })
+    let slice_info =
+        if !slice_disabled && bucket_m > 1 && lm_head.len() == 1 && lh.commands.len() == 1 {
+            if let Instruction::AffineQmm(
+                in_slot,
+                out_slot,
+                layer,
+                n,
+                k,
+                group_size,
+                bits,
+                _vector_limit,
+            ) = &lm_head[0]
+            {
+                if matches!(
+                    lh.commands[0].kernel,
+                    KernelId::AffineQmmT | KernelId::AffineQmmTNax
+                ) {
+                    Some(LmHeadSliceInfo {
+                        in_slot: *in_slot,
+                        out_slot: *out_slot,
+                        layer: *layer,
+                        // The lm_head AffineQmm is the LAST instruction in
+                        // the lm_head slice (lm_head.len() == 1 here), so
+                        // its op_idx is 0 inside the lm_head tape.
+                        locator: WeightLocator {
+                            bucket: lm_head_tape_index,
+                            op_idx: 0,
+                            slot: 0,
+                        },
+                        n: *n,
+                        k: *k,
+                        group_size: *group_size,
+                        bits: *bits,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     use crate::interpreter::metal::lowered::RuntimeGate;
     if let Some(info) = slice_info {
@@ -188,7 +199,10 @@ pub fn lower_pair<W: CanonicalParams>(
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
         runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
         // Post-GEMM scatter: row num_tokens-1 of output := row 0.
-        commands.push(scatter_first_to_last_row_command::<W>(info.out_slot, info.n));
+        commands.push(scatter_first_to_last_row_command::<W>(
+            info.out_slot,
+            info.n,
+        ));
         barrier_before.push(true);
         runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
 
@@ -308,10 +322,7 @@ fn lm_head_qmv_command<W: CanonicalParams>(
     }
 }
 
-fn gather_last_token_command<W: CanonicalParams>(
-    slot: u32,
-    hidden_size: u32,
-) -> LoweredCommand {
+fn gather_last_token_command<W: CanonicalParams>(slot: u32, hidden_size: u32) -> LoweredCommand {
     sample_slice_command::<W>(
         slot,
         hidden_size,
@@ -446,23 +457,28 @@ pub fn lower<W: CanonicalParams>(
                         commands.extend(cmds);
                         if n_cmds >= 1 {
                             barrier_before.push(flag_for(body_start + offset));
-                            for _ in 1..n_cmds {
-                                barrier_before.push(true);
-                            }
+                            barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
                         }
                     }
                 }
                 i = body_end;
             }
             other => {
-                let cmds = lower_one::<W>(other, i, bucket_m, 0, tape_index, &mut splitk_scratch_bytes, &mut moe_scratch_bytes, profile)?;
+                let cmds = lower_one::<W>(
+                    other,
+                    i,
+                    bucket_m,
+                    0,
+                    tape_index,
+                    &mut splitk_scratch_bytes,
+                    &mut moe_scratch_bytes,
+                    profile,
+                )?;
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
                     barrier_before.push(flag_for(i));
-                    for _ in 1..n_cmds {
-                        barrier_before.push(true);
-                    }
+                    barrier_before.extend(std::iter::repeat_n(true, n_cmds - 1));
                 }
                 i += 1;
             }
@@ -510,6 +526,7 @@ pub fn lower<W: CanonicalParams>(
 /// elem_size_bytes(dtype)` across every `AffineQmm` in this tape that
 /// picked `SplitK`. The worker uses it to size the shared scratch
 /// buffer that `Binding::Scratch` resolves against.
+#[allow(clippy::too_many_arguments)]
 fn lower_one<W: CanonicalParams>(
     inst: &Instruction,
     index: usize,
@@ -546,7 +563,10 @@ fn lower_one<W: CanonicalParams>(
             // proportionally with actual M at dispatch time.
             dispatch: {
                 let mut d = DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP);
-                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) });
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
                 d
             },
             bindings: vec![
@@ -560,7 +580,11 @@ fn lower_one<W: CanonicalParams>(
                     kind: WeightBundleKind::Embedding,
                     which: WeightTensor::Weight,
                     layer: super::ids::LayerId(0),
-                    locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                    locator: WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
                     binding_index: 1,
                 },
                 // input_ids
@@ -628,7 +652,11 @@ fn lower_one<W: CanonicalParams>(
                     kind: WeightBundleKind::RmsNorm,
                     which: WeightTensor::Weight,
                     layer: super::ids::LayerId(*layer + layer_offset),
-                    locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                    locator: WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
                     binding_index: 2,
                 },
             ],
@@ -640,9 +668,7 @@ fn lower_one<W: CanonicalParams>(
             LoweredCommand {
                 kernel: KernelId::FusedAddRmsNorm,
                 library: "fused_add_rmsnorm",
-                function: fused_add_rmsnorm_kernel_static_name::<W>(
-                    scale_dtype_for::<W>(),
-                ),
+                function: fused_add_rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
                 constants: super::kernel_constants::RmsNormConstants {
                     bucket_m: super::ids::BucketM(bucket_m),
                     // Per-instruction hidden_size — see I::RmsNorm
@@ -656,7 +682,10 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: vec![
                     // residual: read+write (in-place add target,
@@ -673,7 +702,11 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::RmsNorm,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 2,
                     },
                 ],
@@ -703,7 +736,10 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (tg_x, tg_y, 1),
                     threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: vec![
                     Binding::ArenaSlot {
@@ -718,7 +754,11 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 2,
                     },
                 ],
@@ -820,7 +860,10 @@ fn lower_one<W: CanonicalParams>(
                         // qmv grid x-axis == M directly
                         // (`qmv_dispatch_shape` returns `(m, ceil(N/bn), B)`);
                         // shrinks linearly with actual num_tokens.
-                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            axis: super::lowered::MScaleAxis::X,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        }),
                     },
                     bindings: affine_qmm_bindings(
                         *in_slot,
@@ -886,13 +929,17 @@ fn lower_one<W: CanonicalParams>(
                 };
                 match kernel {
                     QmmTKernel::Nax => {
-                        let (tg, tpg) =
-                            qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                        let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         LoweredCommand {
                             kernel: KernelId::AffineQmmTNax,
                             library: "quantized_qmm_nax",
                             function: qmm_t_kernel_static_name(
-                                kernel, dtype, scale_dtype, bits_v, gs, aligned_n,
+                                kernel,
+                                dtype,
+                                scale_dtype,
+                                bits_v,
+                                gs,
+                                aligned_n,
                             ),
                             constants: super::kernel_constants::AffineQmmTConstants {
                                 k: super::ids::KDimI32(k_v as i32),
@@ -904,25 +951,37 @@ fn lower_one<W: CanonicalParams>(
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
                                 // qmm_t NAX grid = (n_tiles, m_tiles=ceil(M/64), B)
-                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) }),
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    axis: super::lowered::MScaleAxis::Y,
+                                    bucket_m: super::ids::BucketM(bucket_m),
+                                }),
                             },
                             bindings: affine_qmm_bindings(
                                 *in_slot,
                                 *out_slot,
                                 super::ids::LayerId(*layer + layer_offset),
-                                WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                                WeightLocator {
+                                    bucket: tape_index,
+                                    op_idx: index as u32,
+                                    slot: 0,
+                                },
                             ),
                             gemm_dims: None,
                         }
                     }
                     QmmTKernel::Standard => {
-                        let (tg, tpg) =
-                            qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                        let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         LoweredCommand {
                             kernel: KernelId::AffineQmmT,
                             library: "quantized_qmm",
                             function: qmm_t_kernel_static_name_with_compute(
-                                kernel, dtype, compute_dtype, scale_dtype, bits_v, gs, aligned_n,
+                                kernel,
+                                dtype,
+                                compute_dtype,
+                                scale_dtype,
+                                bits_v,
+                                gs,
+                                aligned_n,
                             ),
                             constants: super::kernel_constants::AffineQmmTConstants {
                                 k: super::ids::KDimI32(k_v as i32),
@@ -934,18 +993,28 @@ fn lower_one<W: CanonicalParams>(
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
                                 // qmm_t Standard grid = (n_tiles, m_tiles=ceil(M/32), B)
-                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) }),
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    axis: super::lowered::MScaleAxis::Y,
+                                    bucket_m: super::ids::BucketM(bucket_m),
+                                }),
                             },
                             bindings: affine_qmm_bindings(
                                 *in_slot,
                                 *out_slot,
                                 super::ids::LayerId(*layer + layer_offset),
-                                WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                                WeightLocator {
+                                    bucket: tape_index,
+                                    op_idx: index as u32,
+                                    slot: 0,
+                                },
                             ),
                             gemm_dims: None,
                         }
                     }
-                    QmmTKernel::SplitK { split_k, k_partition_size } => {
+                    QmmTKernel::SplitK {
+                        split_k,
+                        k_partition_size,
+                    } => {
                         // Two commands:
                         //   (1) qmm_t_splitk writes the `[split_k, M, N]`
                         //       partial into `Binding::Scratch`.
@@ -953,17 +1022,24 @@ fn lower_one<W: CanonicalParams>(
                         //       reduces along axis 0 into the AffineQmm's
                         //       arena slot.
                         let elem_bytes = elem_size_bytes(dtype);
-                        let scratch_bytes =
-                            split_k.saturating_mul(bucket_m).saturating_mul(n_v).saturating_mul(elem_bytes);
+                        let scratch_bytes = split_k
+                            .saturating_mul(bucket_m)
+                            .saturating_mul(n_v)
+                            .saturating_mul(elem_bytes);
                         *splitk_scratch_bytes = (*splitk_scratch_bytes).max(scratch_bytes);
 
-                        let (tg, tpg) =
-                            qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                        let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
                         let qmm_t_cmd = LoweredCommand {
                             kernel: KernelId::AffineQmmTSplitK,
                             library: "quantized_qmm",
                             function: qmm_t_kernel_static_name_with_compute(
-                                kernel, dtype, compute_dtype, scale_dtype, bits_v, gs, aligned_n,
+                                kernel,
+                                dtype,
+                                compute_dtype,
+                                scale_dtype,
+                                bits_v,
+                                gs,
+                                aligned_n,
                             ),
                             // SplitK needs FOUR function constants:
                             // (0=K, 1=N, 2=M, 3=k_partition_size) per
@@ -986,7 +1062,10 @@ fn lower_one<W: CanonicalParams>(
                                 threadgroups: tg,
                                 threads_per_threadgroup: tpg,
                                 // qmm_t SplitK grid = (n_tiles, m_tiles=ceil(M/32), split_k)
-                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) }),
+                                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    axis: super::lowered::MScaleAxis::Y,
+                                    bucket_m: super::ids::BucketM(bucket_m),
+                                }),
                             },
                             bindings: affine_qmm_splitk_bindings(
                                 *in_slot,
@@ -1020,7 +1099,10 @@ fn lower_one<W: CanonicalParams>(
                                 // groups = ceil(bucket_m * n_v / TPG) is linear
                                 // in M; proportional scaling shrinks it for
                                 // actual num_tokens.
-                                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) });
+                                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                                    axis: super::lowered::MScaleAxis::X,
+                                    bucket_m: super::ids::BucketM(bucket_m),
+                                });
                                 d
                             },
                             bindings: vec![
@@ -1066,7 +1148,10 @@ fn lower_one<W: CanonicalParams>(
                 // proportionally with M at dispatch time.
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
-                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) });
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
                     d
                 },
                 bindings: vec![
@@ -1153,28 +1238,43 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (groups_x, bucket_m, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::Y,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: vec![
                     Binding::Weight {
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 0,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 1,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::AffineQuantEmbedding,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(0),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 2,
                     },
                     Binding::Runtime {
@@ -1276,7 +1376,10 @@ fn lower_one<W: CanonicalParams>(
                     m_scaling: if bucket_m == 1 {
                         None
                     } else {
-                        Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) })
+                        Some(crate::interpreter::metal::lowered::MScaling {
+                            axis: super::lowered::MScaleAxis::Y,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        })
                     },
                 },
                 bindings: vec![
@@ -1292,7 +1395,11 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 2,
                     },
                 ],
@@ -1334,7 +1441,10 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: super::kernel_bindings::RopeAppendBindingSet {
                     q_out: super::ids::ArenaSlotIdx(*q_out_slot),
@@ -1356,13 +1466,7 @@ fn lower_one<W: CanonicalParams>(
         // Dense BF16/F16 path; Llama-style NeoX, no QKV bias. Qwen2
         // bias / Cohere interleaved variants land in follow-up
         // commits, gated at the matcher.
-        I::FusedQkvRopeCache(
-            in_slot,
-            out_slot,
-            layer,
-            biased,
-            interleaved,
-        ) => {
+        I::FusedQkvRopeCache(in_slot, out_slot, layer, biased, interleaved) => {
             assert!(
                 !*biased && !*interleaved,
                 "metal lowering: FusedQkvRopeCache currently supports only \
@@ -1394,7 +1498,10 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: super::kernel_bindings::FusedQkvRopeCacheBindingSet {
                     q_out: super::ids::ArenaSlotIdx(*out_slot),
@@ -1450,129 +1557,192 @@ fn lower_one<W: CanonicalParams>(
                 // Library name = the synthesized kernel's symbol; the
                 // SpecializedPipelineCache stores one synthesized
                 // library per symbol so `library == function` here.
-                library: *symbol,
-                function: *symbol,
+                library: symbol,
+                function: symbol,
                 // Pre-attn synth kernel bakes HIDDEN / NUM_Q / NUM_KV /
                 // HEAD_DIM / ROT_DIM / BLOCK_SIZE / EPS as MSL
                 // `constant constexpr` literals at synth time. Only
                 // `M` (active token count up to bucket capacity)
                 // stays a function constant — varies per bucket.
-                constants: super::kernel_constants::SynthMegakernelConstants { bucket_m: super::ids::BucketM(bucket_m) }.into(),
+                constants: super::kernel_constants::SynthMegakernelConstants {
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }
+                .into(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: {
                     let mut v: Vec<Binding> = vec![
-                    // 0: q_out
-                    Binding::ArenaSlot { slot: *q_out_slot, binding_index: 0 },
-                    // 1: residual_io (read+write)
-                    Binding::ArenaSlot { slot: *residual_slot, binding_index: 1 },
-                    // 2: delta (read)
-                    Binding::ArenaSlot { slot: *delta_slot, binding_index: 2 },
-                    // 3: rms_weight
-                    Binding::Weight {
-                        kind: WeightBundleKind::RmsNorm,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
-                        binding_index: 3,
-                    },
-                    // 4..6: Q weight + scales + biases
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
-                        binding_index: 4,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineScales,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
-                        binding_index: 5,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineBiases,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
-                        binding_index: 6,
-                    },
-                    // 7..9: K weight + scales + biases (LinearLayer sub-slot 1)
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
-                        binding_index: 7,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineScales,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
-                        binding_index: 8,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineBiases,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
-                        binding_index: 9,
-                    },
-                    // 10..12: V weight + scales + biases (LinearLayer sub-slot 2)
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
-                        binding_index: 10,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineScales,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
-                        binding_index: 11,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::AffineBiases,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
-                        binding_index: 12,
-                    },
-                    // 13: cos_sin
-                    Binding::Weight {
-                        kind: WeightBundleKind::CosSin,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
-                        binding_index: 13,
-                    },
-                    // 14: positions
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::Positions,
-                        binding_index: 14,
-                    },
-                    // 15: slot_mapping
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::SlotMapping,
-                        binding_index: 15,
-                    },
-                    // 16: kv_cache_k
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheK { layer: super::ids::LayerId(*layer + layer_offset) },
-                        binding_index: 16,
-                    },
-                    // 17: kv_cache_v
-                    Binding::Runtime {
-                        kind: RuntimeBindingKind::KvCacheV { layer: super::ids::LayerId(*layer + layer_offset) },
-                        binding_index: 17,
-                    },
+                        // 0: q_out
+                        Binding::ArenaSlot {
+                            slot: *q_out_slot,
+                            binding_index: 0,
+                        },
+                        // 1: residual_io (read+write)
+                        Binding::ArenaSlot {
+                            slot: *residual_slot,
+                            binding_index: 1,
+                        },
+                        // 2: delta (read)
+                        Binding::ArenaSlot {
+                            slot: *delta_slot,
+                            binding_index: 2,
+                        },
+                        // 3: rms_weight
+                        Binding::Weight {
+                            kind: WeightBundleKind::RmsNorm,
+                            which: WeightTensor::Weight,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
+                            binding_index: 3,
+                        },
+                        // 4..6: Q weight + scales + biases
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::Weight,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
+                            binding_index: 4,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineScales,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
+                            binding_index: 5,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineBiases,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
+                            binding_index: 6,
+                        },
+                        // 7..9: K weight + scales + biases (LinearLayer sub-slot 1)
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::Weight,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 1,
+                            },
+                            binding_index: 7,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineScales,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 1,
+                            },
+                            binding_index: 8,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineBiases,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 1,
+                            },
+                            binding_index: 9,
+                        },
+                        // 10..12: V weight + scales + biases (LinearLayer sub-slot 2)
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::Weight,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 2,
+                            },
+                            binding_index: 10,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineScales,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 2,
+                            },
+                            binding_index: 11,
+                        },
+                        Binding::Weight {
+                            kind: WeightBundleKind::LinearLayer,
+                            which: WeightTensor::AffineBiases,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 2,
+                            },
+                            binding_index: 12,
+                        },
+                        // 13: cos_sin
+                        Binding::Weight {
+                            kind: WeightBundleKind::CosSin,
+                            which: WeightTensor::Weight,
+                            layer: super::ids::LayerId(*layer + layer_offset),
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
+                            binding_index: 13,
+                        },
+                        // 14: positions
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::Positions,
+                            binding_index: 14,
+                        },
+                        // 15: slot_mapping
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::SlotMapping,
+                            binding_index: 15,
+                        },
+                        // 16: kv_cache_k
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::KvCacheK {
+                                layer: super::ids::LayerId(*layer + layer_offset),
+                            },
+                            binding_index: 16,
+                        },
+                        // 17: kv_cache_v
+                        Binding::Runtime {
+                            kind: RuntimeBindingKind::KvCacheV {
+                                layer: super::ids::LayerId(*layer + layer_offset),
+                            },
+                            binding_index: 17,
+                        },
                     ];
                     if *has_linear_bias {
                         // 18..20: Q / K / V linear bias (Qwen2-style
@@ -1586,21 +1756,33 @@ fn lower_one<W: CanonicalParams>(
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 0,
+                            },
                             binding_index: 18,
                         });
                         v.push(Binding::Weight {
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 1,
+                            },
                             binding_index: 19,
                         });
                         v.push(Binding::Weight {
                             kind: WeightBundleKind::LinearLayer,
                             which: WeightTensor::AffineLinearBias,
                             layer: super::ids::LayerId(*layer + layer_offset),
-                            locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 2 },
+                            locator: WeightLocator {
+                                bucket: tape_index,
+                                op_idx: index as u32,
+                                slot: 2,
+                            },
                             binding_index: 20,
                         });
                     }
@@ -1641,37 +1823,56 @@ fn lower_one<W: CanonicalParams>(
             let intermediate = W::INTERMEDIATE_SIZE as u32;
             let num_tiles = intermediate / tile_n;
             assert!(
-                intermediate % tile_n == 0,
+                intermediate.is_multiple_of(tile_n),
                 "metal lowering: SynthMlpPreDown requires INTERMEDIATE_SIZE \
                  ({intermediate}) divisible by HEAD_DIM ({tile_n})"
             );
             let threads_per_tg = 32 * tile_n / 4;
             LoweredCommand {
                 kernel: KernelId::SynthMlpPreDown,
-                library: *symbol,
-                function: *symbol,
+                library: symbol,
+                function: symbol,
                 // MLP-pre-down synth kernel bakes HIDDEN / INTERMEDIATE /
                 // TILE_N / EPS as MSL `constant constexpr` literals at
                 // synth time. Only `M_FC` stays a function constant.
-                constants: super::kernel_constants::SynthMegakernelConstants { bucket_m: super::ids::BucketM(bucket_m) }.into(),
+                constants: super::kernel_constants::SynthMegakernelConstants {
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }
+                .into(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, num_tiles, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: vec![
                     // 0: silu_mul_out
-                    Binding::ArenaSlot { slot: *silu_mul_out_slot, binding_index: 0 },
+                    Binding::ArenaSlot {
+                        slot: *silu_mul_out_slot,
+                        binding_index: 0,
+                    },
                     // 1: residual_io (read+write)
-                    Binding::ArenaSlot { slot: *residual_slot, binding_index: 1 },
+                    Binding::ArenaSlot {
+                        slot: *residual_slot,
+                        binding_index: 1,
+                    },
                     // 2: delta (read)
-                    Binding::ArenaSlot { slot: *delta_slot, binding_index: 2 },
+                    Binding::ArenaSlot {
+                        slot: *delta_slot,
+                        binding_index: 2,
+                    },
                     // 3: rms_weight
                     Binding::Weight {
                         kind: WeightBundleKind::RmsNorm,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 3,
                     },
                     // 4..6: gate weight + scales + biases
@@ -1679,21 +1880,33 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 4,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 5,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 6,
                     },
                     // 7..9: up weight + scales + biases (LinearLayer sub-slot 1)
@@ -1701,21 +1914,33 @@ fn lower_one<W: CanonicalParams>(
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 7,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 8,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 9,
                     },
                 ],
@@ -1724,70 +1949,99 @@ fn lower_one<W: CanonicalParams>(
         }
 
         // ── SynthGateUpSiluMul — fused gate+up GEMM + SiluMul (large-M) ─────
-        I::SynthGateUpSiluMul(
-            x_norm_slot,
-            out_slot,
-            layer,
-            _group_size,
-            _bits,
-            symbol,
-        ) => {
+        I::SynthGateUpSiluMul(x_norm_slot, out_slot, layer, _group_size, _bits, symbol) => {
             let intermediate = W::INTERMEDIATE_SIZE as u32;
             let tg_n = 32u32;
             let tg_m = 32u32;
             LoweredCommand {
                 kernel: KernelId::SynthGateUpSiluMul,
-                library: *symbol,
-                function: *symbol,
-                constants: super::kernel_constants::SynthMegakernelConstants { bucket_m: super::ids::BucketM(bucket_m) }.into(),
+                library: symbol,
+                function: symbol,
+                constants: super::kernel_constants::SynthMegakernelConstants {
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }
+                .into(),
                 dispatch: DispatchShape {
                     threadgroups: (intermediate.div_ceil(tg_n), bucket_m.div_ceil(tg_m), 1),
                     threads_per_threadgroup: (128, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::Y, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::Y,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: vec![
-                    Binding::ArenaSlot { slot: *out_slot,    binding_index: 0 },
-                    Binding::ArenaSlot { slot: *x_norm_slot, binding_index: 1 },
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *x_norm_slot,
+                        binding_index: 1,
+                    },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 2,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 3,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 0 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
                         binding_index: 4,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::Weight,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 5,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineScales,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 6,
                     },
                     Binding::Weight {
                         kind: WeightBundleKind::LinearLayer,
                         which: WeightTensor::AffineBiases,
                         layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator { bucket: tape_index, op_idx: index as u32, slot: 1 },
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
                         binding_index: 7,
                     },
                 ],
@@ -1833,7 +2087,10 @@ fn lower_one<W: CanonicalParams>(
                     // AttentionViaCache (decode) — bucket_m == 1 here
                     // (decode bucket). Scaling is a no-op but kept
                     // for uniformity in case decode shares a bucket.
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) }),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
                 },
                 bindings: super::kernel_bindings::AttentionViaCacheBindingSet {
                     output: super::ids::ArenaSlotIdx(*out_slot),
@@ -1900,9 +2157,7 @@ fn lower_one<W: CanonicalParams>(
             // means the (library, function, KERNEL_ID) trio comes from
             // one source. Bug class #8 — drift between the three
             // independent `&'static str` fields — can't recur.
-            use super::kernel_identity::{
-                AttentionSdpaPagedBf16, AttentionSdpaPagedF16,
-            };
+            use super::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
             use ferrite_metal_kernels::steel_paged::steel_paged_symbol;
             let n_q_heads = W::NUM_Q_HEADS;
             const BQ_STEEL: u32 = 32;
@@ -1979,8 +2234,7 @@ fn lower_one<W: CanonicalParams>(
                 // `for_kernel::<K>` — there's no typed ZST for steel
                 // because BD lives in the symbol name; see the
                 // comment in `kernel_identity.rs`.
-                let function = steel_symbol
-                    .expect("steel_symbol is Some when use_steel is true");
+                let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
                 LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpaPaged,
                     library: "attention_steel_paged",
@@ -2019,8 +2273,12 @@ fn lower_one<W: CanonicalParams>(
             // Token-parallel; reduction is per-element so the
             // dispatch covers `M * hidden_size` elements.
             dispatch: {
-                let mut d = DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
-                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) });
+                let mut d =
+                    DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
                 d
             },
             bindings: vec![
@@ -2047,8 +2305,12 @@ fn lower_one<W: CanonicalParams>(
             ),
             constants: Vec::new(),
             dispatch: {
-                let mut d = DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
-                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling { axis: super::lowered::MScaleAxis::X, bucket_m: super::ids::BucketM(bucket_m) });
+                let mut d =
+                    DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
                 d
             },
             bindings: vec![
@@ -2096,8 +2358,7 @@ fn lower_one<W: CanonicalParams>(
             ),
             constants: vec![ConstantValue::uint(0, *n)],
             dispatch: {
-                let mut d =
-                    DispatchShape::dispatch_1d(bucket_m * *n, THREADS_PER_GROUP);
+                let mut d = DispatchShape::dispatch_1d(bucket_m * *n, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
@@ -2154,7 +2415,7 @@ fn lower_one<W: CanonicalParams>(
             moe_inter,
             hidden,
             group_size,
-            bits,
+            _bits,
         ) => {
             let cmds = lower_metal_moe::<W>(
                 MetalMoeLowering {
@@ -2166,7 +2427,6 @@ fn lower_one<W: CanonicalParams>(
                     moe_inter: *moe_inter,
                     hidden: *hidden,
                     group_size: *group_size,
-                    bits: *bits,
                     softmax_first: false,
                     norm_topk_prob: false,
                     shared_intermediate: 0,
@@ -2189,7 +2449,7 @@ fn lower_one<W: CanonicalParams>(
             hidden,
             shared_intermediate,
             group_size,
-            bits,
+            _bits,
             norm_topk_prob,
         ) => {
             let cmds = lower_metal_moe::<W>(
@@ -2202,7 +2462,6 @@ fn lower_one<W: CanonicalParams>(
                     moe_inter: *moe_inter,
                     hidden: *hidden,
                     group_size: *group_size,
-                    bits: *bits,
                     softmax_first: true,
                     norm_topk_prob: *norm_topk_prob,
                     shared_intermediate: *shared_intermediate,
@@ -2425,14 +2684,12 @@ fn elem_size_bytes(dtype: DequantDtype) -> u32 {
 /// / `INT4_PARITY_PROBES.md` §7): RMSNorm gains stay in their on-disk
 /// dtype on the device, the kernel reads them through a `T_scale`
 /// pointer and casts to `T_act` in registers.
-fn rmsnorm_kernel_static_name<W: CanonicalParams>(
-    scale_dtype: ScaleDtype,
-) -> &'static str {
+fn rmsnorm_kernel_static_name<W: CanonicalParams>(scale_dtype: ScaleDtype) -> &'static str {
     use ScaleDtype as S;
     match (W::METAL_DTYPE, scale_dtype) {
-        (MetalDtype::F16, S::F16)   => "rmsnorm_f16_s_f16_specialized",
-        (MetalDtype::Bf16, S::F16)  => "rmsnorm_bf16_s_f16_specialized",
-        (MetalDtype::F16, S::Bf16)  => "rmsnorm_f16_s_bf16_specialized",
+        (MetalDtype::F16, S::F16) => "rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16) => "rmsnorm_f16_s_bf16_specialized",
         (MetalDtype::Bf16, S::Bf16) => "rmsnorm_bf16_s_bf16_specialized",
         (dt, sdt) => unreachable!(
             "rmsnorm_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}) \
@@ -2450,9 +2707,9 @@ fn fused_add_rmsnorm_kernel_static_name<W: CanonicalParams>(
 ) -> &'static str {
     use ScaleDtype as S;
     match (W::METAL_DTYPE, scale_dtype) {
-        (MetalDtype::F16, S::F16)   => "fused_add_rmsnorm_f16_s_f16_specialized",
-        (MetalDtype::Bf16, S::F16)  => "fused_add_rmsnorm_bf16_s_f16_specialized",
-        (MetalDtype::F16, S::Bf16)  => "fused_add_rmsnorm_f16_s_bf16_specialized",
+        (MetalDtype::F16, S::F16) => "fused_add_rmsnorm_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "fused_add_rmsnorm_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16) => "fused_add_rmsnorm_f16_s_bf16_specialized",
         (MetalDtype::Bf16, S::Bf16) => "fused_add_rmsnorm_bf16_s_bf16_specialized",
         (dt, sdt) => unreachable!(
             "fused_add_rmsnorm_kernel_static_name: (dtype={dt:?}, \
@@ -2472,17 +2729,17 @@ fn affine_embed_kernel_static_name(
 ) -> &'static str {
     use ScaleDtype as S;
     match (dtype, scale_dtype, group_size) {
-        (DequantDtype::F16, S::F16, 32)   => "affine_embed_f16_s_f16_gs_32_b_4",
-        (DequantDtype::F16, S::F16, 64)   => "affine_embed_f16_s_f16_gs_64_b_4",
-        (DequantDtype::F16, S::F16, 128)  => "affine_embed_f16_s_f16_gs_128_b_4",
-        (DequantDtype::Bf16, S::F16, 32)  => "affine_embed_bf16_s_f16_gs_32_b_4",
-        (DequantDtype::Bf16, S::F16, 64)  => "affine_embed_bf16_s_f16_gs_64_b_4",
+        (DequantDtype::F16, S::F16, 32) => "affine_embed_f16_s_f16_gs_32_b_4",
+        (DequantDtype::F16, S::F16, 64) => "affine_embed_f16_s_f16_gs_64_b_4",
+        (DequantDtype::F16, S::F16, 128) => "affine_embed_f16_s_f16_gs_128_b_4",
+        (DequantDtype::Bf16, S::F16, 32) => "affine_embed_bf16_s_f16_gs_32_b_4",
+        (DequantDtype::Bf16, S::F16, 64) => "affine_embed_bf16_s_f16_gs_64_b_4",
         (DequantDtype::Bf16, S::F16, 128) => "affine_embed_bf16_s_f16_gs_128_b_4",
-        (DequantDtype::F16, S::Bf16, 32)   => "affine_embed_f16_s_bf16_gs_32_b_4",
-        (DequantDtype::F16, S::Bf16, 64)   => "affine_embed_f16_s_bf16_gs_64_b_4",
-        (DequantDtype::F16, S::Bf16, 128)  => "affine_embed_f16_s_bf16_gs_128_b_4",
-        (DequantDtype::Bf16, S::Bf16, 32)  => "affine_embed_bf16_s_bf16_gs_32_b_4",
-        (DequantDtype::Bf16, S::Bf16, 64)  => "affine_embed_bf16_s_bf16_gs_64_b_4",
+        (DequantDtype::F16, S::Bf16, 32) => "affine_embed_f16_s_bf16_gs_32_b_4",
+        (DequantDtype::F16, S::Bf16, 64) => "affine_embed_f16_s_bf16_gs_64_b_4",
+        (DequantDtype::F16, S::Bf16, 128) => "affine_embed_f16_s_bf16_gs_128_b_4",
+        (DequantDtype::Bf16, S::Bf16, 32) => "affine_embed_bf16_s_bf16_gs_32_b_4",
+        (DequantDtype::Bf16, S::Bf16, 64) => "affine_embed_bf16_s_bf16_gs_64_b_4",
         (DequantDtype::Bf16, S::Bf16, 128) => "affine_embed_bf16_s_bf16_gs_128_b_4",
         (dt, sdt, gs) => unreachable!(
             "affine_embed_kernel_static_name: (dtype={dt:?}, scale_dtype={sdt:?}, gs={gs}) \
@@ -2507,7 +2764,6 @@ struct MetalMoeLowering {
     moe_inter: u32,
     hidden: u32,
     group_size: u32,
-    bits: u32,
     /// `false` = Mixtral order (`topk → softmax(scores)`).
     /// `true`  = Qwen-MoE order (`softmax(probs) → topk → take_along_axis(probs)`).
     softmax_first: bool,
@@ -2518,7 +2774,7 @@ struct MetalMoeLowering {
     norm_topk_prob: bool,
     /// Shared-expert intermediate size; `0` means no shared expert.
     /// Non-zero requires emitting the shared-expert tail (3× AffineQmm
-    /// + sigmoid-gate fusion), which depends on a fused-add-sigmoid-
+    /// plus sigmoid-gate fusion), which depends on a fused-add-sigmoid-
     /// gate-mul kernel that isn't ported yet. The lowering arm
     /// asserts this is `0` for now and panics otherwise. Both Mixtral
     /// and Qwen3-MoE-30B-A3B-Instruct ship `shared_intermediate=0` —
@@ -2562,7 +2818,14 @@ fn align_256(n: u32) -> u32 {
 }
 
 impl MoeScratchLayout {
-    fn compute(bucket_m: u32, num_experts: u32, top_k: u32, moe_inter: u32, hidden: u32, elem_size: u32) -> Self {
+    fn compute(
+        bucket_m: u32,
+        num_experts: u32,
+        top_k: u32,
+        moe_inter: u32,
+        hidden: u32,
+        elem_size: u32,
+    ) -> Self {
         let mut off = 0u32;
         let router_logits = off;
         off = align_256(off + bucket_m * num_experts * elem_size);
@@ -2636,9 +2899,9 @@ fn argpartition_symbol<W: CanonicalParams>() -> &'static str {
     match W::METAL_DTYPE {
         MetalDtype::F16 => "c_arg_block_sort_float16_uint32_bn32_tn4",
         MetalDtype::Bf16 => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
-        MetalDtype::Int4 => panic!(
-            "argpartition_symbol: MoE router argsort over int4 dtype is nonsensical"
-        ),
+        MetalDtype::Int4 => {
+            panic!("argpartition_symbol: MoE router argsort over int4 dtype is nonsensical")
+        }
     }
 }
 
@@ -2653,29 +2916,29 @@ fn affine_gather_qmv_symbol(
     use ScaleDtype as S;
     let fast = n_out.is_multiple_of(8) && k_in.is_multiple_of(512);
     match (fast, dtype, scale_dtype, group_size) {
-        (true, D::F16, S::F16, 32)   => "affine_gather_qmv_fast_f16_s_f16_gs_32_b_4",
-        (true, D::F16, S::F16, 64)   => "affine_gather_qmv_fast_f16_s_f16_gs_64_b_4",
-        (true, D::F16, S::F16, 128)  => "affine_gather_qmv_fast_f16_s_f16_gs_128_b_4",
-        (true, D::Bf16, S::F16, 32)  => "affine_gather_qmv_fast_bf16_s_f16_gs_32_b_4",
-        (true, D::Bf16, S::F16, 64)  => "affine_gather_qmv_fast_bf16_s_f16_gs_64_b_4",
+        (true, D::F16, S::F16, 32) => "affine_gather_qmv_fast_f16_s_f16_gs_32_b_4",
+        (true, D::F16, S::F16, 64) => "affine_gather_qmv_fast_f16_s_f16_gs_64_b_4",
+        (true, D::F16, S::F16, 128) => "affine_gather_qmv_fast_f16_s_f16_gs_128_b_4",
+        (true, D::Bf16, S::F16, 32) => "affine_gather_qmv_fast_bf16_s_f16_gs_32_b_4",
+        (true, D::Bf16, S::F16, 64) => "affine_gather_qmv_fast_bf16_s_f16_gs_64_b_4",
         (true, D::Bf16, S::F16, 128) => "affine_gather_qmv_fast_bf16_s_f16_gs_128_b_4",
-        (true, D::F16, S::Bf16, 32)  => "affine_gather_qmv_fast_f16_s_bf16_gs_32_b_4",
-        (true, D::F16, S::Bf16, 64)  => "affine_gather_qmv_fast_f16_s_bf16_gs_64_b_4",
+        (true, D::F16, S::Bf16, 32) => "affine_gather_qmv_fast_f16_s_bf16_gs_32_b_4",
+        (true, D::F16, S::Bf16, 64) => "affine_gather_qmv_fast_f16_s_bf16_gs_64_b_4",
         (true, D::F16, S::Bf16, 128) => "affine_gather_qmv_fast_f16_s_bf16_gs_128_b_4",
-        (true, D::Bf16, S::Bf16, 32)  => "affine_gather_qmv_fast_bf16_s_bf16_gs_32_b_4",
-        (true, D::Bf16, S::Bf16, 64)  => "affine_gather_qmv_fast_bf16_s_bf16_gs_64_b_4",
+        (true, D::Bf16, S::Bf16, 32) => "affine_gather_qmv_fast_bf16_s_bf16_gs_32_b_4",
+        (true, D::Bf16, S::Bf16, 64) => "affine_gather_qmv_fast_bf16_s_bf16_gs_64_b_4",
         (true, D::Bf16, S::Bf16, 128) => "affine_gather_qmv_fast_bf16_s_bf16_gs_128_b_4",
-        (false, D::F16, S::F16, 32)   => "affine_gather_qmv_f16_s_f16_gs_32_b_4",
-        (false, D::F16, S::F16, 64)   => "affine_gather_qmv_f16_s_f16_gs_64_b_4",
-        (false, D::F16, S::F16, 128)  => "affine_gather_qmv_f16_s_f16_gs_128_b_4",
-        (false, D::Bf16, S::F16, 32)  => "affine_gather_qmv_bf16_s_f16_gs_32_b_4",
-        (false, D::Bf16, S::F16, 64)  => "affine_gather_qmv_bf16_s_f16_gs_64_b_4",
+        (false, D::F16, S::F16, 32) => "affine_gather_qmv_f16_s_f16_gs_32_b_4",
+        (false, D::F16, S::F16, 64) => "affine_gather_qmv_f16_s_f16_gs_64_b_4",
+        (false, D::F16, S::F16, 128) => "affine_gather_qmv_f16_s_f16_gs_128_b_4",
+        (false, D::Bf16, S::F16, 32) => "affine_gather_qmv_bf16_s_f16_gs_32_b_4",
+        (false, D::Bf16, S::F16, 64) => "affine_gather_qmv_bf16_s_f16_gs_64_b_4",
         (false, D::Bf16, S::F16, 128) => "affine_gather_qmv_bf16_s_f16_gs_128_b_4",
-        (false, D::F16, S::Bf16, 32)  => "affine_gather_qmv_f16_s_bf16_gs_32_b_4",
-        (false, D::F16, S::Bf16, 64)  => "affine_gather_qmv_f16_s_bf16_gs_64_b_4",
+        (false, D::F16, S::Bf16, 32) => "affine_gather_qmv_f16_s_bf16_gs_32_b_4",
+        (false, D::F16, S::Bf16, 64) => "affine_gather_qmv_f16_s_bf16_gs_64_b_4",
         (false, D::F16, S::Bf16, 128) => "affine_gather_qmv_f16_s_bf16_gs_128_b_4",
-        (false, D::Bf16, S::Bf16, 32)  => "affine_gather_qmv_bf16_s_bf16_gs_32_b_4",
-        (false, D::Bf16, S::Bf16, 64)  => "affine_gather_qmv_bf16_s_bf16_gs_64_b_4",
+        (false, D::Bf16, S::Bf16, 32) => "affine_gather_qmv_bf16_s_bf16_gs_32_b_4",
+        (false, D::Bf16, S::Bf16, 64) => "affine_gather_qmv_bf16_s_bf16_gs_64_b_4",
         (false, D::Bf16, S::Bf16, 128) => "affine_gather_qmv_bf16_s_bf16_gs_128_b_4",
         (_, _, _, gs) => panic!(
             "affine_gather_qmv_symbol: unsupported group_size={gs} \
@@ -2883,11 +3146,26 @@ fn lower_metal_moe<W: CanonicalParams>(
                     binding_index: 1,
                     byte_offset: layout.sorted_full,
                 },
-                Binding::Inline { binding_index: 2, value: p.num_experts },
-                Binding::Inline { binding_index: 3, value: 1 },
-                Binding::Inline { binding_index: 4, value: 1 },
-                Binding::Inline { binding_index: 5, value: p.num_experts },
-                Binding::Inline { binding_index: 6, value: p.num_experts },
+                Binding::Inline {
+                    binding_index: 2,
+                    value: p.num_experts,
+                },
+                Binding::Inline {
+                    binding_index: 3,
+                    value: 1,
+                },
+                Binding::Inline {
+                    binding_index: 4,
+                    value: 1,
+                },
+                Binding::Inline {
+                    binding_index: 5,
+                    value: p.num_experts,
+                },
+                Binding::Inline {
+                    binding_index: 6,
+                    value: p.num_experts,
+                },
             ],
         ));
     }
@@ -2921,8 +3199,14 @@ fn lower_metal_moe<W: CanonicalParams>(
                     binding_index: 1,
                     byte_offset: layout.topk_inds,
                 },
-                Binding::Inline { binding_index: 2, value: p.num_experts },
-                Binding::Inline { binding_index: 3, value: p.top_k },
+                Binding::Inline {
+                    binding_index: 2,
+                    value: p.num_experts,
+                },
+                Binding::Inline {
+                    binding_index: 3,
+                    value: p.top_k,
+                },
             ],
         ));
     }
@@ -2964,8 +3248,14 @@ fn lower_metal_moe<W: CanonicalParams>(
                     binding_index: 2,
                     byte_offset: layout.topk_scores,
                 },
-                Binding::Inline { binding_index: 3, value: p.num_experts },
-                Binding::Inline { binding_index: 4, value: p.top_k },
+                Binding::Inline {
+                    binding_index: 3,
+                    value: p.num_experts,
+                },
+                Binding::Inline {
+                    binding_index: 4,
+                    value: p.top_k,
+                },
             ],
         ));
     }
@@ -2997,7 +3287,10 @@ fn lower_metal_moe<W: CanonicalParams>(
                     binding_index: 1,
                     byte_offset: layout.topk_scores,
                 },
-                Binding::Inline { binding_index: 2, value: p.top_k },
+                Binding::Inline {
+                    binding_index: 2,
+                    value: p.top_k,
+                },
             ],
         ));
     }
@@ -3038,7 +3331,10 @@ fn lower_metal_moe<W: CanonicalParams>(
                     binding_index: 1,
                     byte_offset: layout.topk_scores,
                 },
-                Binding::Inline { binding_index: 2, value: p.top_k },
+                Binding::Inline {
+                    binding_index: 2,
+                    value: p.top_k,
+                },
             ],
         ));
     }
@@ -3049,70 +3345,80 @@ fn lower_metal_moe<W: CanonicalParams>(
     // `(32, 2, 1)` threads. K and N specialize via function_constant
     // 0 / 1. top_k Inline at buffer slot 6 for the kernel's pointer
     // arithmetic.
-    let gather_qmv = |which_w, which_s, which_b, x_off, y_off, n_out: u32, k_in: u32| -> LoweredCommand {
-        let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, p.group_size);
-        let bn: u32 = 8;
-        let kernel = if symbol.contains("_fast_") {
-            KernelId::AffineGatherQmvFast
-        } else {
-            KernelId::AffineGatherQmv
+    let gather_qmv =
+        |which_w, which_s, which_b, x_off, y_off, n_out: u32, k_in: u32| -> LoweredCommand {
+            let symbol = affine_gather_qmv_symbol(n_out, k_in, dtype, scale_dtype, p.group_size);
+            let bn: u32 = 8;
+            let kernel = if symbol.contains("_fast_") {
+                KernelId::AffineGatherQmvFast
+            } else {
+                KernelId::AffineGatherQmv
+            };
+            make_moe_command(
+                kernel,
+                "quantized_qmv",
+                symbol,
+                vec![
+                    ConstantValue::int(0, k_in as i32),
+                    ConstantValue::int(1, n_out as i32),
+                ],
+                DispatchShape {
+                    threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
+                    threads_per_threadgroup: (32, 2, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        axis: super::lowered::MScaleAxis::Z,
+                        bucket_m: super::ids::BucketM(p.bucket_m),
+                    }),
+                },
+                vec![
+                    Binding::Weight {
+                        kind: bundle_kind,
+                        which: which_w,
+                        layer: layer_id,
+                        locator: locator0,
+                        binding_index: 0,
+                    },
+                    Binding::Weight {
+                        kind: bundle_kind,
+                        which: which_s,
+                        layer: layer_id,
+                        locator: locator0,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: bundle_kind,
+                        which: which_b,
+                        layer: layer_id,
+                        locator: locator0,
+                        binding_index: 2,
+                    },
+                    x_off, // buffer 3 = x
+                    Binding::MoeScratch {
+                        binding_index: 4,
+                        byte_offset: layout.topk_inds,
+                    }, // rhs_indices
+                    y_off, // buffer 5 = y
+                    Binding::Inline {
+                        binding_index: 6,
+                        value: p.top_k,
+                    },
+                ],
+            )
         };
-        make_moe_command(
-            kernel,
-            "quantized_qmv",
-            symbol,
-            vec![
-                ConstantValue::int(0, k_in as i32),
-                ConstantValue::int(1, n_out as i32),
-            ],
-            DispatchShape {
-                threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
-                threads_per_threadgroup: (32, 2, 1),
-                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                    axis: super::lowered::MScaleAxis::Z,
-                    bucket_m: super::ids::BucketM(p.bucket_m),
-                }),
-            },
-            vec![
-                Binding::Weight {
-                    kind: bundle_kind,
-                    which: which_w,
-                    layer: layer_id,
-                    locator: locator0,
-                    binding_index: 0,
-                },
-                Binding::Weight {
-                    kind: bundle_kind,
-                    which: which_s,
-                    layer: layer_id,
-                    locator: locator0,
-                    binding_index: 1,
-                },
-                Binding::Weight {
-                    kind: bundle_kind,
-                    which: which_b,
-                    layer: layer_id,
-                    locator: locator0,
-                    binding_index: 2,
-                },
-                x_off,                                               // buffer 3 = x
-                Binding::MoeScratch {
-                    binding_index: 4,
-                    byte_offset: layout.topk_inds,
-                },                                                   // rhs_indices
-                y_off,                                               // buffer 5 = y
-                Binding::Inline { binding_index: 6, value: p.top_k },
-            ],
-        )
-    };
 
     // Step 6: gate_out = affine_gather_qmv(x, W_expert_gate)
     cmds.push(gather_qmv(
         WeightTensor::MoeExpertGateW,
         WeightTensor::MoeExpertGateS,
         WeightTensor::MoeExpertGateB,
-        Binding::ArenaSlot { slot: p.in_slot, binding_index: 3 },
-        Binding::MoeScratch { binding_index: 5, byte_offset: layout.gate_out },
+        Binding::ArenaSlot {
+            slot: p.in_slot,
+            binding_index: 3,
+        },
+        Binding::MoeScratch {
+            binding_index: 5,
+            byte_offset: layout.gate_out,
+        },
         p.moe_inter,
         p.hidden,
     ));
@@ -3121,8 +3427,14 @@ fn lower_metal_moe<W: CanonicalParams>(
         WeightTensor::MoeExpertUpW,
         WeightTensor::MoeExpertUpS,
         WeightTensor::MoeExpertUpB,
-        Binding::ArenaSlot { slot: p.in_slot, binding_index: 3 },
-        Binding::MoeScratch { binding_index: 5, byte_offset: layout.up_out },
+        Binding::ArenaSlot {
+            slot: p.in_slot,
+            binding_index: 3,
+        },
+        Binding::MoeScratch {
+            binding_index: 5,
+            byte_offset: layout.up_out,
+        },
         p.moe_inter,
         p.hidden,
     ));
@@ -3287,7 +3599,10 @@ fn lower_metal_moe<W: CanonicalParams>(
                 // top_k = 1 for the down step since act_out is already
                 // per-expert-replicated; kernel's `token_n = nk / 1`
                 // walks the rows 1-for-1.
-                Binding::Inline { binding_index: 6, value: 1 },
+                Binding::Inline {
+                    binding_index: 6,
+                    value: 1,
+                },
             ],
         ));
     }
@@ -3400,8 +3715,14 @@ mod tests {
             /*vector_limit=*/ 18,
         );
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 1, /*layer_offset=*/ 5, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(
+            &inst,
+            0,
+            /*bucket_m=*/ 1,
+            /*layer_offset=*/ 5,
+            &mut scratch,
+        )
+        .expect("lower");
         assert_eq!(cmds.len(), 1, "qmv branch emits exactly one command");
         assert_eq!(scratch, 0, "qmv branch never allocates splitk scratch");
         let cmd = &cmds[0];
@@ -3481,14 +3802,23 @@ mod tests {
             /*vector_limit=*/ 18,
         );
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 512, /*layer_offset=*/ 0, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(
+            &inst,
+            0,
+            /*bucket_m=*/ 512,
+            /*layer_offset=*/ 0,
+            &mut scratch,
+        )
+        .expect("lower");
         assert_eq!(cmds.len(), 1, "Standard path emits exactly one command");
         assert_eq!(scratch, 0, "Standard path never allocates splitk scratch");
         let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::AffineQmmT);
         assert_eq!(cmd.library, "quantized_qmm");
-        assert_eq!(cmd.function, "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_true_batch_0");
+        assert_eq!(
+            cmd.function,
+            "affine_qmm_t_bf16_s_f16_gs_64_b_4_alN_true_batch_0"
+        );
         assert_eq!(
             cmd.constants,
             vec![
@@ -3524,8 +3854,14 @@ mod tests {
             /*vector_limit=*/ 18,
         );
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(
+            &inst,
+            0,
+            /*bucket_m=*/ 64,
+            /*layer_offset=*/ 0,
+            &mut scratch,
+        )
+        .expect("lower");
         assert_eq!(cmds.len(), 2, "SplitK pair emits two commands");
         // Scratch sized to split_k * M * N * 2 bytes (bf16 = 2):
         // 4 * 64 * 2048 * 2 = 1_048_576.
@@ -3565,7 +3901,10 @@ mod tests {
         // Bindings: 0 = output ArenaSlot, 1 = Scratch input.
         assert_eq!(reduce.bindings.len(), 2);
         match &reduce.bindings[0] {
-            Binding::ArenaSlot { slot, binding_index } => {
+            Binding::ArenaSlot {
+                slot,
+                binding_index,
+            } => {
                 assert_eq!(*slot, 11);
                 assert_eq!(*binding_index, 0);
             }
@@ -3585,8 +3924,14 @@ mod tests {
         let inst: Instruction<TestParams> =
             Instruction::SiluMul(/*gate=*/ 5, /*up=*/ 6, /*out=*/ 7);
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 64, /*layer_offset=*/ 0, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(
+            &inst,
+            0,
+            /*bucket_m=*/ 64,
+            /*layer_offset=*/ 0,
+            &mut scratch,
+        )
+        .expect("lower");
         assert_eq!(cmds.len(), 1, "SiluMul emits exactly one command");
         let cmd = &cmds[0];
         assert_eq!(cmd.kernel, KernelId::SiluMul);
@@ -3648,8 +3993,14 @@ mod tests {
             /*vector_limit=*/ 18,
         );
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, /*bucket_m=*/ 512, /*layer_offset=*/ 0, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(
+            &inst,
+            0,
+            /*bucket_m=*/ 512,
+            /*layer_offset=*/ 0,
+            &mut scratch,
+        )
+        .expect("lower");
         assert_eq!(cmds.len(), 1);
         let cmd = &cmds[0];
         assert_eq!(
@@ -3685,8 +4036,7 @@ mod tests {
         );
         let bucket_m = 32u32;
         let mut scratch = 0u32;
-        let cmds = lower_one(&inst, 0, bucket_m, /*layer_offset=*/ 5, &mut scratch)
-            .expect("lower");
+        let cmds = lower_one(&inst, 0, bucket_m, /*layer_offset=*/ 5, &mut scratch).expect("lower");
         assert_eq!(cmds.len(), 1, "AffineEmbed always emits a single command");
         assert_eq!(scratch, 0, "AffineEmbed never allocates splitk scratch");
 
@@ -3703,7 +4053,10 @@ mod tests {
         // Q_SIZE=2048 → bytes_per_row=1024; THREADS_PER_GROUP=256.
         // groups_x = 1024.div_ceil(256) = 4.
         assert_eq!(cmd.dispatch.threadgroups, (4, bucket_m, 1));
-        assert_eq!(cmd.dispatch.threads_per_threadgroup, (THREADS_PER_GROUP, 1, 1));
+        assert_eq!(
+            cmd.dispatch.threads_per_threadgroup,
+            (THREADS_PER_GROUP, 1, 1)
+        );
 
         // 5 bindings: weight (0), scales (1), biases (2), input_ids (3), out (4).
         assert_eq!(cmd.bindings.len(), 5);

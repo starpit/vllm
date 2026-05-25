@@ -7,9 +7,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLBuffer, MTLCommandBuffer,
-    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
+    MTLSize,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -337,8 +337,7 @@ fn encode_argmax_into_mtl4_inner(
     name: &'static str,
 ) -> Result<(), MetalStreamError> {
     use objc2_metal::{
-        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _,
-        MTL4VisibilityOptions, MTLStages,
+        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
     };
     // `barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions`
     // is on the `MTL4CommandEncoder` super-trait; the `as _`
@@ -377,8 +376,16 @@ fn encode_argmax_into_mtl4_inner(
     );
     encoder.setComputePipelineState(pipeline);
     encoder.setArgumentTable(Some(arg_table));
-    let threadgroups = MTLSize { width: batch as usize, height: 1, depth: 1 };
-    let threads_per_tg = MTLSize { width: ARGMAX_DEFAULT_TG_SIZE, height: 1, depth: 1 };
+    let threadgroups = MTLSize {
+        width: batch as usize,
+        height: 1,
+        depth: 1,
+    };
+    let threads_per_tg = MTLSize {
+        width: ARGMAX_DEFAULT_TG_SIZE,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads_per_tg);
     Ok(())
 }

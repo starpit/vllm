@@ -300,7 +300,10 @@ fn run_kernel_f16(
     let scales_buf = buffer_from_bytes(&device, scales_bytes);
     let biases_buf = buffer_from_bytes(&device, biases_bytes);
     let indices_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(indices.as_ptr() as *const u8, std::mem::size_of_val(indices))
+        std::slice::from_raw_parts(
+            indices.as_ptr() as *const u8,
+            std::mem::size_of_val(indices),
+        )
     };
     let indices_buf = buffer_from_bytes(&device, indices_bytes);
     let n_out = indices.len() * hidden_size as usize;
@@ -353,7 +356,10 @@ fn run_kernel_bf16(
     let scales_buf = buffer_from_bytes(&device, scales_bytes);
     let biases_buf = buffer_from_bytes(&device, biases_bytes);
     let indices_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(indices.as_ptr() as *const u8, std::mem::size_of_val(indices))
+        std::slice::from_raw_parts(
+            indices.as_ptr() as *const u8,
+            std::mem::size_of_val(indices),
+        )
     };
     let indices_buf = buffer_from_bytes(&device, indices_bytes);
     let n_out = indices.len() * hidden_size as usize;

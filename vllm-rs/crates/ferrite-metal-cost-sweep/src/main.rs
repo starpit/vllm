@@ -52,7 +52,11 @@ fn main() {
     // when iterating on a single sweep family without paying for the
     // ~4-min full table regen.
     let filter = std::env::var("FERRITE_SWEEP").ok();
-    let want = |name: &str| filter.as_deref().map_or(true, |f| f.split(',').any(|s| s == name));
+    let want = |name: &str| {
+        filter
+            .as_deref()
+            .map_or(true, |f| f.split(',').any(|s| s == name))
+    };
     if want("rmsnorm") {
         rmsnorm_sweep::run(launch_overhead_us);
     }

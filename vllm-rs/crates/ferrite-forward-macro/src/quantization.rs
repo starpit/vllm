@@ -232,6 +232,7 @@ pub enum QuantMethod {
     ///     to the full affine triple `[vocab, hidden / pack_factor]`
     ///     U32 + `.scales`/`.biases` F16. Verified against
     ///     `mlx-community/Meta-Llama-3.1-8B-Instruct-4bit`.
+    ///
     /// When `tie_word_embeddings: true`, the embed always ships
     /// quantized (because it's the same tensor as the quantized
     /// lm_head) and this flag has no effect.
@@ -821,7 +822,10 @@ pub fn storage_format_for_weight(
     // emits `LinearLayer::AffineQuant(...)` sharing the embed's
     // packed buffers.
     if dotted == "lm_head" && model.tie_word_embeddings {
-        if let QuantMethod::Affine { bits, group_size, .. } = qc.method {
+        if let QuantMethod::Affine {
+            bits, group_size, ..
+        } = qc.method
+        {
             return StorageFormat::Affine { bits, group_size };
         }
         return StorageFormat::Dense;
@@ -846,14 +850,19 @@ pub fn storage_format_for_weight(
     // dotted-name lm_head rule already returns Affine above), so the
     // rule below only fires for untied checkpoints; tied checkpoints
     // ignore `quantize_embed` entirely.
-    if dotted == "embed_tokens" && !model.tie_word_embeddings {
-        if let QuantMethod::Affine { bits, group_size, quantize_embed } = qc.method {
-            return if quantize_embed {
-                StorageFormat::Affine { bits, group_size }
-            } else {
-                StorageFormat::Dense
-            };
-        }
+    if dotted == "embed_tokens"
+        && !model.tie_word_embeddings
+        && let QuantMethod::Affine {
+            bits,
+            group_size,
+            quantize_embed,
+        } = qc.method
+    {
+        return if quantize_embed {
+            StorageFormat::Affine { bits, group_size }
+        } else {
+            StorageFormat::Dense
+        };
     }
 
     // AutoGPTQ convention: `lm_head` is never quantized, even when

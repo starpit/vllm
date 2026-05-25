@@ -12,10 +12,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
-use objc2_metal::{
-    MTL4ArgumentTable, MTL4ComputeCommandEncoder, MTLComputePipelineState, MTLDevice,
-    MTLLibrary, MTLSize,
-};
+use objc2_metal::{MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize};
 
 use crate::shader_cache::load_library_from_bytes;
 use crate::stream::MetalStreamError;
@@ -31,13 +28,10 @@ pub struct ChainAdvanceKernel {
 
 impl ChainAdvanceKernel {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library =
-            load_library_from_bytes(device, crate::embedded_metallib!("chain_advance"))
-                .map_err(|e| {
-                    MetalStreamError::ShaderCompilationFailed(format!(
-                        "load `chain_advance.metallib`: {e}"
-                    ))
-                })?;
+        let library = load_library_from_bytes(device, crate::embedded_metallib!("chain_advance"))
+            .map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!("load `chain_advance.metallib`: {e}"))
+        })?;
         let ns_name = NSString::from_str("chain_advance");
         let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
             MetalStreamError::ShaderCompilationFailed("chain_advance fn missing".into())
@@ -78,8 +72,7 @@ pub fn encode_chain_advance_into_mtl4(
     num_reqs: u32,
 ) -> Result<(), MetalStreamError> {
     use objc2_metal::{
-        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _,
-        MTL4VisibilityOptions, MTLStages,
+        MTL4CommandEncoder as _, MTL4ComputeCommandEncoder as _, MTL4VisibilityOptions, MTLStages,
     };
     if num_reqs == 0 {
         return Err(MetalStreamError::ShaderCompilationFailed(
@@ -96,7 +89,11 @@ pub fn encode_chain_advance_into_mtl4(
     // One threadgroup, num_reqs threads. K-step batches have
     // num_reqs <= max_num_seqs which is typically <= 256. Single
     // threadgroup is fine.
-    let threadgroups = MTLSize { width: 1, height: 1, depth: 1 };
+    let threadgroups = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
     let threads_per_tg = MTLSize {
         width: num_reqs as usize,
         height: 1,

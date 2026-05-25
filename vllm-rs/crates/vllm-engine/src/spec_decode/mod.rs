@@ -23,12 +23,11 @@ pub mod proposer;
 pub mod verify;
 
 pub use backend::{
-    BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle,
-    SpecDecodeBackend,
+    BackendError, ForwardArgmaxRequest, ForwardHandle, KvPoolHandle, ModelHandle, SpecDecodeBackend,
 };
 pub use ngram::{NgramProposer, NgramProposerConfig};
 pub use proposer::{DraftModelProposer, DraftSeedInputs, Proposer, ProposerStepCtx};
-pub use verify::{greedy_rejection_sample, RejectionResult};
+pub use verify::{RejectionResult, greedy_rejection_sample};
 
 /// Configuration for the draft-model proposer.
 ///

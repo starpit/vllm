@@ -16,7 +16,7 @@
 
 use crate::util::{self, Buffer, Device};
 use ferrite_metal_kernels::quantized::{
-    pick_qmm_t_kernel, DequantDtype, MetalAffineQmmT, QmmTKernel, ScaleDtype,
+    DequantDtype, MetalAffineQmmT, QmmTKernel, ScaleDtype, pick_qmm_t_kernel,
 };
 use ferrite_metal_kernels::stream::MetalStream;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder};
@@ -94,8 +94,7 @@ pub fn run(launch_overhead_us: f64) {
                     if !seen.insert((m, n, k)) {
                         continue;
                     }
-                    let cost_us =
-                        bench_qmm_t(&qmm, device, dtype, m, n, k, gs, launch_overhead_us);
+                    let cost_us = bench_qmm_t(&qmm, device, dtype, m, n, k, gs, launch_overhead_us);
                     // NAX path is dormant for currently-modelled gens
                     // (`is_nax_capable(_) == false` per
                     // `project_metal_nax_layout_bug.md`); sweep the

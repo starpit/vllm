@@ -23,7 +23,6 @@ use crate::interpreter::metal::__re::{
 };
 use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
-use ::objc2_metal::MTL4ComputeCommandEncoder;
 
 use super::lowered::{
     Binding, KernelId, LoweredCommand, LoweredMetalTape, MetalDtype, WeightBundleKind, WeightTensor,
@@ -349,10 +348,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 MTLResourceOptions::StorageModePrivate
             };
             let buf = device
-                .newBufferWithLength_options(
-                    max_splitk_scratch_bytes as usize,
-                    mode,
-                )
+                .newBufferWithLength_options(max_splitk_scratch_bytes as usize, mode)
                 .expect("newBufferWithLength_options returned nil (splitk scratch)");
             if let Some(r) = residency {
                 r.insert(&buf);
@@ -384,10 +380,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 MTLResourceOptions::StorageModePrivate
             };
             let buf = device
-                .newBufferWithLength_options(
-                    max_moe_scratch_bytes as usize,
-                    mode,
-                )
+                .newBufferWithLength_options(max_moe_scratch_bytes as usize, mode)
                 .expect("newBufferWithLength_options returned nil (moe scratch)");
             if let Some(r) = residency {
                 r.insert(&buf);
@@ -459,7 +452,9 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 if let Some(steps) = baking.mtl4_steps.as_ref() {
                     for step in steps {
                         if let Some(ctx) = step.icb.as_ref() {
-                            unsafe { r.insert_raw(ctx.icb().as_ptr()); }
+                            unsafe {
+                                r.insert_raw(ctx.icb().as_ptr());
+                            }
                         }
                     }
                 }
@@ -490,7 +485,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         enc: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        use ::objc2_metal::{MTLCommandEncoder, MTLComputeCommandEncoder};
+        use ::objc2_metal::MTLComputeCommandEncoder;
         let baking = &self.bucket_bakings[bucket];
         for step in &baking.steps {
             match step {
@@ -514,7 +509,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         }
                         for (buf, off, idx) in bindings {
                             unsafe {
-                                enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
+                                enc.setBuffer_offset_atIndex(
+                                    Some(buf),
+                                    *off as usize,
+                                    *idx as usize,
+                                );
                             }
                         }
                         let tg_scaled = scale_tg_for_num_tokens(
@@ -554,12 +553,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         queue: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>,
     ) -> Result<(), WorkerError> {
-        use ::objc2_metal::{
-            MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-            MTLCommandBufferStatus, MTLComputeCommandEncoder, MTLResourceOptions,
-        };
         use ::objc2::rc::Retained;
         use ::objc2::runtime::ProtocolObject;
+        use ::objc2_metal::{
+            MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+            MTLCommandQueue, MTLComputeCommandEncoder,
+        };
         let baking = &self.bucket_bakings[bucket];
         let mut dispatch_idx = 0usize;
         for step in &baking.steps {
@@ -571,7 +570,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 direct_m_scaling,
                 runtime_gate,
                 ..
-            } = step else {
+            } = step
+            else {
                 return Err(WorkerError::WeightLookupFailed {
                     reason: "MTL3 dump path cannot handle Gemm step",
                 });
@@ -594,11 +594,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
                     }
                 }
-                let tg_scaled = scale_tg_for_num_tokens(
-                    *tg,
-                    *scaling,
-                    super::ids::NumTokens(num_tokens),
-                );
+                let tg_scaled =
+                    scale_tg_for_num_tokens(*tg, *scaling, super::ids::NumTokens(num_tokens));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
                 enc.endEncoding();
                 cb.commit();
@@ -610,7 +607,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         .unwrap_or_else(|| "(no NSError)".into());
                     eprintln!(
                         "[ferrite dump {:03}] kernel={:?} FAILED status={:?} error={}",
-                        dispatch_idx, kernel, cb.status(), err_desc
+                        dispatch_idx,
+                        kernel,
+                        cb.status(),
+                        err_desc
                     );
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "dump-mode dispatch did not complete",
@@ -626,7 +626,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 let pipeline_ptr = ::objc2::rc::Retained::as_ptr(pipeline) as *const _ as usize;
                 eprintln!(
                     "[ferrite dump {:03}] kernel={:?} pipeline=0x{:x} tg={:?} bindings={}",
-                    dispatch_idx, kernel, pipeline_ptr, tg_s, bindings.len()
+                    dispatch_idx,
+                    kernel,
+                    pipeline_ptr,
+                    tg_s,
+                    bindings.len()
                 );
                 for (buf, off, idx) in bindings {
                     // Skip Private-storage buffers (splitk_scratch,
@@ -647,7 +651,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         );
                         continue;
                     }
-                    let nbytes = (*buf).length() as usize;
+                    let nbytes = (*buf).length();
                     let base_ptr = (*buf).contents().as_ptr() as *const u8;
                     let off_us = *off as usize;
                     let n_elems_bf16 = ((nbytes.saturating_sub(off_us)) / 2).min(8);
@@ -756,8 +760,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
         mut timing: Option<&super::pool::DispatchTimingState>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{
-            MTL4CommandEncoder, MTL4ComputeCommandEncoder as _,
-            MTL4TimestampGranularity, MTL4VisibilityOptions, MTLStages,
+            MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4TimestampGranularity,
+            MTL4VisibilityOptions, MTLStages,
         };
         let baking = &self.bucket_bakings[bucket];
         let mtl4_steps =
@@ -790,26 +794,25 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // `MTL4IndirectCommandBufferSupportState::Enabled`, so
             // ICB execution under MTL4 produces the same kernel
             // state direct dispatch does.
-            if let Some(ctx) = step.icb.as_ref() {
-                if timing.is_none() {
-                    use ::objc2::msg_send;
-                    use ::objc2::runtime::AnyObject;
-                    use ::objc2_foundation::NSRange;
-                    let n = ctx.command_count();
-                    let enc_ptr: *mut AnyObject =
-                        enc as *const _ as *const AnyObject as *mut _;
-                    unsafe {
-                        let _: () = msg_send![
-                            enc_ptr,
-                            executeCommandsInBuffer: ctx.icb().as_ptr(),
-                            withRange: NSRange { location: 0, length: n }
-                        ];
-                    }
-                    if count_barriers {
-                        total_dispatches += n;
-                    }
-                    continue;
+            if let Some(ctx) = step.icb.as_ref()
+                && timing.is_none()
+            {
+                use ::objc2::msg_send;
+                use ::objc2::runtime::AnyObject;
+                use ::objc2_foundation::NSRange;
+                let n = ctx.command_count();
+                let enc_ptr: *mut AnyObject = enc as *const _ as *const AnyObject as *mut _;
+                unsafe {
+                    let _: () = msg_send![
+                        enc_ptr,
+                        executeCommandsInBuffer: ctx.icb().as_ptr(),
+                        withRange: NSRange { location: 0, length: n }
+                    ];
                 }
+                if count_barriers {
+                    total_dispatches += n;
+                }
+                continue;
             }
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
                 .tables
@@ -866,28 +869,29 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         );
                     }
                 }
-                let tg_scaled = scale_tg_for_num_tokens(
-                    *tg,
-                    *scaling,
-                    super::ids::NumTokens(num_tokens),
-                );
-                if let Some(t) = timing.as_mut() {
-                    if ts_idx < t.heap_capacity {
-                        unsafe {
-                            enc.writeTimestampWithGranularity_intoHeap_atIndex(
-                                MTL4TimestampGranularity::Precise,
-                                &t.heap,
-                                ts_idx,
-                            );
-                        }
-                        t.record_label(
+                let tg_scaled =
+                    scale_tg_for_num_tokens(*tg, *scaling, super::ids::NumTokens(num_tokens));
+                if let Some(t) = timing.as_mut()
+                    && ts_idx < t.heap_capacity
+                {
+                    unsafe {
+                        enc.writeTimestampWithGranularity_intoHeap_atIndex(
+                            MTL4TimestampGranularity::Precise,
+                            &t.heap,
                             ts_idx,
-                            &step.pipeline,
-                            step.kernel,
-                            (tg_scaled.width as u32, tg_scaled.height as u32, tg_scaled.depth as u32),
                         );
-                        ts_idx += 1;
                     }
+                    t.record_label(
+                        ts_idx,
+                        &step.pipeline,
+                        step.kernel,
+                        (
+                            tg_scaled.width as u32,
+                            tg_scaled.height as u32,
+                            tg_scaled.depth as u32,
+                        ),
+                    );
+                    ts_idx += 1;
                 }
                 enc.setArgumentTable(Some(table));
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
@@ -895,17 +899,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
         }
         // Final closing timestamp so the last dispatch's GPU time =
         // ts[N] - ts[N-1].
-        if let Some(t) = timing.as_mut() {
-            if ts_idx < t.heap_capacity {
-                unsafe {
-                    enc.writeTimestampWithGranularity_intoHeap_atIndex(
-                        MTL4TimestampGranularity::Precise,
-                        &t.heap,
-                        ts_idx,
-                    );
-                }
-                t.set_dispatch_count(ts_idx);
+        if let Some(t) = timing.as_mut()
+            && ts_idx < t.heap_capacity
+        {
+            unsafe {
+                enc.writeTimestampWithGranularity_intoHeap_atIndex(
+                    MTL4TimestampGranularity::Precise,
+                    &t.heap,
+                    ts_idx,
+                );
             }
+            t.set_dispatch_count(ts_idx);
         }
         if count_barriers {
             eprintln!(
@@ -951,10 +955,12 @@ fn bake_bucket<W: CanonicalParams>(
     let inline_values: Vec<u32> = tape
         .commands
         .iter()
-        .flat_map(|c| c.bindings.iter().filter_map(|b| match b {
-            Binding::Inline { value, .. } => Some(*value),
-            _ => None,
-        }))
+        .flat_map(|c| {
+            c.bindings.iter().filter_map(|b| match b {
+                Binding::Inline { value, .. } => Some(*value),
+                _ => None,
+            })
+        })
         .collect();
     let moe_inline_buf: Option<Buffer> = if inline_values.is_empty() {
         None
@@ -970,11 +976,7 @@ fn bake_bucket<W: CanonicalParams>(
         // strictly after this `new` returns to the caller.
         unsafe {
             let dst = buf.contents().as_ptr().cast::<u32>();
-            std::ptr::copy_nonoverlapping(
-                inline_values.as_ptr(),
-                dst,
-                inline_values.len(),
-            );
+            std::ptr::copy_nonoverlapping(inline_values.as_ptr(), dst, inline_values.len());
         }
         Some(buf)
     };
@@ -1076,11 +1078,7 @@ fn bake_bucket<W: CanonicalParams>(
                             depth: 1_usize,
                         },
                     );
-                    let cmd_barrier = tape
-                        .barrier_before
-                        .get(cmd_idx)
-                        .copied()
-                        .unwrap_or(true);
+                    let cmd_barrier = tape.barrier_before.get(cmd_idx).copied().unwrap_or(true);
                     // MPS-shaped bf16 Gemm: M is the height axis but
                     // the bake here is for a dense linear that always
                     // dispatches at the actual M (no bucket_m baking),
@@ -1152,7 +1150,7 @@ fn bake_bucket<W: CanonicalParams>(
         )?;
         let bound_refs: Vec<(&Buffer, u64, u64)> =
             bound.iter().map(|(b, off, idx)| (b, *off, *idx)).collect();
-        let (tg, tpt) = mtl_size_pair::<W>(cmd);
+        let (tg, tpt) = mtl_size_pair(cmd);
 
         // Coalesce with the previous step iff (a) it's an ICB step
         // (a Gemm step forces an encoder boundary) and (b) its
@@ -1202,26 +1200,16 @@ fn bake_bucket<W: CanonicalParams>(
                 bind_summary.join(","),
             );
         }
-        let cmd_barrier = tape
-            .barrier_before
-            .get(cmd_idx)
-            .copied()
-            .unwrap_or(true);
-        let cmd_gate = tape
-            .runtime_gate
-            .get(cmd_idx)
-            .copied()
-            .unwrap_or(None);
+        let cmd_barrier = tape.barrier_before.get(cmd_idx).copied().unwrap_or(true);
+        let cmd_gate = tape.runtime_gate.get(cmd_idx).copied().unwrap_or(None);
         let cmd_m_scaling = cmd.dispatch.m_scaling;
         // Coalesce only when the gate matches too — a `OnlyIfSingleSeq`
         // dispatch can't share a step with an ungated dispatch since
         // they fire under different runtime conditions.
         let same_gate = match steps.last() {
-            Some(BucketStep::Icb { runtime_gate, .. }) => runtime_gate
-                .last()
-                .copied()
-                .unwrap_or(None)
-                == cmd_gate,
+            Some(BucketStep::Icb { runtime_gate, .. }) => {
+                runtime_gate.last().copied().unwrap_or(None) == cmd_gate
+            }
             _ => false,
         };
         match steps.last_mut() {
@@ -1269,6 +1257,7 @@ fn bake_bucket<W: CanonicalParams>(
 /// arena slot, index 1 → input arena slot, index 2 → LinearLayer
 /// weight thunk. Anything else is a contract violation surfaced as
 /// [`WorkerError::GemmBindingsMalformed`].
+#[allow(clippy::too_many_arguments)]
 fn resolve_gemm_buffers<W: CanonicalParams>(
     bucket_index: usize,
     command_index: usize,
@@ -1455,8 +1444,7 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 WeightTensor::Weight => e.weight,
                 WeightTensor::AffineScales => e.scales,
                 WeightTensor::AffineBiases => e.affine_biases,
-                WeightTensor::Bias
-                | WeightTensor::AffineLinearBias => {
+                WeightTensor::Bias | WeightTensor::AffineLinearBias => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "AffineQuantEmbedding has no linear-layer bias \
                                  — embeddings only carry (weight, scales, biases)",
@@ -1564,13 +1552,12 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
             // loader was built with shared_inter=0 but the macro
             // baked a shared-expert tail into the Instruction
             // payload anyway → lowering / loader split bug.
-            let shared_or_err =
-                |opt: Option<ferrite_cuda_core::tensor::GpuTensor>| {
-                    opt.ok_or(WorkerError::WeightLookupFailed {
-                        reason: "SharedFusedMoe shared-expert tensor binding fired but \
+            let shared_or_err = |opt: Option<ferrite_cuda_core::tensor::GpuTensor>| {
+                opt.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "SharedFusedMoe shared-expert tensor binding fired but \
                                  layer was loaded with shared_intermediate_size=0",
-                    })
-                };
+                })
+            };
             match which {
                 WeightTensor::MoeRouterGate => routed.router_gate,
                 WeightTensor::MoeExpertGateW => routed.expert_gate_w,
@@ -1654,14 +1641,8 @@ fn resolve_bindings<W: CanonicalParams>(
                 locator,
                 binding_index,
             } => {
-                let (b, off) = resolve_weight(
-                    weights,
-                    allocator,
-                    kind,
-                    layer.get(),
-                    *which,
-                    *locator,
-                )?;
+                let (b, off) =
+                    resolve_weight(weights, allocator, kind, layer.get(), *which, *locator)?;
                 (b, off, *binding_index as u64)
             }
             Binding::Runtime {
@@ -1681,7 +1662,7 @@ fn resolve_bindings<W: CanonicalParams>(
             }
             Binding::Inline {
                 binding_index,
-                value,
+                value: _,
             } => {
                 let buf = moe_inline_buf.ok_or(WorkerError::WeightLookupFailed {
                     reason: "Binding::Inline reached resolve_bindings but the bucket's \
@@ -1708,7 +1689,6 @@ fn resolve_bindings<W: CanonicalParams>(
     }
     Ok(out)
 }
-
 
 /// Rewrite the m-axis of a baked threadgroup grid to match the
 /// actual `num_tokens` of this forward, instead of the bucket_m the
@@ -1747,9 +1727,7 @@ fn gate_matches(
         Some(super::lowered::RuntimeGate::OnlyIfSingleSeqNoSpec) => {
             num_seqs <= 1 && !has_spec_tokens
         }
-        Some(super::lowered::RuntimeGate::OnlyIfMultiSeqOrSpec) => {
-            num_seqs > 1 || has_spec_tokens
-        }
+        Some(super::lowered::RuntimeGate::OnlyIfMultiSeqOrSpec) => num_seqs > 1 || has_spec_tokens,
     }
 }
 
@@ -1772,12 +1750,12 @@ fn scale_tg_for_num_tokens(
     // baseline so accidental num_tokens > bucket_m can't grow the
     // grid past what was baked.
     let baseline = *slot as u64;
-    let scaled = (baseline.saturating_mul(n) + bm - 1) / bm;
+    let scaled = baseline.saturating_mul(n).div_ceil(bm);
     *slot = scaled as usize;
     tg
 }
 
-fn mtl_size_pair<W: CanonicalParams>(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
+fn mtl_size_pair(cmd: &LoweredCommand) -> (MTLSize, MTLSize) {
     let tg = MTLSize {
         width: cmd.dispatch.threadgroups.0 as usize,
         height: cmd.dispatch.threadgroups.1 as usize,
@@ -2231,11 +2209,15 @@ mod tests {
                     binding_index: 3,
                 },
                 Binding::Runtime {
-                    kind: RuntimeBindingKind::KvCacheK { layer: crate::interpreter::metal::ids::LayerId(0) },
+                    kind: RuntimeBindingKind::KvCacheK {
+                        layer: crate::interpreter::metal::ids::LayerId(0),
+                    },
                     binding_index: 4,
                 },
                 Binding::Runtime {
-                    kind: RuntimeBindingKind::KvCacheV { layer: crate::interpreter::metal::ids::LayerId(0) },
+                    kind: RuntimeBindingKind::KvCacheV {
+                        layer: crate::interpreter::metal::ids::LayerId(0),
+                    },
                     binding_index: 5,
                 },
             ],

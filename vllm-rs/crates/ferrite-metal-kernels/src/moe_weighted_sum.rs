@@ -54,12 +54,13 @@ pub struct MoeWeightedSumKernels {
 
 impl MoeWeightedSumKernels {
     pub fn new(device: &Device) -> Result<Self, MetalStreamError> {
-        let library = load_library_from_bytes(device, crate::embedded_metallib!("moe_weighted_sum"))
-            .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "load `moe_weighted_sum.metallib`: {e}"
-                ))
-            })?;
+        let library =
+            load_library_from_bytes(device, crate::embedded_metallib!("moe_weighted_sum"))
+                .map_err(|e| {
+                    MetalStreamError::ShaderCompilationFailed(format!(
+                        "load `moe_weighted_sum.metallib`: {e}"
+                    ))
+                })?;
         Ok(Self {
             library,
             device: device.clone(),
@@ -92,10 +93,7 @@ impl MoeWeightedSumKernels {
             .library
             .newFunctionWithName_constantValues_error(&name, &constants)
             .map_err(|e| {
-                MetalStreamError::ShaderCompilationFailed(format!(
-                    "{}: {e:?}",
-                    dtype.symbol()
-                ))
+                MetalStreamError::ShaderCompilationFailed(format!("{}: {e:?}", dtype.symbol()))
             })?;
         self.device
             .newComputePipelineStateWithFunction_error(&func)
@@ -124,7 +122,8 @@ pub fn dispatch_moe_weighted_sum(
             "dispatch_moe_weighted_sum: rows={rows} top_k={top_k} hidden={hidden}; all > 0"
         )));
     }
-    let expert_bytes = (rows as usize) * (top_k as usize) * (hidden as usize) * dtype.element_size();
+    let expert_bytes =
+        (rows as usize) * (top_k as usize) * (hidden as usize) * dtype.element_size();
     let scores_bytes = (rows as usize) * (top_k as usize) * dtype.element_size();
     let out_bytes = (rows as usize) * (hidden as usize) * dtype.element_size();
     if expert_out.length() < expert_bytes {
@@ -147,9 +146,9 @@ pub fn dispatch_moe_weighted_sum(
     }
 
     let pipeline = kernels.build_pipeline(dtype, top_k, hidden)?;
-    let cmdbuf = queue.commandBuffer().ok_or_else(|| {
-        MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into())
-    })?;
+    let cmdbuf = queue
+        .commandBuffer()
+        .ok_or_else(|| MetalStreamError::ShaderCompilationFailed("commandBuffer nil".into()))?;
     let enc = cmdbuf.computeCommandEncoder().ok_or_else(|| {
         MetalStreamError::ShaderCompilationFailed("computeCommandEncoder nil".into())
     })?;

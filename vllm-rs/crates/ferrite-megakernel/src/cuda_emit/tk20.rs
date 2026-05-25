@@ -894,6 +894,36 @@ pub fn warpgroup_mma_async_wait() -> CuStmt {
     CuStmt::new("kittens::warpgroup::mma_async_wait();".to_string())
 }
 
+/// `kittens::warpgroup::load(rt, st);` — collaborative
+/// shared→register load distributed across the 4 warps of a
+/// warpgroup. The 4 warps each receive their `rt_fl<16, N>` slice
+/// from a `st_bf<64, N>` tile (`ST::rows / RT::rows == GROUP_WARPS
+/// == 4`). bf16→fp32 conversion handled by TK's
+/// `base_types::convertor`. Used to preload the residual into the
+/// wgmma D accumulator before `mma_AB` accumulates `D += A*B`,
+/// implementing fused `D = residual + A*B`.
+///
+/// Static_assert: `ST::rows / RT::rows == GROUP_WARPS == 4` and
+/// `ST::cols == RT::cols`.
+///
+/// Source: `include/ops/group/memory/tile/shared_to_register.cuh:14-128`.
+pub fn warpgroup_load_rt_fl_from_st_bf<const ROWS: u32, const COLS: u32>(
+    rt: &Rt<F32, RtRow, 16, COLS>,
+    st: &St<Bf16, ROWS, COLS>,
+) -> CuStmt {
+    const {
+        assert!(
+            ROWS == 64,
+            "warpgroup_load_rt_fl_from_st_bf: ST::rows must equal warpgroup-distributed RT::rows*4 = 64",
+        );
+    }
+    CuStmt::new(format!(
+        "kittens::warpgroup::load({rt}, {st});",
+        rt = rt.expr(),
+        st = st.expr()
+    ))
+}
+
 /// `kittens::warpgroup::store(st, rt);` — collaborative
 /// register→shared store. The 4 warps in the warpgroup each
 /// contribute their `rt_fl<16, N>` slice; together they write a
@@ -918,6 +948,46 @@ pub fn warpgroup_store_st_bf_from_rt_fl<const ROWS: u32, const COLS: u32>(
         "kittens::warpgroup::store({st}, {rt});",
         st = st.expr(),
         rt = rt.expr()
+    ))
+}
+
+/// `kittens::warpgroup::apply(dst, src, lambda);` — per-element
+/// lambda over a warpgroup-distributed `rt_fl<16, COLS>`. The
+/// warpgroup variant adds `warpid() * RT::height` to the row index
+/// passed to the lambda so the indices are global across the
+/// 64-row tile (`maps.cuh:90-126`). Use for fused activations
+/// (silu, gelu) on the wgmma D accumulator.
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:89-126`.
+pub fn warpgroup_apply_f32_rt_lambda<const COLS: u32>(
+    dst: &Rt<F32, RtRow, 16, COLS>,
+    src: &Rt<F32, RtRow, 16, COLS>,
+    lambda_body: &str,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warpgroup::apply({dst}, {src}, [=] __device__ (int /*row*/, int col, float x) {{ return {body}; }});",
+        dst = dst.expr(),
+        src = src.expr(),
+        body = lambda_body
+    ))
+}
+
+/// `kittens::warpgroup::mul(dst, lhs, rhs);` — elementwise multiply
+/// across a warpgroup-distributed register tile. Inherited from the
+/// group<N> bin_map specializations (each warp executes the
+/// per-element mul on its own 16-row slice).
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:707-710`.
+pub fn warpgroup_mul_rt_rt<const COLS: u32>(
+    dst: &Rt<F32, RtRow, 16, COLS>,
+    lhs: &Rt<F32, RtRow, 16, COLS>,
+    rhs: &Rt<F32, RtRow, 16, COLS>,
+) -> CuStmt {
+    CuStmt::new(format!(
+        "kittens::warpgroup::mul({dst}, {lhs}, {rhs});",
+        dst = dst.expr(),
+        lhs = lhs.expr(),
+        rhs = rhs.expr()
     ))
 }
 

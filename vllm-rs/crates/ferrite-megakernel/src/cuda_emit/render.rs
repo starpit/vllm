@@ -1535,7 +1535,9 @@ pub fn render_tk_fused_gemm_add<
         return RoleBodies::skipped("TkFusedGemmAdd");
     }
     // M%16!=0 → vec-mat decode-shape (small-batch decode).
-    // M%16==0 → tile-MMA prefill-shape.
+    // M%16==0 → tile-MMA prefill-shape, dispatch onto fixed
+    // M_BLOCKS (= M / 64) so the wgmma const-asserts only fire at
+    // those instantiations (mirrors render_gemm dispatch).
     if M % 16 != 0 {
         return render_fused_gemm_add_decode::<M, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
             in_page_id,
@@ -1551,14 +1553,80 @@ pub fn render_tk_fused_gemm_add<
             b_tile_offset,
         );
     }
+    if M == 64 {
+        render_tk_fused_gemm_add_prefill_wgmma::<1, 64, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, residual_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, residual_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else if M == 512 {
+        render_tk_fused_gemm_add_prefill_wgmma::<8, 512, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, residual_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, residual_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else if M == 4096 {
+        render_tk_fused_gemm_add_prefill_wgmma::<64, 4096, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, residual_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, residual_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else {
+        panic!("render_tk_fused_gemm_add prefill: unsupported M (must be 64/512/4096); got {M}");
+    }
+}
+
+// ============================================================
+// TkFusedGemmAdd (prefill shape — TK 2.0 H100 wgmma SMEM+SMEM).
+//
+// Mirrors `render_gemm_prefill_wgmma` with the residual fused
+// in: each warpgroup-worth of D accumulator is preloaded from
+// the residual subtile via `warpgroup::load(rt_fl, st_bf)`, then
+// `mma_AB` accumulates `D += A * B` (TK 2.0 default
+// `accumulate=1`), and the result is stored back into the
+// residual smem slot. Same outer m-block loop and N-tile-per-
+// warpgroup partition as render_gemm.
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_tk_fused_gemm_add_prefill_wgmma<
+    const M_BLOCKS: u32,
+    const M_TOTAL: u32,
+    const K: u32,
+    const N: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    weight_page_id: u32,
+    residual_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    residual_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    b_tile_offset: u32,
+) -> RoleBodies {
+    const { assert!(NCW % 4 == 0, "render_tk_fused_gemm_add prefill: NCW must be a multiple of 4 (warpgroup size)"); }
+    const { assert!(M_BLOCKS >= 1, "render_tk_fused_gemm_add prefill: M_BLOCKS must be >= 1"); }
+    const { assert!(M_TOTAL == M_BLOCKS * 64, "render_tk_fused_gemm_add prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+
+    const M_TILE: u32 = 64;
 
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
     let weight_p = page(weight_page_id);
     let residual_p = page(residual_page_id);
 
-    let in_smem = page_as_st_bf::<M, K>(in_p);
-    let residual_smem = page_as_st_bf::<M, N>(residual_p);
+    let in_smem = page_as_st_bf::<M_TOTAL, K>(in_p);
+    let residual_smem = page_as_st_bf::<M_TOTAL, N>(residual_p);
     let b_tile = scratch_as_st_bf::<K, N>(off(b_tile_offset));
 
     let in_ready = page_ready_sem(in_p);
@@ -1573,16 +1641,16 @@ pub fn render_tk_fused_gemm_add<
     let residual_gmem = gmem_act_ptr_raw(residual_act_slot);
     let weight_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
 
-    let act_bytes = M * K * BF16_BYTES;
+    let act_bytes = M_TOTAL * K * BF16_BYTES;
     let weight_bytes = K * N * BF16_BYTES;
-    let residual_bytes = M * N * BF16_BYTES;
+    let residual_bytes = M_TOTAL * N * BF16_BYTES;
 
     let mut loader = CuBlock::new();
     loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&weight_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&residual_consumed, loader_phase));
     loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M, K>(
+    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M_TOTAL, K>(
         &in_smem, &in_gmem, act_bytes, &in_ready,
     ));
     loader.push(tk20::group_tma_expect_bytes::<1>(&weight_ready, weight_bytes));
@@ -1590,7 +1658,7 @@ pub fn render_tk_fused_gemm_add<
         &b_tile, &weight_gmem, weight_bytes, &weight_ready,
     ));
     loader.push(tk20::group_tma_expect_bytes::<1>(&residual_ready, residual_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M, N>(
+    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M_TOTAL, N>(
         &residual_smem, &residual_gmem, residual_bytes, &residual_ready,
     ));
 
@@ -1601,30 +1669,46 @@ pub fn render_tk_fused_gemm_add<
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&residual_ready, consumer_phase));
 
-    let (decl_a, a_rt) = tk20::decl_rt_bf_row::<M, K>("__gemm_a");
-    let (decl_b, b_rt) = tk20::decl_rt_bf_col::<K, TILE_N>("__gemm_b");
-    let (decl_acc, acc_rt) = tk20::decl_rt_fl::<M, TILE_N>("__gemm_acc");
-    consumer.push(decl_a);
-    consumer.push(decl_b);
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gemm_acc");
     consumer.push(decl_acc);
 
-    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let n_tiles_per_wg: u32 = 4;
+    let groupid = tk20::warpgroup_groupid_expr();
+
+    let mut n_loop_body = CuBlock::new();
+    n_loop_body.push(CuStmt::new(format!(
+        "int __gemm_n_idx = {groupid} * {n_tiles_per_wg} + __gemm_n_in_wg;"
+    )));
+    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
+        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
+    );
     let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, TILE_N>(
-        "__gemm_b_sub", &b_tile, "0", warp_idx_expr,
+        "__gemm_b_sub", &b_tile, "0", "__gemm_n_idx",
     );
-    let (decl_resid_sub, resid_sub) = tk20::decl_st_bf_subtile::<M, N, M, TILE_N>(
-        "__gemm_resid_sub", &residual_smem, "0", warp_idx_expr,
-    );
-    consumer.push(decl_b_sub);
-    consumer.push(decl_resid_sub);
+    let (decl_resid_sub, resid_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, TILE_N>(
+            "__gemm_resid_sub", &residual_smem, "__gemm_m_block", "__gemm_n_idx",
+        );
+    n_loop_body.push(decl_a_sub);
+    n_loop_body.push(decl_b_sub);
+    n_loop_body.push(decl_resid_sub);
+    // Preload residual into D so wgmma's default accumulate gives
+    // D = residual + A*B.
+    n_loop_body.push(tk20::warpgroup_load_rt_fl_from_st_bf::<M_TILE, TILE_N>(&acc_rt, &resid_sub));
+    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, TILE_N>(&acc_rt, &a_sub, &b_sub));
+    n_loop_body.push(tk20::warpgroup_mma_async_wait());
+    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&resid_sub, &acc_rt));
 
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, M, K>(&a_rt, &in_smem));
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, K, TILE_N>(&b_rt, &b_sub));
-    consumer.push(tk20::warp_load_rt_fl_from_st_bf::<M, TILE_N>(&acc_rt, &resid_sub));
+    let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_n_in_wg = 0; __gemm_n_in_wg < {n_tiles_per_wg}; ++__gemm_n_in_wg"),
+        &n_loop_body,
+    ));
 
-    consumer.push(tk20::warp_mma_AB::<M, K, TILE_N>(&acc_rt, &a_rt, &b_rt, &acc_rt));
-
-    consumer.push(tk20::warp_store_st_bf_from_rt_fl::<M, TILE_N>(&resid_sub, &acc_rt));
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_m_block = 0; __gemm_m_block < {M_BLOCKS}; ++__gemm_m_block"),
+        &m_loop_body,
+    ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     consumer.push(tk20::block_warp_zero(&[
@@ -1635,7 +1719,7 @@ pub fn render_tk_fused_gemm_add<
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait::<1>(&residual_done, storer_phase));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, N>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, N>(
         &residual_gmem, &residual_smem, residual_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait::<1>());
@@ -1863,7 +1947,8 @@ pub fn render_fused_gate_up_activate_mul<
         return RoleBodies::skipped("TkFusedGateUpActivateMul");
     }
     // M%16!=0 → vec-mat decode-shape (small-batch decode).
-    // M%16==0 → tile-MMA prefill-shape.
+    // M%16==0 → tile-MMA prefill-shape, dispatch onto fixed
+    // M_BLOCKS so wgmma const-asserts only fire at those instantiations.
     if M % 16 != 0 {
         return render_fused_gate_up_activate_mul_decode::<
             M, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
@@ -1882,14 +1967,91 @@ pub fn render_fused_gate_up_activate_mul<
             activation,
         );
     }
+    if M == 64 {
+        render_fused_gate_up_activate_mul_prefill_wgmma::<
+            1, 64, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor, bar_publish,
+            gate_offset, up_offset, gate_bytes, up_bytes, activation,
+        )
+    } else if M == 512 {
+        render_fused_gate_up_activate_mul_prefill_wgmma::<
+            8, 512, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor, bar_publish,
+            gate_offset, up_offset, gate_bytes, up_bytes, activation,
+        )
+    } else if M == 4096 {
+        render_fused_gate_up_activate_mul_prefill_wgmma::<
+            64, 4096, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
+        >(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor, bar_publish,
+            gate_offset, up_offset, gate_bytes, up_bytes, activation,
+        )
+    } else {
+        panic!("render_fused_gate_up_activate_mul prefill: unsupported M (must be 64/512/4096); got {M}");
+    }
+}
+
+// ============================================================
+// FusedGateUpActivateMul (prefill — TK 2.0 H100 wgmma SMEM+SMEM).
+//
+// Outer m-block CUDA loop wraps a per-warpgroup N-tile loop. For
+// each (m_block, n_in_wg) the body:
+//   1. Subtiles A=st_bf<64, HIDDEN_DIM>, gate_b=st_bf<HIDDEN_DIM, TILE_N>,
+//      up_b=st_bf<HIDDEN_DIM, TILE_N>, out=st_bf<64, TILE_N>
+//   2. zeroes gate_acc, mma gate_acc += A*gate_b (wgmma SMEM+SMEM)
+//   3. zeroes up_acc, mma up_acc += A*up_b
+//   4. mma_async_wait; apply(activation, gate_acc); mul(gate_acc, gate_acc, up_acc)
+//   5. warpgroup store st_bf out_sub from rt_fl gate_acc
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_fused_gate_up_activate_mul_prefill_wgmma<
+    const M_BLOCKS: u32,
+    const M_TOTAL: u32,
+    const HIDDEN_DIM: u32,
+    const INTERMEDIATE_DIM: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    weight_page_id: u32,
+    out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    gate_offset: u32,
+    up_offset: u32,
+    gate_bytes: u32,
+    up_bytes: u32,
+    activation: GateUpActivation,
+) -> RoleBodies {
+    const { assert!(NCW % 4 == 0, "render_fused_gate_up_activate_mul prefill: NCW must be a multiple of 4 (warpgroup size)"); }
+    const { assert!(M_BLOCKS >= 1, "render_fused_gate_up_activate_mul prefill: M_BLOCKS must be >= 1"); }
+    const { assert!(M_TOTAL == M_BLOCKS * 64, "render_fused_gate_up_activate_mul prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+
+    const M_TILE: u32 = 64;
 
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
     let weight_p = page(weight_page_id);
     let out_p = page(out_page_id);
 
-    let in_smem = page_as_st_bf::<M, HIDDEN_DIM>(in_p);
-    let out_smem = page_as_st_bf::<M, INTERMEDIATE_DIM>(out_p);
+    let in_smem = page_as_st_bf::<M_TOTAL, HIDDEN_DIM>(in_p);
+    let out_smem = page_as_st_bf::<M_TOTAL, INTERMEDIATE_DIM>(out_p);
     let gate_buf = scratch_as_st_bf::<HIDDEN_DIM, INTERMEDIATE_DIM>(off(gate_offset));
     let up_buf = scratch_as_st_bf::<HIDDEN_DIM, INTERMEDIATE_DIM>(off(up_offset));
 
@@ -1905,8 +2067,8 @@ pub fn render_fused_gate_up_activate_mul<
     let gate_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
     let up_gmem = gmem_weight_ptr_raw_offset(weight_accessor, layer, NUM_LAYERS, gate_bytes);
 
-    let act_bytes = M * HIDDEN_DIM * BF16_BYTES;
-    let out_bytes = M * INTERMEDIATE_DIM * BF16_BYTES;
+    let act_bytes = M_TOTAL * HIDDEN_DIM * BF16_BYTES;
+    let out_bytes = M_TOTAL * INTERMEDIATE_DIM * BF16_BYTES;
     let weight_total_bytes = gate_bytes + up_bytes;
 
     let mut loader = CuBlock::new();
@@ -1914,7 +2076,7 @@ pub fn render_fused_gate_up_activate_mul<
     loader.push(tk20::group_wait::<1>(&weight_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&out_consumed, loader_phase));
     loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M, HIDDEN_DIM>(
+    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M_TOTAL, HIDDEN_DIM>(
         &in_smem, &in_gmem, act_bytes, &in_ready,
     ));
     loader.push(tk20::group_tma_expect_bytes::<1>(&weight_ready, weight_total_bytes));
@@ -1931,45 +2093,13 @@ pub fn render_fused_gate_up_activate_mul<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
 
-    let (decl_a, a_rt) = tk20::decl_rt_bf_row::<M, HIDDEN_DIM>("__gu_a");
-    let (decl_gate_b, gate_b_rt) = tk20::decl_rt_bf_col::<HIDDEN_DIM, TILE_N>("__gu_gate_b");
-    let (decl_up_b, up_b_rt) = tk20::decl_rt_bf_col::<HIDDEN_DIM, TILE_N>("__gu_up_b");
-    let (decl_gate_acc, gate_acc_rt) = tk20::decl_rt_fl::<M, TILE_N>("__gu_gate_acc");
-    let (decl_up_acc, up_acc_rt) = tk20::decl_rt_fl::<M, TILE_N>("__gu_up_acc");
-    consumer.push(decl_a);
-    consumer.push(decl_gate_b);
-    consumer.push(decl_up_b);
+    let (decl_gate_acc, gate_acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gu_gate_acc");
+    let (decl_up_acc, up_acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gu_up_acc");
     consumer.push(decl_gate_acc);
     consumer.push(decl_up_acc);
 
-    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
-    let (decl_gate_b_sub, gate_b_sub) =
-        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
-            "__gu_gate_b_sub", &gate_buf, "0", warp_idx_expr,
-        );
-    let (decl_up_b_sub, up_b_sub) =
-        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
-            "__gu_up_b_sub", &up_buf, "0", warp_idx_expr,
-        );
-    let (decl_out_sub, out_sub) =
-        tk20::decl_st_bf_subtile::<M, INTERMEDIATE_DIM, M, TILE_N>(
-            "__gu_out_sub", &out_smem, "0", warp_idx_expr,
-        );
-    consumer.push(decl_gate_b_sub);
-    consumer.push(decl_up_b_sub);
-    consumer.push(decl_out_sub);
-
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, M, HIDDEN_DIM>(&a_rt, &in_smem));
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, HIDDEN_DIM, TILE_N>(&gate_b_rt, &gate_b_sub));
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, HIDDEN_DIM, TILE_N>(&up_b_rt, &up_b_sub));
-    consumer.push(tk20::warp_zero_rt::<F32, _, M, TILE_N>(&gate_acc_rt));
-    consumer.push(tk20::warp_zero_rt::<F32, _, M, TILE_N>(&up_acc_rt));
-    consumer.push(tk20::warp_mma_AB::<M, HIDDEN_DIM, TILE_N>(
-        &gate_acc_rt, &a_rt, &gate_b_rt, &gate_acc_rt,
-    ));
-    consumer.push(tk20::warp_mma_AB::<M, HIDDEN_DIM, TILE_N>(
-        &up_acc_rt, &a_rt, &up_b_rt, &up_acc_rt,
-    ));
+    let n_tiles_per_wg: u32 = 4;
+    let groupid = tk20::warpgroup_groupid_expr();
 
     let activation_lambda = match activation {
         GateUpActivation::Silu => "x * (1.0f / (1.0f + __expf(-x)))",
@@ -1977,11 +2107,51 @@ pub fn render_fused_gate_up_activate_mul<
             "0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)))"
         }
     };
-    consumer.push(tk20::warp_apply_f32_rt_lambda::<M, TILE_N>(
+
+    let mut n_loop_body = CuBlock::new();
+    n_loop_body.push(CuStmt::new(format!(
+        "int __gu_n_idx = {groupid} * {n_tiles_per_wg} + __gu_n_in_wg;"
+    )));
+    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, HIDDEN_DIM, M_TILE, HIDDEN_DIM>(
+        "__gu_a_sub", &in_smem, "__gu_m_block", "0",
+    );
+    let (decl_gate_b_sub, gate_b_sub) =
+        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
+            "__gu_gate_b_sub", &gate_buf, "0", "__gu_n_idx",
+        );
+    let (decl_up_b_sub, up_b_sub) =
+        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
+            "__gu_up_b_sub", &up_buf, "0", "__gu_n_idx",
+        );
+    let (decl_out_sub, out_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, INTERMEDIATE_DIM, M_TILE, TILE_N>(
+            "__gu_out_sub", &out_smem, "__gu_m_block", "__gu_n_idx",
+        );
+    n_loop_body.push(decl_a_sub);
+    n_loop_body.push(decl_gate_b_sub);
+    n_loop_body.push(decl_up_b_sub);
+    n_loop_body.push(decl_out_sub);
+    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&gate_acc_rt));
+    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&up_acc_rt));
+    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, TILE_N>(&gate_acc_rt, &a_sub, &gate_b_sub));
+    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, TILE_N>(&up_acc_rt, &a_sub, &up_b_sub));
+    n_loop_body.push(tk20::warpgroup_mma_async_wait());
+    n_loop_body.push(tk20::warpgroup_apply_f32_rt_lambda::<TILE_N>(
         &gate_acc_rt, &gate_acc_rt, activation_lambda,
     ));
-    consumer.push(tk20::warp_mul_rt_rt::<M, TILE_N>(&gate_acc_rt, &gate_acc_rt, &up_acc_rt));
-    consumer.push(tk20::warp_store_st_bf_from_rt_fl::<M, TILE_N>(&out_sub, &gate_acc_rt));
+    n_loop_body.push(tk20::warpgroup_mul_rt_rt::<TILE_N>(&gate_acc_rt, &gate_acc_rt, &up_acc_rt));
+    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&out_sub, &gate_acc_rt));
+
+    let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gu_n_in_wg = 0; __gu_n_in_wg < {n_tiles_per_wg}; ++__gu_n_in_wg"),
+        &n_loop_body,
+    ));
+
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __gu_m_block = 0; __gu_m_block < {M_BLOCKS}; ++__gu_m_block"),
+        &m_loop_body,
+    ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     consumer.push(tk20::block_warp_zero(&[
@@ -1992,7 +2162,7 @@ pub fn render_fused_gate_up_activate_mul<
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait::<1>(&out_done, storer_phase));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, INTERMEDIATE_DIM>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, INTERMEDIATE_DIM>(
         &out_gmem, &out_smem, out_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait::<1>());

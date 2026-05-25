@@ -800,6 +800,137 @@ pub fn warp_mma_ABt<const M: u32, const K: u32, const N: u32>(
     ))
 }
 
+// ============================================================
+// Warpgroup (Hopper wgmma) primitives. The H100 warpgroup is
+// 4 warps × 32 threads = 128 threads = `kittens::group<4>` =
+// `kittens::warpgroup`. `wgmma` instructions accumulate into a
+// register tile that's *split across the 4 warps* (each warp
+// owns a 16-row slice → `D::height == 1` constraint), with both
+// A and B sourced from shared memory (`st_descriptor::input`).
+// This avoids the catastrophic register-blowup of pulling a full
+// `rt_bf<M, K>` tile per warp that hangs cicc on K=2048 prefill.
+//
+// Source: `include/ops/group/mma/warpgroup.cuh:140-234,91-105`,
+// `include/ops/group/group.cuh:115` (`using warpgroup =
+// group<4>`).
+// ============================================================
+
+/// `kittens::rt_fl<16, COLS> <name>;` — declare warpgroup-shaped
+/// fp32 register tile (D operand for wgmma). ROWS=16 is forced
+/// by TK 2.0's wgmma `static_assert(D::height == 1)`, where
+/// `rt::height = ROWS / TILE_ROW_DIM<T>` and `TILE_ROW_DIM<T> ==
+/// 16` for every dtype (`rt_base.cuh:68`,
+/// `kittens::TILE_ROW_DIM<T>`). So `rt_fl<16, COLS>` →
+/// height=1 ✓. Each warp of the warpgroup owns this 16-row
+/// slice; together the 4 warps form a 64-row tile.
+///
+/// Source: `include/types/register/rt.cuh` (rt_fl alias),
+/// `include/ops/group/mma/warpgroup.cuh:193-194`.
+pub fn decl_rt_fl_warpgroup<const COLS: u32>(
+    name: &str,
+) -> (CuStmt, Rt<F32, RtRow, 16, COLS>) {
+    let stmt = CuStmt::new(format!("kittens::rt_fl<16, {COLS}> {name};"));
+    (
+        stmt,
+        Rt::<F32, RtRow, 16, COLS>::from_expr(CuExpr::new(name.to_string())),
+    )
+}
+
+/// `kittens::warpgroup::zero(rt);` — set every element of the
+/// warpgroup-distributed register tile to zero. Inherited from
+/// `group<N>`'s register/maps.cuh ops (works for any group<N>).
+///
+/// Source: `include/ops/group/register/tile/maps.cuh:421-424`.
+pub fn warpgroup_zero_rt_fl<const COLS: u32>(
+    rt: &Rt<F32, RtRow, 16, COLS>,
+) -> CuStmt {
+    CuStmt::new(format!("kittens::warpgroup::zero({});", rt.expr()))
+}
+
+/// `kittens::warpgroup::mma_AB(d, a, b);` — Hopper wgmma
+/// SMEM+SMEM `D += A * B` (default `accumulate=1`). Const-generic
+/// shape contract:
+///   D: [16, N]    fp32 row, warpgroup-distributed (`rt_fl<16,N>`)
+///   A: [64,  K]   bf16,  shared (`st_bf<64, K>`)
+///   B: [K,   N]   bf16,  shared (`st_bf<K, N>`)
+/// TK 2.0 enforces (warpgroup.cuh:193-203):
+///   `M = A::rows / TILE_ROW_DIM<bf16=16> == 4` ⇒ A::rows == 64
+///   `D::height == 1` ⇒ D::rows == 16
+///   `K = A::cols / 16 == B::rows / 16`
+///   `N = B::cols / 16 == D::cols / 16`
+///   `A::T == B::T` (same dtype)
+/// Each call also `mma_commit_group()`s; pair with
+/// [`warpgroup_mma_async_wait`] before reading D.
+///
+/// Source: `include/ops/group/mma/warpgroup.cuh:191-234`.
+#[allow(non_snake_case)]
+pub fn warpgroup_mma_AB<const M: u32, const K: u32, const N: u32>(
+    d: &Rt<F32, RtRow, 16, N>,
+    a: &St<Bf16, M, K>,
+    b: &St<Bf16, K, N>,
+) -> CuStmt {
+    const {
+        assert!(
+            M == 64,
+            "warpgroup_mma_AB: A::rows must be 64 (TK 2.0 wgmma constraint M = A::rows / 16 == 4)",
+        );
+    }
+    CuStmt::new(format!(
+        "kittens::warpgroup::mma_AB({d}, {a}, {b});",
+        d = d.expr(),
+        a = a.expr(),
+        b = b.expr()
+    ))
+}
+
+/// `kittens::warpgroup::mma_async_wait();` — wait for all
+/// previously committed wgmma groups (`mma_commit_group`) to
+/// complete; required before reading the D accumulator. The
+/// default template arg `N=0` waits for *all* outstanding groups
+/// (the matmul.cu reference at line 76 calls it bare).
+///
+/// Source: `include/ops/group/mma/warpgroup.cuh:91-105`.
+pub fn warpgroup_mma_async_wait() -> CuStmt {
+    CuStmt::new("kittens::warpgroup::mma_async_wait();".to_string())
+}
+
+/// `kittens::warpgroup::store(st, rt);` — collaborative
+/// register→shared store. The 4 warps in the warpgroup each
+/// contribute their `rt_fl<16, N>` slice; together they write a
+/// `st_bf<64, N>` tile. fp32→bf16 conversion happens inside TK
+/// (`base_types::convertor`).
+///
+/// Static_assert: `ST::rows / RT::rows == GROUP_WARPS == 4` and
+/// `ST::cols == RT::cols`.
+///
+/// Source: `include/ops/group/memory/tile/shared_to_register.cuh:138-244`.
+pub fn warpgroup_store_st_bf_from_rt_fl<const ROWS: u32, const COLS: u32>(
+    st: &St<Bf16, ROWS, COLS>,
+    rt: &Rt<F32, RtRow, 16, COLS>,
+) -> CuStmt {
+    const {
+        assert!(
+            ROWS == 64,
+            "warpgroup_store_st_bf_from_rt_fl: ST::rows must equal warpgroup-distributed RT::rows*4 = 64",
+        );
+    }
+    CuStmt::new(format!(
+        "kittens::warpgroup::store({st}, {rt});",
+        st = st.expr(),
+        rt = rt.expr()
+    ))
+}
+
+/// Expression returning `kittens::warpgroup::groupid()` — which
+/// warpgroup (0-indexed) within the CTA the current warp belongs
+/// to. Computed as `threadIdx.x / 128`. Used to partition the N
+/// dimension across warpgroups in the prefill GEMM.
+///
+/// Source: `include/ops/group/group.cuh:31`.
+pub fn warpgroup_groupid_expr() -> String {
+    "static_cast<int>(kittens::warpgroup::groupid())".to_string()
+}
+
 /// `auto <name> = <parent>.template subtile<rows, cols>(int2{row, col});`
 /// — declare a named local binding to a shared-tile soft-subtile
 /// view (`st_subtile`). Returns the bound `St<Bf16, ROWS, COLS>`

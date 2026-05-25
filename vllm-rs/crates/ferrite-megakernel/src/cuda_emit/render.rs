@@ -938,13 +938,108 @@ pub fn render_gemm<
         );
     }
 
+    // M%16==0 prefill (M ∈ {64, 512, 4096}). Dispatch to a
+    // function parameterized over M_BLOCKS = M / 64 (so the inner
+    // wgmma A tile is always st_bf<64, K>). The dispatch fans
+    // M onto fixed M_BLOCKS const-generic instantiations so that
+    // Rust monomorphizes `render_gemm` at decode-shape M ∈ {1, 8}
+    // without triggering the M_BLOCKS const-asserts (which fire
+    // only when those branches are actually instantiated, and
+    // they always are at fixed M_BLOCKS values where the asserts
+    // pass).
+    if M == 64 {
+        render_gemm_prefill_wgmma::<1, 64, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else if M == 512 {
+        render_gemm_prefill_wgmma::<8, 512, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else if M == 4096 {
+        render_gemm_prefill_wgmma::<64, 4096, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
+            in_page_id, weight_page_id, out_page_id,
+            consumer_phase, storer_phase, layer,
+            in_act_slot, out_act_slot, weight_accessor,
+            bar_publish, b_tile_offset,
+        )
+    } else {
+        panic!("render_gemm prefill: unsupported M (must be 64/512/4096); got {M}");
+    }
+}
+
+// ============================================================
+// Gemm (prefill shape — TK 2.0 H100 wgmma SMEM+SMEM).
+//
+// Parameterized over `M_BLOCKS` = M_TOTAL / 64. The inner wgmma
+// always operates on a `st_bf<64, K>` A subtile (TK 2.0's
+// `warpgroup::mma_AB` enforces A::rows == 64 because
+// `M = A::rows / TILE_ROW_DIM<bf16=16> == 4`). For M > 64 we
+// emit an outer m-block loop in CUDA that subtiles the
+// activation/output along the row dimension.
+//
+// Lifted out of `render_gemm` so that Rust's monomorphization
+// of `render_gemm` at decode-shape M ∈ {1, 8} does not
+// instantiate the wgmma binding (which fails the
+// M==64 const-assert in tk20::warpgroup_mma_AB at those Ms).
+//
+// D accumulator: per-warp `rt_fl<16, TILE_N>` — each warp of
+// the 4-warp warpgroup holds 16 of the 64 rows.
+//
+// N partitioning: NCW consumer warps form NCW/4 warpgroups
+// (NCW=8 → 2 warpgroups). Full N = NCW * TILE_N. Each
+// warpgroup covers 4 of the NCW N-tiles by looping
+// `n_in_wg ∈ 0..4` and computing column block
+// `groupid()*4 + n_in_wg`.
+//
+// Note: at M_BLOCKS > 1 the activation/output pages are
+// over-committed (a `st_bf<M_TOTAL, K>` view of a 32 KB page).
+// Prefill is not invoked at runtime by the megakernel persistent
+// interpreter — these renders exist to nvcc-compile clean as
+// part of the substrate proof, with no runtime launch.
+// ============================================================
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_gemm_prefill_wgmma<
+    const M_BLOCKS: u32,
+    const M_TOTAL: u32,
+    const K: u32,
+    const N: u32,
+    const TILE_N: u32,
+    const NCW: u32,
+    const NUM_LAYERS: u32,
+    const ITERS: u32,
+>(
+    in_page_id: u32,
+    weight_page_id: u32,
+    out_page_id: u32,
+    consumer_phase: u32,
+    storer_phase: u32,
+    layer: u32,
+    in_act_slot: u32,
+    out_act_slot: u32,
+    weight_accessor: u32,
+    bar_publish: u32,
+    b_tile_offset: u32,
+) -> RoleBodies {
+    const { assert!(NCW % 4 == 0, "render_gemm prefill: NCW must be a multiple of 4 (warpgroup size)"); }
+    const { assert!(M_BLOCKS >= 1, "render_gemm prefill: M_BLOCKS must be >= 1"); }
+    const { assert!(M_TOTAL == M_BLOCKS * 64, "render_gemm prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+
+    const M_TILE: u32 = 64;
+
     let loader_phase = storer_phase;
     let in_p = page(in_page_id);
     let weight_p = page(weight_page_id);
     let out_p = page(out_page_id);
 
-    let in_smem = page_as_st_bf::<M, K>(in_p);
-    let out_smem = page_as_st_bf::<M, N>(out_p);
+    let in_smem = page_as_st_bf::<M_TOTAL, K>(in_p);
+    let out_smem = page_as_st_bf::<M_TOTAL, N>(out_p);
     let b_tile = scratch_as_st_bf::<K, N>(off(b_tile_offset));
 
     let in_ready = page_ready_sem(in_p);
@@ -958,16 +1053,16 @@ pub fn render_gemm<
     let out_gmem = gmem_act_ptr_raw(out_act_slot);
     let weight_gmem = gmem_weight_ptr_raw(weight_accessor, layer, NUM_LAYERS);
 
-    let act_bytes = M * K * BF16_BYTES;
+    let act_bytes = M_TOTAL * K * BF16_BYTES;
     let weight_bytes = K * N * BF16_BYTES;
-    let out_bytes = M * N * BF16_BYTES;
+    let out_bytes = M_TOTAL * N * BF16_BYTES;
 
     let mut loader = CuBlock::new();
     loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&weight_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&out_consumed, loader_phase));
     loader.push(tk20::group_tma_expect_bytes::<1>(&in_ready, act_bytes));
-    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M, K>(
+    loader.push(tk20::group_tma_load_async_raw_st_bf::<1, M_TOTAL, K>(
         &in_smem, &in_gmem, act_bytes, &in_ready,
     ));
     loader.push(tk20::group_tma_expect_bytes::<1>(&weight_ready, weight_bytes));
@@ -981,30 +1076,50 @@ pub fn render_gemm<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
 
-    let (decl_a, a_rt) = tk20::decl_rt_bf_row::<M, K>("__gemm_a");
-    let (decl_b, b_rt) = tk20::decl_rt_bf_col::<K, TILE_N>("__gemm_b");
-    let (decl_acc, acc_rt) = tk20::decl_rt_fl::<M, TILE_N>("__gemm_acc");
-    consumer.push(decl_a);
-    consumer.push(decl_b);
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gemm_acc");
     consumer.push(decl_acc);
 
-    let warp_idx_expr = "static_cast<int>(kittens::warpid())";
+    let n_tiles_per_wg: u32 = 4;
+    let groupid = tk20::warpgroup_groupid_expr();
+
+    // Inner N-tile loop body (per m-block). Each warpgroup
+    // owns 4 of the NCW N-tiles.
+    let mut n_loop_body = CuBlock::new();
+    n_loop_body.push(CuStmt::new(format!(
+        "int __gemm_n_idx = {groupid} * {n_tiles_per_wg} + __gemm_n_in_wg;"
+    )));
+    // A subtile: 64-row slice of in_smem along the M dim.
+    // st<>::subtile<rows, cols>(int2{row_blk, col_blk}) indexes
+    // in units of (rows, cols) — so {__gemm_m_block, 0} picks
+    // rows [m_block*64 .. m_block*64+64).
+    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
+        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
+    );
     let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, TILE_N>(
-        "__gemm_b_sub", &b_tile, "0", warp_idx_expr,
+        "__gemm_b_sub", &b_tile, "0", "__gemm_n_idx",
     );
-    let (decl_out_sub, out_sub) = tk20::decl_st_bf_subtile::<M, N, M, TILE_N>(
-        "__gemm_out_sub", &out_smem, "0", warp_idx_expr,
-    );
-    consumer.push(decl_b_sub);
-    consumer.push(decl_out_sub);
+    let (decl_out_sub, out_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, TILE_N>(
+            "__gemm_out_sub", &out_smem, "__gemm_m_block", "__gemm_n_idx",
+        );
+    n_loop_body.push(decl_a_sub);
+    n_loop_body.push(decl_b_sub);
+    n_loop_body.push(decl_out_sub);
+    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&acc_rt));
+    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, TILE_N>(&acc_rt, &a_sub, &b_sub));
+    n_loop_body.push(tk20::warpgroup_mma_async_wait());
+    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&out_sub, &acc_rt));
 
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, M, K>(&a_rt, &in_smem));
-    consumer.push(tk20::warp_load_rt_from_st_bf::<_, K, TILE_N>(&b_rt, &b_sub));
+    let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_n_in_wg = 0; __gemm_n_in_wg < {n_tiles_per_wg}; ++__gemm_n_in_wg"),
+        &n_loop_body,
+    ));
 
-    consumer.push(tk20::warp_zero_rt::<F32, _, M, TILE_N>(&acc_rt));
-    consumer.push(tk20::warp_mma_AB::<M, K, TILE_N>(&acc_rt, &a_rt, &b_rt, &acc_rt));
-
-    consumer.push(tk20::warp_store_st_bf_from_rt_fl::<M, TILE_N>(&out_sub, &acc_rt));
+    consumer.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_m_block = 0; __gemm_m_block < {M_BLOCKS}; ++__gemm_m_block"),
+        &m_loop_body,
+    ));
 
     consumer.push(tk20::group_sync_named::<NCW>(bar_publish));
     consumer.push(tk20::block_warp_zero(&[
@@ -1015,7 +1130,7 @@ pub fn render_gemm<
 
     let mut storer = CuBlock::new();
     storer.push(tk20::group_wait::<1>(&out_done, storer_phase));
-    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M, N>(
+    storer.push(tk20::group_tma_store_async_raw_st_bf::<1, M_TOTAL, N>(
         &out_gmem, &out_smem, out_bytes,
     ));
     storer.push(tk20::group_tma_store_async_wait::<1>());

@@ -149,9 +149,9 @@ fn nvcc_attention_via_cache() {
         /*q_in_act_slot=*/ 0,
         /*attn_out_act_slot=*/ 1,
         /*score_offset=*/ 0,
-        /*pv_offset=*/ 4096,
-        /*k_smem_offset=*/ 8192,
-        /*v_smem_offset=*/ 24576,
+        /*pv_offset=*/ 256,
+        /*k_smem_page_id=*/ 6,
+        /*v_smem_page_id=*/ 7,
         /*attn_scale=*/ 0.125_f32,
         /*attn_softcap=*/ 0.0_f32,
         /*interleaved=*/ false,
@@ -172,7 +172,7 @@ fn nvcc_sliding_attention_via_cache() {
         16, 64, 32, 8, 16, 256, 8, 16, 1,
     >(
         0, 1, 0, 1, 5, 0, 1,
-        0, 4096, 8192, 24576,
+        0, 256, 6, 7,
         0.125_f32, 0.0_f32, false,
         /*sliding_window=*/ 4096,
     )];
@@ -198,7 +198,7 @@ fn nvcc_attention_via_cache_softcap() {
         16, 64, 32, 8, 16, 256, 8, 16, 1,
     >(
         0, 1, 0, 1, 5, 0, 1,
-        0, 4096, 8192, 24576,
+        0, 256, 6, 7,
         0.125_f32, /*attn_softcap=*/ 30.0_f32, false,
     )];
     let cu = render_canonical("nvcc_attn_softcap", &budget_attn(), LaunchTier::Attn, &bodies);

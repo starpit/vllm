@@ -4884,13 +4884,11 @@ fn emit_canonical_build_fn(
     wp_num_tokens: u32,
     wp_sk_bucket: u32,
 ) -> Result<TokenStream, String> {
-    // Substrate budget. Sprint E task: derive these from the
-    // canonical's actual schedule walker outputs. For now use
-    // generous defaults that fit llama / qwen / gemma tape demands.
-    const NUM_PAGES: u32 = 32;
-    const NUM_CONSUMER_WARPS: u32 = 8;
-    const PAGE_SIZE: u32 = 32_768;
-    const SCRATCH_BYTES: u32 = 32_768;
+    // TK 2.0 default_config (third_party/thunderkittens/prototype/vm/config.cuh).
+    const NUM_PAGES: u32 = 13;
+    const NUM_CONSUMER_WARPS: u32 = 16;
+    const PAGE_SIZE: u32 = 16_384;
+    const SCRATCH_BYTES: u32 = 1024;
     let num_edges: u32 = count_barrier_edges(&lowered.backbone.instances)
         + count_barrier_edges(&lowered.lm_head.instances);
 

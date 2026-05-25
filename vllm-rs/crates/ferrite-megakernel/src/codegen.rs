@@ -995,7 +995,7 @@ pub fn dispatch_instruction_to_push(
                 );
             })
         }
-        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(
+        I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
             emit_attention_via_cache_push(
                 *q_slot,
                 *attn_out_slot,
@@ -1003,9 +1003,9 @@ pub fn dispatch_instruction_to_push(
                 *interleaved,
                 /*is_sliding=*/ true,
                 state,
-            ),
-        ),
-        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(
+            )
+        }
+        I::AttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => {
             emit_attention_via_cache_push(
                 *q_slot,
                 *attn_out_slot,
@@ -1013,8 +1013,8 @@ pub fn dispatch_instruction_to_push(
                 *interleaved,
                 /*is_sliding=*/ false,
                 state,
-            ),
-        ),
+            )
+        }
         I::TkGemmAdd(in_slot, residual_slot, layer, n, k, _k_offset, _k_full) => {
             let weight = weight_paths
                 .first()
@@ -1199,7 +1199,7 @@ fn emit_attention_via_cache_push(
     interleaved: bool,
     is_sliding: bool,
     state: &mut MegaDispatchState,
-) -> TokenStream {
+) -> Result<TokenStream, String> {
     let lit = Literal::u32_unsuffixed;
     let q_id = lit(q_slot);
     let out_id = lit(attn_out_slot);
@@ -1207,24 +1207,28 @@ fn emit_attention_via_cache_push(
     // BLOCK_SIZE is fixed at 16 by the Attn-tier kernel signature
     // (block_table indexes into pages of 16-token granularity).
     let block_size_const: u32 = 16;
-    let kv_block_bytes_const: u32 =
-        block_size_const * state.num_kv_heads * state.head_dim * 2;
-    let score_pv_total = state.scratch_bytes.saturating_sub(2 * kv_block_bytes_const);
-    let score_bytes_const = score_pv_total / 2;
-    let pv_bytes_const = score_pv_total - score_bytes_const;
+
+    // K_smem and V_smem each occupy a full substrate page (TK 2.0
+    // layout — see `feedback_ff_mega_skip_guards` follow-on).
+    // The Node's const assert verifies PAGE_SIZE >= KV block bytes.
+    let k_smem_page_id_const = state.alloc_distinct(&[q_slot, attn_out_slot])?;
+    let v_smem_page_id_const =
+        state.alloc_distinct(&[q_slot, attn_out_slot, k_smem_page_id_const])?;
+
+    // Score / PV scratch tiles — small reduction buffers carried by
+    // the substrate but not addressed by the current render. Cap at
+    // 256 B each (fits TK's 1024 B scratch with headroom).
     let score_off_const: u32 = 0;
+    let score_bytes_const: u32 = 256;
     let pv_off_const: u32 = score_off_const + score_bytes_const;
-    let k_smem_off_const: u32 = pv_off_const + pv_bytes_const;
-    let v_smem_off_const: u32 = k_smem_off_const + kv_block_bytes_const;
+    let pv_bytes_const: u32 = 256;
 
     let score_off = lit(score_off_const);
     let score_bytes = lit(score_bytes_const);
     let pv_off = lit(pv_off_const);
     let pv_bytes = lit(pv_bytes_const);
-    let k_smem_off = lit(k_smem_off_const);
-    let k_smem_bytes = lit(kv_block_bytes_const);
-    let v_smem_off = lit(v_smem_off_const);
-    let v_smem_bytes = lit(kv_block_bytes_const);
+    let k_smem_page_id = lit(k_smem_page_id_const);
+    let v_smem_page_id = lit(v_smem_page_id_const);
 
     let consumer_phase = lit(state.arrives & 1);
     let storer_phase = lit((state.arrives + 1) & 1);
@@ -1259,7 +1263,7 @@ fn emit_attention_via_cache_push(
     };
 
     state.arrives += 1;
-    quote! {
+    Ok(quote! {
         b.push_attention_via_cache(
             ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
             ::ferrite_megakernel::ir::PageId::<#q_id, #num_pages_lit>::new(),
@@ -1272,14 +1276,8 @@ fn emit_attention_via_cache_push(
                 #pv_off, #pv_bytes, #scratch_lit,
                 ::ferrite_megakernel::ir::AttentionScope,
             >::new(),
-            ::ferrite_megakernel::ir::ScratchRegion::<
-                #k_smem_off, #k_smem_bytes, #scratch_lit,
-                ::ferrite_megakernel::ir::AttentionScope,
-            >::new(),
-            ::ferrite_megakernel::ir::ScratchRegion::<
-                #v_smem_off, #v_smem_bytes, #scratch_lit,
-                ::ferrite_megakernel::ir::AttentionScope,
-            >::new(),
+            ::ferrite_megakernel::ir::PageId::<#k_smem_page_id, #num_pages_lit>::new(),
+            ::ferrite_megakernel::ir::PageId::<#v_smem_page_id, #num_pages_lit>::new(),
             ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
             ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
             ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
@@ -1297,7 +1295,7 @@ fn emit_attention_via_cache_push(
             #attn_scale_lit,
             #attn_softcap_lit,
         );
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1999,7 +1997,7 @@ pub fn dispatch_instruction_to_render(
                 *interleaved,
                 /*is_sliding=*/ false,
                 state,
-            ),
+            )?,
         )),
         I::SlidingAttentionViaCache(q_slot, attn_out_slot, layer, interleaved) => Ok(Some(
             render_attention_via_cache_dispatch(
@@ -2009,7 +2007,7 @@ pub fn dispatch_instruction_to_render(
                 *interleaved,
                 /*is_sliding=*/ true,
                 state,
-            ),
+            )?,
         )),
         // RopeAppend mirrors the push side, which routes through
         // push_fused_qkv_rope_cache with a sentinel qkv weight path
@@ -2130,31 +2128,31 @@ fn render_attention_via_cache_dispatch(
     interleaved: bool,
     is_sliding: bool,
     state: &mut MegaDispatchState,
-) -> TokenStream {
+) -> Result<TokenStream, String> {
     let lit = Literal::u32_unsuffixed;
     let q_id = lit(q_slot);
     let out_id = lit(attn_out_slot);
 
-    // Scratch layout — must match `emit_attention_via_cache_push`
-    // verbatim (offsets/sizes are baked into both the const-generic
-    // ScratchRegion args on the push side and the runtime-arg ints
-    // on the render side; mismatch is caught by the substrate's
-    // disjoint_with chain at proc-macro time).
+    // Page-id allocator order MUST match `emit_attention_via_cache_push`
+    // verbatim — the proc-macro walks the Instruction list TWICE (once
+    // for push, once for render) sharing the same `MegaDispatchState`
+    // checkpoint. K_smem and V_smem each occupy a full substrate page
+    // (TK 2.0 PAGE_SIZE=16384 ≥ KV block bytes; verified by Node const
+    // assert).
     let block_size_const: u32 = 16;
-    let kv_block_bytes_const: u32 =
-        block_size_const * state.num_kv_heads * state.head_dim * 2;
-    let score_pv_total = state.scratch_bytes.saturating_sub(2 * kv_block_bytes_const);
-    let score_bytes_const = score_pv_total / 2;
-    let pv_bytes_const = score_pv_total - score_bytes_const;
+    let k_smem_page_id_const = state.alloc_distinct(&[q_slot, attn_out_slot])?;
+    let v_smem_page_id_const =
+        state.alloc_distinct(&[q_slot, attn_out_slot, k_smem_page_id_const])?;
+
+    // Score / PV scratch — small reduction buffers, 256 B each (must
+    // match push side).
     let score_off_const: u32 = 0;
-    let pv_off_const: u32 = score_off_const + score_bytes_const;
-    let k_smem_off_const: u32 = pv_off_const + pv_bytes_const;
-    let v_smem_off_const: u32 = k_smem_off_const + kv_block_bytes_const;
+    let pv_off_const: u32 = 256;
 
     let score_off = lit(score_off_const);
     let pv_off = lit(pv_off_const);
-    let k_smem_off = lit(k_smem_off_const);
-    let v_smem_off = lit(v_smem_off_const);
+    let k_smem_page_id = lit(k_smem_page_id_const);
+    let v_smem_page_id = lit(v_smem_page_id_const);
 
     let consumer_phase = lit(state.arrives & 1);
     let storer_phase = lit((state.arrives + 1) & 1);
@@ -2184,7 +2182,7 @@ fn render_attention_via_cache_dispatch(
             4096
         };
         let sliding_window_lit = lit(sliding_window_val);
-        quote! {
+        Ok(quote! {
             bodies.push(::ferrite_megakernel::cuda_emit::render::render_sliding_attention_via_cache::<
                 #m_lit, #head_dim, #num_q_heads, #num_kv_heads, #block_size,
                 #max_sk, #ncw_lit, #num_layers, #iters,
@@ -2193,14 +2191,14 @@ fn render_attention_via_cache_dispatch(
                 #consumer_phase, #storer_phase,
                 #layer_lit,
                 #q_in_act_slot, #attn_out_act_slot,
-                #score_off, #pv_off, #k_smem_off, #v_smem_off,
+                #score_off, #pv_off, #k_smem_page_id, #v_smem_page_id,
                 #attn_scale_lit, #attn_softcap_lit,
                 #interleaved_lit,
                 #sliding_window_lit,
             ));
-        }
+        })
     } else {
-        quote! {
+        Ok(quote! {
             bodies.push(::ferrite_megakernel::cuda_emit::render::render_attention_via_cache::<
                 #m_lit, #head_dim, #num_q_heads, #num_kv_heads, #block_size,
                 #max_sk, #ncw_lit, #num_layers, #iters,
@@ -2209,11 +2207,11 @@ fn render_attention_via_cache_dispatch(
                 #consumer_phase, #storer_phase,
                 #layer_lit,
                 #q_in_act_slot, #attn_out_act_slot,
-                #score_off, #pv_off, #k_smem_off, #v_smem_off,
+                #score_off, #pv_off, #k_smem_page_id, #v_smem_page_id,
                 #attn_scale_lit, #attn_softcap_lit,
                 #interleaved_lit,
             ));
-        }
+        })
     }
 }
 

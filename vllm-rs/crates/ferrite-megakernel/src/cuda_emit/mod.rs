@@ -199,9 +199,10 @@ fn render_source(
     // `set_non_consumer_registers<Config>` wrappers in
     // `ferrite_warp_roles.cuh`. Promoting these to per-canonical
     // values is a future sprint.
-    const CONSUMER_REGISTERS: u32 = 240;
-    const NON_CONSUMER_REGISTERS: u32 = 24;
-    const INSTRUCTION_PIPE_STAGES: u32 = 4;
+    // TK 2.0 default_config (third_party/thunderkittens/prototype/vm/config.cuh).
+    const CONSUMER_REGISTERS: u32 = 104;
+    const NON_CONSUMER_REGISTERS: u32 = 64;
+    const INSTRUCTION_PIPE_STAGES: u32 = 2;
 
     let kernel_name = format!("ferrite_{canonical}_launch");
     let cfg_name = format!("Config_{canonical}");
@@ -317,6 +318,70 @@ fn render_source(
     s.push_str("            }\n");
     s.push_str("        }\n");
     s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    // Host wrapper: triple-bracket launch with grid/block/shmem the
+    // Rust dispatcher (interpreter::mega::launch{,_qkv,_attn}) can
+    // call directly via `extern "C" fn`. The `__global__` symbol
+    // alone is not host-callable from plain C, so emit a paired
+    // `__host__ extern "C"` wrapper. Positional args mirror
+    // `LaunchFn{,Qkv,Attn}` in
+    // `ferrite-forward/src/interpreter/mega/mod.rs:370-424`
+    // (stream is trailing). Returns the runtime error code as
+    // `int` (0 == cudaSuccess) — caller treats nonzero as failure.
+    let wrapper_name = format!("ferrite_{canonical}_launch_host");
+    let block_threads = (budget.num_consumer_warps + 4) * 32;
+    let shmem_bytes = budget.num_pages * budget.page_size + budget.scratch_bytes + 1024;
+    s.push_str(&format!("extern \"C\" __host__ int {wrapper_name}(\n"));
+    s.push_str("    __nv_bfloat16* const*       act_ptrs,\n");
+    s.push_str("    const __nv_bfloat16* const* weight_ptrs,\n");
+    let kernel_call_args = match tier {
+        LaunchTier::Base => {
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level,\n");
+            s.push_str("    const uint32_t*             input_ids,\n");
+            s.push_str("    void*                       stream\n");
+            "act_ptrs, weight_ptrs, barrier_slots, trace_level, input_ids"
+        }
+        LaunchTier::Qkv => {
+            s.push_str("    const uint32_t*             input_ids,\n");
+            s.push_str("    const uint32_t*             positions,\n");
+            s.push_str("    const int64_t*              slot_mapping,\n");
+            s.push_str("    __nv_bfloat16* const*       key_cache_ptrs,\n");
+            s.push_str("    __nv_bfloat16* const*       value_cache_ptrs,\n");
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level,\n");
+            s.push_str("    void*                       stream\n");
+            "act_ptrs, weight_ptrs, input_ids, positions, slot_mapping, key_cache_ptrs, \
+             value_cache_ptrs, barrier_slots, trace_level"
+        }
+        LaunchTier::Attn => {
+            s.push_str("    const uint32_t*             input_ids,\n");
+            s.push_str("    const uint32_t*             positions,\n");
+            s.push_str("    const int64_t*              slot_mapping,\n");
+            s.push_str("    __nv_bfloat16* const*       key_cache_ptrs,\n");
+            s.push_str("    __nv_bfloat16* const*       value_cache_ptrs,\n");
+            s.push_str("    const int32_t*              seq_lens,\n");
+            s.push_str("    const uint32_t*             block_table,\n");
+            s.push_str("    uint32_t                    block_table_stride,\n");
+            s.push_str("    int32_t*                    barrier_slots,\n");
+            s.push_str("    int32_t                     trace_level,\n");
+            s.push_str("    void*                       stream\n");
+            "act_ptrs, weight_ptrs, input_ids, positions, slot_mapping, key_cache_ptrs, \
+             value_cache_ptrs, seq_lens, block_table, block_table_stride, barrier_slots, \
+             trace_level"
+        }
+    };
+    s.push_str(") {\n");
+    s.push_str(&format!(
+        "    cudaFuncSetAttribute((const void*){kernel_name}, \
+         cudaFuncAttributeMaxDynamicSharedMemorySize, {shmem_bytes});\n"
+    ));
+    s.push_str(&format!(
+        "    {kernel_name}<<<dim3(1,1,1), dim3({block_threads},1,1), {shmem_bytes}, \
+         (cudaStream_t)stream>>>({kernel_call_args});\n"
+    ));
+    s.push_str("    return (int)cudaGetLastError();\n");
     s.push_str("}\n\n");
 
     s.push_str("} // namespace\n");
@@ -1175,8 +1240,8 @@ mod tests {
             /*attn_out_act_slot=*/ 1,
             /*score_offset=*/ 0,
             /*pv_offset=*/ 4096,
-            /*k_smem_offset=*/ 8192,
-            /*v_smem_offset=*/ 24576,
+            /*k_smem_page_id=*/ 6,
+            /*v_smem_page_id=*/ 7,
             /*attn_scale=*/ 0.125_f32,
             /*attn_softcap=*/ 0.0_f32,
             /*interleaved=*/ false,
@@ -1196,8 +1261,8 @@ mod tests {
             "__shared__ kittens::semaphore __attn_k_arr;",
             "__shared__ kittens::semaphore __attn_v_arr;",
             "kittens::init_semaphore(__attn_k_arr, 0, 1);",
-            "ss.scratch + 8192",   // K_smem
-            "ss.scratch + 24576",  // V_smem
+            "ss.pages[6]",         // K_smem
+            "ss.pages[7]",         // V_smem
             "static_cast<int>(seq_lens[0])",
             "(__attn_seq_len + 16 - 1) / 16",
             // Per-Q-head outer loop.
@@ -1256,7 +1321,7 @@ mod tests {
             16, 64, 32, 8, 16, 256, 8, 16, 1,
         >(
             0, 1, 0, 1, 5, 0, 1,
-            0, 4096, 8192, 24576,
+            0, 4096, 6, 7,
             0.125_f32, 0.0_f32, false,
         )];
         let cu = render_canonical("test_attn", &budget_lg(), LaunchTier::Attn, &bodies);
@@ -1271,7 +1336,7 @@ mod tests {
             16, 64, 32, 8, 16, 256, 8, 16, 1,
         >(
             0, 1, 0, 1, 5, 0, 1,
-            0, 4096, 8192, 24576,
+            0, 4096, 6, 7,
             0.125_f32, 0.0_f32, false,
             /*sliding_window=*/ 4096,
         )];

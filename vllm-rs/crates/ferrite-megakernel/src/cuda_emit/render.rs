@@ -3554,8 +3554,8 @@ pub fn render_attention_via_cache<
     attn_out_act_slot: u32,
     _score_offset: u32,
     _pv_offset: u32,
-    k_smem_offset: u32,
-    v_smem_offset: u32,
+    k_smem_page_id: u32,
+    v_smem_page_id: u32,
     attn_scale: f32,
     attn_softcap: f32,
     _interleaved: bool,
@@ -3575,8 +3575,8 @@ pub fn render_attention_via_cache<
             layer,
             q_in_act_slot,
             attn_out_act_slot,
-            k_smem_offset,
-            v_smem_offset,
+            k_smem_page_id,
+            v_smem_page_id,
             attn_scale,
             attn_softcap,
             /*sliding_window=*/ None,
@@ -3592,8 +3592,8 @@ pub fn render_attention_via_cache<
             layer,
             q_in_act_slot,
             attn_out_act_slot,
-            k_smem_offset,
-            v_smem_offset,
+            k_smem_page_id,
+            v_smem_page_id,
             attn_scale,
             attn_softcap,
             /*sliding_window=*/ None,
@@ -3633,8 +3633,8 @@ pub fn render_sliding_attention_via_cache<
     attn_out_act_slot: u32,
     _score_offset: u32,
     _pv_offset: u32,
-    k_smem_offset: u32,
-    v_smem_offset: u32,
+    k_smem_page_id: u32,
+    v_smem_page_id: u32,
     attn_scale: f32,
     attn_softcap: f32,
     _interleaved: bool,
@@ -3651,8 +3651,8 @@ pub fn render_sliding_attention_via_cache<
             layer,
             q_in_act_slot,
             attn_out_act_slot,
-            k_smem_offset,
-            v_smem_offset,
+            k_smem_page_id,
+            v_smem_page_id,
             attn_scale,
             attn_softcap,
             Some(sliding_window),
@@ -3668,8 +3668,8 @@ pub fn render_sliding_attention_via_cache<
             layer,
             q_in_act_slot,
             attn_out_act_slot,
-            k_smem_offset,
-            v_smem_offset,
+            k_smem_page_id,
+            v_smem_page_id,
             attn_scale,
             attn_softcap,
             Some(sliding_window),
@@ -3743,8 +3743,8 @@ fn render_attention_via_cache_impl<
     layer: u32,
     q_in_act_slot: u32,
     attn_out_act_slot: u32,
-    k_smem_offset: u32,
-    v_smem_offset: u32,
+    k_smem_page_id: u32,
+    v_smem_page_id: u32,
     attn_scale: f32,
     attn_softcap: f32,
     sliding_window: Option<u32>,
@@ -3870,20 +3870,22 @@ fn render_attention_via_cache_impl<
         out_id = attn_out_page_id,
     )));
 
-    // K_smem / V_smem typed views (single-stage paged-KV staging).
+    // K_smem / V_smem typed views (single-stage paged-KV staging,
+    // each occupying one full page — TK 2.0 default_config has
+    // PAGE_SIZE=16384, exactly one KV block).
     consumer.push(CuStmt::new(format!(
         "auto& __attn_k_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
-         ss.scratch + {ksoff});",
+         ss.pages[{kpid}]);",
         bs = BLOCK_SIZE,
         kvd = kv_dim,
-        ksoff = k_smem_offset,
+        kpid = k_smem_page_id,
     )));
     consumer.push(CuStmt::new(format!(
         "auto& __attn_v_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
-         ss.scratch + {vsoff});",
+         ss.pages[{vpid}]);",
         bs = BLOCK_SIZE,
         kvd = kv_dim,
-        vsoff = v_smem_offset,
+        vpid = v_smem_page_id,
     )));
 
     // Per-token paged-KV walk parameters. `seq_lens[0]` is used
@@ -4338,8 +4340,8 @@ pub fn render_attention_via_cache_decode<
     layer: u32,
     q_in_act_slot: u32,
     attn_out_act_slot: u32,
-    k_smem_offset: u32,
-    v_smem_offset: u32,
+    k_smem_page_id: u32,
+    v_smem_page_id: u32,
     attn_scale: f32,
     attn_softcap: f32,
     sliding_window: Option<u32>,
@@ -4451,20 +4453,22 @@ pub fn render_attention_via_cache_decode<
     )));
 
     // K_smem / V_smem typed views for this layer's full-block
-    // staging (single-stage paged-KV gather).
+    // staging (single-stage paged-KV gather), each on its own
+    // page — TK 2.0 default_config has PAGE_SIZE=16384, exactly
+    // one KV block.
     consumer.push(CuStmt::new(format!(
         "auto& __attn_k_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
-         ss.scratch + {ksoff});",
+         ss.pages[{kpid}]);",
         bs = BLOCK_SIZE,
         kvd = kv_dim,
-        ksoff = k_smem_offset,
+        kpid = k_smem_page_id,
     )));
     consumer.push(CuStmt::new(format!(
         "auto& __attn_v_smem = *reinterpret_cast<kittens::st_bf<{bs}, {kvd}>*>(\
-         ss.scratch + {vsoff});",
+         ss.pages[{vpid}]);",
         bs = BLOCK_SIZE,
         kvd = kv_dim,
-        vsoff = v_smem_offset,
+        vpid = v_smem_page_id,
     )));
 
     // Per-token paged-KV walk parameters. M=1: single seq, single

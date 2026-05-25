@@ -1419,10 +1419,8 @@ impl<
         const SCORE_BYTES: u32,
         const PV_OFF: u32,
         const PV_BYTES: u32,
-        const K_SMEM_OFF: u32,
-        const K_SMEM_BYTES: u32,
-        const V_SMEM_OFF: u32,
-        const V_SMEM_BYTES: u32,
+        const K_SMEM_PAGE_ID: u32,
+        const V_SMEM_PAGE_ID: u32,
         const CONSUMER_PHASE: u32,
         const STORER_PHASE: u32,
         const ITERS: u32,
@@ -1448,12 +1446,10 @@ impl<
         pv_tile: crate::ir::substrate::ScratchRegion<
             PV_OFF, PV_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
         >,
-        k_smem: crate::ir::substrate::ScratchRegion<
-            K_SMEM_OFF, K_SMEM_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
-        >,
-        v_smem: crate::ir::substrate::ScratchRegion<
-            V_SMEM_OFF, V_SMEM_BYTES, SCRATCH_BYTES, crate::ir::substrate::AttentionScope,
-        >,
+        // K_smem and V_smem live in pages (TK 2.0 layout) — not
+        // scratch (which is 1024 B in TK's default_config).
+        _k_smem_page: crate::ir::substrate::PageId<K_SMEM_PAGE_ID, NUM_PAGES>,
+        _v_smem_page: crate::ir::substrate::PageId<V_SMEM_PAGE_ID, NUM_PAGES>,
         _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
         _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
@@ -1483,14 +1479,12 @@ impl<
         //    the cumulative `ARRIVES` count (the
         //    `AttentionViaCacheNode::new` parity asserts become
         //    dead once these are discharged here).
+        // Score / PV tiles are pairwise disjoint scratch regions.
+        // K_smem / V_smem live in distinct PAGES — proven by the
+        // `K_SMEM_PAGE_ID != V_SMEM_PAGE_ID` const assertion in
+        // `TkAttentionViaCacheNode::new`. Page-vs-scratch
+        // disjointness follows from storage class.
         let (score_tile, pv_tile) = score_tile.disjoint_with(pv_tile);
-        let (score_tile, k_smem) = score_tile.disjoint_with(k_smem);
-        let (score_tile, v_smem) = score_tile.disjoint_with(v_smem);
-        let (pv_tile, k_smem) = pv_tile.disjoint_with(k_smem);
-        let (pv_tile, v_smem) = pv_tile.disjoint_with(v_smem);
-        let (k_smem, v_smem) = k_smem.disjoint_with(v_smem);
-        let _k_smem = k_smem.fits_kv_block::<BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM>();
-        let _v_smem = v_smem.fits_kv_block::<BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM>();
         let _ = score_tile;
         let _ = pv_tile;
         let _ = crate::ir::substrate::MbarrierPhase::<CONSUMER_PHASE>::assert_matches::<ARRIVES>();
@@ -1500,6 +1494,8 @@ impl<
         self.verify_arrives(ARRIVES, "push_attention_via_cache");
         let _ = self.pool.take(Q_IN_ID);
         let _ = self.pool.take(ATTN_OUT_ID);
+        let _ = self.pool.take(K_SMEM_PAGE_ID);
+        let _ = self.pool.take(V_SMEM_PAGE_ID);
         let attn_scale = FiniteF32::new(attn_scale);
         let attn_softcap = FiniteF32::new(attn_softcap);
         let node = TkAttentionViaCacheNode::new::<
@@ -1509,16 +1505,15 @@ impl<
             SCORE_BYTES,
             PV_OFF,
             PV_BYTES,
-            K_SMEM_OFF,
-            K_SMEM_BYTES,
-            V_SMEM_OFF,
-            V_SMEM_BYTES,
+            K_SMEM_PAGE_ID,
+            V_SMEM_PAGE_ID,
             CONSUMER_PHASE,
             STORER_PHASE,
             ITERS,
             LAYER,
             NUM_PAGES,
             NUM_LAYERS,
+            PAGE_SIZE,
             SCRATCH_BYTES,
             ARRIVES,
             HEAD_DIM,
@@ -1533,6 +1528,8 @@ impl<
         self.nodes.push(MegaNode::TkAttentionViaCache(node));
         self.pool.release(Q_IN_ID);
         self.pool.release(ATTN_OUT_ID);
+        self.pool.release(K_SMEM_PAGE_ID);
+        self.pool.release(V_SMEM_PAGE_ID);
         for _ in 0..ITERS {
             self.arrives.bump();
         }

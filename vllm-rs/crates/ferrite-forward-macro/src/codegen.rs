@@ -4885,8 +4885,13 @@ fn emit_canonical_build_fn(
     wp_sk_bucket: u32,
 ) -> Result<TokenStream, String> {
     // TK 2.0 default_config (third_party/thunderkittens/prototype/vm/config.cuh).
+    // NUM_CONSUMER_WARPS is per-canonical: TK 2.0 default_config uses 16, but the
+    // decode attention render skip-guards on `NCW != NUM_KV_HEADS` (one consumer
+    // warp per kv_head — see render_attention_via_cache_decode header) and the
+    // lm_head TkFusedNormGemm render needs `N % NCW == 0 && (N/NCW) % 32 == 0`,
+    // so we pick NUM_CONSUMER_WARPS = num_kv_heads when that satisfies both.
+    // Falls back to TK 2.0 default (16) when num_kv_heads is unset or out of range.
     const NUM_PAGES: u32 = 13;
-    const NUM_CONSUMER_WARPS: u32 = 16;
     const PAGE_SIZE: u32 = 16_384;
     const SCRATCH_BYTES: u32 = 1024;
     let num_edges: u32 = count_barrier_edges(&lowered.backbone.instances)
@@ -4949,9 +4954,22 @@ fn emit_canonical_build_fn(
         .copied()
         .unwrap_or(0) as u32;
 
+    // Per-canonical NUM_CONSUMER_WARPS — see comment at top of fn. Pick
+    // num_kv_heads when it satisfies the decode/lm_head divisibility
+    // constraints; fall back to TK 2.0 default_config (16) otherwise.
+    let num_consumer_warps: u32 = {
+        let candidate = num_kv_heads;
+        let attn_ok = candidate > 0 && candidate <= 16 && num_q_heads % candidate == 0;
+        let lm_head_ok = vocab_size > 0
+            && candidate > 0
+            && vocab_size % candidate == 0
+            && (vocab_size / candidate) % 32 == 0;
+        if attn_ok && lm_head_ok { candidate } else { 16 }
+    };
+
     let mut state = MegaDispatchState::new(
         NUM_PAGES,
-        NUM_CONSUMER_WARPS,
+        num_consumer_warps,
         SCRATCH_BYTES,
         effective_num_layers,
         hidden_dim,
@@ -4987,7 +5005,7 @@ fn emit_canonical_build_fn(
     // `bodies.push(render_*::<...>)` agree per Instruction.
     let mut render_state = MegaDispatchState::new(
         NUM_PAGES,
-        NUM_CONSUMER_WARPS,
+        num_consumer_warps,
         SCRATCH_BYTES,
         effective_num_layers,
         hidden_dim,
@@ -5051,7 +5069,7 @@ fn emit_canonical_build_fn(
     let fn_name = format_ident!("build_mega_tape_{}", canonical_name);
     let emit_fn_name = format_ident!("emit_for_canonical_{}", canonical_name);
     let num_pages_lit = proc_macro2::Literal::u32_unsuffixed(NUM_PAGES);
-    let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(NUM_CONSUMER_WARPS);
+    let num_warps_lit = proc_macro2::Literal::u32_unsuffixed(num_consumer_warps);
     let num_layers_lit_for_finish =
         proc_macro2::Literal::u32_unsuffixed(effective_num_layers);
     let page_size_lit = proc_macro2::Literal::u32_unsuffixed(PAGE_SIZE);
@@ -5590,7 +5608,7 @@ pub fn emit_model(
         // Per-bucket colored slot map. Computed once and shared
         // between backbone lowering and the lm_head fan_out so they
         // agree on slot indices.
-        let slots = crate::interpreter_codegen::colored_slot_map(
+        let (slots, slot_shapes) = crate::interpreter_codegen::colored_slot_map(
             fuf,
             sfuf,
             loop_ir,
@@ -5623,6 +5641,7 @@ pub fn emit_model(
             &mut arch_opcodes,
             backbone_out,
             &slots,
+            &slot_shapes,
         );
 
         // LM_HEAD — only emitted in decoder mode. One row, computed
@@ -5663,6 +5682,7 @@ pub fn emit_model(
                     weight_slots: term_weight_slots,
                     num_slots,
                     final_slot: terminal_slot,
+                    slot_shapes: slot_shapes.clone(),
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
@@ -5670,6 +5690,7 @@ pub fn emit_model(
                 weight_slots: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
+                slot_shapes: slot_shapes.clone(),
             },
         };
 
@@ -5779,7 +5800,7 @@ pub fn emit_model(
         if matches!(layout, BackboneLayout::Decoder { .. }) {
             protected_bb.insert((last_node_id, 0));
         }
-        let slots = crate::interpreter_codegen::colored_slot_map(
+        let (slots, slot_shapes) = crate::interpreter_codegen::colored_slot_map(
             fuf,
             sfuf,
             loop_ir,
@@ -5806,6 +5827,7 @@ pub fn emit_model(
             &mut arch_opcodes,
             backbone_out,
             &slots,
+            &slot_shapes,
         );
         let lowered_lm = match layout {
             BackboneLayout::Decoder { .. } => {
@@ -5844,6 +5866,7 @@ pub fn emit_model(
                     weight_slots: term_weight_slots,
                     num_slots,
                     final_slot: terminal_slot,
+                    slot_shapes: slot_shapes.clone(),
                 }
             }
             BackboneLayout::Encoder => crate::interpreter_codegen::LoweredBucket {
@@ -5851,6 +5874,7 @@ pub fn emit_model(
                 weight_slots: Vec::new(),
                 num_slots,
                 final_slot: terminal_slot,
+                slot_shapes: slot_shapes.clone(),
             },
         };
         canonical_lowered_decode.insert(

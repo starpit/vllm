@@ -2458,7 +2458,7 @@ pub fn colored_slot_map(
     lib: &ImplementationLibrary,
     skip_subgraph: Option<SubgraphId>,
     protected: &HashSet<(TileId, u8)>,
-) -> SlotMap {
+) -> (SlotMap, BTreeMap<u32, Shape>) {
     use std::collections::BTreeSet;
 
     // Walk subgraphs in execution order; assign each one a position.
@@ -2708,7 +2708,8 @@ pub fn colored_slot_map(
         active.push((lu_self, color, (tile, slot)));
     }
 
-    sm
+    let color_shape: BTreeMap<u32, Shape> = color_shape.into_iter().collect();
+    (sm, color_shape)
 }
 
 // ── Per-bucket lowering ──────────────────────────────────────────
@@ -2734,6 +2735,14 @@ pub struct LoweredBucket {
     /// Slot index whose `Owned` entry is the bucket fn's return
     /// value.
     pub final_slot: u32,
+    /// Per-color symbolic shape minted by `colored_slot_map`. Used by
+    /// the megakernel ABI emitter (`emit_mega_artifacts_inline`) to
+    /// resolve each runtime slot's `OwnedTensor` shape against the
+    /// bucket's workload-point bounds — the megakernel `act_ptrs`
+    /// staging path needs concrete (M, ...) byte sizes for each slot.
+    /// Host-interpreter codegen ignores this map (the eval bodies
+    /// already carry shape metadata via `OwnedTensor`).
+    pub slot_shapes: BTreeMap<u32, Shape>,
 }
 
 /// Variant shapes the macro accumulates across every bucket of one
@@ -3190,6 +3199,7 @@ pub fn lower_bucket(
     arch_opcodes: &mut ArchOpcodes,
     final_tile: (TileId, u8),
     slots: &SlotMap,
+    slot_shapes: &BTreeMap<u32, Shape>,
 ) -> LoweredBucket {
     let num_slots = slots.total();
 
@@ -3318,6 +3328,7 @@ pub fn lower_bucket(
         weight_slots,
         num_slots,
         final_slot,
+        slot_shapes: slot_shapes.clone(),
     }
 }
 
@@ -3762,7 +3773,7 @@ mod tests {
         let sfuf = linear_assignment(&[TileId(0), TileId(1), TileId(2)], &[id_plain; 3]);
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_eq!(sm.total(), 1, "serial chain coalesces to one slot");
         assert_eq!(sm.of(TileId(0), 0), sm.of(TileId(1), 0));
@@ -3797,7 +3808,7 @@ mod tests {
         );
         let lp = linear_loop(4);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         // t1 and t2 are co-live at the moment t2 is being written
         // (t1 was just written, t2 is being written, both must
@@ -3834,7 +3845,7 @@ mod tests {
         let lp = linear_loop(3);
         let mut protected: HashSet<(TileId, u8)> = HashSet::new();
         protected.insert((TileId(0), 0));
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         let c_protected = sm.of(TileId(0), 0);
         let c_t1 = sm.of(TileId(1), 0);
@@ -3885,7 +3896,7 @@ mod tests {
         );
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_eq!(
             sm.of(TileId(0), 0),
@@ -3967,7 +3978,7 @@ mod tests {
         );
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_eq!(
             sm.of(TileId(0), 0),
@@ -4026,7 +4037,7 @@ mod tests {
         );
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_ne!(
             sm.of(TileId(0), 0),
@@ -4101,7 +4112,7 @@ mod tests {
         );
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_ne!(
             sm.of(TileId(0), 0),
@@ -4160,7 +4171,7 @@ mod tests {
         );
         let lp = linear_loop(3);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_eq!(
             sm.of(TileId(0), 0),
@@ -4212,7 +4223,7 @@ mod tests {
         let sfuf = linear_assignment(&[TileId(0), TileId(1)], &[id_plain; 2]);
         let lp = linear_loop(2);
         let protected: HashSet<(TileId, u8)> = HashSet::new();
-        let sm = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
+        let (sm, _) = colored_slot_map(&f, &sfuf, &lp, &lib, None, &protected);
 
         assert_ne!(
             sm.of(TileId(0), 0),

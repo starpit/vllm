@@ -39,7 +39,7 @@ use syn::Ident;
 use crate::classified::{OpKind, Program, WeightId};
 use crate::config::ModelParams;
 use crate::fuf::{Fuf, FufInput, TileId};
-use crate::impl_lib::{ImplementationLibrary, WeightAccessor, WeightSlot};
+use crate::impl_lib::{ImplementationLibrary, WeightAccessor, WeightSlot, eval_shape_with};
 use crate::interpreter_codegen::{ArchOpcodes, emit_bucket_static_slice, lower_bucket};
 use crate::schedule::WorkloadLoops;
 use crate::solver::WorkloadAssignments;
@@ -52,8 +52,8 @@ use crate::solver::WorkloadAssignments;
 // (no megakernel logic in non-mega crates).
 use ferrite_megakernel::codegen::{
     MegaDispatchState, count_barrier_edges, dispatch_instruction_to_push,
-    dispatch_instruction_to_render, instruction_kind, launch_tier_for_instructions,
-    max_loop_iter_count, normalize_tk_prefix,
+    dispatch_instruction_to_render, instruction_kind, instruction_weight_bases,
+    launch_tier_for_instructions, max_loop_iter_count, normalize_tk_prefix,
 };
 
 // ── Weights struct + loader emission ─────────────────────────────
@@ -4793,6 +4793,8 @@ type MegaArtifacts = (
 fn emit_mega_artifacts_inline(
     model: &ModelParams,
     canonical_lowered: &BTreeMap<crate::solver::WorkloadPoint, (CanonicalLowered, u32, u32, u32)>,
+    accessor_type_by_base: &BTreeMap<String, String>,
+    tp_world_size: u8,
 ) -> MegaArtifacts {
     // Phase C step 1 (per `MEGA_IR_PLAN.md` §5+§C): for each
     // canonical, emit a `build_mega_tape_<canonical>() -> MegaTape`
@@ -4814,6 +4816,7 @@ fn emit_mega_artifacts_inline(
     let mut rust_decls = TokenStream::new();
     let mut emitted_count: u32 = 0;
     let mut skipped_count: u32 = 0;
+    let mut decode_map: BTreeMap<crate::solver::WorkloadPoint, Ident> = BTreeMap::new();
 
     for (wp, (lowered, _num_slots, _backbone_slot, _terminal_slot)) in canonical_lowered {
         let canonical_name = format!(
@@ -4832,12 +4835,16 @@ fn emit_mega_artifacts_inline(
             lowered,
             num_layers,
             model,
-            wp.num_tokens as u32,
-            wp.sk_bucket as u32,
+            *wp,
+            accessor_type_by_base,
+            tp_world_size,
         ) {
-            Ok(tokens) => {
+            Ok((tokens, wrapper_ident_opt)) => {
                 rust_decls.extend(tokens);
                 emitted_count += 1;
+                if let Some(ident) = wrapper_ident_opt {
+                    decode_map.insert(*wp, ident);
+                }
                 eprintln!(
                     "ferrite-megakernel: emitted build_mega_tape_{canonical_name} (compile-time substrate proofs at user build)"
                 );
@@ -4850,16 +4857,20 @@ fn emit_mega_artifacts_inline(
     }
 
     eprintln!(
-        "ferrite-megakernel: phase-c step 1 — {emitted_count} canonical(s) emitted, {skipped_count} skipped"
+        "ferrite-megakernel: phase-c step 1 — {emitted_count} canonical(s) emitted, {skipped_count} skipped, {} decode wrapper(s) wired",
+        decode_map.len()
     );
 
-    // Phase C step 2 (emit `.cu` per build_mega_tape fn) and step 3
-    // (populate MEGA_FORWARD_TABLE) follow. For now emit zero
-    // dispatch entries so every canonical falls back to the host
-    // interpreter at runtime.
+    // Phase C step 3: every render-eligible canonical now has a
+    // `forward_mega_<canonical>` wrapper Ident in `decode_map`. The
+    // FORWARD_TABLE_DECODE construction site reads this map and emits
+    // a typed fn-pointer per canonical so runtime dispatch hits the
+    // megakernel instead of the host interpreter. Multi-step and
+    // persistent-decode tables stay empty until those tiers are wired
+    // (`LaunchTier::MultiStep` / `PersistentDecode`).
     (
         rust_decls,
-        BTreeMap::new(),
+        decode_map,
         BTreeMap::new(),
         BTreeMap::new(),
     )
@@ -4876,14 +4887,18 @@ fn emit_mega_artifacts_inline(
 /// Returns `Err(reason)` if any instruction can't be dispatched
 /// (variant not yet wired through the const-generic builder API).
 /// The caller `eprintln!`s the reason and skips the canonical.
+#[allow(clippy::too_many_arguments)]
 fn emit_canonical_build_fn(
     canonical_name: &str,
     lowered: &CanonicalLowered,
     num_layers: u32,
     model: &ModelParams,
-    wp_num_tokens: u32,
-    wp_sk_bucket: u32,
-) -> Result<TokenStream, String> {
+    wp: crate::solver::WorkloadPoint,
+    accessor_type_by_base: &BTreeMap<String, String>,
+    tp_world_size: u8,
+) -> Result<(TokenStream, Option<Ident>), String> {
+    let wp_num_tokens = wp.num_tokens as u32;
+    let wp_sk_bucket = wp.sk_bucket as u32;
     // TK 2.0 default_config (third_party/thunderkittens/prototype/vm/config.cuh).
     // NUM_CONSUMER_WARPS is per-canonical: TK 2.0 default_config uses 16, but the
     // decode attention render skip-guards on `NCW != NUM_KV_HEADS` (one consumer
@@ -5077,6 +5092,160 @@ fn emit_canonical_build_fn(
     let num_edges_lit = proc_macro2::Literal::u32_unsuffixed(num_edges);
     let canonical_str = canonical_name.to_string();
 
+    // Phase C step 3 — `forward_mega_<canonical>` wrapper. Only emit
+    // when render succeeded (otherwise the wrapper would dlsym a
+    // `ferrite_<canonical>_launch_host` symbol that nvcc never emits).
+    // Must succeed AT ALL slots / terminal — else skip the canonical
+    // entirely (host-fallback). `wrapper_ident_opt` is the dispatch
+    // table value, returned to the caller.
+    //
+    // Two-pass build chicken-and-egg: the wrapper emits an
+    // `extern "C" { fn ferrite_<canonical>_launch_host(...) }` decl
+    // referenced by `forward_mega_<canonical>`. That symbol comes
+    // from libmegakernels.a, which `ferrite-cuda-builder/build.rs`
+    // nvcc-compiles from `<cache>/megakernels/ferrite_<canonical>.cu`.
+    // Those `.cu` files are written by the `ferrite-mega-cu-emit`
+    // bin, which itself depends on ferrite-model-llama — so on a
+    // cold cache, building cu-emit fails to link the wrapper externs
+    // before the bin can run to populate the cache. Gate emission
+    // on whether THIS canonical's `.cu` already exists in the
+    // cudaforge cache:
+    //   pass 1 (cold): `cargo run -p ferrite-mega-cu-emit --features cuda`
+    //                  — no `.cu` files exist → wrappers skipped → cu-emit
+    //                  links → runs → populates `.cu` cache for whatever
+    //                  canonical set the solver picks this run.
+    //   pass 2:        `cargo clean -p ferrite-model-llama && \
+    //                   cargo build -p vllm-cli --features cuda`
+    //                  — proc-macro re-runs, sees `.cu` files for the
+    //                  canonicals whose render succeeded last pass,
+    //                  emits wrappers for those (and only those).
+    //                  ferrite-cuda-builder nvcc-compiles `.cu` →
+    //                  libmegakernels.a → link clean.
+    // Per-canonical gating (vs blanket env var) survives canonical-
+    // set drift between passes: a canonical whose `.cu` isn't in
+    // the cache yet gets host-fallback dispatch this pass, and gets
+    // its `.cu` on the next cu-emit run.
+    let mut wrapper_tokens = TokenStream::new();
+    let mut wrapper_ident_opt: Option<Ident> = None;
+    let cu_path = {
+        // dirs::cache_dir() — Linux: $XDG_CACHE_HOME or $HOME/.cache.
+        // macOS: $HOME/Library/Caches. Mirror the same lookup the
+        // ferrite-mega-cu-emit bin (and ferrite-cuda-builder build.rs)
+        // use so the per-canonical .cu existence check matches.
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        base.join("cudaforge/megakernels")
+            .join(format!("ferrite_{canonical_name}.cu"))
+    };
+    let cu_exists = cu_path.exists();
+    if render_body_opt.is_some() && cu_exists {
+        // Wrapper-only failures (shape eval / weight base walk /
+        // wrapper emit) must not bail the whole canonical — if they
+        // do, the canonical drops from `canonical_lowered` and the
+        // build_mega_tape side never emits, causing canonical-set
+        // drift between passes (a canonical present in pass 1's
+        // emit set goes missing in pass 2 the moment its `.cu` lands
+        // in the cache and the wrapper-emit path runs and errors).
+        // Catch all wrapper errors locally; on failure, leave
+        // `wrapper_tokens` empty + `wrapper_ident_opt = None` (host
+        // fallback for THIS canonical) and let build_mega_tape emit
+        // proceed normally.
+        let try_emit = || -> Result<(TokenStream, Ident), String> {
+            let bounds = bounds_for_wp(model, wp, tp_world_size);
+            // weight_bases: walk both buckets in the same order as the
+            // push walk (state.next_weight_accessor bumps per
+            // `instruction_weight_bases` entry).
+            let bb_weight_bases =
+                emit_slice_weight_bases_with_loop_expansion("backbone", &lowered.backbone)?;
+            let lm_weight_bases =
+                emit_slice_weight_bases_with_loop_expansion("lm_head", &lowered.lm_head)?;
+            let mut weight_bases: Vec<Option<String>> = bb_weight_bases;
+            weight_bases.extend(lm_weight_bases);
+
+            // slot_byte_sizes — combined across backbone + lm_head
+            // (shared coloring scope per project memory
+            // `feedback_ff_mega_phase_c.md`).
+            let total_slots = lowered.backbone.num_slots.max(lowered.lm_head.num_slots);
+            let mut slot_byte_sizes: Vec<u64> = Vec::with_capacity(total_slots as usize);
+            for c in 0..total_slots {
+                let shape_opt = lowered
+                    .backbone
+                    .slot_shapes
+                    .get(&c)
+                    .or_else(|| lowered.lm_head.slot_shapes.get(&c));
+                let dims = match shape_opt {
+                    Some(s) => match eval_shape_with(s, &bounds) {
+                        Some(d) => d,
+                        None => {
+                            return Err(format!(
+                                "{canonical_name}: slot {c} symbolic shape failed to eval against bounds"
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(format!(
+                            "{canonical_name}: slot {c} has no Shape in either bucket's slot_shapes"
+                        ));
+                    }
+                };
+                let bytes = dims.iter().product::<u64>().saturating_mul(2);
+                slot_byte_sizes.push(bytes);
+            }
+
+            // terminal slot — final logits tile from lm_head bucket.
+            let terminal_slot = lowered.lm_head.final_slot;
+            let terminal_shape = lowered
+                .lm_head
+                .slot_shapes
+                .get(&terminal_slot)
+                .ok_or_else(|| {
+                    format!(
+                        "{canonical_name}: terminal slot {terminal_slot} \
+                         missing from lm_head slot_shapes"
+                    )
+                })?;
+            let terminal_dims = eval_shape_with(terminal_shape, &bounds).ok_or_else(|| {
+                format!(
+                    "{canonical_name}: terminal slot {terminal_slot} \
+                     symbolic shape failed to eval against bounds"
+                )
+            })?;
+            let terminal_bytes = terminal_dims.iter().product::<u64>().saturating_mul(2);
+            let terminal_cols = *terminal_dims.last().unwrap_or(&1);
+
+            emit_forward_mega_wrapper(
+                canonical_name,
+                &weight_bases,
+                &slot_byte_sizes,
+                terminal_slot,
+                terminal_bytes,
+                terminal_cols,
+                effective_num_layers,
+                wp.num_tokens,
+                num_edges,
+                tier,
+                accessor_type_by_base,
+            )
+        };
+        match try_emit() {
+            Ok((w_tokens, w_ident)) => {
+                wrapper_tokens = w_tokens;
+                wrapper_ident_opt = Some(w_ident);
+            }
+            Err(reason) => {
+                eprintln!(
+                    "ferrite-megakernel: {canonical_name}: wrapper emission \
+                     failed (canonical kept, host-fallback dispatch): {reason}"
+                );
+            }
+        }
+    }
+
     let emit_fn_tokens = match render_body_opt {
         Some(render_body) => quote! {
             /// Compile-time-substrate-proof-bearing `.cu` emit.
@@ -5135,7 +5304,7 @@ fn emit_canonical_build_fn(
         },
     };
 
-    Ok(quote! {
+    let combined = quote! {
         /// Compile-time-substrate-proof-bearing MegaTape constructor.
         /// Phase C step 1: every `push_*::<...>` call below is
         /// monomorphized at THIS user's compile time, firing the
@@ -5151,7 +5320,10 @@ fn emit_canonical_build_fn(
         }
 
         #emit_fn_tokens
-    })
+
+        #wrapper_tokens
+    };
+    Ok((combined, wrapper_ident_opt))
 }
 
 /// Walk one bucket slice (backbone or lm_head), expanding `Loop`
@@ -5371,6 +5543,433 @@ fn emit_slice_render_with_loop_expansion(
 // `dispatch_instruction_to_push`, `emit_lm_head_no_delta`,
 // `emit_lm_head_with_delta`, and `normalize_tk_prefix` moved to
 // `ferrite_megakernel::codegen` (imported at the top of this file).
+
+/// Walk one `LoweredBucket` in the SAME loop-expansion order as
+/// [`emit_slice_with_loop_expansion`] and accumulate the per-accessor
+/// weight base name list for the `forward_mega_<canonical>` wrapper's
+/// `weight_ptrs[NUM_WEIGHT_ACCESSORS * NUM_LAYERS]` grid.
+///
+/// Each entry is the base name (`Some(stem)`) the wrapper resolves via
+/// `wm.<stem>(layer)`, or `None` for sentinel slots (see
+/// [`instruction_weight_bases`] — currently only `RopeAppend`'s qkv
+/// slot). Order matches `dispatch_instruction_to_push`'s
+/// `state.next_weight_accessor` bumps, so accessor index `acc_idx` in
+/// the kernel's `weight_ptrs[acc_idx * NUM_LAYERS + layer]` indexing
+/// corresponds 1:1 to position `acc_idx` in the returned vec.
+fn emit_slice_weight_bases_with_loop_expansion(
+    label: &str,
+    bucket: &crate::interpreter_codegen::LoweredBucket,
+) -> Result<Vec<Option<String>>, String> {
+    let mut out: Vec<Option<String>> = Vec::new();
+    let mut i = 0;
+    while i < bucket.instances.len() {
+        let instr = bucket.instances[i];
+        match instr {
+            ferrite_forward::Instruction::Loop(count, body_len) => {
+                let body_start = i + 1;
+                let body_end = body_start + body_len as usize;
+                if body_end > bucket.instances.len() {
+                    return Err(format!(
+                        "{label}[{i}] Loop({count}, {body_len}): body extends past slice end"
+                    ));
+                }
+                for _iter in 0..count {
+                    for body_off in 0..body_len as usize {
+                        let body_idx = body_start + body_off;
+                        let body_instr = bucket.instances[body_idx];
+                        if matches!(
+                            body_instr,
+                            ferrite_forward::Instruction::Alias(_, _)
+                                | ferrite_forward::Instruction::Free(_)
+                                | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+                                | ferrite_forward::Instruction::LoadPixels(_)
+                                | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+                                | ferrite_forward::Instruction::StripCls(_, _)
+                        ) {
+                            continue;
+                        }
+                        let weight_paths: Vec<String> = bucket
+                            .weight_slots
+                            .get(body_idx)
+                            .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                            .unwrap_or_default();
+                        out.extend(instruction_weight_bases(&body_instr, &weight_paths));
+                    }
+                }
+                i = body_end;
+            }
+            ferrite_forward::Instruction::Alias(_, _)
+            | ferrite_forward::Instruction::Free(_)
+            | ferrite_forward::Instruction::Reshape(_, _, _, _, _, _)
+            | ferrite_forward::Instruction::LoadPixels(_)
+            | ferrite_forward::Instruction::EmbeddingGather(_, _, _)
+            | ferrite_forward::Instruction::StripCls(_, _) => {
+                i += 1;
+            }
+            _ => {
+                let weight_paths: Vec<String> = bucket
+                    .weight_slots
+                    .get(i)
+                    .map(|slots| slots.iter().map(|s| s.base.to_string()).collect())
+                    .unwrap_or_default();
+                out.extend(instruction_weight_bases(&instr, &weight_paths));
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Emit `extern "C" fn ferrite_<canonical>_launch_host(...)` decl + an
+/// `unsafe fn forward_mega_<canonical>(wm, ctx, device) -> OwnedTensor`
+/// wrapper that:
+///  1. Allocates `slot_<i>: OwnedTensor` for each color in the canonical's
+///     coloring (sized via the eval'd symbolic shape).
+///  2. Builds `act_ptrs_host: [*mut u16; NUM_ACT_SLOTS]` from those
+///     OwnedTensors and H2Ds it.
+///  3. Builds `weight_ptrs_host: [*const u16; NUM_WA * NUM_LAYERS]` via
+///     a `match w_idx` on per-accessor `wm.<base>(layer)` paths and H2Ds it.
+///  4. Allocates + zero-inits a `barriers[NUM_EDGES]` device buffer.
+///  5. Stages a `LaunchArgsAttn` via `ctx.stage_launch_args_attn` and
+///     calls `dispatch_launch(LaunchFnAny::<Tier>(extern_fn), args, stream)`.
+///  6. Allocates a fresh `[NUM_TOKENS, TERMINAL_COLS]` OwnedTensor and
+///     `memcpy_dtod_async`s the terminal slot into it as the return.
+///
+/// `weight_bases.len()` is the kernel's `NUM_WEIGHT_ACCESSORS`. Each
+/// entry is `Some(base)` (a real `wm.<base>(layer)` accessor) or `None`
+/// (a sentinel slot — currently only `RopeAppend`'s qkv ptr; the kernel
+/// never dereferences it).
+///
+/// Tier picks the `extern "C"` signature shape and the `LaunchFnAny`
+/// constructor: Base→5 args, Qkv→10 args, Attn→13 args.
+#[allow(clippy::too_many_arguments)]
+fn emit_forward_mega_wrapper(
+    canonical_name: &str,
+    weight_bases: &[Option<String>],
+    slot_byte_sizes: &[u64],
+    terminal_slot: u32,
+    terminal_bytes: u64,
+    terminal_cols: u64,
+    num_layers: u32,
+    num_tokens: u64,
+    num_edges: u32,
+    tier: ferrite_megakernel::cuda_emit::LaunchTier,
+    accessor_type_by_base: &BTreeMap<String, String>,
+) -> Result<(TokenStream, Ident), String> {
+    let fn_ident = format_ident!("forward_mega_{}", canonical_name);
+    let extern_ident =
+        format_ident!("ferrite_{}_launch_host", canonical_name);
+    let num_act_slots = slot_byte_sizes.len();
+    let num_weight_accessors = weight_bases.len();
+    let num_layers_usize = num_layers as usize;
+    let num_tokens_usize = num_tokens as usize;
+    let terminal_cols_usize = terminal_cols as usize;
+    let terminal_bytes_usize = terminal_bytes as usize;
+    let num_edges_usize = num_edges as usize;
+    let terminal_slot_idx = terminal_slot as usize;
+
+    if terminal_slot_idx >= num_act_slots {
+        return Err(format!(
+            "forward_mega_{canonical_name}: terminal_slot {terminal_slot} \
+             >= num_act_slots {num_act_slots}"
+        ));
+    }
+
+    let num_act_slots_lit = proc_macro2::Literal::usize_unsuffixed(num_act_slots);
+    let num_weight_accessors_lit =
+        proc_macro2::Literal::usize_unsuffixed(num_weight_accessors);
+    let num_layers_lit = proc_macro2::Literal::usize_unsuffixed(num_layers_usize);
+    let num_tokens_lit = proc_macro2::Literal::usize_unsuffixed(num_tokens_usize);
+    let terminal_cols_lit = proc_macro2::Literal::usize_unsuffixed(terminal_cols_usize);
+    let terminal_bytes_lit = proc_macro2::Literal::usize_unsuffixed(terminal_bytes_usize);
+    let num_edges_lit = proc_macro2::Literal::usize_unsuffixed(num_edges_usize);
+
+    // Per-color OwnedTensor decls. Bytes/2 = bf16 elements in the flat
+    // `[elems]` shape — the kernel reads/writes by absolute byte offset
+    // so the host shape is irrelevant beyond capacity.
+    let slot_decls: Vec<TokenStream> = slot_byte_sizes
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            let ident = format_ident!("slot_{}", i);
+            // bf16 element count; round up so a 1-byte slot still gets
+            // an allocation. Real slots are always >= 2 bytes.
+            let elems = ((*bytes).max(2) / 2) as usize;
+            let elems_lit = proc_macro2::Literal::usize_unsuffixed(elems);
+            quote! {
+                let #ident: ::ferrite_cuda_core::alloc::OwnedTensor =
+                    device.caching.alloc_tensor(
+                        &[#elems_lit],
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                    );
+            }
+        })
+        .collect();
+
+    let act_ptrs_init: Vec<TokenStream> = (0..num_act_slots)
+        .map(|i| {
+            let ident = format_ident!("slot_{}", i);
+            quote! { (*#ident).as_mut_ptr::<u16>(), }
+        })
+        .collect();
+
+    // Per-accessor `*const u16` extraction expression — `Some(base)` →
+    // `wm.<base>(layer)…`, `None` → `::core::ptr::null()` (sentinel).
+    let accessor_arms: Vec<TokenStream> = weight_bases
+        .iter()
+        .enumerate()
+        .map(|(w_idx, base_opt)| {
+            let w_idx_lit = proc_macro2::Literal::usize_unsuffixed(w_idx);
+            let expr = match base_opt {
+                None => quote! { ::core::ptr::null::<u16>() },
+                Some(base) => {
+                    // RopeAppend / FusedQkvRopeCache pass the rotary
+                    // base ("rotary" / "rotary_local") through
+                    // `instruction_weight_bases` because that's what
+                    // the runtime kernel config field carries. The
+                    // *pointer* path on Weights is the synthesized
+                    // `rotary_cos_sin(layer)` / `rotary_local_cos_sin(layer)`
+                    // method on the per-arch struct (see
+                    // `emit_weights_struct::rotary_cos_sin_methods`),
+                    // so translate before resolving against the
+                    // accessor type map / special-case path.
+                    let resolved: String = match base.as_str() {
+                        "rotary" => "rotary_cos_sin".to_string(),
+                        "rotary_local" => "rotary_local_cos_sin".to_string(),
+                        _ => base.clone(),
+                    };
+                    let exprs = build_mega_accessor_ptr_exprs(
+                        std::slice::from_ref(&resolved),
+                        accessor_type_by_base,
+                        canonical_name,
+                    );
+                    exprs.into_iter().next().unwrap_or_else(|| {
+                        quote! { ::core::ptr::null::<u16>() }
+                    })
+                }
+            };
+            quote! {
+                #w_idx_lit => { #expr },
+            }
+        })
+        .collect();
+
+    let terminal_src_ident = format_ident!("slot_{}", terminal_slot_idx);
+
+    // Tier-specific extern "C" decl + LaunchFnAny constructor + tier_path
+    // for diagnostics. Mirror of `cuda_emit/mod.rs`'s `wrapper_name`
+    // emission at the same tier (5 / 10 / 13 args).
+    let (extern_decl, launch_fn_any_ctor): (TokenStream, TokenStream) = match tier {
+        ferrite_megakernel::cuda_emit::LaunchTier::Base => (
+            quote! {
+                unsafe extern "C" {
+                    fn #extern_ident(
+                        act_ptrs: ::ferrite_forward::interpreter::mega::ActPtrs,
+                        weight_ptrs: ::ferrite_forward::interpreter::mega::WeightPtrs,
+                        barriers: ::ferrite_forward::interpreter::mega::I32MutPtr,
+                        trace_level: i32,
+                        stream: *mut ::core::ffi::c_void,
+                    ) -> i32;
+                }
+            },
+            quote! {
+                ::ferrite_forward::interpreter::mega::LaunchFnAny::Base(
+                    #extern_ident as ::ferrite_forward::interpreter::mega::LaunchFn,
+                )
+            },
+        ),
+        ferrite_megakernel::cuda_emit::LaunchTier::Qkv => (
+            quote! {
+                unsafe extern "C" {
+                    fn #extern_ident(
+                        act_ptrs: ::ferrite_forward::interpreter::mega::ActPtrs,
+                        weight_ptrs: ::ferrite_forward::interpreter::mega::WeightPtrs,
+                        input_ids: ::ferrite_forward::interpreter::mega::U32Ptr,
+                        positions: ::ferrite_forward::interpreter::mega::U32Ptr,
+                        slot_mapping: ::ferrite_forward::interpreter::mega::I64Ptr,
+                        key_cache_ptrs: ::ferrite_forward::interpreter::mega::KvPtrs,
+                        value_cache_ptrs: ::ferrite_forward::interpreter::mega::KvPtrs,
+                        barriers: ::ferrite_forward::interpreter::mega::I32MutPtr,
+                        trace_level: i32,
+                        stream: *mut ::core::ffi::c_void,
+                    ) -> i32;
+                }
+            },
+            quote! {
+                ::ferrite_forward::interpreter::mega::LaunchFnAny::Qkv(
+                    #extern_ident as ::ferrite_forward::interpreter::mega::LaunchFnQkv,
+                )
+            },
+        ),
+        ferrite_megakernel::cuda_emit::LaunchTier::Attn => (
+            quote! {
+                unsafe extern "C" {
+                    fn #extern_ident(
+                        act_ptrs: ::ferrite_forward::interpreter::mega::ActPtrs,
+                        weight_ptrs: ::ferrite_forward::interpreter::mega::WeightPtrs,
+                        input_ids: ::ferrite_forward::interpreter::mega::U32Ptr,
+                        positions: ::ferrite_forward::interpreter::mega::U32Ptr,
+                        slot_mapping: ::ferrite_forward::interpreter::mega::I64Ptr,
+                        key_cache_ptrs: ::ferrite_forward::interpreter::mega::KvPtrs,
+                        value_cache_ptrs: ::ferrite_forward::interpreter::mega::KvPtrs,
+                        seq_lens: ::ferrite_forward::interpreter::mega::I32Ptr,
+                        block_table: ::ferrite_forward::interpreter::mega::U32Ptr,
+                        block_table_stride: u32,
+                        barriers: ::ferrite_forward::interpreter::mega::I32MutPtr,
+                        trace_level: i32,
+                        stream: *mut ::core::ffi::c_void,
+                    ) -> i32;
+                }
+            },
+            quote! {
+                ::ferrite_forward::interpreter::mega::LaunchFnAny::Attn(
+                    #extern_ident as ::ferrite_forward::interpreter::mega::LaunchFnAttn,
+                )
+            },
+        ),
+    };
+
+    let body = quote! {
+        #[cfg(feature = "cuda")]
+        #extern_decl
+
+        #[cfg(feature = "cuda")]
+        #[allow(
+            clippy::too_many_lines,
+            clippy::not_unsafe_ptr_arg_deref,
+            clippy::identity_op,
+            clippy::manual_range_patterns,
+            unused_unsafe,
+            non_snake_case,
+            dead_code,
+        )]
+        unsafe fn #fn_ident(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            const NUM_ACT_SLOTS: usize = #num_act_slots_lit;
+            const NUM_WEIGHT_ACCESSORS: usize = #num_weight_accessors_lit;
+            const NUM_LAYERS: usize = #num_layers_lit;
+            const NUM_TOKENS: usize = #num_tokens_lit;
+            const TERMINAL_COLS: usize = #terminal_cols_lit;
+            const TERMINAL_BYTES: usize = #terminal_bytes_lit;
+            const NUM_EDGES: usize = #num_edges_lit;
+            const PTR_BYTES: usize = ::core::mem::size_of::<*mut u16>();
+
+            #(#slot_decls)*
+
+            let act_ptrs_host: [*mut u16; NUM_ACT_SLOTS] = [
+                #(#act_ptrs_init)*
+            ];
+            let act_ptrs_dev = device.caching.alloc_tensor(
+                &[NUM_ACT_SLOTS * PTR_BYTES],
+                ::ferrite_cuda_core::dtype::DType::U8,
+            );
+            unsafe {
+                ::ferrite_cuda_core::driver::memcpy_htod_async(
+                    act_ptrs_dev.raw_ptr(),
+                    act_ptrs_host.as_ptr() as *const u8,
+                    NUM_ACT_SLOTS * PTR_BYTES,
+                    device.compute_stream,
+                )
+                .expect("mega forward: act_ptrs H2D failed");
+            }
+
+            let mut weight_ptrs_host: ::std::vec::Vec<*const u16> =
+                ::std::vec::Vec::with_capacity(NUM_WEIGHT_ACCESSORS * NUM_LAYERS);
+            for w_idx in 0..NUM_WEIGHT_ACCESSORS {
+                for layer in 0..NUM_LAYERS {
+                    let layer = layer as u32;
+                    let _ = layer;
+                    let p: *const u16 = match w_idx {
+                        #(#accessor_arms)*
+                        _ => ::core::ptr::null::<u16>(),
+                    };
+                    weight_ptrs_host.push(p);
+                }
+            }
+            let weight_ptrs_dev = device.caching.alloc_tensor(
+                &[NUM_WEIGHT_ACCESSORS * NUM_LAYERS * PTR_BYTES],
+                ::ferrite_cuda_core::dtype::DType::U8,
+            );
+            unsafe {
+                ::ferrite_cuda_core::driver::memcpy_htod_async(
+                    weight_ptrs_dev.raw_ptr(),
+                    weight_ptrs_host.as_ptr() as *const u8,
+                    NUM_WEIGHT_ACCESSORS * NUM_LAYERS * PTR_BYTES,
+                    device.compute_stream,
+                )
+                .expect("mega forward: weight_ptrs H2D failed");
+            }
+
+            // Barriers: zero-init i32[NUM_EDGES]; null when NUM_EDGES==0.
+            let barriers_dev_opt = if NUM_EDGES == 0 {
+                ::core::option::Option::None
+            } else {
+                let bd = device.caching.alloc_tensor(
+                    &[NUM_EDGES * 4],
+                    ::ferrite_cuda_core::dtype::DType::U8,
+                );
+                unsafe {
+                    ::ferrite_cuda_core::driver::memset_d8(
+                        bd.raw_ptr(),
+                        0,
+                        NUM_EDGES * 4,
+                        device.compute_stream,
+                    )
+                    .expect("mega forward: barriers memset failed");
+                }
+                ::core::option::Option::Some(bd)
+            };
+            let barriers_ptr: *mut i32 = match &barriers_dev_opt {
+                ::core::option::Option::Some(bd) => bd.raw_ptr() as *mut i32,
+                ::core::option::Option::None => ::core::ptr::null_mut(),
+            };
+
+            let trace_level: i32 = ::std::env::var("FERRITE_MEGA_TRACE")
+                .ok()
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+
+            let args = ctx.stage_launch_args_attn(
+                (*act_ptrs_dev).as_ptr::<*mut u16>()
+                    as ::ferrite_forward::interpreter::mega::ActPtrs,
+                (*weight_ptrs_dev).as_ptr::<*const u16>()
+                    as ::ferrite_forward::interpreter::mega::WeightPtrs,
+                barriers_ptr as ::ferrite_forward::interpreter::mega::I32MutPtr,
+                trace_level,
+            );
+            unsafe {
+                ::ferrite_forward::interpreter::mega::dispatch_launch(
+                    #launch_fn_any_ctor,
+                    args,
+                    device.compute_stream as *mut ::core::ffi::c_void,
+                )
+                .expect("mega forward: dispatch_launch failed");
+            }
+
+            let out = device.caching.alloc_tensor(
+                &[NUM_TOKENS, TERMINAL_COLS],
+                ::ferrite_cuda_core::dtype::DType::BF16,
+            );
+            unsafe {
+                ::ferrite_cuda_core::driver::memcpy_dtod_async(
+                    out.raw_ptr(),
+                    #terminal_src_ident.raw_ptr(),
+                    TERMINAL_BYTES,
+                    device.compute_stream,
+                )
+                .expect("mega forward: terminal D2D failed");
+            }
+            // Keep barriers_dev_opt alive past the launch.
+            ::core::mem::drop(barriers_dev_opt);
+            out
+        }
+    };
+
+    Ok((body, fn_ident))
+}
 
 /// Render one `*const u16` expression per catalog-ordered accessor,
 /// mapping each accessor's Rust return type (looked up in
@@ -5922,13 +6521,29 @@ pub fn emit_model(
         mega_ms_forward_fn_by_canonical,
         mega_persistent_decode_start_fn_by_canonical,
     ) = if std::env::var_os("FERRITE_MEGA").is_some() {
-        // FERRITE_MEGA is currently inert: the TapeClaimer machinery
-        // it used was retired with the OpInstance migration. Mega
-        // emission re-lands via `ferrite_megakernel::codegen` per
-        // `MEGA_IR_PLAN.md`. Until then `emit_mega_artifacts_inline`
-        // returns empty maps so MEGA_FORWARD_TABLE construction
-        // sites resolve to the host interpreter for every canonical.
-        emit_mega_artifacts_inline(model, &canonical_lowered_decode)
+        // Phase C step 3 — `emit_mega_artifacts_inline` now returns a
+        // populated `mega_forward_fn_by_canonical_decode`: one
+        // `forward_mega_<canonical>` wrapper Ident per canonical
+        // whose render walk succeeded. The FORWARD_TABLE_DECODE
+        // construction site uses these Idents to call the
+        // megakernel `launch_host` symbols at runtime instead of
+        // falling back to the host interpreter.
+        //
+        // `accessor_type_by_base` maps each `wm.<base>(layer)` stem
+        // to its Rust return type (e.g. `LinearLayer`,
+        // `Embedding`, `RmsNorm`) so the wrapper emitter resolves
+        // each accessor to the right `.dense_weight()` / `.weight`
+        // pointer path.
+        let decode_accessors =
+            collect_accessors(program, fuf, sfufs_decode, lib, model)
+                .unwrap_or_default();
+        let accessor_type_by_base = mega_accessor_type_map(&decode_accessors);
+        emit_mega_artifacts_inline(
+            model,
+            &canonical_lowered_decode,
+            &accessor_type_by_base,
+            tp_world_size,
+        )
     } else {
         (
             TokenStream::new(),

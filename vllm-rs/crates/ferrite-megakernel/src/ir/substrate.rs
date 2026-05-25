@@ -617,6 +617,17 @@ impl<const N: u32> ArrivesCount<N> {
     pub const fn raw(self) -> u32 {
         N
     }
+    /// Derive the page-round mbarrier phase parity from the cumulative
+    /// arrive count. By the page-round protocol all three roles
+    /// (consumer / storer / loader for the current page-round) wait on
+    /// the same parity bit, which is `N & 1`. The const generic `N`
+    /// is the proof — there is no path to fabricate a wrong value
+    /// (no separate `PHASE` const generic that could disagree).
+    /// Replaces redundant `MbarrierPhase::<P>::new()` const generics
+    /// that previously duplicated the formula on the call site.
+    pub const fn derive_phase(self) -> MbarrierPhaseRef {
+        MbarrierPhaseRef::__new_for_erase(N & 1)
+    }
 }
 impl<const N: u32> Default for ArrivesCount<N> {
     fn default() -> Self {

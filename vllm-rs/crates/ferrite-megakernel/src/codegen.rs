@@ -302,8 +302,6 @@ pub fn dispatch_instruction_to_push(
             let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
             let partial_off = lit(0u32);
             let partial_bytes = lit(state.num_consumer_warps * 4);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -331,8 +329,6 @@ pub fn dispatch_instruction_to_push(
                         #scratch_lit,
                         ::ferrite_megakernel::ir::RmsNormScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
@@ -356,8 +352,6 @@ pub fn dispatch_instruction_to_push(
         I::Add(delta_slot, residual_slot) => {
             let delta_id = lit(*delta_slot);
             let residual_id = lit(*residual_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -371,8 +365,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_megakernel::ir::PageId::<#delta_id, #num_pages_lit>::new(),
                     ::ferrite_megakernel::ir::PageId::<#residual_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#delta_act_slot, { u32::MAX }>::new(),
@@ -387,8 +379,6 @@ pub fn dispatch_instruction_to_push(
                 .ok_or_else(|| "Embed weight_paths empty".to_string())?;
             let out_id = lit(*out_slot);
             let weight_id = lit(state.alloc_distinct(&[*out_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -404,8 +394,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
                     ::ferrite_megakernel::ir::PageId::<#weight_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_megakernel::ir::VocabSize::<#vocab_size>::new(),
@@ -420,8 +408,6 @@ pub fn dispatch_instruction_to_push(
         I::ScalarMul(in_slot, out_slot, scale) => {
             let in_id = lit(*in_slot);
             let out_id = lit(*out_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -436,8 +422,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_megakernel::ir::PageId::<#in_id, #num_pages_lit>::new(),
                     ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
@@ -450,8 +434,6 @@ pub fn dispatch_instruction_to_push(
         I::TanhSoftCap(in_slot, out_slot) => {
             let in_id = lit(*in_slot);
             let out_id = lit(*out_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -466,8 +448,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_megakernel::ir::PageId::<#in_id, #num_pages_lit>::new(),
                     ::ferrite_megakernel::ir::PageId::<#out_id, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#in_act_slot, { u32::MAX }>::new(),
@@ -485,8 +465,6 @@ pub fn dispatch_instruction_to_push(
             let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
             let partial_off = lit(0u32);
             let partial_bytes = lit(state.num_consumer_warps * 4);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -513,8 +491,6 @@ pub fn dispatch_instruction_to_push(
                         #partial_off, #partial_bytes, #scratch_lit,
                         ::ferrite_megakernel::ir::RmsNormScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
@@ -544,8 +520,6 @@ pub fn dispatch_instruction_to_push(
             let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
             let b_tile_off = lit(0u32);
             let b_tile_bytes = lit(state.scratch_bytes);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             // ITERS=1 today (proc-macro hands op-level iters; the
             // scheduler doesn't currently chunk K). With ITERS=1
             // CHUNK_K must equal K (Gemm IR invariant).
@@ -586,8 +560,6 @@ pub fn dispatch_instruction_to_push(
                         #b_tile_off, #b_tile_bytes, #scratch_lit,
                         ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::MatmulN::<#n_lit>::new(),
@@ -614,8 +586,6 @@ pub fn dispatch_instruction_to_push(
             let weight_id = lit(state.alloc_distinct(&[*delta_slot, *residual_slot])?);
             let partial_off = lit(0u32);
             let partial_bytes = lit(state.num_consumer_warps * 4);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
             let layer_lit = lit(resolved_layer(*layer));
@@ -642,8 +612,6 @@ pub fn dispatch_instruction_to_push(
                         #partial_off, #partial_bytes, #scratch_lit,
                         ::ferrite_megakernel::ir::RmsNormScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
@@ -685,8 +653,6 @@ pub fn dispatch_instruction_to_push(
             let gate_bytes = lit(half);
             let up_off = lit(half);
             let up_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters = lit(1u32);
             let arrives = lit(state.arrives);
             let num_layers = lit(state.num_layers);
@@ -725,8 +691,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ScratchRegion::<
                         #up_off, #up_bytes, #scratch_lit, ::ferrite_megakernel::ir::MlpScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
@@ -772,8 +736,6 @@ pub fn dispatch_instruction_to_push(
             let k_bytes = lit(quarter);
             let b_tile_off = lit(2 * quarter);
             let b_tile_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
             let iters = lit(iters_const);
             let arrives = lit(state.arrives);
@@ -830,8 +792,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ScratchRegion::<
                         #b_tile_off, #b_tile_bytes, #scratch_lit, ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
@@ -913,8 +873,6 @@ pub fn dispatch_instruction_to_push(
             let k_bytes = lit(quarter);
             let b_tile_off = lit(2 * quarter);
             let b_tile_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
             let iters = lit(iters_const);
             let arrives = lit(state.arrives);
@@ -966,8 +924,6 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::ScratchRegion::<
                         #b_tile_off, #b_tile_bytes, #scratch_lit, ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
@@ -1024,8 +980,6 @@ pub fn dispatch_instruction_to_push(
             let weight_id = lit(state.alloc_distinct(&[*in_slot, *residual_slot])?);
             let b_tile_off = lit(0u32);
             let b_tile_bytes = lit(state.scratch_bytes);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             // ITERS=1 today (proc-macro hands op-level iters; the
             // scheduler doesn't currently chunk K). With ITERS=1
             // CHUNK_K must equal K (TkFusedGemmAdd IR invariant).
@@ -1072,8 +1026,6 @@ pub fn dispatch_instruction_to_push(
                         #b_tile_off, #b_tile_bytes, #scratch_lit,
                         ::ferrite_megakernel::ir::GemmScope,
                     >::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
                     ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
                     ::ferrite_megakernel::ir::MatmulN::<#n_lit>::new(),
@@ -1095,8 +1047,6 @@ pub fn dispatch_instruction_to_push(
         }
         I::SpliceMmEmbeds(slot) => {
             let slot_lit = lit(*slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let arrives = lit(state.arrives);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -1107,8 +1057,6 @@ pub fn dispatch_instruction_to_push(
                 b.push_splice_mm_embeds(
                     ::ferrite_megakernel::ir::ArrivesCount::<#arrives>::new(),
                     ::ferrite_megakernel::ir::PageId::<#slot_lit, #num_pages_lit>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-                    ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
                     ::ferrite_megakernel::ir::HiddenDim::<#hidden_dim>::new(),
                     ::ferrite_megakernel::ir::NumTokensConst::<#num_tokens>::new(),
                     ::ferrite_megakernel::ir::ActSlotConst::<#target_act_slot, { u32::MAX }>::new(),
@@ -1176,6 +1124,68 @@ pub fn dispatch_instruction_to_push(
     }
 }
 
+/// Per-accessor weight base name for the megakernel `weight_ptrs[acc]`
+/// grid emitted by [`dispatch_instruction_to_push`] for `instr`. Length
+/// equals the number of accessors that arm bumps `state.next_weight_accessor`
+/// by, in the same order, so the i-th element is the base name (i.e. the
+/// `wm.<base>(layer)` accessor) the kernel will read for accessor `i`.
+///
+/// `None` means the accessor slot is a sentinel — currently only used
+/// for `I::RopeAppend`'s qkv-projection slot, which carries no weight
+/// (the rotary table is the only real input). The wrapper fills these
+/// with null pointers; the kernel never dereferences them.
+///
+/// Mirrors `dispatch_instruction_to_push` arm-for-arm. Add an arm here
+/// whenever `dispatch_instruction_to_push` grows a new accessor-allocating
+/// variant, or the `forward_mega_<canonical>` wrapper will mis-stage
+/// `weight_ptrs` for that op.
+pub fn instruction_weight_bases(
+    instr: &ferrite_forward::Instruction,
+    weight_paths: &[String],
+) -> Vec<Option<String>> {
+    use ferrite_forward::Instruction as I;
+    let normalized = normalize_tk_prefix(*instr);
+    match normalized {
+        // 1-accessor arms: weight_paths[0] is the base.
+        I::RmsNorm(..)
+        | I::Embed(..)
+        | I::ScalarOffsetRmsNorm(..)
+        | I::Gemm(..)
+        | I::FusedAddRmsNorm(..)
+        | I::FusedGateUpSiluMul(..)
+        | I::FusedGateUpGeluMul(..)
+        | I::TkGemmAdd(..) => vec![weight_paths.first().cloned()],
+        // 2-accessor arms: weight_paths[0] then weight_paths[1].
+        I::FusedQkvRopeCache(..)
+        | I::TkFusedAddRmsNormGemm(..)
+        | I::TkFusedAddScalarOffsetRmsNormGemm(..) => {
+            vec![weight_paths.first().cloned(), weight_paths.get(1).cloned()]
+        }
+        // RopeAppend allocates 2 accessors but carries 1 weight_path:
+        // accessor 0 is the qkv sentinel (no real weight, never read),
+        // accessor 1 is the rotary cos/sin table.
+        I::RopeAppend(..) => vec![None, weight_paths.first().cloned()],
+        // 0-accessor arms.
+        I::Add(..)
+        | I::ScalarMul(..)
+        | I::TanhSoftCap(..)
+        | I::AttentionViaCache(..)
+        | I::SlidingAttentionViaCache(..)
+        | I::SpliceMmEmbeds(..)
+        | I::BarrierSignal(..)
+        | I::BarrierWait(..) => vec![],
+        // Control / view ops have no megakernel substrate effect.
+        I::Loop(..)
+        | I::Alias(..)
+        | I::Free(..)
+        | I::Reshape(..)
+        | I::LoadPixels(..)
+        | I::EmbeddingGather(..)
+        | I::StripCls(..) => vec![],
+        _ => vec![],
+    }
+}
+
 /// Build the `b.push_attention_via_cache::<…>(…)` token stream for
 /// either `I::AttentionViaCache` or `I::SlidingAttentionViaCache`.
 /// Both arms share the same const-generic + scratch-layout logic;
@@ -1230,8 +1240,6 @@ fn emit_attention_via_cache_push(
     let k_smem_page_id = lit(k_smem_page_id_const);
     let v_smem_page_id = lit(v_smem_page_id_const);
 
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
     let iters = lit(1u32);
     let arrives = lit(state.arrives);
     let num_layers = lit(state.num_layers);
@@ -1278,8 +1286,6 @@ fn emit_attention_via_cache_push(
             >::new(),
             ::ferrite_megakernel::ir::PageId::<#k_smem_page_id, #num_pages_lit>::new(),
             ::ferrite_megakernel::ir::PageId::<#v_smem_page_id, #num_pages_lit>::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
             ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
             ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
             ::ferrite_megakernel::ir::HeadDim::<#head_dim>::new(),
@@ -1329,8 +1335,6 @@ fn emit_lm_head_with_delta(
     let partial_bytes = lit(state.num_consumer_warps * 4);
     let b_tile_off = lit(state.num_consumer_warps * 4);
     let b_tile_bytes = lit(state.scratch_bytes - state.num_consumer_warps * 4);
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
     let iters_const = 1_u32;
     let iters = lit(iters_const);
     let arrives = lit(state.arrives);
@@ -1375,8 +1379,6 @@ fn emit_lm_head_with_delta(
                 #b_tile_off, #b_tile_bytes, #scratch_lit,
                 ::ferrite_megakernel::ir::GemmScope,
             >::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#consumer_phase>::new(),
-            ::ferrite_megakernel::ir::MbarrierPhase::<#storer_phase>::new(),
             ::ferrite_megakernel::ir::IterCount::<#iters>::new(),
             ::ferrite_megakernel::ir::LayerIndex::<#layer_lit, #num_layers>::new(),
             ::ferrite_megakernel::ir::MatmulN::<#n_lit>::new(),
@@ -1527,8 +1529,6 @@ pub fn dispatch_instruction_to_render(
                 .ok_or_else(|| "weight_paths empty".to_string())?;
             let in_id = lit(*in_slot);
             let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let layer_lit = lit(resolved_layer(*layer));
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -1543,6 +1543,8 @@ pub fn dispatch_instruction_to_render(
             let bar_publish = lit(2u32);
             let partial_offset = lit(0u32);
             let eps_lit = state.rms_norm_eps;
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1563,8 +1565,6 @@ pub fn dispatch_instruction_to_render(
         I::Add(delta_slot, residual_slot) => {
             let delta_id = lit(*delta_slot);
             let residual_id = lit(*residual_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
             let delta_act_slot = lit(*delta_slot);
@@ -1573,6 +1573,8 @@ pub fn dispatch_instruction_to_render(
             let k_per_warp = lit(state.hidden_dim / ncw.max(1));
             let ncw_lit = lit(ncw);
             let bar_publish = lit(2u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             Ok(Some(quote! {
                 bodies.push(::ferrite_megakernel::cuda_emit::render::render_add::<
@@ -1591,13 +1593,13 @@ pub fn dispatch_instruction_to_render(
                 .ok_or_else(|| "Embed weight_paths empty".to_string())?;
             let out_id = lit(*out_slot);
             let _weight_id = lit(state.alloc_distinct(&[*out_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
             let out_act_slot = lit(*out_slot);
             let weight_accessor_idx = lit(state.next_weight_accessor);
             let num_layers = lit(state.num_layers);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1614,8 +1616,6 @@ pub fn dispatch_instruction_to_render(
         I::ScalarMul(in_slot, out_slot, scale) => {
             let in_id = lit(*in_slot);
             let out_id = lit(*out_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
             let in_act_slot = lit(*in_slot);
@@ -1625,6 +1625,8 @@ pub fn dispatch_instruction_to_render(
             let k_per_warp = lit(state.hidden_dim / ncw.max(1));
             let ncw_lit = lit(ncw);
             let bar_publish = lit(2u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             Ok(Some(quote! {
                 bodies.push(::ferrite_megakernel::cuda_emit::render::render_scalar_mul::<
@@ -1641,8 +1643,6 @@ pub fn dispatch_instruction_to_render(
         I::TanhSoftCap(in_slot, out_slot) => {
             let in_id = lit(*in_slot);
             let out_id = lit(*out_slot);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
             let in_act_slot = lit(*in_slot);
@@ -1652,6 +1652,8 @@ pub fn dispatch_instruction_to_render(
             let k_per_warp = lit(state.hidden_dim / ncw.max(1));
             let ncw_lit = lit(ncw);
             let bar_publish = lit(2u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             Ok(Some(quote! {
                 bodies.push(::ferrite_megakernel::cuda_emit::render::render_tanh_soft_cap::<
@@ -1671,8 +1673,6 @@ pub fn dispatch_instruction_to_render(
                 .ok_or_else(|| "ScalarOffsetRmsNorm weight_paths empty".to_string())?;
             let in_id = lit(*in_slot);
             let weight_id = lit(state.alloc_distinct(&[*in_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let layer_lit = lit(resolved_layer(*layer));
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -1688,6 +1688,8 @@ pub fn dispatch_instruction_to_render(
             let bar_reduce = lit(1u32);
             let bar_publish = lit(2u32);
             let partial_offset = lit(0u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1712,8 +1714,6 @@ pub fn dispatch_instruction_to_render(
             let in_id = lit(*in_slot);
             let out_id = lit(*out_slot);
             let weight_id = lit(state.alloc_distinct(&[*in_slot, *out_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
             let iters = lit(iters_const);
             let ncw = state.num_consumer_warps;
@@ -1730,6 +1730,8 @@ pub fn dispatch_instruction_to_render(
             let ncw_lit = lit(ncw);
             let bar_publish = lit(1u32);
             let b_tile_offset = lit(0u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1753,8 +1755,6 @@ pub fn dispatch_instruction_to_render(
             let delta_id = lit(*delta_slot);
             let residual_id = lit(*residual_slot);
             let weight_id = lit(state.alloc_distinct(&[*delta_slot, *residual_slot])?);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let layer_lit = lit(resolved_layer(*layer));
             let hidden_dim = lit(state.hidden_dim);
             let num_tokens = lit(state.num_tokens);
@@ -1769,6 +1769,8 @@ pub fn dispatch_instruction_to_render(
             let bar_reduce = lit(1u32);
             let bar_publish = lit(2u32);
             let partial_offset = lit(0u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1808,8 +1810,6 @@ pub fn dispatch_instruction_to_render(
             let gate_bytes = lit(half);
             let up_off = lit(half);
             let up_bytes = lit(half);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters = lit(1u32);
             let layer_lit = lit(resolved_layer(*layer));
             let hidden_dim = lit(state.hidden_dim);
@@ -1828,6 +1828,8 @@ pub fn dispatch_instruction_to_render(
             let ncw_lit = lit(ncw);
             let num_layers = lit(state.num_layers);
             let bar_publish = lit(1u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 1;
             Ok(Some(quote! {
@@ -1862,8 +1864,6 @@ pub fn dispatch_instruction_to_render(
             let q_off = lit(0u32);
             let k_off = lit(quarter);
             let b_tile_off = lit(2 * quarter);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
             let iters = lit(iters_const);
             let layer_lit = lit(resolved_layer(*layer));
@@ -1898,6 +1898,8 @@ pub fn dispatch_instruction_to_render(
             let ncw_lit = lit(ncw);
             let num_layers = lit(state.num_layers);
             let bar_publish = lit(1u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 2;
             Ok(Some(quote! {
@@ -1919,7 +1921,7 @@ pub fn dispatch_instruction_to_render(
         I::SpliceMmEmbeds(slot) => {
             let slot_id = lit(*slot);
             let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             Ok(Some(quote! {
                 bodies.push(::ferrite_megakernel::cuda_emit::render::render_splice_mm_embeds(
@@ -2052,8 +2054,6 @@ pub fn dispatch_instruction_to_render(
             let q_off = lit(0u32);
             let k_off = lit(quarter);
             let b_tile_off = lit(2 * quarter);
-            let consumer_phase = lit(state.arrives & 1);
-            let storer_phase = lit((state.arrives + 1) & 1);
             let iters_const = 1_u32;
             let iters = lit(iters_const);
             let layer_lit = lit(resolved_layer(*layer));
@@ -2088,6 +2088,8 @@ pub fn dispatch_instruction_to_render(
             let ncw_lit = lit(ncw);
             let num_layers = lit(state.num_layers);
             let bar_publish = lit(1u32);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit(state.arrives & 1);
             state.arrives += 1;
             state.next_weight_accessor += 2;
             Ok(Some(quote! {
@@ -2154,8 +2156,6 @@ fn render_attention_via_cache_dispatch(
     let k_smem_page_id = lit(k_smem_page_id_const);
     let v_smem_page_id = lit(v_smem_page_id_const);
 
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
     let iters = lit(1u32);
     let layer_lit = lit(layer);
     let head_dim = lit(state.head_dim);
@@ -2173,6 +2173,8 @@ fn render_attention_via_cache_dispatch(
     let ncw_lit = lit(ncw);
     let num_layers = lit(state.num_layers);
 
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit(state.arrives & 1);
     state.arrives += 1;
 
     if is_sliding {
@@ -2250,8 +2252,6 @@ fn render_lm_head_with_delta(
     let lin_w_id = lit(state.alloc_distinct(&[residual_slot, delta_slot, out_slot])?);
     let partial_off = lit(0u32);
     let b_tile_off = lit(state.num_consumer_warps * 4);
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
     let iters_const = 1_u32;
     let iters = lit(iters_const);
     let layer_lit = lit(layer);
@@ -2276,6 +2276,8 @@ fn render_lm_head_with_delta(
     let num_layers = lit(state.num_layers);
     let bar_reduce = lit(1u32);
     let bar_publish = lit(2u32);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit(state.arrives & 1);
     state.arrives += 1;
     state.next_weight_accessor += 2;
     Ok(quote! {
@@ -2325,8 +2327,6 @@ fn render_tk_gemm_add(
     let in_id = lit(in_slot);
     let residual_id = lit(residual_slot);
     let weight_id = lit(state.alloc_distinct(&[in_slot, residual_slot])?);
-    let consumer_phase = lit(state.arrives & 1);
-    let storer_phase = lit((state.arrives + 1) & 1);
     let iters_const = 1_u32;
     let iters = lit(iters_const);
     let ncw = state.num_consumer_warps;
@@ -2343,6 +2343,8 @@ fn render_tk_gemm_add(
     let ncw_lit = lit(ncw);
     let bar_publish = lit(1u32);
     let b_tile_offset = lit(0u32);
+    let consumer_phase = lit(state.arrives & 1);
+    let storer_phase = lit(state.arrives & 1);
     state.arrives += 1;
     state.next_weight_accessor += 1;
     Ok(quote! {

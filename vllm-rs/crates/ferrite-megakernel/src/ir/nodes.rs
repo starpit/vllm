@@ -273,8 +273,6 @@ impl TkRmsNorm {
     /// - `IN_ID != WEIGHT_ID` (within-op alias #2)
     /// - `PARTIAL_OFF + PARTIAL_BYTES <= SCRATCH_BYTES` (#5)
     /// - `LAYER < NUM_LAYERS`
-    /// - `CONSUMER_PHASE == ARRIVES & 1` (#3)
-    /// - `STORER_PHASE == (ARRIVES + 1) & 1` (#3)
     /// - `HIDDEN_DIM > 0`, `NUM_TOKENS > 0` (kernel-AST shape)
     #[allow(clippy::too_many_arguments)]
     pub fn new<
@@ -282,8 +280,6 @@ impl TkRmsNorm {
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
         const NUM_LAYERS: u32,
@@ -329,14 +325,6 @@ impl TkRmsNorm {
                 "RmsNorm: partial_sums region out of substrate scratch budget",
             );
             assert!(LAYER < NUM_LAYERS, "RmsNorm: LAYER out of range");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "RmsNorm: CONSUMER_PHASE parity mismatch with cumulative arrives",
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "RmsNorm: STORER_PHASE parity mismatch with cumulative arrives + 1",
-            );
             assert!(HIDDEN_DIM > 0, "RmsNorm: HIDDEN_DIM must be > 0");
             assert!(NUM_TOKENS > 0, "RmsNorm: NUM_TOKENS must be > 0");
             // CONSUMER_BAR_REDUCE / CONSUMER_BAR_PUBLISH range +
@@ -351,7 +339,7 @@ impl TkRmsNorm {
         // travel through `PageId<>` / `BarSyncId<>` / etc., the
         // typed primitives' constructors validate them.
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, ArrivesCount,NumTokensConst,
             PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
         };
         let in_page = PageId::<IN_ID, NUM_PAGES>::new().erase();
@@ -363,8 +351,8 @@ impl TkRmsNorm {
         // values.
         let partial_offset = ScratchOffsetRef::__new_for_erase(PARTIAL_OFF);
         let partial_bytes = ScratchBytesRef::__new_for_erase(PARTIAL_BYTES);
-        let consumer_phase = MbarrierPhase::<CONSUMER_PHASE>::new().erase();
-        let storer_phase = MbarrierPhase::<STORER_PHASE>::new().erase();
+        let consumer_phase = ArrivesCount::<ARRIVES>::new().derive_phase();
+        let storer_phase = consumer_phase;
         let layer = LayerIndex::<LAYER, NUM_LAYERS>::new().erase();
         let hidden_dim = HiddenDim::<HIDDEN_DIM>::new().erase();
         let num_tokens = NumTokensConst::<NUM_TOKENS>::new().erase();
@@ -583,8 +571,6 @@ impl TkFusedQkvRopeCache {
         const K_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
@@ -682,14 +668,6 @@ impl TkFusedQkvRopeCache {
 
             assert!(ITERS > 0, "FusedQkvRopeCache: ITERS must be > 0");
             assert!(LAYER < NUM_LAYERS, "FusedQkvRopeCache: LAYER out of range");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "FusedQkvRopeCache: CONSUMER_PHASE parity mismatch"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "FusedQkvRopeCache: STORER_PHASE parity mismatch"
-            );
             assert!(HIDDEN_DIM > 0, "FusedQkvRopeCache: HIDDEN_DIM must be > 0");
             assert!(HEAD_DIM > 0, "FusedQkvRopeCache: HEAD_DIM must be > 0");
             assert!(
@@ -722,7 +700,7 @@ impl TkFusedQkvRopeCache {
         // erase to opaque refs for storage. Bare `u32` cannot reach
         // the IR — they flow through typed primitive constructors.
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, ChunkK, HeadDim, HiddenDim, IterCount, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, ChunkK, HeadDim, HiddenDim, IterCount,
             NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef,
             TileN, WeightAccessorConst,
         };
@@ -745,8 +723,8 @@ impl TkFusedQkvRopeCache {
             k_rope_bytes: ScratchBytesRef::__new_for_erase(K_BYTES),
             qkv_b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
             qkv_b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
@@ -899,8 +877,6 @@ impl TkAdd {
     pub fn new<
         const DELTA_ID: u32,
         const RESIDUAL_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
@@ -921,23 +897,15 @@ impl TkAdd {
                 DELTA_ID != RESIDUAL_ID,
                 "Add: DELTA_ID and RESIDUAL_ID alias"
             );
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "Add: CONSUMER_PHASE parity mismatch"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "Add: STORER_PHASE parity mismatch"
-            );
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, BarSyncId, HiddenDim, ArrivesCount,NumTokensConst, PageId,
         };
         Self {
             delta_page: PageId::<DELTA_ID, NUM_PAGES>::new().erase(),
             residual_page: PageId::<RESIDUAL_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             delta_act_slot: ActSlotConst::<DELTA_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -1016,8 +984,6 @@ impl TkFusedAddRmsNorm {
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
         const NUM_LAYERS: u32,
@@ -1054,19 +1020,11 @@ impl TkFusedAddRmsNorm {
                 "FusedAddRmsNorm: partial_sums OOB scratch budget",
             );
             assert!(LAYER < NUM_LAYERS, "FusedAddRmsNorm: LAYER OOB");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "FusedAddRmsNorm: CONSUMER_PHASE parity mismatch",
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "FusedAddRmsNorm: STORER_PHASE parity mismatch",
-            );
             assert!(HIDDEN_DIM > 0, "FusedAddRmsNorm: HIDDEN_DIM must be > 0");
             assert!(NUM_TOKENS > 0, "FusedAddRmsNorm: NUM_TOKENS must be > 0");
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, ArrivesCount,NumTokensConst,
             PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
         };
         Self {
@@ -1075,8 +1033,8 @@ impl TkFusedAddRmsNorm {
             weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
             partial_offset: ScratchOffsetRef::__new_for_erase(PARTIAL_OFF),
             partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
@@ -1203,8 +1161,6 @@ impl TkFusedGateUpActivateMul {
         const GATE_BYTES: u32,
         const UP_OFF: u32,
         const UP_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
@@ -1253,14 +1209,6 @@ impl TkFusedGateUpActivateMul {
             );
             assert!(ITERS > 0, "FusedGateUp: ITERS must be > 0");
             assert!(LAYER < NUM_LAYERS, "FusedGateUp: LAYER OOB");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "FusedGateUp: CONSUMER_PHASE parity mismatch",
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "FusedGateUp: STORER_PHASE parity mismatch",
-            );
             assert!(HIDDEN_DIM > 0, "FusedGateUp: HIDDEN_DIM must be > 0");
             assert!(
                 INTERMEDIATE_DIM > 0,
@@ -1275,7 +1223,7 @@ impl TkFusedGateUpActivateMul {
             assert!(TILE_N > 0, "FusedGateUp: TILE_N must be > 0");
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, HiddenDim, IntermediateDim, IterCount, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, IntermediateDim, IterCount,
             NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
             WeightAccessorConst,
         };
@@ -1287,8 +1235,8 @@ impl TkFusedGateUpActivateMul {
             gate_bytes: ScratchBytesRef::__new_for_erase(GATE_BYTES),
             up_offset: ScratchOffsetRef::__new_for_erase(UP_OFF),
             up_bytes: ScratchBytesRef::__new_for_erase(UP_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
@@ -1393,8 +1341,6 @@ impl TkEmbed {
     pub fn new<
         const OUT_ID: u32,
         const WEIGHT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
@@ -1407,24 +1353,16 @@ impl TkEmbed {
     ) -> Self {
         const {
             assert!(OUT_ID != WEIGHT_ID, "Embed: page alias");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "Embed: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "Embed: STORER_PHASE parity"
-            );
         }
         use crate::ir::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId, VocabSize,
+            ActSlotConst, HiddenDim, ArrivesCount,NumTokensConst, PageId, VocabSize,
             WeightAccessorConst,
         };
         Self {
             out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
             embed_weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             vocab_size: VocabSize::<VOCAB_SIZE>::new().erase(),
@@ -1489,8 +1427,6 @@ impl TkScalarMul {
     pub fn new<
         const IN_ID: u32,
         const OUT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
@@ -1507,23 +1443,15 @@ impl TkScalarMul {
         const {
             // ScalarMul is elementwise; in-place (IN_ID == OUT_ID) is
             // valid (gemma2 post-attn `* hidden`).
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "ScalarMul: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "ScalarMul: STORER_PHASE parity"
-            );
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, BarSyncId, HiddenDim, ArrivesCount,NumTokensConst, PageId,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
             out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -1586,8 +1514,6 @@ impl TkTanhSoftCap {
     pub fn new<
         const IN_ID: u32,
         const OUT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
@@ -1604,23 +1530,15 @@ impl TkTanhSoftCap {
         const {
             // TanhSoftCap is elementwise; in-place (IN_ID == OUT_ID)
             // is valid (gemma2 final logit cap).
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "TanhSoftCap: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "TanhSoftCap: STORER_PHASE parity"
-            );
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, BarSyncId, HiddenDim, ArrivesCount,NumTokensConst, PageId,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
             out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             in_act_slot: ActSlotConst::<IN_ACT_SLOT, { u32::MAX }>::new().erase(),
@@ -1698,8 +1616,6 @@ impl TkScalarOffsetRmsNorm {
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
         const NUM_LAYERS: u32,
@@ -1734,14 +1650,6 @@ impl TkScalarOffsetRmsNorm {
             );
             assert!(LAYER < NUM_LAYERS, "ScalarOffsetRmsNorm: LAYER OOB");
             assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "ScalarOffsetRmsNorm: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "ScalarOffsetRmsNorm: STORER_PHASE parity"
-            );
-            assert!(
                 HIDDEN_DIM > 0,
                 "ScalarOffsetRmsNorm: HIDDEN_DIM must be > 0"
             );
@@ -1751,7 +1659,7 @@ impl TkScalarOffsetRmsNorm {
             );
         }
         use crate::ir::substrate::{
-            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, BarSyncId, BarSyncPair, HiddenDim, ArrivesCount,NumTokensConst,
             PageId, ScratchBytesRef, ScratchOffsetRef, WeightAccessorConst,
         };
         Self {
@@ -1759,8 +1667,8 @@ impl TkScalarOffsetRmsNorm {
             weight_page: PageId::<WEIGHT_ID, NUM_PAGES>::new().erase(),
             partial_offset: ScratchOffsetRef::__new_for_erase(PARTIAL_OFF),
             partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
@@ -1878,8 +1786,6 @@ impl TkGemm {
         const OUT_ID: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -1924,11 +1830,6 @@ impl TkGemm {
             assert!(N > 0, "Gemm: N must be > 0");
             assert!(K > 0, "Gemm: K must be > 0");
             assert!(M > 0, "Gemm: M (NUM_TOKENS) must be > 0");
-            assert!(CONSUMER_PHASE == ARRIVES & 1, "Gemm: CONSUMER_PHASE parity");
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "Gemm: STORER_PHASE parity"
-            );
             // Tile-layout consistency. AlongN warp split: each
             // consumer warp covers TILE_N output cols. tile_n * NCW
             // equality with N is enforced by the proc-macro (NCW
@@ -1948,7 +1849,7 @@ impl TkGemm {
         }
         use crate::ir::substrate::{
             ActSlotConst, BarSyncId, ChunkK, IterCount, MatmulK, MatmulM, MatmulN,
-            MbarrierPhase, PageId, ScratchBytesRef, ScratchOffsetRef, TileN, WeightAccessorConst,
+            ArrivesCount,PageId, ScratchBytesRef, ScratchOffsetRef, TileN, WeightAccessorConst,
         };
         Self {
             in_page: PageId::<IN_ID, NUM_PAGES>::new().erase(),
@@ -1956,8 +1857,8 @@ impl TkGemm {
             out_page: PageId::<OUT_ID, NUM_PAGES>::new().erase(),
             b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
             b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             n: MatmulN::<N>::new().erase(),
@@ -2088,8 +1989,6 @@ impl TkFusedGemmAdd {
         const RESIDUAL_ID: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -2138,14 +2037,6 @@ impl TkFusedGemmAdd {
             assert!(N > 0, "TkFusedGemmAdd: N must be > 0");
             assert!(K > 0, "TkFusedGemmAdd: K must be > 0");
             assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "TkFusedGemmAdd: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "TkFusedGemmAdd: STORER_PHASE parity"
-            );
-            assert!(
                 NUM_TOKENS > 0,
                 "TkFusedGemmAdd: NUM_TOKENS must be > 0"
             );
@@ -2171,7 +2062,7 @@ impl TkFusedGemmAdd {
         }
         use crate::ir::substrate::{
             ActSlotConst, BarSyncId, ChunkK, IterCount, KFull, KOffset, MatmulK, MatmulN,
-            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            ArrivesCount,NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
             WeightAccessorConst,
         };
         Self {
@@ -2180,8 +2071,8 @@ impl TkFusedGemmAdd {
             residual_page: PageId::<RESIDUAL_ID, NUM_PAGES>::new().erase(),
             b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
             b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             n: MatmulN::<N>::new().erase(),
@@ -2357,8 +2248,6 @@ impl TkFusedNormGemm {
         const PARTIAL_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -2419,14 +2308,6 @@ impl TkFusedNormGemm {
             assert!(N > 0, "TkFusedNormGemm: N must be > 0");
             assert!(K > 0, "TkFusedNormGemm: K must be > 0");
             assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "TkFusedNormGemm: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "TkFusedNormGemm: STORER_PHASE parity"
-            );
-            assert!(
                 NUM_TOKENS > 0,
                 "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
@@ -2455,7 +2336,7 @@ impl TkFusedNormGemm {
         }
         use crate::ir::substrate::{
             ActSlotConst, BarSyncId, BarSyncPair, ChunkK, IterCount, MatmulK, MatmulN,
-            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            ArrivesCount,NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
             WeightAccessorConst,
         };
         Self {
@@ -2468,8 +2349,8 @@ impl TkFusedNormGemm {
             partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
             b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
             b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             n: MatmulN::<N>::new().erase(),
@@ -2515,8 +2396,6 @@ impl TkFusedNormGemm {
         const PARTIAL_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -2584,14 +2463,6 @@ impl TkFusedNormGemm {
             assert!(N > 0, "TkFusedNormGemm: N must be > 0");
             assert!(K > 0, "TkFusedNormGemm: K must be > 0");
             assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "TkFusedNormGemm: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "TkFusedNormGemm: STORER_PHASE parity"
-            );
-            assert!(
                 NUM_TOKENS > 0,
                 "TkFusedNormGemm: NUM_TOKENS must be > 0"
             );
@@ -2620,7 +2491,7 @@ impl TkFusedNormGemm {
         }
         use crate::ir::substrate::{
             ActSlotConst, BarSyncId, BarSyncPair, ChunkK, IterCount, MatmulK, MatmulN,
-            MbarrierPhase, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
+            ArrivesCount,NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef, TileN,
             WeightAccessorConst,
         };
         Self {
@@ -2633,8 +2504,8 @@ impl TkFusedNormGemm {
             partial_bytes: ScratchBytesRef::__new_for_erase(PARTIAL_BYTES),
             b_tile_offset: ScratchOffsetRef::__new_for_erase(B_TILE_OFF),
             b_tile_bytes: ScratchBytesRef::__new_for_erase(B_TILE_BYTES),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             n: MatmulN::<N>::new().erase(),
@@ -2806,8 +2677,6 @@ impl TkAttentionViaCacheNode {
         const PV_BYTES: u32,
         const K_SMEM_PAGE_ID: u32,
         const V_SMEM_PAGE_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_PAGES: u32,
@@ -2893,14 +2762,6 @@ impl TkAttentionViaCacheNode {
             );
             assert!(ITERS > 0, "AttentionViaCache: ITERS must be > 0");
             assert!(LAYER < NUM_LAYERS, "AttentionViaCache: LAYER OOB");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "AttentionViaCache: CONSUMER_PHASE parity"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "AttentionViaCache: STORER_PHASE parity"
-            );
             assert!(HEAD_DIM > 0, "AttentionViaCache: HEAD_DIM must be > 0");
             assert!(
                 NUM_Q_HEADS > 0,
@@ -2934,7 +2795,7 @@ impl TkAttentionViaCacheNode {
         // const-generic SlidingWindow<W> primitive; here we just
         // store the runtime u32 carried in AttentionKind::Sliding.
         use crate::ir::substrate::{
-            ActSlotConst, BlockSize, HeadDim, IterCount, MaxSk, MbarrierPhase, NumKvHeads,
+            ActSlotConst, BlockSize, HeadDim, IterCount, MaxSk, ArrivesCount,NumKvHeads,
             NumQHeads, NumTokensConst, PageId, ScratchBytesRef, ScratchOffsetRef,
         };
         Self {
@@ -2946,8 +2807,8 @@ impl TkAttentionViaCacheNode {
             pv_bytes: ScratchBytesRef::__new_for_erase(PV_BYTES),
             k_smem_page: PageId::<K_SMEM_PAGE_ID, NUM_PAGES>::new().erase(),
             v_smem_page: PageId::<V_SMEM_PAGE_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             iters: IterCount::<ITERS>::new().erase(),
             kv_cache_layer: LayerIndex::<LAYER, NUM_LAYERS>::new().erase(),
             head_dim: HeadDim::<HEAD_DIM>::new().erase(),
@@ -3092,8 +2953,6 @@ impl TkSpliceMmEmbeds {
     #[allow(clippy::too_many_arguments)]
     pub fn new<
         const SLOT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const NUM_PAGES: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
@@ -3102,24 +2961,16 @@ impl TkSpliceMmEmbeds {
     >() -> Self {
         const {
             assert!(SLOT_ID < NUM_PAGES, "SpliceMmEmbeds: SLOT_ID out of bounds");
-            assert!(
-                CONSUMER_PHASE == ARRIVES & 1,
-                "SpliceMmEmbeds: CONSUMER_PHASE parity mismatch"
-            );
-            assert!(
-                STORER_PHASE == (ARRIVES + 1) & 1,
-                "SpliceMmEmbeds: STORER_PHASE parity mismatch"
-            );
             assert!(HIDDEN_DIM > 0, "SpliceMmEmbeds: HIDDEN_DIM must be > 0");
             assert!(NUM_TOKENS > 0, "SpliceMmEmbeds: NUM_TOKENS must be > 0");
         }
         use crate::ir::substrate::{
-            ActSlotConst, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, HiddenDim, ArrivesCount,NumTokensConst, PageId,
         };
         Self {
             slot: PageId::<SLOT_ID, NUM_PAGES>::new().erase(),
-            consumer_phase: MbarrierPhase::<CONSUMER_PHASE>::new().erase(),
-            storer_phase: MbarrierPhase::<STORER_PHASE>::new().erase(),
+            consumer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
+            storer_phase: ArrivesCount::<ARRIVES>::new().derive_phase(),
             hidden_dim: HiddenDim::<HIDDEN_DIM>::new().erase(),
             num_tokens: NumTokensConst::<NUM_TOKENS>::new().erase(),
             target_act_slot: ActSlotConst::<TARGET_ACT_SLOT, { u32::MAX }>::new().erase(),

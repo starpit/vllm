@@ -161,8 +161,6 @@ impl<
     /// - `IN_ID != WEIGHT_ID`
     /// - `PARTIAL_OFF + PARTIAL_BYTES <= SCRATCH_BYTES`
     /// - `LAYER < NUM_LAYERS`
-    /// - `CONSUMER_PHASE == ARRIVES & 1`
-    /// - `STORER_PHASE == (ARRIVES + 1) & 1`
     /// - `HIDDEN_DIM > 0`, `NUM_TOKENS > 0` (kernel-AST shape)
     ///
     /// Kernel-AST const generics (per `MEGA_IR_PLAN.md` §0/§4a/§8.0
@@ -193,8 +191,6 @@ impl<
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const HIDDEN_DIM: u32,
@@ -221,8 +217,6 @@ impl<
             SCRATCH_BYTES,
             crate::ir::substrate::RmsNormScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
@@ -265,8 +259,6 @@ impl<
             WEIGHT_ID,
             PARTIAL_OFF,
             PARTIAL_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             LAYER,
             NUM_PAGES,
             NUM_LAYERS,
@@ -308,8 +300,6 @@ impl<
         const K_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
@@ -355,8 +345,6 @@ impl<
             SCRATCH_BYTES,
             crate::ir::substrate::GemmScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
@@ -410,8 +398,6 @@ impl<
             K_BYTES,
             B_TILE_OFF,
             B_TILE_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             NUM_PAGES,
@@ -451,8 +437,6 @@ impl<
     pub fn push_add<
         const DELTA_ID: u32,
         const RESIDUAL_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
@@ -464,8 +448,6 @@ impl<
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _delta_page: crate::ir::substrate::PageId<DELTA_ID, NUM_PAGES>,
         _residual_page: crate::ir::substrate::PageId<RESIDUAL_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _delta_act_slot: crate::ir::substrate::ActSlotConst<DELTA_ACT_SLOT, { u32::MAX }>,
@@ -481,8 +463,6 @@ impl<
         let node = TkAdd::new::<
             DELTA_ID,
             RESIDUAL_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             NUM_PAGES,
             ARRIVES,
             HIDDEN_DIM,
@@ -506,8 +486,6 @@ impl<
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
@@ -530,8 +508,6 @@ impl<
             SCRATCH_BYTES,
             crate::ir::substrate::RmsNormScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
@@ -565,8 +541,6 @@ impl<
             WEIGHT_ID,
             PARTIAL_OFF,
             PARTIAL_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             LAYER,
             NUM_PAGES,
             NUM_LAYERS,
@@ -602,8 +576,6 @@ impl<
         const GATE_BYTES: u32,
         const UP_OFF: u32,
         const UP_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
@@ -628,8 +600,6 @@ impl<
         _up: crate::ir::substrate::ScratchRegion<
             UP_OFF, UP_BYTES, SCRATCH_BYTES, crate::ir::substrate::MlpScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
@@ -662,8 +632,6 @@ impl<
             GATE_BYTES,
             UP_OFF,
             UP_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             NUM_PAGES,
@@ -696,8 +664,6 @@ impl<
     pub fn push_embed<
         const OUT_ID: u32,
         const WEIGHT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
@@ -709,8 +675,6 @@ impl<
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _out_page: crate::ir::substrate::PageId<OUT_ID, NUM_PAGES>,
         _weight_page: crate::ir::substrate::PageId<WEIGHT_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _vocab_size: crate::ir::substrate::VocabSize<VOCAB_SIZE>,
@@ -727,8 +691,6 @@ impl<
         let node = TkEmbed::new::<
             OUT_ID,
             WEIGHT_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             NUM_PAGES,
             ARRIVES,
             HIDDEN_DIM,
@@ -750,8 +712,6 @@ impl<
     pub fn push_scalar_mul<
         const IN_ID: u32,
         const OUT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
@@ -763,8 +723,6 @@ impl<
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _in_page: crate::ir::substrate::PageId<IN_ID, NUM_PAGES>,
         _out_page: crate::ir::substrate::PageId<OUT_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _in_act_slot: crate::ir::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
@@ -782,8 +740,6 @@ impl<
         let node = TkScalarMul::new::<
             IN_ID,
             OUT_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             NUM_PAGES,
             ARRIVES,
             HIDDEN_DIM,
@@ -806,8 +762,6 @@ impl<
     pub fn push_tanh_soft_cap<
         const IN_ID: u32,
         const OUT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
@@ -819,8 +773,6 @@ impl<
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _in_page: crate::ir::substrate::PageId<IN_ID, NUM_PAGES>,
         _out_page: crate::ir::substrate::PageId<OUT_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _in_act_slot: crate::ir::substrate::ActSlotConst<IN_ACT_SLOT, { u32::MAX }>,
@@ -838,8 +790,6 @@ impl<
         let node = TkTanhSoftCap::new::<
             IN_ID,
             OUT_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             NUM_PAGES,
             ARRIVES,
             HIDDEN_DIM,
@@ -864,8 +814,6 @@ impl<
         const WEIGHT_ID: u32,
         const PARTIAL_OFF: u32,
         const PARTIAL_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
         const ARRIVES: u32,
@@ -884,8 +832,6 @@ impl<
         _partial: crate::ir::substrate::ScratchRegion<
             PARTIAL_OFF, PARTIAL_BYTES, SCRATCH_BYTES, crate::ir::substrate::RmsNormScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
@@ -918,8 +864,6 @@ impl<
             WEIGHT_ID,
             PARTIAL_OFF,
             PARTIAL_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             LAYER,
             NUM_PAGES,
             NUM_LAYERS,
@@ -951,8 +895,6 @@ impl<
         const OUT_ID: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -975,8 +917,6 @@ impl<
         _b_tile: crate::ir::substrate::ScratchRegion<
             B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::ir::substrate::GemmScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _n: crate::ir::substrate::MatmulN<N>,
@@ -1007,8 +947,6 @@ impl<
             OUT_ID,
             B_TILE_OFF,
             B_TILE_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             N,
@@ -1051,8 +989,6 @@ impl<
         const RESIDUAL_ID: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -1077,8 +1013,6 @@ impl<
         _b_tile: crate::ir::substrate::ScratchRegion<
             B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::ir::substrate::GemmScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _n: crate::ir::substrate::MatmulN<N>,
@@ -1111,8 +1045,6 @@ impl<
             RESIDUAL_ID,
             B_TILE_OFF,
             B_TILE_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             N,
@@ -1156,8 +1088,6 @@ impl<
         const PARTIAL_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -1186,8 +1116,6 @@ impl<
         _b_tile: crate::ir::substrate::ScratchRegion<
             B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::ir::substrate::GemmScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _n: crate::ir::substrate::MatmulN<N>,
@@ -1238,8 +1166,6 @@ impl<
             PARTIAL_BYTES,
             B_TILE_OFF,
             B_TILE_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             N,
@@ -1285,8 +1211,6 @@ impl<
         const PARTIAL_BYTES: u32,
         const B_TILE_OFF: u32,
         const B_TILE_BYTES: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const N: u32,
@@ -1317,8 +1241,6 @@ impl<
         _b_tile: crate::ir::substrate::ScratchRegion<
             B_TILE_OFF, B_TILE_BYTES, SCRATCH_BYTES, crate::ir::substrate::GemmScope,
         >,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _n: crate::ir::substrate::MatmulN<N>,
@@ -1374,8 +1296,6 @@ impl<
             PARTIAL_BYTES,
             B_TILE_OFF,
             B_TILE_BYTES,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             N,
@@ -1421,8 +1341,6 @@ impl<
         const PV_BYTES: u32,
         const K_SMEM_PAGE_ID: u32,
         const V_SMEM_PAGE_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ITERS: u32,
         const LAYER: u32,
         const NUM_LAYERS: u32,
@@ -1450,8 +1368,6 @@ impl<
         // scratch (which is 1024 B in TK's default_config).
         _k_smem_page: crate::ir::substrate::PageId<K_SMEM_PAGE_ID, NUM_PAGES>,
         _v_smem_page: crate::ir::substrate::PageId<V_SMEM_PAGE_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _iters: crate::ir::substrate::IterCount<ITERS>,
         _layer: crate::ir::nodes::LayerIndex<LAYER, NUM_LAYERS>,
         _head_dim: crate::ir::substrate::HeadDim<HEAD_DIM>,
@@ -1475,10 +1391,8 @@ impl<
         //    pair so we can chain through the rest.
         // 2. K_smem and V_smem each fit a `[BLOCK_SIZE,
         //    NUM_KV_HEADS * HEAD_DIM]` bf16 paged-KV block.
-        // 3. CONSUMER_PHASE / STORER_PHASE parities match
-        //    the cumulative `ARRIVES` count (the
-        //    `AttentionViaCacheNode::new` parity asserts become
-        //    dead once these are discharged here).
+        // 3. Page-round phase parity is derived from the cumulative
+        //    `ARRIVES` count — no separate `*_PHASE` const generic.
         // Score / PV tiles are pairwise disjoint scratch regions.
         // K_smem / V_smem live in distinct PAGES — proven by the
         // `K_SMEM_PAGE_ID != V_SMEM_PAGE_ID` const assertion in
@@ -1487,9 +1401,6 @@ impl<
         let (score_tile, pv_tile) = score_tile.disjoint_with(pv_tile);
         let _ = score_tile;
         let _ = pv_tile;
-        let _ = crate::ir::substrate::MbarrierPhase::<CONSUMER_PHASE>::assert_matches::<ARRIVES>();
-        let _ =
-            crate::ir::substrate::MbarrierPhase::<STORER_PHASE>::assert_matches_next::<ARRIVES>();
 
         self.verify_arrives(ARRIVES, "push_attention_via_cache");
         let _ = self.pool.take(Q_IN_ID);
@@ -1507,8 +1418,6 @@ impl<
             PV_BYTES,
             K_SMEM_PAGE_ID,
             V_SMEM_PAGE_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             ITERS,
             LAYER,
             NUM_PAGES,
@@ -1541,8 +1450,6 @@ impl<
     #[allow(clippy::too_many_arguments)]
     pub fn push_splice_mm_embeds<
         const SLOT_ID: u32,
-        const CONSUMER_PHASE: u32,
-        const STORER_PHASE: u32,
         const ARRIVES: u32,
         const HIDDEN_DIM: u32,
         const NUM_TOKENS: u32,
@@ -1551,8 +1458,6 @@ impl<
         &mut self,
         _arrives: crate::ir::substrate::ArrivesCount<ARRIVES>,
         _slot: crate::ir::substrate::PageId<SLOT_ID, NUM_PAGES>,
-        _consumer_phase: crate::ir::substrate::MbarrierPhase<CONSUMER_PHASE>,
-        _storer_phase: crate::ir::substrate::MbarrierPhase<STORER_PHASE>,
         _hidden_dim: crate::ir::substrate::HiddenDim<HIDDEN_DIM>,
         _num_tokens: crate::ir::substrate::NumTokensConst<NUM_TOKENS>,
         _target_act_slot: crate::ir::substrate::ActSlotConst<TARGET_ACT_SLOT, { u32::MAX }>,
@@ -1561,8 +1466,6 @@ impl<
         let _ = self.pool.take(SLOT_ID);
         let node = TkSpliceMmEmbeds::new::<
             SLOT_ID,
-            CONSUMER_PHASE,
-            STORER_PHASE,
             NUM_PAGES,
             ARRIVES,
             HIDDEN_DIM,
@@ -1672,7 +1575,7 @@ mod tests {
         // `BarSyncPair<1, 2>` proves the two bars are distinct).
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         b.push_rms_norm(
@@ -1680,8 +1583,6 @@ mod tests {
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -1704,7 +1605,7 @@ mod tests {
         assert_eq!(n.partial_offset().raw(), 0);
         assert_eq!(n.partial_bytes().raw(), 32);
         assert_eq!(n.consumer_phase().raw(), 0);
-        assert_eq!(n.storer_phase().raw(), 1);
+        assert_eq!(n.storer_phase().raw(), 0);
         assert_eq!(n.layer().raw(), 0);
         assert_eq!(n.hidden_dim().raw(), 2048);
         assert_eq!(n.num_tokens().raw(), 8);
@@ -1721,7 +1622,7 @@ mod tests {
     fn lowers_two_rms_norms_with_phase_advance() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = Builder6::new();
@@ -1730,8 +1631,6 @@ mod tests {
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -1744,15 +1643,13 @@ mod tests {
             "W::n0".to_string(),
             1.0e-5_f32,
         );
-        // After first op, ARRIVES = 1; CONSUMER_PHASE = 1, STORER_PHASE = 0.
+        // After first op, ARRIVES = 1 ⇒ derived phase = 1.
         // OUT_ACT_SLOT = 2 to avoid runtime PagePool aliasing on slot 1.
         b.push_rms_norm(
             ArrivesCount::<1>::new(),
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<1>::new(),
-            MbarrierPhase::<0>::new(),
             LayerIndex::<1, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -1773,9 +1670,9 @@ mod tests {
             panic!();
         };
         assert_eq!(n0.consumer_phase().raw(), 0);
-        assert_eq!(n0.storer_phase().raw(), 1);
+        assert_eq!(n0.storer_phase().raw(), 0);
         assert_eq!(n1.consumer_phase().raw(), 1);
-        assert_eq!(n1.storer_phase().raw(), 0);
+        assert_eq!(n1.storer_phase().raw(), 1);
     }
 
     #[test]
@@ -1795,7 +1692,7 @@ mod tests {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, ChunkK, GemmScope, HeadDim, HiddenDim,
-            IterCount, MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId,
+            IterCount, NumKvHeads, NumQHeads, NumTokensConst, PageId,
             RopeScope, ScratchRegion, TileN, WeightAccessorConst,
         };
         let mut b = Builder8::new();
@@ -1805,8 +1702,8 @@ mod tests {
         //   qkv_b_tile[4096.. 8192) GemmScope (cross-scope: no
         //                   sealed disjoint proof against rope by
         //                   substrate; codegen places it after rope).
-        // ITERS=4, LAYER=0, NUM_LAYERS=16, ARRIVES=0,
-        // CONSUMER_PHASE=0, STORER_PHASE=1. S15a: NUM_TOKENS=8,
+        // ITERS=4, LAYER=0, NUM_LAYERS=16, ARRIVES=0
+        // (⇒ derived phase=0). S15a: NUM_TOKENS=8,
         // TILE_N=768 (qkv_n=3072 / 4 NCW), CHUNK_K=512
         // (HIDDEN_DIM=2048 / ITERS=4), bar_publish=1. S15c:
         // qkv_b_tile sized for the full per-iter staging tile.
@@ -1821,8 +1718,6 @@ mod tests {
             ScratchRegion::<0, 2048, 8192, RopeScope>::new(),
             ScratchRegion::<2048, 2048, 8192, RopeScope>::new(),
             ScratchRegion::<4096, 4096, 8192, GemmScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<4>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
@@ -1871,7 +1766,7 @@ mod tests {
     #[test]
     fn lowers_add_minimal() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, NumTokensConst,
             PageId,
         };
         let mut b = Builder6::new();
@@ -1879,8 +1774,6 @@ mod tests {
             ArrivesCount::<0>::new(),
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
@@ -1903,7 +1796,7 @@ mod tests {
     fn lowers_fused_add_rms_norm() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = Builder6::new();
@@ -1913,8 +1806,6 @@ mod tests {
             PageId::<1, 6>::new(),
             PageId::<2, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<3, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -1940,7 +1831,7 @@ mod tests {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, IntermediateDim, IterCount,
-            MbarrierPhase, MlpScope, NumTokensConst, PageId, ScratchRegion, TileN,
+            MlpScope, NumTokensConst, PageId, ScratchRegion, TileN,
             WeightAccessorConst,
         };
         let mut b = Builder8::new();
@@ -1951,8 +1842,6 @@ mod tests {
             PageId::<2, 8>::new(),
             ScratchRegion::<0, 2048, 8192, MlpScope>::new(),
             ScratchRegion::<2048, 2048, 8192, MlpScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<8>::new(),
             LayerIndex::<5, 16>::new(),
             HiddenDim::<2048>::new(),
@@ -1984,7 +1873,7 @@ mod tests {
     #[test]
     fn lowers_embed() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, HiddenDim, MbarrierPhase, NumTokensConst, PageId,
+            ActSlotConst, ArrivesCount, HiddenDim, NumTokensConst, PageId,
             VocabSize, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
@@ -1992,8 +1881,6 @@ mod tests {
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
             VocabSize::<128_000>::new(),
@@ -2017,7 +1904,7 @@ mod tests {
     #[test]
     fn lowers_scalar_mul_finite_scale() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, NumTokensConst,
             PageId,
         };
         let mut b = BuilderD::new();
@@ -2025,8 +1912,6 @@ mod tests {
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
@@ -2048,7 +1933,7 @@ mod tests {
     #[should_panic(expected = "FiniteF32 rejects non-finite value: NaN")]
     fn scalar_mul_rejects_nan_scale() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, NumTokensConst,
             PageId,
         };
         let mut b = BuilderD::new();
@@ -2056,8 +1941,6 @@ mod tests {
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
@@ -2070,7 +1953,7 @@ mod tests {
     #[test]
     fn lowers_tanh_soft_cap() {
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, MbarrierPhase, NumTokensConst,
+            ActSlotConst, ArrivesCount, BarSyncId, HiddenDim, NumTokensConst,
             PageId,
         };
         let mut b = BuilderD::new();
@@ -2078,8 +1961,6 @@ mod tests {
             ArrivesCount::<0>::new(),
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
@@ -2100,7 +1981,7 @@ mod tests {
     fn lowers_scalar_offset_rms_norm() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = BuilderD::new();
@@ -2109,8 +1990,6 @@ mod tests {
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
             ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<5, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -2143,7 +2022,7 @@ mod tests {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, ChunkK, GemmScope, IterCount, MatmulK,
-            MatmulM, MatmulN, MbarrierPhase, PageId, ScratchRegion, TileN, WeightAccessorConst,
+            MatmulM, MatmulN, PageId, ScratchRegion, TileN, WeightAccessorConst,
         };
         // K=2048, ITERS=4 → CHUNK_K=512. N=4096, NCW=8 → TILE_N=512.
         let mut b = BuilderD::new();
@@ -2153,8 +2032,6 @@ mod tests {
             PageId::<1, 8>::new(),
             PageId::<2, 8>::new(),
             ScratchRegion::<0, 4096, 32_768, GemmScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<4>::new(),
             LayerIndex::<3, 16>::new(),
             MatmulN::<4096>::new(),
@@ -2181,7 +2058,7 @@ mod tests {
     fn lowers_lm_head_rms_norm_no_delta() {
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
-            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            MatmulK, MatmulN, NumTokensConst, PageId, ScratchRegion, TileN,
             WeightAccessorConst,
         };
         let mut b = BuilderD::new();
@@ -2201,8 +2078,6 @@ mod tests {
             PageId::<3, 8>::new(),
             ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
             ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<1>::new(),
             crate::ir::nodes::LayerIndex::<0, 16>::new(),
             MatmulN::<128_000>::new(),
@@ -2234,7 +2109,7 @@ mod tests {
     fn lowers_lm_head_add_scalar_offset_rms_norm_with_delta() {
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
-            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            MatmulK, MatmulN, NumTokensConst, PageId, ScratchRegion, TileN,
             WeightAccessorConst,
         };
         let mut b = BuilderD::new();
@@ -2255,8 +2130,6 @@ mod tests {
             PageId::<4, 8>::new(),
             ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
             ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<1>::new(),
             crate::ir::nodes::LayerIndex::<0, 16>::new(),
             MatmulN::<128_000>::new(),
@@ -2292,7 +2165,7 @@ mod tests {
     fn lm_head_rejects_missing_offset_for_scalar_offset_kind() {
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, ChunkK, GemmScope, IterCount,
-            MatmulK, MatmulN, MbarrierPhase, NumTokensConst, PageId, ScratchRegion, TileN,
+            MatmulK, MatmulN, NumTokensConst, PageId, ScratchRegion, TileN,
             WeightAccessorConst,
         };
         let mut b = BuilderD::new();
@@ -2313,8 +2186,6 @@ mod tests {
             PageId::<4, 8>::new(),
             ScratchRegion::<0, 32, 32_768, GemmScope>::new(),
             ScratchRegion::<4096, 4096, 32_768, GemmScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<1>::new(),
             crate::ir::nodes::LayerIndex::<0, 16>::new(),
             MatmulN::<128_000>::new(),
@@ -2342,7 +2213,7 @@ mod tests {
     fn lowers_attention_via_cache_full() {
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, AttentionScope, BlockSize, HeadDim, IterCount, MaxSk,
-            MbarrierPhase, NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchRegion,
+            NumKvHeads, NumQHeads, NumTokensConst, PageId, ScratchRegion,
         };
         let mut b = BuilderAttn::new();
         // Scratch layout (AttentionScope, SCRATCH_BYTES=65536):
@@ -2364,8 +2235,6 @@ mod tests {
             ScratchRegion::<4096, 4096, 65_536, AttentionScope>::new(),
             ScratchRegion::<8192, 16384, 65_536, AttentionScope>::new(),
             ScratchRegion::<24576, 16384, 65_536, AttentionScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             IterCount::<8>::new(),
             crate::ir::nodes::LayerIndex::<5, 16>::new(),
             HeadDim::<64>::new(),
@@ -2412,7 +2281,7 @@ mod tests {
     fn barriers_do_not_advance_arrives() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         // Barriers don't bump the per-CTA mbarrier count, so the
@@ -2428,8 +2297,6 @@ mod tests {
             PageId::<0, 8>::new(),
             PageId::<1, 8>::new(),
             ScratchRegion::<0, 32, 32_768, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -2450,7 +2317,7 @@ mod tests {
     fn builder_arrives_visible_to_caller() {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
-            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim, MbarrierPhase,
+            ActSlotConst, ArrivesCount, BarSyncId, BarSyncPair, HiddenDim,
             NumTokensConst, PageId, RmsNormScope, ScratchRegion, WeightAccessorConst,
         };
         let mut b = Builder6::new();
@@ -2460,8 +2327,6 @@ mod tests {
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<0>::new(),
-            MbarrierPhase::<1>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),
@@ -2480,8 +2345,6 @@ mod tests {
             PageId::<0, 6>::new(),
             PageId::<1, 6>::new(),
             ScratchRegion::<0, 32, 8192, RmsNormScope>::new(),
-            MbarrierPhase::<1>::new(),
-            MbarrierPhase::<0>::new(),
             LayerIndex::<0, 16>::new(),
             HiddenDim::<2048>::new(),
             NumTokensConst::<8>::new(),

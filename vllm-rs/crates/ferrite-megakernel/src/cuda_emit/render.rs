@@ -947,27 +947,72 @@ pub fn render_gemm<
     // only when those branches are actually instantiated, and
     // they always are at fixed M_BLOCKS values where the asserts
     // pass).
+    // Dispatch on (M, TILE_N) → concrete (M_BLOCKS, M_TOTAL, WGMMA_N, N_MICRO).
+    // wgmma::base specializations exist only for cols ∈ [16..256, step 16]
+    // (see TK 2.0 base.cuh:28-43), so each wgmma instruction takes WGMMA_N
+    // ≤ 256 and we walk N_MICRO of them per warpgroup-N-tile.
+    macro_rules! dispatch_m {
+        ($mb:expr, $mt:expr) => {
+            if TILE_N == 64 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 64, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 128 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 128, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 256 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 256, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 512 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 256, 2, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 1024 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 256, 4, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 2048 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 256, 8, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 4096 {
+                render_gemm_prefill_wgmma::<$mb, $mt, K, N, 256, 16, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else {
+                RoleBodies::skipped("TkGemm")
+            }
+        };
+    }
     if M == 64 {
-        render_gemm_prefill_wgmma::<1, 64, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m!(1, 64)
     } else if M == 512 {
-        render_gemm_prefill_wgmma::<8, 512, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m!(8, 512)
     } else if M == 4096 {
-        render_gemm_prefill_wgmma::<64, 4096, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m!(64, 4096)
     } else {
         panic!("render_gemm prefill: unsupported M (must be 64/512/4096); got {M}");
     }
@@ -1010,7 +1055,8 @@ pub fn render_gemm_prefill_wgmma<
     const M_TOTAL: u32,
     const K: u32,
     const N: u32,
-    const TILE_N: u32,
+    const WGMMA_N: u32,
+    const N_MICRO: u32,
     const NCW: u32,
     const NUM_LAYERS: u32,
     const ITERS: u32,
@@ -1030,6 +1076,9 @@ pub fn render_gemm_prefill_wgmma<
     const { assert!(NCW % 4 == 0, "render_gemm prefill: NCW must be a multiple of 4 (warpgroup size)"); }
     const { assert!(M_BLOCKS >= 1, "render_gemm prefill: M_BLOCKS must be >= 1"); }
     const { assert!(M_TOTAL == M_BLOCKS * 64, "render_gemm prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+    const { assert!(WGMMA_N >= 16 && WGMMA_N <= 256 && WGMMA_N % 16 == 0,
+        "render_gemm prefill: WGMMA_N must be a multiple of 16 in [16, 256] (TK 2.0 wgmma::base specializations)"); }
+    const { assert!(N_MICRO >= 1, "render_gemm prefill: N_MICRO must be >= 1"); }
 
     const M_TILE: u32 = 64;
 
@@ -1076,41 +1125,52 @@ pub fn render_gemm_prefill_wgmma<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
 
-    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gemm_acc");
-    consumer.push(decl_acc);
-
     let n_tiles_per_wg: u32 = 4;
     let groupid = tk20::warpgroup_groupid_expr();
 
+    // A subtile: 64-row slice of in_smem along the M dim, declared
+    // once per m-block (shared across all N-microtiles in this block).
+    let (decl_a_sub, a_sub_outer) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
+        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
+    );
+
+    // Innermost: per-microtile wgmma over WGMMA_N cols. acc_rt is
+    // declared inside the loop body so each iteration gets its own
+    // (compiler reuses registers).
+    let mut micro_body = CuBlock::new();
+    micro_body.push(CuStmt::new(format!(
+        "int __gemm_b_col = __gemm_n_idx * {N_MICRO} + __gemm_nm;"
+    )));
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<WGMMA_N>("__gemm_acc");
+    let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, WGMMA_N>(
+        "__gemm_b_sub", &b_tile, "0", "__gemm_b_col",
+    );
+    let (decl_out_sub, out_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, WGMMA_N>(
+            "__gemm_out_sub", &out_smem, "__gemm_m_block", "__gemm_b_col",
+        );
+    micro_body.push(decl_acc);
+    micro_body.push(decl_b_sub);
+    micro_body.push(decl_out_sub);
+    micro_body.push(tk20::warpgroup_zero_rt_fl::<WGMMA_N>(&acc_rt));
+    micro_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, WGMMA_N>(&acc_rt, &a_sub_outer, &b_sub));
+    micro_body.push(tk20::warpgroup_mma_async_wait());
+    micro_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, WGMMA_N>(&out_sub, &acc_rt));
+
     // Inner N-tile loop body (per m-block). Each warpgroup
-    // owns 4 of the NCW N-tiles.
+    // owns 4 of the NCW N-tiles. A subtile is shared across all
+    // microtiles within a warpgroup-N-tile (same A rows).
     let mut n_loop_body = CuBlock::new();
     n_loop_body.push(CuStmt::new(format!(
         "int __gemm_n_idx = {groupid} * {n_tiles_per_wg} + __gemm_n_in_wg;"
     )));
-    // A subtile: 64-row slice of in_smem along the M dim.
-    // st<>::subtile<rows, cols>(int2{row_blk, col_blk}) indexes
-    // in units of (rows, cols) — so {__gemm_m_block, 0} picks
-    // rows [m_block*64 .. m_block*64+64).
-    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
-        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
-    );
-    let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, TILE_N>(
-        "__gemm_b_sub", &b_tile, "0", "__gemm_n_idx",
-    );
-    let (decl_out_sub, out_sub) =
-        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, TILE_N>(
-            "__gemm_out_sub", &out_smem, "__gemm_m_block", "__gemm_n_idx",
-        );
-    n_loop_body.push(decl_a_sub);
-    n_loop_body.push(decl_b_sub);
-    n_loop_body.push(decl_out_sub);
-    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&acc_rt));
-    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, TILE_N>(&acc_rt, &a_sub, &b_sub));
-    n_loop_body.push(tk20::warpgroup_mma_async_wait());
-    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&out_sub, &acc_rt));
+    n_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_nm = 0; __gemm_nm < {N_MICRO}; ++__gemm_nm"),
+        &micro_body,
+    ));
 
     let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(decl_a_sub);
     m_loop_body.push(tk20::for_loop_no_unroll(
         &format!("int __gemm_n_in_wg = 0; __gemm_n_in_wg < {n_tiles_per_wg}; ++__gemm_n_in_wg"),
         &n_loop_body,
@@ -1553,27 +1613,68 @@ pub fn render_tk_fused_gemm_add<
             b_tile_offset,
         );
     }
+    macro_rules! dispatch_m_ga {
+        ($mb:expr, $mt:expr) => {
+            if TILE_N == 64 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 64, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 128 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 128, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 256 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 256, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 512 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 256, 2, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 1024 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 256, 4, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 2048 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 256, 8, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else if TILE_N == 4096 {
+                render_tk_fused_gemm_add_prefill_wgmma::<$mb, $mt, K, N, 256, 16, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, residual_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, residual_act_slot, weight_accessor,
+                    bar_publish, b_tile_offset,
+                )
+            } else {
+                RoleBodies::skipped("TkFusedGemmAdd")
+            }
+        };
+    }
     if M == 64 {
-        render_tk_fused_gemm_add_prefill_wgmma::<1, 64, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, residual_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, residual_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m_ga!(1, 64)
     } else if M == 512 {
-        render_tk_fused_gemm_add_prefill_wgmma::<8, 512, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, residual_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, residual_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m_ga!(8, 512)
     } else if M == 4096 {
-        render_tk_fused_gemm_add_prefill_wgmma::<64, 4096, K, N, TILE_N, NCW, NUM_LAYERS, ITERS>(
-            in_page_id, weight_page_id, residual_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, residual_act_slot, weight_accessor,
-            bar_publish, b_tile_offset,
-        )
+        dispatch_m_ga!(64, 4096)
     } else {
         panic!("render_tk_fused_gemm_add prefill: unsupported M (must be 64/512/4096); got {M}");
     }
@@ -1597,7 +1698,8 @@ pub fn render_tk_fused_gemm_add_prefill_wgmma<
     const M_TOTAL: u32,
     const K: u32,
     const N: u32,
-    const TILE_N: u32,
+    const WGMMA_N: u32,
+    const N_MICRO: u32,
     const NCW: u32,
     const NUM_LAYERS: u32,
     const ITERS: u32,
@@ -1617,6 +1719,9 @@ pub fn render_tk_fused_gemm_add_prefill_wgmma<
     const { assert!(NCW % 4 == 0, "render_tk_fused_gemm_add prefill: NCW must be a multiple of 4 (warpgroup size)"); }
     const { assert!(M_BLOCKS >= 1, "render_tk_fused_gemm_add prefill: M_BLOCKS must be >= 1"); }
     const { assert!(M_TOTAL == M_BLOCKS * 64, "render_tk_fused_gemm_add prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+    const { assert!(WGMMA_N >= 16 && WGMMA_N <= 256 && WGMMA_N % 16 == 0,
+        "render_tk_fused_gemm_add prefill: WGMMA_N must be a multiple of 16 in [16, 256]"); }
+    const { assert!(N_MICRO >= 1, "render_tk_fused_gemm_add prefill: N_MICRO must be >= 1"); }
 
     const M_TILE: u32 = 64;
 
@@ -1669,37 +1774,48 @@ pub fn render_tk_fused_gemm_add_prefill_wgmma<
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&residual_ready, consumer_phase));
 
-    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gemm_acc");
-    consumer.push(decl_acc);
-
     let n_tiles_per_wg: u32 = 4;
     let groupid = tk20::warpgroup_groupid_expr();
+
+    // A subtile shared across all N-microtiles in this m-block.
+    let (decl_a_sub, a_sub_outer) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
+        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
+    );
+
+    // Innermost: per-microtile fused-residual wgmma.
+    let mut micro_body = CuBlock::new();
+    micro_body.push(CuStmt::new(format!(
+        "int __gemm_b_col = __gemm_n_idx * {N_MICRO} + __gemm_nm;"
+    )));
+    let (decl_acc, acc_rt) = tk20::decl_rt_fl_warpgroup::<WGMMA_N>("__gemm_acc");
+    let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, WGMMA_N>(
+        "__gemm_b_sub", &b_tile, "0", "__gemm_b_col",
+    );
+    let (decl_resid_sub, resid_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, WGMMA_N>(
+            "__gemm_resid_sub", &residual_smem, "__gemm_m_block", "__gemm_b_col",
+        );
+    micro_body.push(decl_acc);
+    micro_body.push(decl_b_sub);
+    micro_body.push(decl_resid_sub);
+    // Preload residual into D so wgmma's default accumulate gives
+    // D = residual + A*B.
+    micro_body.push(tk20::warpgroup_load_rt_fl_from_st_bf::<M_TILE, WGMMA_N>(&acc_rt, &resid_sub));
+    micro_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, WGMMA_N>(&acc_rt, &a_sub_outer, &b_sub));
+    micro_body.push(tk20::warpgroup_mma_async_wait());
+    micro_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, WGMMA_N>(&resid_sub, &acc_rt));
 
     let mut n_loop_body = CuBlock::new();
     n_loop_body.push(CuStmt::new(format!(
         "int __gemm_n_idx = {groupid} * {n_tiles_per_wg} + __gemm_n_in_wg;"
     )));
-    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, K, M_TILE, K>(
-        "__gemm_a_sub", &in_smem, "__gemm_m_block", "0",
-    );
-    let (decl_b_sub, b_sub) = tk20::decl_st_bf_subtile::<K, N, K, TILE_N>(
-        "__gemm_b_sub", &b_tile, "0", "__gemm_n_idx",
-    );
-    let (decl_resid_sub, resid_sub) =
-        tk20::decl_st_bf_subtile::<M_TOTAL, N, M_TILE, TILE_N>(
-            "__gemm_resid_sub", &residual_smem, "__gemm_m_block", "__gemm_n_idx",
-        );
-    n_loop_body.push(decl_a_sub);
-    n_loop_body.push(decl_b_sub);
-    n_loop_body.push(decl_resid_sub);
-    // Preload residual into D so wgmma's default accumulate gives
-    // D = residual + A*B.
-    n_loop_body.push(tk20::warpgroup_load_rt_fl_from_st_bf::<M_TILE, TILE_N>(&acc_rt, &resid_sub));
-    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, K, TILE_N>(&acc_rt, &a_sub, &b_sub));
-    n_loop_body.push(tk20::warpgroup_mma_async_wait());
-    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&resid_sub, &acc_rt));
+    n_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gemm_nm = 0; __gemm_nm < {N_MICRO}; ++__gemm_nm"),
+        &micro_body,
+    ));
 
     let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(decl_a_sub);
     m_loop_body.push(tk20::for_loop_no_unroll(
         &format!("int __gemm_n_in_wg = 0; __gemm_n_in_wg < {n_tiles_per_wg}; ++__gemm_n_in_wg"),
         &n_loop_body,
@@ -1967,33 +2083,68 @@ pub fn render_fused_gate_up_activate_mul<
             activation,
         );
     }
+    macro_rules! dispatch_m_gu {
+        ($mb:expr, $mt:expr) => {
+            if TILE_N == 64 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 64, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 128 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 128, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 256 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 256, 1, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 512 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 256, 2, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 1024 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 256, 4, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 2048 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 256, 8, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else if TILE_N == 4096 {
+                render_fused_gate_up_activate_mul_prefill_wgmma::<$mb, $mt, HIDDEN_DIM, INTERMEDIATE_DIM, 256, 16, NCW, NUM_LAYERS, ITERS>(
+                    in_page_id, weight_page_id, out_page_id,
+                    consumer_phase, storer_phase, layer,
+                    in_act_slot, out_act_slot, weight_accessor, bar_publish,
+                    gate_offset, up_offset, gate_bytes, up_bytes, activation,
+                )
+            } else {
+                RoleBodies::skipped("TkFusedGateUpActivateMul")
+            }
+        };
+    }
     if M == 64 {
-        render_fused_gate_up_activate_mul_prefill_wgmma::<
-            1, 64, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
-        >(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor, bar_publish,
-            gate_offset, up_offset, gate_bytes, up_bytes, activation,
-        )
+        dispatch_m_gu!(1, 64)
     } else if M == 512 {
-        render_fused_gate_up_activate_mul_prefill_wgmma::<
-            8, 512, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
-        >(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor, bar_publish,
-            gate_offset, up_offset, gate_bytes, up_bytes, activation,
-        )
+        dispatch_m_gu!(8, 512)
     } else if M == 4096 {
-        render_fused_gate_up_activate_mul_prefill_wgmma::<
-            64, 4096, HIDDEN_DIM, INTERMEDIATE_DIM, TILE_N, NCW, NUM_LAYERS, ITERS,
-        >(
-            in_page_id, weight_page_id, out_page_id,
-            consumer_phase, storer_phase, layer,
-            in_act_slot, out_act_slot, weight_accessor, bar_publish,
-            gate_offset, up_offset, gate_bytes, up_bytes, activation,
-        )
+        dispatch_m_gu!(64, 4096)
     } else {
         panic!("render_fused_gate_up_activate_mul prefill: unsupported M (must be 64/512/4096); got {M}");
     }
@@ -2018,7 +2169,8 @@ pub fn render_fused_gate_up_activate_mul_prefill_wgmma<
     const M_TOTAL: u32,
     const HIDDEN_DIM: u32,
     const INTERMEDIATE_DIM: u32,
-    const TILE_N: u32,
+    const WGMMA_N: u32,
+    const N_MICRO: u32,
     const NCW: u32,
     const NUM_LAYERS: u32,
     const ITERS: u32,
@@ -2042,6 +2194,9 @@ pub fn render_fused_gate_up_activate_mul_prefill_wgmma<
     const { assert!(NCW % 4 == 0, "render_fused_gate_up_activate_mul prefill: NCW must be a multiple of 4 (warpgroup size)"); }
     const { assert!(M_BLOCKS >= 1, "render_fused_gate_up_activate_mul prefill: M_BLOCKS must be >= 1"); }
     const { assert!(M_TOTAL == M_BLOCKS * 64, "render_fused_gate_up_activate_mul prefill: M_TOTAL must equal M_BLOCKS * 64"); }
+    const { assert!(WGMMA_N >= 16 && WGMMA_N <= 256 && WGMMA_N % 16 == 0,
+        "render_fused_gate_up_activate_mul prefill: WGMMA_N must be a multiple of 16 in [16, 256] (TK 2.0 wgmma::base specializations)"); }
+    const { assert!(N_MICRO >= 1, "render_fused_gate_up_activate_mul prefill: N_MICRO must be >= 1"); }
 
     const M_TILE: u32 = 64;
 
@@ -2093,11 +2248,6 @@ pub fn render_fused_gate_up_activate_mul_prefill_wgmma<
     consumer.push(tk20::group_wait::<1>(&in_ready, consumer_phase));
     consumer.push(tk20::group_wait::<1>(&weight_ready, consumer_phase));
 
-    let (decl_gate_acc, gate_acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gu_gate_acc");
-    let (decl_up_acc, up_acc_rt) = tk20::decl_rt_fl_warpgroup::<TILE_N>("__gu_up_acc");
-    consumer.push(decl_gate_acc);
-    consumer.push(decl_up_acc);
-
     let n_tiles_per_wg: u32 = 4;
     let groupid = tk20::warpgroup_groupid_expr();
 
@@ -2108,41 +2258,61 @@ pub fn render_fused_gate_up_activate_mul_prefill_wgmma<
         }
     };
 
+    // A subtile: 64-row slice of in_smem along the M dim, declared
+    // once per m-block (shared across all N-microtiles in this block).
+    let (decl_a_sub, a_sub_outer) = tk20::decl_st_bf_subtile::<M_TOTAL, HIDDEN_DIM, M_TILE, HIDDEN_DIM>(
+        "__gu_a_sub", &in_smem, "__gu_m_block", "0",
+    );
+
+    // Innermost: per-microtile wgmma over WGMMA_N cols. Fresh
+    // gate_acc/up_acc declared per-iteration (registers reused).
+    let mut micro_body = CuBlock::new();
+    micro_body.push(CuStmt::new(format!(
+        "int __gu_b_col = __gu_n_idx * {N_MICRO} + __gu_nm;"
+    )));
+    let (decl_gate_acc, gate_acc_rt) = tk20::decl_rt_fl_warpgroup::<WGMMA_N>("__gu_gate_acc");
+    let (decl_up_acc, up_acc_rt) = tk20::decl_rt_fl_warpgroup::<WGMMA_N>("__gu_up_acc");
+    let (decl_gate_b_sub, gate_b_sub) =
+        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, WGMMA_N>(
+            "__gu_gate_b_sub", &gate_buf, "0", "__gu_b_col",
+        );
+    let (decl_up_b_sub, up_b_sub) =
+        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, WGMMA_N>(
+            "__gu_up_b_sub", &up_buf, "0", "__gu_b_col",
+        );
+    let (decl_out_sub, out_sub) =
+        tk20::decl_st_bf_subtile::<M_TOTAL, INTERMEDIATE_DIM, M_TILE, WGMMA_N>(
+            "__gu_out_sub", &out_smem, "__gu_m_block", "__gu_b_col",
+        );
+    micro_body.push(decl_gate_acc);
+    micro_body.push(decl_up_acc);
+    micro_body.push(decl_gate_b_sub);
+    micro_body.push(decl_up_b_sub);
+    micro_body.push(decl_out_sub);
+    micro_body.push(tk20::warpgroup_zero_rt_fl::<WGMMA_N>(&gate_acc_rt));
+    micro_body.push(tk20::warpgroup_zero_rt_fl::<WGMMA_N>(&up_acc_rt));
+    micro_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, WGMMA_N>(&gate_acc_rt, &a_sub_outer, &gate_b_sub));
+    micro_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, WGMMA_N>(&up_acc_rt, &a_sub_outer, &up_b_sub));
+    micro_body.push(tk20::warpgroup_mma_async_wait());
+    micro_body.push(tk20::warpgroup_apply_f32_rt_lambda::<WGMMA_N>(
+        &gate_acc_rt, &gate_acc_rt, activation_lambda,
+    ));
+    micro_body.push(tk20::warpgroup_mul_rt_rt::<WGMMA_N>(&gate_acc_rt, &gate_acc_rt, &up_acc_rt));
+    micro_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, WGMMA_N>(&out_sub, &gate_acc_rt));
+
+    // Inner N-tile loop body (per m-block). Each warpgroup
+    // owns 4 of the NCW N-tiles; A subtile shared across micros.
     let mut n_loop_body = CuBlock::new();
     n_loop_body.push(CuStmt::new(format!(
         "int __gu_n_idx = {groupid} * {n_tiles_per_wg} + __gu_n_in_wg;"
     )));
-    let (decl_a_sub, a_sub) = tk20::decl_st_bf_subtile::<M_TOTAL, HIDDEN_DIM, M_TILE, HIDDEN_DIM>(
-        "__gu_a_sub", &in_smem, "__gu_m_block", "0",
-    );
-    let (decl_gate_b_sub, gate_b_sub) =
-        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
-            "__gu_gate_b_sub", &gate_buf, "0", "__gu_n_idx",
-        );
-    let (decl_up_b_sub, up_b_sub) =
-        tk20::decl_st_bf_subtile::<HIDDEN_DIM, INTERMEDIATE_DIM, HIDDEN_DIM, TILE_N>(
-            "__gu_up_b_sub", &up_buf, "0", "__gu_n_idx",
-        );
-    let (decl_out_sub, out_sub) =
-        tk20::decl_st_bf_subtile::<M_TOTAL, INTERMEDIATE_DIM, M_TILE, TILE_N>(
-            "__gu_out_sub", &out_smem, "__gu_m_block", "__gu_n_idx",
-        );
-    n_loop_body.push(decl_a_sub);
-    n_loop_body.push(decl_gate_b_sub);
-    n_loop_body.push(decl_up_b_sub);
-    n_loop_body.push(decl_out_sub);
-    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&gate_acc_rt));
-    n_loop_body.push(tk20::warpgroup_zero_rt_fl::<TILE_N>(&up_acc_rt));
-    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, TILE_N>(&gate_acc_rt, &a_sub, &gate_b_sub));
-    n_loop_body.push(tk20::warpgroup_mma_AB::<M_TILE, HIDDEN_DIM, TILE_N>(&up_acc_rt, &a_sub, &up_b_sub));
-    n_loop_body.push(tk20::warpgroup_mma_async_wait());
-    n_loop_body.push(tk20::warpgroup_apply_f32_rt_lambda::<TILE_N>(
-        &gate_acc_rt, &gate_acc_rt, activation_lambda,
+    n_loop_body.push(tk20::for_loop_no_unroll(
+        &format!("int __gu_nm = 0; __gu_nm < {N_MICRO}; ++__gu_nm"),
+        &micro_body,
     ));
-    n_loop_body.push(tk20::warpgroup_mul_rt_rt::<TILE_N>(&gate_acc_rt, &gate_acc_rt, &up_acc_rt));
-    n_loop_body.push(tk20::warpgroup_store_st_bf_from_rt_fl::<M_TILE, TILE_N>(&out_sub, &gate_acc_rt));
 
     let mut m_loop_body = CuBlock::new();
+    m_loop_body.push(decl_a_sub);
     m_loop_body.push(tk20::for_loop_no_unroll(
         &format!("int __gu_n_in_wg = 0; __gu_n_in_wg < {n_tiles_per_wg}; ++__gu_n_in_wg"),
         &n_loop_body,

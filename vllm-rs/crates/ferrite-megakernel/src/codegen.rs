@@ -2011,10 +2011,106 @@ pub fn dispatch_instruction_to_render(
                 state,
             ),
         )),
+        // RopeAppend mirrors the push side, which routes through
+        // push_fused_qkv_rope_cache with a sentinel qkv weight path
+        // (the runtime kernel handles the no-qkv-matmul shape via the
+        // sentinel; emit shares the FusedQkvRopeCache render fn).
+        // State bumps and slot alloc order MUST match the push arm
+        // verbatim — see codegen.rs RopeAppend push (alloc sequence
+        // q_id, qkv_id, cs_id, k_id, v_id with progressive
+        // exclude lists from in_id_val = q_slot).
+        I::RopeAppend(
+            q_slot,
+            _k_slot,
+            _v_slot,
+            _q_out_slot,
+            _k_out_slot,
+            _v_out_slot,
+            layer,
+            _interleaved,
+        ) => {
+            if weight_paths.len() != 1 {
+                return Err(format!(
+                    "RopeAppend expected 1 weight_path (rotary), got {}",
+                    weight_paths.len()
+                ));
+            }
+            let in_id_val = *q_slot;
+            let q_id_val = state.alloc_distinct(&[in_id_val])?;
+            let qkv_id_val = state.alloc_distinct(&[in_id_val, q_id_val])?;
+            let cs_id_val = state.alloc_distinct(&[in_id_val, q_id_val, qkv_id_val])?;
+            let k_id_val =
+                state.alloc_distinct(&[in_id_val, q_id_val, qkv_id_val, cs_id_val])?;
+            let v_id_val = state.alloc_distinct(&[
+                in_id_val, q_id_val, qkv_id_val, cs_id_val, k_id_val,
+            ])?;
+            let in_id = lit(in_id_val);
+            let qkv_id = lit(qkv_id_val);
+            let cs_id = lit(cs_id_val);
+            let q_id = lit(q_id_val);
+            let k_id = lit(k_id_val);
+            let v_id = lit(v_id_val);
+            let quarter = state.scratch_bytes / 4;
+            let q_off = lit(0u32);
+            let k_off = lit(quarter);
+            let b_tile_off = lit(2 * quarter);
+            let consumer_phase = lit(state.arrives & 1);
+            let storer_phase = lit((state.arrives + 1) & 1);
+            let iters_const = 1_u32;
+            let iters = lit(iters_const);
+            let layer_lit = lit(resolved_layer(*layer));
+            let hidden_dim = lit(state.hidden_dim);
+            let head_dim = lit(state.head_dim);
+            let num_q_heads_lit = lit(state.num_q_heads);
+            let num_kv_heads_lit = lit(state.num_kv_heads);
+            let q_dim_lit = lit(state.num_q_heads * state.head_dim);
+            let kv_dim_lit = lit(state.num_kv_heads * state.head_dim);
+            let qkv_n_val = (state.num_q_heads + 2 * state.num_kv_heads) * state.head_dim;
+            let qkv_n_lit = lit(qkv_n_val);
+            let m_lit = lit(state.num_tokens);
+            let in_act_slot = lit(in_id_val);
+            let q_out_act_slot = lit(in_id_val);
+            let k_out_act_slot = lit(in_id_val.wrapping_add(1));
+            let v_out_act_slot = lit(in_id_val.wrapping_add(2));
+            let qkv_weight_accessor = lit(state.next_weight_accessor);
+            let rotary_accessor = lit(state.next_weight_accessor + 1);
+            let ncw = state.num_consumer_warps;
+            let tile_n_const = if ncw > 0 && qkv_n_val % ncw == 0 {
+                qkv_n_val / ncw
+            } else {
+                qkv_n_val
+            };
+            let tile_n_lit = lit(tile_n_const);
+            let heads_per_warp_const = if state.head_dim > 0 {
+                tile_n_const / state.head_dim
+            } else {
+                0
+            };
+            let heads_per_warp_lit = lit(heads_per_warp_const);
+            let ncw_lit = lit(ncw);
+            let num_layers = lit(state.num_layers);
+            let bar_publish = lit(1u32);
+            state.arrives += 1;
+            state.next_weight_accessor += 2;
+            Ok(Some(quote! {
+                bodies.push(::ferrite_megakernel::cuda_emit::render::render_fused_qkv_rope_cache::<
+                    #m_lit, #hidden_dim, #head_dim, #num_q_heads_lit, #num_kv_heads_lit,
+                    #q_dim_lit, #kv_dim_lit, #qkv_n_lit, #tile_n_lit, #heads_per_warp_lit,
+                    #ncw_lit, #num_layers, #iters,
+                >(
+                    #in_id, #qkv_id, #cs_id, #q_id, #k_id, #v_id,
+                    #consumer_phase, #storer_phase,
+                    #layer_lit,
+                    #in_act_slot, #q_out_act_slot, #k_out_act_slot, #v_out_act_slot,
+                    #qkv_weight_accessor, #rotary_accessor,
+                    #bar_publish,
+                    #q_off, #k_off, #b_tile_off,
+                ));
+            }))
+        }
         // Variants wired in dispatch_to_push but whose render_*
         // counterpart hasn't been written yet — the proc-macro skips
         // emit_for_canonical for any tape that contains them.
-        // (RopeAppend.)
         _ => Ok(None),
     }
 }

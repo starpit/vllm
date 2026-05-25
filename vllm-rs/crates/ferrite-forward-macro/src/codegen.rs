@@ -5298,7 +5298,13 @@ fn emit_slice_render_with_loop_expansion(
                         })?;
                         match render_opt {
                             Some(ts) => out.extend(ts),
-                            None => return Ok(None),
+                            None => {
+                                eprintln!(
+                                    "ferrite-megakernel: render skip {label}[loop iter {iter} body[{body_off}]] kind={}",
+                                    instruction_kind(&normalized)
+                                );
+                                return Ok(None);
+                            }
                         }
                     }
                 }
@@ -5328,7 +5334,13 @@ fn emit_slice_render_with_loop_expansion(
                 .map_err(|e| format!("{label}[{i}] {}: {e}", instruction_kind(&normalized)))?;
                 match render_opt {
                     Some(ts) => out.extend(ts),
-                    None => return Ok(None),
+                    None => {
+                        eprintln!(
+                            "ferrite-megakernel: render skip {label}[{i}] kind={}",
+                            instruction_kind(&normalized)
+                        );
+                        return Ok(None);
+                    }
                 }
                 i += 1;
             }

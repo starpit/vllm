@@ -390,7 +390,7 @@ impl<'a> Ser<'a> {
             if self.slot_of.contains_key(&ot) {
                 continue; // shared by this op's N-blocks
             }
-            let slot = if matches!(node.op, SubOp::RopeRotate { .. }) {
+            let slot = if matches!(node.op, SubOp::RopeRotate { .. } | SubOp::RopeAppend { .. }) {
                 let in0 = node.inputs[0].tensor;
                 if self.is_source(in0) {
                     return Err(SerializeError::UnsupportedOp {
@@ -463,6 +463,7 @@ impl<'a> Ser<'a> {
             SubOp::MatmulTile => self.emit_qmv(node),
             SubOp::RmsNorm { eps } => self.emit_rmsnorm(node, eps),
             SubOp::RopeRotate { head_dim } => self.emit_rope(node, head_dim),
+            SubOp::RopeAppend { head_dim, layer } => self.emit_rope_append(node, head_dim, layer),
             SubOp::SiluMul => self.emit_silu_mul(node),
             SubOp::Elementwise(EwKind::Add) => self.emit_add(node),
             SubOp::AttnDecode {
@@ -592,6 +593,65 @@ impl<'a> Ser<'a> {
         let num_heads = cols / head_dim;
         let base = self.push_operands(&[x, cos, sin]);
         let sc = self.intern_shape([op_kind::ROPE, head_dim, num_heads, 0, 0, 0, 0, 0]);
+        Ok((sc, base))
+    }
+
+    /// ROPE_APPEND: operands `[k, cos, sin, v, kv_cache_k, kv_cache_v,
+    /// slot_mapping]`; shape `(ROPE_APPEND, head_dim, num_kv, rot_dim,
+    /// block_size, ...)`. Rotate K in place (operand 0 is the aliased producer
+    /// buffer), then write rotated K + un-rotated V to the paged cache. The
+    /// cache halves + slot_mapping are runtime inputs the serializer injects
+    /// (the region IR keeps the new K as an abstract edge); `layer` routes the
+    /// cache operands. Full rope (`rot_dim == head_dim`), matching `RopeRotate`.
+    fn emit_rope_append(
+        &mut self,
+        node: &SubtileNode,
+        head_dim: u32,
+        layer: u32,
+    ) -> Result<(u32, u32), SerializeError> {
+        let id = node.id.0;
+        let k = self.write_operand(&node.output, id)?; // in-place (aliased) K
+        let cos = self.read_operand(&node.inputs[1], id)?;
+        let sin = self.read_operand(&node.inputs[2], id)?;
+        let v = self.read_operand(&node.inputs[3], id)?;
+        let cols = node.output.region.cols.len;
+        if head_dim == 0 || !cols.is_multiple_of(head_dim) {
+            return Err(SerializeError::NonDecodeShape {
+                id,
+                detail: "rope_append output cols not a multiple of head_dim",
+            });
+        }
+        let num_kv = cols / head_dim;
+        let kv_k = OperandSlot {
+            buffer: self.intern(
+                BufferRef::Input(InputKind::KvCacheK { layer }),
+                self.geom.act_elem,
+            ),
+            byte_offset: 0,
+        };
+        let kv_v = OperandSlot {
+            buffer: self.intern(
+                BufferRef::Input(InputKind::KvCacheV { layer }),
+                self.geom.act_elem,
+            ),
+            byte_offset: 0,
+        };
+        let slot = OperandSlot {
+            buffer: self.intern(BufferRef::Input(InputKind::SlotMapping), 4),
+            byte_offset: 0,
+        };
+        let base = self.push_operands(&[k, cos, sin, v, kv_k, kv_v, slot]);
+        // rot_dim == head_dim (full rope), matching RopeRotate.
+        let sc = self.intern_shape([
+            op_kind::ROPE_APPEND,
+            head_dim,
+            num_kv,
+            head_dim,
+            self.geom.block_size,
+            0,
+            0,
+            0,
+        ]);
         Ok((sc, base))
     }
 
@@ -1412,6 +1472,123 @@ mod tests {
         );
         let progt = serialize(&gt, &st, &sources, geom()).expect("tiled layer serializes");
         assert_eq!(progt.num_computes(), gt.nodes.len());
+    }
+
+    /// A `RopeAppend` (K side) serializes to WL_OP_ROPE_APPEND with the cache
+    /// operands the serializer injects: `[k, cos, sin, v, kv_cache_k,
+    /// kv_cache_v, slot_mapping]` (cache halves routed to the node's `layer`,
+    /// plus slot_mapping), and the K operand aliases the k-proj output slot
+    /// (in-place rotate).
+    #[test]
+    fn rope_append_serializes_with_cache_operands() {
+        let (h, hd, kvdim) = (16u32, 4u32, 8u32); // num_kv = 2
+        let layer = 3u32;
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: h }, // 0 x
+                SourceShape {
+                    rows: kvdim,
+                    cols: h,
+                }, // 1 wk
+                SourceShape {
+                    rows: kvdim,
+                    cols: h,
+                }, // 2 wv
+                SourceShape { rows: 1, cols: hd }, // 3 cos
+                SourceShape { rows: 1, cols: hd }, // 4 sin
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
+                },
+                OpDesc {
+                    op: LoweredOp::RopeAppend {
+                        head_dim: hd,
+                        layer,
+                    },
+                    m: 1,
+                    inputs: vec![
+                        InputRef::Op(0),
+                        InputRef::Ext(3),
+                        InputRef::Ext(4),
+                        InputRef::Op(1),
+                    ],
+                },
+            ],
+            result: 2,
+        };
+        let sources = vec![
+            dense(0, WeightBundle::Embedding),
+            qweight(1),
+            qweight(2),
+            dense(3, WeightBundle::CosSin),
+            dense(4, WeightBundle::CosSin),
+        ];
+        let g = lower_region(&input, 1000);
+        let s = partition_roundrobin(&g, 1);
+        let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
+
+        let ra = prog
+            .tape
+            .iter()
+            .find(|i| op_of(&prog, i) == op_kind::ROPE_APPEND)
+            .expect("a ROPE_APPEND compute");
+        assert_eq!(
+            prog.shapes[ra[1] as usize],
+            [op_kind::ROPE_APPEND, hd, kvdim / hd, hd, 16, 0, 0, 0]
+        );
+        let ops = &prog.operands[ra[2] as usize..ra[2] as usize + 7];
+        let buf = |o: &OperandSlot| prog.buffers[o.buffer.0 as usize].clone();
+        // [k, cos, sin, v, kv_cache_k, kv_cache_v, slot_mapping]
+        assert!(
+            matches!(buf(&ops[0]), BufferRef::ArenaSlot(_)),
+            "k in-place arena"
+        );
+        assert!(matches!(
+            buf(&ops[1]),
+            BufferRef::Weight {
+                bundle: WeightBundle::CosSin,
+                ..
+            }
+        ));
+        assert!(matches!(
+            buf(&ops[2]),
+            BufferRef::Weight {
+                bundle: WeightBundle::CosSin,
+                ..
+            }
+        ));
+        assert!(
+            matches!(buf(&ops[3]), BufferRef::ArenaSlot(_)),
+            "v from v_proj arena"
+        );
+        assert_eq!(
+            buf(&ops[4]),
+            BufferRef::Input(InputKind::KvCacheK { layer })
+        );
+        assert_eq!(
+            buf(&ops[5]),
+            BufferRef::Input(InputKind::KvCacheV { layer })
+        );
+        assert_eq!(buf(&ops[6]), BufferRef::Input(InputKind::SlotMapping));
+        // The K operand aliases the k-proj (first qmv) output slot.
+        let kproj = prog
+            .tape
+            .iter()
+            .find(|i| op_of(&prog, i) == op_kind::QMV)
+            .unwrap();
+        let kproj_y = prog.operands[kproj[2] as usize + 4].buffer;
+        assert_eq!(
+            ops[0].buffer, kproj_y,
+            "rope_append rotates k_proj output in place"
+        );
     }
 
     #[test]

@@ -140,6 +140,17 @@ pub enum SubOp {
     /// Pairs `(d, d + half)`; matches `cpu_golden::rope`/`rope_append`'s
     /// rotation. Shape-preserving, so bit-exact vs the reference.
     RopeRotate { head_dim: u32 },
+    /// The K-side `rope_append` for the GPU megakernel: rotate K (NeoX) **and**
+    /// write the rotated K + un-rotated V into the paged KV cache, so the
+    /// downstream attention reads the new token from the cache like the oracle
+    /// non-mega path (Tier-B exact). `inputs[0]` = K, `inputs[1]` = cos,
+    /// `inputs[2]` = sin, `inputs[3]` = V. The host eval is **rotation only**
+    /// (identical to [`SubOp::RopeRotate`]): the abstract dataflow model keeps
+    /// the new K as an edge into attention (decision #4), so `inputs[3]` (V)
+    /// and the cache write are GPU-only — V is carried for the schedule edge
+    /// (the cache write consumes it) and so the serializer can bind it. `layer`
+    /// names the KV-cache layer the serializer routes the cache operands to.
+    RopeAppend { head_dim: u32, layer: u32 },
     /// Decode attention. `inputs[0]` = Q `[Mq, num_q_heads * head_dim]`;
     /// the remaining inputs are alternating `(K_seg, V_seg)`, each
     /// `[seg_len, num_kv_heads * head_dim]`, concatenated along the KV
@@ -754,7 +765,9 @@ pub fn eval_node(
             }
             out
         }
-        SubOp::RopeRotate { head_dim } => {
+        // RopeAppend's host eval is rotation only (identical to RopeRotate);
+        // its V input (3) and the paged-cache write are GPU-only.
+        SubOp::RopeRotate { head_dim } | SubOp::RopeAppend { head_dim, .. } => {
             let (x, xr, xc) = read_operand(&node.inputs[0], graph, sources, outs);
             let (cos, _, cc) = read_operand(&node.inputs[1], graph, sources, outs);
             let (sin, _, sc) = read_operand(&node.inputs[2], graph, sources, outs);
@@ -900,6 +913,7 @@ pub fn validate(graph: &SubtileGraph) -> Result<usize, String> {
             SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
+            SubOp::RopeAppend { .. } => arity == 4, // K, cos, sin, V
             // Q followed by one or more (K_seg, V_seg) pairs.
             SubOp::AttnDecode { .. } => arity >= 3 && arity % 2 == 1,
         };

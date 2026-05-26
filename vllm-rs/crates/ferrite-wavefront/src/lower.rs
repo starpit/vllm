@@ -54,6 +54,12 @@ pub enum LoweredOp {
     /// where cos/sin are the new token's position rows `[1, head_dim]`.
     /// Shape-preserving.
     RopeRotate { head_dim: u32 },
+    /// The K-side `rope_append` for the GPU megakernel: rotate K + write the
+    /// rotated K / un-rotated V into the paged KV cache for `layer`. Inputs:
+    /// `[K, cos, sin, V]`. Host eval is rotation only (the cache write is
+    /// GPU-only — see [`SubOp::RopeAppend`]); shape-preserving on K. The macro
+    /// emits this for `rope_append`'s K slot; the Q slot stays `RopeRotate`.
+    RopeAppend { head_dim: u32, layer: u32 },
     /// Fused decode attention. Inputs: `[Q, (K_seg, V_seg)...]` —
     /// concatenated along the KV axis. The fused decode passes the prefix
     /// cache as `Ext` (`Source`) segments and the rotated new token as
@@ -149,6 +155,10 @@ pub fn lower(input: &LoweringInput) -> SubtileGraph {
             LoweredOp::RopeRotate { head_dim } => {
                 let cols = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
                 (SubOp::RopeRotate { head_dim }, cols)
+            }
+            LoweredOp::RopeAppend { head_dim, layer } => {
+                let cols = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
+                (SubOp::RopeAppend { head_dim, layer }, cols)
             }
             LoweredOp::AttnDecode {
                 num_q_heads,

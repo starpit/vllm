@@ -574,6 +574,7 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
             LoweredOp::SiluMul => "SiluMul",
             LoweredOp::Add => "Add",
             LoweredOp::RopeRotate { .. } => "RopeRotate",
+            LoweredOp::RopeAppend { .. } => "RopeAppend",
             LoweredOp::AttnDecode { .. } => "AttnDecode",
         };
         *hist.entry(name).or_default() += 1;

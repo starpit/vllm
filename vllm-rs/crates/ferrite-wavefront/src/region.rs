@@ -263,7 +263,9 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
             }
             out
         }
-        SubOp::RopeRotate { head_dim } => {
+        // RopeAppend's host eval is rotation only (identical to RopeRotate);
+        // its V input (3) + the paged-cache write are GPU-only.
+        SubOp::RopeRotate { head_dim } | SubOp::RopeAppend { head_dim, .. } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (cos, _, cc) = gather(&node.inputs[1], graph, bufs);
             let (sin, _, sc) = gather(&node.inputs[2], graph, bufs);
@@ -428,6 +430,7 @@ pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
             SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
+            SubOp::RopeAppend { .. } => arity == 4,
             SubOp::AttnDecode { .. } => arity >= 3 && arity % 2 == 1,
         };
         if !arity_ok {
@@ -520,7 +523,8 @@ fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
         | LoweredOp::Mul
         | LoweredOp::SiluMul
         | LoweredOp::Add
-        | LoweredOp::RopeRotate { .. } => in0_cols,
+        | LoweredOp::RopeRotate { .. }
+        | LoweredOp::RopeAppend { .. } => in0_cols,
     }
 }
 
@@ -632,6 +636,9 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
                     LoweredOp::SiluMul => SubOp::SiluMul,
                     LoweredOp::Add => SubOp::Elementwise(EwKind::Add),
                     LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate { head_dim },
+                    LoweredOp::RopeAppend { head_dim, layer } => {
+                        SubOp::RopeAppend { head_dim, layer }
+                    }
                     LoweredOp::AttnDecode {
                         num_q_heads,
                         num_kv_heads,

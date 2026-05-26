@@ -205,7 +205,114 @@ LoweringInput → lower() → SubtileGraph (DAG)
   line per model variant (tile/subgraph/source/op counts, `valid (N nodes)`, op histogram). Errors
   log `not lowered — <reason>` and never gate the build (env-gated + fully fallible).
 
-## LATEST STATUS — 2026-05-26 (typed-OpDataflow IR + end-to-end metal decode; B != A open)
+## LATEST STATUS — 2026-05-26 (COURSE CORRECTION: host scaffold abandoned → on-GPU 10-tape megakernel)
+
+**The host-orchestrated single-tape scaffold (UPDATEs 12–14) was a DRIFT off the plan and is abandoned.**
+The user re-affirmed the plan in plain terms: **(1) 10 tapes (M4 = 10 cores), (2) tape players that run
+IN the GPU (one persistent kernel, 10 co-resident threadgroups, each running its own tape), (3) producer→
+consumer SPINLOOP barriers on the tapes (fine-grained p2p flags, NOT global barriers, NOT command-encoder
+barriers).** The scaffold (`subtile_compile`→flat `SubtileIr`→host `MetalExecutor` per-subtile dispatch with
+NO-OP Wait/Signal, A/B `wavefront_ab_compare`) is none of those: single flat tape, no bins, no flags emitted
+(`num_flags=0`), Metal-3 serial encoder. Its `B != A` is the wrong thing to chase. STOP debugging it.
+
+**What the scaffold got right and is kept:** the typed `SubtileIr` + `validate` (compile-time shape/dataflow
+safety) and the N-block qmv linchpin (proven bit-exact on-device). The bin-packer (`scheduler.rs`/`tape.rs`)
+and p2p-flag stamping were proven on host but bound to the COARSE `subtile.rs` graph (whole-producer
+`Operand::Sub`) — which can't N-block a matmul across workers (the bandwidth point). The drift was: the GPU
+path bypassed the SSA dataflow IR + bin-packer entirely and went `Instruction`→colored-arena flat tape.
+
+**Landed this session (corrective, host-proven, `cargo test -p ferrite-wavefront` = 46 green):**
+`crates/ferrite-wavefront/src/region_schedule.rs` bin-packs the **SSA `region.rs` graph** (N-block-accurate,
+`predecessors()` = region-overlap RAW edges) into **P=10 balanced worker tapes** with cross-tape `Wait`/
+`Signal` flags. `region_schedule_replays_bit_exact` (P∈{1,2,4,10}, nb∈{4,8,coarse}) replays bit-exact vs
+`eval_dag` ⇒ bin-packing + flag stamping deadlock-free + order-correct (Tier A). `wide_matmul_spreads_across_
+workers`: 30 N-blocks over 10 workers, even, 0 global barriers. `flag_invariants`. **This is the megakernel's
+SCHEDULE — the exact input the on-GPU players consume.**
+
+**Atom composability for the GPU player (CHECKED):** qmv is already factored into `METAL_FUNC` device fns
+(`qmv_fast_impl` etc., `quantized_qmv.metal:593`; `out_row = tid.y*8 + simd_gid*4`, indexes off base ptrs) —
+composable NOW. rmsnorm / silu·mul / attention / rope are `[[kernel]]` entry points whose bodies need a
+mechanical "extract → `METAL_FUNC` device fn + thin wrapper" (extraction, NOT rewrite — preserves validated math).
+
+**BACKEND-NEUTRALITY RULE — LOCKED (user, 2026-05-26): the megakernel's tape/table ENCODING is neutral data in
+`ferrite-wavefront`.** The on-GPU interpreter's input — the per-TG instruction stream (opcode, shape-class index,
+operand-table indices, flag ids), the shape-class table ((op,K,N,gs,bits) descriptors), and the operand table —
+are plain serializable types in `ferrite-wavefront`, NOT baked into Metal/objc2 code. The MSL interpreter and a
+future CUDA `.cu` interpreter are PARALLEL CONSUMERS of the identical encoding. Per-target ONLY: the kernel
+source, the atom device fns (`qmv_fast_impl` ↔ CUDA qmv), operand-index→pointer resolution (Metal `gpuAddress` ↔
+CUDA `CUdeviceptr`), and the flag PRIMITIVE (Metal device-atomic spinloop ↔ CUDA cooperative-groups grid sync —
+SAME `Signal`/`Wait` semantics in the tape; do NOT force one primitive on both). NB the host `Executor` seam in
+`subtile_ir.rs` is for the per-dispatch scaffold; the *megakernel's* neutral seam is this DATA encoding, not a
+host trait. (Milestone A1/A2 are raw proofs dispatched directly; the encoding lands when the interpreter is built.)
+
+**GPU PLAYER SHAPE — LOCKED (user, 2026-05-26): data-driven interpreter, NOT unrolled codegen.** One persistent
+kernel; each co-resident TG runs an interpret loop over its per-TG tape (instructions = data). Rationale: a
+persistent megakernel is ONE compiled binary (function constants are baked per-launch, uniform), so the only
+real perf edge unrolled has is per-op constant-folding of `K`/`N` — and that's the CHEAP kind (the inner
+`load_vector`/`qdot` work is templated on `bits`/`group_size`, uniform across decode ⇒ folded either way; only
+the short outer K-reduction loop bound, 4–16 iters on a BW-bound matvec, loses static unroll = <1%). Interpreter
+wins on: debuggability, small reused icache footprint, it IS the exact GPU analogue of the proven host player
+(`region_schedule::play` — free bit-exact oracle), trivial-player law, and no MSL-emitter. **BUILT IN FROM THE
+START (user): a `switch(shape_class)` whose arms call the atom with LITERAL `K`/`N`** (decode has ~8 distinct
+qmv shapes: q/k/v/o/gate/up/down/lm_head) ⇒ per-shape folding recovered, one kernel, ~8 atom copies (not
+one-per-op), schedule still pure data. The compiler enumerates shape-classes + emits the tape; the kernel's only
+generated part is the ~8-arm switch table.
+
+**NEXT = on-GPU megakernel, built incrementally (this is where `_mt` died — compose atoms, never hand-write):**
+- **Milestone A1 — DONE + GPU-VERIFIED.** `wavefront_qmv_mega` (appended to `quantized_qmv.metal` so it calls
+  `qmv_fast_impl`; instantiated `wavefront_qmv_mega_<act>_s_<scale>_gs_<gs>_b_4`): a persistent kernel, P
+  co-resident TGs, each looping `g = tgpos.x; g < ceil(N/8); g += grid_tg.x` and composing `qmv_fast_impl`
+  (synthetic `tid.y = g`, 64 threads = 2 simdgroups). Test `tests/wavefront_mega_gpu.rs` =
+  **bit-exact vs whole `affine_qmv_fast` for P∈{1,2,4,10}** (`cargo test -p ferrite-forward -F metal --test
+  wavefront_mega_gpu`). Proves persistent multi-TG tape-loop + on-device atom composition + co-residency. No
+  flags/switch yet (disjoint outputs). Uncommitted.
+- **Milestone A2 — BUILT + RUNS; root-caused; `#[ignore]` pending the fix.** `wavefront_qmv_mega_2stage`
+  (folded shape-class `switch` calling `qmv_fast_impl` at LITERAL K/N per stage; producer TGs compute y1 blocks,
+  `threadgroup_barrier(mem_device)`, `atomic_store` flag; consumer TGs spin-`Wait`, read whole y1, compute y2)
+  is bit-exact at P=1 but RACES at P>=2. `tests/wavefront_mega_gpu.rs` (ignored). 
+
+- **CRITICAL FINDING — cross-TG data handoff must be ATOMIC (microbench `tests/wavefront_sync_probe.rs`).**
+  On Apple GPU with relaxed-only MSL atomics, NON-atomic device writes are NOT reliably visible across
+  threadgroups even with `threadgroup_barrier(mem_device)` (it's intra-TG per Apple docs). ATOMIC device
+  writes/reads ARE device-coherent. Probe (200 retries each, P∈{1,2,4,8,10}): PAT 0/1/2 (non-atomic data) RACE;
+  **PAT 3 (atomic data write+read + flag + barrier) and PAT 4 (data-IS-the-flag sentinel spin) both CORRECT.**
+  `flag_sync_sweep` only ever proved TOKEN handoff (data == the atomic); this is the missing data-behind-flag
+  result. **Megakernel consequence:** the cross-TG activation handoff (the N-block join — a consumer reading
+  producers' outputs on other workers) must use atomic accesses. Activations are bf16/f16, Metal atomics are
+  32-bit ⇒ u32-pack pairs (or an f32 staging slot) on cross-WORKER edges only. Intra-worker edges stay
+  non-atomic (program order + barrier; the scheduler's edge-cut objective already pulls dependent chains onto
+  one worker, minimizing cross-worker edges).
+
+- **A2 — DONE + GPU-VERIFIED (atomic u32-packed handoff).** `wavefront_qmv_mega_2stage` now: stage-0 producers
+  write their disjoint y1 stripe (bf16), `threadgroup_barrier(mem_device)`, then PACK each group (8 bf16 → 4 u32)
+  and `atomic_store` to a coherent `y1c` handoff + signal; consumers join on all flags, `atomic_load` + unpack
+  `y1c` into a PRIVATE per-worker bf16 copy (`y1r[me*N0..]`), then stage-1 qmv reads that. The only cross-TG
+  buffer is the atomic `y1c`; everything else is intra-worker. **Bit-exact vs two sequential whole-qmv dispatches,
+  50 retries × P∈{1,2,4,10}** (`tests/wavefront_mega_gpu.rs`, no longer ignored). Proves cross-TG spinloop sync +
+  folded shape-class switch + the atomic handoff together. ⇒ **the full on-GPU megakernel execution model is
+  proven** (persistent multi-TG tape-loop + atom composition + co-residency + p2p spinloop + atomic cross-TG
+  handoff), alongside the host-proven 10-tape schedule.
+
+- **ThunderMittens SEEDED (sync primitives done + proven).** `shaders/mittens/sync.h` (`#pragma once`,
+  `namespace mittens`): the cross-TG sync PRIMITIVES — `wf_signal`/`wf_wait`/`wf_wait_all` (p2p flags) +
+  `wf_pack2`/`wf_unpack_lo|hi`/`wf_publish_pairs`/`wf_acquire_pairs` (atomic u32-packed bulk handoff) + `WF_SPIN_CAP`.
+  `quantized_qmv.metal` `#include "mittens/sync.h"` (relative-resolved by `xcrun metal`; the `.h` is a header, not a
+  metallib target); A2 refactored to compose them and STILL bit-exact (50× × P∈{1,2,4,10}). The library is the
+  per-target primitive home (IR/encoding stays neutral in `ferrite-wavefront`; ≈ ThunderKittens for CUDA).
+- **NEXT — extract the COMPUTE atoms → ThunderMittens, then scale up.** `qmv_fast_impl` is already a `METAL_FUNC`
+  (move to `mittens/qmv.h`); then extract rmsnorm/rope/silu·mul/attention bodies from their `[[kernel]]` entries
+  into `mittens/` `METAL_FUNC` headers + thin kernel wrappers (each: extract → compose in the megakernel →
+  bit-exact). Then full decode layer → 16 layers + lm_head, driven by `region_schedule`; wire as the alt decode
+  path; bit-exact vs non-mega; then persistent-launch occupancy sizing + ≥5-run perf vs 8.2 ms.
+- Then: extract rmsnorm→silu·mul→rope→attention device fns one at a time (each: extract + compose + bit-exact
+  test); scale to full layer → 16 layers + lm_head; drive from `region_schedule` (10 tapes + flags); persistent
+  launch sized to occupancy (M4+); measure ≥5 runs vs 8.2 ms. Sync primitive reference = `flag_sync_sweep.rs`.
+
+Landed in one commit off `0b00278a5` (fmt + clippy clean; region_schedule + A1/A2 megakernels + ThunderMittens
+`mittens/sync.h` + the sync probe + this plan). Not yet wired into the live decode path. The OLD status below is
+superseded.
+
+## (superseded) LATEST STATUS — 2026-05-26 (typed-OpDataflow IR + end-to-end metal decode; B != A open)
 
 Two commits past `24997d429` on `worktree-pd-wavefront`. Detail in memory `[[pd-clean-wavefront-design]]`
 UPDATEs 10–14; the short version:

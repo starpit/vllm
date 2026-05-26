@@ -18,6 +18,7 @@
 
 pub mod lower;
 pub mod region;
+pub mod region_schedule;
 pub mod scheduler;
 pub mod subtile;
 pub mod subtile_ir;

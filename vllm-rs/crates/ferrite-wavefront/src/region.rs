@@ -127,7 +127,7 @@ fn gather(tr: &TensorRegion, graph: &RegionGraph, bufs: &[Vec<f32>]) -> (Vec<f32
 }
 
 /// Scatter a dense `[rows, cols]` buffer into `bufs[tensor]` at `region`.
-fn scatter(
+pub(crate) fn scatter(
     bufs: &mut [Vec<f32>],
     tensor: TensorId,
     region: Region,

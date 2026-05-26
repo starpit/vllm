@@ -43,6 +43,13 @@ fn cuda_link() {
     println!("cargo:rustc-link-lib=static=cutlass_gemm_bias");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
     println!("cargo:rustc-link-lib=static=flashinfer_attn");
+    // Link the previously-compiled megakernels archive so the
+    // `forward_mega_<canonical>()` functions ferrite-models emits
+    // (which extern-call `<canonical>_launch_host`) resolve at link
+    // time. The .a we link here is the OLD one (from a prior build);
+    // running this binary writes fresh .cu, and a subsequent
+    // ferrite-cuda-builder pass rebuilds the .a from those.
+    println!("cargo:rustc-link-lib=static=megakernels");
 
     println!("cargo:rustc-link-lib=static=cudart_static");
     println!("cargo:rustc-link-lib=dylib=cublas");

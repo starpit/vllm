@@ -677,7 +677,7 @@ pub fn warp_apply_f32_rt_lambda<const ROWS: u32, const COLS: u32>(
     lambda_body: &str,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::warp::apply({dst}, {src}, [=] __device__ (int /*row*/, int col, float x) {{ return {body}; }});",
+        "kittens::warp::apply({dst}, {src}, [=] __device__ (int row, int col, float x) {{ (void)row; (void)col; return {body}; }});",
         dst = dst.expr(),
         src = src.expr(),
         body = lambda_body

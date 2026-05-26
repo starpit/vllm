@@ -2768,6 +2768,25 @@ pub fn render_fused_qkv_rope_cache_decode<
     let k_out_bytes: u32 = M * KV_DIM * BF16_BYTES;
     let v_out_bytes: u32 = M * KV_DIM * BF16_BYTES;
 
+    // Q/K rope staging lives in the in_page region past the input
+    // data (ss.scratch is only SCRATCH_BYTES=1024, far smaller than
+    // M*Q_DIM*2). Phase 1 reads __qd_a_in[m*HIDDEN_DIM+k] for
+    // k in [0..HIDDEN_DIM) — bytes [0..act_bytes) — and writes to
+    // q_stage/k_stage at offsets ≥ act_bytes (no aliasing). The
+    // input page is freed (in_consumed arrived) only after phase 2
+    // re-reads the staging region. Total per-page bytes:
+    //   act_bytes + q_stage_bytes + k_stage_bytes
+    // must fit in TK 2.0 PAGE_SIZE = 16384.
+    const PAGE_SIZE_BYTES: u32 = 16384;
+    let q_stage_offset: u32 = act_bytes;
+    let k_stage_offset: u32 = act_bytes + M * Q_DIM * BF16_BYTES;
+    let total_in_page_bytes: u32 = act_bytes + M * Q_DIM * BF16_BYTES + M * KV_DIM * BF16_BYTES;
+    if total_in_page_bytes > PAGE_SIZE_BYTES {
+        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
+    }
+    let _ = q_rope_offset;
+    let _ = k_rope_offset;
+
     let mut loader = CuBlock::new();
     loader.push(tk20::group_wait::<1>(&in_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&cos_sin_consumed, loader_phase));
@@ -2815,9 +2834,9 @@ pub fn render_fused_qkv_rope_cache_decode<
          __nv_bfloat16* __qd_v_out = reinterpret_cast<__nv_bfloat16*>(\
              ss.pages[{v_id}]); \
          __nv_bfloat16* __qd_q_stage = reinterpret_cast<__nv_bfloat16*>(\
-             ss.scratch + {q_off}); \
+             ss.pages[{in_id}] + {q_off}); \
          __nv_bfloat16* __qd_k_stage = reinterpret_cast<__nv_bfloat16*>(\
-             ss.scratch + {k_off}); \
+             ss.pages[{in_id}] + {k_off}); \
          int __qd_warp_id = static_cast<int>(kittens::warpid()); \
          int __qd_lane = static_cast<int>(kittens::laneid()); \
          int __qd_warp_col_base = __qd_warp_id * {tile_n}; \
@@ -2864,8 +2883,8 @@ pub fn render_fused_qkv_rope_cache_decode<
         in_id = in_page_id,
         v_id = v_out_page_id,
         qkv_gmem = qkv_weight_gmem.expr(),
-        q_off = q_rope_offset,
-        k_off = k_rope_offset,
+        q_off = q_stage_offset,
+        k_off = k_stage_offset,
         tile_n = TILE_N,
         m = M,
         hidden = HIDDEN_DIM,
@@ -2879,9 +2898,9 @@ pub fn render_fused_qkv_rope_cache_decode<
     consumer.push(CuStmt::new(format!(
         "{{ \
          const __nv_bfloat16* __qd_q_stage = reinterpret_cast<const __nv_bfloat16*>(\
-             ss.scratch + {q_off}); \
+             ss.pages[{in_id}] + {q_off}); \
          const __nv_bfloat16* __qd_k_stage = reinterpret_cast<const __nv_bfloat16*>(\
-             ss.scratch + {k_off}); \
+             ss.pages[{in_id}] + {k_off}); \
          const __nv_bfloat16* __qd_cos_sin = reinterpret_cast<const __nv_bfloat16*>(\
              ss.pages[{cs_id}]); \
          __nv_bfloat16* __qd_q_out = reinterpret_cast<__nv_bfloat16*>(\
@@ -2941,8 +2960,9 @@ pub fn render_fused_qkv_rope_cache_decode<
              }} \
          }} \
          }}",
-        q_off = q_rope_offset,
-        k_off = k_rope_offset,
+        in_id = in_page_id,
+        q_off = q_stage_offset,
+        k_off = k_stage_offset,
         cs_id = cos_sin_page_id,
         q_id = q_out_page_id,
         k_id = k_out_page_id,
@@ -3560,13 +3580,16 @@ pub fn render_attention_via_cache<
     attn_softcap: f32,
     _interleaved: bool,
 ) -> RoleBodies {
-    // M=1 → decode shape (heads-packed Q + per-warp staging +
-    //                     cross-warp compact, log-space softmax).
-    // M=16 → prefill shape (per-Q-head outer loop).
-    // Other M → SKIPPED until the corresponding shape lands.
-    if M == 1 {
+    // Decode shape (heads-packed Q + per-warp staging + cross-warp
+    // compact, log-space softmax) handles M=1 and any M with
+    // M*NUM_Q_HEADS divisible by TK 2.0's TILE_ROW_DIM=16. Each
+    // m-iter is a complete per-token attention against the cache;
+    // the M-loop is the natural TK-faithful shape for short prefills
+    // (no per-row padding, no fake tiles). Larger M (M=16 prefill)
+    // uses the per-Q-head outer-loop shape in `_impl`.
+    if M < 16 && (M * NUM_Q_HEADS) % 16 == 0 {
         render_attention_via_cache_decode::<
-            HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
+            M, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
         >(
             q_in_page_id,
             attn_out_page_id,
@@ -3640,9 +3663,9 @@ pub fn render_sliding_attention_via_cache<
     _interleaved: bool,
     sliding_window: u32,
 ) -> RoleBodies {
-    if M == 1 {
+    if M < 16 && (M * NUM_Q_HEADS) % 16 == 0 {
         render_attention_via_cache_decode::<
-            HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
+            M, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS, BLOCK_SIZE, MAX_SK, NCW, NUM_LAYERS, ITERS,
         >(
             q_in_page_id,
             attn_out_page_id,
@@ -4324,6 +4347,7 @@ fn render_attention_via_cache_impl<
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_attention_via_cache_decode<
+    const M: u32,
     const HEAD_DIM: u32,
     const NUM_Q_HEADS: u32,
     const NUM_KV_HEADS: u32,
@@ -4349,7 +4373,7 @@ pub fn render_attention_via_cache_decode<
     if ITERS != 1 {
         return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
-    if NUM_Q_HEADS == 0 || NUM_KV_HEADS == 0 || HEAD_DIM == 0 || NCW == 0 {
+    if M == 0 || NUM_Q_HEADS == 0 || NUM_KV_HEADS == 0 || HEAD_DIM == 0 || NCW == 0 {
         return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
     if NUM_Q_HEADS % NUM_KV_HEADS != 0 {
@@ -4364,6 +4388,11 @@ pub fn render_attention_via_cache_decode<
     if HEAD_DIM % 16 != 0 {
         return RoleBodies::skipped("TkAttentionViaCacheDecode");
     }
+    // Required so st_bf<M*NUM_Q_HEADS, HEAD_DIM> is a valid TK 2.0
+    // shared tile (rows must be a multiple of TILE_ROW_DIM=16).
+    if (M * NUM_Q_HEADS) % 16 != 0 {
+        return RoleBodies::skipped("TkAttentionViaCacheDecode");
+    }
 
     const Q_HEAD_TILE_ROWS: u32 = 16;
 
@@ -4371,7 +4400,14 @@ pub fn render_attention_via_cache_decode<
     let q_dim: u32 = NUM_Q_HEADS * HEAD_DIM;
     let kv_block_bytes: u32 = BLOCK_SIZE * kv_dim * BF16_BYTES;
     let gqa_group: u32 = NUM_Q_HEADS / NUM_KV_HEADS;
-    let final_out_bytes: u32 = NUM_Q_HEADS * HEAD_DIM * BF16_BYTES;
+    // Per-token Q / output bytes — the m-th token's region in the
+    // shared-page slot. Total Q load = M * per_token_q_bytes;
+    // output is now scattered to gmem direct from the consumer
+    // (see compact pass below), so total_out_bytes is no longer a
+    // shmem allocation. Per-warp staging fits in V_smem page (NCW
+    // * stage_per_warp_bytes = PAGE_SIZE for NCW=8, HEAD_DIM=64).
+    let per_token_q_bytes: u32 = NUM_Q_HEADS * HEAD_DIM * BF16_BYTES;
+    let total_q_bytes: u32 = M * per_token_q_bytes;
     let stage_per_warp_bytes: u32 = Q_HEAD_TILE_ROWS * HEAD_DIM * BF16_BYTES;
 
     let loader_phase = storer_phase;
@@ -4386,33 +4422,33 @@ pub fn render_attention_via_cache_decode<
 
     // -----------------------------------------------------------
     // LOADER role — TMA-load Q from gmem into q_in_page.
-    // Layout: [M=1, NUM_Q_HEADS, HEAD_DIM] flat = NUM_Q_HEADS *
+    // Layout: [M, NUM_Q_HEADS, HEAD_DIM] flat = M * NUM_Q_HEADS *
     // HEAD_DIM bf16 elements. Reinterpreted in consumer as
-    // st_bf<NUM_Q_HEADS, HEAD_DIM> (heads-packed).
+    // st_bf<M*NUM_Q_HEADS, HEAD_DIM> (token-major + heads-packed
+    // within each token).
     // -----------------------------------------------------------
     let mut loader = CuBlock::new();
     let q_in_ready = page_ready_sem(q_in_p);
     let q_in_consumed = page_consumed_sem(q_in_p);
     let attn_out_consumed = page_consumed_sem(attn_out_p);
     let q_in_gmem = gmem_act_ptr_raw(q_in_act_slot);
-    let q_bytes = NUM_Q_HEADS * HEAD_DIM * BF16_BYTES;
     loader.push(tk20::group_wait::<1>(&q_in_consumed, loader_phase));
     loader.push(tk20::group_wait::<1>(&attn_out_consumed, loader_phase));
-    loader.push(tk20::group_tma_expect_bytes::<1>(&q_in_ready, q_bytes));
+    loader.push(tk20::group_tma_expect_bytes::<1>(&q_in_ready, total_q_bytes));
     loader.push(CuStmt::new(format!(
         "{{ \
-         auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{nqh}, {hd}>*>(\
+         auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{rows}, {hd}>*>(\
          ss.pages[{q_in_id}]); \
          kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&__attn_q_tile), \
          reinterpret_cast<void*>({q_gmem}), \
          {q_bytes}, {q_ready}); \
          }}",
-        nqh = NUM_Q_HEADS,
+        rows = M * NUM_Q_HEADS,
         hd = HEAD_DIM,
         q_in_id = q_in_page_id,
         q_gmem = q_in_gmem.expr(),
-        q_bytes = q_bytes,
+        q_bytes = total_q_bytes,
         q_ready = q_in_ready.expr(),
     )));
 
@@ -4422,13 +4458,23 @@ pub fn render_attention_via_cache_decode<
     let launcher = CuBlock::new();
 
     // -----------------------------------------------------------
-    // CONSUMER role — per-warp FA-2 inner loop, then cross-warp
-    // compact, then arrive on attn_out_done.
+    // CONSUMER role — per-token outer loop wrapping per-warp FA-2
+    // inner loop, cross-warp compact, then arrive on attn_out_done
+    // once after all M tokens are written. Each m-iter is a
+    // complete independent attention; the heads-packed register
+    // tile shape stays at NUM_Q_HEADS rows per token, NO padding.
     // -----------------------------------------------------------
+    // Bind attn_out gmem ptr early so the consumer can scatter the
+    // compacted [NUM_Q_HEADS, HEAD_DIM] tile DIRECTLY to gmem (no
+    // shmem buffering of M*total_out_bytes — would overflow into
+    // pages owned by other ops).
+    let attn_out_gmem = gmem_act_ptr_raw(attn_out_act_slot);
     let mut consumer = CuBlock::new();
 
     // Local block-scope semaphores for per-block-iter K/V TMA
-    // handshake (single-stage, phase-toggled).
+    // handshake (single-stage, phase-toggled). Phase tracks total
+    // arrivals across ALL m iterations — the semaphore ARRIVES
+    // counter is monotonic across the whole consumer body.
     consumer.push(tk20::decl_shared_semaphore("__attn_k_arr"));
     consumer.push(tk20::decl_shared_semaphore("__attn_v_arr"));
     consumer.push(tk20::init_semaphore_warp0::<NCW>(
@@ -4443,11 +4489,14 @@ pub fn render_attention_via_cache_decode<
 
     consumer.push(tk20::group_wait::<1>(&q_in_ready, consumer_phase));
 
-    // Heads-packed Q tile view of in-page.
+    // Big Q tile: [M*NUM_Q_HEADS, HEAD_DIM]. Token m's NUM_Q_HEADS
+    // rows live at row-window indices `m*windows_per_token ..
+    // (m+1)*windows_per_token` (windows_per_token = NUM_Q_HEADS/16,
+    // and NUM_Q_HEADS%16==0 enforced above).
     consumer.push(CuStmt::new(format!(
-        "auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{nqh}, {hd}>*>(\
+        "auto& __attn_q_tile = *reinterpret_cast<kittens::st_bf<{rows}, {hd}>*>(\
          ss.pages[{q_in_id}]);",
-        nqh = NUM_Q_HEADS,
+        rows = M * NUM_Q_HEADS,
         hd = HEAD_DIM,
         q_in_id = q_in_page_id,
     )));
@@ -4471,26 +4520,13 @@ pub fn render_attention_via_cache_decode<
         vpid = v_smem_page_id,
     )));
 
-    // Per-token paged-KV walk parameters. M=1: single seq, single
-    // block_table row.
-    consumer.push(tk20::decl_local_int(
-        "__attn_seq_len",
-        "static_cast<int>(seq_lens[0])",
-    ));
-    consumer.push(tk20::decl_local_int(
-        "__attn_num_blocks",
-        &format!("(__attn_seq_len + {bs} - 1) / {bs}", bs = BLOCK_SIZE),
-    ));
+    // Per-warp kv_head ownership (NCW == NUM_KV_HEADS): kv_head ==
+    // warp_id. Window (16 rows) and row offset within window are
+    // const-generic functions of kv_head, fixed for this warp.
     consumer.push(tk20::decl_local_int(
         "__attn_consumer_warp_id",
         "static_cast<int>(kittens::warpid())",
     ));
-
-    // Per-warp kv_head ownership: kv_head == warp_id (NCW ==
-    // NUM_KV_HEADS). The GQA_GROUP Q rows for this kv_head live in
-    // a 16-row Q-tile window; the per-CTA Q tile is contiguous so
-    // window_id and the row offset within that window are fixed
-    // const-generic functions of kv_head.
     consumer.push(tk20::decl_local_int(
         "__attn_kv_head",
         "__attn_consumer_warp_id",
@@ -4504,45 +4540,9 @@ pub fn render_attention_via_cache_decode<
         &format!("(__attn_kv_head * {gqa}) % 16", gqa = gqa_group),
     ));
 
-    // Q register tile for this kv_head's window: rt_bf<16, HEAD_DIM>
-    // row-layout. Subtile<16, HEAD_DIM> at (window_id, 0) of the
-    // heads-packed [NUM_Q_HEADS, HEAD_DIM] Q tile.
-    let (decl_q_rt, q_rt) =
-        tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_q_rt");
-    consumer.push(decl_q_rt);
-    consumer.push(CuStmt::new(format!(
-        "auto __attn_q_sub = __attn_q_tile.template subtile<16, {hd}>(\
-         int2{{__attn_q_window_id, 0}});",
-        hd = HEAD_DIM,
-    )));
-    consumer.push(CuStmt::new(
-        "kittens::warp::load(__attn_q_rt, __attn_q_sub);".to_string(),
-    ));
-
-    // Online softmax running state: log-space (TK's exp2 / log2
-    // pattern) so the partial outputs are mergeable by a future
-    // reduction op without losing precision.
-    //
-    //   max_vec   ← -inf (per-row max of un-scaled att)
-    //   sum_vec   ← 0    (per-row sum of exp2(scaled - max_scaled))
-    //   o_reg     ← 0    (per-row accumulator)
-    //
-    // SOFTMAX_TEMPERATURE = attn_scale * log2(e). Multiplying att
-    // by this (instead of by attn_scale) lets us use exp2 instead
-    // of expf — same math, exp2 is faster and matches TK.
-    let (decl_max, max_rv) =
-        tk20::decl_rv_fl_neg_infty::<Q_HEAD_TILE_ROWS>("__attn_max");
-    let (decl_sum, sum_rv) =
-        tk20::decl_rv_fl_ortho::<Q_HEAD_TILE_ROWS>("__attn_sum");
-    let (decl_o, o_rt) =
-        tk20::decl_rt_fl::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o");
-    consumer.push(decl_max);
-    consumer.push(decl_sum);
-    consumer.push(tk20::warp_zero_rv::<Q_HEAD_TILE_ROWS, _>(&sum_rv));
-    consumer.push(decl_o);
-    consumer.push(tk20::warp_zero_rt::<F32, RtRow, Q_HEAD_TILE_ROWS, HEAD_DIM>(
-        &o_rt,
-    ));
+    // Absolute per-block phase counter: bumped once per p-iter
+    // across ALL m iterations so phase = total_arrivals & 1.
+    consumer.push(CuStmt::new("int __attn_total_p = 0;".to_string()));
 
     let softmax_temperature_lit = format!("{:e}f * 1.44269504089f", attn_scale);
     consumer.push(CuStmt::new(format!(
@@ -4550,13 +4550,65 @@ pub fn render_attention_via_cache_decode<
         st = softmax_temperature_lit,
     )));
 
+    let windows_per_token: u32 = NUM_Q_HEADS / 16;
+
     // -----------------------------------------------------------
-    // Per-block FA-2 inner loop.
+    // Per-token outer loop body (m_body). One full FA-2 attention
+    // per iteration; max/sum/o_reg are reset per token.
+    // -----------------------------------------------------------
+    let mut m_body = CuBlock::new();
+
+    m_body.push(tk20::decl_local_int(
+        "__attn_seq_len",
+        "static_cast<int>(seq_lens[__attn_m])",
+    ));
+    m_body.push(tk20::decl_local_int(
+        "__attn_num_blocks",
+        &format!("(__attn_seq_len + {bs} - 1) / {bs}", bs = BLOCK_SIZE),
+    ));
+
+    // Q register tile for this kv_head's 16-row window of token m.
+    // Absolute window in the [M*NUM_Q_HEADS, HEAD_DIM] big tile:
+    //   row_window = m * windows_per_token + q_window_id
+    let (decl_q_rt, q_rt) =
+        tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_q_rt");
+    m_body.push(decl_q_rt);
+    m_body.push(CuStmt::new(format!(
+        "auto __attn_q_sub = __attn_q_tile.template subtile<16, {hd}>(\
+         int2{{__attn_m * {wpt} + __attn_q_window_id, 0}});",
+        hd = HEAD_DIM,
+        wpt = windows_per_token,
+    )));
+    m_body.push(CuStmt::new(
+        "kittens::warp::load(__attn_q_rt, __attn_q_sub);".to_string(),
+    ));
+
+    // Online softmax running state — TK's log-space (exp2 / log2)
+    // pattern. Reset per token.
+    //   max_vec   ← -inf
+    //   sum_vec   ← 0
+    //   o_reg     ← 0
+    let (decl_max, max_rv) =
+        tk20::decl_rv_fl_neg_infty::<Q_HEAD_TILE_ROWS>("__attn_max");
+    let (decl_sum, sum_rv) =
+        tk20::decl_rv_fl_ortho::<Q_HEAD_TILE_ROWS>("__attn_sum");
+    let (decl_o, o_rt) =
+        tk20::decl_rt_fl::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o");
+    m_body.push(decl_max);
+    m_body.push(decl_sum);
+    m_body.push(tk20::warp_zero_rv::<Q_HEAD_TILE_ROWS, _>(&sum_rv));
+    m_body.push(decl_o);
+    m_body.push(tk20::warp_zero_rt::<F32, RtRow, Q_HEAD_TILE_ROWS, HEAD_DIM>(
+        &o_rt,
+    ));
+
+    // -----------------------------------------------------------
+    // Per-block FA-2 inner loop (within token m).
     // -----------------------------------------------------------
     let mut p_body = CuBlock::new();
     p_body.push(tk20::decl_local_int(
         "__attn_phase",
-        "(static_cast<int>(__attn_p)) & 1",
+        "__attn_total_p & 1",
     ));
 
     // Issue paged-KV K/V block TMA loads on warp-0 lane-0 only.
@@ -4780,60 +4832,67 @@ pub fn render_attention_via_cache_decode<
         &o_rt, &att_bf_rt, &v_rt, &o_rt,
     ));
 
-    consumer.push(tk20::for_loop(
+    // Bump absolute phase counter so the next p (or next-m's first
+    // p) sees the correct semaphore parity.
+    p_body.push(CuStmt::new("__attn_total_p++;".to_string()));
+
+    m_body.push(tk20::for_loop(
         "uint32_t __attn_p = 0; __attn_p < static_cast<uint32_t>(__attn_num_blocks); ++__attn_p",
         &p_body,
     ));
 
-    // Finalize: o /= sum_vec (per row).
-    consumer.push(tk20::warp_div_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
+    // Finalize for token m: o /= sum_vec (per row).
+    m_body.push(tk20::warp_div_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
         &o_rt, &o_rt, &sum_rv,
     ));
 
     // Cast o (fp32) → bf16, store to per-warp UNSWIZZLED staging in
-    // attn_out page at offset `final_out_bytes + warpid * 16 *
-    // HEAD_DIM * 2`. swizzle=false so the cross-warp compact below
-    // can flat-read row-major.
+    // V_SMEM page at offset `warpid * 16 * HEAD_DIM * 2`.
+    //
+    // V_smem is reused as scratch for the FA-2 epilogue: by the
+    // time we arrive here for token m, the last p-iter's mma_AB
+    // against V is complete, so V_smem's contents are dead. NCW *
+    // stage_per_warp_bytes = 8 * 2048 = 16384 B = exactly one TK
+    // page, so the staging fits in V_smem with zero overflow.
+    //
+    // swizzle=false so the cross-warp compact below can flat-read
+    // row-major. Staging is reused per m.
     let (decl_o_bf, o_bf_rt) =
         tk20::decl_rt_bf_row::<Q_HEAD_TILE_ROWS, HEAD_DIM>("__attn_o_bf");
-    consumer.push(decl_o_bf);
-    consumer.push(tk20::warp_copy_rt_fl_to_bf::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
+    m_body.push(decl_o_bf);
+    m_body.push(tk20::warp_copy_rt_fl_to_bf::<Q_HEAD_TILE_ROWS, HEAD_DIM>(
         &o_bf_rt, &o_rt,
     ));
-    consumer.push(CuStmt::new(format!(
+    m_body.push(CuStmt::new(format!(
         "auto& __attn_stage_w = *reinterpret_cast<\
          kittens::st<kittens::bf16, 16, {hd}, false>*>(\
-         ss.pages[{out_id}] + {fob} + __attn_consumer_warp_id * {sw});",
+         ss.pages[{vpid}] + __attn_consumer_warp_id * {sw});",
         hd = HEAD_DIM,
-        out_id = attn_out_page_id,
-        fob = final_out_bytes,
+        vpid = v_smem_page_id,
         sw = stage_per_warp_bytes,
     )));
-    consumer.push(CuStmt::new(
+    m_body.push(CuStmt::new(
         "kittens::warp::store(__attn_stage_w, __attn_o_bf);".to_string(),
     ));
 
-    // -----------------------------------------------------------
     // Cross-warp barrier — every warp's staging slot must be
     // visible before the compact pass reads it.
-    // -----------------------------------------------------------
-    consumer.push(CuStmt::new("__syncthreads();".to_string()));
+    m_body.push(CuStmt::new("__syncthreads();".to_string()));
 
-    // -----------------------------------------------------------
-    // Cross-warp compact: NCW * 32 threads cooperatively scatter
-    // each kv_head's GQA valid rows from staging into the final
-    // [NUM_Q_HEADS, HEAD_DIM] tile at the start of the attn_out
-    // page. Source row in staging = `(kv_head*GQA + r) % 16` which
-    // for GQA dividing 16 evenly is just `(kv_head*GQA) % 16 + r`.
-    // -----------------------------------------------------------
-    consumer.push(CuStmt::new(format!(
+    // Cross-warp compact for token m: NCW * 32 threads scatter
+    // each kv_head's GQA valid rows from V_smem-page staging into
+    // token m's [NUM_Q_HEADS, HEAD_DIM] slot DIRECTLY in gmem at
+    // offset `__attn_m * per_token_out_bytes`. No shmem buffering
+    // of M tokens (would need M*per_token_out_bytes which can
+    // overflow a single TK page).
+    m_body.push(CuStmt::new(format!(
         "{{ \
          int __compact_total = {nqh} * {hd}; \
          int __compact_threads = {ncw} * 32; \
          int __compact_tid = static_cast<int>(threadIdx.x); \
-         __nv_bfloat16* __compact_final_base = \
-             reinterpret_cast<__nv_bfloat16*>(ss.pages[{out_id}]); \
-         uint8_t* __compact_stage_base = ss.pages[{out_id}] + {fob}; \
+         __nv_bfloat16* __compact_final_base = reinterpret_cast<__nv_bfloat16*>(\
+             {out_gmem}) + __attn_m * ({nqh} * {hd}); \
+         uint8_t* __compact_stage_base = ss.pages[{vpid}]; \
          for (int __idx = __compact_tid; __idx < __compact_total; __idx += __compact_threads) {{ \
              int __r = __idx / {hd}; \
              int __c = __idx % {hd}; \
@@ -4849,13 +4908,20 @@ pub fn render_attention_via_cache_decode<
         nqh = NUM_Q_HEADS,
         hd = HEAD_DIM,
         ncw = NCW,
-        out_id = attn_out_page_id,
-        fob = final_out_bytes,
+        out_gmem = attn_out_gmem.expr(),
+        vpid = v_smem_page_id,
         gqa = gqa_group,
         sw = stage_per_warp_bytes,
     )));
 
-    consumer.push(CuStmt::new("__syncthreads();".to_string()));
+    // Barrier before the next m iter overwrites staging.
+    m_body.push(CuStmt::new("__syncthreads();".to_string()));
+
+    // Wrap the per-token m_body in the outer M-loop.
+    consumer.push(tk20::for_loop(
+        &format!("int __attn_m = 0; __attn_m < {m}; ++__attn_m", m = M),
+        &m_body,
+    ));
 
     let attn_out_done = page_done_sem(attn_out_p);
     consumer.push(tk20::block_warp_zero(&[
@@ -4864,27 +4930,15 @@ pub fn render_attention_via_cache_decode<
     ]));
 
     // -----------------------------------------------------------
-    // STORER role — TMA-store final compacted [NUM_Q_HEADS,
-    // HEAD_DIM] tile from offset 0 of the attn_out page to gmem.
+    // STORER role — output already scattered to gmem by the
+    // consumer's per-m compact pass (writes through the 8B
+    // global-coherent path on H100). No TMA store needed; just
+    // wait on attn_out_done so the page protocol stays coherent
+    // and arrive on attn_out_consumed.
     // -----------------------------------------------------------
     let mut storer = CuBlock::new();
-    let attn_out_gmem = gmem_act_ptr_raw(attn_out_act_slot);
     let attn_out_consumed = page_consumed_sem(attn_out_p);
     storer.push(tk20::group_wait::<1>(&attn_out_done, storer_phase));
-    storer.push(CuStmt::new(format!(
-        "{{ \
-         __nv_bfloat16* __out_src = reinterpret_cast<__nv_bfloat16*>(\
-             ss.pages[{out_id}]); \
-         kittens::group<1>::tma::store_async(\
-             reinterpret_cast<void*>({out_gmem}), \
-             reinterpret_cast<void*>(__out_src), \
-             {bytes}); \
-         }}",
-        out_id = attn_out_page_id,
-        out_gmem = attn_out_gmem.expr(),
-        bytes = final_out_bytes,
-    )));
-    storer.push(tk20::group_tma_store_async_wait::<1>());
     storer.push(tk20::group_arrive::<1>(&attn_out_consumed));
 
     RoleBodies {

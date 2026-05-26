@@ -50,9 +50,9 @@ mod quantization;
 mod schedule;
 mod shape;
 mod solver;
-mod to_wavefront;
 mod solver_metal_tests;
 mod target;
+mod to_wavefront;
 mod tp_lowering;
 mod vision_lowering;
 mod viz_dump;
@@ -935,10 +935,7 @@ fn compile_common(
                                 );
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "[wavefront] {}: not lowered — {e}",
-                                    model.source_stem
-                                );
+                                eprintln!("[wavefront] {}: not lowered — {e}", model.source_stem);
                             }
                         }
                     }

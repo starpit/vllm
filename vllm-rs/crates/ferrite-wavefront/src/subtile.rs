@@ -120,6 +120,13 @@ pub enum SubOp {
     /// `inputs[1]`, both matching the output shape. Col-tiling never
     /// reorders a computation, so always bit-exact vs the whole op.
     Elementwise(EwKind),
+    /// Fused SwiGLU activation: `out[j] = silu(gate[j]) * up[j]`.
+    /// `inputs[0]` = gate, `inputs[1]` = up, both `[out_rows, out_cols]`.
+    /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
+    /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
+    /// `Silu` + `Mul` are fused into this one node *before scheduling* (so
+    /// the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
+    SiluMul,
     /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
     /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
     /// `inputs[1]` = weight `[1, cols]`. The per-row reduction is kept
@@ -714,6 +721,20 @@ pub fn eval_node(
                 }
             }
         }
+        SubOp::SiluMul => {
+            let (a, ar, ac) = read_operand(&node.inputs[0], graph, sources, outs);
+            let (b, br, bc) = read_operand(&node.inputs[1], graph, sources, outs);
+            assert_eq!(
+                (ar, ac),
+                (node.out_rows, node.out_cols),
+                "silu_mul gate shape"
+            );
+            assert_eq!((br, bc), (ar, ac), "silu_mul up shape");
+            a.iter()
+                .zip(&b)
+                .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+                .collect()
+        }
         SubOp::RmsNorm { eps } => {
             let (x, xr, xc) = read_operand(&node.inputs[0], graph, sources, outs);
             let (wt, _wr, wc) = read_operand(&node.inputs[1], graph, sources, outs);
@@ -876,6 +897,7 @@ pub fn validate(graph: &SubtileGraph) -> Result<usize, String> {
             SubOp::SumReduce => arity >= 1,
             SubOp::Elementwise(EwKind::Silu) => arity == 1,
             SubOp::Elementwise(EwKind::Mul | EwKind::Add) => arity == 2,
+            SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
             // Q followed by one or more (K_seg, V_seg) pairs.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// ThunderMittens — RoPE rotation COMPUTE atom for the PD-wavefront persistent
-// decode megakernel on Apple GPU. A faithful EXTRACTION (not a rewrite) of the
-// NeoX pair-rotation body shared by `rope_append_{f16,bf16}_specialized` in
-// `rope.metal`.
+// ThunderMittens — RoPE COMPUTE atoms for the PD-wavefront persistent decode
+// megakernel on Apple GPU. Faithful EXTRACTIONS (not rewrites) of
+// `rope_append_{f16,bf16}_specialized` (`rope.metal`): the NeoX pair-rotation
+// (`rope_rotate_pair`) and the paged KV-cache commit (`kv_paged_write`).
 //
-// Just the ROTATION — per locked design decision #4 the megakernel keeps the
-// new token's rotated K as a dataflow edge into attention (no cache round-trip),
-// so the paged KV-cache write stays in the [[kernel]] wrapper as a commit
-// side-output, NOT in this atom. The cos/sin rows are precomputed
-// (cos_sin[pos*rot_dim ..]); the caller slices the (token, head) row and the
-// rotation is per element `d`.
+// The wavefront megakernel composes these as a `rope_append`-style K op
+// (rotate K, then write rotated K + un-rotated V into the paged cache) so the
+// downstream attention reads the new token from the cache exactly like the
+// oracle non-mega path does — that is what makes the megakernel Tier-B
+// bit-exact (it runs the oracle's exact computation). The Q-side stays
+// rotation-only. cos/sin rows are precomputed (cos_sin[pos*rot_dim ..]); the
+// caller slices the (token, head) row and the rotation is per element `d`.
 #pragma once
 #include <metal_stdlib>
 
@@ -43,6 +44,40 @@ METAL_FUNC void rope_rotate_pair(
     row[d] = T(x0 * c - x1 * s);
     row[half_dim + d] = T(x1 * c + x0 * s);
   }
+}
+
+// Paged KV-cache append — the COMMIT half of `rope_append_*_specialized`
+// (rope.metal:317-342), extracted verbatim. Copy one element `d` of one
+// kv-head's rotated `k_row` and un-rotated `v_row` into the per-layer paged
+// cache at `slot`. Cache layout `[num_blocks, num_kv, block_size, head_dim]`;
+// `slot` is the flat token index, split into (block_id, block_offset). The
+// `0xFFFFFFFF` sentinel marks a padding lane (pool.rs fills padding
+// `slot_mapping` with `u32::MAX`) and skips the write so it can't corrupt slot
+// 0. The caller must fence the K rotation (`threadgroup_barrier(mem_device)`)
+// before this reads `k_row[d]` — for `d >= half_dim` that element was written
+// by another thread during rotation.
+template <typename T>
+METAL_FUNC void kv_paged_write(
+    device T* kv_cache_k,
+    device T* kv_cache_v,
+    device const T* k_row, // this kv-head's rotated K
+    device const T* v_row, // this kv-head's un-rotated V
+    uint slot,
+    uint kv_head,
+    uint d,
+    uint num_kv,
+    uint block_size,
+    uint head_dim) {
+  if (slot == 0xFFFFFFFFu) {
+    return;
+  }
+  const uint block_id = slot / block_size;
+  const uint block_offset = slot % block_size;
+  const uint blk_stride = num_kv * block_size * head_dim;
+  const uint head_stride = block_size * head_dim;
+  const uint off = block_id * blk_stride + kv_head * head_stride + block_offset * head_dim;
+  kv_cache_k[off + d] = k_row[d];
+  kv_cache_v[off + d] = v_row[d];
 }
 
 } // namespace mittens

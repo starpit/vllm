@@ -17,6 +17,7 @@
 //! ferrite-metal non-mega at temp=0).
 
 pub mod lower;
+pub mod mega;
 pub mod region;
 pub mod region_schedule;
 pub mod scheduler;

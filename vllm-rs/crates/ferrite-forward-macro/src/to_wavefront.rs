@@ -77,10 +77,18 @@ impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedOp { tile, op } => {
-                write!(f, "tile {} op {op:?} is outside the coarse decode set", tile.0)
+                write!(
+                    f,
+                    "tile {} op {op:?} is outside the coarse decode set",
+                    tile.0
+                )
             }
             Self::UnresolvedShape { tile, what } => {
-                write!(f, "tile {} {what} did not close to a concrete shape", tile.0)
+                write!(
+                    f,
+                    "tile {} {what} did not close to a concrete shape",
+                    tile.0
+                )
             }
             Self::DanglingInput { tile, dep, slot } => write!(
                 f,
@@ -109,7 +117,10 @@ impl std::error::Error for BridgeError {}
 pub enum SourceBinding {
     /// A model weight: the `index` is the unrolled (former loop-var)
     /// integer, so `(id, index)` uniquely names a per-layer tensor.
-    Weight { id: u32, index: Option<u64> },
+    Weight {
+        id: u32,
+        index: Option<u64>,
+    },
     /// The embedded hidden-state row the runtime gathers from
     /// `embed_tokens[input_id]` before the kernel — embed is a cheap
     /// host lookup, not a megakernel op.
@@ -119,8 +130,12 @@ pub enum SourceBinding {
     Cos,
     Sin,
     /// The read-only prefix KV cache for a layer, `[prefix_len, kvdim]`.
-    PrefixK { layer: u64 },
-    PrefixV { layer: u64 },
+    PrefixK {
+        layer: u64,
+    },
+    PrefixV {
+        layer: u64,
+    },
 }
 
 /// The bridge's output: a coarse subtile `LoweringInput` plus the
@@ -198,7 +213,11 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn push_op(&mut self, op: LoweredOp, inputs: Vec<InputRef>) -> usize {
         let idx = self.ops.len();
-        self.ops.push(OpDesc { op, m: self.m, inputs });
+        self.ops.push(OpDesc {
+            op,
+            m: self.m,
+            inputs,
+        });
         idx
     }
 
@@ -248,12 +267,14 @@ impl<'a> Builder<'a> {
         if let Some(&e) = self.weight_src.get(&(id, index)) {
             return Ok(e);
         }
-        let shape = self.inferred.weights.get(&crate::classified::WeightId(id)).ok_or(
-            BridgeError::UnresolvedShape {
+        let shape = self
+            .inferred
+            .weights
+            .get(&crate::classified::WeightId(id))
+            .ok_or(BridgeError::UnresolvedShape {
                 tile,
                 what: "weight (no inferred shape)",
-            },
-        )?;
+            })?;
         let dims = eval_shape_with(shape, &self.bounds).ok_or(BridgeError::UnresolvedShape {
             tile,
             what: "weight shape has unresolved dim",
@@ -357,7 +378,9 @@ pub fn lower_decode_to_wavefront(
     let eps = *model
         .scalars
         .get("rms_norm_eps")
-        .ok_or(BridgeError::MissingScalar { key: "rms_norm_eps" })? as f32;
+        .ok_or(BridgeError::MissingScalar {
+            key: "rms_norm_eps",
+        })? as f32;
     let scale = attention_scale_for(model);
     let mut b = bounds.clone();
     b.insert("num_tokens".into(), 1);
@@ -548,6 +571,7 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
             LoweredOp::RmsNorm { .. } => "RmsNorm",
             LoweredOp::Silu => "Silu",
             LoweredOp::Mul => "Mul",
+            LoweredOp::SiluMul => "SiluMul",
             LoweredOp::Add => "Add",
             LoweredOp::RopeRotate { .. } => "RopeRotate",
             LoweredOp::AttnDecode { .. } => "AttnDecode",
@@ -564,7 +588,12 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
     let prefix_sources = lowered
         .bindings
         .iter()
-        .filter(|b| matches!(b, SourceBinding::PrefixK { .. } | SourceBinding::PrefixV { .. }))
+        .filter(|b| {
+            matches!(
+                b,
+                SourceBinding::PrefixK { .. } | SourceBinding::PrefixV { .. }
+            )
+        })
         .count();
     BridgeStats {
         fuf_tiles: fuf.len(),

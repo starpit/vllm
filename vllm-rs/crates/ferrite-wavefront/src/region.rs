@@ -236,6 +236,16 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
                 }
             }
         }
+        SubOp::SiluMul => {
+            let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
+            let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
+            assert_eq!((ar, ac), (out_rows, out_cols), "silu_mul gate shape");
+            assert_eq!((br, bc), (ar, ac), "silu_mul up shape");
+            a.iter()
+                .zip(&b)
+                .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
+                .collect()
+        }
         SubOp::RmsNorm { eps } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (wt, _wr, wc) = gather(&node.inputs[1], graph, bufs);
@@ -415,6 +425,7 @@ pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
             SubOp::SumReduce => arity >= 1,
             SubOp::Elementwise(EwKind::Silu) => arity == 1,
             SubOp::Elementwise(EwKind::Mul | EwKind::Add) => arity == 2,
+            SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
             SubOp::AttnDecode { .. } => arity >= 3 && arity % 2 == 1,
@@ -507,6 +518,7 @@ fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
         LoweredOp::RmsNorm { .. }
         | LoweredOp::Silu
         | LoweredOp::Mul
+        | LoweredOp::SiluMul
         | LoweredOp::Add
         | LoweredOp::RopeRotate { .. } => in0_cols,
     }
@@ -617,6 +629,7 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
                     LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
+                    LoweredOp::SiluMul => SubOp::SiluMul,
                     LoweredOp::Add => SubOp::Elementwise(EwKind::Add),
                     LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate { head_dim },
                     LoweredOp::AttnDecode {

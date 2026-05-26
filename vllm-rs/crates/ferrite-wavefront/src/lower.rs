@@ -44,6 +44,10 @@ pub enum LoweredOp {
     Silu,
     /// `a * b`. Inputs: `[a, b]`. Shape-preserving.
     Mul,
+    /// Fused `silu(gate) * up`. Inputs: `[gate, up]`. Shape-preserving.
+    /// Produced by [`fuse_silu_mul`] from an adjacent `Silu` + `Mul`; maps
+    /// to the GPU's fused `silu_mul` arm.
+    SiluMul,
     /// `a + b` (e.g. the residual). Inputs: `[a, b]`. Shape-preserving.
     Add,
     /// NeoX rotary over `[M, heads * head_dim]`. Inputs: `[x, cos, sin]`,
@@ -134,6 +138,10 @@ pub fn lower(input: &LoweringInput) -> SubtileGraph {
                 let d = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
                 (SubOp::Elementwise(EwKind::Mul), d)
             }
+            LoweredOp::SiluMul => {
+                let d = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
+                (SubOp::SiluMul, d)
+            }
             LoweredOp::Add => {
                 let d = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
                 (SubOp::Elementwise(EwKind::Add), d)
@@ -182,6 +190,119 @@ pub fn lower(input: &LoweringInput) -> SubtileGraph {
                 cols: Range::new(0, rc),
             },
         }],
+    }
+}
+
+// ── Silu + Mul → SiluMul fusion ─────────────────────────────────────
+
+/// Fuse each adjacent `Silu` → `Mul(silu, up)` into one
+/// [`LoweredOp::SiluMul`] (SwiGLU). The GPU has only a *fused* `silu_mul`
+/// arm (no standalone silu), and fusion must happen **before scheduling**
+/// so the pair lands on one worker — the serializer otherwise rejects a
+/// standalone `Silu`. A `Silu` is fused only when its output feeds exactly
+/// one consumer (that `Mul`) and is not the forward result; everything else
+/// is left untouched. Bit-exact: `SiluMul` computes `silu(gate) * up`,
+/// identical to the two separate ops, so `eval_dag` is unchanged.
+///
+/// `Mul` is commutative, so the `Silu`-producing operand becomes `gate` and
+/// the other becomes `up` regardless of input order. Op references are
+/// re-indexed after the dropped `Silu`s are removed.
+pub fn fuse_silu_mul(input: &LoweringInput) -> LoweringInput {
+    use std::collections::HashMap;
+    let n = input.ops.len();
+
+    // Count consumers of each op output (op inputs across the forward + the
+    // result) so a multiply-consumed `Silu` is never duplicated by fusion.
+    let mut uses = vec![0u32; n];
+    for od in &input.ops {
+        for r in &od.inputs {
+            if let InputRef::Op(j) = r {
+                uses[*j] += 1;
+            }
+        }
+    }
+    uses[input.result] += 1;
+
+    // Decide fusions: mul index → (silu index, gate ref, up ref).
+    let is_silu = |i: usize| matches!(input.ops[i].op, LoweredOp::Silu);
+    let mut fuse_at: HashMap<usize, (usize, InputRef, InputRef)> = HashMap::new();
+    let mut dropped = vec![false; n];
+    for (j, od) in input.ops.iter().enumerate() {
+        if !matches!(od.op, LoweredOp::Mul) || od.inputs.len() != 2 {
+            continue;
+        }
+        // A fusable operand is a single-use, non-result `Silu` output.
+        let fusable = |r: InputRef, dropped: &[bool]| -> Option<usize> {
+            if let InputRef::Op(i) = r
+                && is_silu(i)
+                && uses[i] == 1
+                && input.result != i
+                && !dropped[i]
+            {
+                return Some(i);
+            }
+            None
+        };
+        let (a, b) = (od.inputs[0], od.inputs[1]);
+        let pick = fusable(a, &dropped)
+            .map(|si| (si, b))
+            .or_else(|| fusable(b, &dropped).map(|si| (si, a)));
+        if let Some((si, up)) = pick {
+            let gate = input.ops[si].inputs[0];
+            fuse_at.insert(j, (si, gate, up));
+            dropped[si] = true;
+        }
+    }
+    if fuse_at.is_empty() {
+        return input.clone();
+    }
+
+    // Old op index → new index, with the dropped `Silu`s removed.
+    let mut new_idx = vec![usize::MAX; n];
+    let mut next = 0usize;
+    for (i, d) in dropped.iter().enumerate() {
+        if !d {
+            new_idx[i] = next;
+            next += 1;
+        }
+    }
+    let remap = |r: InputRef| -> InputRef {
+        match r {
+            InputRef::Op(j) => {
+                debug_assert_ne!(
+                    new_idx[j],
+                    usize::MAX,
+                    "ref to a dropped Silu survived fusion"
+                );
+                InputRef::Op(new_idx[j])
+            }
+            InputRef::Ext(e) => InputRef::Ext(e),
+        }
+    };
+
+    let mut ops: Vec<OpDesc> = Vec::with_capacity(next);
+    for (i, od) in input.ops.iter().enumerate() {
+        if dropped[i] {
+            continue;
+        }
+        if let Some((_, gate, up)) = fuse_at.get(&i) {
+            ops.push(OpDesc {
+                op: LoweredOp::SiluMul,
+                m: od.m,
+                inputs: vec![remap(*gate), remap(*up)],
+            });
+        } else {
+            ops.push(OpDesc {
+                op: od.op,
+                m: od.m,
+                inputs: od.inputs.iter().map(|r| remap(*r)).collect(),
+            });
+        }
+    }
+    LoweringInput {
+        sources: input.sources.clone(),
+        ops,
+        result: new_idx[input.result],
     }
 }
 
@@ -341,6 +462,78 @@ mod tests {
         let srcs: Vec<&[f32]> = vec![&x, &norm_w, &w_gate, &w_up, &w_down];
         let got = assemble_result(&g, &eval_dag(&g, &srcs));
         assert_eq!(got, want, "SwiGLU MLP block must be bit-exact");
+
+        // Fusing Silu+Mul → SiluMul drops the standalone silu, rewrites the
+        // mul, re-indexes the refs, and is bit-exact (same arithmetic).
+        let fused = fuse_silu_mul(&input);
+        assert_eq!(fused.ops.len(), input.ops.len() - 1, "one op fewer");
+        assert_eq!(
+            fused
+                .ops
+                .iter()
+                .filter(|o| matches!(o.op, LoweredOp::SiluMul))
+                .count(),
+            1,
+            "exactly one fused SiluMul"
+        );
+        assert!(
+            !fused
+                .ops
+                .iter()
+                .any(|o| matches!(o.op, LoweredOp::Silu | LoweredOp::Mul)),
+            "no standalone Silu/Mul remain"
+        );
+        // The SiluMul reads (gate gemm, up gemm); the down gemm + add are
+        // re-pointed; the result is remapped.
+        let sm = fused
+            .ops
+            .iter()
+            .find(|o| matches!(o.op, LoweredOp::SiluMul))
+            .unwrap();
+        assert_eq!(
+            sm.inputs,
+            vec![InputRef::Op(1), InputRef::Op(2)],
+            "gate, up"
+        );
+        let gf = lower(&fused);
+        let got_f = assemble_result(&gf, &eval_dag(&gf, &srcs));
+        assert_eq!(got_f, want, "fused SwiGLU MLP must stay bit-exact");
+    }
+
+    /// A `Silu` whose output has a second consumer (besides the `Mul`) is
+    /// NOT fused (fusion would have to duplicate it); the graph is returned
+    /// untouched.
+    #[test]
+    fn fuse_silu_mul_skips_multi_use_silu() {
+        let h = 8u32;
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: h },
+                SourceShape { rows: 1, cols: h },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Silu,
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0)],
+                },
+                OpDesc {
+                    op: LoweredOp::Mul,
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(1)],
+                },
+                // second consumer of the silu output → not single-use
+                OpDesc {
+                    op: LoweredOp::Add,
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Op(1)],
+                },
+            ],
+            result: 2,
+        };
+        let fused = fuse_silu_mul(&input);
+        assert_eq!(fused.ops.len(), input.ops.len(), "nothing fused");
+        assert!(fused.ops.iter().any(|o| matches!(o.op, LoweredOp::Silu)));
     }
 
     /// A whole Llama-style decode layer (M=1): input-norm → q/k/v gemms →

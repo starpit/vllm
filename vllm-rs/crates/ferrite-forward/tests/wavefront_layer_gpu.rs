@@ -802,6 +802,10 @@ fn bytes_of_u32(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+fn bytes_of_u64(v: &[u64]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
 // ── rmsnorm shape-class arm: single subtile through the player ────────────
 
 /// The player runs one rmsnorm subtile (op_kind 3) on the single decode row in
@@ -1422,4 +1426,428 @@ fn wavefront_player_add_bit_exact() {
         let want = half::bf16::from_f32(af(&a, i) + af(&b, i)).to_bits();
         assert_eq!(g, want, "player add arm[{i}] mismatch");
     }
+}
+
+/// rope_append (K side) arm: rotate K in place + write rotated K / un-rotated V
+/// into the paged cache, bit-exact vs the whole `rope_append_bf16_specialized`
+/// — the UNCHANGED oracle, kept as an independent reference so the test can't
+/// pass spuriously. This is the op that lets the megakernel's attention read
+/// the new token from the cache, matching the non-mega oracle (Tier-B exact).
+/// The Q side stays the rotation-only ROPE arm.
+#[test]
+fn wavefront_player_rope_append_bit_exact() {
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+
+    // Llama-3.2-1B attention geometry; full rope; one decode token at pos 7.
+    let (head_dim, num_q, num_kv, rot_dim, block_size) = (64u32, 32u32, 8u32, 64u32, 16u32);
+    let half = (rot_dim / 2) as usize;
+    let (pos, max_pos, num_blocks) = (7u32, 16u32, 4u32);
+    let slot = 37u32; // block 2, offset 5 — a real (non-sentinel) cache slot
+    let kvdim = num_kv * head_dim;
+
+    let bf16le = |v: f32| half::bf16::from_f32(v).to_bits().to_le_bytes();
+    let mut st = 0x9E37_1234u64;
+    let mut next = || {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((st >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let q: Vec<u8> = (0..num_q * head_dim)
+        .flat_map(|_| bf16le(next() * 2.0))
+        .collect();
+    let k: Vec<u8> = (0..kvdim).flat_map(|_| bf16le(next() * 2.0)).collect();
+    let v: Vec<u8> = (0..kvdim).flat_map(|_| bf16le(next())).collect();
+    let cos_sin: Vec<u8> = (0..max_pos * rot_dim)
+        .flat_map(|i| {
+            let d = (i % rot_dim) as usize;
+            let ang = 0.07 * (i as f32);
+            bf16le(if d < half { ang.cos() } else { ang.sin() })
+        })
+        .collect();
+    let positions: Vec<u8> = pos.to_le_bytes().to_vec();
+    let slot_mapping: Vec<u8> = slot.to_le_bytes().to_vec();
+    let cos_sin_buf = buffer_from_bytes(&device, &cos_sin);
+    let cache_bytes = (num_blocks * num_kv * block_size * head_dim * 2) as usize;
+
+    // Reference: the whole rope_append_bf16_specialized (rotates q + k, writes
+    // the paged cache). We compare only its K rotation + cache (Q is the
+    // separate rotation-only ROPE arm).
+    let whole = cache
+        .get_or_build(&PipelineKey::new(
+            "rope",
+            "rope_append_bf16_specialized",
+            vec![
+                ConstantValue::uint(0, head_dim),
+                ConstantValue::uint(1, num_q),
+                ConstantValue::uint(2, num_kv),
+                ConstantValue::uint(3, rot_dim),
+                ConstantValue::uint(4, block_size),
+            ],
+        ))
+        .expect("rope_append pipeline");
+    let k_ref = buffer_from_bytes(&device, &k);
+    let kc_ref = zeroed_buffer(&device, cache_bytes);
+    let vc_ref = zeroed_buffer(&device, cache_bytes);
+    {
+        let q_ref = buffer_from_bytes(&device, &q);
+        let v_ref = buffer_from_bytes(&device, &v);
+        let pos_buf = buffer_from_bytes(&device, &positions);
+        let slot_buf = buffer_from_bytes(&device, &slot_mapping);
+        let queue = device.newCommandQueue().expect("queue");
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        enc.setComputePipelineState(&whole);
+        let bufs = [
+            &q_ref,
+            &k_ref,
+            &v_ref,
+            &cos_sin_buf,
+            &pos_buf,
+            &slot_buf,
+            &kc_ref,
+            &vc_ref,
+        ];
+        for (i, b) in bufs.iter().enumerate() {
+            unsafe { enc.setBuffer_offset_atIndex(Some(b), 0, i) };
+        }
+        enc.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: 1,
+                height: num_q as usize,
+                depth: 1,
+            },
+            MTLSize {
+                width: head_dim as usize,
+                height: 1,
+                depth: 1,
+            },
+        );
+        enc.endEncoding();
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    let k_rot_ref = read_bf16(&k_ref, kvdim as usize);
+    let kc_ref_bits = read_bf16(&kc_ref, cache_bytes / 2);
+    let vc_ref_bits = read_bf16(&vc_ref, cache_bytes / 2);
+    assert!(
+        kc_ref_bits.iter().any(|&b| b != 0),
+        "oracle wrote nothing into the K cache"
+    );
+
+    // Player: one WL_OP_ROPE_APPEND instruction. operands [k, cos, sin, v,
+    // kv_cache_k, kv_cache_v, slot_mapping]; cos/sin slice cos_sin at pos.
+    let k_buf = buffer_from_bytes(&device, &k);
+    let v_buf = buffer_from_bytes(&device, &v);
+    let kc = zeroed_buffer(&device, cache_bytes);
+    let vc = zeroed_buffer(&device, cache_bytes);
+    let slot_buf = buffer_from_bytes(&device, &slot_mapping);
+    let cos_off = (pos * rot_dim) as u64 * 2;
+    let sin_off = (pos * rot_dim + half as u32) as u64 * 2;
+    let operands_bytes: Vec<u8> = [
+        k_buf.gpuAddress(),
+        cos_sin_buf.gpuAddress() + cos_off,
+        cos_sin_buf.gpuAddress() + sin_off,
+        v_buf.gpuAddress(),
+        kc.gpuAddress(),
+        vc.gpuAddress(),
+        slot_buf.gpuAddress(),
+    ]
+    .iter()
+    .flat_map(|a| a.to_le_bytes())
+    .collect();
+    let operands = buffer_from_bytes(&device, &operands_bytes);
+    // shape (ROPE_APPEND=8, head_dim, num_kv, rot_dim, block_size, ...).
+    let shapes = buffer_from_bytes(
+        &device,
+        &bytes_of_u32(&[8, head_dim, num_kv, rot_dim, block_size, 0, 0, 0]),
+    );
+    let tape = buffer_from_bytes(&device, &bytes_of_u32(&[0, 0, 0, 0]));
+    let tape_offsets = buffer_from_bytes(&device, &bytes_of_u32(&[0, 1]));
+    let flags = zeroed_buffer(&device, 4);
+    let player = cache
+        .get_or_build(&PipelineKey::new(
+            "wavefront_layer",
+            "wavefront_player_bf16_s_f16_gs_64_b_4",
+            vec![],
+        ))
+        .expect("player pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&player);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&operands), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+    }
+    use_resource(
+        &enc,
+        &k_buf,
+        MTLResourceUsage::Read | MTLResourceUsage::Write,
+    );
+    use_resource(&enc, &cos_sin_buf, MTLResourceUsage::Read);
+    use_resource(&enc, &v_buf, MTLResourceUsage::Read);
+    use_resource(&enc, &kc, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    use_resource(&enc, &vc, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    use_resource(&enc, &slot_buf, MTLResourceUsage::Read);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    assert_eq!(
+        read_bf16(&k_buf, kvdim as usize),
+        k_rot_ref,
+        "rope_append arm: K rotation must match the whole rope_append"
+    );
+    assert_eq!(
+        read_bf16(&kc, cache_bytes / 2),
+        kc_ref_bits,
+        "rope_append arm: K paged-cache write must match the whole rope_append"
+    );
+    assert_eq!(
+        read_bf16(&vc, cache_bytes / 2),
+        vc_ref_bits,
+        "rope_append arm: V paged-cache write must match the whole rope_append"
+    );
+}
+
+// ── serializer → player end-to-end (the encoding actually drives the GPU) ──
+
+/// A 2-op `qmv → qmv` chain produced by `ferrite_wavefront::mega::serialize`,
+/// run through the player with the gpuAddress operand table built from
+/// `MegaProgram.operands`, must be bit-exact vs two sequential whole qmvs.
+///
+/// Every prior test drove the player from a hand-built tape; this is the first
+/// to drive it from the *serializer's* output, so it proves the whole path:
+/// the emitted tape/shape tables, the `BufId → gpuAddress` resolution, and the
+/// intra-worker arena hand-off (qmv0 writes an arena slot that qmv1 reads).
+#[test]
+fn wavefront_serialized_qmv_chain_bit_exact() {
+    use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
+    use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
+    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::region_schedule::partition_roundrobin;
+    use ferrite_wavefront::subtile::SourceShape;
+    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+
+    let gs = 64u32;
+    let (k0, n0) = (512u32, 512u32); // stage0: x[1,512] @ W0[512,512]
+    let (k1, n1) = (512u32, 64u32); // stage1: y1[1,512] @ W1[64,512]; k1 == n0
+
+    let (w0, s0, b0, x) = make_qmv(&device, n0, k0, gs, 0x5151_0001);
+    let (w1, s1, b1, _x1) = make_qmv(&device, n1, k1, gs, 0x5151_0002);
+
+    // Reference: two sequential whole qmvs.
+    let y1_ref = zeroed_buffer(&device, (n0 * 2) as usize);
+    qmv_whole_into(&device, &cache, &w0, &s0, &b0, &x, &y1_ref, n0, k0, gs);
+    let y2_ref_buf = zeroed_buffer(&device, (n1 * 2) as usize);
+    qmv_whole_into(
+        &device,
+        &cache,
+        &w1,
+        &s1,
+        &b1,
+        &y1_ref,
+        &y2_ref_buf,
+        n1,
+        k1,
+        gs,
+    );
+    let y2_ref = read_bf16(&y2_ref_buf, n1 as usize);
+    assert!(y2_ref.iter().any(|&v| v != 0));
+
+    // Build + serialize the chain.
+    let wl = |op_idx| WeightLoc {
+        layer: 0,
+        bucket: 0,
+        op_idx,
+        slot: 0,
+    };
+    let qw = |op_idx| SourceDesc::QuantWeight {
+        weight: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::Weight,
+            loc: wl(op_idx),
+        },
+        scales: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineScales,
+            loc: wl(op_idx),
+        },
+        biases: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineBiases,
+            loc: wl(op_idx),
+        },
+        group_size: gs,
+        bits: 4,
+        scale_elem: 2,
+    };
+    let input = LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: k0 },  // 0 x
+            SourceShape { rows: n0, cols: k0 }, // 1 W0
+            SourceShape { rows: n1, cols: k1 }, // 2 W1
+        ],
+        ops: vec![
+            OpDesc {
+                op: LoweredOp::Gemm { n: n0, k: k0 },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            OpDesc {
+                op: LoweredOp::Gemm { n: n1, k: k1 },
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+            },
+        ],
+        result: 1,
+    };
+    let sources = vec![
+        SourceDesc::Dense {
+            buffer: BufferRef::Weight {
+                bundle: WeightBundle::Embedding,
+                role: WeightRole::Weight,
+                loc: wl(0),
+            },
+            elem: 2,
+        },
+        qw(1),
+        qw(2),
+    ];
+    let g = lower_region(&input, 1000); // coarse: one block per qmv, P=1
+    let sched = partition_roundrobin(&g, 1);
+    let prog = serialize(
+        &g,
+        &sched,
+        &sources,
+        Geometry {
+            act_elem: 2,
+            block_size: 16,
+            max_blocks: 4,
+        },
+    )
+    .expect("serialize");
+
+    // Resolve each BufId → a synthetic buffer: arena slots are fresh zeroed
+    // buffers (sized by arena_bytes), weights/x map to the make_qmv buffers.
+    let arena: Vec<Buffer> = prog
+        .arena_bytes
+        .iter()
+        .map(|&b| zeroed_buffer(&device, b as usize))
+        .collect();
+    let resolved: Vec<Buffer> = prog
+        .buffers
+        .iter()
+        .map(|bref| match bref {
+            BufferRef::ArenaSlot(s) => arena[*s as usize].clone(),
+            BufferRef::Weight {
+                bundle: WeightBundle::Embedding,
+                ..
+            } => x.clone(),
+            BufferRef::Weight {
+                bundle: WeightBundle::LinearLayer,
+                role,
+                loc,
+            } => {
+                let (w, s, b) = if loc.op_idx == 1 {
+                    (&w0, &s0, &b0)
+                } else {
+                    (&w1, &s1, &b1)
+                };
+                match role {
+                    WeightRole::Weight => w.clone(),
+                    WeightRole::AffineScales => s.clone(),
+                    WeightRole::AffineBiases => b.clone(),
+                    other => panic!("unexpected weight role {other:?}"),
+                }
+            }
+            other => panic!("unexpected buffer ref {other:?}"),
+        })
+        .collect();
+
+    // Operand table: gpuAddress(buffer) + byte_offset (base 0 — whole tensors).
+    let operand_addrs: Vec<u64> = prog
+        .operands
+        .iter()
+        .map(|sl| resolved[sl.buffer.0 as usize].gpuAddress() + sl.byte_offset)
+        .collect();
+    let operands = buffer_from_bytes(&device, &bytes_of_u64(&operand_addrs));
+    let tape = buffer_from_bytes(&device, &prog.tape_bytes());
+    let shapes = buffer_from_bytes(&device, &prog.shapes_bytes());
+    let tape_offsets = buffer_from_bytes(&device, &prog.tape_offsets_bytes());
+    let flags = zeroed_buffer(&device, (prog.num_flags.max(1) * 4) as usize);
+
+    let player = cache
+        .get_or_build(&PipelineKey::new(
+            "wavefront_layer",
+            "wavefront_player_bf16_s_f16_gs_64_b_4",
+            vec![],
+        ))
+        .expect("player pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&player);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&operands), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+    }
+    for buf in &resolved {
+        use_resource(&enc, buf, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    }
+    let p = prog.tape_offsets.len() as u32 - 1;
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: p as usize,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    // The result is the qmv1 output arena slot the serializer recorded.
+    let result_buf = &resolved[prog.result.0 as usize];
+    assert_eq!(
+        read_bf16(result_buf, n1 as usize),
+        y2_ref,
+        "serialized qmv→qmv chain must be bit-exact vs two sequential whole qmvs"
+    );
 }

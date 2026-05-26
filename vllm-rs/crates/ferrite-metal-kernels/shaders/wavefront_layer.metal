@@ -128,6 +128,7 @@ constant constexpr uint WL_OP_SILU_MUL = 4u; // elementwise silu(gate)*up
 constant constexpr uint WL_OP_ROPE = 5u;     // NeoX pair-rotate Q or K in place
 constant constexpr uint WL_OP_ATTN = 6u;     // paged decode attention (loops q-heads)
 constant constexpr uint WL_OP_ADD = 7u;      // elementwise residual add
+constant constexpr uint WL_OP_ROPE_APPEND = 8u; // rotate K in place + write K/V to paged cache
 
 // Each shape-class descriptor is a fixed-width record of WL_SHAPE_STRIDE u32s:
 // [op_kind, p1, p2, p3, p4, p5, p6, _]. Wide enough for attention's 6 dims;
@@ -265,6 +266,41 @@ template <typename T_act, typename T_scale, int group_size, int bits>
                   head_dim, num_q, num_kv, scale, block_size, max_blocks,
                   /*seq_idx=*/0u, /*q_head_idx=*/h, simd_gid, simd_lid);
               threadgroup_barrier(mem_flags::mem_threadgroup); // scratch reuse across heads
+            }
+            break;
+          }
+          case WL_OP_ROPE_APPEND: {
+            // The oracle's rope_append, K side: rotate K in place, then write
+            // rotated K + un-rotated V into the paged cache at slot_mapping[0],
+            // so attention reads the new token from the cache (Tier-B exact).
+            // operands [k(in/out), cos, sin, v, kv_cache_k, kv_cache_v, slot_mapping];
+            // shape (ROPE_APPEND, head_dim, num_kv, rot_dim, block_size, ...).
+            device T_act* k = (device T_act*)(operands[ins.z + 0u]);
+            const device T_act* cos_row = (const device T_act*)(operands[ins.z + 1u]);
+            const device T_act* sin_row = (const device T_act*)(operands[ins.z + 2u]);
+            const device T_act* v = (const device T_act*)(operands[ins.z + 3u]);
+            device T_act* kv_cache_k = (device T_act*)(operands[ins.z + 4u]);
+            device T_act* kv_cache_v = (device T_act*)(operands[ins.z + 5u]);
+            const device uint* slot_mapping = (const device uint*)(operands[ins.z + 6u]);
+            uint head_dim = shapes[sb + 1u];
+            uint num_kv = shapes[sb + 2u];
+            uint rot_dim = shapes[sb + 3u];
+            uint block_size = shapes[sb + 4u];
+            uint half_dim = rot_dim / 2u;
+            // Rotate K in place: each thread owns (kv_head, d<half) pairs.
+            for (uint idx = tid_in_tg; idx < num_kv * half_dim; idx += 1024u) {
+              mittens::rope_rotate_pair<T_act>(
+                  k + (idx / half_dim) * head_dim, cos_row, sin_row, idx % half_dim, half_dim);
+            }
+            // K must be fully rotated before the paged write reads it (a d>=half
+            // element was written by the d-half thread during rotation).
+            threadgroup_barrier(mem_flags::mem_device);
+            uint slot = slot_mapping[0];
+            for (uint idx = tid_in_tg; idx < num_kv * head_dim; idx += 1024u) {
+              uint h = idx / head_dim;
+              mittens::kv_paged_write<T_act>(
+                  kv_cache_k, kv_cache_v, k + h * head_dim, v + h * head_dim,
+                  slot, h, idx % head_dim, num_kv, block_size, head_dim);
             }
             break;
           }

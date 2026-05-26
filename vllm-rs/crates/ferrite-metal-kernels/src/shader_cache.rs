@@ -8,8 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice, MTLFunctionConstantValues,
-    MTLLibrary, MTLPipelineOption,
+    MTLCompileOptions, MTLComputePipelineDescriptor, MTLComputePipelineState, MTLDevice,
+    MTLFunctionConstantValues, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLPipelineOption,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -75,10 +75,10 @@ impl ShaderCache {
                 "quantized_qmm",
                 &crate::embedded_metallib!("quantized_qmm")[..],
             ),
-            (
-                "quantized_qmm_nax",
-                &crate::embedded_metallib!("quantized_qmm_nax")[..],
-            ),
+            // NOTE: `quantized_qmm_nax` is NOT loaded here — it uses MPP
+            // cooperative tensors that the offline metallib toolchain
+            // miscompiles, so it is compiled from source at runtime
+            // below via `compile_nax_library_from_source`.
             (
                 "quantized_qvm",
                 &crate::embedded_metallib!("quantized_qvm")[..],
@@ -111,6 +111,15 @@ impl ShaderCache {
             })?;
             libraries.insert(name.to_string(), lib);
         }
+
+        // NAX qmm_t: runtime-compiled from source (offline metallib
+        // toolchain miscompiles MPP matmul2d — see
+        // `compile_nax_library_from_source`).
+        let nax_lib = compile_nax_library_from_source(&device).map_err(|e| {
+            MetalStreamError::ShaderCompilationFailed(format!("compile `quantized_qmm_nax`: {e}"))
+        })?;
+        libraries.insert("quantized_qmm_nax".to_string(), nax_lib);
+
         Ok(Self {
             device,
             libraries,
@@ -320,4 +329,41 @@ pub fn load_library_from_bytes(device: &Device, bytes: &'static [u8]) -> Result<
     device
         .newLibraryWithData_error(&data)
         .map_err(|e| format!("newLibraryWithData failed: {:?}", e))
+}
+
+/// Compile the NAX qmm_t library (`quantized_qmm_nax`) from MSL **source
+/// at runtime** via `newLibraryWithSource`, NOT from the offline
+/// `xcrun metal` metallib the build embeds for every other shader.
+///
+/// Why: anything that includes `metal_nax.h` uses MetalPerformance-
+/// Primitives `matmul2d` cooperative tensors. The offline `xcrun metal`
+/// then `xcrun metallib` toolchain **miscompiles** those — each
+/// `matmul2d` reduces only half its K, so `affine_qmm_t_nax_*` comes out
+/// ~95% wrong (verified on M5/applegpu_g17g, SDK 26.5). The runtime
+/// `newLibraryWithSource` compiler produces correct code; this is also
+/// the path mlx uses (`mlx/backend/metal/device.cpp:547`), which is why
+/// mlx's identical kernel is correct on the same hardware. Math mode Safe
+/// (fastMath off) and Metal 4.0 match mlx's `MTLCompileOptions`.
+///
+/// The runtime compiler has no `-I` for our shader dir, so we inline the
+/// `#include "metal_nax.h"` ourselves; the `<MetalPerformancePrimitives/…>`
+/// framework include inside `metal_nax.h` is resolved by the runtime
+/// compiler. Function constants (`QMM_K/N/M`) and `[[host_name]]`
+/// instantiations resolve normally via `newFunctionWithName`.
+pub fn compile_nax_library_from_source(device: &Device) -> Result<Library, String> {
+    const NAX_HEADER: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/metal_nax.h"));
+    const QMM_NAX_SRC: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/shaders/quantized_qmm_nax.metal"
+    ));
+    let body = QMM_NAX_SRC.replace("#include \"metal_nax.h\"", "");
+    let source = format!("{NAX_HEADER}\n{body}");
+
+    let opts = MTLCompileOptions::new();
+    opts.setMathMode(MTLMathMode::Safe); // == fastMath off; what mlx uses
+    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    device
+        .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&opts))
+        .map_err(|e| format!("newLibraryWithSource(quantized_qmm_nax) failed: {:?}", e))
 }

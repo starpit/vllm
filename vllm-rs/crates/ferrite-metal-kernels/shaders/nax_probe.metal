@@ -8,6 +8,7 @@
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
 #include <metal_tensor>
+#include "metal_nax.h"   // NAXTile + tile_matmad_nax — the kernel's real MMA path
 
 using namespace metal;
 
@@ -125,5 +126,42 @@ constexpr constant int CAP_MAX = 32;
         if (a1 < 16 && a0 < 32) {
             c_out[16 * 32 + a1 * 32 + a0] = cT[idx];
         }
+    }
+}
+
+// Faithful-path MMA check: mirrors `qmm_t_nax_impl`'s exact register
+// path — NAXTile load (threadgroup) → tile_matmad_nax → store — with
+// A=B=1.0 over a 32×32×32 (TM=TN=TK=2) tile on ONE simdgroup. Every
+// output element must equal K=32 (sum of 32 ones). If this is wrong,
+// the bug is in metal_nax.h's MMA on M5, not the quantized loader.
+[[kernel]] void nax_frag_mma_check(
+    device float* d_out [[buffer(0)]],   // 32×32 float, row-major ld=32
+    uint simd_lid [[thread_index_in_simdgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]])
+{
+    using namespace mlx::steel;
+    constexpr int SZ = 32;
+    threadgroup bfloat a_tg[SZ * SZ];
+    threadgroup bfloat b_tg[SZ * SZ];
+    // Dispatched with 128 threads (4 simdgroups) like mlx's qmm_t_nax;
+    // all-ones fill is idempotent across the redundant writers.
+    if (simd_lid == 0) {
+        for (int i = 0; i < SZ * SZ; ++i) { a_tg[i] = bfloat(1.0f); b_tg[i] = bfloat(1.0f); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    NAXTile<bfloat, 2, 2> Atile;   // [32, 32]
+    NAXTile<bfloat, 2, 2> Btile;   // [32, 32]
+    NAXTile<float,  2, 2> Dtile;   // [32, 32]
+    Dtile.clear();
+
+    Atile.template load<bfloat, SZ, 1>(a_tg);
+    Btile.template load<bfloat, SZ, 1>(b_tg);
+    tile_matmad_nax(Dtile,
+                    Atile, metal::bool_constant<false>{},
+                    Btile, metal::bool_constant<true>{});
+    // Only simdgroup 0 writes (others compute redundantly) to avoid races.
+    if (simd_gid == 0) {
+        Dtile.store(d_out, SZ);
     }
 }

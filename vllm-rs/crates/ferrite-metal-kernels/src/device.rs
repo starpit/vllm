@@ -56,6 +56,8 @@ pub fn detect_device() -> Option<MetalDevice> {
         ferrite_metal_targets::M3_10CORE
     } else if name.contains("M4") {
         ferrite_metal_targets::m4_with_costs()
+    } else if name.contains("M5") {
+        ferrite_metal_targets::M5_10CORE
     } else {
         // Default to M1 for unknown devices
         eprintln!(

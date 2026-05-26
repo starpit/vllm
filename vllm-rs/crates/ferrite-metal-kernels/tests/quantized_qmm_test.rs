@@ -1131,3 +1131,300 @@ fn nax_ones_mma_sanity() {
         eprintln!("row{r:2}: {row:?}");
     }
 }
+
+/// Compiles `metal_nax.h` + the all-ones MMA kernel at RUNTIME via
+/// `newLibraryWithSource` (fast-math off, Metal 4.0 — exactly like mlx),
+/// instead of the offline `xcrun metal` metallib the build embeds. If
+/// this gives 32 but `nax_frag_mma_check` (offline) gives 16, the offline
+/// toolchain miscompiles MPP cooperative tensors and the fix is to JIT
+/// NAX shaders at runtime like mlx does.
+#[test]
+#[ignore = "Offline-vs-runtime compiler A/B — run with --ignored --nocapture"]
+fn nax_runtime_compile_check() {
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::NSString;
+    use objc2_metal::{
+        MTLCommandQueue, MTLComputeCommandEncoder, MTLDevice, MTLLibrary, MTLMathMode, MTLSize,
+    };
+
+    let dev = ferrite_metal_kernels::device::detect_device().expect("Metal device");
+    let device = dev.device;
+
+    // metal_nax.h carries the MPP include + BaseNAXFrag/NAXTile/tile_matmad
+    // in namespace mlx::steel + the internals pragma. Append the kernel.
+    let header =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/metal_nax.h"))
+            .expect("read metal_nax.h");
+    let kernel = r#"
+using namespace metal;
+[[kernel]] void rt_nax_mma(device float* d_out [[buffer(0)]],
+                           uint simd_lid [[thread_index_in_simdgroup]]) {
+    using namespace mlx::steel;
+    constexpr int SZ = 32;
+    threadgroup bfloat a_tg[SZ*SZ]; threadgroup bfloat b_tg[SZ*SZ];
+    if (simd_lid == 0) { for (int i=0;i<SZ*SZ;++i){a_tg[i]=bfloat(1.0f);b_tg[i]=bfloat(1.0f);} }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    NAXTile<bfloat,2,2> A; NAXTile<bfloat,2,2> B; NAXTile<float,2,2> D; D.clear();
+    A.template load<bfloat,SZ,1>(a_tg); B.template load<bfloat,SZ,1>(b_tg);
+    tile_matmad_nax(D, A, metal::bool_constant<false>{}, B, metal::bool_constant<true>{});
+    D.store(d_out, SZ);
+}
+"#;
+    let source = format!("{header}\n{kernel}");
+    let opts = objc2_metal::MTLCompileOptions::new();
+    opts.setMathMode(MTLMathMode::Safe);
+    opts.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
+
+    let library = match device
+        .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&opts))
+    {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("runtime compile FAILED: {}", e.localizedDescription());
+            panic!("newLibraryWithSource failed");
+        }
+    };
+    let function = library
+        .newFunctionWithName(&NSString::from_str("rt_nax_mma"))
+        .expect("rt_nax_mma function");
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .expect("pipeline");
+
+    let out_buf = zeroed_buffer(&device, 32 * 32 * 4);
+    let cmdq: Retained<ProtocolObject<dyn MTLCommandQueue>> =
+        device.newCommandQueue().expect("queue");
+    let cmdbuf = cmdq.commandBuffer().expect("cmdbuf");
+    let encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> =
+        cmdbuf.computeCommandEncoder().expect("encoder");
+    encoder.setComputePipelineState(&pipeline);
+    unsafe { encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 0) };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    cmdbuf.commit();
+    cmdbuf.waitUntilCompleted();
+    let ptr = out_buf.contents().as_ptr() as *const f32;
+    let out = unsafe { std::slice::from_raw_parts(ptr, 32 * 32) };
+    let bad = (0..1024).filter(|&i| (out[i] - 32.0).abs() > 0.01).count();
+    eprintln!("RUNTIME-compiled metal_nax.h: row0={:?}", &out[..8]);
+    eprintln!("mismatches vs 32.0: {bad}/1024");
+}
+
+/// Kernel-level A/B: times the NAX qmm_t against the production
+/// non-NAX pick (Standard/SplitK) on identical prefill shapes, isolated
+/// from the rest of the model. Reports median µs over 30 iters (5 warm).
+#[test]
+#[ignore = "NAX vs Standard qmm_t microbench — run with --ignored --nocapture"]
+fn nax_vs_standard_qmm_t_bench() {
+    let device = detect_device().expect("Metal device").device;
+    let qmm = MetalAffineQmmT::new(device.clone()).expect("MetalAffineQmmT");
+    let gs = 64u32;
+
+    // Representative Llama-3B prefill GEMMs (all N,K % 64 == 0).
+    let shapes_nk: &[(u32, u32, &str)] = &[
+        (3072, 3072, "qkv/o  3072x3072"),
+        (8192, 3072, "gate/up 8192x3072"),
+        (3072, 8192, "down   3072x8192"),
+    ];
+    let m_vals = [16u32, 32, 64, 128, 256, 512, 1024];
+
+    let time_kernel = |m: u32, n: u32, k: u32, kernel: QmmTKernel| -> f64 {
+        let (packed, scales, biases, x) = make_inputs_bf16(
+            0xBEEF ^ (m as u64) ^ ((n as u64) << 20),
+            n as usize,
+            k as usize,
+            m as usize,
+            gs as usize,
+        );
+        let packed_buf = buffer_from_bytes(&device, &packed);
+        let sb: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                scales.as_ptr() as *const u8,
+                std::mem::size_of_val(&scales[..]),
+            )
+        };
+        let bb: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                biases.as_ptr() as *const u8,
+                std::mem::size_of_val(&biases[..]),
+            )
+        };
+        let xb: &[u8] = unsafe {
+            std::slice::from_raw_parts(x.as_ptr() as *const u8, std::mem::size_of_val(&x[..]))
+        };
+        let scales_buf = buffer_from_bytes(&device, sb);
+        let biases_buf = buffer_from_bytes(&device, bb);
+        let x_buf = buffer_from_bytes(&device, xb);
+        let y_buf = zeroed_buffer(
+            &device,
+            (m * n) as usize * std::mem::size_of::<half::bf16>() * 32,
+        );
+        let mut stream = MetalStream::new(&device);
+
+        let mut run = || {
+            let cb = stream.get_command_buffer().expect("cb").clone();
+            let enc = cb.computeCommandEncoder().expect("enc");
+            qmm.execute_with_kernel(
+                &x_buf,
+                &packed_buf,
+                &scales_buf,
+                &biases_buf,
+                &y_buf,
+                m,
+                n,
+                k,
+                1,
+                gs,
+                4,
+                DequantDtype::Bf16,
+                ScaleDtype::F16,
+                kernel,
+                &enc,
+            )
+            .expect("dispatch");
+            enc.endEncoding();
+            stream.commit().expect("commit");
+            stream.synchronize().expect("sync");
+        };
+        for _ in 0..5 {
+            run();
+        } // warmup
+        let mut samples = Vec::with_capacity(30);
+        for _ in 0..30 {
+            let t = std::time::Instant::now();
+            run();
+            samples.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2] // median µs
+    };
+
+    eprintln!("\n=== NAX vs non-NAX qmm_t (median µs, 30 iters) — gs={gs} ===");
+    eprintln!(
+        "{:<22} {:>5} {:>10} {:>12} {:>9}",
+        "shape", "M", "NAX µs", "base µs", "speedup"
+    );
+    for &(n, k, label) in shapes_nk {
+        for &m in &m_vals {
+            let base_kernel = pick_qmm_t_kernel(m, n, k, 1, gs, /*is_nax=*/ false);
+            let nax_us = time_kernel(m, n, k, QmmTKernel::Nax);
+            let base_us = time_kernel(m, n, k, base_kernel);
+            let base_tag = match base_kernel {
+                QmmTKernel::Standard => "Std",
+                QmmTKernel::SplitK { .. } => "SplitK",
+                QmmTKernel::Nax => "Nax",
+            };
+            eprintln!(
+                "{:<22} {:>5} {:>10.1} {:>8.1}({:<6}) {:>8.2}x",
+                label,
+                m,
+                nax_us,
+                base_us,
+                base_tag,
+                base_us / nax_us
+            );
+        }
+    }
+}
+
+/// Prints this GPU's Metal architecture name + parsed gen, the exact
+/// inputs to mlx's `is_nax_available()` gate
+/// (`gen >= (arch.back()=='p' ? 18 : 17)`).
+#[test]
+#[ignore = "Diagnostic — run with --ignored --nocapture"]
+fn nax_arch_probe() {
+    use objc2_metal::MTLDevice;
+    let dev = ferrite_metal_kernels::device::detect_device().expect("Metal device");
+    let arch = dev.device.architecture();
+    let name = arch.name().to_string();
+    let bytes = name.as_bytes();
+    let (gen, class) = if bytes.len() >= 3 {
+        let tens = (bytes[bytes.len() - 3] as char).to_digit(10).unwrap_or(0);
+        let ones = (bytes[bytes.len() - 2] as char).to_digit(10).unwrap_or(0);
+        (tens * 10 + ones, *bytes.last().unwrap() as char)
+    } else {
+        (0, '?')
+    };
+    let threshold = if class == 'p' { 18 } else { 17 };
+    eprintln!("Metal architecture: {name:?}");
+    eprintln!("parsed gen={gen}, class='{class}', threshold={threshold}");
+    eprintln!("mlx is_nax_available() would be: {}", gen >= threshold);
+}
+
+/// Faithful-path MMA check: dispatches `nax_frag_mma_check`, which runs
+/// the kernel's real `NAXTile`→`tile_matmad_nax`→`store` path with
+/// A=B=1.0 over a 32×32×32 tile. Every output must equal K=32. Isolates
+/// metal_nax.h's MMA correctness on M5 from the quantized W-loader.
+#[test]
+#[ignore = "Diagnostic for NAX MMA on M5 — run with --ignored --nocapture"]
+fn nax_frag_mma_check() {
+    use objc2::runtime::ProtocolObject;
+    use objc2_foundation::NSString;
+    use objc2_metal::{MTLCommandQueue, MTLComputeCommandEncoder, MTLLibrary, MTLSize};
+
+    let dev = ferrite_metal_kernels::device::detect_device().expect("Metal device");
+    let device = dev.device;
+
+    let bytes: &'static [u8] = ferrite_metal_kernels::embedded_metallib!("nax_probe");
+    let library = ferrite_metal_kernels::shader_cache::load_library_from_bytes(&device, bytes)
+        .expect("nax_probe metallib");
+    let function = library
+        .newFunctionWithName(&NSString::from_str("nax_frag_mma_check"))
+        .expect("nax_frag_mma_check function");
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .expect("nax_frag_mma_check pipeline");
+
+    let out_buf = zeroed_buffer(&device, 32 * 32 * 4);
+
+    let cmdq: Retained<ProtocolObject<dyn MTLCommandQueue>> =
+        device.newCommandQueue().expect("command queue");
+    let cmdbuf = cmdq.commandBuffer().expect("command buffer");
+    let encoder: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>> =
+        cmdbuf.computeCommandEncoder().expect("encoder");
+    encoder.setComputePipelineState(&pipeline);
+    unsafe { encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 0) };
+    let threadgroups = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    let threads = MTLSize {
+        width: 128,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(threadgroups, threads);
+    encoder.endEncoding();
+    cmdbuf.commit();
+    cmdbuf.waitUntilCompleted();
+
+    let ptr = out_buf.contents().as_ptr() as *const f32;
+    let out = unsafe { std::slice::from_raw_parts(ptr, 32 * 32) };
+
+    eprintln!("\n=== nax_frag_mma_check D (32x32), expected all 32.0 ===");
+    let mut bad = 0usize;
+    for r in 0..32 {
+        let row: Vec<f32> = (0..32).map(|c| out[r * 32 + c]).collect();
+        for &v in &row {
+            if (v - 32.0).abs() > 0.01 {
+                bad += 1;
+            }
+        }
+        if r < 4 || bad == 0 {
+            eprintln!("row{r:2}: {row:?}");
+        }
+    }
+    eprintln!("mismatches vs 32.0: {bad}/1024");
+}

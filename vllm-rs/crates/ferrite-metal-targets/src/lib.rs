@@ -16,6 +16,9 @@ pub enum AppleSiliconGen {
     M2,
     M3,
     M4,
+    /// Apple9 gen 17+ — first generation with the NAX (Neural Accelerator
+    /// eXtension) hardware MMA. See [`is_nax_capable`].
+    M5,
 }
 
 /// Metal device profile containing hardware specs and cost models
@@ -177,6 +180,24 @@ pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
     cost_table: BTreeMap::new(),
 };
 
+/// M5 device profile (base model, 10 GPU cores).
+///
+/// First generation with NAX hardware MMA (gen 17 ≥ 17 — see
+/// [`is_nax_capable`]). Perf figures are estimates pending a cost sweep
+/// on this chip; the empty `cost_table` forces the solver onto the
+/// analytical roofline, so these only affect cost-model scoring, not
+/// correctness.
+pub const M5_10CORE: MetalTargetProfile = MetalTargetProfile {
+    generation: AppleSiliconGen::M5,
+    gpu_cores: 10,
+    peak_tflops_fp16: 5.0,
+    memory_bandwidth_gbps: 150.0,
+    unified_memory_gb: 24,
+    threadgroup_memory_bytes: 32768,
+    max_threads_per_threadgroup: 1024,
+    cost_table: BTreeMap::new(),
+};
+
 /// Returns `true` if the given generation has the NAX (Neural Accelerator
 /// eXtension) hardware MMA that MLX's `BaseNAXFrag` cooperative-tensor
 /// layout assumes.
@@ -191,11 +212,15 @@ pub const M4_10CORE: MetalTargetProfile = MetalTargetProfile {
 /// `crates/ferrite-metal-kernels/tests/quantized_qmm_test.rs` and the
 /// memo `project_metal_nax_layout_bug.md`.
 ///
-/// Returns `false` for every generation currently modelled (M1–M4) —
-/// add an `M5` (or later) variant to [`AppleSiliconGen`] and return
-/// `true` for it once we have a chip to validate against.
-pub fn is_nax_capable(_gen: AppleSiliconGen) -> bool {
-    false
+/// Returns `false` for M1–M4 (gen ≤ 16, no NAX hardware — M4 emulates
+/// `matmul2d` via the standard simdgroup matmul, yielding a
+/// cooperative-tensor layout that does NOT match `BaseNAXFrag`). Returns
+/// `true` for M5+ (gen ≥ 17), validated against the layout probe on an
+/// Apple M5 (MacBook Pro, macOS 26.5): the `ct_c` per-thread coords come
+/// back in the contiguous 2×4 `BaseNAXFrag` pattern, distinct from the
+/// M4 emulation layout. See `nax_probe_dump_layout`.
+pub fn is_nax_capable(gen: AppleSiliconGen) -> bool {
+    matches!(gen, AppleSiliconGen::M5)
 }
 
 /// Returns `true` when the GPU's bf16 simdgroup MMA path is slow

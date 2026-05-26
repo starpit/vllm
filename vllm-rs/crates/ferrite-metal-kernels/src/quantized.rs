@@ -895,7 +895,7 @@ pub fn get_qmv_batch_limit(
                 6
             }
         }
-        G::M3 | G::M4 => {
+        G::M3 | G::M4 | G::M5 => {
             if k <= 2048 && n <= 2048 {
                 18
             } else if k <= 4096 && n <= 4096 {
@@ -962,7 +962,7 @@ pub fn pick_qmm_t_split_k(m: u32, n: u32, k: u32, group_size: u32) -> u32 {
 /// Mirrors `quantized.cpp:1411-1424` plus the NAX gate at `:695`:
 ///
 /// ```text
-/// if is_nax && K % 64 == 0 && group_size != 32:    qmm_t_nax  (M4+)
+/// if is_nax && M >= 32 && K % 64 == 0 && group_size != 32: qmm_t_nax (M5+)
 /// else if transpose && B == 1:                      qmm_splitk
 /// else if transpose:                                qmm (transpose=true)
 /// ```
@@ -982,7 +982,14 @@ pub fn pick_qmm_t_kernel(
     group_size: u32,
     is_nax: bool,
 ) -> QmmTKernel {
-    if is_nax && k.is_multiple_of(64) && group_size != 32 {
+    // NAX's 64×64 tiling wastes work and yields too few threadgroups at
+    // tiny M: it regresses to ~0.8× vs SplitK at M=16 but wins (≥1.7×)
+    // from M=32 up (see `nax_vs_standard_qmm_t_bench`). Gate it to
+    // M ≥ 32 so very short prefills keep the SplitK/Standard path.
+    // (Belt-and-suspenders: the production qmm_t buckets start at 64,
+    // so this threshold isn't normally reached.)
+    const NAX_MIN_M: u32 = 32;
+    if is_nax && m >= NAX_MIN_M && k.is_multiple_of(64) && group_size != 32 {
         return QmmTKernel::Nax;
     }
     if b == 1 {

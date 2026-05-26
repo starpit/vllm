@@ -887,19 +887,22 @@ fn lower_one<W: CanonicalParams>(
                 //     fed by the `splitk_reduce_sum` kernel that
                 //     collapses the `[split_k, M, N]` partial to
                 //     `[M, N]` in the AffineQmm's out slot.
-                // NAX (M5+/A19+ only — MLX gates on arch_gen >= 17, see
-                // `mlx/backend/metal/device.cpp:828`). On M4 and earlier
-                // MPP `matmul2d` emulates via standard simdgroup matmul
-                // with a cooperative-tensor per-thread layout that does
-                // NOT match MLX `BaseNAXFrag`'s 2-row × 4-col assumption,
-                // so the kernel produces garbage. `is_nax_capable` is
-                // currently `false` for every gen we model; add an M5
-                // variant + run the `nax_probe_dump_layout` diagnostic
-                // before flipping it true. See `memory/
-                // project_metal_nax_layout_bug.md` and PROGRESS.md.
+                // NAX hardware MMA (`affine_qmm_t_nax`, MPP `matmul2d`):
+                // M5+/A19+ only — `is_nax_capable` gates on arch gen ≥ 17
+                // (MLX `mlx/backend/metal/device.cpp:828`). M4 and earlier
+                // lack the unit (M4's `matmul2d` emulates and produces a
+                // wrong layout), so `is_nax_capable` is false there. The
+                // NAX library is runtime-compiled (`newLibraryWithSource`)
+                // because the offline metallib toolchain miscompiles MPP
+                // cooperative tensors — see
+                // `compile_nax_library_from_source` + `project_metal_nax`.
+                // ~3× prefill GEMM speedup on M5.
+                // `FERRITE_DISABLE_NAX=1` forces the Standard/SplitK qmm_t
+                // path on NAX-capable hardware (kill-switch + A/B toggle).
+                // Read once per graph build (not hot).
                 let is_nax = profile.is_some_and(|p| {
                     ferrite_metal_kernels::ferrite_metal_targets::is_nax_capable(p.generation)
-                });
+                }) && std::env::var_os("FERRITE_DISABLE_NAX").is_none();
                 let kernel = pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax);
                 // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
                 let aligned_n = match kernel {

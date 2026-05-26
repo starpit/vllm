@@ -296,6 +296,12 @@ impl SpecializedPipelineCache {
                     crate::embedded_metallib!("quantized_splitk_reduce"),
                 ),
                 ("silu_mul", crate::embedded_metallib!("silu_mul")),
+                // PD-wavefront persistent decode megakernel / trivial tape
+                // player (bindless operands via gpuAddress table).
+                (
+                    "wavefront_layer",
+                    crate::embedded_metallib!("wavefront_layer"),
+                ),
                 ("gemm", crate::embedded_metallib!("gemm")),
                 // MoE-on-Metal: router decomposition kernels.
                 // `lower_metal_moe` (Phase A) emits commands that

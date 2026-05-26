@@ -4013,7 +4013,7 @@ fn render_attention_via_cache_impl<
         &kv_block_bytes.to_string(),
     ));
     warp0_block.push(CuStmt::new(format!(
-        "kittens::tma::load_async(\
+        "kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&__attn_k_smem), \
          reinterpret_cast<void*>(__attn_k_ptr), \
          {bytes}, __attn_k_arr);",
@@ -4160,7 +4160,7 @@ fn render_attention_via_cache_impl<
         &kv_block_bytes.to_string(),
     ));
     v_warp0_block.push(CuStmt::new(format!(
-        "kittens::tma::load_async(\
+        "kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&__attn_v_smem), \
          reinterpret_cast<void*>(__attn_v_ptr), \
          {bytes}, __attn_v_arr);",
@@ -4637,7 +4637,7 @@ pub fn render_attention_via_cache_decode<
         &kv_block_bytes.to_string(),
     ));
     warp0_block.push(CuStmt::new(format!(
-        "kittens::tma::load_async(\
+        "kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&__attn_k_smem), \
          reinterpret_cast<void*>(__attn_k_ptr), \
          {bytes}, __attn_k_arr);",
@@ -4797,7 +4797,7 @@ pub fn render_attention_via_cache_decode<
         &kv_block_bytes.to_string(),
     ));
     v_warp0_block.push(CuStmt::new(format!(
-        "kittens::tma::load_async(\
+        "kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&__attn_v_smem), \
          reinterpret_cast<void*>(__attn_v_ptr), \
          {bytes}, __attn_v_arr);",

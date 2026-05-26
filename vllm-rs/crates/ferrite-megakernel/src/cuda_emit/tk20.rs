@@ -1475,13 +1475,16 @@ pub fn init_semaphore_warp0<const NCW: u32>(
     ))
 }
 
-/// `kittens::tma::expect_bytes(sem, bytes);` — warp-scope (group<1>)
-/// expect_bytes call. Issuer-thread gating happens inside the TK
-/// helper (`include/ops/group/util/tma.cuh:18-22` — `if (laneid()
-/// == 0)`).
+/// `kittens::group<1>::tma::expect_bytes(sem, bytes);` — warp-scope
+/// expect_bytes. Lane-0 gating happens inside the group helper
+/// (`include/ops/group/util/tma.cuh:18-22` — `if (laneid() == 0)`).
+/// Calling the thread-level `kittens::tma::expect_bytes` directly
+/// from inside a `if (warpid()==0)` block is a kernel-launch-fail
+/// bug: all 32 lanes would issue `mbarrier.arrive.expect_tx`,
+/// underflowing the arrive count.
 pub fn warp_tma_expect_bytes(sem: &Semaphore, bytes_expr: &str) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::tma::expect_bytes({sem}, {bytes});",
+        "kittens::group<1>::tma::expect_bytes({sem}, {bytes});",
         sem = sem.expr(),
         bytes = bytes_expr,
     ))
@@ -1501,7 +1504,7 @@ pub fn warp_tma_load_async_raw_st_bf<const ROWS: u32, const COLS: u32>(
     sem: &Semaphore,
 ) -> CuStmt {
     CuStmt::new(format!(
-        "kittens::tma::load_async(\
+        "kittens::group<1>::tma::load_async(\
          reinterpret_cast<void*>(&{dst}), \
          reinterpret_cast<void*>({src}), \
          {bytes}, {sem});",

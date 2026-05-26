@@ -90,9 +90,10 @@ pub fn schedule_from_assignment(
         let cw = worker_of[node.id.0 as usize];
         for inp in &node.inputs {
             if let Operand::Sub(prod) = inp
-                && worker_of[prod.0 as usize] != cw {
-                    needs_flag[prod.0 as usize] = true;
-                }
+                && worker_of[prod.0 as usize] != cw
+            {
+                needs_flag[prod.0 as usize] = true;
+            }
         }
     }
     let mut flag_of = vec![u32::MAX; n];
@@ -111,14 +112,15 @@ pub fn schedule_from_assignment(
         let mut waited: Vec<u32> = Vec::new();
         for inp in &node.inputs {
             if let Operand::Sub(prod) = inp
-                && worker_of[prod.0 as usize] != worker_of[node.id.0 as usize] {
-                    let f = flag_of[prod.0 as usize];
-                    debug_assert_ne!(f, u32::MAX, "cross-worker producer must have a flag");
-                    if !waited.contains(&f) {
-                        waited.push(f);
-                        workers[w].tape.push(TapeInstr::Wait(f));
-                    }
+                && worker_of[prod.0 as usize] != worker_of[node.id.0 as usize]
+            {
+                let f = flag_of[prod.0 as usize];
+                debug_assert_ne!(f, u32::MAX, "cross-worker producer must have a flag");
+                if !waited.contains(&f) {
+                    waited.push(f);
+                    workers[w].tape.push(TapeInstr::Wait(f));
                 }
+            }
         }
         workers[w].tape.push(TapeInstr::Compute(node.id));
         if needs_flag[node.id.0 as usize] {

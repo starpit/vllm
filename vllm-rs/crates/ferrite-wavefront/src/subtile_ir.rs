@@ -54,6 +54,8 @@
 
 #![allow(dead_code)]
 
+use crate::subtile::{Range, Region};
+
 // ── Handles ─────────────────────────────────────────────────────────
 
 /// Index into [`SubtileIr::buffers`].
@@ -189,6 +191,36 @@ impl Binding {
     }
 }
 
+/// A 2-D region of a buffer a dispatch reads or writes — the DATAFLOW the
+/// validator checks, distinct from the kernel `Binding`s the player
+/// issues. Row-major `Region{rows, cols}` (region.rs's model), so it
+/// expresses a column slice (an N-block), a whole tensor (elementwise),
+/// or a strided sub-block — what a flat byte interval cannot. The
+/// validator derives byte extents from `region` + the buffer's element
+/// width when it needs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionRef {
+    pub buffer: BufId,
+    pub region: Region,
+}
+
+impl RegionRef {
+    pub fn new(buffer: BufId, region: Region) -> Self {
+        Self { buffer, region }
+    }
+    /// A single `[rows]×[c0, c0+w)` row-major region (the common M-row,
+    /// column-slice access — e.g. an N-block of a matvec output).
+    pub fn rows_cols(buffer: BufId, rows: u32, c0: u32, w: u32) -> Self {
+        Self {
+            buffer,
+            region: Region {
+                rows: Range::new(0, rows),
+                cols: Range::new(c0, w),
+            },
+        }
+    }
+}
+
 /// A dispatch grid, resolved by the compiler: `tg` grid-groups each of
 /// `tpt` threads (Metal threadgroups × threads-per-threadgroup; the same
 /// shape as CUDA grid-blocks × threads-per-block).
@@ -260,15 +292,85 @@ pub enum OpKind {
     Other,
 }
 
+/// The arena dataflow of a dispatch — what the validator checks (NOT
+/// executed; the player only runs `bindings`). One **fixed-arity** variant
+/// per op, so a malformed op (a qmv missing its `y` write, an `Add` with
+/// the wrong inputs) is a TYPE ERROR at the construction site, not a
+/// runtime `validate` miss. There is deliberately **no `Vec`** here: every
+/// op's arena read/write count is statically known (even the fused synth
+/// kernels — their slots are fixed; only their kernel *bindings* vary,
+/// which is why `Dispatch.bindings` stays a list and this does not).
+/// Weights / runtime inputs are external (always defined) and are not
+/// modeled here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpDataflow {
+    /// One N-block: reads the whole activation `x`, writes a column slice
+    /// of the output `y`.
+    QmvBlock { x: RegionRef, y: RegionRef },
+    /// reads `x`, writes `out` (rmsnorm, fused-gate-up-silu-mul, …).
+    Map { x: RegionRef, out: RegionRef },
+    /// reads `a` + `b`, writes `out` (silu·mul).
+    Zip {
+        a: RegionRef,
+        b: RegionRef,
+        out: RegionRef,
+    },
+    /// writes `out`, reads only external operands (embed from input_ids).
+    Produce { out: RegionRef },
+    /// reads `x`, writes `out` (attention; the KV cache is external).
+    Attn { x: RegionRef, out: RegionRef },
+    /// reads `delta` + `residual`, writes `residual` in place (residual add).
+    AddInPlace {
+        delta: RegionRef,
+        residual: RegionRef,
+    },
+    /// reads `x`, updates `residual` in place, and writes `out` — the
+    /// fused (add-norm → … → out) megakernels.
+    UpdateProduce {
+        x: RegionRef,
+        residual: RegionRef,
+        out: RegionRef,
+    },
+}
+
+impl OpDataflow {
+    /// The arena regions this op reads (excludes external weights/inputs).
+    pub fn reads(&self) -> Vec<RegionRef> {
+        match *self {
+            OpDataflow::QmvBlock { x, .. } => vec![x],
+            OpDataflow::Map { x, .. } => vec![x],
+            OpDataflow::Zip { a, b, .. } => vec![a, b],
+            OpDataflow::Produce { .. } => vec![],
+            OpDataflow::Attn { x, .. } => vec![x],
+            OpDataflow::AddInPlace { delta, residual } => vec![delta, residual],
+            OpDataflow::UpdateProduce { x, residual, .. } => vec![x, residual],
+        }
+    }
+    /// The arena regions this op writes.
+    pub fn writes(&self) -> Vec<RegionRef> {
+        match *self {
+            OpDataflow::QmvBlock { y, .. } => vec![y],
+            OpDataflow::Map { out, .. } => vec![out],
+            OpDataflow::Zip { out, .. } => vec![out],
+            OpDataflow::Produce { out } => vec![out],
+            OpDataflow::Attn { out, .. } => vec![out],
+            OpDataflow::AddInPlace { residual, .. } => vec![residual],
+            OpDataflow::UpdateProduce { residual, out, .. } => vec![residual, out],
+        }
+    }
+}
+
 /// A fully-resolved kernel dispatch. The compiler picked `pipeline`,
-/// every binding's buffer + byte offset, and the `grid`. The player only
-/// replays them.
+/// every binding's buffer + byte offset, the `grid`, and the typed
+/// `dataflow`. The player only replays the bindings + grid.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dispatch {
     pub op: OpKind,
     pub pipeline: PipeId,
     pub bindings: Vec<Binding>,
     pub grid: Grid,
+    /// Typed, fixed-arity arena dataflow (validation only — never executed).
+    pub dataflow: OpDataflow,
 }
 
 impl Dispatch {
@@ -276,8 +378,9 @@ impl Dispatch {
     /// `quantized_qmv.metal`: 0=packed weight, 1=scales, 2=biases,
     /// 3=x activations, 4=y output. The weight/scales/biases/y bindings
     /// carry the block's row offset; `pipeline` is the `OUT_VEC_SIZE=nb`
-    /// specialization; `grid` is the block's grid. Exactly five operands
-    /// — a qmv block cannot be built malformed.
+    /// specialization; `grid` is the block's grid. `reads`/`write` are the
+    /// dataflow (x read, the y column-slice this block writes). Exactly
+    /// five operands — a qmv block cannot be built malformed.
     #[allow(clippy::too_many_arguments)]
     pub fn qmv_block(
         pipeline: PipeId,
@@ -287,25 +390,38 @@ impl Dispatch {
         x: Binding,
         y: Binding,
         grid: Grid,
+        x_read: RegionRef,
+        y_write: RegionRef,
     ) -> Self {
         Self {
             op: OpKind::QmvBlock,
             pipeline,
             bindings: vec![weight, scales, biases, x, y],
             grid,
+            dataflow: OpDataflow::QmvBlock {
+                x: x_read,
+                y: y_write,
+            },
         }
     }
 
     /// A generic whole-op dispatch (rmsnorm / rope / attention / silu·mul
     /// / add / embed). The compiler supplies the op tag, the resolved
-    /// pipeline, the binding list in the kernel's argument order, and the
-    /// grid. Used for every node the lowering keeps whole.
-    pub fn whole(op: OpKind, pipeline: PipeId, bindings: Vec<Binding>, grid: Grid) -> Self {
+    /// pipeline, the binding list, the grid, and the dataflow
+    /// (`reads`/`write` regions).
+    pub fn whole(
+        op: OpKind,
+        pipeline: PipeId,
+        bindings: Vec<Binding>,
+        grid: Grid,
+        dataflow: OpDataflow,
+    ) -> Self {
         Self {
             op,
             pipeline,
             bindings,
             grid,
+            dataflow,
         }
     }
 }
@@ -327,6 +443,10 @@ pub enum SubtileInstr {
 #[derive(Clone, Debug)]
 pub struct SubtileIr {
     pub buffers: Vec<BufferRef>,
+    /// Element width (bytes) of each buffer, parallel to `buffers`. Lets
+    /// the executor turn a `RegionRef`'s column extent into a byte extent
+    /// for a real-buffer bounds check at resolve time.
+    pub elem_bytes: Vec<u32>,
     pub pipelines: Vec<PipelineSpec>,
     pub num_flags: u32,
     pub tape: Vec<SubtileInstr>,
@@ -362,19 +482,69 @@ pub fn play(ir: &SubtileIr, exec: &mut impl Executor) {
     }
 }
 
-// ── Structural validation ───────────────────────────────────────────
+// ── Structural + dataflow validation ────────────────────────────────
 
-/// Check the IR's cross-references and flag discipline without executing:
-/// every binding's buffer, every pipeline, and the terminal are in range;
-/// every flag id is `< num_flags`; and every `Wait(f)` is preceded in
-/// tape order by a `Signal(f)` (so a single in-order replay never blocks
-/// on an unsignaled flag — deadlock-free). Returns the instruction count.
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    a.start < b.end() && b.start < a.end()
+}
+
+/// Is `read`'s column extent fully covered by the union of `writes` whose
+/// rows overlap it? (M-row, column-slice model: an N-block-tiled output is
+/// covered iff its blocks tile the read's columns.) A `false` means a
+/// use-before-def (no writer) or a partial-coverage gap (uninitialized
+/// bytes) — both memory errors.
+fn cols_covered(read: Region, writes: &[Region]) -> bool {
+    let (rs, re) = (read.cols.start, read.cols.end());
+    if rs >= re {
+        return true; // empty read
+    }
+    let mut ivals: Vec<(u32, u32)> = writes
+        .iter()
+        .filter(|w| ranges_overlap(w.rows, read.rows))
+        .map(|w| (w.cols.start, w.cols.end()))
+        .collect();
+    ivals.sort_unstable();
+    let mut cursor = rs;
+    for (s, e) in ivals {
+        if s > cursor {
+            break; // gap before `cursor` is reached
+        }
+        cursor = cursor.max(e);
+        if cursor >= re {
+            return true;
+        }
+    }
+    cursor >= re
+}
+
+/// Check the IR without executing. Structural: every binding/read/write
+/// buffer, every pipeline, and the terminal are in range; `elem_bytes`
+/// matches `buffers`; every flag is `< num_flags` and every `Wait(f)` has
+/// a preceding `Signal(f)` (deadlock-free).
+///
+/// **Dataflow (memory safety):** every region a dispatch READS from an
+/// **arena slot** must be fully covered by the regions earlier dispatches
+/// WROTE to that slot. A miss is a use-before-def (reading an unwritten /
+/// wrong slot) or a partial-coverage gap (N-blocks leaving uninitialized
+/// columns) — caught here at compile time instead of as GPU garbage.
+/// Reads of weights / inputs / scratch are external (always defined) and
+/// skip the check. Returns the instruction count.
 pub fn validate(ir: &SubtileIr) -> Result<usize, String> {
     let n_buf = ir.buffers.len() as u32;
     let n_pipe = ir.pipelines.len() as u32;
+    if ir.elem_bytes.len() != ir.buffers.len() {
+        return Err(format!(
+            "elem_bytes len {} != buffers len {}",
+            ir.elem_bytes.len(),
+            ir.buffers.len()
+        ));
+    }
     if ir.terminal.0 >= n_buf {
         return Err(format!("terminal buffer {} out of range", ir.terminal.0));
     }
+    let is_arena = |b: BufId| matches!(ir.buffers.get(b.0 as usize), Some(BufferRef::ArenaSlot(_)));
+    // Written regions per buffer, accumulated in tape order.
+    let mut writes: Vec<Vec<Region>> = vec![Vec::new(); ir.buffers.len()];
     let mut signaled = vec![false; ir.num_flags as usize];
     for (i, instr) in ir.tape.iter().enumerate() {
         match instr {
@@ -389,6 +559,37 @@ pub fn validate(ir: &SubtileIr) -> Result<usize, String> {
                             bnd.buffer.0
                         ));
                     }
+                }
+                let df_reads = d.dataflow.reads();
+                let df_writes = d.dataflow.writes();
+                for r in &df_reads {
+                    if r.buffer.0 >= n_buf {
+                        return Err(format!(
+                            "instr {i}: read buffer {} out of range",
+                            r.buffer.0
+                        ));
+                    }
+                }
+                for w in &df_writes {
+                    if w.buffer.0 >= n_buf {
+                        return Err(format!(
+                            "instr {i}: write buffer {} out of range",
+                            w.buffer.0
+                        ));
+                    }
+                }
+                // Dataflow: arena-slot reads must be covered by prior writes.
+                for r in &df_reads {
+                    if is_arena(r.buffer) && !cols_covered(r.region, &writes[r.buffer.0 as usize]) {
+                        return Err(format!(
+                            "instr {i}: reads arena buffer {} region {:?} not covered by prior \
+                             writes (use-before-def / partial coverage)",
+                            r.buffer.0, r.region
+                        ));
+                    }
+                }
+                for w in &df_writes {
+                    writes[w.buffer.0 as usize].push(w.region);
                 }
             }
             SubtileInstr::Signal(f) => {
@@ -568,6 +769,11 @@ pub fn tile_qmv(
             Binding::new(ops.x.0, ops.x.1, 3),
             Binding::new(ops.y.0, ops.y.1 + off * act_elem, 4),
             Grid::new([shape.m, w.div_ceil(info.bn), 1], info.tpt),
+            // Dataflow: reads the whole activation row; writes this
+            // block's output columns [n0, n0+w). Weights/scales/biases are
+            // external (always defined) so they're not dataflow reads.
+            RegionRef::rows_cols(ops.x.0, shape.m, 0, shape.k),
+            RegionRef::rows_cols(ops.y.0, shape.m, n0, w),
         );
         out.push(SubtileInstr::Run(d));
         n0 += w;
@@ -589,18 +795,21 @@ pub fn tile_qmv(
 #[derive(Default)]
 pub struct SubtileIrBuilder {
     buffers: Vec<BufferRef>,
+    elem_bytes: Vec<u32>,
     pipelines: PipelineInterner,
     tape: Vec<SubtileInstr>,
     num_flags: u32,
 }
 
 impl SubtileIrBuilder {
-    /// Intern a logical buffer, returning its (deduped) [`BufId`].
-    pub fn buffer(&mut self, b: BufferRef) -> BufId {
+    /// Intern a logical buffer with its element width (bytes), returning
+    /// its (deduped) [`BufId`].
+    pub fn buffer(&mut self, b: BufferRef, elem_bytes: u32) -> BufId {
         if let Some(i) = self.buffers.iter().position(|x| *x == b) {
             return BufId(i as u32);
         }
         self.buffers.push(b);
+        self.elem_bytes.push(elem_bytes);
         BufId(self.buffers.len() as u32 - 1)
     }
 
@@ -609,10 +818,17 @@ impl SubtileIrBuilder {
         self.pipelines.intern(spec)
     }
 
-    /// Append a fully-resolved whole-op dispatch.
-    pub fn whole(&mut self, op: OpKind, pipeline: PipeId, bindings: Vec<Binding>, grid: Grid) {
+    /// Append a fully-resolved whole-op dispatch with its typed dataflow.
+    pub fn whole(
+        &mut self,
+        op: OpKind,
+        pipeline: PipeId,
+        bindings: Vec<Binding>,
+        grid: Grid,
+        dataflow: OpDataflow,
+    ) {
         self.tape.push(SubtileInstr::Run(Dispatch::whole(
-            op, pipeline, bindings, grid,
+            op, pipeline, bindings, grid, dataflow,
         )));
     }
 
@@ -661,6 +877,7 @@ impl SubtileIrBuilder {
     pub fn finish(self, terminal: BufId) -> SubtileIr {
         SubtileIr {
             buffers: self.buffers,
+            elem_bytes: self.elem_bytes,
             pipelines: self.pipelines.specs,
             num_flags: self.num_flags,
             tape: self.tape,
@@ -704,16 +921,19 @@ mod tests {
         }
     }
 
-    /// A small two-block qmv + sync + add tape: a hand-built IR that
-    /// validates and whose play() trace is exactly the tape in order.
+    /// A small two-block qmv + sync + consumer tape: a hand-built IR with
+    /// a VALID dataflow (the two blocks tile y's 8 columns; the consumer
+    /// reads the whole y, covered) that validates and whose play() trace
+    /// is exactly the tape in order.
     fn sample_ir() -> SubtileIr {
-        // buffers: 0=W 1=scales 2=biases 3=x 4=y(out) 5=residual
         let wl = WeightLoc {
             layer: 0,
             bucket: 0,
             op_idx: 0,
             slot: 0,
         };
+        // 0=W 1=scales 2=biases (external weights), 3=x (external input),
+        // 4=y (arena, written by the blocks), 5=z (arena, consumer output).
         let buffers = vec![
             BufferRef::Weight {
                 bundle: WeightBundle::LinearLayer,
@@ -730,15 +950,14 @@ mod tests {
                 role: WeightRole::AffineBiases,
                 loc: wl,
             },
-            BufferRef::ArenaSlot(3),
+            BufferRef::Input(InputKind::InputIds),
             BufferRef::ArenaSlot(4),
             BufferRef::ArenaSlot(5),
         ];
+        let elem_bytes = vec![4, 2, 2, 2, 2, 2];
         let pipelines = vec![pipe("qmv_nb4"), pipe("add")];
-        let (w, s, b, x, y, res) = (BufId(0), BufId(1), BufId(2), BufId(3), BufId(4), BufId(5));
-        // Two N-blocks of a qmv writing disjoint column halves of y, then
-        // a Signal/Wait pair gating an Add that reads the whole y.
-        let k = 8u64; // bytes/row stride placeholder for the test
+        let (w, s, b, x, y, z) = (BufId(0), BufId(1), BufId(2), BufId(3), BufId(4), BufId(5));
+        // y has 8 columns; block 0 writes cols [0,4), block 1 writes [4,8).
         let blk0 = Dispatch::qmv_block(
             PipeId(0),
             Binding::new(w, 0, 0),
@@ -747,24 +966,35 @@ mod tests {
             Binding::whole(x, 3),
             Binding::new(y, 0, 4),
             Grid::new([1, 1, 1], [32, 2, 1]),
+            RegionRef::rows_cols(x, 1, 0, 8),
+            RegionRef::rows_cols(y, 1, 0, 4),
         );
         let blk1 = Dispatch::qmv_block(
             PipeId(0),
-            Binding::new(w, k, 0),
-            Binding::new(s, k, 1),
-            Binding::new(b, k, 2),
+            Binding::new(w, 8, 0),
+            Binding::new(s, 8, 1),
+            Binding::new(b, 8, 2),
             Binding::whole(x, 3),
-            Binding::new(y, 4, 4),
+            Binding::new(y, 8, 4),
             Grid::new([1, 1, 1], [32, 2, 1]),
+            RegionRef::rows_cols(x, 1, 0, 8),
+            RegionRef::rows_cols(y, 1, 4, 4),
         );
+        // Consumer reads the whole y (cols [0,8), covered by both blocks)
+        // and writes z.
         let add = Dispatch::whole(
             OpKind::Add,
             PipeId(1),
-            vec![Binding::whole(y, 0), Binding::whole(res, 1)],
+            vec![Binding::whole(y, 0), Binding::whole(z, 1)],
             Grid::new([1, 1, 1], [256, 1, 1]),
+            OpDataflow::Map {
+                x: RegionRef::rows_cols(y, 1, 0, 8),
+                out: RegionRef::rows_cols(z, 1, 0, 8),
+            },
         );
         SubtileIr {
             buffers,
+            elem_bytes,
             pipelines,
             num_flags: 1,
             tape: vec![
@@ -774,7 +1004,7 @@ mod tests {
                 SubtileInstr::Wait(FlagId(0)),
                 SubtileInstr::Run(add),
             ],
-            terminal: y,
+            terminal: z,
         }
     }
 
@@ -810,6 +1040,8 @@ mod tests {
             Binding::whole(BufId(3), 3),
             Binding::new(BufId(4), 0, 4),
             Grid::new([1, 1, 1], [32, 2, 1]),
+            RegionRef::rows_cols(BufId(3), 1, 0, 64),
+            RegionRef::rows_cols(BufId(4), 1, 0, 8),
         );
         assert_eq!(d.bindings.len(), 5);
         assert_eq!(d.op, OpKind::QmvBlock);
@@ -1039,6 +1271,109 @@ mod tests {
         assert_eq!(d.grid.tg, [1, 512u32.div_ceil(8), 1]);
     }
 
+    /// A 1-read-1-write whole op, for building dataflow tests cheaply.
+    fn map_op(x: RegionRef, out: RegionRef) -> Dispatch {
+        Dispatch::whole(
+            OpKind::RmsNorm,
+            PipeId(0),
+            vec![],
+            Grid::new([1, 1, 1], [1, 1, 1]),
+            OpDataflow::Map { x, out },
+        )
+    }
+
+    #[test]
+    fn validate_rejects_read_before_write() {
+        // An op reads arena slot `a` that NO prior op wrote → use-before-def.
+        let ir = SubtileIr {
+            buffers: vec![BufferRef::ArenaSlot(0), BufferRef::ArenaSlot(1)],
+            elem_bytes: vec![2, 2],
+            pipelines: vec![pipe("rms")],
+            num_flags: 0,
+            tape: vec![SubtileInstr::Run(map_op(
+                RegionRef::rows_cols(BufId(0), 1, 0, 8), // reads a (unwritten!)
+                RegionRef::rows_cols(BufId(1), 1, 0, 8),
+            ))],
+            terminal: BufId(1),
+        };
+        let err = validate(&ir).unwrap_err();
+        assert!(
+            err.contains("not covered"),
+            "expected use-before-def, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_partial_coverage() {
+        // Two writes cover y[0,4) and y[6,10) — a gap at [4,6). A consumer
+        // reading the whole y[0,10) must be rejected (uninitialized bytes).
+        let x = BufId(0); // external input
+        let y = BufId(1);
+        let z = BufId(2);
+        let ir = SubtileIr {
+            buffers: vec![
+                BufferRef::Input(InputKind::InputIds),
+                BufferRef::ArenaSlot(1),
+                BufferRef::ArenaSlot(2),
+            ],
+            elem_bytes: vec![2, 2, 2],
+            pipelines: vec![pipe("rms")],
+            num_flags: 0,
+            tape: vec![
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(x, 1, 0, 1),
+                    RegionRef::rows_cols(y, 1, 0, 4),
+                )),
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(x, 1, 0, 1),
+                    RegionRef::rows_cols(y, 1, 6, 4), // [6,10) — leaves [4,6) unwritten
+                )),
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(y, 1, 0, 10), // reads whole y → gap!
+                    RegionRef::rows_cols(z, 1, 0, 10),
+                )),
+            ],
+            terminal: z,
+        };
+        let err = validate(&ir).unwrap_err();
+        assert!(
+            err.contains("not covered"),
+            "expected partial-coverage gap, got: {err}"
+        );
+    }
+
+    /// Two writes that tile y[0,4)+[4,10) fully cover a whole y[0,10) read.
+    #[test]
+    fn validate_accepts_full_coverage() {
+        let (x, y, z) = (BufId(0), BufId(1), BufId(2));
+        let ir = SubtileIr {
+            buffers: vec![
+                BufferRef::Input(InputKind::InputIds),
+                BufferRef::ArenaSlot(1),
+                BufferRef::ArenaSlot(2),
+            ],
+            elem_bytes: vec![2, 2, 2],
+            pipelines: vec![pipe("rms")],
+            num_flags: 0,
+            tape: vec![
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(x, 1, 0, 1),
+                    RegionRef::rows_cols(y, 1, 0, 4),
+                )),
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(x, 1, 0, 1),
+                    RegionRef::rows_cols(y, 1, 4, 6), // [4,10) — now fully tiled
+                )),
+                SubtileInstr::Run(map_op(
+                    RegionRef::rows_cols(y, 1, 0, 10),
+                    RegionRef::rows_cols(z, 1, 0, 10),
+                )),
+            ],
+            terminal: z,
+        };
+        assert!(validate(&ir).is_ok());
+    }
+
     #[test]
     fn builder_interns_dedups_and_finishes() {
         let mut b = SubtileIrBuilder::default();
@@ -1048,24 +1383,35 @@ mod tests {
             op_idx: 0,
             slot: 0,
         };
-        let w = b.buffer(BufferRef::Weight {
-            bundle: WeightBundle::LinearLayer,
-            role: WeightRole::Weight,
-            loc: wl,
-        });
-        let s = b.buffer(BufferRef::Weight {
-            bundle: WeightBundle::LinearLayer,
-            role: WeightRole::AffineScales,
-            loc: wl,
-        });
-        let bi = b.buffer(BufferRef::Weight {
-            bundle: WeightBundle::LinearLayer,
-            role: WeightRole::AffineBiases,
-            loc: wl,
-        });
-        let x = b.buffer(BufferRef::ArenaSlot(3));
-        let y = b.buffer(BufferRef::ArenaSlot(4));
-        assert_eq!(b.buffer(BufferRef::ArenaSlot(3)), x, "buffer dedup");
+        let w = b.buffer(
+            BufferRef::Weight {
+                bundle: WeightBundle::LinearLayer,
+                role: WeightRole::Weight,
+                loc: wl,
+            },
+            4,
+        );
+        let s = b.buffer(
+            BufferRef::Weight {
+                bundle: WeightBundle::LinearLayer,
+                role: WeightRole::AffineScales,
+                loc: wl,
+            },
+            2,
+        );
+        let bi = b.buffer(
+            BufferRef::Weight {
+                bundle: WeightBundle::LinearLayer,
+                role: WeightRole::AffineBiases,
+                loc: wl,
+            },
+            2,
+        );
+        // x is an external input (so the qmv's read of it is always
+        // defined); y is the arena slot the blocks write.
+        let x = b.buffer(BufferRef::Input(InputKind::InputIds), 2);
+        let y = b.buffer(BufferRef::ArenaSlot(4), 2);
+        assert_eq!(b.buffer(BufferRef::ArenaSlot(4), 2), y, "buffer dedup");
 
         let ops = QmvOperands {
             weight: (w, 0),

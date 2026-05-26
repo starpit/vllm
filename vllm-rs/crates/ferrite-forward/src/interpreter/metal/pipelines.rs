@@ -101,6 +101,13 @@ impl SpecializedPipelines {
         Self { cache }
     }
 
+    /// The underlying pipeline cache — used by the subtile player's
+    /// [`resolve_pipelines`](crate::interpreter::metal::subtile_player::resolve_pipelines)
+    /// to build pipeline states for a `SubtileIr` directly.
+    pub fn cache(&self) -> &SpecializedPipelineCache {
+        &self.cache
+    }
+
     /// Return the specialized pipeline a [`LoweredCommand`] names
     /// directly. The lowering pass already baked `library` /
     /// `function` / `constants` from `W` + `bucket_m` + `dtype`, so

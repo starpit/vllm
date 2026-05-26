@@ -162,6 +162,7 @@ fn nblocked_qmv_bit_exact_vs_whole() {
     assert_eq!(tape_w.len(), 1, "whole = single block");
     let ir_w = SubtileIr {
         buffers: placeholder.clone(),
+        elem_bytes: vec![2, 2, 2, 2, 2],
         pipelines: pl_w.specs,
         num_flags: 0,
         tape: tape_w,
@@ -182,6 +183,7 @@ fn nblocked_qmv_bit_exact_vs_whole() {
     assert_eq!(tape_b.len(), 4, "96/24 = 4 blocks");
     let ir_b = SubtileIr {
         buffers: placeholder,
+        elem_bytes: vec![2, 2, 2, 2, 2],
         pipelines: pl_b.specs,
         num_flags: 0,
         tape: tape_b,

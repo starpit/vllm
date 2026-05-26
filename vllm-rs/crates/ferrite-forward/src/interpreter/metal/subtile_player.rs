@@ -25,15 +25,22 @@
 use ::objc2::runtime::ProtocolObject;
 use ::objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
+use ferrite_cuda_core::MetalAllocator;
 use ferrite_metal_kernels::specialized_pipeline_cache::{
     ConstantValue, PipelineKey, SpecializedPipelineCache,
 };
 use ferrite_metal_kernels::stream::MetalStreamError;
 use ferrite_wavefront::subtile_ir::{
-    Binding, ConstValue, Executor, FlagId, FnConst, Grid, OpKind, PipeId, SubtileIr,
+    Binding, BufferRef, ConstValue, Executor, FlagId, FnConst, Grid, InputKind, OpKind, PipeId,
+    SubtileIr, WeightBundle, WeightRole,
 };
 
 use super::__re::{Buffer, ComputePipelineState};
+use super::ids::LayerId;
+use super::lowered::{RuntimeBindingKind, WeightBundleKind, WeightLocator, WeightTensor};
+use super::runtime::RuntimeBindings;
+use super::worker::{WorkerError, resolve_weight};
+use crate::{CanonicalParams, WeightAccessors};
 
 /// The resolved form of a [`ferrite_wavefront::subtile_ir::BufferRef`]:
 /// the concrete GPU buffer plus the base byte-offset of the whole
@@ -124,4 +131,94 @@ impl Executor for MetalExecutor<'_> {
 
     fn wait(&mut self, _flag: FlagId) {}
     fn signal(&mut self, _flag: FlagId) {}
+}
+
+// ── Buffer-table resolution (BufferRef → (Buffer, base)) ────────────
+//
+// The inverse of the compiler's mappers. Mirrors the worker's
+// `resolve_bindings`: weights via `resolve_weight`, arena slots from the
+// worker arena, runtime inputs via `RuntimeBindings::buffer_for` (which
+// resolves KV-cache halves etc. itself), scratch from the split-K buffer.
+
+fn bundle_to_metal(b: WeightBundle) -> WeightBundleKind {
+    match b {
+        WeightBundle::RmsNorm => WeightBundleKind::RmsNorm,
+        WeightBundle::Embedding => WeightBundleKind::Embedding,
+        WeightBundle::LinearLayer => WeightBundleKind::LinearLayer,
+        WeightBundle::CosSin => WeightBundleKind::CosSin,
+        WeightBundle::AffineQuantEmbedding => WeightBundleKind::AffineQuantEmbedding,
+    }
+}
+
+fn role_to_metal(r: WeightRole) -> WeightTensor {
+    match r {
+        WeightRole::Weight => WeightTensor::Weight,
+        WeightRole::Bias => WeightTensor::Bias,
+        WeightRole::AffineScales => WeightTensor::AffineScales,
+        WeightRole::AffineBiases => WeightTensor::AffineBiases,
+        WeightRole::AffineLinearBias => WeightTensor::AffineLinearBias,
+    }
+}
+
+fn input_to_metal(k: InputKind) -> RuntimeBindingKind {
+    match k {
+        InputKind::InputIds => RuntimeBindingKind::InputIds,
+        InputKind::Positions => RuntimeBindingKind::Positions,
+        InputKind::SlotMapping => RuntimeBindingKind::SlotMapping,
+        InputKind::CuSeqlensQ => RuntimeBindingKind::CuSeqlensQ,
+        InputKind::SeqUsedK => RuntimeBindingKind::SeqUsedK,
+        InputKind::BlockTable => RuntimeBindingKind::BlockTable,
+        InputKind::KvCacheK { layer } => RuntimeBindingKind::KvCacheK {
+            layer: LayerId(layer),
+        },
+        InputKind::KvCacheV { layer } => RuntimeBindingKind::KvCacheV {
+            layer: LayerId(layer),
+        },
+        InputKind::NumTokens => RuntimeBindingKind::NumTokensU32,
+    }
+}
+
+/// Resolve a [`SubtileIr`]'s logical buffer table to concrete
+/// `(Buffer, base_offset)` in `BufId` order — the inputs the
+/// [`MetalExecutor`] borrows. Call once per forward; the weight/arena
+/// handles are stable and the runtime handles are the same ones the
+/// normal path rebinds.
+pub fn resolve_buffers<W: CanonicalParams + WeightAccessors>(
+    ir: &SubtileIr,
+    arena: &[Buffer],
+    splitk_scratch: Option<&Buffer>,
+    weights: &W,
+    allocator: &MetalAllocator,
+    runtime: &RuntimeBindings,
+) -> Result<Vec<ResolvedBuffer>, WorkerError> {
+    ir.buffers
+        .iter()
+        .map(|b| match b {
+            BufferRef::ArenaSlot(slot) => arena
+                .get(*slot as usize)
+                .cloned()
+                .map(|buf| (buf, 0u64))
+                .ok_or(WorkerError::WeightLookupFailed {
+                    reason: "wavefront: arena slot out of range",
+                }),
+            BufferRef::Scratch(_) => splitk_scratch.cloned().map(|buf| (buf, 0u64)).ok_or(
+                WorkerError::WeightLookupFailed {
+                    reason: "wavefront: split-K scratch missing",
+                },
+            ),
+            BufferRef::Input(kind) => Ok((runtime.buffer_for(input_to_metal(*kind)).clone(), 0u64)),
+            BufferRef::Weight { bundle, role, loc } => resolve_weight(
+                weights,
+                allocator,
+                &bundle_to_metal(*bundle),
+                loc.layer,
+                role_to_metal(*role),
+                WeightLocator {
+                    bucket: loc.bucket,
+                    op_idx: loc.op_idx,
+                    slot: loc.slot,
+                },
+            ),
+        })
+        .collect()
 }

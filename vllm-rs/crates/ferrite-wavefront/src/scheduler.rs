@@ -68,9 +68,10 @@ pub fn schedule_wavefront(
             let mut cut = 0u32;
             for inp in &node.inputs {
                 if let Operand::Sub(prod) = inp
-                    && worker_of[prod.0 as usize] as usize != w {
-                        cut += 1;
-                    }
+                    && worker_of[prod.0 as usize] as usize != w
+                {
+                    cut += 1;
+                }
             }
             // Balance (new load on w) + communication into this node.
             let score = load_w + c + params.wait_cost_us * cut as f64;
@@ -230,7 +231,13 @@ mod tests {
         };
 
         // Even ids heavy (10), odd ids light (1).
-        let cost = |node: &SubtileNode| if node.id.0.is_multiple_of(2) { 10.0 } else { 1.0 };
+        let cost = |node: &SubtileNode| {
+            if node.id.0.is_multiple_of(2) {
+                10.0
+            } else {
+                1.0
+            }
+        };
         let params = ScheduleParams {
             num_workers: 2,
             wait_cost_us: 0.0,

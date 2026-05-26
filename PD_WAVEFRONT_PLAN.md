@@ -204,3 +204,37 @@ LoweringInput → lower() → SubtileGraph (DAG)
   — the `#[forward]` macro runs the bridge at expansion time and prints a `[wavefront] …` dump
   line per model variant (tile/subgraph/source/op counts, `valid (N nodes)`, op histogram). Errors
   log `not lowered — <reason>` and never gate the build (env-gated + fully fallible).
+
+## LATEST STATUS — 2026-05-26 (typed-OpDataflow IR + end-to-end metal decode; B != A open)
+
+Two commits past `24997d429` on `worktree-pd-wavefront`. Detail in memory `[[pd-clean-wavefront-design]]`
+UPDATEs 10–14; the short version:
+
+**The GPU subtile decode path is wired end-to-end and runs on real Llama-3.2-1B** (env `FERRITE_WAVEFRONT_GPU=1`).
+Pipeline: `subtile_compile::compile_decode` (runtime decode `Instruction` tape → `SubtileIr`) → `validate` →
+`subtile_player::{resolve_pipelines, resolve_buffers}` → `play` (trivial `MetalExecutor`). Wired as a
+non-destructive A/B check in `MetalWorkerPool::wavefront_ab_compare` (runs the wavefront, compares logits vs
+the normal forward, restores the trusted result). N-block qmv linchpin proven bit-exact on-device.
+
+**The SubtileIr is now compile-time-shape-safe + memory-error-catching** (the session's main thrust, per the
+user): `OpDataflow` is a typed fixed-arity enum (NOT `Vec`), `RegionRef` is a 2-D `Region` (row/col, not byte
+intervals), and `validate` does region-overlap use-before-def + partial-coverage on arena slots. 43 host tests;
+`validate_rejects_{read_before_write,partial_coverage}` prove the checks fire. The player stays trivial.
+
+**OPEN — the only thing left for a bit-exact decode: root-cause `B != A`.** On the live decode, `validate`
+PASSES (429 subtile instrs) yet the wavefront logits differ from the baseline (first diff @ byte 0). Per the
+compile-time-or-residue discipline: validate passing ⇒ it's NOT a dataflow bug. Next, in order:
+1. **Bound the A/B compare to the logit region** (`vocab*2 ≈ 256 KB`), not the whole 1.05 GB terminal buffer
+   (sized for the 4096-tok prefill bucket) — the mismatch *count* is polluted by stale tail + coloring reuse;
+   `first diff @ byte 0` is the real signal.
+2. **Lift the `binding⟺region` invariant** into `validate` (a binding's byte offset == its region's
+   col-offset × elem_bytes; the write binding's buffer == the dataflow write buffer). For the qmv these come
+   from the same `n0` (consistent by construction), which already argues the bug is elsewhere.
+3. **lm_head slice-vs-raw** (PRIME residue suspect): the baseline runs `lower_pair`'s single-seq
+   gather→qmv→scatter slice; the wavefront runs the raw lm_head `AffineQmm`. To localize, dump wavefront vs
+   normal arena slots op-by-op and find the first divergence.
+
+Synth-fused decode tape note: q/k/v/gate/up are inside `SynthPreAttn`/`SynthMlpPreDown` megakernels (dispatched
+whole); only o_proj/down_proj/lm_head are standalone qmvs that get N-blocked. Un-fusing to N-block the rest is
+a later step. `lower_pair`'s lm_head slice is NOT in the source tape (synthesized at lowering) — so matching the
+source dataflow wouldn't flag the slice difference.

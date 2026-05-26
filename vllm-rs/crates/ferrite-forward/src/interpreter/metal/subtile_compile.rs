@@ -22,10 +22,11 @@ use ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile;
 use ferrite_metal_kernels::quantized::{QmvKernel, pick_qmv_kernel, qmv_kernel_static_name};
 use ferrite_metal_kernels::specialized_pipeline_cache::{ConstantType, ConstantValue};
 use ferrite_wavefront::subtile_ir::{
-    Binding as IrBinding, BufferRef, ConstValue, FnConst, Grid, InputKind, OpKind, PipelineSpec,
-    QmvKernelInfo, QmvOperands, QmvShape, SubtileIr, SubtileIrBuilder, WeightBundle, WeightLoc,
-    WeightRole,
+    Binding as IrBinding, BufId, BufferRef, ConstValue, FnConst, Grid, InputKind, OpDataflow,
+    OpKind, PipelineSpec, QmvKernelInfo, QmvOperands, QmvShape, RegionRef, SubtileIr,
+    SubtileIrBuilder, WeightBundle, WeightLoc, WeightRole,
 };
+use std::collections::HashMap;
 
 use super::lowered::{
     Binding, KernelId, LoweredCommand, LoweringError, RuntimeBindingKind, WeightBundleKind,
@@ -49,6 +50,18 @@ pub enum CompileError {
     UnsupportedBinding,
     /// Called with `bucket_m != 1`; the subtile decode path is M=1 only.
     NotDecode { bucket_m: u32 },
+    /// A `Loop(count, body_len)` whose body runs past the slice end.
+    MalformedLoop {
+        index: usize,
+        count: u32,
+        body_len: u32,
+    },
+    /// A nested `Loop` inside a loop body (not produced by the macro).
+    NestedLoop,
+    /// An instruction that lowered to a dispatch but has no `OpDataflow`
+    /// model yet — surfaced (never silently skipped) so the dataflow
+    /// validator can't be bypassed by an unmodeled op.
+    UnmodeledDataflow(&'static str),
 }
 
 impl std::fmt::Display for CompileError {
@@ -62,6 +75,18 @@ impl std::fmt::Display for CompileError {
             }
             Self::NotDecode { bucket_m } => {
                 write!(f, "subtile decode requires bucket_m=1, got {bucket_m}")
+            }
+            Self::MalformedLoop {
+                index,
+                count,
+                body_len,
+            } => write!(
+                f,
+                "malformed Loop at {index}: count={count} body_len={body_len} runs past slice end"
+            ),
+            Self::NestedLoop => write!(f, "nested Loop in a loop body (unexpected)"),
+            Self::UnmodeledDataflow(op) => {
+                write!(f, "instruction `{op}` has no OpDataflow model yet")
             }
         }
     }
@@ -116,6 +141,28 @@ fn const_from_metal(cv: &ConstantValue) -> FnConst {
     FnConst {
         index: cv.index as u32,
         value,
+    }
+}
+
+/// A column extent meaning "the whole slot, width unknown" — used for the
+/// writes of whole ops (which write their entire output) and as the
+/// default read width. It covers any precise read; only N-block-tiled qmv
+/// outputs are recorded with a precise width (so a tiling gap is caught).
+const WHOLE: u32 = u32::MAX;
+
+/// Element width (bytes) of a logical buffer — recorded on the IR for a
+/// future resolve-time byte-bounds check. Approximate today (the dataflow
+/// validator works in element columns, not bytes); packed 4-bit weight is
+/// u32, affine scales/biases + activations are 2-byte, index inputs u32.
+fn elem_of(b: &BufferRef) -> u32 {
+    match b {
+        BufferRef::Weight { role, .. } => match role {
+            WeightRole::Weight => 4, // packed u32 (4-bit) — the qmv matrix
+            _ => 2,                  // scales / biases / dense gain (f16)
+        },
+        BufferRef::ArenaSlot(_) | BufferRef::Scratch(_) => 2, // f16/bf16 activations
+        BufferRef::Input(InputKind::KvCacheK { .. } | InputKind::KvCacheV { .. }) => 2,
+        BufferRef::Input(_) => 4, // u32 ids / positions / cu_seqlens / …
     }
 }
 
@@ -174,6 +221,7 @@ fn map_op(k: KernelId) -> OpKind {
 fn translate_whole(
     cmd: &LoweredCommand,
     builder: &mut SubtileIrBuilder,
+    dataflow: OpDataflow,
 ) -> Result<(), CompileError> {
     let pipe = builder.pipeline(PipelineSpec {
         library: cmd.library,
@@ -183,7 +231,8 @@ fn translate_whole(
     let mut bindings = Vec::with_capacity(cmd.bindings.len());
     for b in &cmd.bindings {
         let (bref, idx) = map_binding(b)?;
-        let bid = builder.buffer(bref);
+        let e = elem_of(&bref);
+        let bid = builder.buffer(bref, e);
         bindings.push(IrBinding::new(bid, 0, idx));
     }
     let (tg, tpt) = (
@@ -195,6 +244,7 @@ fn translate_whole(
         pipe,
         bindings,
         Grid::new([tg.0, tg.1, tg.2], [tpt.0, tpt.1, tpt.2]),
+        dataflow,
     );
     Ok(())
 }
@@ -216,6 +266,7 @@ fn compile_affine_qmm<W: CanonicalParams>(
     tape_index: u32,
     op_idx: u32,
     nb: u32,
+    slot_width: &mut HashMap<u32, u32>,
 ) {
     let loc = WeightLoc {
         layer: layer + layer_offset,
@@ -226,8 +277,8 @@ fn compile_affine_qmm<W: CanonicalParams>(
     let w = builder_weight(builder, WeightRole::Weight, loc);
     let sc = builder_weight(builder, WeightRole::AffineScales, loc);
     let bi = builder_weight(builder, WeightRole::AffineBiases, loc);
-    let x = builder.buffer(BufferRef::ArenaSlot(in_slot));
-    let y = builder.buffer(BufferRef::ArenaSlot(out_slot));
+    let x = builder.buffer(BufferRef::ArenaSlot(in_slot), 2);
+    let y = builder.buffer(BufferRef::ArenaSlot(out_slot), 2);
     let ops = QmvOperands {
         weight: (w, 0),
         scales: (sc, 0),
@@ -274,18 +325,20 @@ fn compile_affine_qmm<W: CanonicalParams>(
         2,
         2,
     );
+    // Record the qmv's output width (n). Its blocks tile [0, n); a
+    // consumer reading [0, n) is covered ONLY if they fully tile it, so a
+    // tiling gap surfaces as a partial-coverage error at validate time.
+    slot_width.insert(out_slot, n);
 }
 
-fn builder_weight(
-    builder: &mut SubtileIrBuilder,
-    role: WeightRole,
-    loc: WeightLoc,
-) -> ferrite_wavefront::subtile_ir::BufId {
-    builder.buffer(BufferRef::Weight {
+fn builder_weight(builder: &mut SubtileIrBuilder, role: WeightRole, loc: WeightLoc) -> BufId {
+    let bref = BufferRef::Weight {
         bundle: WeightBundle::LinearLayer,
         role,
         loc,
-    })
+    };
+    let e = elem_of(&bref);
+    builder.buffer(bref, e)
 }
 
 /// Lower a decode tape (the bucket's `backbone` then `lm_head` slices,
@@ -295,7 +348,6 @@ fn builder_weight(
 pub fn compile_decode<W: CanonicalParams>(
     segments: &[(&[Instruction], u32)],
     bucket_m: u32,
-    layer_offset: u32,
     profile: Option<&MetalTargetProfile>,
     nb: u32,
     terminal_slot: u32,
@@ -306,44 +358,200 @@ pub fn compile_decode<W: CanonicalParams>(
     let mut builder = SubtileIrBuilder::default();
     let mut splitk_scratch = 0u32;
     let mut moe_scratch = 0u32;
+    // Per-arena-slot producer width: a qmv records its precise output `n`;
+    // a consumer's read uses it so a tiling gap is caught (else `WHOLE`).
+    let mut slot_width: HashMap<u32, u32> = HashMap::new();
     for (instrs, tape_index) in segments {
-        for (index, inst) in instrs.iter().enumerate() {
-            match inst {
-                Instruction::AffineQmm(in_slot, out_slot, layer, n, k, group_size, bits, _vl) => {
-                    compile_affine_qmm::<W>(
-                        &mut builder,
-                        *in_slot,
-                        *out_slot,
-                        *layer,
-                        *n,
-                        *k,
-                        *group_size,
-                        *bits,
-                        layer_offset,
-                        *tape_index,
-                        index as u32,
-                        nb,
-                    );
+        // Mirror `lower()`'s static loop unroll: `Loop(count, body_len)`
+        // expands the body `count` times with `layer_offset = iter`. A
+        // body instruction's `index` (= WeightLocator op_idx) is its
+        // position in the slice, the SAME across iterations — per-layer
+        // disambiguation rides on `layer + layer_offset`, not the index.
+        let mut i = 0usize;
+        while i < instrs.len() {
+            match &instrs[i] {
+                Instruction::Loop(count, body_len) => {
+                    let body_start = i + 1;
+                    let body_end = body_start
+                        .checked_add(*body_len as usize)
+                        .filter(|end| *end <= instrs.len())
+                        .ok_or(CompileError::MalformedLoop {
+                            index: i,
+                            count: *count,
+                            body_len: *body_len,
+                        })?;
+                    for iter in 0..*count as usize {
+                        for (offset, inst) in instrs[body_start..body_end].iter().enumerate() {
+                            process_instr::<W>(
+                                &mut builder,
+                                inst,
+                                body_start + offset,
+                                iter as u32,
+                                *tape_index,
+                                nb,
+                                profile,
+                                &mut splitk_scratch,
+                                &mut moe_scratch,
+                                &mut slot_width,
+                            )?;
+                        }
+                    }
+                    i = body_end;
                 }
-                _ => {
-                    let cmds = lower_one::<W>(
-                        inst,
-                        index,
-                        bucket_m,
-                        layer_offset,
+                other => {
+                    process_instr::<W>(
+                        &mut builder,
+                        other,
+                        i,
+                        0,
                         *tape_index,
+                        nb,
+                        profile,
                         &mut splitk_scratch,
                         &mut moe_scratch,
-                        profile,
-                    )
-                    .map_err(CompileError::Lowering)?;
-                    for cmd in &cmds {
-                        translate_whole(cmd, &mut builder)?;
-                    }
+                        &mut slot_width,
+                    )?;
+                    i += 1;
                 }
             }
         }
     }
-    let terminal = builder.buffer(BufferRef::ArenaSlot(terminal_slot));
+    let terminal = builder.buffer(BufferRef::ArenaSlot(terminal_slot), 2);
     Ok(builder.finish(terminal))
+}
+
+/// The recorded width of an arena slot's producer (defaults to `WHOLE`
+/// when no precise width was recorded — i.e. a whole-op output).
+fn rw(slot_width: &HashMap<u32, u32>, slot: u32) -> u32 {
+    slot_width.get(&slot).copied().unwrap_or(WHOLE)
+}
+
+/// Build the typed [`OpDataflow`] for one (loop-unrolled) whole op from
+/// its instruction's in/out arena slots. Read widths come from the
+/// producer's recorded width (so a consumer reading a qmv output uses the
+/// precise `n` → a tiling gap surfaces as partial-coverage); writes use
+/// `WHOLE`. Errors (never silently skips) on an op with no model yet.
+fn whole_op_dataflow(
+    inst: &Instruction,
+    builder: &mut SubtileIrBuilder,
+    slot_width: &HashMap<u32, u32>,
+) -> Result<OpDataflow, CompileError> {
+    use Instruction as I;
+    let rd = |bid: BufId, w: u32| RegionRef::rows_cols(bid, 1, 0, w);
+    Ok(match inst {
+        I::Embed(out) | I::AffineEmbed(out, ..) => {
+            let o = builder.buffer(BufferRef::ArenaSlot(*out), 2);
+            OpDataflow::Produce { out: rd(o, WHOLE) }
+        }
+        I::RmsNorm(inp, out, ..) | I::FusedGateUpSiluMul(inp, out, _) => {
+            let xi = builder.buffer(BufferRef::ArenaSlot(*inp), 2);
+            let oi = builder.buffer(BufferRef::ArenaSlot(*out), 2);
+            OpDataflow::Map {
+                x: rd(xi, rw(slot_width, *inp)),
+                out: rd(oi, WHOLE),
+            }
+        }
+        I::SiluMul(gate, up, out) => {
+            let g = builder.buffer(BufferRef::ArenaSlot(*gate), 2);
+            let u = builder.buffer(BufferRef::ArenaSlot(*up), 2);
+            let o = builder.buffer(BufferRef::ArenaSlot(*out), 2);
+            OpDataflow::Zip {
+                a: rd(g, rw(slot_width, *gate)),
+                b: rd(u, rw(slot_width, *up)),
+                out: rd(o, WHOLE),
+            }
+        }
+        I::Add(delta, residual) | I::FusedAddRmsNorm(delta, residual, ..) => {
+            let d = builder.buffer(BufferRef::ArenaSlot(*delta), 2);
+            let r = builder.buffer(BufferRef::ArenaSlot(*residual), 2);
+            OpDataflow::AddInPlace {
+                delta: rd(d, rw(slot_width, *delta)),
+                residual: rd(r, rw(slot_width, *residual)),
+            }
+        }
+        I::AttentionViaCache(q, out, ..) => {
+            let qi = builder.buffer(BufferRef::ArenaSlot(*q), 2);
+            let oi = builder.buffer(BufferRef::ArenaSlot(*out), 2);
+            OpDataflow::Attn {
+                x: rd(qi, rw(slot_width, *q)),
+                out: rd(oi, WHOLE),
+            }
+        }
+        // Synth megakernels: read `delta`, update `residual` in place, and
+        // produce the slot the downstream qmv consumes (q_out / silu_out).
+        I::SynthPreAttn(residual, delta, produced, ..)
+        | I::SynthMlpPreDown(residual, delta, produced, ..) => {
+            let r = builder.buffer(BufferRef::ArenaSlot(*residual), 2);
+            let d = builder.buffer(BufferRef::ArenaSlot(*delta), 2);
+            let p = builder.buffer(BufferRef::ArenaSlot(*produced), 2);
+            OpDataflow::UpdateProduce {
+                x: rd(d, rw(slot_width, *delta)),
+                residual: rd(r, rw(slot_width, *residual)),
+                out: rd(p, WHOLE),
+            }
+        }
+        _ => return Err(CompileError::UnmodeledDataflow("(unmodeled whole op)")),
+    })
+}
+
+/// Process one (already loop-unrolled) instruction: `AffineQmm` → native
+/// N-block qmv subtiles, every other op → its whole-op dispatch (via
+/// `lower_one`) carrying the typed [`OpDataflow`]. `index` is the
+/// instruction's slice position; `layer_offset` its enclosing loop
+/// iteration (0 outside a loop).
+#[allow(clippy::too_many_arguments)]
+fn process_instr<W: CanonicalParams>(
+    builder: &mut SubtileIrBuilder,
+    inst: &Instruction,
+    index: usize,
+    layer_offset: u32,
+    tape_index: u32,
+    nb: u32,
+    profile: Option<&MetalTargetProfile>,
+    splitk_scratch: &mut u32,
+    moe_scratch: &mut u32,
+    slot_width: &mut HashMap<u32, u32>,
+) -> Result<(), CompileError> {
+    match inst {
+        Instruction::AffineQmm(in_slot, out_slot, layer, n, k, group_size, bits, _vl) => {
+            compile_affine_qmm::<W>(
+                builder,
+                *in_slot,
+                *out_slot,
+                *layer,
+                *n,
+                *k,
+                *group_size,
+                *bits,
+                layer_offset,
+                tape_index,
+                index as u32,
+                nb,
+                slot_width,
+            );
+            Ok(())
+        }
+        Instruction::Loop(..) => Err(CompileError::NestedLoop),
+        other => {
+            let cmds = lower_one::<W>(
+                other,
+                index,
+                1,
+                layer_offset,
+                tape_index,
+                splitk_scratch,
+                moe_scratch,
+                profile,
+            )
+            .map_err(CompileError::Lowering)?;
+            if cmds.is_empty() {
+                return Ok(()); // metadata-only (Reshape / Alias / Free) — no dispatch
+            }
+            let df = whole_op_dataflow(other, builder, slot_width)?;
+            for cmd in &cmds {
+                translate_whole(cmd, builder, df)?;
+            }
+            Ok(())
+        }
+    }
 }

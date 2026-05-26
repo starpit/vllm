@@ -1123,7 +1123,7 @@ fn resolve_gemm_buffers<W: CanonicalParams>(
 /// struct → `GpuTensor`. The Metal-side delta is just the final
 /// pointer → `(&Buffer, offset)` reverse lookup against the arena
 /// allocator.
-fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
+pub(crate) fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
     weights: &W,
     allocator: &MetalAllocator,
     kind: &WeightBundleKind,

@@ -1851,3 +1851,391 @@ fn wavefront_serialized_qmv_chain_bit_exact() {
         "serialized qmv→qmv chain must be bit-exact vs two sequential whole qmvs"
     );
 }
+
+/// Whole `rmsnorm_bf16_s_f16_specialized` into a caller buffer (TG 1024 to
+/// match the player's RMSNORM arm reduction width).
+fn rmsnorm_whole_into(
+    device: &Device,
+    cache: &SpecializedPipelineCache,
+    in_buf: &Buffer,
+    gain: &Buffer,
+    out: &Buffer,
+    hidden: u32,
+    eps: f32,
+) {
+    let pipe = cache
+        .get_or_build(&PipelineKey::new(
+            "rmsnorm",
+            "rmsnorm_bf16_s_f16_specialized",
+            vec![
+                ConstantValue::uint(0, 1),
+                ConstantValue::uint(1, hidden),
+                ConstantValue::float(2, eps),
+            ],
+        ))
+        .expect("rmsnorm pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&pipe);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(out), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(in_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(gain), 0, 2);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+}
+
+/// Whole `silu_mul_bf16` into a caller buffer.
+fn silu_mul_whole_into(
+    device: &Device,
+    cache: &SpecializedPipelineCache,
+    gate: &Buffer,
+    up: &Buffer,
+    out: &Buffer,
+    n: u32,
+) {
+    let pipe = cache
+        .get_or_build(&PipelineKey::new(
+            "silu_mul",
+            "silu_mul_bf16",
+            vec![ConstantValue::uint(0, n)],
+        ))
+        .expect("silu_mul pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&pipe);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(out), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(gate), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(up), 0, 2);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: (n as usize).div_ceil(256),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+}
+
+/// The whole non-attention decode half — input-norm → gate/up proj →
+/// (Silu·Mul, fused) → down proj → residual add — produced by
+/// `fuse_silu_mul` + `serialize`, run through the player, bit-exact vs the
+/// sequential whole kernels. Exercises every clean arm in one serialized
+/// chain plus the SwiGLU diamond (gate + up both read the norm; SiluMul
+/// rejoins) and a residual add that reads the block input (a Dense source).
+#[test]
+fn wavefront_serialized_mlp_block_bit_exact() {
+    use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc, fuse_silu_mul};
+    use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
+    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::region_schedule::partition_roundrobin;
+    use ferrite_wavefront::subtile::SourceShape;
+    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+
+    // K must be a multiple of the fast qmv block (512); hidden == inter == 512.
+    let (hidden, inter, gs, eps) = (512u32, 512u32, 64u32, 1e-5f32);
+
+    let bf16le = |v: f32| half::bf16::from_f32(v).to_bits().to_le_bytes();
+    let f16le = |v: f32| half::f16::from_f32(v).to_bits().to_le_bytes();
+    let mut st = 0x515E_1234u64;
+    let mut next = || {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((st >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    let x: Vec<u8> = (0..hidden).flat_map(|_| bf16le(next())).collect();
+    let gain: Vec<u8> = (0..hidden)
+        .flat_map(|i| f16le(0.5 + 0.01 * (i % 7) as f32))
+        .collect();
+    let x_buf = buffer_from_bytes(&device, &x);
+    let gain_buf = buffer_from_bytes(&device, &gain);
+    let (wg, sg, bg, _) = make_qmv(&device, inter, hidden, gs, 0x6001);
+    let (wu, su, bu, _) = make_qmv(&device, inter, hidden, gs, 0x6002);
+    let (wd, sd, bd, _) = make_qmv(&device, hidden, inter, gs, 0x6003);
+
+    // Reference: sequential whole kernels (same bf16 intermediates).
+    let xn = zeroed_buffer(&device, (hidden * 2) as usize);
+    rmsnorm_whole_into(&device, &cache, &x_buf, &gain_buf, &xn, hidden, eps);
+    let gate = zeroed_buffer(&device, (inter * 2) as usize);
+    qmv_whole_into(
+        &device, &cache, &wg, &sg, &bg, &xn, &gate, inter, hidden, gs,
+    );
+    let up = zeroed_buffer(&device, (inter * 2) as usize);
+    qmv_whole_into(&device, &cache, &wu, &su, &bu, &xn, &up, inter, hidden, gs);
+    let act = zeroed_buffer(&device, (inter * 2) as usize);
+    silu_mul_whole_into(&device, &cache, &gate, &up, &act, inter);
+    let down = zeroed_buffer(&device, (hidden * 2) as usize);
+    qmv_whole_into(
+        &device, &cache, &wd, &sd, &bd, &act, &down, hidden, inter, gs,
+    );
+    let down_bits = read_bf16(&down, hidden as usize);
+    let bf16f = |b: &[u8], i: usize| {
+        half::bf16::from_bits(u16::from_le_bytes([b[i * 2], b[i * 2 + 1]])).to_f32()
+    };
+    let want: Vec<u16> = (0..hidden as usize)
+        .map(|i| {
+            half::bf16::from_f32(half::bf16::from_bits(down_bits[i]).to_f32() + bf16f(&x, i))
+                .to_bits()
+        })
+        .collect();
+    assert!(want.iter().any(|&v| v != 0));
+
+    // Build + fuse + serialize the MLP block.
+    let wl = |op_idx| WeightLoc {
+        layer: 0,
+        bucket: 0,
+        op_idx,
+        slot: 0,
+    };
+    let qw = |op_idx| SourceDesc::QuantWeight {
+        weight: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::Weight,
+            loc: wl(op_idx),
+        },
+        scales: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineScales,
+            loc: wl(op_idx),
+        },
+        biases: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineBiases,
+            loc: wl(op_idx),
+        },
+        group_size: gs,
+        bits: 4,
+        scale_elem: 2,
+    };
+    let input = LoweringInput {
+        sources: vec![
+            SourceShape {
+                rows: 1,
+                cols: hidden,
+            }, // 0 x
+            SourceShape {
+                rows: 1,
+                cols: hidden,
+            }, // 1 gain
+            SourceShape {
+                rows: inter,
+                cols: hidden,
+            }, // 2 Wgate
+            SourceShape {
+                rows: inter,
+                cols: hidden,
+            }, // 3 Wup
+            SourceShape {
+                rows: hidden,
+                cols: inter,
+            }, // 4 Wdown
+        ],
+        ops: vec![
+            OpDesc {
+                op: LoweredOp::RmsNorm { eps },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            },
+            OpDesc {
+                op: LoweredOp::Gemm {
+                    n: inter,
+                    k: hidden,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+            },
+            OpDesc {
+                op: LoweredOp::Silu,
+                m: 1,
+                inputs: vec![InputRef::Op(1)],
+            },
+            OpDesc {
+                op: LoweredOp::Gemm {
+                    n: inter,
+                    k: hidden,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(0), InputRef::Ext(3)],
+            },
+            OpDesc {
+                op: LoweredOp::Mul,
+                m: 1,
+                inputs: vec![InputRef::Op(2), InputRef::Op(3)],
+            },
+            OpDesc {
+                op: LoweredOp::Gemm {
+                    n: hidden,
+                    k: inter,
+                },
+                m: 1,
+                inputs: vec![InputRef::Op(4), InputRef::Ext(4)],
+            },
+            OpDesc {
+                op: LoweredOp::Add,
+                m: 1,
+                inputs: vec![InputRef::Op(5), InputRef::Ext(0)],
+            },
+        ],
+        result: 6,
+    };
+    let sources = vec![
+        SourceDesc::Dense {
+            buffer: BufferRef::Weight {
+                bundle: WeightBundle::Embedding,
+                role: WeightRole::Weight,
+                loc: wl(0),
+            },
+            elem: 2,
+        },
+        SourceDesc::Dense {
+            buffer: BufferRef::Weight {
+                bundle: WeightBundle::RmsNorm,
+                role: WeightRole::Weight,
+                loc: wl(1),
+            },
+            elem: 2,
+        },
+        qw(2),
+        qw(3),
+        qw(4),
+    ];
+    let fused = fuse_silu_mul(&input);
+    let g = lower_region(&fused, 1000); // coarse, P=1
+    let sched = partition_roundrobin(&g, 1);
+    let prog = serialize(
+        &g,
+        &sched,
+        &sources,
+        Geometry {
+            act_elem: 2,
+            block_size: 16,
+            max_blocks: 4,
+        },
+    )
+    .expect("serialize mlp");
+
+    let arena: Vec<Buffer> = prog
+        .arena_bytes
+        .iter()
+        .map(|&b| zeroed_buffer(&device, b as usize))
+        .collect();
+    let resolved: Vec<Buffer> = prog
+        .buffers
+        .iter()
+        .map(|bref| match bref {
+            BufferRef::ArenaSlot(s) => arena[*s as usize].clone(),
+            BufferRef::Weight {
+                bundle: WeightBundle::Embedding,
+                ..
+            } => x_buf.clone(),
+            BufferRef::Weight {
+                bundle: WeightBundle::RmsNorm,
+                ..
+            } => gain_buf.clone(),
+            BufferRef::Weight {
+                bundle: WeightBundle::LinearLayer,
+                role,
+                loc,
+            } => {
+                let (w, s, b) = match loc.op_idx {
+                    2 => (&wg, &sg, &bg),
+                    3 => (&wu, &su, &bu),
+                    _ => (&wd, &sd, &bd),
+                };
+                match role {
+                    WeightRole::Weight => w.clone(),
+                    WeightRole::AffineScales => s.clone(),
+                    WeightRole::AffineBiases => b.clone(),
+                    other => panic!("unexpected role {other:?}"),
+                }
+            }
+            other => panic!("unexpected buffer ref {other:?}"),
+        })
+        .collect();
+    let operand_addrs: Vec<u64> = prog
+        .operands
+        .iter()
+        .map(|sl| resolved[sl.buffer.0 as usize].gpuAddress() + sl.byte_offset)
+        .collect();
+    let operands = buffer_from_bytes(&device, &bytes_of_u64(&operand_addrs));
+    let tape = buffer_from_bytes(&device, &prog.tape_bytes());
+    let shapes = buffer_from_bytes(&device, &prog.shapes_bytes());
+    let tape_offsets = buffer_from_bytes(&device, &prog.tape_offsets_bytes());
+    let flags = zeroed_buffer(&device, (prog.num_flags.max(1) * 4) as usize);
+
+    let player = cache
+        .get_or_build(&PipelineKey::new(
+            "wavefront_layer",
+            "wavefront_player_bf16_s_f16_gs_64_b_4",
+            vec![],
+        ))
+        .expect("player pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&player);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&operands), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+    }
+    for buf in &resolved {
+        use_resource(&enc, buf, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    let result_buf = &resolved[prog.result.0 as usize];
+    assert_eq!(
+        read_bf16(result_buf, hidden as usize),
+        want,
+        "serialized MLP block must be bit-exact vs the sequential whole kernels"
+    );
+}

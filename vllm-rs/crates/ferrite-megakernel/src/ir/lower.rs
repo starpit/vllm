@@ -367,6 +367,20 @@ impl<
         _tile_n: crate::ir::substrate::TileN<TILE_N>,
         _chunk_k: crate::ir::substrate::ChunkK<CHUNK_K>,
         _consumer_bar_publish: crate::ir::substrate::BarSyncId<CONSUMER_BAR_PUBLISH>,
+        // Compile-time proof that the input page fits act + Q stage
+        // + K stage at this M. Replaces the prior render-time
+        // `if total > PAGE_SIZE { return RoleBodies::skipped(...) }`
+        // — a canonical with M too big for one TK 2.0 page is now a
+        // Rust compile error at the proc-macro emit site, not a
+        // late-bound codegen-time skip.
+        _in_page_staging: crate::ir::substrate::InPageStagingFits<
+            NUM_TOKENS,
+            HIDDEN_DIM,
+            NUM_Q_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+        >,
         qkv_weight_path: String,
         rotary_path: String,
         biased: bool,
@@ -1692,7 +1706,7 @@ mod tests {
         use crate::ir::nodes::LayerIndex;
         use crate::ir::substrate::{
             ActSlotConst, ArrivesCount, BarSyncId, ChunkK, GemmScope, HeadDim, HiddenDim,
-            IterCount, NumKvHeads, NumQHeads, NumTokensConst, PageId,
+            InPageStagingFits, IterCount, NumKvHeads, NumQHeads, NumTokensConst, PageId,
             RopeScope, ScratchRegion, TileN, WeightAccessorConst,
         };
         let mut b = Builder8::new();
@@ -1703,8 +1717,11 @@ mod tests {
         //                   sealed disjoint proof against rope by
         //                   substrate; codegen places it after rope).
         // ITERS=4, LAYER=0, NUM_LAYERS=16, ARRIVES=0
-        // (⇒ derived phase=0). S15a: NUM_TOKENS=8,
-        // TILE_N=768 (qkv_n=3072 / 4 NCW), CHUNK_K=512
+        // (⇒ derived phase=0). S15a: NUM_TOKENS=1 (decode shape;
+        // larger M would fail the InPageStagingFits witness against
+        // Builder8's PAGE_SIZE=32_768 — for HIDDEN_DIM=2048 +
+        // Q_DIM=2048 + KV_DIM=512, M=1 stages 9216 bytes, M=8 needs
+        // 73728), TILE_N=768 (qkv_n=3072 / 4 NCW), CHUNK_K=512
         // (HIDDEN_DIM=2048 / ITERS=4), bar_publish=1. S15c:
         // qkv_b_tile sized for the full per-iter staging tile.
         b.push_fused_qkv_rope_cache(
@@ -1724,7 +1741,7 @@ mod tests {
             HeadDim::<64>::new(),
             NumQHeads::<32>::new(),
             NumKvHeads::<8>::new(),
-            NumTokensConst::<8>::new(),
+            NumTokensConst::<1>::new(),
             ActSlotConst::<0, { u32::MAX }>::new(),
             ActSlotConst::<1, { u32::MAX }>::new(),
             ActSlotConst::<2, { u32::MAX }>::new(),
@@ -1734,6 +1751,7 @@ mod tests {
             TileN::<768>::new(),
             ChunkK::<512>::new(),
             BarSyncId::<1>::new(),
+            InPageStagingFits::<1, 2048, 32, 8, 64, 32_768>::new(),
             "W::qkv".to_string(),
             "W::rot".to_string(),
             true,
@@ -1756,7 +1774,7 @@ mod tests {
         assert_eq!(n.qkv_b_tile_offset().raw(), 4096);
         assert_eq!(n.qkv_b_tile_bytes().raw(), 4096);
         assert_eq!(n.iters().raw(), 4);
-        assert_eq!(n.num_tokens().raw(), 8);
+        assert_eq!(n.num_tokens().raw(), 1);
         assert_eq!(n.tile_n().raw(), 768);
         assert_eq!(n.chunk_k().raw(), 512);
         assert_eq!(n.consumer_bar_publish().raw(), 1);

@@ -2774,16 +2774,18 @@ pub fn render_fused_qkv_rope_cache_decode<
     // k in [0..HIDDEN_DIM) — bytes [0..act_bytes) — and writes to
     // q_stage/k_stage at offsets ≥ act_bytes (no aliasing). The
     // input page is freed (in_consumed arrived) only after phase 2
-    // re-reads the staging region. Total per-page bytes:
-    //   act_bytes + q_stage_bytes + k_stage_bytes
-    // must fit in TK 2.0 PAGE_SIZE = 16384.
-    const PAGE_SIZE_BYTES: u32 = 16384;
+    // re-reads the staging region. Total per-page bytes
+    // (act_bytes + q_stage + k_stage ≤ TK 2.0 PAGE_SIZE = 16384) is
+    // discharged at the proc-macro emit site by `InPageStagingFits<
+    // NUM_TOKENS, HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM,
+    // PAGE_SIZE>` — a canonical with M too big is a Rust E0080 at
+    // user-crate compile time, not a render-side `RoleBodies::
+    // skipped()`. Per `feedback_end_to_end_compile_time_proofs` +
+    // `feedback_asserts_must_be_dead_code`: by the time we reach
+    // this render fn, the page-fit proof has already been
+    // discharged.
     let q_stage_offset: u32 = act_bytes;
     let k_stage_offset: u32 = act_bytes + M * Q_DIM * BF16_BYTES;
-    let total_in_page_bytes: u32 = act_bytes + M * Q_DIM * BF16_BYTES + M * KV_DIM * BF16_BYTES;
-    if total_in_page_bytes > PAGE_SIZE_BYTES {
-        return RoleBodies::skipped("TkFusedQkvRopeCacheDecode");
-    }
     let _ = q_rope_offset;
     let _ = k_rope_offset;
 

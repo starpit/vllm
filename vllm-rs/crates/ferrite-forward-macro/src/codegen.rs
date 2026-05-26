@@ -4985,6 +4985,7 @@ fn emit_canonical_build_fn(
     let mut state = MegaDispatchState::new(
         NUM_PAGES,
         num_consumer_warps,
+        PAGE_SIZE,
         SCRATCH_BYTES,
         effective_num_layers,
         hidden_dim,
@@ -5021,6 +5022,7 @@ fn emit_canonical_build_fn(
     let mut render_state = MegaDispatchState::new(
         NUM_PAGES,
         num_consumer_warps,
+        PAGE_SIZE,
         SCRATCH_BYTES,
         effective_num_layers,
         hidden_dim,

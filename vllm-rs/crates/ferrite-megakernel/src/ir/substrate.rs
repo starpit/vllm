@@ -304,6 +304,89 @@ impl<const OFFSET: u32, const BYTES: u32, const SCRATCH_BYTES: u32, Scope: IsScr
 }
 
 // ============================================================
+// In-page staging witness — TkFusedQkvRopeCache decode body
+// stages Q/K rotated tiles inside the SAME TK 2.0 page that holds
+// the input activation row, at offsets past `act_bytes`. The total
+// per-page byte budget is:
+//
+//   M * HIDDEN_DIM * 2     (input act, bf16)
+// + M * Q_DIM * 2          (Q rotated stage, bf16)
+// + M * KV_DIM * 2         (K rotated stage, bf16)
+// ≤ PAGE_SIZE_BYTES
+//
+// where Q_DIM = NUM_Q_HEADS * HEAD_DIM and KV_DIM = NUM_KV_HEADS *
+// HEAD_DIM. Per `feedback_no_redundant_const_generics`, Q_DIM /
+// KV_DIM are NOT separate const generics — they are computed inline
+// from the head-count + head-dim params already on the call site.
+//
+// `InPageStagingFits::<M, HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
+// HEAD_DIM, PAGE_SIZE_BYTES>::new()` opens a `const {}` block whose
+// `assert!` is evaluated at MONOMORPHIZATION TIME — a canonical
+// whose M overflows the page is a Rust compile error (E0080), not
+// a render-time skip. Per `feedback_end_to_end_compile_time_proofs`
+// + `feedback_asserts_must_be_dead_code`: the previous render-side
+// `if total > PAGE_SIZE { return RoleBodies::skipped(...) }` was a
+// proof-system hole. This witness closes it.
+// ============================================================
+
+/// Witness that the TkFusedQkvRopeCache decode body's three in-page
+/// staged regions (input act + Q rotated + K rotated) fit in one
+/// TK 2.0 page. Compile-fails (E0080) at monomorphization when the
+/// combined byte budget exceeds `PAGE_SIZE_BYTES`.
+pub struct InPageStagingFits<
+    const M: u32,
+    const HIDDEN_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const HEAD_DIM: u32,
+    const PAGE_SIZE_BYTES: u32,
+>;
+
+impl<
+    const M: u32,
+    const HIDDEN_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const HEAD_DIM: u32,
+    const PAGE_SIZE_BYTES: u32,
+> InPageStagingFits<M, HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE_BYTES>
+{
+    pub const fn new() -> Self {
+        const {
+            // bf16 = 2 bytes. u64 throughout to keep the
+            // multiplication overflow-safe at monomorphization.
+            let bf16: u64 = 2;
+            let q_dim = (NUM_Q_HEADS as u64) * (HEAD_DIM as u64);
+            let kv_dim = (NUM_KV_HEADS as u64) * (HEAD_DIM as u64);
+            let act_bytes = (M as u64) * (HIDDEN_DIM as u64) * bf16;
+            let q_stage = (M as u64) * q_dim * bf16;
+            let k_stage = (M as u64) * kv_dim * bf16;
+            let total = act_bytes + q_stage + k_stage;
+            assert!(
+                total <= PAGE_SIZE_BYTES as u64,
+                "InPageStagingFits: M*HIDDEN_DIM*2 + M*NUM_Q_HEADS*HEAD_DIM*2 + M*NUM_KV_HEADS*HEAD_DIM*2 > PAGE_SIZE_BYTES — TkFusedQkvRopeCache decode cannot stage Q/K rotated tiles in one TK 2.0 page at this M; lower M or split staging across pages",
+            );
+        }
+        Self
+    }
+}
+
+impl<
+    const M: u32,
+    const HIDDEN_DIM: u32,
+    const NUM_Q_HEADS: u32,
+    const NUM_KV_HEADS: u32,
+    const HEAD_DIM: u32,
+    const PAGE_SIZE_BYTES: u32,
+> Default
+    for InPageStagingFits<M, HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, PAGE_SIZE_BYTES>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================
 // Mbarrier phase (bug class #3).
 // ============================================================
 

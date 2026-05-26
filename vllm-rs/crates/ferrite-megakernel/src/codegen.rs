@@ -47,6 +47,13 @@ pub struct MegaDispatchState {
     next_slot: u32,
     num_pages_budget: u32,
     num_consumer_warps: u32,
+    /// `PAGE_SIZE` const-generic value the surrounding
+    /// `MegaTapeBuilder<NUM_PAGES, NUM_CONSUMER_WARPS, PAGE_SIZE,
+    /// SCRATCH_BYTES, NUM_EDGES>` was instantiated with (TK 2.0 =
+    /// 16384 bytes). Threaded into `InPageStagingFits<...>` const
+    /// generics at `push_fused_qkv_rope_cache` emit sites so M-too-big
+    /// canonicals fail at Rust compile time, not at render-time skip.
+    page_size: u32,
     scratch_bytes: u32,
     num_layers: u32,
     // ── Canonical context (per `MEGA_IR_PLAN.md` §0/§4a).
@@ -108,6 +115,7 @@ impl MegaDispatchState {
     pub fn new(
         num_pages_budget: u32,
         num_consumer_warps: u32,
+        page_size: u32,
         scratch_bytes: u32,
         num_layers: u32,
         hidden_dim: u32,
@@ -130,6 +138,7 @@ impl MegaDispatchState {
             next_slot: 0,
             num_pages_budget,
             num_consumer_warps,
+            page_size,
             scratch_bytes,
             num_layers,
             hidden_dim,
@@ -715,6 +724,37 @@ pub fn dispatch_instruction_to_push(
                     weight_paths.len()
                 ));
             }
+            // Decode-time in-page staging witness: the proc-macro emits
+            // `InPageStagingFits<M, HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS,
+            // HEAD_DIM, PAGE_SIZE>::new()` below — its `const{}` assert
+            // panics at user-crate compile time (E0080) if M doesn't fit.
+            // Pre-check here so the canonical is skipped (Err propagates,
+            // emit_canonical_build_fn returns Err, the caller increments
+            // skipped_count) instead of breaking the entire build for
+            // every canonical that exceeds the staging budget. Per
+            // `feedback_asserts_must_be_dead_code`: by the time the witness
+            // is actually instantiated below, this gate has discharged the
+            // proof — the assert is dead code.
+            {
+                let m = state.num_tokens as u64;
+                let q_dim = (state.num_q_heads as u64) * (state.head_dim as u64);
+                let kv_dim = (state.num_kv_heads as u64) * (state.head_dim as u64);
+                let total =
+                    m * (state.hidden_dim as u64) * 2 + m * q_dim * 2 + m * kv_dim * 2;
+                if total > state.page_size as u64 {
+                    return Err(format!(
+                        "FusedQkvRopeCache: in-page staging M*HIDDEN_DIM*2 + \
+                         M*NUM_Q_HEADS*HEAD_DIM*2 + M*NUM_KV_HEADS*HEAD_DIM*2 = {total} \
+                         > PAGE_SIZE_BYTES = {} at M={m} \
+                         (HIDDEN_DIM={}, NUM_Q_HEADS={}, NUM_KV_HEADS={}, HEAD_DIM={})",
+                        state.page_size,
+                        state.hidden_dim,
+                        state.num_q_heads,
+                        state.num_kv_heads,
+                        state.head_dim,
+                    ));
+                }
+            }
             let qkv_path = weight_paths[0].as_str();
             let rotary_path = weight_paths[1].as_str();
             let in_id = lit(*in_slot);
@@ -755,6 +795,7 @@ pub fn dispatch_instruction_to_push(
             let interleaved_lit = *interleaved;
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            let page_size_lit = lit(state.page_size);
             // S15a: matmul layout. M = num_tokens; K = hidden_dim;
             // N = qkv_n = (num_q_heads + 2*num_kv_heads) * head_dim.
             // TILE_N = qkv_n / NCW (AlongN warp split). Fall back to
@@ -772,6 +813,13 @@ pub fn dispatch_instruction_to_push(
             // Single named bar for the post-mma + RoPE publish.
             // Mirror of FusedGateUpActivateMul S12a (BarSyncId=1).
             let consumer_bar_publish = lit(1u32);
+            // Discharge proof that act + Q stage + K stage fits one
+            // TK 2.0 page at this M (M = NUM_TOKENS). Const args
+            // mirror the typed primitives below: NUM_TOKENS,
+            // HIDDEN_DIM, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM,
+            // PAGE_SIZE. A canonical with M too big to stage in one
+            // page (e.g. M=8 + HIDDEN_DIM=2048) fails at THIS user's
+            // compile time via E0080, not at render-time skip.
             state.arrives += 1;
             state.next_weight_accessor += 2;
             Ok(quote! {
@@ -812,6 +860,9 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
                     ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
                     ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
+                    ::ferrite_megakernel::ir::InPageStagingFits::<
+                        #num_tokens_lit, #hidden_dim, #num_q_heads, #num_kv_heads, #head_dim, #page_size_lit,
+                    >::new(),
                     #qkv_path.to_string(),
                     #rotary_path.to_string(),
                     #biased_lit,
@@ -843,6 +894,28 @@ pub fn dispatch_instruction_to_push(
                     "RopeAppend expected 1 weight_path (rotary), got {}",
                     weight_paths.len()
                 ));
+            }
+            // In-page staging witness — see FusedQkvRopeCache arm above
+            // for the full rationale. Same proof, same gate.
+            {
+                let m = state.num_tokens as u64;
+                let q_dim = (state.num_q_heads as u64) * (state.head_dim as u64);
+                let kv_dim = (state.num_kv_heads as u64) * (state.head_dim as u64);
+                let total =
+                    m * (state.hidden_dim as u64) * 2 + m * q_dim * 2 + m * kv_dim * 2;
+                if total > state.page_size as u64 {
+                    return Err(format!(
+                        "RopeAppend: in-page staging M*HIDDEN_DIM*2 + \
+                         M*NUM_Q_HEADS*HEAD_DIM*2 + M*NUM_KV_HEADS*HEAD_DIM*2 = {total} \
+                         > PAGE_SIZE_BYTES = {} at M={m} \
+                         (HIDDEN_DIM={}, NUM_Q_HEADS={}, NUM_KV_HEADS={}, HEAD_DIM={})",
+                        state.page_size,
+                        state.hidden_dim,
+                        state.num_q_heads,
+                        state.num_kv_heads,
+                        state.head_dim,
+                    ));
+                }
             }
             let rotary_path = weight_paths[0].as_str();
             let qkv_sentinel = "<rope_append_no_qkv>";
@@ -892,6 +965,7 @@ pub fn dispatch_instruction_to_push(
             let interleaved_lit = *interleaved;
             let num_pages_lit = lit(state.num_pages_budget);
             let scratch_lit = lit(state.scratch_bytes);
+            let page_size_lit = lit(state.page_size);
             // S15a: same matmul-layout defaults as FusedQkvRopeCache.
             // RopeAppend is structurally identical at the IR level
             // (the runtime kernel handles the no-qkv-matmul shape via
@@ -944,6 +1018,9 @@ pub fn dispatch_instruction_to_push(
                     ::ferrite_megakernel::ir::TileN::<#tile_n_lit>::new(),
                     ::ferrite_megakernel::ir::ChunkK::<#chunk_k_lit>::new(),
                     ::ferrite_megakernel::ir::BarSyncId::<#consumer_bar_publish>::new(),
+                    ::ferrite_megakernel::ir::InPageStagingFits::<
+                        #num_tokens_lit, #hidden_dim, #num_q_heads, #num_kv_heads, #head_dim, #page_size_lit,
+                    >::new(),
                     #qkv_sentinel.to_string(),
                     #rotary_path.to_string(),
                     #biased_lit,

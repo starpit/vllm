@@ -35,7 +35,7 @@ pub use substrate::{
     ActSlotConst, ActSlotRef, ArrivesCount, AttentionScope, BarRef, BarSyncId, BarSyncPair,
     BlockSize, BlockSizeRef, ChunkK, ChunkKRef, DistinctBarPairProof, EdgeId, EdgeIdRef, Empty,
     ExpectedCount, ExpectedCountRef, Filled, GemmScope, HeadDim, HeadDimRef, HiddenDim,
-    HiddenDimRef, IntermediateDim, IntermediateDimRef, IsDistinctBarPair, IsLifecycleState,
+    HiddenDimRef, InPageStagingFits, IntermediateDim, IntermediateDimRef, IsDistinctBarPair, IsLifecycleState,
     IsScratchScope, IsScratchScopePub, IsValidBarSyncId, IsValidHiddenDim, IsValidWarpRole,
     IterCount, IterCountRef, KFull, KFullRef, KOffset, KOffsetRef, LayerRef, MatmulK, MatmulKRef,
     MatmulM, MatmulMRef, MatmulN, MatmulNRef, MaxSk, MaxSkRef, MbarrierPhase, MbarrierPhaseRef,

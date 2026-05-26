@@ -29,6 +29,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// ThunderMittens — the paged-cache decode attention atom the
+// attention_via_cache_v2_*_specialized wrappers and the wavefront megakernel
+// below compose.
+#include "mittens/attention.h"
+
 
 
 constant uint  ATTN_HEAD_DIM           [[function_constant(0)]];
@@ -107,146 +112,17 @@ kernel void attention_via_cache_v2_f16_specialized(
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
-    constexpr int BN = 32; // simdgroups per threadgroup
-    constexpr int BD = 32; // lanes per simdgroup
-    typedef float U;
-
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
-
-    // qk_per_thread = HEAD_DIM / 32. For TinyLlama 64/32 = 2.
-    const uint qk_per_thread = head_dim / uint(BD);
-
-    const uint seq_idx     = tg_pos.x;            // batch index
-    const uint q_head_idx  = tg_pos.y;            // 0..NUM_Q_HEADS
-    const uint group_ratio = num_q / num_kv;
-    const uint kv_head_idx = q_head_idx / group_ratio;
-    const uint kv_len      = seq_used_k[seq_idx];
-
-    const uint kv_blk_stride  = num_kv * block_size * head_dim;
-    const uint kv_head_stride = block_size * head_dim;
-    const uint kv_tok_stride  = head_dim;
-
-    // Per-thread Q + accumulators (qk_per_thread should be a
-    // compile-time constant; runtime division of head_dim/BD makes
-    // this a runtime sized loop).
-    thread U q_reg[8];                  // qk_per_thread <= 8 (head_dim<=256)
-    thread U o_reg[8];
-
-    // Threadgroup scratch for per-simdgroup max + sum_exp combine.
-    threadgroup U tg_outputs[BN * BD];
-    threadgroup U tg_max[BN];
-    threadgroup U tg_sum[BN];
-
-    // Q row pointer + scaled load. Each lane owns qk_per_thread
-    // contiguous elements at offset simd_lid * qk_per_thread.
-    device const half* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       half* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
-    device const uint* row_block_table = block_table + seq_idx * max_blocks;
-
-    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
-    for (uint i = 0; i < qk_per_thread; ++i) {
-        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
-        o_reg[i] = 0;
-    }
-
-    // Initialize per-thread max with finite minimum (MLX uses
-    // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
-    // fast::exp doesn't handle -INFINITY safely so we avoid it.
-    U max_score = -FLT_MAX;
-    U sum_exp_score = 0;
-
-    // For each key, simdgroup `simd_gid` handles tokens at indices
-    // simd_gid, simd_gid+BN, simd_gid+2*BN, ... The simdgroup that
-    // overshoots `kv_len` skips its iteration and contributes 0.
-    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
-        // Resolve paged cache pointer for token i in this simdgroup.
-        const uint logical_block = i / block_size;
-        const uint physical_block = row_block_table[logical_block];
-        const uint token_in_block = i - logical_block * block_size;
-        device const half* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride
-            + simd_lid * qk_per_thread;
-        device const half* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride
-            + simd_lid * qk_per_thread;
-
-        // Dot product of q · k for this lane's slice; simd_sum
-        // reduces within the simdgroup.
-        U score = 0;
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            score += q_reg[j] * U(k_ptr[j]);
-        }
-        score = simd_sum(score);
-
-        // Online softmax update. Match MLX `sdpa_vector`: fast::exp
-        // for both factor + exp_score.
-        U new_max = max(max_score, score);
-        U factor = metal::fast::exp(max_score - new_max);
-        U exp_score = metal::fast::exp(score - new_max);
-
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-
-        // Accumulate weighted V; rescale prior accumulator with factor.
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
-        }
-    }
-
-    // ── Combine per-simdgroup partials ───────────────────────────
-    //
-    // Each simdgroup's lane 0 publishes its max + sum_exp; all
-    // simdgroups then read all values via lane id and reduce.
-    if (simd_lid == 0) {
-        tg_max[simd_gid] = max_score;
-        tg_sum[simd_gid] = sum_exp_score;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Each lane (within simdgroup_id 0..BN-1) reads tg_max[simd_lid]
-    // / tg_sum[simd_lid]; simd_max + simd_sum produce the global max
-    // and (factor-rescaled) global sum_exp.
-    U other_max = tg_max[simd_lid];
-    U global_max = simd_max(other_max);
-    U factor = metal::fast::exp(other_max - global_max);
-    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
-
-    // Combine output partials. Each simdgroup wrote o_reg[j] for
-    // its slice; we need to weight each simdgroup's contribution by
-    // its `factor` (the rescaling for the global max), then sum
-    // across simdgroups, then divide by global_sum.
-    for (uint j = 0; j < qk_per_thread; ++j) {
-        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Each simdgroup reads its column from tg_outputs and sums
-        // across the BD partials, weighted by per-simdgroup factor.
-        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
-        U combined = simd_sum(val);
-        if (global_sum != 0) {
-            combined = combined / global_sum;
-        }
-        o_reg[j] = combined;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Lane 0 of each simdgroup writes its qk_per_thread output slice.
-    if (simd_lid == 0) {
-        device half* o_ptr = o_row + simd_gid * qk_per_thread;
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_ptr[j] = half(o_reg[j]);
-        }
-    }
+    // Thin wrapper: own the per-simdgroup combine scratch and forward the
+    // function constants + grid coordinates to the mittens attention atom.
+    threadgroup float tg_outputs[32 * 32];
+    threadgroup float tg_max[32];
+    threadgroup float tg_sum[32];
+    mittens::attention_decode_impl<half>(
+        output, q, seq_used_k, block_table, k_cache, v_cache,
+        tg_outputs, tg_max, tg_sum,
+        ATTN_HEAD_DIM, ATTN_NUM_Q_HEADS, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
+        ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
+        tg_pos.x, tg_pos.y, simd_gid, simd_lid);
 }
 
 /// BF16 sibling of `attention_via_cache_v2_f16_specialized`. Same
@@ -270,122 +146,64 @@ kernel void attention_via_cache_v2_bf16_specialized(
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
     uint   simd_lid  [[thread_index_in_simdgroup]])
 {
-    constexpr int BN = 32; // simdgroups per threadgroup
-    constexpr int BD = 32; // lanes per simdgroup
-    typedef float U;
-
-    const uint head_dim    = ATTN_HEAD_DIM;
-    const uint num_q       = ATTN_NUM_Q_HEADS;
-    const uint num_kv      = ATTN_NUM_KV_HEADS;
-    const uint block_size  = ATTN_BLOCK_SIZE;
-    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
-    const float scale      = ATTN_SCALE_FC;
-
-    // Each lane handles `qk_per_thread` contiguous elements of head_dim.
-    const uint qk_per_thread = head_dim / uint(BD);
-
-    const uint seq_idx     = tg_pos.x;
-    const uint q_head_idx  = tg_pos.y;
-    const uint group_ratio = num_q / num_kv;
-    const uint kv_head_idx = q_head_idx / group_ratio;
-    const uint kv_len      = seq_used_k[seq_idx];
-
-    const uint kv_blk_stride  = num_kv * block_size * head_dim;
-    const uint kv_head_stride = block_size * head_dim;
-    const uint kv_tok_stride  = head_dim;
-
-    thread U q_reg[8];
-    thread U o_reg[8];
-
-    threadgroup U tg_outputs[BN * BD];
-    threadgroup U tg_max[BN];
-    threadgroup U tg_sum[BN];
-
-    device const bfloat* q_row = q + (seq_idx * num_q + q_head_idx) * head_dim;
-    device       bfloat* o_row = output + (seq_idx * num_q + q_head_idx) * head_dim;
-    device const uint*   row_block_table = block_table + seq_idx * max_blocks;
-
-    // Pre-multiply Q by scale (MLX `sdpa_vector`: `q[i] = scale * queries[i]`).
-    for (uint i = 0; i < qk_per_thread; ++i) {
-        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
-        o_reg[i] = 0;
-    }
-
-    // Initialize per-thread max with finite minimum (MLX uses
-    // `Limits<U>::finite_min`; -FLT_MAX is the f32 equivalent).
-    // fast::exp doesn't handle -INFINITY safely so we avoid it.
-    U max_score = -FLT_MAX;
-    U sum_exp_score = 0;
-
-    // Online softmax over K axis. Each simdgroup `simd_gid` covers
-    // tokens at indices simd_gid, simd_gid+BN, simd_gid+2*BN, ...
-    for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
-        const uint logical_block = i / block_size;
-        const uint physical_block = row_block_table[logical_block];
-        const uint token_in_block = i - logical_block * block_size;
-        device const bfloat* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride
-            + simd_lid * qk_per_thread;
-        device const bfloat* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
-            + kv_head_idx    * kv_head_stride
-            + token_in_block * kv_tok_stride
-            + simd_lid * qk_per_thread;
-
-        U score = 0;
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            score += q_reg[j] * U(k_ptr[j]);
-        }
-        score = simd_sum(score);
-
-        U new_max = max(max_score, score);
-        // Match MLX `sdpa_vector`: fast::exp for both factor + exp_score.
-        U factor = metal::fast::exp(max_score - new_max);
-        U exp_score = metal::fast::exp(score - new_max);
-
-        max_score = new_max;
-        sum_exp_score = sum_exp_score * factor + exp_score;
-
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_reg[j] = o_reg[j] * factor + exp_score * U(v_ptr[j]);
-        }
-    }
-
-    // Combine per-simdgroup partials (online-softmax merge).
-    if (simd_lid == 0) {
-        tg_max[simd_gid] = max_score;
-        tg_sum[simd_gid] = sum_exp_score;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    U other_max = tg_max[simd_lid];
-    U global_max = simd_max(other_max);
-    U factor = metal::fast::exp(other_max - global_max);
-    U global_sum = simd_sum(tg_sum[simd_lid] * factor);
-
-    for (uint j = 0; j < qk_per_thread; ++j) {
-        tg_outputs[simd_lid * BD + simd_gid] = o_reg[j];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        U val = tg_outputs[simd_gid * BD + simd_lid] * factor;
-        U combined = simd_sum(val);
-        if (global_sum != 0) {
-            combined = combined / global_sum;
-        }
-        o_reg[j] = combined;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (simd_lid == 0) {
-        device bfloat* o_ptr = o_row + simd_gid * qk_per_thread;
-        for (uint j = 0; j < qk_per_thread; ++j) {
-            o_ptr[j] = bfloat(o_reg[j]);
-        }
-    }
+    threadgroup float tg_outputs[32 * 32];
+    threadgroup float tg_max[32];
+    threadgroup float tg_sum[32];
+    mittens::attention_decode_impl<bfloat>(
+        output, q, seq_used_k, block_table, k_cache, v_cache,
+        tg_outputs, tg_max, tg_sum,
+        ATTN_HEAD_DIM, ATTN_NUM_Q_HEADS, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
+        ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
+        tg_pos.x, tg_pos.y, simd_gid, simd_lid);
 }
+
+// ─────────────────────────────────────────────────────────────────
+// wavefront_attention_mega — PD-wavefront decode-attention composition proof.
+// P co-resident threadgroups (1024 threads = 32 simdgroups each) loop the
+// flattened (seq, q_head) pairs they own (g = tgpos, += grid_tg), composing the
+// mittens::attention_decode_impl atom once per pair. Disjoint output rows ⇒ no
+// cross-TG flags (mirrors A1). Each (seq, q_head) uses the full 32-simdgroup
+// combine exactly like the whole kernel ⇒ BIT-EXACT vs
+// attention_via_cache_v2_*_specialized for any P. The trailing barrier
+// serialises the combine scratch across a worker's iterations. Constant 6 =
+// BATCH (mega-only; the whole kernel gets it from the grid).
+// ─────────────────────────────────────────────────────────────────
+constant uint ATTN_BATCH [[function_constant(6)]];
+
+template <typename T>
+[[kernel]] void wavefront_attention_mega(
+    device       T*    output      [[buffer(0)]],
+    device const T*    q           [[buffer(1)]],
+    device const uint* seq_used_k  [[buffer(2)]],
+    device const uint* block_table [[buffer(3)]],
+    device const T*    k_cache     [[buffer(4)]],
+    device const T*    v_cache     [[buffer(5)]],
+    uint tgpos    [[threadgroup_position_in_grid]],
+    uint grid_tg  [[threadgroups_per_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup float tg_outputs[32 * 32];
+  threadgroup float tg_max[32];
+  threadgroup float tg_sum[32];
+  const uint num_q = ATTN_NUM_Q_HEADS;
+  const uint total = ATTN_BATCH * num_q;
+  for (uint g = tgpos; g < total; g += grid_tg) {
+    mittens::attention_decode_impl<T>(
+        output, q, seq_used_k, block_table, k_cache, v_cache,
+        tg_outputs, tg_max, tg_sum,
+        ATTN_HEAD_DIM, num_q, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
+        ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
+        g / num_q, g % num_q, simd_gid, simd_lid);
+    threadgroup_barrier(mem_flags::mem_threadgroup); // serialise combine scratch reuse
+  }
+}
+
+#define INST_WF_ATTN_MEGA(tag, type)                                          \
+  template [[host_name("wavefront_attention_mega_" #tag)]]                     \
+  [[kernel]] decltype(wavefront_attention_mega<type>)                          \
+      wavefront_attention_mega<type>;
+INST_WF_ATTN_MEGA(f16, half)
+INST_WF_ATTN_MEGA(bf16, bfloat)
 
 // ─────────────────────────────────────────────────────────────────────
 // attention_prefill_sdpa_v2_paged — paged-cache variant of the prefill

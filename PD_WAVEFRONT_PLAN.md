@@ -312,6 +312,71 @@ Landed in one commit off `0b00278a5` (fmt + clippy clean; region_schedule + A1/A
 `mittens/sync.h` + the sync probe + this plan). Not yet wired into the live decode path. The OLD status below is
 superseded.
 
+## LATEST STATUS — 2026-05-26 (ThunderMittens COMPUTE-ATOM EXTRACTION COMPLETE — all 5 atoms)
+
+**All five decode compute atoms are extracted into ThunderMittens (`shaders/mittens/`), each composed in a
+persistent multi-TG megakernel and bit-exact-verified. UNCOMMITTED (user gates commits).** This finishes the
+"extract the compute atoms into ThunderMittens" half of the prior NEXT; the full-layer megakernel is next.
+
+Atoms (all `namespace mittens`, VERBATIM bodies — extraction not rewrite; dims/eps/scale + threadgroup scratch
+ride as params so each is self-contained, exactly like `qmv_*_impl` take K/N by value):
+- `mittens/qmv.h` — `qmv_fast_impl` / `qmv_impl` / `qmv_quad_impl` + `load_vector(_safe)` / `qdot(_safe)` / pack
+  helpers + `SIMD_SIZE`/`QUAD_SIZE`, moved out of `quantized_qmv.metal` (its sole includer; other quantized
+  shaders keep their own copies and compile independently). All `affine_qmv*` + gather + A1/A2 megakernels call
+  `mittens::qmv_*`.
+- `mittens/rmsnorm.h` — `rmsnorm_impl` (the `rmsnorm_*_specialized` body; `shared_sum` + M/HIDDEN/EPS as params).
+- `mittens/rope.h` — `rope_rotate_pair` (the NeoX pair-rotation shared by Q + K in `rope_append_*_specialized`;
+  ROTATION ONLY — the paged-cache write stays in the wrapper per design #4).
+- `mittens/silu_mul.h` — `silu_mul_impl` (the `silu_mul` body; element count as param).
+- `mittens/attention.h` — `attention_decode_impl` (the `attention_via_cache_v2_*_specialized` body: paged-cache
+  `sdpa_vector`, online softmax, 32-simdgroup K-split + combine; tg scratch + dims/scale + (seq,q_head) as params;
+  one template covers f16+bf16 — they were byte-identical bar the type).
+
+Each production `[[kernel]]` is now a THIN WRAPPER (declares its threadgroup scratch, forwards function constants,
+calls the atom) — production decode path signatures/bindings/constants/dispatch unchanged.
+
+Per-atom composition proof (in each atom's shader): `wavefront_{qmv,rmsnorm,rope,silu_mul,attention}_mega` — P
+co-resident TGs loop the work-items they own (g = tgpos, += grid_tg) composing the atom. A1-style: disjoint
+outputs, NO cross-TG flags (qmv also keeps A2's cross-TG atomic-handoff proof). Bit-exactness holds because each
+loop iteration uses the atom's natural per-item TG layout identical to the reference (rmsnorm/attention reduce
+over the same thread count; rope/silu·mul are per-element). Megas that reuse threadgroup scratch across items add
+a trailing `threadgroup_barrier` between iterations. New per-mega function constants for the flattened bound:
+`ROPE_NUM_TOKENS` (fc5), `ATTN_BATCH` (fc6).
+
+Verification (`cargo test -p ferrite-forward -F metal --test wavefront_mega_gpu` = 6 green: 5 mega + A2; also
+`cargo test -p ferrite-metal-kernels --test quantized_qmv_test` = 12 green): each `*_mega` is BIT-EXACT vs its
+whole [[kernel]] for P∈{1,2,4,10}; correctness vs an independent reference (qmv: the 12-test parity suite;
+rmsnorm/rope/silu·mul: CPU ref within noise floor — Metal may FMA-contract / Metal-exp ≠ Rust-exp; attention: a
+CONSTANT-V cache ⇒ output == that kv-head's V regardless of scores, a reference-free softmax/weighted-V/paging
+check). `cargo build -p ferrite-metal-kernels` compiles all MSL. fmt clean (Rust test).
+
+Files: NEW `shaders/mittens/{qmv,rmsnorm,rope,silu_mul,attention}.h`; MODIFIED
+`shaders/{quantized_qmv,rmsnorm,rope,silu_mul,attention}.metal` (include + thin wrappers + `*_mega`) and
+`tests/wavefront_mega_gpu.rs` (+4 mega tests). `/tmp/{quantized_qmv,attention}.metal.bak` are pre-edit backups.
+
+LSP shows false-positive errors on `mittens/*.h` (`metal_stdlib` not found, `device`/`constant` unknown) — that's
+the editor's C++ clang, NOT the Metal compiler; `xcrun metal` (via build.rs) is the real gate and passes.
+
+**NEXT = the full-layer megakernel (the "big metal build", ≈T6) — compose the atoms, never hand-write:**
+1. Build ONE persistent decode-layer megakernel composing the mittens atoms in the SSA dataflow order
+   (rmsnorm → qkv qmv → rope → attention → o_proj → rmsnorm → gate/up qmv → silu·mul → down qmv → residual),
+   driven by `region_schedule`'s 10 tapes with A2's atomic u32-packed cross-WORKER handoff for the N-block
+   activation joins + p2p `wf_signal`/`wf_wait` flags; intra-worker edges stay non-atomic.
+2. KEY DESIGN PROBLEM (deferred here intentionally): reconcile per-atom TG shapes in one persistent TG — rmsnorm
+   wants a big-TG reduction (tg_size = min(N,1024)), qmv wants 2 simdgroups (64 threads) per 8-row group,
+   attention wants 32 simdgroups (1024 threads). Pick a fixed TG (e.g. 1024 = 32 simdgroups) and have each atom
+   use the subset it needs. THIS is where TG-shape decisions belong — that is why the per-atom proofs each used
+   the atom's own natural TG rather than forcing a shared one.
+3. Bit-exact vs sequential (Tier A) → then full 16 layers + lm_head via `region_schedule` → wire as the alt decode
+   path (`FERRITE_WAVEFRONT_GPU`-style env gate) → temp=0 bit-exact vs ferrite-metal non-mega (Tier B, e2e —
+   the FIRST whole-system check the thin-wrapper extractions get) → persistent-launch occupancy sizing → ≥5-run
+   perf vs 8.2 ms (min/median/p99, distributions must not overlap).
+
+Constraints unchanged: build/run `--bin vllm -Fmetal FERRITE_MODELS=llama-3.2-1b`; ONE vllm chat at a time; 24 GiB
+cap; `cargo build -p ferrite-metal-kernels` (no feature) compiles MSL; `xcrun metal` resolves `#include
+"mittens/..."` relative to the .metal; MSL device atomics are relaxed-only; NEVER hand-write kernel math (compose
+atoms — this is what killed `_mt`); user gates commits.
+
 ## (superseded) LATEST STATUS — 2026-05-26 (typed-OpDataflow IR + end-to-end metal decode; B != A open)
 
 Two commits past `24997d429` on `worktree-pd-wavefront`. Detail in memory `[[pd-clean-wavefront-design]]`

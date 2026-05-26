@@ -15,6 +15,10 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// ThunderMittens — the NeoX RoPE rotation atom the rope_append_*_specialized
+// wrappers and the wavefront megakernel below compose.
+#include "mittens/rope.h"
+
 // ---------------------------------------------------------------------------
 // NeoX-style RoPE (standard Llama, GPT-NeoX)
 // ---------------------------------------------------------------------------
@@ -293,14 +297,7 @@ kernel void rope_append_f16_specialized(
     // ── Q rotation (in-place) ────────────────────────────────────────
     const uint q_dim = num_q * head_dim;
     device half* q_row = q_inout + t * q_dim + q_head * head_dim;
-    if (d < half_dim) {
-        const float c  = float(cos_row[d]);
-        const float s  = float(sin_row[d]);
-        const float x0 = float(q_row[d]);
-        const float x1 = float(q_row[half_dim + d]);
-        q_row[d]            = half(x0 * c - x1 * s);
-        q_row[half_dim + d] = half(x1 * c + x0 * s);
-    }
+    mittens::rope_rotate_pair<half>(q_row, cos_row, sin_row, d, half_dim);
 
     // ── K/V rotation + paged write (only owning q_head per kv_head) ─
     if (q_head % group_r != 0) return;
@@ -310,14 +307,7 @@ kernel void rope_append_f16_specialized(
     device half* v_row = v_inout + t * kv_dim + kv_head * head_dim;
 
     // K rotation (in-place).
-    if (d < half_dim) {
-        const float c  = float(cos_row[d]);
-        const float s  = float(sin_row[d]);
-        const float x0 = float(k_row[d]);
-        const float x1 = float(k_row[half_dim + d]);
-        k_row[d]            = half(x0 * c - x1 * s);
-        k_row[half_dim + d] = half(x1 * c + x0 * s);
-    }
+    mittens::rope_rotate_pair<half>(k_row, cos_row, sin_row, d, half_dim);
     // Fence the K writes — the paged write below has thread `d` read
     // `k_row[d]`, which (for d ≥ half_dim) was written by thread
     // `d - half_dim`. Without the barrier the paged write may see the
@@ -387,14 +377,7 @@ kernel void rope_append_bf16_specialized(
 
     const uint q_dim = num_q * head_dim;
     device bfloat* q_row = q_inout + t * q_dim + q_head * head_dim;
-    if (d < half_dim) {
-        const float c  = float(cos_row[d]);
-        const float s  = float(sin_row[d]);
-        const float x0 = float(q_row[d]);
-        const float x1 = float(q_row[half_dim + d]);
-        q_row[d]            = bfloat(x0 * c - x1 * s);
-        q_row[half_dim + d] = bfloat(x1 * c + x0 * s);
-    }
+    mittens::rope_rotate_pair<bfloat>(q_row, cos_row, sin_row, d, half_dim);
 
     if (q_head % group_r != 0) return;
     const uint kv_head = q_head / group_r;
@@ -402,14 +385,7 @@ kernel void rope_append_bf16_specialized(
     device bfloat* k_row = k_inout + t * kv_dim + kv_head * head_dim;
     device bfloat* v_row = v_inout + t * kv_dim + kv_head * head_dim;
 
-    if (d < half_dim) {
-        const float c  = float(cos_row[d]);
-        const float s  = float(sin_row[d]);
-        const float x0 = float(k_row[d]);
-        const float x1 = float(k_row[half_dim + d]);
-        k_row[d]            = bfloat(x0 * c - x1 * s);
-        k_row[half_dim + d] = bfloat(x1 * c + x0 * s);
-    }
+    mittens::rope_rotate_pair<bfloat>(k_row, cos_row, sin_row, d, half_dim);
     threadgroup_barrier(mem_flags::mem_device);
 
     // Sentinel `0xFFFFFFFF` marks padding lanes (write_slot_mapping in
@@ -434,6 +410,61 @@ kernel void rope_append_bf16_specialized(
     k_dst[d] = k_row[d];
     v_dst[d] = v_row[d];
 }
+
+// ─────────────────────────────────────────────────────────────────
+// wavefront_rope_mega — PD-wavefront RoPE rotation composition proof.
+// P co-resident threadgroups (one per GPU core), each with HEAD_DIM threads,
+// loop the flattened (token, q_head) pairs they own (g = tgpos, +grid_tg, …)
+// composing mittens::rope_rotate_pair for Q (+ K on the owning q_head per
+// kv_head). ROTATION ONLY — no paged-cache write (design #4: the megakernel
+// keeps rotated K as a dataflow edge into attention), so q_inout/k_inout must
+// be BIT-EXACT vs the whole rope_append_*_specialized (whose cache write +
+// barrier never touch q_inout/k_inout). Each (t, qh) is rotated once (disjoint
+// striping) and the rotation is per-element ⇒ no reduction order to preserve.
+// Constant 5 = NUM_TOKENS (mega-only; the whole kernel gets it from the grid).
+// ─────────────────────────────────────────────────────────────────
+constant uint ROPE_NUM_TOKENS [[function_constant(5)]];
+
+template <typename T>
+[[kernel]] void wavefront_rope_mega(
+    device       T*    q_inout   [[buffer(0)]],
+    device       T*    k_inout   [[buffer(1)]],
+    device const T*    cos_sin   [[buffer(2)]],
+    device const uint* positions [[buffer(3)]],
+    uint tgpos   [[threadgroup_position_in_grid]],
+    uint grid_tg [[threadgroups_per_grid]],
+    uint d       [[thread_position_in_threadgroup]]) {
+  const uint head_dim = ROPE_HEAD_DIM;
+  const uint rot_dim  = ROPE_ROT_DIM;
+  const uint half_dim = rot_dim / 2;
+  const uint num_q    = ROPE_NUM_Q_HEADS;
+  const uint num_kv   = ROPE_NUM_KV_HEADS;
+  const uint group_r  = num_q / num_kv;
+  const uint total    = ROPE_NUM_TOKENS * num_q; // flattened (token, q_head)
+
+  for (uint g = tgpos; g < total; g += grid_tg) {
+    const uint t  = g / num_q;
+    const uint qh = g % num_q;
+    const uint pos = positions[t];
+    device const T* cos_row = cos_sin + pos * rot_dim;
+    device const T* sin_row = cos_sin + pos * rot_dim + half_dim;
+
+    device T* q_row = q_inout + t * (num_q * head_dim) + qh * head_dim;
+    mittens::rope_rotate_pair<T>(q_row, cos_row, sin_row, d, half_dim);
+
+    if (qh % group_r == 0) {
+      const uint kv_head = qh / group_r;
+      device T* k_row = k_inout + t * (num_kv * head_dim) + kv_head * head_dim;
+      mittens::rope_rotate_pair<T>(k_row, cos_row, sin_row, d, half_dim);
+    }
+  }
+}
+
+#define INST_WF_ROPE_MEGA(tag, type)                                         \
+  template [[host_name("wavefront_rope_mega_" #tag)]]                        \
+  [[kernel]] decltype(wavefront_rope_mega<type>) wavefront_rope_mega<type>;
+INST_WF_ROPE_MEGA(f16, half)
+INST_WF_ROPE_MEGA(bf16, bfloat)
 
 /// BFloat16 variant of interleaved RoPE
 kernel void rope_interleaved_bf16(

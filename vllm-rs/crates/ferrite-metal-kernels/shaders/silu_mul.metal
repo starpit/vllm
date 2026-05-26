@@ -25,6 +25,10 @@
 
 using namespace metal;
 
+// ThunderMittens — the silu·mul compute atom the [[kernel]] below and the
+// wavefront megakernel compose.
+#include "mittens/silu_mul.h"
+
 constant uint SILU_MUL_N [[function_constant(0)]];
 
 template <typename T>
@@ -34,15 +38,7 @@ template <typename T>
     const device T* up   [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= SILU_MUL_N) {
-    return;
-  }
-  // SiLU(x) = x / (1 + exp(-x)) — kept in float so the denormalized
-  // tail of the half/bfloat exp() stays representable.
-  float g = float(gate[gid]);
-  float u = float(up[gid]);
-  float silu_g = g / (1.0f + exp(-g));
-  out[gid] = static_cast<T>(silu_g * u);
+  mittens::silu_mul_impl<T>(out, gate, up, gid, SILU_MUL_N);
 }
 
 #define INST_SILU_MUL(dtype_tag, mtl_type)                                \
@@ -55,3 +51,30 @@ template <typename T>
 
 INST_SILU_MUL(f16,  half)
 INST_SILU_MUL(bf16, bfloat)
+
+// ─────────────────────────────────────────────────────────────────
+// wavefront_silu_mul_mega — PD-wavefront silu·mul composition proof.
+// P co-resident threadgroups grid-stride over the SILU_MUL_N output elements
+// (e = thread_position_in_grid, += threads_per_grid) composing
+// mittens::silu_mul_impl. Embarrassingly parallel (one element per thread, no
+// cross-thread state) ⇒ BIT-EXACT vs the whole silu_mul for any P.
+// ─────────────────────────────────────────────────────────────────
+template <typename T>
+[[kernel]] void wavefront_silu_mul_mega(
+    device       T* out  [[buffer(0)]],
+    const device T* gate [[buffer(1)]],
+    const device T* up   [[buffer(2)]],
+    uint gtid      [[thread_position_in_grid]],
+    uint grid_size [[threads_per_grid]])
+{
+  for (uint e = gtid; e < SILU_MUL_N; e += grid_size) {
+    mittens::silu_mul_impl<T>(out, gate, up, e, SILU_MUL_N);
+  }
+}
+
+#define INST_WF_SILU_MUL_MEGA(dtype_tag, mtl_type)                            \
+  template [[host_name("wavefront_silu_mul_mega_" #dtype_tag)]] [[kernel]]    \
+  decltype(wavefront_silu_mul_mega<mtl_type>)                                 \
+      wavefront_silu_mul_mega<mtl_type>;
+INST_WF_SILU_MUL_MEGA(f16,  half)
+INST_WF_SILU_MUL_MEGA(bf16, bfloat)

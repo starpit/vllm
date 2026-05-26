@@ -1,0 +1,20 @@
+[package]
+name = "ferrite-wavefront"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+
+[dev-dependencies]
+# `cpu_golden` is the host calculator the VALIDATION tests compute with
+# (test-only — no non-test code references ferrite-forward). It lives in
+# dev-dependencies so this crate's normal graph has NO edge to
+# ferrite-forward: that lets `ferrite-forward` depend on this crate (the
+# GPU subtile Executor lives in its metal interpreter and consumes
+# `subtile_ir`) without a cycle. Cargo permits the dev-only back-edge.
+# ferrite-forward builds backend-agnostic here (no cuda/metal feature),
+# so the tests stay host-runnable on any platform.
+ferrite-forward = { path = "../ferrite-forward" }

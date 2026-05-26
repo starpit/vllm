@@ -28,6 +28,7 @@
 mod affine_qmm_sweep;
 mod affine_qmv_sweep;
 mod attention_sweep;
+mod flag_sync_sweep;
 mod rmsnorm_sweep;
 mod synth_gate_up_silu_mul_sweep;
 mod synth_mlp_pre_down_sweep;
@@ -77,6 +78,9 @@ fn main() {
     }
     if want("attention") {
         attention_sweep::run(launch_overhead_us);
+    }
+    if want("flag_sync") {
+        flag_sync_sweep::run(launch_overhead_us);
     }
 
     eprintln!("metal_cost_sweep: done");

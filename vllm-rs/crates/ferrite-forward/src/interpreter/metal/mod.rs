@@ -24,6 +24,10 @@ pub mod pool;
 #[cfg(feature = "metal")]
 pub mod runtime;
 #[cfg(feature = "metal")]
+pub mod subtile_compile;
+#[cfg(feature = "metal")]
+pub mod subtile_player;
+#[cfg(feature = "metal")]
 pub mod worker;
 
 /// Re-export of `ferrite_metal_kernels::quantized::ScaleDtype` so the

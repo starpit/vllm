@@ -527,7 +527,7 @@ pub fn lower<W: CanonicalParams>(
 /// picked `SplitK`. The worker uses it to size the shared scratch
 /// buffer that `Binding::Scratch` resolves against.
 #[allow(clippy::too_many_arguments)]
-fn lower_one<W: CanonicalParams>(
+pub(crate) fn lower_one<W: CanonicalParams>(
     inst: &Instruction,
     index: usize,
     bucket_m: u32,
@@ -2615,7 +2615,7 @@ fn silu_mul_static_name(dtype: DequantDtype) -> &'static str {
 /// `qmm_t_kernel_static_name` consume). Same two cases either way —
 /// the duplicate enum exists because the kernel-dispatcher crate
 /// can't depend on lowering types.
-fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
+pub(crate) fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
     match W::METAL_DTYPE {
         MetalDtype::F16 => DequantDtype::F16,
         MetalDtype::Bf16 => DequantDtype::Bf16,
@@ -2631,7 +2631,7 @@ fn dequant_dtype_for<W: CanonicalParams>() -> DequantDtype {
 /// params. Reads `W::SCALE_DTYPE`, populated from each arch's
 /// quantization manifest (default F16; Qwen3 family overrides to BF16
 /// because their mlx-community 4bit checkpoints ship BF16 scales).
-fn scale_dtype_for<W: CanonicalParams>() -> ScaleDtype {
+pub(crate) fn scale_dtype_for<W: CanonicalParams>() -> ScaleDtype {
     W::SCALE_DTYPE
 }
 

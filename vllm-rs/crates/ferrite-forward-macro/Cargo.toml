@@ -40,6 +40,13 @@ nccl = ["ferrite-forward/nccl"]
 
 [dependencies]
 ferrite-fusion-synth = { path = "../ferrite-fusion-synth" }
+# PD-wavefront (task T2b): the subtile-wavefront IR + lowering +
+# scheduler + host tape player live in this normal (Mac-testable) lib
+# crate. `to_wavefront.rs` here translates the solved FUF + `Assignment`
+# into a `ferrite_wavefront::LoweringInput` and calls `lower()`. Same
+# pattern as the `ferrite-fusion-synth` dep above — the proc-macro crate
+# can't export the IR types, so they live in a normal crate it calls.
+ferrite-wavefront = { path = "../ferrite-wavefront" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"

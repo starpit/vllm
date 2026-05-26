@@ -50,6 +50,7 @@ mod quantization;
 mod schedule;
 mod shape;
 mod solver;
+mod to_wavefront;
 mod solver_metal_tests;
 mod target;
 mod tp_lowering;
@@ -893,6 +894,60 @@ fn compile_common(
                 &target_profile,
                 &solve_bounds,
             );
+
+            // PD-wavefront task T2b: route the solved decode FUF through
+            // the macro→wavefront bridge so a real model's forward flows
+            // into the host-validated subtile pipeline. Env-gated and
+            // strictly diagnostic — any error logs and continues, never
+            // gating the build. `FERRITE_WAVEFRONT=1` to dump.
+            if std::env::var_os("FERRITE_WAVEFRONT").is_some() {
+                match sfufs.get_nt(1) {
+                    Some(decode_asn) => {
+                        match to_wavefront::lower_decode_to_wavefront(
+                            &model_fuf,
+                            decode_asn,
+                            &inferred,
+                            &solve_bounds,
+                            model,
+                            /* prefix_len (structural) */ 0,
+                        ) {
+                            Ok(lowered) => {
+                                let g = ferrite_wavefront::lower::lower(&lowered.input);
+                                let st = to_wavefront::stats(&model_fuf, decode_asn, &lowered);
+                                let valid = match ferrite_wavefront::subtile::validate(&g) {
+                                    Ok(n) => format!("valid ({n} nodes)"),
+                                    Err(e) => format!("INVALID: {e}"),
+                                };
+                                eprintln!(
+                                    "[wavefront] {}: {} fuf tiles, {} subgraphs → \
+                                     {} sources ({} weights, {} prefix-kv) , {} ops, \
+                                     {} subtile nodes [{}]; ops {:?}",
+                                    model.source_stem,
+                                    st.fuf_tiles,
+                                    st.subgraphs,
+                                    st.sources,
+                                    st.weight_sources,
+                                    st.prefix_sources,
+                                    st.ops,
+                                    g.nodes.len(),
+                                    valid,
+                                    st.op_histogram,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[wavefront] {}: not lowered — {e}",
+                                    model.source_stem
+                                );
+                            }
+                        }
+                    }
+                    None => eprintln!(
+                        "[wavefront] {}: no decode (num_tokens=1) workload point",
+                        model.source_stem
+                    ),
+                }
+            }
 
             let max_waves = loops
                 .per_workload

@@ -2025,6 +2025,7 @@ dependencies = [
  "ferrite-kernels",
  "ferrite-metal-kernels",
  "ferrite-vision",
+ "ferrite-wavefront",
  "half",
  "hf-hub",
  "inventory",
@@ -2046,6 +2047,7 @@ dependencies = [
  "ferrite-fusion-synth",
  "ferrite-metal-kernels",
  "ferrite-metal-targets",
+ "ferrite-wavefront",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -2422,6 +2424,13 @@ dependencies = [
  "half",
  "image",
  "vllm-common",
+]
+
+[[package]]
+name = "ferrite-wavefront"
+version = "0.1.0"
+dependencies = [
+ "ferrite-forward",
 ]
 
 [[package]]

@@ -89,4 +89,35 @@ METAL_FUNC void wf_acquire_pairs(
   }
 }
 
+// Threadgroup-cooperative variants: ALL `nthreads` lanes call these, lane
+// `tid` owning the strided pairs `tid, tid+nthreads, ...`. The single-thread
+// versions above serialize the whole activation on one lane (~1024 atomics);
+// at a P-worker join that is ~P×(publish+acquire) single-lane passes per
+// op-boundary and dominates the megakernel. Each pair is an independent
+// atomic address, so striping across the TG parallelizes cleanly. The caller's
+// existing `threadgroup_barrier(mem_device)` (after the PUBLISH compute, before
+// the Signal; and after the ACQUIRE compute, before the consumer reads the
+// private copy) still provides the completion fence — no barrier inside here.
+template <typename T>
+METAL_FUNC void wf_publish_pairs_tg(
+    device atomic_uint* dst, const device T* src, uint pair0, uint n_pairs,
+    uint tid, uint nthreads) {
+  for (uint q = tid; q < n_pairs; q += nthreads) {
+    uint p = pair0 + q;
+    atomic_store_explicit(
+        &dst[p], wf_pack2<T>(src[2u * p], src[2u * p + 1u]), memory_order_relaxed);
+  }
+}
+
+template <typename T>
+METAL_FUNC void wf_acquire_pairs_tg(
+    device T* dst, const device atomic_uint* src, uint n_pairs,
+    uint tid, uint nthreads) {
+  for (uint q = tid; q < n_pairs; q += nthreads) {
+    uint v = atomic_load_explicit(&src[q], memory_order_relaxed);
+    dst[2u * q] = wf_unpack_lo<T>(v);
+    dst[2u * q + 1u] = wf_unpack_hi<T>(v);
+  }
+}
+
 } // namespace mittens

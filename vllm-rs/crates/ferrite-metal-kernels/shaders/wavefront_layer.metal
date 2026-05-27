@@ -170,23 +170,23 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             break;
           case WL_OP_PUBLISH:
             // pack operands[base+1] (this worker's written region, bf16) into the
-            // coherent operands[base+0] (atomic u32). pair0=p1, n_pairs=p2.
-            if (tid_in_tg == 0u) {
-              mittens::wf_publish_pairs<T_act>(
-                  (device atomic_uint*)(operands[ins.z + 0u]),
-                  (const device T_act*)(operands[ins.z + 1u]),
-                  shapes[sb + 1u], shapes[sb + 2u]);
-            }
+            // coherent operands[base+0] (atomic u32). pair0=p1, n_pairs=p2. All
+            // 1024 lanes co-operate (strided); the trailing per-op mem_device
+            // barrier fences the stripes before the Signal.
+            mittens::wf_publish_pairs_tg<T_act>(
+                (device atomic_uint*)(operands[ins.z + 0u]),
+                (const device T_act*)(operands[ins.z + 1u]),
+                shapes[sb + 1u], shapes[sb + 2u], tid_in_tg, 1024u);
             break;
           case WL_OP_ACQUIRE:
             // load+unpack the coherent operands[base+1] (atomic u32) into the
-            // private operands[base+0] (bf16). n_pairs=p1.
-            if (tid_in_tg == 0u) {
-              mittens::wf_acquire_pairs<T_act>(
-                  (device T_act*)(operands[ins.z + 0u]),
-                  (const device atomic_uint*)(operands[ins.z + 1u]),
-                  shapes[sb + 1u]);
-            }
+            // private operands[base+0] (bf16). n_pairs=p1. All 1024 lanes
+            // co-operate (strided); the trailing per-op mem_device barrier
+            // fences the private copy before the consumer reads it.
+            mittens::wf_acquire_pairs_tg<T_act>(
+                (device T_act*)(operands[ins.z + 0u]),
+                (const device atomic_uint*)(operands[ins.z + 1u]),
+                shapes[sb + 1u], tid_in_tg, 1024u);
             break;
           case WL_OP_RMSNORM:
             // operands [out, in, weight]; shape (RMSNORM, hidden, eps_bits, ...).

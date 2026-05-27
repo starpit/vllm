@@ -5999,13 +5999,47 @@ fn dump_wavefront_mega(
     let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
     let (descs, report) =
         to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
-    let rg = ferrite_wavefront::region::lower_region(&fused, 256);
+    // PERF DIAG (droppable): nb (N-block size) and P (worker count) sweep the
+    // cross-tape-communication tradeoff. Coarser nb / smaller P ⇒ fewer joins;
+    // both trade off bandwidth spread. Defaults nb=256, P=10.
+    let env_u32 = |k: &str, d: u32| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(d)
+    };
+    let nb = env_u32("FERRITE_WAVEFRONT_NB", 256);
+    let num_workers = env_u32("FERRITE_WAVEFRONT_P", 10);
+    let rg = ferrite_wavefront::region::lower_region(&fused, nb);
+    // PERF DIAG (droppable): cost a matmul block by its WEIGHT-READ bytes
+    // (N_block × K) — the bandwidth-bound cost — instead of output area
+    // (N_block), so the load-balancer doesn't leave workers idle at a join
+    // when blocks read very different K (e.g. down_proj K=8192 vs others 2048).
+    // `FERRITE_WAVEFRONT_COST=area` restores the old output-area cost.
+    let read_cost = std::env::var("FERRITE_WAVEFRONT_COST").as_deref() != Ok("area");
+    // PERF DIAG (droppable): the edge-cut (cross-worker handoff) price. The
+    // default 0.18 (µs/hop, measured) is ~6 orders below a block's compute cost
+    // (N_block·K ≈ 5e5 element-units), so the scheduler ignores communication and
+    // scatters every block → max handoff. FERRITE_WAVEFRONT_WAITCOST=<f64> raises
+    // it (in the SAME element-units as `cost`) so the cost-driven assignment
+    // co-locates producer→consumer chains and cuts cross-worker edges.
+    let wait_cost_us = std::env::var("FERRITE_WAVEFRONT_WAITCOST")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.18);
     let sched = schedule_wavefront(
         &rg,
-        |n| (n.output.region.rows.len * n.output.region.cols.len) as f64,
+        |n| {
+            let area = (n.output.region.rows.len * n.output.region.cols.len) as f64;
+            if read_cost && matches!(n.op, ferrite_wavefront::subtile::SubOp::MatmulTile) {
+                (n.output.region.cols.len as f64) * (n.inputs[0].region.cols.len as f64)
+            } else {
+                area
+            }
+        },
         ScheduleParams {
-            num_workers: 10,
-            wait_cost_us: 0.18,
+            num_workers,
+            wait_cost_us,
         },
     );
     let geom = ferrite_wavefront::mega::Geometry {
@@ -6013,7 +6047,19 @@ fn dump_wavefront_mega(
         block_size: 16,
         max_blocks: 64,
     };
-    match ferrite_wavefront::mega::serialize(&rg, &sched, &descs, geom) {
+    // DEFAULT = pipelined (low-latency ~9 ms). FERRITE_WAVEFRONT_TRANCHE=1 emits
+    // the tranche/simdgroup-packed layout (a measured net-neutral point-2 study,
+    // see mega::EmitMode). FERRITE_WAVEFRONT_COMPUTE_ONLY=1 emits computes with
+    // NO sync/handoff/barriers — WRONG result, a TIMING probe that isolates the
+    // raw per-worker compute throughput from all cross-worker sync + idle.
+    let emit_mode = if std::env::var("FERRITE_WAVEFRONT_COMPUTE_ONLY").as_deref() == Ok("1") {
+        ferrite_wavefront::mega::EmitMode::ComputeOnly
+    } else if std::env::var("FERRITE_WAVEFRONT_TRANCHE").as_deref() == Ok("1") {
+        ferrite_wavefront::mega::EmitMode::Tranche
+    } else {
+        ferrite_wavefront::mega::EmitMode::Pipelined
+    };
+    match ferrite_wavefront::mega::serialize_mode(&rg, &sched, &descs, geom, emit_mode) {
         Ok(prog) => {
             eprintln!(
                 "[wavefront-mega] {stem}: {} region nodes → {} tape instrs ({} node-computes, \
@@ -6035,6 +6081,44 @@ fn dump_wavefront_mega(
                     format!(" — UNRESOLVED bases: {:?}", report.unresolved)
                 },
             );
+            // PERF DIAG (droppable): how many Computes the tranche packer
+            // assigned a non-whole-TG simdgroup range (flag != 0) — i.e. ran
+            // concurrently with siblings. 0 ⇒ packing never fired.
+            let computes = prog
+                .tape
+                .iter()
+                .filter(|i| i[0] == ferrite_wavefront::mega::opcode::COMPUTE)
+                .count();
+            let packed = prog
+                .tape
+                .iter()
+                .filter(|i| i[0] == ferrite_wavefront::mega::opcode::COMPUTE && i[3] != 0)
+                .count();
+            let waits = prog
+                .tape
+                .iter()
+                .filter(|i| i[0] == ferrite_wavefront::mega::opcode::WAIT)
+                .count();
+            let barriers = prog
+                .tape
+                .iter()
+                .filter(|i| i[0] == ferrite_wavefront::mega::opcode::BARRIER)
+                .count();
+            eprintln!(
+                "[wavefront-pack] {stem}: {packed}/{computes} computes packed (concurrent), \
+                 {waits} waits, {barriers} barriers"
+            );
+            // PERF DIAG (droppable): FERRITE_WAVEFRONT_TAPE=N dumps the first N
+            // instructions of each worker's tape in a concise token form, to
+            // eyeball that tranches / sync / ops are correct (a layer is ~50/
+            // worker, so N=60 shows one). N defaults to 60 if unparsable.
+            if let Ok(v) = std::env::var("FERRITE_WAVEFRONT_TAPE") {
+                let n = v.parse::<usize>().unwrap_or(60);
+                eprintln!(
+                    "[wavefront-tape] {stem} (mode {emit_mode:?}):\n{}",
+                    prog.dump_tape(n)
+                );
+            }
             // Only a FULLY-resolved program is a runnable megakernel target;
             // a placeholder locator (e.g. dense gate/up fused under one
             // accessor) must not be baked into a runtime builder.

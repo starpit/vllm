@@ -119,11 +119,29 @@ pub mod op_kind {
     /// cache (the oracle's `rope_append` K side); attention then reads the
     /// new token from the cache.
     pub const ROPE_APPEND: u32 = 8;
+    /// A qmv whose output crosses workers: it writes its result DIRECTLY into
+    /// the coherent (atomic u32-packed) handoff buffer, simdgroup-locally and
+    /// sentinel-safe (PAT-4). Replaces the `QMV` + separate `PUBLISH` + the
+    /// compute→publish barrier — the store itself is the readiness signal a
+    /// consumer `ACQUIRE`-spins on. Operands `[w, scales, biases, x, y_coh]`.
+    pub const QMV_COH: u32 = 9;
 }
 
 /// `u32`s per shape-class record (`WL_SHAPE_STRIDE`). Wide enough for
 /// attention's six dims; simpler ops use the leading slots.
 pub const SHAPE_STRIDE: usize = 8;
+
+/// Simdgroups in a worker's fixed 1024-thread threadgroup. The tranche packer
+/// distributes a tranche's mutually-independent ops across these (the player's
+/// `simd_gid` runs `[0, NUM_SIMDGROUPS)`).
+pub const NUM_SIMDGROUPS: u32 = 32;
+
+/// Pack a Compute instruction's `[sg_start, sg_count)` simdgroup range into the
+/// tape flag field. `sg_count == 0` (an unpacked / solo op) the player reads as
+/// the whole TG, so the default `flag = 0` keeps the old whole-TG behaviour.
+pub fn encode_sg_range(sg_start: u32, sg_count: u32) -> u32 {
+    (sg_start & 0xFF) | ((sg_count & 0xFF) << 8)
+}
 
 // ── The neutral program ──────────────────────────────────────────────
 
@@ -217,6 +235,78 @@ impl MegaProgram {
             })
             .count()
     }
+
+    /// Dump each worker's tape GROUPED INTO TRANCHES, so the dump shows the
+    /// parallelism structure the tape encodes. A tranche is a maximal run of
+    /// consecutive `Compute` instructions (nothing — no `BARRIER`/`Wait`/
+    /// `Signal` — between them); its ops run CONCURRENTLY on their `@start-end`
+    /// simdgroup ranges, and a `BARRIER` ends it. Each worker prints
+    /// `[(op,op,…), Wn, (op,…), Sn, …]`: a `(…)` group is one tranche (its ops
+    /// are parallel), `Wn`/`Sn` are the cross-worker wait/signal on flag `n`.
+    /// Ops: `qmv(K,N)` (+`@s-e` when packed onto a simdgroup sub-range) / `rms`
+    /// / `rope` / `ropeA` / `silu` / `add` / `attn` / `pub` / `acq`. So
+    /// `[(rms), (qmv(2048,256)@0-16, qmv(512,2048)@16-32)]` = tranche 0 is rms
+    /// alone (whole TG), tranche 1 runs two qmvs in parallel on 16 simdgroups
+    /// each. First `max_per_worker` instructions per worker.
+    pub fn dump_tape(&self, max_per_worker: usize) -> String {
+        let opname = |op: u32| match op {
+            op_kind::QMV => "qmv",
+            op_kind::PUBLISH => "pub",
+            op_kind::ACQUIRE => "acq",
+            op_kind::RMSNORM => "rms",
+            op_kind::SILU_MUL => "silu",
+            op_kind::ROPE => "rope",
+            op_kind::ATTN => "attn",
+            op_kind::ADD => "add",
+            op_kind::ROPE_APPEND => "ropeA",
+            _ => "op?",
+        };
+        let mut out = String::new();
+        for w in 0..self.tape_offsets.len().saturating_sub(1) {
+            let lo = self.tape_offsets[w] as usize;
+            let hi = self.tape_offsets[w + 1] as usize;
+            let shown = hi.min(lo + max_per_worker);
+            let mut groups: Vec<String> = Vec::new();
+            let mut tranche: Vec<String> = Vec::new(); // current run of parallel computes
+            for i in lo..shown {
+                let ins = self.tape[i];
+                if ins[0] == opcode::COMPUTE {
+                    let sh = &self.shapes[ins[1] as usize];
+                    let mut t = opname(sh[0]).to_string();
+                    if sh[0] == op_kind::QMV {
+                        t += &format!("({},{})", sh[1], sh[2]);
+                    }
+                    let sgc = (ins[3] >> 8) & 0xFF;
+                    if sgc != 0 {
+                        let sgs = ins[3] & 0xFF;
+                        t += &format!("@{}-{}", sgs, sgs + sgc);
+                    }
+                    tranche.push(t);
+                } else {
+                    // Any sync/barrier ends the current tranche.
+                    if !tranche.is_empty() {
+                        groups.push(format!("({})", tranche.join(",")));
+                        tranche.clear();
+                    }
+                    match ins[0] {
+                        opcode::WAIT => groups.push(format!("W{}", ins[3])),
+                        opcode::SIGNAL => groups.push(format!("S{}", ins[3])),
+                        opcode::BARRIER => {} // boundary only — already split above
+                        _ => {}
+                    }
+                }
+            }
+            if !tranche.is_empty() {
+                groups.push(format!("({})", tranche.join(",")));
+            }
+            out += &format!("  w{w}: [{}]", groups.join(", "));
+            if shown < hi {
+                out += &format!(" …(+{} more)", hi - shown);
+            }
+            out.push('\n');
+        }
+        out
+    }
 }
 
 // ── Serializer inputs ────────────────────────────────────────────────
@@ -298,15 +388,49 @@ impl std::error::Error for SerializeError {}
 
 // ── The serializer ───────────────────────────────────────────────────
 
+/// How a worker's tape is laid out — the point-2 study's two emission orders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitMode {
+    /// DEFAULT. Each producer's publish/signal is emitted immediately after its
+    /// compute, so cross-worker consumers unblock ASAP and DAG levels overlap
+    /// across workers (the low-latency ~9 ms schedule). No multi-op runs, so the
+    /// simdgroup packer is a no-op.
+    Pipelined,
+    /// OPT-IN study. Group a worker's same-(ASAP-)level ops into a tranche and
+    /// batch their publishes/signals, so the simdgroup packer can run them
+    /// concurrently on disjoint simdgroup ranges. MEASURED net-neutral at M=1
+    /// (the deferred signals turn each level into a BSP superstep whose sync
+    /// cost cancels the packing gain). Kept as the reproducible disproof.
+    Tranche,
+    /// DIAGNOSTIC ONLY (WRONG RESULT). Emit each worker's computes back-to-back
+    /// with NO cross-worker sync (no Wait/Signal), NO handoff (no Acquire/
+    /// Publish), and NO barriers — every read hits the shared arena slot (racy/
+    /// stale). The token stream is garbage; the point is the TIMING: it isolates
+    /// the raw per-worker compute throughput from all sync/idle, so the gap to
+    /// the real (pipelined) mega is exactly what cross-worker sync + idle costs.
+    ComputeOnly,
+}
+
 /// Flatten a wavefront [`Schedule`] over a [`RegionGraph`] into a
-/// [`MegaProgram`]. `sources` is parallel to `graph.tensors[0..
-/// num_sources]`; `geom` supplies the element width and the attention
-/// paged-cache geometry the abstract graph omits.
+/// [`MegaProgram`] with the default ([`EmitMode::Pipelined`]) layout. `sources`
+/// is parallel to `graph.tensors[0..num_sources]`; `geom` supplies the element
+/// width and the attention paged-cache geometry the abstract graph omits.
 pub fn serialize(
     graph: &RegionGraph,
     schedule: &Schedule,
     sources: &[SourceDesc],
     geom: Geometry,
+) -> Result<MegaProgram, SerializeError> {
+    serialize_mode(graph, schedule, sources, geom, EmitMode::Pipelined)
+}
+
+/// As [`serialize`], choosing the worker-tape [`EmitMode`].
+pub fn serialize_mode(
+    graph: &RegionGraph,
+    schedule: &Schedule,
+    sources: &[SourceDesc],
+    geom: Geometry,
+    mode: EmitMode,
 ) -> Result<MegaProgram, SerializeError> {
     let mut ser = Ser::new(graph, sources, geom);
     ser.assign_arena_slots()?;
@@ -317,57 +441,91 @@ pub fn serialize(
     let worker_of = reconstruct_worker_of(graph, schedule);
     ser.plan_handoffs(&worker_of)?;
 
-    // Region-overlap predecessors (the RAW edges). A Compute needs an
-    // intra-worker barrier before it iff one of its predecessors ran on the
-    // SAME worker since the last sync. Cross-worker preds aren't in `since`, so
-    // they're handled by the schedule's Wait/Signal, not by these barriers.
+    // Region-overlap predecessors (the RAW edges). They both split a worker's
+    // computes into tranches (a same-worker producer→consumer edge is a tranche
+    // boundary) and tell us which tranche boundaries need an intra-worker
+    // barrier. Cross-worker preds are gated by the schedule's Wait/Signal, not
+    // by these barriers.
     let preds = predecessors(graph);
+
+    // ASAP level (longest path from a root) of every node. Nodes at the same
+    // level are mutually independent AND have all inputs at strictly lower
+    // levels — so a worker's level-L computes are a tranche the simdgroup packer
+    // can run concurrently, and (since a level-L tranche only WAITs on `< L`
+    // producers and SIGNALs `> L` consumers) batching its signals at the tranche
+    // END stays deadlock-free. (Grouping by same-worker RAW instead would let a
+    // tranche mix levels — waiting on a high level while a peer waits on this
+    // tranche's deferred low-level signal — a cycle.) preds have smaller ids, so
+    // one ascending-id pass suffices.
+    let mut level = vec![0u32; graph.nodes.len()];
+    for node in &graph.nodes {
+        let id = node.id.0 as usize;
+        level[id] = preds[id]
+            .iter()
+            .map(|p| level[p.0 as usize] + 1)
+            .max()
+            .unwrap_or(0);
+    }
+    // Each producer's Signal flag, read off the schedule (a `Compute(id)` trailed
+    // by `Signal(f)`), so a consumer tranche can wait on its cross-worker inputs'
+    // flags regardless of how the schedule ordered the original per-node waits.
+    let mut producer_flag = vec![u32::MAX; graph.nodes.len()];
+    for worker in &schedule.workers {
+        let mut last: Option<SubtileId> = None;
+        for instr in &worker.tape {
+            match *instr {
+                TapeInstr::Compute(id) => last = Some(id),
+                TapeInstr::Signal(f) => {
+                    if let Some(id) = last {
+                        producer_flag[id.0 as usize] = f;
+                    }
+                }
+                TapeInstr::Wait(_) => {}
+            }
+        }
+    }
+
     let mut tape: Vec<[u32; 4]> = Vec::new();
     let mut tape_offsets: Vec<u32> = vec![0];
     for (wi, worker) in schedule.workers.iter().enumerate() {
         ser.acquired.clear(); // private acquired-copies are per worker
-        let wi = wi as u32;
-        // Nodes this worker computed since its last barrier/Signal/Wait (each
-        // of those carries a device fence). Cleared whenever one is emitted.
-        let mut since: HashSet<SubtileId> = HashSet::new();
-        for instr in &worker.tape {
-            match *instr {
-                TapeInstr::Compute(id) => {
-                    let node = &graph.nodes[id.0 as usize];
-                    // ACQUIRE each cross-worker input before reading it (the
-                    // worker `Wait`ed on the producers' flags just above).
-                    let n_acq = ser.emit_acquires(node, wi, &mut tape)?;
-                    // Barrier before the Compute iff it reads an ACQUIRE's
-                    // private copy (n_acq > 0) or a same-worker producer's
-                    // output (RAW). One barrier coalesces all prior writes.
-                    let raw = preds[id.0 as usize].iter().any(|p| since.contains(p));
-                    if n_acq > 0 || raw {
-                        tape.push([opcode::BARRIER, 0, 0, 0]);
-                        since.clear();
-                    }
-                    let (sc, base) = ser.emit_compute(node)?;
-                    tape.push([opcode::COMPUTE, sc, base, 0]);
-                    since.insert(id);
-                    // PUBLISH this output's stripe if it crosses workers (before
-                    // the schedule's next `Signal`). The PUBLISH reads the
-                    // output the Compute just wrote ⇒ fence between them.
-                    if ser.produces_handoff(node) {
-                        tape.push([opcode::BARRIER, 0, 0, 0]);
-                        since.clear();
-                        ser.emit_publish(node, &mut tape)?;
+        match mode {
+            EmitMode::Tranche => emit_worker_tranches(
+                &mut ser,
+                wi as u32,
+                worker,
+                &preds,
+                &level,
+                &producer_flag,
+                &mut tape,
+            )?,
+            EmitMode::ComputeOnly => {
+                // No sync, no handoff, no barriers — racy/wrong, timing only.
+                for instr in &worker.tape {
+                    if let TapeInstr::Compute(id) = *instr {
+                        let node = &graph.nodes[id.0 as usize];
+                        let (sc, base) = ser.emit_compute(node)?;
+                        tape.push([opcode::COMPUTE, sc, base, 0]);
                     }
                 }
-                TapeInstr::Signal(f) => {
-                    tape.push([opcode::SIGNAL, 0, 0, f]);
-                    since.clear();
-                }
-                TapeInstr::Wait(f) => {
-                    tape.push([opcode::WAIT, 0, 0, f]);
-                    since.clear();
-                }
+            }
+            EmitMode::Pipelined => {
+                emit_worker_pipelined(&mut ser, wi as u32, worker, &preds, &mut tape)?
             }
         }
         tape_offsets.push(tape.len() as u32);
+    }
+
+    // Point-2 simdgroup packing only applies in the tranche path (which emits a
+    // tranche's independent ops as a consecutive run for the packer to spread
+    // across the 32 simdgroups). The pipelined default emits a producer's
+    // publish/signal between computes, so there are no multi-op runs to pack;
+    // skipping keeps the default tape byte-identical to the committed mega.
+    // MEASURED (M5, 1B-4bit, clean): packing is BW-neutral — tranche+pack 9.3 ms
+    // vs pipelined 9.0 ms (both ~78 GB/s) vs per-op 6.3 ms. The M=1 gap is
+    // 1-TG-per-core occupancy, which intra-TG packing cannot change. See memory.
+    if mode == EmitMode::Tranche {
+        pack_simdgroup_ranges(&mut tape, &tape_offsets, &ser.shapes);
     }
 
     let result = ser.arena_bufid(graph.result);
@@ -382,6 +540,315 @@ pub fn serialize(
         arena_bytes: ser.arena_bytes,
         result,
     })
+}
+
+/// Emit one worker's tape in the DEFAULT pipelined per-node order: each compute
+/// is preceded by its `ACQUIRE`s + a barrier (iff it reads an acquired private
+/// copy or a same-worker producer since the last sync), and a producer's
+/// `PUBLISH` (fenced) + `Signal` are emitted IMMEDIATELY after its compute.
+/// Signalling immediately lets cross-worker consumers unblock as soon as their
+/// specific producer is done, so adjacent DAG levels overlap across workers —
+/// the low-latency schedule. (The simdgroup packer rarely fires here: producers
+/// hand off, so their publish barrier splits consecutive computes — that is the
+/// cost the tranche path trades against.) `worker.tape` is `[Wait* Compute
+/// Signal?]` in ascending id; emitted verbatim.
+fn emit_worker_pipelined(
+    ser: &mut Ser,
+    wi: u32,
+    worker: &crate::region_schedule::Worker,
+    preds: &[Vec<SubtileId>],
+    tape: &mut Vec<[u32; 4]>,
+) -> Result<(), SerializeError> {
+    let graph = ser.graph;
+    // Nodes computed since this worker's last barrier/Signal/Wait (each carries
+    // a device fence); cleared whenever one is emitted.
+    let mut since: HashSet<SubtileId> = HashSet::new();
+    for instr in &worker.tape {
+        match *instr {
+            TapeInstr::Compute(id) => {
+                let node = &graph.nodes[id.0 as usize];
+                let n_acq = ser.emit_acquires(node, wi, tape)?;
+                let raw = preds[id.0 as usize].iter().any(|p| since.contains(p));
+                if n_acq > 0 || raw {
+                    tape.push([opcode::BARRIER, 0, 0, 0]);
+                    since.clear();
+                }
+                let (sc, base) = ser.emit_compute(node)?;
+                tape.push([opcode::COMPUTE, sc, base, 0]);
+                since.insert(id);
+                // A qmv handoff producer wrote the coherent slot DIRECTLY
+                // (QMV_COH) — no PUBLISH, no compute→publish barrier. Only a
+                // non-qmv handoff producer (rope/silu/add output crossing
+                // workers) still needs the barrier + PUBLISH from arena.
+                if ser.produces_handoff(node) && !matches!(node.op, SubOp::MatmulTile) {
+                    tape.push([opcode::BARRIER, 0, 0, 0]);
+                    since.clear();
+                    ser.emit_publish(node, tape)?;
+                }
+            }
+            // PAT-4 (data-IS-the-flag): the cross-worker order is carried by the
+            // consumer's spin-ACQUIRE on the producer's coherent store, so the
+            // schedule's Signal/Wait flags are redundant — drop them (and the
+            // device barrier each one carried in the player). These were the
+            // dominant sync cost (3192 waits + signals, each a TG barrier).
+            TapeInstr::Signal(_) | TapeInstr::Wait(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Emit one worker's tape, grouped into **tranches by ASAP level** so the
+/// simdgroup packer can run a tranche's independent ops concurrently. The
+/// worker's computes are bucketed by `level` and emitted in ascending level;
+/// each level-bucket is one tranche of mutually-independent ops (all their
+/// inputs are at strictly lower levels, already produced). Per tranche, in
+/// order: its cross-worker `Wait`s (worker-deduped, on its inputs' producer
+/// flags) → `ACQUIRE`s → one `BARRIER` (iff it acquired or reads an earlier
+/// tranche's same-worker output) → all its `Compute`s (the packer splits the 32
+/// simdgroups among them) → one `BARRIER` + the `PUBLISH`es of any cross-worker
+/// outputs → the producers' `Signal`s. Batching publishes/signals AFTER all the
+/// computes (vs `compute,barrier,publish,signal` per node) keeps the tranche's
+/// computes consecutive for the packer; deferring the signals is safe precisely
+/// because a level-L tranche signals only `> L` consumers and waits only `< L`
+/// producers — no wait cycle.
+#[allow(clippy::too_many_arguments)]
+fn emit_worker_tranches(
+    ser: &mut Ser,
+    wi: u32,
+    worker: &crate::region_schedule::Worker,
+    preds: &[Vec<SubtileId>],
+    level: &[u32],
+    producer_flag: &[u32],
+    tape: &mut Vec<[u32; 4]>,
+) -> Result<(), SerializeError> {
+    // The graph ref is also held by `ser`; bind it separately so a node borrow
+    // (`&graph.nodes[..]`) can coexist with `&mut ser` (which only mutates ser's
+    // other fields). Both are shared refs to the same graph.
+    let graph = ser.graph;
+
+    // This worker's computes (the schedule emits them in ascending id).
+    let mut ids: Vec<SubtileId> = worker
+        .tape
+        .iter()
+        .filter_map(|i| match i {
+            TapeInstr::Compute(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // A pred in `on_worker` is same-worker (tranche-boundary barrier); one not in
+    // it is cross-worker (gated by a Wait on its producer flag).
+    let on_worker: HashSet<SubtileId> = ids.iter().copied().collect();
+    // Order by (level, id): a valid topological order that buckets same-level
+    // (independent, concurrently-runnable) computes together.
+    ids.sort_by_key(|id| (level[id.0 as usize], id.0));
+
+    let mut waited: HashSet<u32> = HashSet::new(); // flags this worker has waited
+    let mut i = 0usize;
+    while i < ids.len() {
+        let lvl = level[ids[i].0 as usize];
+        let mut j = i;
+        while j < ids.len() && level[ids[j].0 as usize] == lvl {
+            j += 1;
+        }
+        let tranche = &ids[i..j];
+
+        // 1. Wait on each cross-worker input's producer flag (deduped per worker).
+        for &id in tranche {
+            for p in &preds[id.0 as usize] {
+                if !on_worker.contains(p) {
+                    let f = producer_flag[p.0 as usize];
+                    debug_assert_ne!(f, u32::MAX, "cross-worker producer must have a flag");
+                    if waited.insert(f) {
+                        tape.push([opcode::WAIT, 0, 0, f]);
+                    }
+                }
+            }
+        }
+        // 2. ACQUIRE each cross-worker input (emit_acquires dedups per worker).
+        let mut n_acq = 0usize;
+        for &id in tranche {
+            n_acq += ser.emit_acquires(&graph.nodes[id.0 as usize], wi, tape)?;
+        }
+        // 3. Barrier before the computes iff an ACQUIRE wrote a private copy, or
+        //    a compute reads a same-worker producer from an earlier tranche.
+        let cross_tranche_raw = tranche.iter().any(|&id| {
+            preds[id.0 as usize]
+                .iter()
+                .any(|p| on_worker.contains(p) && !tranche.contains(p))
+        });
+        if n_acq > 0 || cross_tranche_raw {
+            tape.push([opcode::BARRIER, 0, 0, 0]);
+        }
+        // 4. The tranche's computes (flag 0; pack_simdgroup_ranges fills it).
+        for &id in tranche {
+            let (sc, base) = ser.emit_compute(&graph.nodes[id.0 as usize])?;
+            tape.push([opcode::COMPUTE, sc, base, 0]);
+        }
+        // 5. PUBLISH every cross-worker output, fenced from the computes by one
+        //    barrier (the computes wrote disjoint stripes; one barrier covers all).
+        let publishes: Vec<SubtileId> = tranche
+            .iter()
+            .copied()
+            .filter(|&id| ser.produces_handoff(&graph.nodes[id.0 as usize]))
+            .collect();
+        if !publishes.is_empty() {
+            tape.push([opcode::BARRIER, 0, 0, 0]);
+            for id in &publishes {
+                ser.emit_publish(&graph.nodes[id.0 as usize], tape)?;
+            }
+        }
+        // 6. Signals for this tranche's producers (after the publishes they fence).
+        for &id in tranche {
+            let f = producer_flag[id.0 as usize];
+            if f != u32::MAX {
+                tape.push([opcode::SIGNAL, 0, 0, f]);
+            }
+        }
+        i = j;
+    }
+    Ok(())
+}
+
+// ── Tranche simdgroup packer (point-2) ───────────────────────────────
+
+/// Whether the player's arm for `op` is **simdgroup-local** — it uses no
+/// threadgroup scratch and no TG-wide `threadgroup_barrier`, so it runs
+/// correctly on any disjoint sub-range of the 32 simdgroups (and several such
+/// ops can therefore run concurrently). The threadgroup-wide arms (RMSNORM /
+/// ATTN reduce across all 1024 threads; PUBLISH / ACQUIRE pack across them;
+/// ROPE_APPEND has an internal device barrier) must keep the whole TG, so a run
+/// containing any of them is left solo.
+fn is_packable(op: u32) -> bool {
+    matches!(
+        op,
+        op_kind::QMV | op_kind::SILU_MUL | op_kind::ROPE | op_kind::ADD
+    )
+}
+
+/// The relative cost of one packable op, used to size its simdgroup share. A
+/// qmv is bandwidth-bound on its weight read (`N × K` bytes); the elementwise
+/// arms scale with their element count `N`.
+fn op_cost(shape: &[u32; SHAPE_STRIDE]) -> f64 {
+    match shape[0] {
+        op_kind::QMV => shape[1] as f64 * shape[2] as f64, // K × N
+        _ => shape[1] as f64,                              // N
+    }
+}
+
+/// Assign each op in a tranche a `[sg_start, sg_count)` simdgroup range over the
+/// worker's [`NUM_SIMDGROUPS`] simdgroups, sized ∝ cost so the tranche's
+/// makespan (`max over ops of work/simdgroups`) is minimised. `sg_count` is
+/// always **even** (qmv pairs two simdgroups per 8-row group). Returns one
+/// `(start, count)` per input op, in input order.
+///
+/// Ranges partition the 32 simdgroups into `min(k, 16)` contiguous **lanes**
+/// (each lane ≥ 1 pair). With `k ≤ 16` (the decode reality — e.g. ~6 gate/up
+/// blocks per worker) each op gets its own cost-weighted lane and they all run
+/// concurrently. With `k > 16` (very fine N-blocking) ops share lanes by greedy
+/// longest-processing-time balance and the lane's ops run sequentially while
+/// the 16 lanes run concurrently — still correct, just less parallel.
+fn pack_tranche(costs: &[f64]) -> Vec<(u32, u32)> {
+    let k = costs.len();
+    debug_assert!(k > 0);
+    let total_pairs = NUM_SIMDGROUPS / 2; // 16 pairs (qmv needs simdgroup pairs)
+    let n_lanes = k.min(total_pairs as usize);
+    let cmp = |a: f64, b: f64| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+
+    // Greedy LPT: place the costliest ops first, each onto the least-loaded lane.
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| cmp(costs[b], costs[a]));
+    let mut lane_of = vec![0usize; k];
+    let mut lane_load = vec![0f64; n_lanes];
+    for &oi in &order {
+        let l = (0..n_lanes)
+            .min_by(|&a, &b| cmp(lane_load[a], lane_load[b]))
+            .unwrap();
+        lane_of[oi] = l;
+        lane_load[l] += costs[oi];
+    }
+
+    // Distribute the 16 simdgroup-pairs across lanes ∝ load (each lane ≥ 1 pair),
+    // greedily handing the next pair to the lane with the worst load/pair ratio.
+    let mut pairs = vec![1u32; n_lanes];
+    let mut remaining = total_pairs - n_lanes as u32;
+    while remaining > 0 {
+        let l = (0..n_lanes)
+            .max_by(|&a, &b| {
+                cmp(
+                    lane_load[a] / pairs[a] as f64,
+                    lane_load[b] / pairs[b] as f64,
+                )
+            })
+            .unwrap();
+        pairs[l] += 1;
+        remaining -= 1;
+    }
+
+    // Contiguous simdgroup range per lane; each op takes its lane's range.
+    let mut lane_start = vec![0u32; n_lanes];
+    let mut acc = 0u32;
+    for l in 0..n_lanes {
+        lane_start[l] = acc;
+        acc += pairs[l] * 2;
+    }
+    debug_assert_eq!(acc, NUM_SIMDGROUPS, "lanes must cover all simdgroups");
+    (0..k)
+        .map(|oi| {
+            let l = lane_of[oi];
+            (lane_start[l], pairs[l] * 2)
+        })
+        .collect()
+}
+
+/// Stamp per-op simdgroup ranges into the Compute flag fields. For each worker
+/// it finds maximal runs of consecutive Compute instructions — which the
+/// emission guarantees are mutually independent (a BARRIER / Signal / Wait sits
+/// at every dependence edge) — and, when every op in the run is simdgroup-local
+/// and the run has more than one op, packs them with [`pack_tranche`]. Single-op
+/// runs and runs containing a threadgroup-wide op are left at `flag = 0` (the
+/// player then gives them the whole TG, i.e. the prior sequential behaviour).
+fn pack_simdgroup_ranges(
+    tape: &mut [[u32; 4]],
+    tape_offsets: &[u32],
+    shapes: &[[u32; SHAPE_STRIDE]],
+) {
+    // PERF DIAG (droppable): FERRITE_WAVEFRONT_PACK=0 leaves every Compute at the
+    // whole TG (flag 0) so the tranche restructure can be measured WITHOUT the
+    // simdgroup packing — isolating the two levers.
+    if std::env::var("FERRITE_WAVEFRONT_PACK").as_deref() == Ok("0") {
+        return;
+    }
+    let op_of = |instr: &[u32; 4]| shapes[instr[1] as usize][0];
+    for w in 0..tape_offsets.len().saturating_sub(1) {
+        let lo = tape_offsets[w] as usize;
+        let hi = tape_offsets[w + 1] as usize;
+        let mut i = lo;
+        while i < hi {
+            if tape[i][0] != opcode::COMPUTE {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < hi && tape[i][0] == opcode::COMPUTE {
+                i += 1;
+            }
+            let run = start..i;
+            if run.len() < 2 || !run.clone().all(|j| is_packable(op_of(&tape[j]))) {
+                continue; // solo op, or a threadgroup-wide run → leave flag = 0
+            }
+            let costs: Vec<f64> = run
+                .clone()
+                .map(|j| op_cost(&shapes[tape[j][1] as usize]))
+                .collect();
+            for (k, j) in run.zip(pack_tranche(&costs)) {
+                let (sg_start, sg_count) = j;
+                tape[k][3] = encode_sg_range(sg_start, sg_count);
+            }
+        }
+    }
 }
 
 /// Recover `worker_of[node_id]` from the schedule's per-worker tapes: a
@@ -815,9 +1282,31 @@ impl<'a> Ser<'a> {
         let s_buf = self.intern(scales, scale_elem);
         let b_buf = self.intern(biases, scale_elem);
         let x = self.read_operand(act, id)?;
-        let y = OperandSlot {
-            buffer: self.arena_bufid(out.tensor),
-            byte_offset: y_off,
+        // PAT-4 producer fuse: if this qmv's output crosses workers, write it
+        // STRAIGHT into the handoff's coherent (atomic u32-packed) slot at this
+        // block's stripe — no arena, no separate PUBLISH, no compute→publish
+        // barrier (the qmv-coh arm stores each simdgroup's own rows, so nothing
+        // re-reads them; the store IS the readiness signal). `r` is even (nb /
+        // block starts even), so the pair offset `r/2` is exact.
+        let handoff_slot = self.handoff.get(&out.tensor).map(|h| h.coherent_slot);
+        let (y, op) = match handoff_slot {
+            Some(coherent_slot) => {
+                let coh = self.intern(BufferRef::ArenaSlot(coherent_slot), 4);
+                (
+                    OperandSlot {
+                        buffer: coh,
+                        byte_offset: (r / 2) * 4,
+                    },
+                    op_kind::QMV_COH,
+                )
+            }
+            None => (
+                OperandSlot {
+                    buffer: self.arena_bufid(out.tensor),
+                    byte_offset: y_off,
+                },
+                op_kind::QMV,
+            ),
         };
         let base = self.push_operands(&[
             OperandSlot {
@@ -835,7 +1324,7 @@ impl<'a> Ser<'a> {
             x,
             y,
         ]);
-        let sc = self.intern_shape([op_kind::QMV, k, n, 0, 0, 0, 0, 0]);
+        let sc = self.intern_shape([op, k, n, 0, 0, 0, 0, 0]);
         Ok((sc, base))
     }
 
@@ -1291,15 +1780,24 @@ mod tests {
             "P=2: the cross-worker handoff fires"
         );
 
-        // Both arms are present, and each ACQUIRE reads a coherent slot that
-        // some PUBLISH wrote (same staging buffer) — the round-trip is closed.
+        // PAT-4 producer fuse: the qmv producer writes its coherent slot
+        // DIRECTLY (QMV_COH) — there is NO PUBLISH for a qmv. Each ACQUIRE reads
+        // a coherent slot that some QMV_COH wrote (same staging buffer) — the
+        // round-trip is still closed, just without the separate publish.
         let kinds: HashSet<u32> = p2
             .tape
             .iter()
             .filter(|i| i[0] == opcode::COMPUTE)
             .map(|i| p2.shapes[i[1] as usize][0])
             .collect();
-        assert!(kinds.contains(&op_kind::PUBLISH), "a PUBLISH compute");
+        assert!(
+            kinds.contains(&op_kind::QMV_COH),
+            "a QMV_COH compute (qmv producer writes coherent directly)"
+        );
+        assert!(
+            !kinds.contains(&op_kind::PUBLISH),
+            "no PUBLISH for a qmv producer (fused into QMV_COH)"
+        );
         assert!(kinds.contains(&op_kind::ACQUIRE), "an ACQUIRE compute");
         let coherent_of = |op: u32, slot_idx: usize| -> HashSet<BufId> {
             p2.tape
@@ -1308,11 +1806,11 @@ mod tests {
                 .map(|i| p2.operands[i[2] as usize + slot_idx].buffer)
                 .collect()
         };
-        let published_into = coherent_of(op_kind::PUBLISH, 0); // PUBLISH operand 0 = coherent
+        let published_into = coherent_of(op_kind::QMV_COH, 4); // QMV_COH operand 4 = y_coh
         let acquired_from = coherent_of(op_kind::ACQUIRE, 1); // ACQUIRE operand 1 = coherent
         assert!(
             !acquired_from.is_empty() && acquired_from.is_subset(&published_into),
-            "every acquired staging slot was published into: pub={published_into:?} acq={acquired_from:?}"
+            "every acquired staging slot was written by a QMV_COH: pub={published_into:?} acq={acquired_from:?}"
         );
     }
 
@@ -1669,28 +2167,24 @@ mod tests {
                 }
             }
 
-            // Flag discipline (mirrors region_schedule::flag_invariants).
-            assert_eq!(prog.num_flags, s.num_flags);
-            let mut sig = vec![0u32; prog.num_flags as usize];
-            let mut wai = vec![0u32; prog.num_flags as usize];
-            for instr in &prog.tape {
-                match instr[0] {
-                    opcode::SIGNAL => sig[instr[3] as usize] += 1,
-                    opcode::WAIT => wai[instr[3] as usize] += 1,
-                    _ => {}
-                }
-            }
-            for f in 0..prog.num_flags as usize {
-                assert_eq!(sig[f], 1, "flag {f} signaled once (p={p})");
-                assert!(wai[f] >= 1, "flag {f} waited (p={p})");
-            }
+            // PAT-4 (data-IS-the-flag): cross-worker order is carried by the
+            // consumer's spin-ACQUIRE on the producer's coherent store, so the
+            // tape emits NO Signal/Wait flags at all.
+            let signals = prog.tape.iter().filter(|i| i[0] == opcode::SIGNAL).count();
+            let waits = prog.tape.iter().filter(|i| i[0] == opcode::WAIT).count();
+            assert_eq!(signals, 0, "no SIGNAL — data-is-flag (p={p})");
+            assert_eq!(waits, 0, "no WAIT — data-is-flag (p={p})");
 
-            // Op histogram: 6 qmv, 1 rms, 2 rope, 1 attn, 1 add.
+            // Op histogram: 6 qmv, 1 rms, 2 rope, 1 attn, 1 add. (A cross-worker
+            // qmv producer is emitted as QMV_COH — coherent direct output — so
+            // count QMV + QMV_COH for the total.)
             let mut hist = std::collections::HashMap::new();
             for instr in prog.tape.iter().filter(|i| i[0] == opcode::COMPUTE) {
                 *hist.entry(op_of(&prog, instr)).or_insert(0u32) += 1;
             }
-            assert_eq!(hist.get(&op_kind::QMV), Some(&6), "p={p}");
+            let qmv_total = hist.get(&op_kind::QMV).copied().unwrap_or(0)
+                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0);
+            assert_eq!(qmv_total, 6, "p={p}");
             assert_eq!(hist.get(&op_kind::RMSNORM), Some(&1));
             assert_eq!(hist.get(&op_kind::ROPE), Some(&2));
             assert_eq!(hist.get(&op_kind::ATTN), Some(&1));
@@ -1892,7 +2386,10 @@ mod tests {
             for instr in prog.tape.iter().filter(|i| i[0] == opcode::COMPUTE) {
                 *hist.entry(op_of(&prog, instr)).or_insert(0u32) += 1;
             }
-            assert_eq!(hist.get(&op_kind::QMV), Some(&7), "q,k,v,o,gate,up,down");
+            // q,k,v,o,gate,up,down — a cross-worker producer is QMV_COH.
+            let qmv_total = hist.get(&op_kind::QMV).copied().unwrap_or(0)
+                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0);
+            assert_eq!(qmv_total, 7, "q,k,v,o,gate,up,down");
             assert_eq!(hist.get(&op_kind::RMSNORM), Some(&2));
             assert_eq!(hist.get(&op_kind::ROPE), Some(&2));
             assert_eq!(hist.get(&op_kind::ATTN), Some(&1));
@@ -2061,5 +2558,122 @@ mod tests {
             matches!(err, SerializeError::UnsupportedOp { detail, .. } if detail.contains("Silu")),
             "standalone Silu must error (pending fusion), got {err:?}"
         );
+    }
+
+    // ── tranche simdgroup packer (point-2) ──────────────────────────
+
+    /// `(sg_start, sg_count)` ranges sorted by start must contiguously
+    /// partition all `NUM_SIMDGROUPS`, with even counts ≥ 2.
+    fn assert_partition(ranges: &[(u32, u32)]) {
+        for &(_, c) in ranges {
+            assert!(c >= 2 && c % 2 == 0, "sg_count even ≥ 2, got {c}");
+            assert!(c <= NUM_SIMDGROUPS, "sg_count ≤ 32, got {c}");
+        }
+        let mut sorted: Vec<(u32, u32)> = ranges.to_vec();
+        sorted.sort_by_key(|&(s, _)| s);
+        sorted.dedup();
+        let mut acc = 0u32;
+        for &(s, c) in &sorted {
+            assert_eq!(s, acc, "lanes contiguous from 0");
+            acc += c;
+        }
+        assert_eq!(acc, NUM_SIMDGROUPS, "lanes cover every simdgroup");
+    }
+
+    /// `pack_tranche` always partitions the 32 simdgroups into even lanes, and
+    /// (when each op gets its own lane, k ≤ 16) the costliest op gets no fewer
+    /// simdgroups than the cheapest.
+    #[test]
+    fn pack_tranche_invariants() {
+        for costs in [
+            vec![1.0, 1.0],      // two equal blocks
+            vec![4.0, 1.0, 1.0], // q : k : v
+            vec![1.0; 6],        // ~6 gate/up blocks, equal
+            vec![3.0, 2.0, 2.0, 1.0, 1.0],
+            vec![8.0, 1.0], // very skewed
+        ] {
+            let ranges = pack_tranche(&costs);
+            assert_eq!(ranges.len(), costs.len());
+            assert_partition(&ranges);
+            let cmp = |a: usize, b: usize| costs[a].partial_cmp(&costs[b]).unwrap();
+            let imax = (0..costs.len()).max_by(|&a, &b| cmp(a, b)).unwrap();
+            let imin = (0..costs.len()).min_by(|&a, &b| cmp(a, b)).unwrap();
+            assert!(
+                ranges[imax].1 >= ranges[imin].1,
+                "costlier op gets ≥ simdgroups: costs={costs:?} ranges={ranges:?}"
+            );
+        }
+    }
+
+    /// More ops than simdgroup-pairs (> 16): ops share lanes but the result is
+    /// still a valid even partition (each lane runs its ops sequentially).
+    #[test]
+    fn pack_tranche_more_ops_than_lanes() {
+        let ranges = pack_tranche(&vec![1.0; 40]);
+        assert_eq!(ranges.len(), 40);
+        assert_partition(&ranges);
+        let starts: std::collections::HashSet<u32> = ranges.iter().map(|&(s, _)| s).collect();
+        assert!(starts.len() <= 16, "at most 16 lanes, got {}", starts.len());
+    }
+
+    /// A wide qmv N-block-tiled into 4 independent blocks on one worker is a
+    /// tranche: the 4 consecutive Computes get disjoint simdgroup ranges
+    /// covering all 32 — they run concurrently in the player.
+    #[test]
+    fn serialize_packs_independent_qmv_tranche() {
+        let (n, k, nb) = (128u32, 2048u32, 32u32);
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: k },
+                SourceShape { rows: n, cols: k },
+            ],
+            ops: vec![OpDesc {
+                op: LoweredOp::Gemm { n, k },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
+        let g = lower_region(&input, nb);
+        let s = partition_roundrobin(&g, 1); // all 4 blocks on worker 0
+        // Tranche mode groups the 4 independent blocks into one packed tranche.
+        let prog = serialize_mode(&g, &s, &sources, geom(), EmitMode::Tranche).expect("serialize");
+        assert_eq!(prog.tape.len(), 4);
+        let ranges: Vec<(u32, u32)> = prog
+            .tape
+            .iter()
+            .map(|i| {
+                assert_eq!(i[0], opcode::COMPUTE);
+                assert_eq!(op_of(&prog, i), op_kind::QMV);
+                (i[3] & 0xFF, (i[3] >> 8) & 0xFF)
+            })
+            .collect();
+        assert_partition(&ranges);
+    }
+
+    /// A single block is alone in its tranche, so it keeps the whole TG
+    /// (`flag == 0`) — no packing, the prior whole-threadgroup behaviour.
+    #[test]
+    fn serialize_leaves_solo_op_unpacked() {
+        let (n, k) = (16u32, 256u32);
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: k },
+                SourceShape { rows: n, cols: k },
+            ],
+            ops: vec![OpDesc {
+                op: LoweredOp::Gemm { n, k },
+                m: 1,
+                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+            }],
+            result: 0,
+        };
+        let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
+        let g = lower_region(&input, 64); // nb ≥ n ⇒ one block
+        let s = partition_roundrobin(&g, 1);
+        let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
+        assert_eq!(prog.tape.len(), 1);
+        assert_eq!(prog.tape[0][3], 0, "solo op keeps the whole TG (flag 0)");
     }
 }

@@ -293,8 +293,15 @@ pub fn dispatch_mega(
         },
     );
     enc.endEncoding();
+    // PERF DIAG (droppable): time JUST the kernel (commit→wait), separate from
+    // the per-step buffer rebuilds above — a production path caches those.
+    let t_exec = std::time::Instant::now();
     cb.commit();
     cb.waitUntilCompleted();
+    eprintln!(
+        "[wf-perf] mega_exec={:.3}ms",
+        t_exec.elapsed().as_secs_f64() * 1e3
+    );
 }
 
 // ── small buffer helpers (mirror the integration-test harness) ───────

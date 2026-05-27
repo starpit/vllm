@@ -761,7 +761,16 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 return;
             }
         };
+        // PERF (droppable): time JUST the single-dispatch megakernel exec
+        // (commit+wait of the 16-layer + lm_head kernel) — the steady-state
+        // cost; `mega_total` (in forward_with_tail) additionally includes the
+        // per-step resolve/build/argmax overhead a production path would cache.
+        let t_disp = std::time::Instant::now();
         dispatch_mega(prog, &resolved, &operands, &pipeline, &self.device, queue);
+        eprintln!(
+            "[wf-perf] mega_dispatch={:.3}ms",
+            t_disp.elapsed().as_secs_f64() * 1e3
+        );
 
         // Tier-B check: does the megakernel pick the SAME token as the per-op
         // forward (greedy = argmax)? Both logit vectors are `[vocab]` in the

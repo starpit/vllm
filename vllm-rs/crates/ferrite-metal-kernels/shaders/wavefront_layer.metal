@@ -87,17 +87,25 @@ INST_WL_QMV_BINDLESS(f16, half, f16, half, 64)
 // Each worker (co-resident threadgroup) runs the tape slice
 // [tape_offsets[me], tape_offsets[me+1]); `tape_offsets` has P+1 entries.
 
-// QMV shape-class arm in the fixed 1024-thread TG: the 32 simdgroups cover 16
-// of `qmv_fast`'s 8-row groups per wave (gi = simd_gid>>1 selects the group,
-// role = simd_gid&1 is qmv_fast's simd_gid in {0,1}), so each group's two
-// simdgroups replay the whole kernel's 2-simdgroup compute exactly ⇒ bit-exact.
+// QMV shape-class arm, parameterised by the simdgroup sub-range the compiler's
+// tranche bin-packer assigned this op (`local_sg` in `[0, sg_count)`, the op's
+// simdgroup index; `sg_count` even ≥ 2). The op's `sg_count` simdgroups cover
+// `sg_count/2` of `qmv_fast`'s 8-row groups per wave (gi = local_sg>>1 selects
+// the group, role = local_sg&1 is qmv_fast's simd_gid in {0,1}), so each
+// group's two simdgroups replay the whole kernel's 2-simdgroup compute exactly
+// ⇒ bit-exact regardless of how many simdgroups the op got. Solo (`sg_count ==
+// 32`) reproduces the old whole-TG behaviour (16 groups/wave); a packed op
+// (e.g. `sg_count == 6`) covers 3 groups/wave so several ops run concurrently
+// on disjoint simdgroup ranges of the same worker — more outstanding weight
+// loads, the latency-hiding the tranche packer is for.
 template <typename T_act, typename T_scale, int group_size, int bits>
 METAL_FUNC void wl_qmv_arm(
     const device ulong* operands,
     uint operand_base,
     uint k,
     uint n,
-    uint simd_gid,
+    uint local_sg,
+    uint sg_count,
     uint simd_lid) {
   const device uint32_t* w = (const device uint32_t*)(operands[operand_base + 0u]);
   const device T_scale* s = (const device T_scale*)(operands[operand_base + 1u]);
@@ -105,13 +113,46 @@ METAL_FUNC void wl_qmv_arm(
   const device T_act* x = (const device T_act*)(operands[operand_base + 3u]);
   device T_act* y = (device T_act*)(operands[operand_base + 4u]);
   const uint num_groups = (n + 7u) / 8u;
-  const uint gi = simd_gid >> 1;
-  const uint role = simd_gid & 1u;
-  for (uint base = 0u; base < num_groups; base += 16u) {
+  const uint gi = local_sg >> 1;
+  const uint role = local_sg & 1u;
+  const uint groups_per_wave = sg_count >> 1; // sg_count even ⇒ exact
+  for (uint base = 0u; base < num_groups; base += groups_per_wave) {
     uint g = base + gi;
     if (g < num_groups) {
       mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
           w, s, b, x, y, int(k), int(n), uint3(0u, g, 0u), role, simd_lid);
+    }
+  }
+}
+
+// Coherent-output qmv arm: identical to `wl_qmv_arm` but operand 4 is the
+// coherent (atomic u32) handoff buffer, and `qmv_fast_coh_impl` writes each
+// simdgroup's rows STRAIGHT into it (sentinel-safe, packed). No compute→publish
+// barrier: each simdgroup stores only its own rows, so nothing re-reads another
+// simdgroup's output; the store IS the readiness signal (data-IS-the-flag).
+template <typename T_act, typename T_scale, int group_size, int bits>
+METAL_FUNC void wl_qmv_coh_arm(
+    const device ulong* operands,
+    uint operand_base,
+    uint k,
+    uint n,
+    uint local_sg,
+    uint sg_count,
+    uint simd_lid) {
+  const device uint32_t* w = (const device uint32_t*)(operands[operand_base + 0u]);
+  const device T_scale* s = (const device T_scale*)(operands[operand_base + 1u]);
+  const device T_scale* b = (const device T_scale*)(operands[operand_base + 2u]);
+  const device T_act* x = (const device T_act*)(operands[operand_base + 3u]);
+  device atomic_uint* y_coh = (device atomic_uint*)(operands[operand_base + 4u]);
+  const uint num_groups = (n + 7u) / 8u;
+  const uint gi = local_sg >> 1;
+  const uint role = local_sg & 1u;
+  const uint groups_per_wave = sg_count >> 1;
+  for (uint base = 0u; base < num_groups; base += groups_per_wave) {
+    uint g = base + gi;
+    if (g < num_groups) {
+      mittens::qmv_fast_coh_impl<T_act, T_scale, group_size, bits>(
+          w, s, b, x, y_coh, int(k), int(n), uint3(0u, g, 0u), role, simd_lid);
     }
   }
 }
@@ -130,6 +171,7 @@ constant constexpr uint WL_OP_ROPE = 5u;     // NeoX pair-rotate Q or K in place
 constant constexpr uint WL_OP_ATTN = 6u;     // paged decode attention (loops q-heads)
 constant constexpr uint WL_OP_ADD = 7u;      // elementwise residual add
 constant constexpr uint WL_OP_ROPE_APPEND = 8u; // rotate K in place + write K/V to paged cache
+constant constexpr uint WL_OP_QMV_COH = 9u; // qmv whose output is written DIRECTLY into the coherent handoff buffer (PAT-4; no compute→publish barrier)
 
 // Each shape-class descriptor is a fixed-width record of WL_SHAPE_STRIDE u32s:
 // [op_kind, p1, p2, p3, p4, p5, p6, _]. Wide enough for attention's 6 dims;
@@ -164,27 +206,58 @@ template <typename T_act, typename T_scale, int group_size, int bits>
       case WL_OPC_COMPUTE: {
         const uint sb = ins.y * WL_SHAPE_STRIDE;
         const uint op = shapes[sb + 0u];
+        // Per-op simdgroup range, packed into the flag field (`ins.w`) by the
+        // compiler's tranche bin-packer: a tranche's mutually-independent ops
+        // get DISJOINT simdgroup ranges so they run CONCURRENTLY on this
+        // worker's 32 simdgroups (more outstanding weight loads → better BW).
+        // `sg_count == 0` ⇒ the whole 32-simdgroup TG (a solo op, or any tape
+        // the packer left untouched). Only the simdgroup-local arms (qmv,
+        // silu_mul, add, rope — no threadgroup scratch, no TG-wide barrier)
+        // honour the range; the threadgroup-wide arms (rmsnorm/attn/publish/
+        // acquire/rope_append reduce or barrier across all 1024 threads) are
+        // always emitted solo and use the whole TG via `tid_in_tg`/1024.
+        uint sg_start = ins.w & 0xFFu;
+        uint sg_count = (ins.w >> 8u) & 0xFFu;
+        if (sg_count == 0u) {
+          sg_start = 0u;
+          sg_count = 32u;
+        }
+        const bool in_range = simd_gid >= sg_start && simd_gid < sg_start + sg_count;
+        const uint local_sg = simd_gid - sg_start;        // simdgroup index within the op
+        const uint op_threads = sg_count << 5u;            // sg_count * 32
+        const uint local_tid = (local_sg << 5u) + simd_lid; // thread index within the op
         switch (op) {
           case WL_OP_QMV:
-            wl_qmv_arm<T_act, T_scale, group_size, bits>(
-                operands, ins.z, shapes[sb + 1u], shapes[sb + 2u], simd_gid, simd_lid);
+            if (in_range) {
+              wl_qmv_arm<T_act, T_scale, group_size, bits>(
+                  operands, ins.z, shapes[sb + 1u], shapes[sb + 2u], local_sg, sg_count,
+                  simd_lid);
+            }
+            break;
+          case WL_OP_QMV_COH:
+            if (in_range) {
+              wl_qmv_coh_arm<T_act, T_scale, group_size, bits>(
+                  operands, ins.z, shapes[sb + 1u], shapes[sb + 2u], local_sg, sg_count,
+                  simd_lid);
+            }
             break;
           case WL_OP_PUBLISH:
-            // pack operands[base+1] (this worker's written region, bf16) into the
-            // coherent operands[base+0] (atomic u32). pair0=p1, n_pairs=p2. All
-            // 1024 lanes co-operate (strided); the trailing per-op mem_device
-            // barrier fences the stripes before the Signal.
-            mittens::wf_publish_pairs_tg<T_act>(
+            // PAT-4 (data-IS-the-flag): pack operands[base+1] (this worker's
+            // written region, bf16) into the coherent operands[base+0] (atomic
+            // u32), SENTINEL-SAFE (never stores 0). pair0=p1, n_pairs=p2. The
+            // store itself is the readiness signal — no Signal, no fence after.
+            mittens::wf_publish_pairs_nz_tg<T_act>(
                 (device atomic_uint*)(operands[ins.z + 0u]),
                 (const device T_act*)(operands[ins.z + 1u]),
                 shapes[sb + 1u], shapes[sb + 2u], tid_in_tg, 1024u);
             break;
           case WL_OP_ACQUIRE:
-            // load+unpack the coherent operands[base+1] (atomic u32) into the
-            // private operands[base+0] (bf16). n_pairs=p1. All 1024 lanes
-            // co-operate (strided); the trailing per-op mem_device barrier
-            // fences the private copy before the consumer reads it.
-            mittens::wf_acquire_pairs_tg<T_act>(
+            // PAT-4: SPIN on each coherent slot operands[base+1] (atomic u32)
+            // until non-sentinel (written this step), unpacking into the private
+            // operands[base+0] (bf16). n_pairs=p1. The per-slot spin IS the wait
+            // — no Wait, no flag. (The trailing compiler BARRIER still fences the
+            // private copy before the consumer reads it cross-simdgroup.)
+            mittens::wf_acquire_pairs_spin_tg<T_act>(
                 (device T_act*)(operands[ins.z + 0u]),
                 (const device atomic_uint*)(operands[ins.z + 1u]),
                 shapes[sb + 1u], tid_in_tg, 1024u);
@@ -201,28 +274,33 @@ template <typename T_act, typename T_scale, int group_size, int bits>
                 0u, tid_in_tg, 1024u);
             break;
           case WL_OP_SILU_MUL: {
-            // operands [out, gate, up]; shape (SILU_MUL, n, ...). The 1024
-            // threads grid-stride the n elements (per-element pure ⇒ bit-exact).
-            uint n = shapes[sb + 1u];
-            for (uint e = tid_in_tg; e < n; e += 1024u) {
-              mittens::silu_mul_impl<T_act>(
-                  (device T_act*)(operands[ins.z + 0u]),
-                  (const device T_act*)(operands[ins.z + 1u]),
-                  (const device T_act*)(operands[ins.z + 2u]),
-                  e, n);
+            // operands [out, gate, up]; shape (SILU_MUL, n, ...). The op's
+            // `op_threads` grid-stride the n elements (per-element pure ⇒
+            // bit-exact at any thread count).
+            if (in_range) {
+              uint n = shapes[sb + 1u];
+              for (uint e = local_tid; e < n; e += op_threads) {
+                mittens::silu_mul_impl<T_act>(
+                    (device T_act*)(operands[ins.z + 0u]),
+                    (const device T_act*)(operands[ins.z + 1u]),
+                    (const device T_act*)(operands[ins.z + 2u]),
+                    e, n);
+              }
             }
             break;
           }
           case WL_OP_ADD: {
             // operands [out, a, b]; shape (ADD, n, ...). Residual add; out may
             // alias a or b (in-place residual) — each element is independent.
-            uint n = shapes[sb + 1u];
-            for (uint e = tid_in_tg; e < n; e += 1024u) {
-              mittens::add_impl<T_act>(
-                  (device T_act*)(operands[ins.z + 0u]),
-                  (const device T_act*)(operands[ins.z + 1u]),
-                  (const device T_act*)(operands[ins.z + 2u]),
-                  e, n);
+            if (in_range) {
+              uint n = shapes[sb + 1u];
+              for (uint e = local_tid; e < n; e += op_threads) {
+                mittens::add_impl<T_act>(
+                    (device T_act*)(operands[ins.z + 0u]),
+                    (const device T_act*)(operands[ins.z + 1u]),
+                    (const device T_act*)(operands[ins.z + 2u]),
+                    e, n);
+              }
             }
             break;
           }
@@ -235,20 +313,22 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             // here exactly like the oracle (`cos_sin + pos*rot_dim`) — NEVER a
             // compile-time-baked offset. Each thread owns distinct (head, d<half)
             // pairs and rotates the (d, d+half) pair of its head's row.
-            device T_act* x = (device T_act*)(operands[ins.z + 0u]);
-            const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
-            const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
-            uint head_dim = shapes[sb + 1u];
-            uint num_heads = shapes[sb + 2u];
-            uint rot_dim = shapes[sb + 3u];
-            uint half_dim = rot_dim / 2u;
-            uint pos = positions[0];
-            const device T_act* cos_row = cos_sin + pos * rot_dim;
-            const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
-            for (uint idx = tid_in_tg; idx < num_heads * half_dim; idx += 1024u) {
-              uint h = idx / half_dim;
-              uint d = idx % half_dim;
-              mittens::rope_rotate_pair<T_act>(x + h * head_dim, cos_row, sin_row, d, half_dim);
+            if (in_range) {
+              device T_act* x = (device T_act*)(operands[ins.z + 0u]);
+              const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
+              const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
+              uint head_dim = shapes[sb + 1u];
+              uint num_heads = shapes[sb + 2u];
+              uint rot_dim = shapes[sb + 3u];
+              uint half_dim = rot_dim / 2u;
+              uint pos = positions[0];
+              const device T_act* cos_row = cos_sin + pos * rot_dim;
+              const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
+              for (uint idx = local_tid; idx < num_heads * half_dim; idx += op_threads) {
+                uint h = idx / half_dim;
+                uint d = idx % half_dim;
+                mittens::rope_rotate_pair<T_act>(x + h * head_dim, cos_row, sin_row, d, half_dim);
+              }
             }
             break;
           }

@@ -120,4 +120,59 @@ METAL_FUNC void wf_acquire_pairs_tg(
   }
 }
 
+// ── PAT-4: data-IS-the-flag handoff (NO barrier, NO separate flag) ───
+//
+// Proven barrier-free in `wavefront_sync_probe.rs` PAT 4: the producer's
+// atomic store IS the readiness signal; the consumer spins on that same
+// atomic slot until it's written, then reads it. The coherent buffer is
+// reset to the SENTINEL (0) before the step, the producer guarantees a
+// NON-sentinel store, and the consumer treats 0 as "not yet written".
+// This removes the data-before-flag `threadgroup_barrier` and the separate
+// Signal/Wait of the PAT-3 path entirely.
+
+// Sentinel-safe pack: a pair of true-zero 16-bit values (`0x00000000`)
+// would collide with the empty sentinel and hang the consumer's spin, so
+// flush the low half from +0.0 (`0x0000`) to -0.0 (`0x8000`) in that one
+// case. -0.0 is numerically identical to +0.0 in the downstream sums/
+// products, so this is value-preserving; every other pair is left exact.
+template <typename T>
+METAL_FUNC uint wf_pack2_nz(T lo, T hi) {
+  uint v = wf_pack2<T>(lo, hi);
+  return v == 0u ? 0x00008000u : v;
+}
+
+// Producer side: publish `n_pairs` of `src` (sentinel-safe) into the
+// coherent `dst[pair0..]`, TG-cooperative. No barrier needed afterward —
+// the store itself is the readiness signal.
+template <typename T>
+METAL_FUNC void wf_publish_pairs_nz_tg(
+    device atomic_uint* dst, const device T* src, uint pair0, uint n_pairs,
+    uint tid, uint nthreads) {
+  for (uint q = tid; q < n_pairs; q += nthreads) {
+    uint p = pair0 + q;
+    atomic_store_explicit(
+        &dst[p], wf_pack2_nz<T>(src[2u * p], src[2u * p + 1u]), memory_order_relaxed);
+  }
+}
+
+// Consumer side: spin on each coherent slot in `[0, n_pairs)` until it's
+// non-sentinel (written this step), unpacking into the private `dst`.
+// TG-cooperative; the spin per slot IS the wait, so no flag and no barrier
+// precede it. The caller still barriers AFTER (before the threadgroup reads
+// `dst`) only if `dst` is a shared copy read cross-simdgroup; a consumer
+// that reads its own lane's slots needs nothing.
+template <typename T>
+METAL_FUNC void wf_acquire_pairs_spin_tg(
+    device T* dst, const device atomic_uint* src, uint n_pairs,
+    uint tid, uint nthreads) {
+  for (uint q = tid; q < n_pairs; q += nthreads) {
+    uint v = 0u, s = 0u;
+    do {
+      v = atomic_load_explicit(&src[q], memory_order_relaxed);
+    } while (v == 0u && ++s < WF_SPIN_CAP);
+    dst[2u * q] = wf_unpack_lo<T>(v);
+    dst[2u * q + 1u] = wf_unpack_hi<T>(v);
+  }
+}
+
 } // namespace mittens

@@ -19,6 +19,8 @@
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
+#include "sync.h" // wf_pack2_nz for the PAT-4 coherent-output qmv variant
+
 using namespace metal;
 
 #ifndef METAL_FUNC
@@ -552,6 +554,89 @@ METAL_FUNC void qmv_fast_impl(
     if (simd_lid == 0) {
       y[row] = static_cast<T_act>(result[row]);
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// qmv_fast_coh_impl — qmv_fast_impl with a PAT-4 COHERENT output.
+//
+// Identical compute to `qmv_fast_impl`, but instead of writing the 4 result
+// rows to a plain `device T_act* y`, simd_lid 0 packs them into 2 sentinel-safe
+// atomic u32 pairs and `atomic_store`s them straight into the coherent buffer
+// `y_coh` (pair index `out_row/2`; `out_row` is a multiple of 4, so the pairs
+// are DISJOINT across simdgroups). Each simdgroup writes only the rows it just
+// computed — nothing re-reads another simdgroup's output — so there is NO
+// compute→publish `threadgroup_barrier`, and the store itself is the readiness
+// signal a consumer spins on (data-IS-the-flag, `wf_acquire_pairs_spin_tg`).
+// `y_coh` points at this N-block's stripe base; `out_vec_size` is unused.
+// ─────────────────────────────────────────────────────────────────
+
+template <typename T_act, typename T_scale, int group_size, int bits>
+METAL_FUNC void qmv_fast_coh_impl(
+    const device uint32_t* w,
+    const device T_scale* scales,
+    const device T_scale* biases,
+    const device T_act* x,
+    device atomic_uint* y_coh,
+    int in_vec_size,
+    int out_vec_size,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)out_vec_size;
+  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+
+  for (int k = 0; k < in_vec_size; k += block_size) {
+    U sum = load_vector<T_act, U, values_per_thread, bits>(x, x_thread);
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T_scale* sl = scales + row * in_vec_size_g;
+      const device T_scale* bl = biases + row * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    scales += block_size / group_size;
+    biases += block_size / group_size;
+    x += block_size;
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    result[row] = simd_sum(result[row]);
+  }
+  if (simd_lid == 0) {
+    uint pb = uint(out_row) >> 1; // out_row multiple of 4 ⇒ disjoint pairs/simdgroup
+    atomic_store_explicit(
+        &y_coh[pb],
+        wf_pack2_nz<T_act>(static_cast<T_act>(result[0]), static_cast<T_act>(result[1])),
+        memory_order_relaxed);
+    atomic_store_explicit(
+        &y_coh[pb + 1u],
+        wf_pack2_nz<T_act>(static_cast<T_act>(result[2]), static_cast<T_act>(result[3])),
+        memory_order_relaxed);
   }
 }
 

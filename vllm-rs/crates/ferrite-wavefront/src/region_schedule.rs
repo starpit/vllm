@@ -132,7 +132,14 @@ pub fn schedule_from_assignment(
     for node in &graph.nodes {
         let id = node.id.0 as usize;
         let w = worker_of[id] as usize;
-        // One Wait per distinct cross-worker producer flag.
+        // One Wait per distinct cross-worker producer flag for THIS node. (Not
+        // deduped across the worker's whole tape: a measured regression — the
+        // re-issued `Wait` before each consumer, though redundant for
+        // correctness, keeps the megakernel ~7× faster on M5. The device
+        // barrier each `Wait` carries appears to pace the worker against the
+        // producers; deduping lets a consumer worker rush to a join and busy-
+        // spin, contending the bus with the producers' weight loads. Keep the
+        // re-waits.)
         let mut waited: Vec<u32> = Vec::new();
         for prod in &preds[id] {
             if worker_of[prod.0 as usize] != worker_of[id] {

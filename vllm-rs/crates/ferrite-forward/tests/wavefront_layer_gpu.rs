@@ -540,6 +540,132 @@ fn wavefront_player_nblock_spread_across_workers() {
     );
 }
 
+/// **Point-2: tranche simdgroup packing.** One worker (P=1) runs a tranche of
+/// 4 mutually-independent qmv blocks packed onto DISJOINT, uneven simdgroup
+/// ranges — (0,16),(16,8),(24,4),(28,4) — so the 4 weight reads stream
+/// concurrently within the single threadgroup. Each block's qmv arm covers its
+/// N-block with whatever `groups_per_wave = sg_count/2` it was given (8/4/2/2
+/// here), so this also exercises the variable-wave path. The assembled output
+/// must be bit-exact vs the whole `affine_qmv_fast` — proving the player honours
+/// the packed ranges without changing the arithmetic.
+#[test]
+fn wavefront_player_packs_tranche_across_simdgroups() {
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+
+    // N=128 split into 4 blocks of nb=32 (32/8 = 4 groups/block), all on one
+    // worker. K=512, gs=64, 4-bit, bf16 act / f16 scale.
+    let (n, k, gs) = (128u32, 512u32, 64u32);
+    let nb = 32u32;
+    let nblocks = n / nb; // 4
+
+    let (w, s, b, x) = make_qmv(&device, n, k, gs, 0x5A5A_2002);
+    let y_ref = qmv_ref(&device, &cache, &w, &s, &b, &x, n, k, gs);
+    assert!(y_ref.iter().any(|&v| v != 0));
+
+    let y = zeroed_buffer(&device, (n * 2) as usize);
+
+    let w_row = (k / 2) as u64; // K/2 bytes/row (4-bit packed)
+    let sb_row = (k / gs) as u64 * 2; // (K/gs) f16 groups/row
+    let y_row = 2u64; // bf16
+
+    // operand table: block i → [w+off, s+off, b+off, x (whole), y+off].
+    let mut operands_bytes: Vec<u8> = Vec::new();
+    for i in 0..nblocks as u64 {
+        let r = i * nb as u64;
+        for a in [
+            w.gpuAddress() + r * w_row,
+            s.gpuAddress() + r * sb_row,
+            b.gpuAddress() + r * sb_row,
+            x.gpuAddress(),
+            y.gpuAddress() + r * y_row,
+        ] {
+            operands_bytes.extend_from_slice(&a.to_le_bytes());
+        }
+    }
+    let operands = buffer_from_bytes(&device, &operands_bytes);
+
+    // One shape class shared by every block: (QMV, K, nb, ...).
+    let shapes_bytes: Vec<u8> = [0u32, k, nb, 0, 0, 0, 0, 0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let shapes = buffer_from_bytes(&device, &shapes_bytes);
+
+    // tape: 4 Computes on worker 0, packed onto disjoint uneven simdgroup
+    // ranges (flag = sg_start | sg_count<<8). Sums to the 32 simdgroups.
+    let ranges = [(0u32, 16u32), (16, 8), (24, 4), (28, 4)];
+    let mut tape_u32: Vec<u32> = Vec::new();
+    for (i, &(sg_start, sg_count)) in ranges.iter().enumerate() {
+        tape_u32.extend_from_slice(&[
+            0,                          // Compute
+            0,                          // shape 0
+            5 * i as u32,               // operand_base
+            sg_start | (sg_count << 8), // packed simdgroup range
+        ]);
+    }
+    let tape_bytes: Vec<u8> = tape_u32.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tape = buffer_from_bytes(&device, &tape_bytes);
+    // P=1: worker 0 runs all 4 instructions.
+    let offsets_bytes: Vec<u8> = [0u32, nblocks]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let tape_offsets = buffer_from_bytes(&device, &offsets_bytes);
+
+    let player = cache
+        .get_or_build(&PipelineKey::new(
+            "wavefront_layer",
+            "wavefront_player_bf16_s_f16_gs_64_b_4",
+            vec![],
+        ))
+        .expect("wavefront_player pipeline");
+
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&player);
+    let flags = zeroed_buffer(&device, 4); // no Signal/Wait
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&operands), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+    }
+    use_resource(&enc, &w, MTLResourceUsage::Read);
+    use_resource(&enc, &s, MTLResourceUsage::Read);
+    use_resource(&enc, &b, MTLResourceUsage::Read);
+    use_resource(&enc, &x, MTLResourceUsage::Read);
+    use_resource(&enc, &y, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    assert_eq!(
+        read_bf16(&y, n as usize),
+        y_ref,
+        "packed-tranche player output must be bit-exact vs whole affine_qmv_fast"
+    );
+}
+
 // ── step 4b: cross-worker handoff (Signal/Wait + atomic Publish/Acquire) ──
 
 /// Whole `affine_qmv_fast` dispatched into a caller-provided `y` buffer.

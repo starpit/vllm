@@ -101,9 +101,8 @@ impl SpecializedPipelines {
         Self { cache }
     }
 
-    /// The underlying pipeline cache — used by the subtile player's
-    /// [`resolve_pipelines`](crate::interpreter::metal::subtile_player::resolve_pipelines)
-    /// to build pipeline states for a `SubtileIr` directly.
+    /// The underlying pipeline cache — used by the wavefront megakernel
+    /// glue (`mega_player`) to build the trivial player's pipeline directly.
     pub fn cache(&self) -> &SpecializedPipelineCache {
         &self.cache
     }

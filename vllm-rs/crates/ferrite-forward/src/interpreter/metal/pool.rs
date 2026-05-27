@@ -241,14 +241,6 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     allocator: Arc<MetalAllocator>,
     pipelines: Arc<SpecializedPipelines>,
     bucket_tapes: Arc<[LoweredMetalTape]>,
-    /// The bucket specs (backbone/lm_head `Instruction` slices + tape
-    /// indices + terminal slot), kept so the env-gated wavefront subtile
-    /// path (`FERRITE_WAVEFRONT_GPU`) can `compile_decode` a bucket at
-    /// forward time. Empty unless built via [`Self::for_buckets`].
-    bucket_specs: Arc<[MetalBucketSpec]>,
-    /// The target profile the tapes were lowered against — reused by the
-    /// wavefront compiler so its kernel picks match the baseline's.
-    target_profile: Option<ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
     arena_layout: Arc<ArenaLayout>,
     runtime_factory: RuntimeFactory,
     max_workers: usize,
@@ -549,10 +541,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             allocator,
             pipelines,
             bucket_tapes,
-            // Populated by `for_buckets` (the only path with the specs);
-            // left empty for the lower-level `new` entry point.
-            bucket_specs: Arc::from(Vec::new()),
-            target_profile: None,
             arena_layout: Arc::new(arena_layout),
             runtime_factory,
             max_workers,
@@ -663,7 +651,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
-        let mut pool = Self::new(
+        let pool = Self::new(
             device,
             weights,
             allocator,
@@ -674,10 +662,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             max_workers,
         )
         .map_err(PoolBuildError::Worker)?;
-        // Keep the specs + profile for the env-gated wavefront subtile
-        // path (`MetalBucketSpec` is Copy / holds 'static slices).
-        pool.bucket_specs = Arc::from(bucket_specs.to_vec());
-        pool.target_profile = target_profile;
         Ok(pool)
     }
 
@@ -1280,138 +1264,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
         }
 
-        // Env-gated wavefront subtile A/B check. Non-destructive: it
-        // re-runs the decode bucket through the SubtileIr player, compares
-        // the terminal-slot logits against the normal forward's, logs the
-        // verdict, and restores the trusted logits. Decode bucket only.
-        if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
-            self.wavefront_ab_compare(&guard.worker, &guard.runtime, weights, queue, bucket_idx);
-        }
-
         Ok(with_output(&guard.worker, bucket_idx))
-    }
-
-    /// Re-run the just-completed decode bucket through the wavefront
-    /// subtile path (`compile_decode` -> `resolve` -> `play`) into the
-    /// same arena, compare the terminal-slot logits to the normal
-    /// forward's (snapshot taken first), log the bit-exact verdict, and
-    /// restore the snapshot so the engine keeps the trusted logits.
-    /// Best-effort: any compile/resolve error is logged and skips the
-    /// check without disturbing the forward. See `FERRITE_WAVEFRONT_GPU`.
-    fn wavefront_ab_compare(
-        &self,
-        worker: &MetalWorker<W>,
-        runtime: &RuntimeBindings,
-        weights: &W,
-        queue: &CommandQueue,
-        bucket_idx: usize,
-    ) where
-        W: crate::WeightAccessors,
-    {
-        use super::subtile_player::{MetalExecutor, resolve_buffers, resolve_pipelines};
-        use ::objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue};
-        let Some(spec) = self.bucket_specs.get(bucket_idx).copied() else {
-            return;
-        };
-        if spec.bucket_m != 1 {
-            return; // subtile decode path is M=1 only
-        }
-        let terminal = spec.terminal_slot as usize;
-        let Some(term_buf) = worker.arena.get(terminal) else {
-            eprintln!("[wavefront] terminal slot {terminal} out of arena range");
-            return;
-        };
-        let len = term_buf.length();
-        // Snapshot A — the normal forward's logits.
-        let logits_a: Vec<u8> = unsafe {
-            std::slice::from_raw_parts(term_buf.contents().as_ptr() as *const u8, len).to_vec()
-        };
-
-        let ir = match super::subtile_compile::compile_decode::<W>(
-            &[
-                (spec.backbone, spec.backbone_tape_index),
-                (spec.lm_head, spec.lm_head_tape_index),
-            ],
-            1,
-            self.target_profile.as_ref(),
-            512,
-            spec.terminal_slot,
-        ) {
-            Ok(ir) => ir,
-            Err(e) => {
-                eprintln!("[wavefront] compile_decode failed: {e}");
-                return;
-            }
-        };
-        // Strengthened structural + dataflow validation. A miss here
-        // (use-before-def, partial-coverage, dangling index) pinpoints a
-        // compiler bug at the IR level instead of as GPU garbage.
-        match ferrite_wavefront::subtile_ir::validate(&ir) {
-            Ok(n) => eprintln!("[wavefront] validate OK: {n} subtile instrs"),
-            Err(e) => {
-                eprintln!("[wavefront] validate FAILED: {e}");
-                return;
-            }
-        }
-        let pipelines = match resolve_pipelines(&ir, self.pipelines.cache()) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[wavefront] resolve_pipelines failed: {e:?}");
-                return;
-            }
-        };
-        let buffers = match resolve_buffers::<W>(
-            &ir,
-            &worker.arena,
-            worker.splitk_scratch.as_ref(),
-            weights,
-            &self.allocator,
-            runtime,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[wavefront] resolve_buffers failed: {e:?}");
-                return;
-            }
-        };
-
-        // Play the tape into the arena (overwrites the terminal slot -> B).
-        let cb = queue.commandBuffer().expect("wavefront cb");
-        let enc = cb.computeCommandEncoder().expect("wavefront enc");
-        {
-            let mut exec = MetalExecutor::new(&enc, &buffers, &pipelines);
-            ferrite_wavefront::subtile_ir::play(&ir, &mut exec);
-        }
-        enc.endEncoding();
-        cb.commit();
-        cb.waitUntilCompleted();
-
-        // Compare B vs A (bit-exact byte compare), then restore A.
-        let logits_b: &[u8] =
-            unsafe { std::slice::from_raw_parts(term_buf.contents().as_ptr() as *const u8, len) };
-        let mismatched = logits_a
-            .iter()
-            .zip(logits_b.iter())
-            .filter(|(a, b)| a != b)
-            .count();
-        let first = logits_a
-            .iter()
-            .zip(logits_b.iter())
-            .position(|(a, b)| a != b);
-        eprintln!(
-            "[wavefront] decode A/B: {} subtile instrs, {len} bytes, mismatched={mismatched}{}",
-            ir.tape.len(),
-            first
-                .map(|i| format!(", first diff @ byte {i}"))
-                .unwrap_or_default(),
-        );
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                logits_a.as_ptr(),
-                term_buf.contents().as_ptr() as *mut u8,
-                len,
-            );
-        }
     }
 
     fn spawn_worker(&self, weights: &W) -> Result<PooledWorker<W>, WorkerError> {

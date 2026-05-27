@@ -18,15 +18,13 @@ pub mod pipelines;
 #[cfg(feature = "metal")]
 pub mod forward;
 #[cfg(feature = "metal")]
+pub mod mega_player;
+#[cfg(feature = "metal")]
 pub mod mtl4;
 #[cfg(feature = "metal")]
 pub mod pool;
 #[cfg(feature = "metal")]
 pub mod runtime;
-#[cfg(feature = "metal")]
-pub mod subtile_compile;
-#[cfg(feature = "metal")]
-pub mod subtile_player;
 #[cfg(feature = "metal")]
 pub mod worker;
 

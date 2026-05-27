@@ -120,6 +120,7 @@ METAL_FUNC void wl_qmv_arm(
 constant constexpr uint WL_OPC_COMPUTE = 0u;
 constant constexpr uint WL_OPC_SIGNAL = 1u;
 constant constexpr uint WL_OPC_WAIT = 2u;
+constant constexpr uint WL_OPC_BARRIER = 3u; // compiler-placed intra-worker fence
 constant constexpr uint WL_OP_QMV = 0u;
 constant constexpr uint WL_OP_PUBLISH = 1u; // pack a written region → coherent handoff (atomic)
 constant constexpr uint WL_OP_ACQUIRE = 2u; // load+unpack handoff → a private readable copy
@@ -320,13 +321,17 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             break;
           }
         }
-        // Make this instruction's device writes visible to this worker's lanes
-        // before the next subtile reads them (intra-worker edge / publish done /
-        // acquired copy visible). The barrier is uniform: the opcode is the same
-        // across the TG (one tape per worker).
-        threadgroup_barrier(mem_flags::mem_device);
+        // No blind per-op barrier: intra-worker visibility is fenced by an
+        // explicit WL_OPC_BARRIER the compiler placed at the real RAW
+        // boundaries (and Signal/Wait carry their own fences). The player is a
+        // dumb executor — it never invents sync.
         break;
       }
+      case WL_OPC_BARRIER:
+        // Compiler-placed intra-worker device fence (a dependence boundary —
+        // the tranche boundary). Uniform across the TG (one tape per worker).
+        threadgroup_barrier(mem_flags::mem_device);
+        break;
       case WL_OPC_SIGNAL:
         // Data-before-flag fence (relaxed-only MSL device atomics ⇒ the barrier,
         // not a release order, provides the producer's data visibility), then

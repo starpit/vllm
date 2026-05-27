@@ -734,16 +734,19 @@ fn wavefront_player_two_stage_handoff_bit_exact() {
         for i in 0..p {
             let base = 14 * i;
             tape_u32.extend_from_slice(&[0, 0, base, 0]); // Compute QMV stage0
+            tape_u32.extend_from_slice(&[3, 0, 0, 0]); // Barrier: stage0 → PUBLISH RAW
             tape_u32.extend_from_slice(&[0, 1, base + 5, 0]); // Compute PUBLISH
             tape_u32.extend_from_slice(&[1, 0, 0, i]); // Signal flag i
             for j in 0..p {
                 tape_u32.extend_from_slice(&[2, 0, 0, j]); // Wait flag j
             }
             tape_u32.extend_from_slice(&[0, 2, base + 7, 0]); // Compute ACQUIRE
+            tape_u32.extend_from_slice(&[3, 0, 0, 0]); // Barrier: ACQUIRE → stage1 RAW
             tape_u32.extend_from_slice(&[0, 3, base + 9, 0]); // Compute QMV stage1
         }
         let tape = buffer_from_bytes(&device, &bytes_of_u32(&tape_u32));
-        let per_worker = 5 + p;
+        // per worker: stage0, BARRIER, publish, signal, P waits, BARRIER, acquire, stage1.
+        let per_worker = 7 + p;
         let offsets_u32: Vec<u32> = (0..=p).map(|i| i * per_worker).collect();
         let tape_offsets = buffer_from_bytes(&device, &bytes_of_u32(&offsets_u32));
 

@@ -81,9 +81,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion};
+use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion, predecessors};
 use crate::region_schedule::{Schedule, TapeInstr};
-use crate::subtile::{EwKind, SubOp};
+use crate::subtile::{EwKind, SubOp, SubtileId};
 use crate::subtile_ir::{
     BufId, BufferRef, InputKind, WeightBundle, affine_scale_row_bytes, packed_weight_row_bytes,
 };
@@ -95,6 +95,13 @@ pub mod opcode {
     pub const COMPUTE: u32 = 0;
     pub const SIGNAL: u32 = 1;
     pub const WAIT: u32 = 2;
+    /// Intra-worker `threadgroup_barrier` emitted by the serializer ONLY at a
+    /// real read-after-write boundary (a Compute whose region-overlap
+    /// predecessor ran on the same worker since the last barrier, plus the
+    /// ACQUIRE→Compute and Compute→PUBLISH plumbing RAWs). Replaces the player's
+    /// old blind per-op barrier — the player is a dumb executor; the compiler,
+    /// which holds the dependence edges, places the sync.
+    pub const BARRIER: u32 = 3;
 }
 
 /// Shape-class `op_kind` field (`shapes[sc*STRIDE]`); matches the player's
@@ -310,26 +317,54 @@ pub fn serialize(
     let worker_of = reconstruct_worker_of(graph, schedule);
     ser.plan_handoffs(&worker_of)?;
 
+    // Region-overlap predecessors (the RAW edges). A Compute needs an
+    // intra-worker barrier before it iff one of its predecessors ran on the
+    // SAME worker since the last sync. Cross-worker preds aren't in `since`, so
+    // they're handled by the schedule's Wait/Signal, not by these barriers.
+    let preds = predecessors(graph);
     let mut tape: Vec<[u32; 4]> = Vec::new();
     let mut tape_offsets: Vec<u32> = vec![0];
     for (wi, worker) in schedule.workers.iter().enumerate() {
         ser.acquired.clear(); // private acquired-copies are per worker
         let wi = wi as u32;
+        // Nodes this worker computed since its last barrier/Signal/Wait (each
+        // of those carries a device fence). Cleared whenever one is emitted.
+        let mut since: HashSet<SubtileId> = HashSet::new();
         for instr in &worker.tape {
             match *instr {
                 TapeInstr::Compute(id) => {
                     let node = &graph.nodes[id.0 as usize];
                     // ACQUIRE each cross-worker input before reading it (the
                     // worker `Wait`ed on the producers' flags just above).
-                    ser.emit_acquires(node, wi, &mut tape)?;
+                    let n_acq = ser.emit_acquires(node, wi, &mut tape)?;
+                    // Barrier before the Compute iff it reads an ACQUIRE's
+                    // private copy (n_acq > 0) or a same-worker producer's
+                    // output (RAW). One barrier coalesces all prior writes.
+                    let raw = preds[id.0 as usize].iter().any(|p| since.contains(p));
+                    if n_acq > 0 || raw {
+                        tape.push([opcode::BARRIER, 0, 0, 0]);
+                        since.clear();
+                    }
                     let (sc, base) = ser.emit_compute(node)?;
                     tape.push([opcode::COMPUTE, sc, base, 0]);
-                    // PUBLISH this block's stripe if its output crosses workers
-                    // (before the `Signal` the schedule emits next).
-                    ser.emit_publish(node, &mut tape)?;
+                    since.insert(id);
+                    // PUBLISH this output's stripe if it crosses workers (before
+                    // the schedule's next `Signal`). The PUBLISH reads the
+                    // output the Compute just wrote ⇒ fence between them.
+                    if ser.produces_handoff(node) {
+                        tape.push([opcode::BARRIER, 0, 0, 0]);
+                        since.clear();
+                        ser.emit_publish(node, &mut tape)?;
+                    }
                 }
-                TapeInstr::Signal(f) => tape.push([opcode::SIGNAL, 0, 0, f]),
-                TapeInstr::Wait(f) => tape.push([opcode::WAIT, 0, 0, f]),
+                TapeInstr::Signal(f) => {
+                    tape.push([opcode::SIGNAL, 0, 0, f]);
+                    since.clear();
+                }
+                TapeInstr::Wait(f) => {
+                    tape.push([opcode::WAIT, 0, 0, f]);
+                    since.clear();
+                }
             }
         }
         tape_offsets.push(tape.len() as u32);
@@ -605,7 +640,7 @@ impl<'a> Ser<'a> {
         node: &SubtileNode,
         wi: u32,
         tape: &mut Vec<[u32; 4]>,
-    ) -> Result<(), SerializeError> {
+    ) -> Result<usize, SerializeError> {
         // Decide first (immutable view), then mutate — avoids aliasing self.
         let mut to_acquire: Vec<TensorId> = Vec::new();
         for inp in &node.inputs {
@@ -619,6 +654,7 @@ impl<'a> Ser<'a> {
                 to_acquire.push(t);
             }
         }
+        let n_acquired = to_acquire.len();
         for t in to_acquire {
             let (coherent_slot, cols) = {
                 let h = &self.handoff[&t];
@@ -651,7 +687,14 @@ impl<'a> Ser<'a> {
             tape.push([opcode::COMPUTE, sc, base, 0]);
             self.acquired.insert(t, priv_slot);
         }
-        Ok(())
+        Ok(n_acquired)
+    }
+
+    /// Whether this node's output tensor crosses workers — i.e. `emit_publish`
+    /// will emit a PUBLISH for it (so the caller knows to fence the producer
+    /// Compute → PUBLISH read).
+    fn produces_handoff(&self, node: &SubtileNode) -> bool {
+        self.handoff.contains_key(&node.output.tensor)
     }
 
     /// After a producer block `Compute` whose output tensor is a handoff,
@@ -1309,11 +1352,24 @@ mod tests {
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
-        // tape: [qmv block, rope]. qmv y = operand[base0+4]; rope x = operand[base1+0].
-        let qmv = &prog.tape[0];
-        let rope = &prog.tape[1];
+        // tape: [qmv block, BARRIER, rope]. The rope reads the qmv's output, so
+        // the compiler places exactly one barrier at that RAW boundary. qmv y =
+        // operand[base0+4]; rope x = operand[base1+0].
+        let computes: Vec<&[u32; 4]> = prog
+            .tape
+            .iter()
+            .filter(|i| i[0] == opcode::COMPUTE)
+            .collect();
+        let qmv = computes[0];
+        let rope = computes[1];
         assert_eq!(op_of(&prog, qmv), op_kind::QMV);
         assert_eq!(op_of(&prog, rope), op_kind::ROPE);
+        assert_eq!(
+            prog.tape.iter().filter(|i| i[0] == opcode::BARRIER).count(),
+            1,
+            "one barrier at the qmv→rope RAW boundary"
+        );
+        assert_eq!(prog.tape[1][0], opcode::BARRIER);
         let qmv_y = prog.operands[qmv[2] as usize + 4].buffer;
         let rope_base = rope[2] as usize;
         let rope_x = prog.operands[rope_base].buffer;
@@ -1608,6 +1664,7 @@ mod tests {
                         assert!((instr[2] as usize) <= prog.operands.len());
                     }
                     opcode::SIGNAL | opcode::WAIT => assert!(instr[3] < prog.num_flags),
+                    opcode::BARRIER => assert_eq!(*instr, [opcode::BARRIER, 0, 0, 0]),
                     other => panic!("bad opcode {other}"),
                 }
             }

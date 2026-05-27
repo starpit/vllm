@@ -585,18 +585,25 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             return Err(PoolBuildError::NoBuckets);
         }
 
-        // Worker arena is sized for the largest activation across
-        // every bucket — every spec's `arena_bytes` has the same
-        // length (the macro shares the colored slot map across
-        // canonicals), so taking elementwise max is safe.
-        let num_slots = bucket_specs[0].num_arena_slots as usize;
+        // Worker arena is sized for the largest activation across every
+        // bucket, AND for the largest colored slot count across buckets.
+        // Slot counts can differ per bucket: a bucket whose solver picked
+        // a fusion that needs extra scratch — e.g. the synth pre-attn /
+        // mlp-pre-down kernels, which write the updated residual to a
+        // distinct `residual_out` slot instead of in place to avoid a
+        // cross-threadgroup race — carries more colored slots than a
+        // bucket that didn't. A bucket's tape only ever references slots
+        // in `0..its own num_arena_slots`, so an arena sized to the max
+        // serves every bucket; smaller buckets simply leave the tail
+        // slots resident and idle. `arena_bytes` is elementwise-maxed
+        // over whatever slots each spec defines.
+        let num_slots = bucket_specs
+            .iter()
+            .map(|s| s.num_arena_slots as usize)
+            .max()
+            .unwrap_or(0);
         let mut arena_layout: ArenaLayout = vec![0u64; num_slots];
         for spec in bucket_specs {
-            debug_assert_eq!(
-                spec.arena_bytes.len(),
-                num_slots,
-                "every bucket spec must share the same colored slot count"
-            );
             for (slot, &bytes) in spec.arena_bytes.iter().enumerate() {
                 if bytes > arena_layout[slot] {
                     arena_layout[slot] = bytes;
@@ -608,11 +615,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .map_err(|e| PoolBuildError::PipelineCacheBuild(format!("{e:?}")))?;
         // Compiler-driven synthesis (METAL_KITTENS_SYNTHESIS_PLAN.md):
         // each Metal arch exposes its macro-generated synthesized
-        // kernel metallibs via `W::synthesized_kernel_metallibs()`.
-        // The proc-macro AOT-compiles MSL via `xcrun metal -c` at
-        // macro-expansion time; we load the precompiled bytes here
-        // via `newLibraryWithData` — same path used by every
-        // hand-written shader. NOT `newLibraryWithSource`.
+        // kernel metallibs via `W::synthesized_kernel_metallibs()`,
+        // loaded via `newLibraryWithData`.
         for (name, bytes) in W::synthesized_kernel_metallibs() {
             cache.register_metallib_library(name, bytes).map_err(|e| {
                 PoolBuildError::PipelineCacheBuild(format!("synthesized kernel `{name}`: {e:?}"))

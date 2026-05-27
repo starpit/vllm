@@ -897,9 +897,6 @@ fn lower_one<W: CanonicalParams>(
                 // cooperative tensors — see
                 // `compile_nax_library_from_source` + `project_metal_nax`.
                 // ~3× prefill GEMM speedup on M5.
-                // `FERRITE_DISABLE_NAX=1` forces the Standard/SplitK qmm_t
-                // path on NAX-capable hardware (kill-switch + A/B toggle).
-                // Read once per graph build (not hot).
                 let is_nax = profile.is_some_and(|p| {
                     ferrite_metal_kernels::ferrite_metal_targets::is_nax_capable(p.generation)
                 }) && std::env::var_os("FERRITE_DISABLE_NAX").is_none();
@@ -1540,6 +1537,7 @@ fn lower_one<W: CanonicalParams>(
             residual_slot,
             delta_slot,
             q_out_slot,
+            residual_out_slot,
             layer,
             group_size,
             bits,
@@ -1789,6 +1787,16 @@ fn lower_one<W: CanonicalParams>(
                             binding_index: 20,
                         });
                     }
+                    // 21: residual_out (write target — distinct from
+                    // residual_io at buffer 1). Fixed index past the
+                    // optional 18..20 bias block so it's stable across
+                    // the Llama (no-bias, sparse 18..20) and Qwen paths.
+                    // The kernel reads buffer 1 and writes the updated
+                    // residual here, never in place.
+                    v.push(Binding::ArenaSlot {
+                        slot: *residual_out_slot,
+                        binding_index: 21,
+                    });
                     v
                 },
                 gemm_dims: None,
@@ -1812,6 +1820,7 @@ fn lower_one<W: CanonicalParams>(
             residual_slot,
             delta_slot,
             silu_mul_out_slot,
+            residual_out_slot,
             layer,
             group_size,
             bits,
@@ -1945,6 +1954,14 @@ fn lower_one<W: CanonicalParams>(
                             slot: 1,
                         },
                         binding_index: 9,
+                    },
+                    // 10: residual_out (write target — distinct from
+                    // residual_io at buffer 1; the kernel reads buffer 1
+                    // and writes the updated residual here, never in
+                    // place, to avoid the cross-threadgroup race).
+                    Binding::ArenaSlot {
+                        slot: *residual_out_slot,
+                        binding_index: 10,
                     },
                 ],
                 gemm_dims: None,

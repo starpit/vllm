@@ -155,6 +155,10 @@ fn synthesize_pre_attn_chunk_impl(
     let x_norm_name = "__x_norm".to_string();
     let qmv_smem_name = "__qmv_smem".to_string();
     let residual_io = "__residual_io".to_string();
+    // residual_out: distinct device buffer for the `residual_in + delta`
+    // writeback (never in place — see AddRmsNormAtom). Bound to a slot
+    // the coloring keeps separate from `residual_io`.
+    let residual_out = "__residual_out".to_string();
     let delta_buf = "__delta".to_string();
     let rms_wt_buf = "__rms_weight".to_string();
     // Per-projection weight triples — the chain emits ONE
@@ -219,9 +223,11 @@ fn synthesize_pre_attn_chunk_impl(
         has_linear_bias: consts.has_linear_bias,
     };
 
-    // Bind channel names for each atom.
+    // Bind channel names for each atom. bound_outputs[1] = residual_out
+    // (the non-init AddRmsNorm writes the residual there; the init
+    // variant ignores it — see AddRmsNormAtom).
     let addrms_in = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
-    let addrms_out = vec![x_norm_name.clone()];
+    let addrms_out = vec![x_norm_name.clone(), residual_out.clone()];
     let addrms_ctx = AtomCtx {
         bound_inputs: &addrms_in,
         bound_outputs: &addrms_out,
@@ -379,7 +385,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
 
 [[kernel]] void {symbol}(
     device       {t_act}*   {q_out_buf}      [[buffer(0)]],
-    device       {t_act}*   {residual_io}    [[buffer(1)]],
+    device const {t_act}*   {residual_io}    [[buffer(1)]],
     device const {t_act}*   {delta_buf}      [[buffer(2)]],
     device const {t_scale}* {rms_wt_buf}     [[buffer(3)]],
     device const uint32_t*  {q_wt_buf}       [[buffer(4)]],
@@ -396,7 +402,8 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     device const uint*      {slot_map_buf}   [[buffer(15)]],
     device       {t_act}*   {kv_cache_k}     [[buffer(16)]],
     device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
-{maybe_bias_params}    uint3 __tg_pos    [[threadgroup_position_in_grid]],
+{maybe_bias_params}    device       {t_act}*   {residual_out}   [[buffer(21)]],
+    uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
     uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
     uint  __simd_lid  [[thread_index_in_simdgroup]])
@@ -434,6 +441,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         t_scale = t_scale,
         q_out_buf = q_out_buf,
         residual_io = residual_io,
+        residual_out = residual_out,
         delta_buf = delta_buf,
         rms_wt_buf = rms_wt_buf,
         q_wt_buf = q_wt_buf,
@@ -533,6 +541,9 @@ pub fn synthesize_mlp_pre_down_chunk(
     let gate_smem_name = "__gate_smem".to_string();
     let up_smem_name = "__up_smem".to_string();
     let residual_io = "__residual_io".to_string();
+    // residual_out: distinct device buffer for the `residual_in + delta`
+    // writeback (never in place — see AddRmsNormAtom).
+    let residual_out = "__residual_out".to_string();
     let delta_buf = "__delta".to_string();
     let rms_wt_buf = "__rms_weight".to_string();
     let gate_wt_buf = "__gate_weight".to_string();
@@ -568,7 +579,9 @@ pub fn synthesize_mlp_pre_down_chunk(
     };
 
     let addrms_in = vec![residual_io.clone(), delta_buf.clone(), rms_wt_buf.clone()];
-    let addrms_out = vec![x_norm_name.clone()];
+    // bound_outputs[1] = residual_out (the AddRmsNorm writes the residual
+    // there instead of in place — see AddRmsNormAtom).
+    let addrms_out = vec![x_norm_name.clone(), residual_out.clone()];
     let addrms_ctx = AtomCtx {
         bound_inputs: &addrms_in,
         bound_outputs: &addrms_out,
@@ -640,7 +653,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
 
 [[kernel]] void {symbol}(
     device       {t_act}*   {silu_mul_out}  [[buffer(0)]],
-    device       {t_act}*   {residual_io}   [[buffer(1)]],
+    device const {t_act}*   {residual_io}   [[buffer(1)]],
     device const {t_act}*   {delta_buf}     [[buffer(2)]],
     device const {t_scale}* {rms_wt_buf}    [[buffer(3)]],
     device const uint32_t*  {gate_wt_buf}   [[buffer(4)]],
@@ -649,6 +662,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     device const uint32_t*  {up_wt_buf}     [[buffer(7)]],
     device const {t_scale}* {up_sc_buf}     [[buffer(8)]],
     device const {t_scale}* {up_bi_buf}     [[buffer(9)]],
+    device       {t_act}*   {residual_out}  [[buffer(10)]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
     uint  __simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -694,6 +708,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         t_scale = t_scale,
         silu_mul_out = silu_mul_out,
         residual_io = residual_io,
+        residual_out = residual_out,
         delta_buf = delta_buf,
         rms_wt_buf = rms_wt_buf,
         gate_wt_buf = gate_wt_buf,

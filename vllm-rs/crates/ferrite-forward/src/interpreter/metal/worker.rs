@@ -299,13 +299,17 @@ impl<W: CanonicalParams> MetalWorker<W> {
         residency: Option<&ferrite_metal_kernels::residency::MetalResidencySet>,
     ) -> Result<Self, WorkerError> {
         // Arena slot count comes from the lowered tape (post-FUF
-        // coloring). Every bucket of a given model shares the same
-        // colored slot map, so checking the first bucket is enough.
-        if let Some(first) = bucket_tapes.first()
-            && first.num_arena_slots as usize != arena_layout.len()
+        // coloring). The shared arena is sized to the MAX colored slot
+        // count across buckets (see `for_buckets`); per-bucket counts can
+        // differ (a fusion needing extra scratch carries more slots), so
+        // a tape may legitimately use FEWER slots than the arena holds.
+        // Only a tape needing MORE slots than the arena provides is a
+        // genuine lowering/arena mismatch.
+        if let Some(max_tape) = bucket_tapes.iter().map(|t| t.num_arena_slots).max()
+            && (max_tape as usize) > arena_layout.len()
         {
             return Err(WorkerError::ArenaShapeMismatch {
-                expected: first.num_arena_slots,
+                expected: max_tape,
                 actual: arena_layout.len(),
             });
         }
@@ -936,7 +940,11 @@ fn bake_bucket<W: CanonicalParams>(
     runtime: &RuntimeBindings,
     device: Arc<Device>,
 ) -> Result<BucketBaking, WorkerError> {
-    if tape.num_arena_slots as usize != arena.len() {
+    // The shared arena is sized to the max colored slot count across
+    // buckets; this bucket's tape may reference fewer slots (different
+    // buckets pick different fusions). Only a tape demanding MORE slots
+    // than the arena provides is a real mismatch.
+    if tape.num_arena_slots as usize > arena.len() {
         return Err(WorkerError::ArenaShapeMismatch {
             expected: tape.num_arena_slots,
             actual: arena.len(),

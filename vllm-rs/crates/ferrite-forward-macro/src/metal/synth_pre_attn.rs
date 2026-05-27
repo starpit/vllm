@@ -458,6 +458,7 @@ impl Implementation for MetalSynthPreAttnImpl {
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
+                ("residual_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits", syn::parse_quote!(u32)),
@@ -541,6 +542,18 @@ impl Implementation for MetalSynthPreAttnImpl {
                 let idx = slots.of(norm_in, norm_slot);
                 (idx, idx)
             }
+        };
+
+        // residual_out: the updated residual (`residual_in + delta`) the
+        // kernel writes. Non-init = the `Add` tile's own output value
+        // (coloring gives it a slot distinct from `residual_slot_idx`, so
+        // the kernel reads the input and writes this — never in place).
+        // Init = no residual add / no write, so it aliases the input slot
+        // (downstream reads the unchanged embedding); the kernel leaves it
+        // untouched in init mode.
+        let residual_out_slot_idx = match add_tile {
+            Some(a) => slots.of(a, 0),
+            None => residual_slot_idx,
         };
 
         // q_out_slot: the Q-projection Gemm's output. Identify Q
@@ -696,6 +709,7 @@ impl Implementation for MetalSynthPreAttnImpl {
             residual_slot_idx,
             delta_slot_idx,
             q_out_slot_idx,
+            residual_out_slot_idx,
             layer,
             gs,
             self.bits,

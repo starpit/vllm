@@ -746,23 +746,25 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let h = lit_u32(h);
             quote! { AffineQmm(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
-        I::SynthPreAttn(a, b, c, d, e, f, g, h) => {
+        I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
             let d = lit_u32(d);
             let e = lit_u32(e);
             let f = lit_u32(f);
-            quote! { SynthPreAttn(#a, #b, #c, #d, #e, #f, #g, #h) }
+            let g = lit_u32(g);
+            quote! { SynthPreAttn(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
         }
-        I::SynthMlpPreDown(a, b, c, d, e, f, g) => {
+        I::SynthMlpPreDown(a, b, c, d, e, f, g, h) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
             let d = lit_u32(d);
             let e = lit_u32(e);
             let f = lit_u32(f);
-            quote! { SynthMlpPreDown(#a, #b, #c, #d, #e, #f, #g) }
+            let g = lit_u32(g);
+            quote! { SynthMlpPreDown(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
         I::SiluMul(a, b, c) => {
             let a = lit_u32(a);
@@ -1525,22 +1527,24 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             7 => u(h),
             _ => None,
         },
-        I::SynthPreAttn(a, b, c, d, e, f, _g, _h) => match idx {
+        I::SynthPreAttn(a, b, c, d, e, f, g, _h, _i) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
             3 => u(d),
             4 => u(e),
             5 => u(f),
+            6 => u(g),
             _ => None,
         },
-        I::SynthMlpPreDown(a, b, c, d, e, f, _g) => match idx {
+        I::SynthMlpPreDown(a, b, c, d, e, f, g, _h) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
             3 => u(d),
             4 => u(e),
             5 => u(f),
+            6 => u(g),
             _ => None,
         },
         I::SiluMul(a, b, c) => match idx {
@@ -2193,22 +2197,24 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             7 => I::AffineQmm(a, b, c, d, e, f, g, n),
             _ => panic!("AffineQmm: bad idx {idx}"),
         },
-        I::SynthPreAttn(a, b, c, d, e, f, g, h) => match idx {
-            0 => I::SynthPreAttn(n, b, c, d, e, f, g, h),
-            1 => I::SynthPreAttn(a, n, c, d, e, f, g, h),
-            2 => I::SynthPreAttn(a, b, n, d, e, f, g, h),
-            3 => I::SynthPreAttn(a, b, c, n, e, f, g, h),
-            4 => I::SynthPreAttn(a, b, c, d, n, f, g, h),
-            5 => I::SynthPreAttn(a, b, c, d, e, n, g, h),
+        I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::SynthPreAttn(n, b, c, d, e, f, g, h, i),
+            1 => I::SynthPreAttn(a, n, c, d, e, f, g, h, i),
+            2 => I::SynthPreAttn(a, b, n, d, e, f, g, h, i),
+            3 => I::SynthPreAttn(a, b, c, n, e, f, g, h, i),
+            4 => I::SynthPreAttn(a, b, c, d, n, f, g, h, i),
+            5 => I::SynthPreAttn(a, b, c, d, e, n, g, h, i),
+            6 => I::SynthPreAttn(a, b, c, d, e, f, n, h, i),
             _ => panic!("SynthPreAttn: bad idx {idx}"),
         },
-        I::SynthMlpPreDown(a, b, c, d, e, f, g) => match idx {
-            0 => I::SynthMlpPreDown(n, b, c, d, e, f, g),
-            1 => I::SynthMlpPreDown(a, n, c, d, e, f, g),
-            2 => I::SynthMlpPreDown(a, b, n, d, e, f, g),
-            3 => I::SynthMlpPreDown(a, b, c, n, e, f, g),
-            4 => I::SynthMlpPreDown(a, b, c, d, n, f, g),
-            5 => I::SynthMlpPreDown(a, b, c, d, e, n, g),
+        I::SynthMlpPreDown(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::SynthMlpPreDown(n, b, c, d, e, f, g, h),
+            1 => I::SynthMlpPreDown(a, n, c, d, e, f, g, h),
+            2 => I::SynthMlpPreDown(a, b, n, d, e, f, g, h),
+            3 => I::SynthMlpPreDown(a, b, c, n, e, f, g, h),
+            4 => I::SynthMlpPreDown(a, b, c, d, n, f, g, h),
+            5 => I::SynthMlpPreDown(a, b, c, d, e, n, g, h),
+            6 => I::SynthMlpPreDown(a, b, c, d, e, f, n, h),
             _ => panic!("SynthMlpPreDown: bad idx {idx}"),
         },
         I::SiluMul(a, b, c) => match idx {
@@ -2403,17 +2409,33 @@ pub fn colored_slot_map(
     // emit a kernel chain whose intermediate outputs hit the arena).
     // Last use of a non-owner (a View slot itself) is computed
     // separately below.
+    // A fused subgraph is ONE kernel (a fusion) whose claimed tiles
+    // execute CONCURRENTLY across threadgroups — there is no intra-subgraph
+    // ordering between a tile that READS a boundary input and a tile
+    // that WRITES (in-place) that same storage. So a boundary input
+    // read by ANY tile of the subgraph stays live until the subgraph
+    // COMPLETES (its last per-tile position), not just until the
+    // reading tile's position. Charging the reading tile's position
+    // lets the linear scan free the input early and an in-place output
+    // of the SAME subgraph (e.g. SynthMlpPreDown / SynthPreAttn residual
+    // `Add`) reuse its slot — a cross-threadgroup RAW/WAR race that only
+    // manifests on hardware that doesn't run the tiles in position order
+    // (M5 / gen-17). Single-tile subgraphs are unaffected (subgraph-last
+    // == the tile's own position). Genuinely-safe element-wise in-place
+    // (the standalone `Add`) is untouched: it's pinned via an explicit
+    // `output_alias`, a separate mechanism from this implicit reuse.
     let mut owner_last_use: HashMap<(TileId, u8), usize> = HashMap::new();
     for &sg in &order_arr {
-        for tile in sfuf.tiles_in_subgraph(sg) {
-            let consumer_pos = tile_position[&tile];
-            for input in &fuf.get(tile).inputs {
+        let tiles = sfuf.tiles_in_subgraph(sg);
+        let sg_last = tiles.iter().map(|t| tile_position[t]).max().unwrap_or(0);
+        for tile in &tiles {
+            for input in &fuf.get(*tile).inputs {
                 if let FufInput::Tile { id, slot } = input {
                     let owner = resolve((*id, *slot));
                     owner_last_use
                         .entry(owner)
-                        .and_modify(|p| *p = (*p).max(consumer_pos))
-                        .or_insert(consumer_pos);
+                        .and_modify(|p| *p = (*p).max(sg_last))
+                        .or_insert(sg_last);
                 }
             }
         }
@@ -2797,6 +2819,7 @@ fn synth_pre_attn_opcode_shape() -> OpcodeShape {
             ("residual_slot", syn::parse_quote!(u32)),
             ("delta_slot", syn::parse_quote!(u32)),
             ("out_slot", syn::parse_quote!(u32)),
+            ("residual_out_slot", syn::parse_quote!(u32)),
             ("layer", syn::parse_quote!(u32)),
             ("group_size", syn::parse_quote!(u32)),
             ("bits", syn::parse_quote!(u32)),

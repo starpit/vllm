@@ -320,6 +320,7 @@ impl Implementation for MetalSynthMlpPreDownImpl {
                 ("residual_slot", syn::parse_quote!(u32)),
                 ("delta_slot", syn::parse_quote!(u32)),
                 ("out_slot", syn::parse_quote!(u32)),
+                ("residual_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 ("group_size", syn::parse_quote!(u32)),
                 ("bits", syn::parse_quote!(u32)),
@@ -443,10 +444,17 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         // 0/1 (Linear) and 0 (RmsNorm).
         let _ = (gate_base, up_base, rms_base);
         let kernel_symbol: &'static str = Box::leak(symbol.into_boxed_str());
+        // residual_out: the updated residual (`residual_in + delta`) the
+        // kernel writes — the `Add` tile's own output value. The coloring
+        // gives it a slot distinct from `residual_slot_idx` (fused-
+        // subgraph inputs stay live to the subgraph end), so the kernel
+        // reads the input slot and writes this one — never in place.
+        let residual_out_slot_idx = slots.of(add_tile, 0);
         Some(vec![ferrite_forward::Instruction::SynthMlpPreDown(
             residual_slot_idx,
             delta_slot_idx,
             out_slot_idx,
+            residual_out_slot_idx,
             layer,
             gs,
             self.bits,

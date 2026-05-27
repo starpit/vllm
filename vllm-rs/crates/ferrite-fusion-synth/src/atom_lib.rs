@@ -83,11 +83,23 @@ impl Atom for AddRmsNormAtom {
                     ty: "const {T_scale}".into(),
                 },
             ],
-            outputs: vec![AtomChannel {
-                name: "x_norm".into(),
-                kind: ChannelKind::Threadgroup,
-                ty: "{T_act}".into(),
-            }],
+            outputs: vec![
+                AtomChannel {
+                    name: "x_norm".into(),
+                    kind: ChannelKind::Threadgroup,
+                    ty: "{T_act}".into(),
+                },
+                // The updated residual (`residual_in + delta`), written to
+                // a DISTINCT device buffer from `residual_io` so the
+                // per-Q-head writeback never races the cross-threadgroup
+                // rmsnorm reads. Unused by the `init` variant (layer 0 has
+                // no residual add); the lowering still binds it.
+                AtomChannel {
+                    name: "residual_out".into(),
+                    kind: ChannelKind::Device,
+                    ty: "{T_act}".into(),
+                },
+            ],
         }
     }
 
@@ -146,20 +158,31 @@ impl Atom for AddRmsNormAtom {
                 out = out,
             ));
         }
+        // residual_out: the DISTINCT device buffer that receives the
+        // updated residual (`residual_in + delta`). The coloring assigns
+        // it a slot separate from `residual_io`, so the kernel reads the
+        // input and writes here — never in place. Writing in place would
+        // race cross-threadgroup: every threadgroup reads the whole
+        // `residual_in` row for the rmsnorm sum, and Metal has no
+        // cross-threadgroup barrier to order that against an in-place
+        // write of `residual_in + delta` by a peer threadgroup.
+        let res_out = &ctx.bound_outputs[1]; // residual_out (device)
+
         // Body sourced from fused_add_rmsnorm_affine_qkv_rope_cache.metal:
-        // each thread reads its strided slice of (residual, delta) over
+        // each thread reads its strided slice of (residual_in, delta) over
         // HIDDEN, accumulates sumsq, mk_tg_rmsnorm_scale, then writes
-        // x_norm[i] = (residual + delta) * scale * rms_weight[i]. Q-head
-        // TGs additionally write residual_new back to device.
+        // x_norm[i] = (residual_in + delta) * scale * rms_weight[i]. Q-head
+        // TGs additionally write residual_new to residual_out (device).
         Some(format!(
             r#"
     // --- atom: AddRmsNorm ---
     {{
-        device {t_act}* __res_row = {res} + (size_t)__t * (size_t)__hidden;
+        device const {t_act}* __res_in_row  = {res} + (size_t)__t * (size_t)__hidden;
+        device {t_act}*       __res_out_row = {res_out} + (size_t)__t * (size_t)__hidden;
         device const {t_act}* __del_row = {del} + (size_t)__t * (size_t)__hidden;
         float __local_sumsq = 0.0f;
         for (uint __i = __tid; __i < __hidden; __i += __threads_per_tg) {{
-            const float __r = float(__res_row[__i]);
+            const float __r = float(__res_in_row[__i]);
             const float __d = float(__del_row[__i]);
             const float __v = __r + __d;
             __local_sumsq += __v * __v;
@@ -168,6 +191,10 @@ impl Atom for AddRmsNormAtom {
         const float __scale = mk_tg_rmsnorm_scale(__local_sumsq, __hidden, __eps,
                                                   __scratch, __num_simdgroups,
                                                   __simd_gid, __simd_lid);
+        // Each Q-head writes its own disjoint [__res_slice_lo,
+        // __res_slice_hi) slice of __res_out_row (a buffer no peer
+        // threadgroup reads this dispatch), so the residual write never
+        // races the cross-threadgroup rmsnorm reads of __res_in_row.
         const bool __writes_residual = (__head < __num_q);
         const uint __res_slice_lo = __head * __head_dim;
         const uint __res_slice_hi = __res_slice_lo + __head_dim;
@@ -176,7 +203,7 @@ impl Atom for AddRmsNormAtom {
             const float __w     = float({rw}[__i]);
             const float __normed = __v_pre * __scale * __w;
             if (__writes_residual && __i >= __res_slice_lo && __i < __res_slice_hi) {{
-                __res_row[__i] = {t_act}(__v_pre);
+                __res_out_row[__i] = {t_act}(__v_pre);
             }}
             {out}[__i] = {t_act}(__normed);
         }}
@@ -185,6 +212,7 @@ impl Atom for AddRmsNormAtom {
 "#,
             t_act = t_act,
             res = res,
+            res_out = res_out,
             del = del,
             rw = rw,
             out = out,

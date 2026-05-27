@@ -882,14 +882,23 @@ pub enum Instruction {
     ///
     /// CUDA eval is `unreachable!`.
     SynthPreAttn(
+        u32, // 0: residual_in_slot
+        u32, // 1: delta_slot
+        u32, // 2: q_out_slot
+        /// 3: `residual_out_slot` — distinct arena slot for the updated
+        /// residual (`residual_in + delta`). NOT written in place: the
+        /// kernel is tiled across threadgroups and reads the whole
+        /// `residual_in` for the rmsnorm sum, so an in-place write would
+        /// race cross-threadgroup. The coloring keeps it distinct from
+        /// `residual_in_slot`; downstream reads this. For the layer-0
+        /// `_init` variant (no residual add) the `fan_out` sets it equal
+        /// to `residual_in_slot` and the kernel leaves it untouched.
         u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        u32,
-        &'static str,
-        /// `has_linear_bias`. When `true`, the lowering arm appends 3
+        u32,          // 4: layer
+        u32,          // 5: group_size
+        u32,          // 6: bits
+        &'static str, // 7: kernel_symbol
+        /// 8: `has_linear_bias`. When `true`, the lowering arm appends 3
         /// extra `Binding::Weight { which: AffineLinearBias, .. }`
         /// entries for Q/K/V at buffers 18/19/20 and picks the
         /// `_bias` synth kernel symbol (set by `fan_out`). Qwen2/2.5
@@ -906,15 +915,23 @@ pub enum Instruction {
     /// per-arch source-compiled library registered into the
     /// `SpecializedPipelineCache` at worker-pool init.
     ///
-    /// Tuple fields: `(residual_slot, delta_slot, silu_mul_out_slot,
-    /// layer, group_size, bits, kernel_symbol)`. Gate/up `LinearLayer`s
-    /// and the RmsNorm resolve through `WeightAccessors::{linear_at,
-    /// rms_norm_at}` at slots 0/1/2 of the same `(bucket, op_idx)`.
-    /// The standalone `AffineQmm` for down_proj follows directly in
-    /// the instruction stream as before.
+    /// Tuple fields: `(residual_in_slot, delta_slot, silu_mul_out_slot,
+    /// residual_out_slot, layer, group_size, bits, kernel_symbol)`.
+    /// Gate/up `LinearLayer`s and the RmsNorm resolve through
+    /// `WeightAccessors::{linear_at, rms_norm_at}` at slots 0/1/2 of the
+    /// same `(bucket, op_idx)`. The standalone `AffineQmm` for down_proj
+    /// follows directly in the instruction stream as before.
+    ///
+    /// `residual_out_slot` is the distinct arena slot the fusion writes
+    /// the updated residual (`residual_in + delta`) into — NOT in place,
+    /// because the kernel is tiled across threadgroups and reads the
+    /// whole `residual_in` for the rmsnorm sum (an in-place write would
+    /// race cross-threadgroup). The coloring assigns it a slot distinct
+    /// from `residual_in_slot` (fused-subgraph inputs stay live to the
+    /// subgraph's end); downstream reads `residual_out_slot`.
     ///
     /// CUDA eval is `unreachable!`.
-    SynthMlpPreDown(u32, u32, u32, u32, u32, u32, &'static str),
+    SynthMlpPreDown(u32, u32, u32, u32, u32, u32, u32, &'static str),
     /// Fused elementwise `silu(gate) * up` for the decomposed q-MLP
     /// path (plan P12 branch (i)). The macro emits this after a pair
     /// of `AffineQmm` GEMMs when both gate_proj and up_proj are

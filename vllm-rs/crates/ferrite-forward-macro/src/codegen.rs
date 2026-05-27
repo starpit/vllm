@@ -1645,16 +1645,30 @@ fn emit_fingerprint_check(
             quote! {}
         }
         Some(crate::quantization::QuantMethod::Ggml) | None => quote! {},
-        Some(crate::quantization::QuantMethod::Affine { .. }) => {
-            // MLX-affine fingerprint has no shape gate at the
-            // q_proj level — the per-tensor `.scales` / `.biases`
-            // sibling presence is the load-time signal that
-            // distinguishes it from Dense, and the `U32` dtype on
-            // `<prefix>.weight` distinguishes it from CT GPTQ which
-            // uses i32-packed `.weight_packed` of the same `[N, K/8]`
-            // shape. Both checks are at-load; nothing to fingerprint
-            // at compile time at the shape level.
-            quote! {}
+        Some(crate::quantization::QuantMethod::Affine { group_size, .. }) => {
+            // Group-size discriminator. The packed `.weight` (U32) has
+            // the SAME shape for every group_size — 4-bit packs 8 values
+            // per word along `in`, independent of the grouping — so g64
+            // and g128 affine variants are otherwise fingerprint-
+            // identical, and a mismatched checkpoint would dequantize
+            // with the wrong group stride → silent garbage (not a
+            // rejection). The `.scales` sibling is `[out, in/group_size]`;
+            // for the q_proj fingerprint leaf `in == hidden_size`, so its
+            // last dim must equal `hidden_size / group_size`. Reject
+            // otherwise: a checkpoint whose group_size has no compiled
+            // variant then gets the `ArchNotSupported` error (pointing at
+            // quantizations.json) instead of corrupt output, and one that
+            // DOES have a matching variant is routed to it deterministically
+            // regardless of variant registration order.
+            let scales_groups =
+                proc_macro2::Literal::usize_unsuffixed(hidden_size as usize / *group_size as usize);
+            quote! {
+                match gw.tensor_info(#mlx_marker_tensor) {
+                    Some((shape, _))
+                        if shape.len() == 2 && shape[1] == #scales_groups => {}
+                    _ => return false,
+                }
+            }
         }
     };
 

@@ -7622,19 +7622,24 @@ impl FerriteWorker {
                 .scheduled_cached_reqs
                 .resumed_req_ids
                 .contains(req_id);
-            // Chunked prefill continuation: cached request with num_scheduled > 1
-            // means the scheduler is sending another chunk of prompt tokens.
-            // We must re-arm the InputBatch slot as prefill (remove + add_request)
-            // so prepare_inputs emits the full chunk instead of a single decode token.
-            let num_scheduled_for_req = scheduler_output
-                .num_scheduled_tokens
-                .get(req_id)
-                .copied()
-                .unwrap_or(0);
-            // Only treat as chunked prefill if the request still has prompt tokens
-            // remaining. A cached request with num_scheduled > 1 that has already
-            // completed its prefill is just a normal decode (e.g. spec decode or
-            // scheduler batching artifact) and must NOT be re-armed.
+            // Chunked prefill continuation: a cached (running) request that
+            // still has un-prefilled prompt tokens. We must re-arm the
+            // InputBatch slot as prefill (remove + add_request) so
+            // prepare_inputs emits this chunk's prompt tokens (q_len = chunk
+            // size) instead of a single decode token.
+            //
+            // The request is still mid-prefill iff `num_computed < prompt_len`
+            // (matches Python vLLM, where a request is "in prefill" while
+            // num_computed_tokens < num_prompt_tokens). This INCLUDES the
+            // final chunk, where num_computed + num_scheduled == prompt_len.
+            //
+            // (Earlier this gated on `num_computed + num_scheduled < prompt_len`
+            // (strict), which dropped the FINAL chunk of every chunked prefill:
+            // its prompt tokens — including the user's actual question — were
+            // never processed, and the slot ran as a 1-token decode of the
+            // discarded mid-prefill sample. So every prompt longer than
+            // max_num_batched_tokens produced garbage / a prompt echo. A normal
+            // decode has num_computed >= prompt_len and is still excluded.)
             let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
             let num_computed_here = scheduler_output
                 .scheduled_cached_reqs
@@ -7642,9 +7647,7 @@ impl FerriteWorker {
                 .get(i)
                 .copied()
                 .unwrap_or(0) as usize;
-            let is_chunked_prefill_continuation = !is_resumed
-                && num_scheduled_for_req > 1
-                && num_computed_here + num_scheduled_for_req < prompt_len;
+            let is_chunked_prefill_continuation = !is_resumed && num_computed_here < prompt_len;
             if !is_resumed && !is_chunked_prefill_continuation {
                 continue;
             }
@@ -10924,6 +10927,53 @@ impl Worker for FerriteWorker {
             }
         }
 
+        // ── 3b. Re-arm chunked-prefill continuations as prefill ───
+        // A cached (running) request that still has un-prefilled prompt
+        // tokens must run THIS step as a PREFILL chunk, not a decode. The
+        // previous chunk's commit_step cleared is_prefill, so without this
+        // re-arm prepare_inputs would emit a single decode token (q_len=1)
+        // and DROP the rest of the prompt — including the user's question —
+        // producing garbage / a prompt echo on every prompt longer than
+        // max_num_batched_tokens (the chunked-prefill threshold). Unlike the
+        // CUDA worker (execute_model_inner), the metal path previously had no
+        // re-arm at all, so all chunked prefill was silently broken.
+        //
+        // The request is still mid-prefill iff `num_computed < prompt_len`
+        // (matches Python vLLM, where a request is "in prefill" while
+        // num_computed_tokens < num_prompt_tokens). This INCLUDES the final
+        // chunk (num_computed + num_scheduled == prompt_len). The block table
+        // (step 3 above) and tokens_in_pool (prior commit_step) are already
+        // up to date, so set_prefill_continuation — flip is_prefill + set this
+        // chunk's tokens + pos_offset — is sufficient.
+        for (i, req_id) in cached.req_ids.iter().enumerate() {
+            if cached.resumed_req_ids.contains(req_id) {
+                continue;
+            }
+            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
+            let num_computed = cached.num_computed_tokens.get(i).copied().unwrap_or(0) as usize;
+            if num_computed >= prompt_len {
+                continue; // prefill complete → normal decode, leave as-is
+            }
+            let num_scheduled = scheduler_output
+                .num_scheduled_tokens
+                .get(req_id)
+                .copied()
+                .unwrap_or(0);
+            if num_scheduled == 0 {
+                continue;
+            }
+            let tokens = match self.token_buffers.get(req_id) {
+                Some(buf) => {
+                    let start = num_computed;
+                    let end = (start + num_scheduled).min(buf.len());
+                    buf[start..end].to_vec()
+                }
+                None => continue,
+            };
+            self.input_batch
+                .set_prefill_continuation(req_id, tokens, num_computed as u32);
+        }
+
         if self.input_batch.num_active() == 0 {
             return Ok(ModelRunnerOutput::empty());
         }
@@ -11426,6 +11476,31 @@ impl Worker for FerriteWorker {
         for (i, req_id) in req_ids_in_order.iter().enumerate() {
             let req_slice = &prepared.req_inputs[i];
             req_id_to_index.insert(req_id.clone(), i);
+            // Chunked-prefill intermediate chunk: the prefill does NOT
+            // complete this step (the request still has prompt tokens past
+            // this chunk, i.e. `seq_len < prompt_len`). Such a chunk writes
+            // its K/V into the cache but must NOT emit a sampled token —
+            // only the FINAL chunk (where seq_len == prompt_len) or a decode
+            // step produces output. This matches Python vLLM, which excludes
+            // still-prefilling requests from the logits/sample set.
+            //
+            // Without this gate every non-final chunk emits one spurious
+            // token: the greedy argmax at the chunk's last prompt position
+            // (e.g. the model's continuation of the boilerplate). The engine
+            // (`update_from_output`) appends whatever the worker returns, so
+            // that token is prepended before the real first generated token
+            // — the "doubled first token" / prompt-echo symptom of chunked
+            // prefill. `commit_step` still advances `tokens_in_pool` by the
+            // chunk's `q_len` (it keys on `input_token_count`, not the token
+            // slice), so an empty emit leaves prefill bookkeeping correct and
+            // the next step's re-arm continues the prefill.
+            let prompt_len = self.prompt_lengths.get(req_id).copied().unwrap_or(0);
+            let seq_len_after = attn.seq_lens.get(i).copied().unwrap_or(usize::MAX);
+            if seq_len_after < prompt_len {
+                sampled_token_ids.push(Vec::new());
+                was_spec_decode.push(false);
+                continue;
+            }
             if req_slice.spec_token_ids.is_empty() {
                 let row = sample_indices[i] as usize;
                 debug_assert!(row < total_n as usize);

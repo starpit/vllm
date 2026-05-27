@@ -355,6 +355,17 @@ pub enum MScaleAxis {
 pub struct MScaling {
     pub axis: MScaleAxis,
     pub bucket_m: BucketM,
+    /// When `Some(ax)`, the worker SETS `threadgroups.{ax}` to the live
+    /// `num_seqs` at dispatch (not a proportional scale — an exact set).
+    /// Used by the steel paged prefill attention kernel, whose grid is
+    /// `(Q-blocks-per-seq, num_q_heads, num_seqs)`: it tiles queries in
+    /// BQ-sized blocks that must not straddle a sequence boundary, so it
+    /// needs one grid-Z layer per sequence (`tid.z = seq_idx`, indexing
+    /// `cu_seqlens_q` / `block_table`). `axis` still scales the Q-block
+    /// dimension by `num_tokens`; over-dispatched blocks early-out in the
+    /// kernel. `None` (every other kernel, incl. SDPA which is per-query-
+    /// token and self-attributes via `cu_seqlens_q`) leaves Z untouched.
+    pub seq_axis: Option<MScaleAxis>,
 }
 
 /// Runtime gate evaluated per dispatch — when `Some`, the worker

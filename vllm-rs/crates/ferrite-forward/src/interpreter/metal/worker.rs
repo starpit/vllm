@@ -524,6 +524,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                             *tg,
                             *scaling,
                             super::ids::NumTokens(num_tokens),
+                            num_seqs,
                         );
                         enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
                     }
@@ -598,8 +599,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         enc.setBuffer_offset_atIndex(Some(buf), *off as usize, *idx as usize);
                     }
                 }
-                let tg_scaled =
-                    scale_tg_for_num_tokens(*tg, *scaling, super::ids::NumTokens(num_tokens));
+                let tg_scaled = scale_tg_for_num_tokens(
+                    *tg,
+                    *scaling,
+                    super::ids::NumTokens(num_tokens),
+                    num_seqs,
+                );
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
                 enc.endEncoding();
                 cb.commit();
@@ -873,8 +878,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         );
                     }
                 }
-                let tg_scaled =
-                    scale_tg_for_num_tokens(*tg, *scaling, super::ids::NumTokens(num_tokens));
+                let tg_scaled = scale_tg_for_num_tokens(
+                    *tg,
+                    *scaling,
+                    super::ids::NumTokens(num_tokens),
+                    num_seqs,
+                );
                 if let Some(t) = timing.as_mut()
                     && ts_idx < t.heap_capacity
                 {
@@ -1743,6 +1752,7 @@ fn scale_tg_for_num_tokens(
     mut tg: MTLSize,
     scaling: Option<super::lowered::MScaling>,
     num_tokens: super::ids::NumTokens,
+    num_seqs: u32,
 ) -> MTLSize {
     let Some(s) = scaling else {
         return tg;
@@ -1760,6 +1770,19 @@ fn scale_tg_for_num_tokens(
     let baseline = *slot as u64;
     let scaled = baseline.saturating_mul(n).div_ceil(bm);
     *slot = scaled as usize;
+    // `seq_axis`: SET (not scale) the chosen axis to the live num_seqs.
+    // The steel paged prefill kernel needs one grid-Z layer per sequence
+    // (`tid.z = seq_idx`) so a BQ-block tile never straddles a sequence
+    // boundary; over-dispatched (seq, q-block) pairs early-out in the
+    // kernel. See `MScaling::seq_axis`.
+    if let Some(seq_ax) = s.seq_axis {
+        let seq_slot = match seq_ax {
+            super::lowered::MScaleAxis::X => &mut tg.width,
+            super::lowered::MScaleAxis::Y => &mut tg.height,
+            super::lowered::MScaleAxis::Z => &mut tg.depth,
+        };
+        *seq_slot = num_seqs.max(1) as usize;
+    }
     tg
 }
 

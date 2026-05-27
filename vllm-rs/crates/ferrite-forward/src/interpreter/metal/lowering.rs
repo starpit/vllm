@@ -564,6 +564,7 @@ fn lower_one<W: CanonicalParams>(
             dispatch: {
                 let mut d = DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -635,6 +636,7 @@ fn lower_one<W: CanonicalParams>(
                 threadgroups: (bucket_m * *m_multiplier, 1, 1),
                 threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -683,6 +685,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (bucket_m, 1, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -737,6 +740,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (tg_x, tg_y, 1),
                     threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -861,6 +865,7 @@ fn lower_one<W: CanonicalParams>(
                         // (`qmv_dispatch_shape` returns `(m, ceil(N/bn), B)`);
                         // shrinks linearly with actual num_tokens.
                         m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            seq_axis: None,
                             axis: super::lowered::MScaleAxis::X,
                             bucket_m: super::ids::BucketM(bucket_m),
                         }),
@@ -952,6 +957,7 @@ fn lower_one<W: CanonicalParams>(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t NAX grid = (n_tiles, m_tiles=ceil(M/64), B)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    seq_axis: None,
                                     axis: super::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -994,6 +1000,7 @@ fn lower_one<W: CanonicalParams>(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t Standard grid = (n_tiles, m_tiles=ceil(M/32), B)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    seq_axis: None,
                                     axis: super::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -1063,6 +1070,7 @@ fn lower_one<W: CanonicalParams>(
                                 threads_per_threadgroup: tpg,
                                 // qmm_t SplitK grid = (n_tiles, m_tiles=ceil(M/32), split_k)
                                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                    seq_axis: None,
                                     axis: super::lowered::MScaleAxis::Y,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 }),
@@ -1100,6 +1108,7 @@ fn lower_one<W: CanonicalParams>(
                                 // in M; proportional scaling shrinks it for
                                 // actual num_tokens.
                                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                                    seq_axis: None,
                                     axis: super::lowered::MScaleAxis::X,
                                     bucket_m: super::ids::BucketM(bucket_m),
                                 });
@@ -1149,6 +1158,7 @@ fn lower_one<W: CanonicalParams>(
                 dispatch: {
                     let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     });
@@ -1239,6 +1249,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (groups_x, bucket_m, 1),
                     threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -1377,6 +1388,7 @@ fn lower_one<W: CanonicalParams>(
                         None
                     } else {
                         Some(crate::interpreter::metal::lowered::MScaling {
+                            seq_axis: None,
                             axis: super::lowered::MScaleAxis::Y,
                             bucket_m: super::ids::BucketM(bucket_m),
                         })
@@ -1442,6 +1454,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (bucket_m, n_q_heads, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -1499,6 +1512,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -1573,6 +1587,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (bucket_m, num_heads_total, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -1855,6 +1870,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (bucket_m, num_tiles, 1),
                     threads_per_threadgroup: (threads_per_tg, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -1985,6 +2001,7 @@ fn lower_one<W: CanonicalParams>(
                     threadgroups: (intermediate.div_ceil(tg_n), bucket_m.div_ceil(tg_m), 1),
                     threads_per_threadgroup: (128, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::Y,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2108,6 +2125,7 @@ fn lower_one<W: CanonicalParams>(
                     // (decode bucket). Scaling is a no-op but kept
                     // for uniformity in case decode shares a bucket.
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
                         bucket_m: super::ids::BucketM(bucket_m),
                     }),
@@ -2243,6 +2261,16 @@ fn lower_one<W: CanonicalParams>(
                 threadgroups: tg_shape,
                 threads_per_threadgroup: threads_per_tg,
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    // Steel tiles queries in BQ-blocks that must not
+                    // straddle a sequence boundary, so its grid needs one
+                    // Z-layer per sequence (`tid.z = seq_idx`). SDPA is
+                    // per-query-token and self-attributes, so it leaves Z
+                    // alone. See MScaling::seq_axis.
+                    seq_axis: if use_steel {
+                        Some(crate::interpreter::metal::lowered::MScaleAxis::Z)
+                    } else {
+                        None
+                    },
                     axis: m_scale_axis,
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
@@ -2296,6 +2324,7 @@ fn lower_one<W: CanonicalParams>(
                 let mut d =
                     DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -2328,6 +2357,7 @@ fn lower_one<W: CanonicalParams>(
                 let mut d =
                     DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -2380,6 +2410,7 @@ fn lower_one<W: CanonicalParams>(
             dispatch: {
                 let mut d = DispatchShape::dispatch_1d(bucket_m * *n, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(bucket_m),
                 });
@@ -3071,6 +3102,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (tg_x, tg_y, 1),
                 threads_per_threadgroup: (GEMM_TILE_M, GEMM_TILE_N, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3115,6 +3147,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (p.bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3153,6 +3186,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (1, p.bucket_m, 1),
                 threads_per_threadgroup: (bn, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::Y,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3206,6 +3240,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (tg_x_count, p.bucket_m, 1),
                 threads_per_threadgroup: (tg_x_threads, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::Y,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3251,6 +3286,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (tg_x_count, p.bucket_m, 1),
                 threads_per_threadgroup: (tg_x_threads, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::Y,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3294,6 +3330,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (p.bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3338,6 +3375,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (p.bucket_m, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3386,6 +3424,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                     threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                     threads_per_threadgroup: (32, 2, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
                         axis: super::lowered::MScaleAxis::Z,
                         bucket_m: super::ids::BucketM(p.bucket_m),
                     }),
@@ -3494,6 +3533,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (groups, 1, 1),
                 threads_per_threadgroup: (256, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3577,6 +3617,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (1, n_out.div_ceil(bn), p.bucket_m * p.top_k),
                 threads_per_threadgroup: (32, 2, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::Z,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),
@@ -3647,6 +3688,7 @@ fn lower_metal_moe<W: CanonicalParams>(
                 threadgroups: (tg_x_count, p.bucket_m, 1),
                 threads_per_threadgroup: (tg_x_threads, 1, 1),
                 m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
                     axis: super::lowered::MScaleAxis::Y,
                     bucket_m: super::ids::BucketM(p.bucket_m),
                 }),

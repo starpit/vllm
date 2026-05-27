@@ -81,6 +81,28 @@ async fn start_metal_server() -> (TestServer, Client) {
     (server, client)
 }
 
+/// Like [`start_metal_server`] but pins `--max-num-batched-tokens`, which
+/// is the knob that forces chunked prefill: a prompt longer than this many
+/// tokens is split across steps even when it would fit the 4096 bucket. Two
+/// servers at different caps let a test diff single-prefill vs chunked-
+/// prefill on the SAME prompt. Takes an explicit model so the caller can
+/// pick one strong enough for a real needle assertion.
+async fn start_metal_server_max_batched(model: &str, max_batched: &str) -> (TestServer, Client) {
+    let server = TestServer::builder(model)
+        .with_device("metal")
+        .with_args(&[
+            "--max-model-len",
+            "8192",
+            "--max-num-batched-tokens",
+            max_batched,
+        ])
+        .start()
+        .await
+        .expect("server should start");
+    let client = Client::new(server.base_url());
+    (server, client)
+}
+
 /// Sanity baseline: ~1k-token prompt fits in the M=4096 bucket as a
 /// single (paged) prefill call. Catches regressions in the prefill
 /// path independent of the chunked / multi-turn cases below.
@@ -132,13 +154,82 @@ async fn long_prompt_metal_chunked_prefill_completes() {
         "chunked-prefill must produce a non-empty completion"
     );
 
-    // Coherence smoke: the model should mention "green" given the
-    // prompt's overwhelming prior. A successful paged-prefill leaves
-    // the question salient; a broken chunked-prefill produces
-    // garbage / repeats the input pattern.
+    // NOTE: this is a non-panic / non-empty smoke test for the
+    // bucket-cap (>4096) chunking path. It deliberately does NOT assert
+    // `contains("green")` — "green" is in the repeated boilerplate, so a
+    // broken chunked-prefill that merely echoes the prompt passes it too
+    // (this false-pass is why metal chunked-prefill shipped broken). The
+    // real correctness gate is `long_prompt_metal_chunked_matches_single_prefill`
+    // below, which diffs chunked output against single-prefill output.
+}
+
+/// Chunked-prefill CORRECTNESS gate: the same prompt must produce the
+/// SAME greedy output whether prefilled in one step or split into chunks,
+/// AND that output must answer a needle question whose answer is NOT in
+/// the boilerplate.
+///
+/// Chunking is forced by lowering `--max-num-batched-tokens` below the
+/// prompt length (independent of the 4096 bucket cap), so a ~3000-token
+/// prompt runs as ONE prefill at `--max-num-batched-tokens 4096` and as
+/// TWO chunks at `2048` — an apples-to-apples diff on the same model.
+///
+/// Uses Llama-3.2-1B (not the 135M SmolLM the other cases use): it's
+/// strong enough that the needle assertion (`contains "42"`) is reliable,
+/// so the test isn't a vacuous empty==empty pass.
+///
+/// Gates two chunked-prefill bugs that the old `contains("green")`
+/// assertion silently passed ("green" is in the boilerplate):
+///   1. Dropping the final chunk (missing re-arm) → prompt echo, no "42".
+///   2. Sampling an INTERMEDIATE chunk → a spurious leading token
+///      prepended before the real first generated token → differs from
+///      the single-prefill output.
+#[tokio::test(flavor = "multi_thread")]
+async fn long_prompt_metal_chunked_matches_single_prefill() {
+    const MODEL: &str = vllm_e2e::TestModels::LLAMA_3_2;
+    // Needle at the front, ~2900 tokens of boilerplate, question at the
+    // end. Total > 2048 (→ 2 chunks at cap 2048) but < 4096 (→ single
+    // prefill at cap 4096). The answer ("42") is NOT in the boilerplate,
+    // so a broken chunked-prefill cannot pass by echoing the prompt.
+    let prompt = format!(
+        "The magic number is 42. {}",
+        build_prompt(2900, " Q: What is the magic number? A:")
+    );
+
+    // Single prefill first; drop its server before starting the next so
+    // only one model is resident at a time.
+    let single = {
+        let (_server, client) = start_metal_server_max_batched(MODEL, "4096").await;
+        let resp = client
+            .completion(&greedy_completion(&prompt, 16))
+            .await
+            .expect("single-prefill completion must succeed");
+        assert_valid_completion_response(&resp);
+        resp.choices[0].text.clone()
+    };
+
+    // Single-prefill is the reference; it must answer the needle. (If this
+    // fails the model/prompt is wrong, not the chunking — fix the test.)
     assert!(
-        text.to_lowercase().contains("green"),
-        "post-fix coherence: model should answer 'green' to the explicit question — got {text:?}"
+        single.contains("42"),
+        "single-prefill reference must answer the needle question with '42' — got {single:?}"
+    );
+
+    let chunked = {
+        let (_server, client) = start_metal_server_max_batched(MODEL, "2048").await;
+        let resp = client
+            .completion(&greedy_completion(&prompt, 16))
+            .await
+            .expect("chunked-prefill completion must succeed");
+        assert_valid_completion_response(&resp);
+        resp.choices[0].text.clone()
+    };
+
+    assert_eq!(
+        chunked, single,
+        "chunked prefill (--max-num-batched-tokens 2048) must produce identical \
+         greedy output to single prefill (4096) for the same prompt — a mismatch \
+         means chunking changed the result (dropped the final chunk, or emitted a \
+         spurious token for an intermediate chunk).\n  single:  {single:?}\n  chunked: {chunked:?}"
     );
 }
 

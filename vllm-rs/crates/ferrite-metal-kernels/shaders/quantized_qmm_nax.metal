@@ -371,7 +371,18 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
     INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, true,  true)  \
     INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, false, false)
 
-INST_QMM_T_NAX_ALL(f16,  half,   f16, half,  64)
-INST_QMM_T_NAX_ALL(f16,  half,   f16, half, 128)
-INST_QMM_T_NAX_ALL(bf16, bfloat, f16, half,  64)
-INST_QMM_T_NAX_ALL(bf16, bfloat, f16, half, 128)
+// T_scale is purely the dequant-read type for the per-group scales /
+// biases (`w = q*scale + bias`); it does not touch the NAX MMA, which
+// runs on the dequantized T_act values. So every (T_act, T_scale, gs)
+// combo is valid — instantiate both f16- and bf16-scale variants so
+// bf16-scale models (e.g. Qwen3) get NAX too, not just f16-scale ones
+// (e.g. Llama). The dispatcher picks the symbol by the model's scale
+// dtype; a missing instantiation would abort with a nil computeFunction.
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64)
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128)

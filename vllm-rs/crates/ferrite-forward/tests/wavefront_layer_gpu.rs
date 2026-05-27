@@ -1194,22 +1194,25 @@ fn wavefront_player_rope_bit_exact() {
         "whole rope produced all zeros"
     );
 
-    // Player: operands [q, cos, sin] where cos/sin slice cos_sin at the token
-    // position. shape (ROPE=5, head_dim, num_q, _).
+    // Player: operands [q, cos_sin (WHOLE table), positions]. The arm indexes
+    // cos_sin + positions[0]*rot_dim at runtime, exactly like the oracle — no
+    // compile-time-baked position offset. shape (ROPE=5, head_dim, num_q,
+    // rot_dim, _).
     let q_buf = buffer_from_bytes(&device, &q);
-    let cos_off = (pos * rot_dim) as u64 * 2; // bf16 bytes
-    let sin_off = (pos * rot_dim + half as u32) as u64 * 2;
-    // Build operands with explicit per-operand offsets (cos/sin into cos_sin).
+    let pos_buf = buffer_from_bytes(&device, &positions);
     let operands_bytes: Vec<u8> = [
         q_buf.gpuAddress(),
-        cos_sin_buf.gpuAddress() + cos_off,
-        cos_sin_buf.gpuAddress() + sin_off,
+        cos_sin_buf.gpuAddress(),
+        pos_buf.gpuAddress(),
     ]
     .iter()
     .flat_map(|a| a.to_le_bytes())
     .collect();
     let operands = buffer_from_bytes(&device, &operands_bytes);
-    let shapes = buffer_from_bytes(&device, &bytes_of_u32(&[5, head_dim, num_q, 0, 0, 0, 0, 0]));
+    let shapes = buffer_from_bytes(
+        &device,
+        &bytes_of_u32(&[5, head_dim, num_q, rot_dim, 0, 0, 0, 0]),
+    );
     let tape = buffer_from_bytes(&device, &bytes_of_u32(&[0, 0, 0, 0]));
     let tape_offsets = buffer_from_bytes(&device, &bytes_of_u32(&[0, 1]));
     let flags = zeroed_buffer(&device, 4);
@@ -1237,6 +1240,7 @@ fn wavefront_player_rope_bit_exact() {
         MTLResourceUsage::Read | MTLResourceUsage::Write,
     );
     use_resource(&enc, &cos_sin_buf, MTLResourceUsage::Read);
+    use_resource(&enc, &pos_buf, MTLResourceUsage::Read);
     enc.dispatchThreadgroups_threadsPerThreadgroup(
         MTLSize {
             width: 1,
@@ -1539,19 +1543,19 @@ fn wavefront_player_rope_append_bit_exact() {
         "oracle wrote nothing into the K cache"
     );
 
-    // Player: one WL_OP_ROPE_APPEND instruction. operands [k, cos, sin, v,
-    // kv_cache_k, kv_cache_v, slot_mapping]; cos/sin slice cos_sin at pos.
+    // Player: one WL_OP_ROPE_APPEND instruction. operands [k, cos_sin (WHOLE
+    // table), positions, v, kv_cache_k, kv_cache_v, slot_mapping]; the arm
+    // indexes cos_sin + positions[0]*rot_dim at runtime like the oracle.
     let k_buf = buffer_from_bytes(&device, &k);
     let v_buf = buffer_from_bytes(&device, &v);
     let kc = zeroed_buffer(&device, cache_bytes);
     let vc = zeroed_buffer(&device, cache_bytes);
     let slot_buf = buffer_from_bytes(&device, &slot_mapping);
-    let cos_off = (pos * rot_dim) as u64 * 2;
-    let sin_off = (pos * rot_dim + half as u32) as u64 * 2;
+    let pos_buf = buffer_from_bytes(&device, &positions);
     let operands_bytes: Vec<u8> = [
         k_buf.gpuAddress(),
-        cos_sin_buf.gpuAddress() + cos_off,
-        cos_sin_buf.gpuAddress() + sin_off,
+        cos_sin_buf.gpuAddress(),
+        pos_buf.gpuAddress(),
         v_buf.gpuAddress(),
         kc.gpuAddress(),
         vc.gpuAddress(),
@@ -1593,6 +1597,7 @@ fn wavefront_player_rope_append_bit_exact() {
         MTLResourceUsage::Read | MTLResourceUsage::Write,
     );
     use_resource(&enc, &cos_sin_buf, MTLResourceUsage::Read);
+    use_resource(&enc, &pos_buf, MTLResourceUsage::Read);
     use_resource(&enc, &v_buf, MTLResourceUsage::Read);
     use_resource(&enc, &kc, MTLResourceUsage::Read | MTLResourceUsage::Write);
     use_resource(&enc, &vc, MTLResourceUsage::Read | MTLResourceUsage::Write);

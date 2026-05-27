@@ -85,7 +85,7 @@ use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion};
 use crate::region_schedule::{Schedule, TapeInstr};
 use crate::subtile::{EwKind, SubOp};
 use crate::subtile_ir::{
-    BufId, BufferRef, InputKind, affine_scale_row_bytes, packed_weight_row_bytes,
+    BufId, BufferRef, InputKind, WeightBundle, affine_scale_row_bytes, packed_weight_row_bytes,
 };
 
 // ── Encoding constants (mirror wavefront_layer.metal) ────────────────
@@ -809,8 +809,15 @@ impl<'a> Ser<'a> {
         Ok((sc, base))
     }
 
-    /// ROPE: operands `[x, cos, sin]`; shape `(ROPE, head_dim, num_heads)`.
-    /// In place — operand 0 is the (aliased) producer buffer.
+    /// ROPE: operands `[x, cos_sin, positions]`; shape `(ROPE, head_dim,
+    /// num_heads, rot_dim)`. In place — operand 0 is the (aliased) producer
+    /// buffer. The rotary row a rope needs is `cos_sin[positions[t]]`, a
+    /// **runtime** quantity (the position changes every decode step), so the
+    /// operand is the WHOLE `cos_sin` table plus the `positions` input and the
+    /// arm indexes `cos_sin + positions[0]*rot_dim` exactly like the oracle —
+    /// never a compile-time-baked position offset. (The region IR's input 2,
+    /// the host-eval `sin` slice, is not a GPU operand: `sin` is the same table
+    /// row at `+ rot_dim/2`, derived in the arm.)
     fn emit_rope(
         &mut self,
         node: &SubtileNode,
@@ -818,8 +825,8 @@ impl<'a> Ser<'a> {
     ) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let x = self.write_operand(&node.output, id)?;
-        let cos = self.read_operand(&node.inputs[1], id)?;
-        let sin = self.read_operand(&node.inputs[2], id)?;
+        let cos_sin = self.rotary_table_operand(&node.inputs[1])?;
+        let positions = self.positions_operand();
         let cols = node.output.region.cols.len;
         if head_dim == 0 || !cols.is_multiple_of(head_dim) {
             return Err(SerializeError::NonDecodeShape {
@@ -828,16 +835,60 @@ impl<'a> Ser<'a> {
             });
         }
         let num_heads = cols / head_dim;
-        let base = self.push_operands(&[x, cos, sin]);
-        let sc = self.intern_shape([op_kind::ROPE, head_dim, num_heads, 0, 0, 0, 0, 0]);
+        let base = self.push_operands(&[x, cos_sin, positions]);
+        // rot_dim == head_dim (full rope), matching RopeAppend / the oracle.
+        let sc = self.intern_shape([op_kind::ROPE, head_dim, num_heads, head_dim, 0, 0, 0, 0]);
         Ok((sc, base))
     }
 
-    /// ROPE_APPEND: operands `[k, cos, sin, v, kv_cache_k, kv_cache_v,
-    /// slot_mapping]`; shape `(ROPE_APPEND, head_dim, num_kv, rot_dim,
-    /// block_size, ...)`. Rotate K in place (operand 0 is the aliased producer
-    /// buffer), then write rotated K + un-rotated V to the paged cache. The
-    /// cache halves + slot_mapping are runtime inputs the serializer injects
+    /// The rotary `cos_sin` TABLE operand for a rope op: input `tr` must be a
+    /// `CosSin`-bundle weight leaf. Returns the table base (`byte_offset 0`);
+    /// the arm applies the live position. This is the compile-time guard that
+    /// closes the gap which let cos/sin be mis-bound as a baked position-0
+    /// slice — a rope's rotary input MUST be the whole `CosSin` table (position
+    /// applied at runtime), never a `Dense` gain or a pre-sliced row.
+    fn rotary_table_operand(&mut self, tr: &TensorRegion) -> Result<OperandSlot, SerializeError> {
+        if !self.is_source(tr.tensor) {
+            return Err(SerializeError::BadSource {
+                tensor: tr.tensor.0,
+                detail: "rope rotary input must be a CosSin leaf source",
+            });
+        }
+        match self.source(tr.tensor)?.clone() {
+            SourceDesc::Dense {
+                buffer:
+                    buffer @ BufferRef::Weight {
+                        bundle: WeightBundle::CosSin,
+                        ..
+                    },
+                elem,
+            } => Ok(OperandSlot {
+                buffer: self.intern(buffer, elem),
+                byte_offset: 0, // table base; the arm indexes + positions[0]*rot_dim
+            }),
+            _ => Err(SerializeError::BadSource {
+                tensor: tr.tensor.0,
+                detail: "rope rotary input is not a CosSin table",
+            }),
+        }
+    }
+
+    /// The `positions` runtime input operand (the live decode positions buffer);
+    /// the rope arms read `positions[0]` (decode is `m == 1`).
+    fn positions_operand(&mut self) -> OperandSlot {
+        OperandSlot {
+            buffer: self.intern(BufferRef::Input(InputKind::Positions), 4),
+            byte_offset: 0,
+        }
+    }
+
+    /// ROPE_APPEND: operands `[k, cos_sin, positions, v, kv_cache_k,
+    /// kv_cache_v, slot_mapping]`; shape `(ROPE_APPEND, head_dim, num_kv,
+    /// rot_dim, block_size, ...)`. Rotate K in place (operand 0 is the aliased
+    /// producer buffer), then write rotated K + un-rotated V to the paged cache.
+    /// `cos_sin` is the WHOLE rotary table + the `positions` runtime input (the
+    /// arm applies the live position, like the oracle — never a baked offset);
+    /// the cache halves + slot_mapping are runtime inputs the serializer injects
     /// (the region IR keeps the new K as an abstract edge); `layer` routes the
     /// cache operands. Full rope (`rot_dim == head_dim`), matching `RopeRotate`.
     fn emit_rope_append(
@@ -848,8 +899,8 @@ impl<'a> Ser<'a> {
     ) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let k = self.write_operand(&node.output, id)?; // in-place (aliased) K
-        let cos = self.read_operand(&node.inputs[1], id)?;
-        let sin = self.read_operand(&node.inputs[2], id)?;
+        let cos_sin = self.rotary_table_operand(&node.inputs[1])?;
+        let positions = self.positions_operand();
         let v = self.read_operand(&node.inputs[3], id)?;
         let cols = node.output.region.cols.len;
         if head_dim == 0 || !cols.is_multiple_of(head_dim) {
@@ -877,7 +928,7 @@ impl<'a> Ser<'a> {
             buffer: self.intern(BufferRef::Input(InputKind::SlotMapping), 4),
             byte_offset: 0,
         };
-        let base = self.push_operands(&[k, cos, sin, v, kv_k, kv_v, slot]);
+        let base = self.push_operands(&[k, cos_sin, positions, v, kv_k, kv_v, slot]);
         // rot_dim == head_dim (full rope), matching RopeRotate.
         let sc = self.intern_shape([
             op_kind::ROPE_APPEND,
@@ -1264,13 +1315,34 @@ mod tests {
         assert_eq!(op_of(&prog, qmv), op_kind::QMV);
         assert_eq!(op_of(&prog, rope), op_kind::ROPE);
         let qmv_y = prog.operands[qmv[2] as usize + 4].buffer;
-        let rope_x = prog.operands[rope[2] as usize].buffer;
+        let rope_base = rope[2] as usize;
+        let rope_x = prog.operands[rope_base].buffer;
         assert_eq!(qmv_y, rope_x, "rope rotates the qmv output buffer in place");
+        // operand 1 = the whole CosSin table at offset 0 (the arm indexes by
+        // position); operand 2 = the runtime Positions input — never a baked
+        // per-position cos/sin slice.
+        let cos_sin = &prog.operands[rope_base + 1];
+        assert_eq!(cos_sin.byte_offset, 0, "cos_sin operand is the table base");
+        assert!(
+            matches!(
+                prog.buffers[cos_sin.buffer.0 as usize],
+                BufferRef::Weight {
+                    bundle: WeightBundle::CosSin,
+                    ..
+                }
+            ),
+            "rope operand 1 is the CosSin table"
+        );
+        assert_eq!(
+            prog.buffers[prog.operands[rope_base + 2].buffer.0 as usize],
+            BufferRef::Input(InputKind::Positions),
+            "rope operand 2 is the runtime Positions input"
+        );
         // Only one arena slot is allocated (rope aliases, no fresh slot).
         assert_eq!(prog.arena_bytes.len(), 1);
         assert_eq!(
             prog.shapes[rope[1] as usize],
-            [op_kind::ROPE, hd, h / hd, 0, 0, 0, 0, 0]
+            [op_kind::ROPE, hd, h / hd, hd, 0, 0, 0, 0]
         );
     }
 
@@ -1860,11 +1932,14 @@ mod tests {
         );
         let ops = &prog.operands[ra[2] as usize..ra[2] as usize + 7];
         let buf = |o: &OperandSlot| prog.buffers[o.buffer.0 as usize].clone();
-        // [k, cos, sin, v, kv_cache_k, kv_cache_v, slot_mapping]
+        // [k, cos_sin, positions, v, kv_cache_k, kv_cache_v, slot_mapping]
         assert!(
             matches!(buf(&ops[0]), BufferRef::ArenaSlot(_)),
             "k in-place arena"
         );
+        // operand 1 = the whole CosSin table (table base, offset 0); the arm
+        // indexes the live position. operand 2 = the runtime Positions input —
+        // NOT a second cos/sin slice (that was the position-blind bug).
         assert!(matches!(
             buf(&ops[1]),
             BufferRef::Weight {
@@ -1872,13 +1947,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            buf(&ops[2]),
-            BufferRef::Weight {
-                bundle: WeightBundle::CosSin,
-                ..
-            }
-        ));
+        assert_eq!(ops[1].byte_offset, 0, "cos_sin operand is the table base");
+        assert_eq!(buf(&ops[2]), BufferRef::Input(InputKind::Positions));
         assert!(
             matches!(buf(&ops[3]), BufferRef::ArenaSlot(_)),
             "v from v_proj arena"

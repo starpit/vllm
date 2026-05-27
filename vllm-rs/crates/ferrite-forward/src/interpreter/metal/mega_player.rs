@@ -159,6 +159,10 @@ pub fn resolve_mega_buffers<W: CanonicalParams + WeightAccessors>(
     weights: &W,
     allocator: &MetalAllocator,
     runtime: &RuntimeBindings,
+    // The per-op forward's embed-output buffer, bound to any
+    // [`BufferRef::EmbeddedHidden`] source (embed-as-source — see the variant
+    // doc). `None` ⇒ a program that references it fails to resolve.
+    embedded_hidden: Option<&Buffer>,
     residency: Option<&MetalResidencySet>,
 ) -> Result<(Vec<ResolvedBuffer>, Vec<Buffer>), WorkerError> {
     // The megakernel's own arena: one fresh zeroed buffer per slot. Shared
@@ -198,6 +202,11 @@ pub fn resolve_mega_buffers<W: CanonicalParams + WeightAccessors>(
                 reason: "wavefront-mega: serializer emits no Scratch (k_chunks=1 only)",
             }),
             BufferRef::Input(kind) => Ok((runtime.buffer_for(input_to_metal(*kind)).clone(), 0u64)),
+            BufferRef::EmbeddedHidden => embedded_hidden.map(|b| (b.clone(), 0u64)).ok_or(
+                WorkerError::WeightLookupFailed {
+                    reason: "wavefront-mega: EmbeddedHidden source but no embed-output buffer supplied",
+                },
+            ),
             BufferRef::Weight { bundle, role, loc } => resolve_weight(
                 weights,
                 allocator,

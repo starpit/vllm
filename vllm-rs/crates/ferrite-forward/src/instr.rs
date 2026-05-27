@@ -120,6 +120,19 @@ pub trait CanonicalParams: WeightAccessors {
     fn synthesized_kernel_metallibs() -> &'static [(&'static str, &'static [u8])] {
         &[]
     }
+    /// Metal-only: the compile-time PD-wavefront decode megakernel program
+    /// for this canonical, or `None` when the decode didn't fully resolve to
+    /// a runnable target (dense models, where the megakernel doesn't apply).
+    /// The proc-macro overrides this per-canonical — emitting the
+    /// `wavefront_mega_decode()` builder it delegates to — when
+    /// `FERRITE_WAVEFRONT` is set at build time. Default `None` keeps the
+    /// `FERRITE_WAVEFRONT_GPU` alt decode path in
+    /// `MetalWorkerPool::forward_with_tail` off. The pool materializes it
+    /// once and caches it.
+    #[cfg(feature = "metal")]
+    fn wavefront_mega_program() -> Option<crate::wavefront::MegaProgram> {
+        None
+    }
     /// Vision-tower attention head dimension. Same defaults / set-by
     /// rule as [`Self::VISION_NUM_HEADS`].
     const VISION_HEAD_DIM: u32 = 0;

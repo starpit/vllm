@@ -5912,6 +5912,17 @@ fn emit_canonical_params_impl(
             #mrope_section_tokens
             #synth_sources_override
             #scale_dtype_override
+            // PD-wavefront: delegate to the module-level free fn the
+            // megakernel emission defines (`None` unless built with
+            // `FERRITE_WAVEFRONT` + a fully-resolved 4bit decode). Splitting
+            // it out of this impl lets the (earlier-emitted) impl reference a
+            // body the (later-emitted) megakernel block fills, with no
+            // reordering of `emit_model`.
+            #[cfg(feature = "metal")]
+            fn wavefront_mega_program()
+            -> ::core::option::Option<::ferrite_forward::wavefront::MegaProgram> {
+                wavefront_mega_program_impl()
+            }
         }
     }
 }
@@ -6130,6 +6141,7 @@ fn buffer_ref_to_tokens(b: &ferrite_wavefront::subtile_ir::BufferRef) -> TokenSt
             let k = input_kind_to_tokens(*k);
             quote! { BufferRef::Input(#k) }
         }
+        BufferRef::EmbeddedHidden => quote! { BufferRef::EmbeddedHidden },
     }
 }
 
@@ -6604,6 +6616,11 @@ pub fn emit_model(
     // fully resolves to a runnable megakernel target; empty TokenStream
     // otherwise (so normal builds carry nothing).
     let mut wavefront_mega_builder = TokenStream::new();
+    // Body of the emitted free fn `wavefront_mega_program_impl()` that the
+    // `CanonicalParams::wavefront_mega_program` override delegates to:
+    // `Some(wavefront_mega_decode())` when the builder was emitted, else
+    // `None` (the megakernel alt path stays off).
+    let mut wavefront_mega_program_body = quote! { ::core::option::Option::None };
 
     // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
     // HERE — not in the pre-emit drive — because the decode bucket's
@@ -6636,6 +6653,9 @@ pub fn emit_model(
                             bb_bucket_id,
                         ) {
                             wavefront_mega_builder = emit_wavefront_mega(&prog);
+                            wavefront_mega_program_body = quote! {
+                                ::core::option::Option::Some(wavefront_mega_decode())
+                            };
                         }
                     }
                     None => eprintln!(
@@ -6932,6 +6952,15 @@ pub fn emit_model(
         // empty unless built with `FERRITE_WAVEFRONT` set). Self-gated on
         // `feature = "metal"`.
         #wavefront_mega_builder
+
+        // The free fn `CanonicalParams::wavefront_mega_program` delegates to.
+        // Always emitted under metal; its body is `None` unless the builder
+        // above was emitted (then `Some(wavefront_mega_decode())`).
+        #[cfg(feature = "metal")]
+        fn wavefront_mega_program_impl()
+        -> ::core::option::Option<::ferrite_forward::wavefront::MegaProgram> {
+            #wavefront_mega_program_body
+        }
 
         /// Per-canonical tape_index plan for the Metal pool. One row per
         /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`

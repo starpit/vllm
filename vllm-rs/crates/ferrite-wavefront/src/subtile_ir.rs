@@ -162,6 +162,13 @@ pub enum BufferRef {
     Scratch(u32),
     /// A runtime per-forward input.
     Input(InputKind),
+    /// The host-gathered embedded hidden-state row `[1, hidden]` the runtime
+    /// supplies as the decode's first activation. Per the plan, embed is a
+    /// host gather ("embed-as-source"), NOT a megakernel op and NOT the
+    /// embedding weight — so it resolves neither through `WeightAccessors`
+    /// nor `RuntimeBindings`. The Metal glue binds it to the per-op forward's
+    /// embed-output buffer (the megakernel runs as an alt path right after).
+    EmbeddedHidden,
 }
 
 // ── Dispatch payload ────────────────────────────────────────────────

@@ -732,8 +732,12 @@ pub fn build_source_descs(
             };
             let bref = |bundle, role, loc| BufferRef::Weight { bundle, role, loc };
             match b {
+                // Embed is a host gather ("embed-as-source", plan decision):
+                // the embedded hidden is the runtime-supplied first activation,
+                // NOT the embedding weight. The Metal glue binds it to the
+                // per-op forward's embed output.
                 SourceBinding::EmbeddedHidden => SourceDesc::Dense {
-                    buffer: bref(WeightBundle::Embedding, WeightRole::Weight, placeholder),
+                    buffer: BufferRef::EmbeddedHidden,
                     elem: 2,
                 },
                 SourceBinding::Cos | SourceBinding::Sin => {

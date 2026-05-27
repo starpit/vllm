@@ -226,16 +226,24 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             break;
           }
           case WL_OP_ROPE: {
-            // operands [x, cos, sin]; shape (ROPE, head_dim, num_heads, ...).
-            // Each thread owns distinct (head, d<half) pairs; the d<half thread
-            // rotates the (d, d+half) pair of its head's row. cos/sin are the
-            // token-position row, shared across heads.
+            // operands [x, cos_sin, positions]; shape (ROPE, head_dim,
+            // num_heads, rot_dim, ...). `cos_sin` is the WHOLE rotary table
+            // [max_pos, rot_dim] (each row = [cos[half] | sin[half]]); the live
+            // decode position is `positions[0]`. The per-position row is a
+            // RUNTIME quantity (it changes every decode step), so it is indexed
+            // here exactly like the oracle (`cos_sin + pos*rot_dim`) — NEVER a
+            // compile-time-baked offset. Each thread owns distinct (head, d<half)
+            // pairs and rotates the (d, d+half) pair of its head's row.
             device T_act* x = (device T_act*)(operands[ins.z + 0u]);
-            const device T_act* cos_row = (const device T_act*)(operands[ins.z + 1u]);
-            const device T_act* sin_row = (const device T_act*)(operands[ins.z + 2u]);
+            const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
+            const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
             uint head_dim = shapes[sb + 1u];
             uint num_heads = shapes[sb + 2u];
-            uint half_dim = head_dim / 2u;
+            uint rot_dim = shapes[sb + 3u];
+            uint half_dim = rot_dim / 2u;
+            uint pos = positions[0];
+            const device T_act* cos_row = cos_sin + pos * rot_dim;
+            const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
             for (uint idx = tid_in_tg; idx < num_heads * half_dim; idx += 1024u) {
               uint h = idx / half_dim;
               uint d = idx % half_dim;
@@ -273,11 +281,15 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             // The oracle's rope_append, K side: rotate K in place, then write
             // rotated K + un-rotated V into the paged cache at slot_mapping[0],
             // so attention reads the new token from the cache (Tier-B exact).
-            // operands [k(in/out), cos, sin, v, kv_cache_k, kv_cache_v, slot_mapping];
-            // shape (ROPE_APPEND, head_dim, num_kv, rot_dim, block_size, ...).
+            // operands [k(in/out), cos_sin, positions, v, kv_cache_k,
+            // kv_cache_v, slot_mapping]; shape (ROPE_APPEND, head_dim, num_kv,
+            // rot_dim, block_size, ...). `cos_sin` is the WHOLE rotary table and
+            // the live decode position is `positions[0]` — indexed at runtime
+            // exactly like the oracle (`cos_sin + pos*rot_dim`), never a baked
+            // offset (the position changes every decode step).
             device T_act* k = (device T_act*)(operands[ins.z + 0u]);
-            const device T_act* cos_row = (const device T_act*)(operands[ins.z + 1u]);
-            const device T_act* sin_row = (const device T_act*)(operands[ins.z + 2u]);
+            const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
+            const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
             const device T_act* v = (const device T_act*)(operands[ins.z + 3u]);
             device T_act* kv_cache_k = (device T_act*)(operands[ins.z + 4u]);
             device T_act* kv_cache_v = (device T_act*)(operands[ins.z + 5u]);
@@ -287,6 +299,9 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             uint rot_dim = shapes[sb + 3u];
             uint block_size = shapes[sb + 4u];
             uint half_dim = rot_dim / 2u;
+            uint pos = positions[0];
+            const device T_act* cos_row = cos_sin + pos * rot_dim;
+            const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
             // Rotate K in place: each thread owns (kv_head, d<half) pairs.
             for (uint idx = tid_in_tg; idx < num_kv * half_dim; idx += 1024u) {
               mittens::rope_rotate_pair<T_act>(

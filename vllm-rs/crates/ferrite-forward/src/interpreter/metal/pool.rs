@@ -258,6 +258,27 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     mtl4: Mutex<Option<Mtl4Pool>>,
     inner: Mutex<PoolInner<W>>,
     cv: Condvar,
+    /// PD-wavefront decode megakernel program — the compile-time
+    /// [`ferrite_wavefront::mega::MegaProgram`] the macro emitted, fetched
+    /// from `W` via [`crate::CanonicalParams::wavefront_mega_program`].
+    /// Lazily materialized + cached on the first decode (the builder
+    /// allocates the tape/operand/buffer tables once); `Some(..)` only for a
+    /// fully-resolved 4bit decode. Reading it from `W` here — rather than at
+    /// each pool-construction site — keeps every construction path
+    /// (`metal_pool`, the lazy-init forward fns) covered uniformly. The
+    /// `FERRITE_WAVEFRONT_GPU` alt decode path in [`Self::forward_with_tail`]
+    /// dispatches it through [`super::mega_player`].
+    mega_program: std::sync::OnceLock<Option<ferrite_wavefront::mega::MegaProgram>>,
+    /// Per-bucket embed-output arena slot — the output slot of the bucket's
+    /// first `Embed`/`AffineEmbed` (embed is the decode's host gather). The
+    /// `FERRITE_WAVEFRONT_GPU` alt path binds the megakernel's
+    /// `EmbeddedHidden` source to `worker.arena[this]`, which the per-op
+    /// forward (running first) just filled. `None` for buckets with no embed.
+    embed_slots: Vec<Option<u32>>,
+    /// Per-bucket terminal (logits) arena slot — `MetalBucketSpec::terminal_slot`.
+    /// The `FERRITE_WAVEFRONT_GPU` alt path reads `worker.arena[this]` (the
+    /// per-op forward's logits) to Tier-B-compare against the megakernel's.
+    terminal_slots: Vec<u32>,
 }
 
 /// Pool-owned MTL4 surface. The allocator is reset between forwards;
@@ -551,6 +572,9 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 total_created: 0,
             }),
             cv: Condvar::new(),
+            mega_program: std::sync::OnceLock::new(),
+            embed_slots: Vec::new(),
+            terminal_slots: Vec::new(),
         };
         let first = pool.spawn_worker(weights)?;
         {
@@ -651,7 +675,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
-        let pool = Self::new(
+        let mut pool = Self::new(
             device,
             weights,
             allocator,
@@ -662,7 +686,142 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             max_workers,
         )
         .map_err(PoolBuildError::Worker)?;
+        // Per-bucket embed-output slot for the `FERRITE_WAVEFRONT_GPU` alt
+        // decode path (the megakernel reads the per-op forward's embed output
+        // as its first activation). Embed is the bucket's first gather;
+        // `find_map` is robust to any alias/prelude rows ahead of it.
+        pool.embed_slots = bucket_specs
+            .iter()
+            .map(|spec| {
+                spec.backbone.iter().find_map(|ins| match ins {
+                    Instruction::Embed(out_slot) => Some(*out_slot),
+                    Instruction::AffineEmbed(out_slot, _, _) => Some(*out_slot),
+                    _ => None,
+                })
+            })
+            .collect();
+        pool.terminal_slots = bucket_specs.iter().map(|spec| spec.terminal_slot).collect();
         Ok(pool)
+    }
+
+    /// `FERRITE_WAVEFRONT_GPU` alt decode path (diagnostic): dispatch the
+    /// compile-time decode megakernel ([`Self::mega_program`]) through the
+    /// trivial GPU tape player ([`super::mega_player`]) and log result stats.
+    ///
+    /// Non-destructive: it resolves a FRESH arena (sized by the program), so
+    /// the trusted per-op result in `guard.worker.arena` (read by the
+    /// caller's `with_output`) is untouched. It swallows + logs any error so
+    /// the megakernel can never gate a real decode. Tier-A bit-exact
+    /// comparison vs the per-op forward (and threading the real KV-cache
+    /// write ordering) is the next step.
+    fn run_wavefront_mega(
+        &self,
+        prog: &ferrite_wavefront::mega::MegaProgram,
+        weights: &W,
+        runtime: &RuntimeBindings,
+        embedded_hidden: Option<&Buffer>,
+        per_op_logits: Option<&Buffer>,
+        queue: &CommandQueue,
+    ) where
+        W: crate::WeightAccessors,
+    {
+        use super::mega_player::{
+            build_operand_table, dispatch_mega, player_pipeline_key, resolve_mega_buffers,
+        };
+        // TODO(inc3): thread the real (group_size, bits) from the model. The
+        // player ships only the affine g64/b4 instantiation today, which is
+        // the Llama-3.2-1B-4bit target, so hardcode it for first bring-up.
+        let (group_size, bits) = (64u32, 4u32);
+
+        let residency = self.allocator.residency();
+        let (resolved, _arena) = match resolve_mega_buffers(
+            prog,
+            &self.device,
+            weights,
+            &self.allocator,
+            runtime,
+            embedded_hidden,
+            Some(residency),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[wavefront-gpu] resolve_mega_buffers failed: {e:?}");
+                return;
+            }
+        };
+        let operands = build_operand_table(prog, &resolved);
+        let pipeline = match self
+            .pipelines
+            .cache()
+            .get_or_build(&player_pipeline_key::<W>(group_size, bits))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[wavefront-gpu] player pipeline build failed: {e:?}");
+                return;
+            }
+        };
+        dispatch_mega(prog, &resolved, &operands, &pipeline, &self.device, queue);
+
+        // Tier-B check: does the megakernel pick the SAME token as the per-op
+        // forward (greedy = argmax)? Both logit vectors are `[vocab]` in the
+        // activation dtype (bf16 for the 4bit target); compare argmax indices.
+        // (`per_op_logits` is `worker.arena[terminal_slot]`, filled by the
+        // forward that ran just above.)
+        let argmax_bf16 = |buf: &Buffer, base: u64, count: usize| -> (usize, f32) {
+            let avail = buf.length().saturating_sub(base as usize) / 2;
+            let n = count.min(avail);
+            let s = unsafe {
+                let p = (buf.contents().as_ptr() as *const u8).add(base as usize) as *const u16;
+                std::slice::from_raw_parts(p, n)
+            };
+            let mut best = (0usize, f32::NEG_INFINITY);
+            for (i, &bits) in s.iter().enumerate() {
+                let v = f32::from_bits((bits as u32) << 16);
+                if v > best.1 {
+                    best = (i, v);
+                }
+            }
+            best
+        };
+        let (mbuf, mbase) = &resolved[prog.result.0 as usize];
+        // The megakernel result is exactly `[1, vocab]`; the per-op terminal
+        // slot is oversized (sized for the largest prefill bucket), so cap
+        // BOTH argmaxes to the decode row's `vocab` logits (row 0).
+        let vocab = (mbuf.length().saturating_sub(*mbase as usize) / 2).max(1);
+        let (mega_tok, mega_val) = argmax_bf16(mbuf, *mbase, vocab);
+        match per_op_logits {
+            Some(pbuf) => {
+                let (ref_tok, ref_val) = argmax_bf16(pbuf, 0, vocab);
+                eprintln!(
+                    "[wavefront-gpu] Tier-B: mega tok={mega_tok} ({mega_val:.3}) vs per-op \
+                     tok={ref_tok} ({ref_val:.3}) — {}",
+                    if mega_tok == ref_tok {
+                        "MATCH"
+                    } else {
+                        "MISMATCH"
+                    }
+                );
+            }
+            None => eprintln!(
+                "[wavefront-gpu] mega tok={mega_tok} ({mega_val:.3}); no per-op logits to compare"
+            ),
+        }
+
+        // Replace-mode (plan decision #5, Tier B): DRIVE the decode with the
+        // megakernel's logits — copy them over the terminal slot the sampler
+        // reads (`worker.arena[terminal_slot]` == `per_op_logits`). The
+        // megakernel's KV-cache writes already ran last, so the decode is then
+        // fully megakernel-driven (no per-op/mega shared-cache conflict);
+        // diff the generated token stream vs a non-mega (no-env) run.
+        if let Some(pbuf) = per_op_logits {
+            let copy = (vocab * 2).min(pbuf.length());
+            unsafe {
+                let src = (mbuf.contents().as_ptr() as *const u8).add(*mbase as usize);
+                let dst = pbuf.contents().as_ptr() as *mut u8;
+                std::ptr::copy_nonoverlapping(src, dst, copy);
+            }
+        }
     }
 
     pub fn max_workers(&self) -> usize {
@@ -1218,6 +1377,41 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             has_spec_tokens,
             tail,
         )?;
+
+        // FERRITE_WAVEFRONT_GPU (diagnostic alt decode path): after the
+        // trusted per-op decode, also dispatch the compile-time decode
+        // megakernel through the trivial GPU tape player and log result
+        // stats. Non-destructive (own fresh arena), so the result the caller
+        // reads below is still the per-op one. Decode only (num_tokens == 1);
+        // a no-op unless a program was installed (4bit decode) and the gate
+        // is set.
+        if inputs.num_tokens == 1
+            && std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
+            && let Some(prog) = self
+                .mega_program
+                .get_or_init(|| W::wavefront_mega_program())
+        {
+            // The per-op forward (just dispatched above) gathered the embed
+            // into this slot; the megakernel reads it as its first activation.
+            let embedded_hidden = self
+                .embed_slots
+                .get(bucket_idx)
+                .copied()
+                .flatten()
+                .map(|s| &guard.worker.arena[s as usize]);
+            let per_op_logits = self
+                .terminal_slots
+                .get(bucket_idx)
+                .map(|&s| &guard.worker.arena[s as usize]);
+            self.run_wavefront_mega(
+                prog,
+                weights,
+                &guard.runtime,
+                embedded_hidden,
+                per_op_logits,
+                queue,
+            );
+        }
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
         // us where in the chain values transition from real to zero.

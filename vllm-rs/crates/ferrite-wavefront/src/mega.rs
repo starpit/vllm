@@ -79,7 +79,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion};
 use crate::region_schedule::{Schedule, TapeInstr};
@@ -182,9 +182,33 @@ impl MegaProgram {
             .collect()
     }
 
-    /// Total `Compute` instructions — must equal the region node count.
+    /// Number of *region-node* computes — must equal the region node count.
+    /// Excludes the cross-worker handoff `PUBLISH`/`ACQUIRE` computes (those
+    /// are plumbing the scheduler's worker assignment forces, not graph nodes).
     pub fn num_computes(&self) -> usize {
-        self.tape.iter().filter(|i| i[0] == opcode::COMPUTE).count()
+        self.tape
+            .iter()
+            .filter(|i| {
+                i[0] == opcode::COMPUTE && {
+                    let op = self.shapes[i[1] as usize][0];
+                    op != op_kind::PUBLISH && op != op_kind::ACQUIRE
+                }
+            })
+            .count()
+    }
+
+    /// Number of cross-worker handoff computes (`PUBLISH` + `ACQUIRE`). Zero
+    /// at `P = 1` (no cross-worker edges).
+    pub fn num_handoff_ops(&self) -> usize {
+        self.tape
+            .iter()
+            .filter(|i| {
+                i[0] == opcode::COMPUTE && {
+                    let op = self.shapes[i[1] as usize][0];
+                    op == op_kind::PUBLISH || op == op_kind::ACQUIRE
+                }
+            })
+            .count()
     }
 }
 
@@ -279,16 +303,30 @@ pub fn serialize(
 ) -> Result<MegaProgram, SerializeError> {
     let mut ser = Ser::new(graph, sources, geom);
     ser.assign_arena_slots()?;
+    // Cross-worker atomic handoff (plan CRITICAL FINDING / A2): a peer
+    // worker's plain arena writes are not coherent on the GPU, so a tensor
+    // produced on one worker and read on another rides a PUBLISH (per
+    // producer block) → ACQUIRE (per consuming worker) atomic round-trip.
+    let worker_of = reconstruct_worker_of(graph, schedule);
+    ser.plan_handoffs(&worker_of)?;
 
     let mut tape: Vec<[u32; 4]> = Vec::new();
     let mut tape_offsets: Vec<u32> = vec![0];
-    for worker in &schedule.workers {
+    for (wi, worker) in schedule.workers.iter().enumerate() {
+        ser.acquired.clear(); // private acquired-copies are per worker
+        let wi = wi as u32;
         for instr in &worker.tape {
             match *instr {
                 TapeInstr::Compute(id) => {
                     let node = &graph.nodes[id.0 as usize];
+                    // ACQUIRE each cross-worker input before reading it (the
+                    // worker `Wait`ed on the producers' flags just above).
+                    ser.emit_acquires(node, wi, &mut tape)?;
                     let (sc, base) = ser.emit_compute(node)?;
                     tape.push([opcode::COMPUTE, sc, base, 0]);
+                    // PUBLISH this block's stripe if its output crosses workers
+                    // (before the `Signal` the schedule emits next).
+                    ser.emit_publish(node, &mut tape)?;
                 }
                 TapeInstr::Signal(f) => tape.push([opcode::SIGNAL, 0, 0, f]),
                 TapeInstr::Wait(f) => tape.push([opcode::WAIT, 0, 0, f]),
@@ -311,8 +349,40 @@ pub fn serialize(
     })
 }
 
+/// Recover `worker_of[node_id]` from the schedule's per-worker tapes: a
+/// `Compute(id)` in worker `w`'s tape means node `id` runs on worker `w`.
+/// The handoff planner needs the assignment the scheduler chose; the
+/// [`Schedule`] only exposes the per-worker instruction streams, so rebuild it.
+fn reconstruct_worker_of(graph: &RegionGraph, schedule: &Schedule) -> Vec<u32> {
+    let mut worker_of = vec![0u32; graph.nodes.len()];
+    for (wi, worker) in schedule.workers.iter().enumerate() {
+        for instr in &worker.tape {
+            if let TapeInstr::Compute(id) = instr {
+                worker_of[id.0 as usize] = wi as u32;
+            }
+        }
+    }
+    worker_of
+}
+
+/// The cross-worker handoff plan for one op-output tensor: a tensor whose
+/// blocks are produced on one worker and read on another. The GPU player
+/// cannot read a peer worker's plain arena writes coherently (plan CRITICAL
+/// FINDING / A2), so every producer block PUBLISHes its stripe (atomic
+/// u32-pack) into a coherent staging buffer, and each consuming worker
+/// ACQUIREs the whole tensor (unpack → a private copy) before reading it.
+#[derive(Clone, Debug)]
+struct Handoff {
+    /// Coherent (atomic u32-packed) staging arena slot, holds the whole tensor.
+    coherent_slot: u32,
+    /// Workers that write a block of this tensor (each publishes its stripe).
+    producers: HashSet<u32>,
+    /// Tensor width in elements (decode row 0); `n_pairs = cols / 2`.
+    cols: u32,
+}
+
 /// Mutable serializer state: the interned buffer / shape tables, the
-/// operand list, and the tensor→arena-slot map.
+/// operand list, the tensor→arena-slot map, and the cross-worker handoff plan.
 struct Ser<'a> {
     graph: &'a RegionGraph,
     sources: &'a [SourceDesc],
@@ -326,6 +396,13 @@ struct Ser<'a> {
     slot_of: HashMap<TensorId, u32>,
     /// Byte size of each arena slot (indexed by slot).
     arena_bytes: Vec<u64>,
+    /// Cross-worker handoff plan, keyed by the shared op-output tensor.
+    handoff: HashMap<TensorId, Handoff>,
+    /// `(tensor, worker)` → its private acquired-copy arena slot (lazy).
+    private_slot: HashMap<(TensorId, u32), u32>,
+    /// Tensors the *current* worker has already acquired (reset per worker);
+    /// a redirected read targets the private copy, not the shared arena slot.
+    acquired: HashMap<TensorId, u32>,
 }
 
 impl<'a> Ser<'a> {
@@ -341,6 +418,9 @@ impl<'a> Ser<'a> {
             operands: Vec::new(),
             slot_of: HashMap::new(),
             arena_bytes: Vec::new(),
+            handoff: HashMap::new(),
+            private_slot: HashMap::new(),
+            acquired: HashMap::new(),
         }
     }
 
@@ -432,8 +512,14 @@ impl<'a> Ser<'a> {
             }
         } else {
             let off = tr.region.cols.start as u64 * self.geom.act_elem as u64;
+            // A cross-worker tensor this worker has ACQUIREd is read from its
+            // private (coherent) copy, not the shared arena slot a peer wrote.
+            let buffer = match self.acquired.get(&tr.tensor) {
+                Some(&slot) => self.intern(BufferRef::ArenaSlot(slot), self.geom.act_elem),
+                None => self.arena_bufid(tr.tensor),
+            };
             Ok(OperandSlot {
-                buffer: self.arena_bufid(tr.tensor),
+                buffer,
                 byte_offset: off,
             })
         }
@@ -455,6 +541,157 @@ impl<'a> Ser<'a> {
         let base = self.operands.len() as u32;
         self.operands.extend_from_slice(slots);
         base
+    }
+
+    /// Plan the cross-worker handoffs: find every op-output tensor whose
+    /// blocks are produced on one worker and read on another, and allocate a
+    /// coherent (atomic u32-packed, whole-tensor) staging slot for each. A
+    /// peer worker's plain arena writes are not coherent on the GPU; a
+    /// consumer must instead read a private copy it ACQUIREs from the staging
+    /// slot, which every producer block PUBLISHes its stripe into.
+    fn plan_handoffs(&mut self, worker_of: &[u32]) -> Result<(), SerializeError> {
+        // Producer / consumer worker-sets per op-output tensor.
+        let mut producers: HashMap<TensorId, HashSet<u32>> = HashMap::new();
+        let mut consumers: HashMap<TensorId, HashSet<u32>> = HashMap::new();
+        for node in &self.graph.nodes {
+            let w = worker_of[node.id.0 as usize];
+            producers.entry(node.output.tensor).or_default().insert(w);
+            for inp in &node.inputs {
+                if !self.is_source(inp.tensor) {
+                    consumers.entry(inp.tensor).or_default().insert(w);
+                }
+            }
+        }
+        let mut tids: Vec<TensorId> = producers.keys().copied().collect();
+        tids.sort_by_key(|t| t.0); // deterministic slot order
+        for t in tids {
+            let prod = producers[&t].clone();
+            let Some(cons) = consumers.get(&t) else {
+                continue; // no reader (e.g. the result tensor) → no handoff
+            };
+            // Crosses iff some producer worker differs from some consumer worker.
+            if !prod.iter().any(|p| cons.iter().any(|c| p != c)) {
+                continue;
+            }
+            let cols = self.graph.shape(t).cols;
+            if !cols.is_multiple_of(2) {
+                return Err(SerializeError::NonDecodeShape {
+                    id: t.0,
+                    detail: "cross-worker handoff tensor has odd width (can't pair-pack)",
+                });
+            }
+            let coherent_slot = self.arena_bytes.len() as u32;
+            self.arena_bytes.push((cols as u64 / 2) * 4); // one u32 per bf16 pair
+            self.handoff.insert(
+                t,
+                Handoff {
+                    coherent_slot,
+                    producers: prod,
+                    cols,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Before a consumer `Compute`, emit an `ACQUIRE` for each cross-worker
+    /// input tensor it reads whose data was produced (partly) on another
+    /// worker — once per worker. Records the tensor→private-slot redirect so
+    /// `emit_compute`'s reads target the coherent private copy, not the shared
+    /// arena slot a peer wrote. Operands `[private_dst, coherent]`; the worker
+    /// has already `Wait`ed on every cross-worker producer's flag.
+    fn emit_acquires(
+        &mut self,
+        node: &SubtileNode,
+        wi: u32,
+        tape: &mut Vec<[u32; 4]>,
+    ) -> Result<(), SerializeError> {
+        // Decide first (immutable view), then mutate — avoids aliasing self.
+        let mut to_acquire: Vec<TensorId> = Vec::new();
+        for inp in &node.inputs {
+            let t = inp.tensor;
+            if self.is_source(t) || self.acquired.contains_key(&t) || to_acquire.contains(&t) {
+                continue;
+            }
+            if let Some(h) = self.handoff.get(&t)
+                && h.producers.iter().any(|&p| p != wi)
+            {
+                to_acquire.push(t);
+            }
+        }
+        for t in to_acquire {
+            let (coherent_slot, cols) = {
+                let h = &self.handoff[&t];
+                (h.coherent_slot, h.cols)
+            };
+            // This worker's private whole-tensor copy (lazy, one per worker).
+            let priv_slot = match self.private_slot.get(&(t, wi)) {
+                Some(&s) => s,
+                None => {
+                    let s = self.arena_bytes.len() as u32;
+                    self.arena_bytes
+                        .push(cols as u64 * self.geom.act_elem as u64);
+                    self.private_slot.insert((t, wi), s);
+                    s
+                }
+            };
+            let dst = self.intern(BufferRef::ArenaSlot(priv_slot), self.geom.act_elem);
+            let coh = self.intern(BufferRef::ArenaSlot(coherent_slot), 4);
+            let base = self.push_operands(&[
+                OperandSlot {
+                    buffer: dst,
+                    byte_offset: 0,
+                },
+                OperandSlot {
+                    buffer: coh,
+                    byte_offset: 0,
+                },
+            ]);
+            let sc = self.intern_shape([op_kind::ACQUIRE, cols / 2, 0, 0, 0, 0, 0, 0]);
+            tape.push([opcode::COMPUTE, sc, base, 0]);
+            self.acquired.insert(t, priv_slot);
+        }
+        Ok(())
+    }
+
+    /// After a producer block `Compute` whose output tensor is a handoff,
+    /// emit a `PUBLISH` of that block's stripe (atomic u32-pack) into the
+    /// coherent slot — before the `Signal` the schedule emits next. Operands
+    /// `[coherent + stripe, arena + stripe]`; shape `(PUBLISH, pair0=0,
+    /// n_pairs)` (the stripe offsets ride in the pointers).
+    fn emit_publish(
+        &mut self,
+        node: &SubtileNode,
+        tape: &mut Vec<[u32; 4]>,
+    ) -> Result<(), SerializeError> {
+        let t = node.output.tensor;
+        let coherent_slot = match self.handoff.get(&t) {
+            Some(h) => h.coherent_slot,
+            None => return Ok(()),
+        };
+        self.check_row0(&node.output, node.id.0)?;
+        let cols = node.output.region.cols;
+        if !cols.start.is_multiple_of(2) || !cols.len.is_multiple_of(2) {
+            return Err(SerializeError::NonDecodeShape {
+                id: node.id.0,
+                detail: "handoff producer block has odd col offset/width (can't pair-pack)",
+            });
+        }
+        let arena = self.arena_bufid(t);
+        let coh = self.intern(BufferRef::ArenaSlot(coherent_slot), 4);
+        let base = self.push_operands(&[
+            OperandSlot {
+                buffer: coh,
+                byte_offset: (cols.start as u64 / 2) * 4,
+            },
+            OperandSlot {
+                buffer: arena,
+                byte_offset: cols.start as u64 * self.geom.act_elem as u64,
+            },
+        ]);
+        let sc = self.intern_shape([op_kind::PUBLISH, 0, cols.len / 2, 0, 0, 0, 0, 0]);
+        tape.push([opcode::COMPUTE, sc, base, 0]);
+        Ok(())
     }
 
     /// Emit one compute node → `(shape_class, operand_base)`.
@@ -906,6 +1143,83 @@ mod tests {
         }
         assert_eq!(prog.arena_bytes.len(), 1, "one output tensor → one slot");
         assert_eq!(prog.arena_bytes[0], n as u64 * ACT_ELEM as u64);
+    }
+
+    // ── cross-worker atomic handoff (PUBLISH/ACQUIRE) ───────────────
+
+    /// A qmv→qmv chain whose first qmv N-block-splits across workers and whose
+    /// second qmv reads the whole first output: at P>1 the serializer must
+    /// route the cross-worker activation through the atomic handoff — a
+    /// PUBLISH per producer block + an ACQUIRE per consuming worker, into a
+    /// coherent staging slot, never a peer's plain arena write (plan CRITICAL
+    /// FINDING). P=1 has no cross-worker edge, so emits none.
+    #[test]
+    fn cross_worker_qmv_chain_emits_publish_acquire() {
+        let (k0, n0, n1) = (512u32, 128u32, 128u32); // k1 == n0
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: k0 },
+                SourceShape { rows: n0, cols: k0 },
+                SourceShape { rows: n1, cols: n0 },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Gemm { n: n0, k: k0 },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: LoweredOp::Gemm { n: n1, k: n0 },
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+                },
+            ],
+            result: 1,
+        };
+        let sources = vec![dense(0, WeightBundle::Embedding), qweight(1), qweight(2)];
+        let g = lower_region(&input, 64); // n0=128 → 2 blocks of 64
+
+        // P=1: a single worker reads its own arena writes → no handoff.
+        let p1 = serialize(&g, &partition_roundrobin(&g, 1), &sources, geom()).expect("p1");
+        assert_eq!(p1.num_handoff_ops(), 0, "P=1: no cross-worker handoff");
+        assert_eq!(p1.num_computes(), g.nodes.len());
+
+        // P=2: the 2 producer blocks land on distinct workers (round-robin),
+        // and every consumer block reads the whole first output → cross-worker.
+        let p2 = serialize(&g, &partition_roundrobin(&g, 2), &sources, geom()).expect("p2");
+        assert_eq!(
+            p2.num_computes(),
+            g.nodes.len(),
+            "every region node computed once (handoff plumbing excluded)"
+        );
+        assert!(
+            p2.num_handoff_ops() > 0,
+            "P=2: the cross-worker handoff fires"
+        );
+
+        // Both arms are present, and each ACQUIRE reads a coherent slot that
+        // some PUBLISH wrote (same staging buffer) — the round-trip is closed.
+        let kinds: HashSet<u32> = p2
+            .tape
+            .iter()
+            .filter(|i| i[0] == opcode::COMPUTE)
+            .map(|i| p2.shapes[i[1] as usize][0])
+            .collect();
+        assert!(kinds.contains(&op_kind::PUBLISH), "a PUBLISH compute");
+        assert!(kinds.contains(&op_kind::ACQUIRE), "an ACQUIRE compute");
+        let coherent_of = |op: u32, slot_idx: usize| -> HashSet<BufId> {
+            p2.tape
+                .iter()
+                .filter(|i| i[0] == opcode::COMPUTE && p2.shapes[i[1] as usize][0] == op)
+                .map(|i| p2.operands[i[2] as usize + slot_idx].buffer)
+                .collect()
+        };
+        let published_into = coherent_of(op_kind::PUBLISH, 0); // PUBLISH operand 0 = coherent
+        let acquired_from = coherent_of(op_kind::ACQUIRE, 1); // ACQUIRE operand 1 = coherent
+        assert!(
+            !acquired_from.is_empty() && acquired_from.is_subset(&published_into),
+            "every acquired staging slot was published into: pub={published_into:?} acq={acquired_from:?}"
+        );
     }
 
     // ── rope is in place: output slot aliases the producer's ────────

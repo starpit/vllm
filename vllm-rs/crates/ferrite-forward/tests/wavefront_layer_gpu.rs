@@ -1852,6 +1852,250 @@ fn wavefront_serialized_qmv_chain_bit_exact() {
     );
 }
 
+/// The serializer's cross-worker **atomic handoff**, end-to-end on the GPU.
+///
+/// A qmv→qmv chain N-block-split across `P>1` workers: `mega::serialize` must
+/// emit PUBLISH (per producer block) + ACQUIRE (per consuming worker) so the
+/// first qmv's output — written in stripes on *different* workers — reaches
+/// the second qmv coherently. A peer worker's plain arena write is not
+/// cross-TG coherent on Apple GPU (plan CRITICAL FINDING); only the atomic
+/// u32-packed handoff is. The serializer-driven result must be bit-exact vs
+/// two sequential whole qmvs, across retries (the handoff is timing-
+/// dependent). This is the serializer analogue of the hand-built
+/// `wavefront_player_two_stage_handoff_bit_exact`.
+#[test]
+fn wavefront_serialized_qmv_chain_cross_worker_bit_exact() {
+    use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
+    use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
+    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::region_schedule::partition_roundrobin;
+    use ferrite_wavefront::subtile::SourceShape;
+    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+    let gs = 64u32;
+    let wl = |op_idx| WeightLoc {
+        layer: 0,
+        bucket: 0,
+        op_idx,
+        slot: 0,
+    };
+    let qw = |op_idx| SourceDesc::QuantWeight {
+        weight: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::Weight,
+            loc: wl(op_idx),
+        },
+        scales: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineScales,
+            loc: wl(op_idx),
+        },
+        biases: BufferRef::Weight {
+            bundle: WeightBundle::LinearLayer,
+            role: WeightRole::AffineBiases,
+            loc: wl(op_idx),
+        },
+        group_size: gs,
+        bits: 4,
+        scale_elem: 2,
+    };
+
+    for p in [2u32, 4] {
+        // n0 splits into exactly P blocks each %8 (the fast variant's row
+        // granularity); k1 == n0 so qmv1 reads the whole y0 (the join). n1's
+        // blocks are %8 with no sub-8 tail.
+        let n0 = {
+            let a = 512u32;
+            let bb = p * 8;
+            a / gcd(a, bb) * bb
+        };
+        let nb = n0 / p; // qmv0 → exactly P blocks, one per round-robin worker
+        let (k0, k1) = (512u32, n0);
+        let n1 = 64 * p;
+
+        let (w0, s0, b0, x) = make_qmv(&device, n0, k0, gs, 0xC100_0000 + p as u64);
+        let (w1, s1, b1, _x1) = make_qmv(&device, n1, k1, gs, 0xC200_0000 + p as u64);
+
+        // Reference: two sequential whole qmvs.
+        let y0_ref = zeroed_buffer(&device, (n0 * 2) as usize);
+        qmv_whole_into(&device, &cache, &w0, &s0, &b0, &x, &y0_ref, n0, k0, gs);
+        let y1_ref_buf = zeroed_buffer(&device, (n1 * 2) as usize);
+        qmv_whole_into(
+            &device,
+            &cache,
+            &w1,
+            &s1,
+            &b1,
+            &y0_ref,
+            &y1_ref_buf,
+            n1,
+            k1,
+            gs,
+        );
+        let y1_ref = read_bf16(&y1_ref_buf, n1 as usize);
+        assert!(y1_ref.iter().any(|&v| v != 0), "p={p} reference all zeros");
+
+        let input = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: k0 },
+                SourceShape { rows: n0, cols: k0 },
+                SourceShape { rows: n1, cols: k1 },
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Gemm { n: n0, k: k0 },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: LoweredOp::Gemm { n: n1, k: k1 },
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+                },
+            ],
+            result: 1,
+        };
+        let sources = vec![
+            SourceDesc::Dense {
+                buffer: BufferRef::Weight {
+                    bundle: WeightBundle::Embedding,
+                    role: WeightRole::Weight,
+                    loc: wl(0),
+                },
+                elem: 2,
+            },
+            qw(1),
+            qw(2),
+        ];
+        let g = lower_region(&input, nb);
+        let sched = partition_roundrobin(&g, p);
+        let prog = serialize(
+            &g,
+            &sched,
+            &sources,
+            Geometry {
+                act_elem: 2,
+                block_size: 16,
+                max_blocks: 4,
+            },
+        )
+        .expect("serialize");
+        assert!(
+            prog.num_handoff_ops() > 0,
+            "p={p}: a cross-worker chain must emit the handoff"
+        );
+
+        // Arena slots (incl. the handoff's coherent staging + private copies)
+        // are fresh zeroed buffers; weights / x map to the make_qmv buffers.
+        let arena: Vec<Buffer> = prog
+            .arena_bytes
+            .iter()
+            .map(|&b| zeroed_buffer(&device, b.max(1) as usize))
+            .collect();
+        let resolved: Vec<Buffer> = prog
+            .buffers
+            .iter()
+            .map(|bref| match bref {
+                BufferRef::ArenaSlot(s) => arena[*s as usize].clone(),
+                BufferRef::Weight {
+                    bundle: WeightBundle::Embedding,
+                    ..
+                } => x.clone(),
+                BufferRef::Weight {
+                    bundle: WeightBundle::LinearLayer,
+                    role,
+                    loc,
+                } => {
+                    let (w, s, b) = if loc.op_idx == 1 {
+                        (&w0, &s0, &b0)
+                    } else {
+                        (&w1, &s1, &b1)
+                    };
+                    match role {
+                        WeightRole::Weight => w.clone(),
+                        WeightRole::AffineScales => s.clone(),
+                        WeightRole::AffineBiases => b.clone(),
+                        other => panic!("unexpected weight role {other:?}"),
+                    }
+                }
+                other => panic!("unexpected buffer ref {other:?}"),
+            })
+            .collect();
+
+        let operand_addrs: Vec<u64> = prog
+            .operands
+            .iter()
+            .map(|sl| resolved[sl.buffer.0 as usize].gpuAddress() + sl.byte_offset)
+            .collect();
+        let operands = buffer_from_bytes(&device, &bytes_of_u64(&operand_addrs));
+        let tape = buffer_from_bytes(&device, &prog.tape_bytes());
+        let shapes = buffer_from_bytes(&device, &prog.shapes_bytes());
+        let tape_offsets = buffer_from_bytes(&device, &prog.tape_offsets_bytes());
+        let flags = zeroed_buffer(&device, (prog.num_flags.max(1) * 4) as usize);
+
+        let player = cache
+            .get_or_build(&PipelineKey::new(
+                "wavefront_layer",
+                "wavefront_player_bf16_s_f16_gs_64_b_4",
+                vec![],
+            ))
+            .expect("player pipeline");
+        let result_buf = &resolved[prog.result.0 as usize];
+
+        // The cross-TG handoff is timing-dependent — retry so a pass isn't luck.
+        for iter in 0..30 {
+            for buf in &arena {
+                zero_buf(buf, buf.length());
+            }
+            zero_buf(&flags, (prog.num_flags.max(1) * 4) as usize);
+
+            let queue = device.newCommandQueue().expect("queue");
+            let cb = queue.commandBuffer().expect("cb");
+            let enc = cb.computeCommandEncoder().expect("enc");
+            enc.setComputePipelineState(&player);
+            unsafe {
+                enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+                enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+                enc.setBuffer_offset_atIndex(Some(&operands), 0, 2);
+                enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+                enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+            }
+            for buf in &resolved {
+                use_resource(&enc, buf, MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
+            enc.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: p as usize,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.endEncoding();
+            cb.commit();
+            cb.waitUntilCompleted();
+
+            assert_eq!(
+                read_bf16(result_buf, n1 as usize),
+                y1_ref,
+                "serialized cross-worker qmv→qmv must be bit-exact vs two sequential whole \
+                 qmvs (p={p} iter={iter}) — a mismatch = a PUBLISH/ACQUIRE or Signal/Wait bug"
+            );
+        }
+    }
+}
+
 /// Whole `rmsnorm_bf16_s_f16_specialized` into a caller buffer (TG 1024 to
 /// match the player's RMSNORM arm reduction width).
 fn rmsnorm_whole_into(

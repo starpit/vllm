@@ -5926,8 +5926,14 @@ fn emit_canonical_params_impl(
 /// locator source — only exists after lowering + loop compression, and the
 /// `(bucket, op_idx, slot)` triples it produces must match the very match
 /// table [`emit_weight_accessors_impl`] builds from the same
-/// `canonical_lowered`. Strictly diagnostic: every fallible step logs and
-/// returns; it never gates a build.
+/// `canonical_lowered`. Every fallible step logs and returns; it never gates
+/// a build.
+///
+/// Returns the serialized [`MegaProgram`] when the decode lowered, serialized,
+/// AND every weight resolved to a real locator — i.e. a runnable megakernel
+/// target — so the caller can emit it as a compile-time builder. Returns
+/// `None` (still dumping diagnostics) otherwise: a program with placeholder
+/// locators (e.g. dense gate/up fused under one accessor) is not runnable.
 #[allow(clippy::too_many_arguments)]
 fn dump_wavefront_mega(
     program: &Program,
@@ -5939,7 +5945,7 @@ fn dump_wavefront_mega(
     backbone_slots: &[Vec<WeightSlot>],
     lm_head_slots: &[Vec<WeightSlot>],
     bb_bucket_id: u32,
-) {
+) -> Option<ferrite_wavefront::mega::MegaProgram> {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
     let lowered = match to_wavefront::lower_decode_to_wavefront(
@@ -5953,7 +5959,7 @@ fn dump_wavefront_mega(
         Ok(l) => l,
         Err(e) => {
             eprintln!("[wavefront] {stem}: not lowered — {e}");
-            return;
+            return None;
         }
     };
     let g = ferrite_wavefront::lower::lower(&lowered.input);
@@ -5997,27 +6003,170 @@ fn dump_wavefront_mega(
         max_blocks: 64,
     };
     match ferrite_wavefront::mega::serialize(&rg, &sched, &descs, geom) {
-        Ok(prog) => eprintln!(
-            "[wavefront-mega] {stem}: {} region nodes → {} tape instrs ({} node-computes, \
-             {} handoff), {} operands, {} buffers, {} arena slots, {} flags; \
-             weights {}/{} → real locators{}",
-            rg.nodes.len(),
-            prog.tape.len(),
-            prog.num_computes(),
-            prog.num_handoff_ops(),
-            prog.operands.len(),
-            prog.buffers.len(),
-            prog.arena_bytes.len(),
-            prog.num_flags,
-            report.weights_resolved,
-            report.weights_total,
+        Ok(prog) => {
+            eprintln!(
+                "[wavefront-mega] {stem}: {} region nodes → {} tape instrs ({} node-computes, \
+                 {} handoff), {} operands, {} buffers, {} arena slots, {} flags; \
+                 weights {}/{} → real locators{}",
+                rg.nodes.len(),
+                prog.tape.len(),
+                prog.num_computes(),
+                prog.num_handoff_ops(),
+                prog.operands.len(),
+                prog.buffers.len(),
+                prog.arena_bytes.len(),
+                prog.num_flags,
+                report.weights_resolved,
+                report.weights_total,
+                if report.unresolved.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — UNRESOLVED bases: {:?}", report.unresolved)
+                },
+            );
+            // Only a FULLY-resolved program is a runnable megakernel target;
+            // a placeholder locator (e.g. dense gate/up fused under one
+            // accessor) must not be baked into a runtime builder.
             if report.unresolved.is_empty() {
-                String::new()
+                Some(prog)
             } else {
-                format!(" — UNRESOLVED bases: {:?}", report.unresolved)
-            },
-        ),
-        Err(e) => eprintln!("[wavefront-mega] {stem}: serialize FAILED — {e}"),
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("[wavefront-mega] {stem}: serialize FAILED — {e}");
+            None
+        }
+    }
+}
+
+// ── PD-wavefront: MegaProgram → compile-time Rust ────────────────────
+
+/// Emit a `wavefront_mega_decode() -> MegaProgram` builder for a fully
+/// resolved decode [`ferrite_wavefront::mega::MegaProgram`] (the megakernel's
+/// neutral tape + buffer table). The flat numeric tables ride compact
+/// `static &[…]`; the semantic `buffers: Vec<BufferRef>` (carrying per-weight
+/// `WeightLoc`/bundle/role) rides typed enum literals — the same "macro emits
+/// typed Rust" pattern as [`emit_bucket_static_slice`], with NO runtime
+/// deserialization. The builder materializes the baked data once at worker
+/// init; the `mega_player` glue dispatches the result.
+fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStream {
+    let tape = prog.tape.iter().map(|r| {
+        let (a, b, c, d) = (r[0], r[1], r[2], r[3]);
+        quote! { [#a, #b, #c, #d] }
+    });
+    let shapes = prog.shapes.iter().map(|r| {
+        let xs = r.iter();
+        quote! { [#(#xs),*] }
+    });
+    let offsets = prog.tape_offsets.iter();
+    let operands = prog.operands.iter().map(|o| {
+        let (b, off) = (o.buffer.0, o.byte_offset);
+        quote! { (#b, #off) }
+    });
+    let arena = prog.arena_bytes.iter();
+    let elem = prog.elem_bytes.iter();
+    let buffers = prog.buffers.iter().map(buffer_ref_to_tokens);
+    let num_flags = prog.num_flags;
+    let result = prog.result.0;
+
+    quote! {
+        /// Compile-time PD-wavefront decode megakernel program, serialized by
+        /// the macro from the solved decode FUF. This builder only
+        /// materializes the baked data — there is NO runtime IR building.
+        #[cfg(feature = "metal")]
+        pub fn wavefront_mega_decode() -> ::ferrite_forward::wavefront::MegaProgram {
+            use ::ferrite_forward::wavefront::{
+                BufId, BufferRef, InputKind, MegaProgram, OperandSlot, WeightBundle, WeightLoc,
+                WeightRole,
+            };
+            static TAPE: &[[u32; 4]] = &[ #(#tape),* ];
+            static SHAPES: &[[u32; 8]] = &[ #(#shapes),* ];
+            static OFFSETS: &[u32] = &[ #(#offsets),* ];
+            static OPERANDS: &[(u32, u64)] = &[ #(#operands),* ];
+            static ARENA: &[u64] = &[ #(#arena),* ];
+            static ELEM: &[u32] = &[ #(#elem),* ];
+            MegaProgram {
+                tape: TAPE.to_vec(),
+                shapes: SHAPES.to_vec(),
+                operands: OPERANDS
+                    .iter()
+                    .map(|&(b, o)| OperandSlot {
+                        buffer: BufId(b),
+                        byte_offset: o,
+                    })
+                    .collect(),
+                tape_offsets: OFFSETS.to_vec(),
+                num_flags: #num_flags,
+                buffers: ::std::vec![ #(#buffers),* ],
+                elem_bytes: ELEM.to_vec(),
+                arena_bytes: ARENA.to_vec(),
+                result: BufId(#result),
+            }
+        }
+    }
+}
+
+/// One [`ferrite_wavefront::subtile_ir::BufferRef`] as a typed Rust literal
+/// (bare paths — the builder `use`s the variants).
+fn buffer_ref_to_tokens(b: &ferrite_wavefront::subtile_ir::BufferRef) -> TokenStream {
+    use ferrite_wavefront::subtile_ir::BufferRef;
+    match b {
+        BufferRef::Weight { bundle, role, loc } => {
+            let bundle = weight_bundle_to_tokens(*bundle);
+            let role = weight_role_to_tokens(*role);
+            let (layer, bucket, op_idx, slot) = (loc.layer, loc.bucket, loc.op_idx, loc.slot);
+            quote! {
+                BufferRef::Weight {
+                    bundle: #bundle,
+                    role: #role,
+                    loc: WeightLoc { layer: #layer, bucket: #bucket, op_idx: #op_idx, slot: #slot },
+                }
+            }
+        }
+        BufferRef::ArenaSlot(s) => quote! { BufferRef::ArenaSlot(#s) },
+        BufferRef::Scratch(s) => quote! { BufferRef::Scratch(#s) },
+        BufferRef::Input(k) => {
+            let k = input_kind_to_tokens(*k);
+            quote! { BufferRef::Input(#k) }
+        }
+    }
+}
+
+fn weight_bundle_to_tokens(b: ferrite_wavefront::subtile_ir::WeightBundle) -> TokenStream {
+    use ferrite_wavefront::subtile_ir::WeightBundle;
+    match b {
+        WeightBundle::RmsNorm => quote! { WeightBundle::RmsNorm },
+        WeightBundle::Embedding => quote! { WeightBundle::Embedding },
+        WeightBundle::LinearLayer => quote! { WeightBundle::LinearLayer },
+        WeightBundle::CosSin => quote! { WeightBundle::CosSin },
+        WeightBundle::AffineQuantEmbedding => quote! { WeightBundle::AffineQuantEmbedding },
+    }
+}
+
+fn weight_role_to_tokens(r: ferrite_wavefront::subtile_ir::WeightRole) -> TokenStream {
+    use ferrite_wavefront::subtile_ir::WeightRole;
+    match r {
+        WeightRole::Weight => quote! { WeightRole::Weight },
+        WeightRole::Bias => quote! { WeightRole::Bias },
+        WeightRole::AffineScales => quote! { WeightRole::AffineScales },
+        WeightRole::AffineBiases => quote! { WeightRole::AffineBiases },
+        WeightRole::AffineLinearBias => quote! { WeightRole::AffineLinearBias },
+    }
+}
+
+fn input_kind_to_tokens(k: ferrite_wavefront::subtile_ir::InputKind) -> TokenStream {
+    use ferrite_wavefront::subtile_ir::InputKind;
+    match k {
+        InputKind::InputIds => quote! { InputKind::InputIds },
+        InputKind::Positions => quote! { InputKind::Positions },
+        InputKind::SlotMapping => quote! { InputKind::SlotMapping },
+        InputKind::CuSeqlensQ => quote! { InputKind::CuSeqlensQ },
+        InputKind::SeqUsedK => quote! { InputKind::SeqUsedK },
+        InputKind::BlockTable => quote! { InputKind::BlockTable },
+        InputKind::KvCacheK { layer } => quote! { InputKind::KvCacheK { layer: #layer } },
+        InputKind::KvCacheV { layer } => quote! { InputKind::KvCacheV { layer: #layer } },
+        InputKind::NumTokens => quote! { InputKind::NumTokens },
     }
 }
 
@@ -6450,11 +6599,18 @@ pub fn emit_model(
         .map(|(ci, (wp, _))| (*wp, (ci as u32) * 2))
         .collect();
 
-    // PD-wavefront macro-emission (env-gated, diagnostic). HERE — not in the
-    // pre-emit drive — because the decode bucket's `weight_slots` (the real
-    // weight-locator source) only exists post-lowering + post-loop-compression,
-    // and the `(bucket, op_idx, slot)` triples must match the very match table
-    // `emit_weight_accessors_impl` builds from this same `canonical_lowered`.
+    // The PD-wavefront decode megakernel program (env-gated): emitted into
+    // `metal_emission` as a `wavefront_mega_decode()` builder when the decode
+    // fully resolves to a runnable megakernel target; empty TokenStream
+    // otherwise (so normal builds carry nothing).
+    let mut wavefront_mega_builder = TokenStream::new();
+
+    // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
+    // HERE — not in the pre-emit drive — because the decode bucket's
+    // `weight_slots` (the real weight-locator source) only exists post-lowering
+    // + post-loop-compression, and the `(bucket, op_idx, slot)` triples must
+    // match the very match table `emit_weight_accessors_impl` builds from this
+    // same `canonical_lowered`.
     if std::env::var_os("FERRITE_WAVEFRONT").is_some() {
         match sfufs.get_nt(1) {
             Some(decode_asn) => {
@@ -6468,7 +6624,7 @@ pub fn emit_model(
                         let bb_bucket_id = canonical_to_bucket_id[&canonical];
                         let (cl, ..) = &canonical_lowered[&canonical];
                         let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
-                        dump_wavefront_mega(
+                        if let Some(prog) = dump_wavefront_mega(
                             program,
                             model,
                             fuf,
@@ -6478,7 +6634,9 @@ pub fn emit_model(
                             &cl.backbone.weight_slots,
                             &cl.lm_head.weight_slots,
                             bb_bucket_id,
-                        );
+                        ) {
+                            wavefront_mega_builder = emit_wavefront_mega(&prog);
+                        }
                     }
                     None => eprintln!(
                         "[wavefront] {}: no decode (num_tokens=1) workload point",
@@ -6769,6 +6927,11 @@ pub fn emit_model(
 
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
+
+        // PD-wavefront decode megakernel program builder (env-gated emission;
+        // empty unless built with `FERRITE_WAVEFRONT` set). Self-gated on
+        // `feature = "metal"`.
+        #wavefront_mega_builder
 
         /// Per-canonical tape_index plan for the Metal pool. One row per
         /// `num_tokens` point, ordered ascending. `MetalWorkerPool::pick_bucket`

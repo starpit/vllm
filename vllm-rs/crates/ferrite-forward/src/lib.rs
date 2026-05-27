@@ -55,6 +55,20 @@ pub mod vision_arch;
 #[cfg(feature = "metal")]
 pub mod interpreter;
 
+// PD-wavefront: the neutral megakernel IR types the macro-emitted
+// `wavefront_mega_decode()` builder constructs. The generated model crates
+// depend on `ferrite-forward`, not `ferrite-wavefront` (which is pulled in
+// only under `metal`), so this thin re-export gives the emitted code a
+// stable `::ferrite_forward::wavefront::…` path. The runtime dispatch glue
+// (`interpreter::metal::mega_player`) reaches `ferrite_wavefront` directly.
+#[cfg(feature = "metal")]
+pub mod wavefront {
+    pub use ferrite_wavefront::mega::{MegaProgram, OperandSlot};
+    pub use ferrite_wavefront::subtile_ir::{
+        BufId, BufferRef, InputKind, WeightBundle, WeightLoc, WeightRole,
+    };
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use info::{
     BackboneDumpRegistration, BucketDump, NormalizedField, NormalizedStep, VariantDump,

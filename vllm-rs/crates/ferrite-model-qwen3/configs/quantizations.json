@@ -6,6 +6,8 @@
     "fp8-block-128x128",
     "mlx-affine-b4-g64",
     "mlx-affine-b4-g64-qembed",
+    "mlx-affine-b4-g128",
+    "mlx-affine-b4-g128-qembed",
     "ggml"
   ]
 }

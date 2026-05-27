@@ -35,7 +35,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
+use ferrite_wavefront::mega::SourceDesc;
 use ferrite_wavefront::subtile::SourceShape;
+use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
 use crate::classified::{ExternKind, OpKind};
 use crate::config::ModelParams;
@@ -559,6 +561,76 @@ pub fn lower_decode_to_wavefront(
         },
         bindings: bx.bindings,
     })
+}
+
+/// Map the bridge's [`SourceBinding`] manifest to the serializer's
+/// [`SourceDesc`] vector (parallel to `input.sources`), so a solved decode FUF
+/// can flow all the way to a [`ferrite_wavefront::mega::MegaProgram`]. The
+/// *structural* shape — which source is a quantized linear weight vs a dense
+/// rmsnorm gain / rotary row / prefix-cache half — is recovered from how each
+/// source is consumed. The per-weight runtime [`WeightLoc`] + quant params are
+/// PLACEHOLDERS here (unique `op_idx` per source); the REAL locators come from
+/// the lowered tape's `weight_slots` (codegen, where `linear_at` is built).
+/// This is enough to prove the compile-time pipeline (`lower_region` →
+/// `region_schedule` → `mega::serialize`) runs on the real FUF and yields a
+/// structurally sound MegaProgram.
+pub fn build_source_descs(input: &LoweringInput, bindings: &[SourceBinding]) -> Vec<SourceDesc> {
+    // A source read as a Gemm's weight (input 1) is a quantized linear weight;
+    // any other `Weight` binding is a dense gain (rmsnorm).
+    let mut gemm_weight: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for od in &input.ops {
+        if matches!(od.op, LoweredOp::Gemm { .. })
+            && let Some(InputRef::Ext(e)) = od.inputs.get(1)
+        {
+            gemm_weight.insert(*e);
+        }
+    }
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let bref = |bundle, role| BufferRef::Weight {
+                bundle,
+                role,
+                loc: WeightLoc {
+                    layer: 0,
+                    bucket: 0,
+                    op_idx: i as u32,
+                    slot: 0,
+                },
+            };
+            match b {
+                SourceBinding::EmbeddedHidden => SourceDesc::Dense {
+                    buffer: bref(WeightBundle::Embedding, WeightRole::Weight),
+                    elem: 2,
+                },
+                SourceBinding::Cos | SourceBinding::Sin => SourceDesc::Dense {
+                    buffer: bref(WeightBundle::CosSin, WeightRole::Weight),
+                    elem: 2,
+                },
+                SourceBinding::PrefixK { layer } => SourceDesc::PrefixK {
+                    layer: *layer as u32,
+                },
+                SourceBinding::PrefixV { layer } => SourceDesc::PrefixV {
+                    layer: *layer as u32,
+                },
+                SourceBinding::Weight { .. } if gemm_weight.contains(&i) => {
+                    SourceDesc::QuantWeight {
+                        weight: bref(WeightBundle::LinearLayer, WeightRole::Weight),
+                        scales: bref(WeightBundle::LinearLayer, WeightRole::AffineScales),
+                        biases: bref(WeightBundle::LinearLayer, WeightRole::AffineBiases),
+                        group_size: 64,
+                        bits: 4,
+                        scale_elem: 2,
+                    }
+                }
+                SourceBinding::Weight { .. } => SourceDesc::Dense {
+                    buffer: bref(WeightBundle::RmsNorm, WeightRole::Weight),
+                    elem: 2,
+                },
+            }
+        })
+        .collect()
 }
 
 /// Compute dump stats for a lowered forward (the drive logs these).

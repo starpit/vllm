@@ -933,6 +933,58 @@ fn compile_common(
                                     valid,
                                     st.op_histogram,
                                 );
+
+                                // The full compile-time artifact: fuse Silu+Mul,
+                                // N-block-tile every matmul (region graph),
+                                // wavefront-schedule across 10 workers, and
+                                // serialize to the neutral MegaProgram the GPU
+                                // player runs. Proves the whole compile-time
+                                // pipeline on the real decode FUF. WeightLocs are
+                                // placeholders here (real ones come from the
+                                // lowered tape's weight_slots, next).
+                                use ferrite_wavefront::region_schedule::{
+                                    ScheduleParams, schedule_wavefront,
+                                };
+                                let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
+                                let descs =
+                                    to_wavefront::build_source_descs(&fused, &lowered.bindings);
+                                let rg = ferrite_wavefront::region::lower_region(&fused, 256);
+                                let sched = schedule_wavefront(
+                                    &rg,
+                                    |n| {
+                                        (n.output.region.rows.len * n.output.region.cols.len) as f64
+                                    },
+                                    ScheduleParams {
+                                        num_workers: 10,
+                                        wait_cost_us: 0.18,
+                                    },
+                                );
+                                let geom = ferrite_wavefront::mega::Geometry {
+                                    act_elem: 2,
+                                    block_size: 16,
+                                    max_blocks: 64,
+                                };
+                                match ferrite_wavefront::mega::serialize(&rg, &sched, &descs, geom)
+                                {
+                                    Ok(prog) => eprintln!(
+                                        "[wavefront-mega] {}: {} region nodes → {} tape instrs \
+                                         ({} node-computes, {} handoff), {} operands, \
+                                         {} buffers, {} arena slots, {} flags",
+                                        model.source_stem,
+                                        rg.nodes.len(),
+                                        prog.tape.len(),
+                                        prog.num_computes(),
+                                        prog.num_handoff_ops(),
+                                        prog.operands.len(),
+                                        prog.buffers.len(),
+                                        prog.arena_bytes.len(),
+                                        prog.num_flags,
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "[wavefront-mega] {}: serialize FAILED — {e}",
+                                        model.source_stem
+                                    ),
+                                }
                             }
                             Err(e) => {
                                 eprintln!("[wavefront] {}: not lowered — {e}", model.source_stem);

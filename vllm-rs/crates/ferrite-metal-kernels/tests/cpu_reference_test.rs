@@ -2,10 +2,9 @@
 //
 // Unit tests for `ferrite_metal_kernels::cpu_reference`. Lives in
 // `tests/` (rather than as an inline `#[cfg(test)] mod` next to the
-// implementation) because the crate's lib-test target also pulls in
-// `src/instruction_executor/test_direct_vs_icb.rs`, which currently
-// fails to compile after the objc2-metal migration. Integration
-// tests bypass that scope.
+// implementation) because the crate's lib-test target pulls in other
+// test modules that currently fail to compile after the objc2-metal
+// migration. Integration tests bypass that scope.
 
 use ferrite_metal_kernels::cpu_reference::{
     affine_dequantize_b4_bf16, affine_dequantize_b4_f16, affine_qmm_n_b4_bf16,

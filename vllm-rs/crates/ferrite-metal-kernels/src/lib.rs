@@ -47,9 +47,6 @@ pub mod specialized_pipeline_cache;
 pub mod stream;
 pub mod take_along_axis;
 
-// Instruction recording for ICB execution
-pub mod instruction_executor;
-
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};

@@ -43,6 +43,13 @@ pub use lowered::{
 pub use lowering::{lower, lower_pair};
 pub use pipelines::{PipelineLookupError, SpecializedPipelines};
 
+/// Reactive (chunked) KV pool granularity — re-exported single source
+/// of truth so the worker (chunk-pool sizing) and the lowering
+/// (chunk-table `[[function_constant]]`) share the exact value the
+/// macro-generated `SynthPreAttn` bakes. See
+/// [`ferrite_fusion_synth::BLOCKS_PER_CHUNK`].
+#[cfg(feature = "metal")]
+pub use ferrite_fusion_synth::BLOCKS_PER_CHUNK;
 #[cfg(feature = "metal")]
 pub use forward::{ForwardError, ForwardInputs};
 #[cfg(feature = "metal")]

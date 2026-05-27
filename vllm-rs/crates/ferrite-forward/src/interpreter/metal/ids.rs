@@ -228,6 +228,13 @@ u32_newtype!(
     RotDim,
     /// Tokens per paged KV-cache block (`W::BLOCK_SIZE`).
     BlockSize,
+    /// Reactive (chunked) KV pool granularity — paged blocks backed by
+    /// one physical chunk buffer (`ferrite_fusion_synth::BLOCKS_PER_CHUNK`).
+    /// The KV cache bindings are per-layer chunk-address tables (device
+    /// uint64 gpuAddresses); a physical block id `pb` derefs
+    /// `table[pb / BLOCKS_PER_CHUNK]` and addresses `pb % BLOCKS_PER_CHUNK`
+    /// within that chunk. Same value baked into the `SynthPreAttn` MSL.
+    BlocksPerChunk,
     /// Block-table fanout per sequence (`W::MAX_BLOCKS_PER_SEQ`).
     MaxBlocksPerSeq,
     /// Hidden / Q-projection size (`W::Q_SIZE` — `num_q_heads * head_dim`).

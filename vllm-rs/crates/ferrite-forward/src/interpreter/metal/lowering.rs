@@ -1579,6 +1579,9 @@ fn lower_one<W: CanonicalParams>(
                     num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
                     rot_dim: super::ids::RotDim(W::ROT_DIM),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -1637,6 +1640,9 @@ fn lower_one<W: CanonicalParams>(
                     rot_dim: super::ids::RotDim(W::ROT_DIM),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     bucket_m: super::ids::BucketM(bucket_m),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -2247,6 +2253,9 @@ fn lower_one<W: CanonicalParams>(
                     attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -2374,6 +2383,9 @@ fn lower_one<W: CanonicalParams>(
                 attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                 block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                 max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                blocks_per_chunk: super::ids::BlocksPerChunk(
+                    ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                ),
                 // Steel kernel reads slot 99; omitting it leaves Metal
                 // undefined and the kernel can hit a diagnostic path
                 // (the b3ddb3b46 regression). sdpa_vector ignores it.

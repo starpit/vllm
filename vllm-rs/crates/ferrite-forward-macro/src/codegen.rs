@@ -6913,11 +6913,18 @@ pub fn emit_model(
             // factory invocation in single-worker configs.
             let pool = wm.metal_pool.get_or_init(|| {
                 let num_layers = ctx.kv_cache.num_layers;
+                // Reactive (chunked) KV pool: bind the per-layer
+                // chunk-address TABLE buffers (device uint64 arrays of
+                // chunk gpuAddresses), not the cache data. The KV
+                // kernels deref `table[block_id / BLOCKS_PER_CHUNK]`.
+                // The table buffer identity is stable across the
+                // pool's life (chunk-set growth edits its contents, not
+                // its binding), so baking its gpuAddress once is sound.
                 let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.k_layer_mem(l).buffer().clone())
+                    .map(|l| ctx.kv_cache.k_chunk_table_mem(l).buffer().clone())
                     .collect();
                 let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.v_layer_mem(l).buffer().clone())
+                    .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
                     .collect();
                 let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
                     ::std::sync::Arc::new(move |dev| {
@@ -7124,11 +7131,18 @@ pub fn emit_model(
             // get_or_init).
             let pool = wm.metal_pool.get_or_init(|| {
                 let num_layers = ctx.kv_cache.num_layers;
+                // Reactive (chunked) KV pool: bind the per-layer
+                // chunk-address TABLE buffers (device uint64 arrays of
+                // chunk gpuAddresses), not the cache data. The KV
+                // kernels deref `table[block_id / BLOCKS_PER_CHUNK]`.
+                // The table buffer identity is stable across the
+                // pool's life (chunk-set growth edits its contents, not
+                // its binding), so baking its gpuAddress once is sound.
                 let kv_k: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.k_layer_mem(l).buffer().clone())
+                    .map(|l| ctx.kv_cache.k_chunk_table_mem(l).buffer().clone())
                     .collect();
                 let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
-                    .map(|l| ctx.kv_cache.v_layer_mem(l).buffer().clone())
+                    .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
                     .collect();
                 let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
                     ::std::sync::Arc::new(move |dev| {

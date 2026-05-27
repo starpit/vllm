@@ -53,6 +53,12 @@ constant uint  ATTN_PAGED_NUM_KV_HEADS       [[function_constant(2)]];
 constant float ATTN_PAGED_SCALE              [[function_constant(3)]];
 constant uint  ATTN_PAGED_BLOCK_SIZE         [[function_constant(4)]];  // unused; ==BLOCK_SIZE_
 constant uint  ATTN_PAGED_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
+// Reactive (chunked) KV pool: k_cache/v_cache (buffers 5/6) are
+// per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
+// cache buffers. `PagedBlockLoaderT` derefs
+// `chunk_table[physical / BLOCKS_PER_CHUNK]` per block. See
+// `ferrite_fusion_synth::BLOCKS_PER_CHUNK`.
+constant uint  ATTN_PAGED_BLOCKS_PER_CHUNK   [[function_constant(6)]];
 
 // Debug toggle. When `ATTN_PAGED_DEBUG_MODE != 0`, the kernel replaces
 // its normal store path with a per-lane marker write so the bench can
@@ -126,8 +132,8 @@ void attention_paged(
     const device uint* cu_seqlens_q [[buffer(2)]],   // [batch+1]
     const device uint* seq_used_k   [[buffer(3)]],   // [batch] total cached K
     const device uint* block_table  [[buffer(4)]],   // [batch, max_blocks_per_seq]
-    const device T*    k_cache      [[buffer(5)]],   // [num_blocks, num_kv_heads, BLOCK_SIZE, head_dim]
-    const device T*    v_cache      [[buffer(6)]],
+    const device uint64_t* k_cache  [[buffer(5)]],   // per-layer chunk-address table
+    const device uint64_t* v_cache  [[buffer(6)]],   // per-layer chunk-address table
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -222,18 +228,26 @@ void attention_paged(
 
   QBlockLoader loader_q(
       Q, Q_stride_tok, Qs, simd_group_id, simd_lane_id);
+  // Chunked KV: pass the chunk-address table + the per-block head
+  // offset (kv_head_idx * kv_head_stride) + BLOCKS_PER_CHUNK; the
+  // loader resolves the chunk base per physical block (it can no
+  // longer be folded into a single `cache_base`).
   KBlockLoader loader_k(
-      k_cache + int(kv_head_idx) * kv_head_stride,
+      k_cache,
       per_token_stride,
       kv_blk_stride,
+      int(kv_head_idx) * kv_head_stride,
+      int(ATTN_PAGED_BLOCKS_PER_CHUNK),
       row_block_table,
       Ks,
       simd_group_id,
       simd_lane_id);
   VBlockLoader loader_v(
-      v_cache + int(kv_head_idx) * kv_head_stride,
+      v_cache,
       per_token_stride,
       kv_blk_stride,
+      int(kv_head_idx) * kv_head_stride,
+      int(ATTN_PAGED_BLOCKS_PER_CHUNK),
       row_block_table,
       Vs,
       simd_group_id,

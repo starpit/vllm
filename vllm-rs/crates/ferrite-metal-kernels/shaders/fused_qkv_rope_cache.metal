@@ -62,6 +62,11 @@ constant uint FQRC_HEAD_DIM     [[function_constant(3)]];
 constant uint FQRC_ROT_DIM      [[function_constant(4)]];
 constant uint FQRC_BLOCK_SIZE   [[function_constant(5)]];
 constant uint FQRC_M            [[function_constant(6)]];
+// Reactive (chunked) KV pool: buffers 6/7 are per-layer chunk-address
+// TABLES (device uint64 gpuAddresses), not the cache buffers. Deref
+// `table[block_id / BLOCKS_PER_CHUNK]` then address with
+// `block_id % BLOCKS_PER_CHUNK`. See `ferrite_fusion_synth::BLOCKS_PER_CHUNK`.
+constant uint FQRC_BLOCKS_PER_CHUNK [[function_constant(7)]];
 
 // Threadgroup scratch ceiling. Llama-3.x: HEAD_DIM <= 128; Qwen2-7B,
 // Mistral-7B: 128. 256 leaves headroom without bloating tg memory.
@@ -75,8 +80,8 @@ template <typename T>
     device const T*    cos_sin       [[buffer(3)]],
     device const uint* positions     [[buffer(4)]],
     device const uint* slot_mapping  [[buffer(5)]],
-    device       T*    kv_cache_k    [[buffer(6)]],
-    device       T*    kv_cache_v    [[buffer(7)]],
+    device const uint64_t* kv_cache_k [[buffer(6)]],
+    device const uint64_t* kv_cache_v [[buffer(7)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -153,8 +158,11 @@ template <typename T>
         const uint kv_blk_stride  = num_kv * block_sz * head_dim;
         const uint kv_head_stride = block_sz * head_dim;
         const uint kv_tok_stride  = head_dim;
-        device T* k_dst = kv_cache_k
-            + (size_t)block_id     * (size_t)kv_blk_stride
+        // Chunked KV: deref the chunk backing this physical block.
+        const uint chunk        = block_id / FQRC_BLOCKS_PER_CHUNK;
+        const uint blk_in_chunk = block_id % FQRC_BLOCKS_PER_CHUNK;
+        device T* k_dst = (device T*)kv_cache_k[chunk]
+            + (size_t)blk_in_chunk * (size_t)kv_blk_stride
             + (size_t)kv_head      * (size_t)kv_head_stride
             + (size_t)block_offset * (size_t)kv_tok_stride;
 
@@ -184,8 +192,11 @@ template <typename T>
     const uint kv_blk_stride  = num_kv * block_sz * head_dim;
     const uint kv_head_stride = block_sz * head_dim;
     const uint kv_tok_stride  = head_dim;
-    device T* v_dst = kv_cache_v
-        + (size_t)block_id     * (size_t)kv_blk_stride
+    // Chunked KV: deref the chunk backing this physical block.
+    const uint chunk        = block_id / FQRC_BLOCKS_PER_CHUNK;
+    const uint blk_in_chunk = block_id % FQRC_BLOCKS_PER_CHUNK;
+    device T* v_dst = (device T*)kv_cache_v[chunk]
+        + (size_t)blk_in_chunk * (size_t)kv_blk_stride
         + (size_t)kv_head      * (size_t)kv_head_stride
         + (size_t)block_offset * (size_t)kv_tok_stride;
     v_dst[d] = T(acc);

@@ -109,4 +109,66 @@ impl PagedKvLayout {
         let slot = global_slot % self.block_size;
         self.elem_offset(block, kv_head, slot)
     }
+
+    /// Decompose a physical block id into `(chunk_index, block_in_chunk)`
+    /// for the metal chunked KV pool.
+    ///
+    /// On metal the KV pool is allocated as a series of fixed-size
+    /// *chunk* buffers (`blocks_per_chunk` blocks each, one MTLBuffer
+    /// per chunk per layer per K/V) so the `MTLResidencySet` can hold
+    /// only the live chunks — physical RAM then tracks live KV instead
+    /// of pinning the whole pool resident. A physical block id maps to
+    /// the chunk that backs it (`id / blocks_per_chunk`) and the block
+    /// offset within that chunk (`id % blocks_per_chunk`); the kernel
+    /// looks the chunk's base `gpuAddress` up in a per-layer table and
+    /// then addresses within it with the *block-in-chunk* index in
+    /// place of `physical_block`.
+    ///
+    /// CUDA (and any single-buffer caller) passes
+    /// `blocks_per_chunk == num_blocks`, so `chunk_index` is always 0
+    /// and `block_in_chunk == physical_block` — i.e. a no-op.
+    ///
+    /// `blocks_per_chunk` must be non-zero.
+    #[inline]
+    pub fn chunk_decompose(physical_block: u32, blocks_per_chunk: u32) -> (u32, u32) {
+        debug_assert!(blocks_per_chunk > 0, "blocks_per_chunk must be non-zero");
+        (
+            physical_block / blocks_per_chunk,
+            physical_block % blocks_per_chunk,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_decompose_single_buffer_is_noop() {
+        // blocks_per_chunk == num_blocks: everything lands in chunk 0
+        // at its own index (the CUDA / single-buffer contract).
+        for blk in [0u32, 1, 17, 255] {
+            assert_eq!(PagedKvLayout::chunk_decompose(blk, 256), (0, blk));
+        }
+    }
+
+    #[test]
+    fn chunk_decompose_crosses_chunk_boundaries() {
+        let bpc = 512; // one chunk == one 8192-token seq at block_size 16
+        assert_eq!(PagedKvLayout::chunk_decompose(0, bpc), (0, 0));
+        assert_eq!(PagedKvLayout::chunk_decompose(511, bpc), (0, 511));
+        assert_eq!(PagedKvLayout::chunk_decompose(512, bpc), (1, 0));
+        assert_eq!(PagedKvLayout::chunk_decompose(513, bpc), (1, 1));
+        assert_eq!(PagedKvLayout::chunk_decompose(1024, bpc), (2, 0));
+    }
+
+    #[test]
+    fn chunk_decompose_reassembles_to_global_block() {
+        let bpc = 300;
+        for blk in [0u32, 1, 299, 300, 301, 899, 900, 12_345] {
+            let (chunk, in_chunk) = PagedKvLayout::chunk_decompose(blk, bpc);
+            assert_eq!(chunk * bpc + in_chunk, blk);
+            assert!(in_chunk < bpc);
+        }
+    }
 }

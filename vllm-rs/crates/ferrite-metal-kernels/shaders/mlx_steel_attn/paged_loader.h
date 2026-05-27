@@ -81,17 +81,38 @@ struct PagedBlockLoaderT {
   threadgroup T* dst;
   const device T* src;  // re-bound in next() via block_table
 
-  // Block-indirection extras.
+  // Block-indirection extras. Chunked KV: `chunk_table` is the
+  // per-layer chunk-address table (device uint64 gpuAddresses), not a
+  // single cache buffer. A physical block id derefs
+  // `chunk_table[physical / blocks_per_chunk]` then addresses
+  // `physical % blocks_per_chunk` within that chunk. `kv_head_off`
+  // (= kv_head_idx * kv_head_stride) is added per-block since the
+  // chunk base is resolved fresh on every block.
   const device uint* block_table_row;
-  const device T* cache_base;
+  const device uint64_t* chunk_table;
   const int kv_blk_stride;
-  const int per_thread_offset;  // = bi * src_ld + bj
+  const int kv_head_off;
+  const int blocks_per_chunk;
+  const int per_thread_offset;  // = bi * src_ld + bj + kv_head_off
   int logical_block;
 
+  // Resolve this thread's `src` for the given logical block: deref the
+  // chunk that backs the physical block, then add the within-chunk +
+  // head + per-thread offsets.
+  METAL_FUNC const device T* resolve(int lb) const {
+    const uint physical = uint(block_table_row[lb]);
+    const uint chunk    = physical / uint(blocks_per_chunk);
+    const uint bic      = physical % uint(blocks_per_chunk);
+    return (const device T*)chunk_table[chunk]
+        + int(bic) * kv_blk_stride + per_thread_offset;
+  }
+
   METAL_FUNC PagedBlockLoaderT(
-      const device T* cache_base_,
+      const device uint64_t* chunk_table_,
       const int src_ld_,
       const int kv_blk_stride_,
+      const int kv_head_off_,
+      const int blocks_per_chunk_,
       const device uint* block_table_row_,
       threadgroup T* dst_,
       ushort simd_group_id [[simdgroup_index_in_threadgroup]],
@@ -102,13 +123,16 @@ struct PagedBlockLoaderT {
         bi(thread_idx / TCOLS),
         bj(vec_size * (thread_idx % TCOLS)),
         dst(dst_ + bi * kDstStrRow + bj * kDstStrCol),
-        src(cache_base_ + int(block_table_row_[0]) * kv_blk_stride_
-            + bi * src_ld_ + bj),
+        src(nullptr),
         block_table_row(block_table_row_),
-        cache_base(cache_base_),
+        chunk_table(chunk_table_),
         kv_blk_stride(kv_blk_stride_),
-        per_thread_offset(int(bi) * src_ld_ + int(bj)),
-        logical_block(0) {}
+        kv_head_off(kv_head_off_),
+        blocks_per_chunk(blocks_per_chunk_),
+        per_thread_offset(int(bi) * src_ld_ + int(bj) + kv_head_off_),
+        logical_block(0) {
+    src = resolve(0);
+  }
 
   // ===== Methods copied verbatim from `BlockLoaderT` =====================
 
@@ -167,9 +191,7 @@ struct PagedBlockLoaderT {
   /* Iteration helper — paged-cache variant. */
   METAL_FUNC void next() {
     logical_block += 1;
-    src = cache_base
-        + int(block_table_row[logical_block]) * kv_blk_stride
-        + per_thread_offset;
+    src = resolve(logical_block);
   }
 };
 

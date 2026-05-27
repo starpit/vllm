@@ -103,6 +103,21 @@ impl MetalResidencySet {
         let _: () = msg_send![inner.set_ptr, addAllocation: ptr];
     }
 
+    /// Remove a previously-inserted allocation from the residency set
+    /// (reactive shrink). Pair with [`Self::commit`] to apply, then the
+    /// caller may free the buffer — its pages are no longer wired.
+    pub fn remove(&self, buffer: &Buffer) {
+        let inner = self.inner.lock().expect("residency set mutex");
+        if inner.set_ptr.is_null() {
+            return;
+        }
+        unsafe {
+            let buf_ptr: *mut AnyObject =
+                Retained::as_ptr(buffer) as *const AnyObject as *mut AnyObject;
+            let _: () = msg_send![inner.set_ptr, removeAllocation: buf_ptr];
+        }
+    }
+
     pub fn commit(&self) {
         let inner = self.inner.lock().expect("residency set mutex");
         if inner.set_ptr.is_null() {

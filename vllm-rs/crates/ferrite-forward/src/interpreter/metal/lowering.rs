@@ -27,7 +27,40 @@
 //! [`LoweringError::UnsupportedVariant`] with the variant's type name
 //! so the model author knows which arm to add next.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::{CanonicalParams, Instruction};
+
+/// Set by the worker when a draft model is loaded. The
+/// `attention_via_cache_v2_*` kernel's BPC=0 fast path has an unresolved
+/// interaction with the draft K-step chain on 3B-class+ models (symptom:
+/// out-of-vocab token IDs from the draft proposer). Forcing the chunked
+/// addressing path keeps spec-decode correct; non-spec-decode workloads
+/// keep the fast path. One-shot at worker init; the lowering pass picks
+/// up the value at first forward.
+static FORCE_CHUNKED_ADDRESSING: AtomicBool = AtomicBool::new(false);
+
+/// Disable the BPC=0 attention reader fast path for the lifetime of this
+/// process. The worker calls this when a draft model is loaded.
+pub fn force_chunked_attention_addressing() {
+    FORCE_CHUNKED_ADDRESSING.store(true, Ordering::Relaxed);
+}
+
+/// Value passed as `ATTN_BLOCKS_PER_CHUNK` to the attention reader's
+/// pipeline. `0` selects the direct-addressing fast path: the kernel
+/// treats `k_cache[0]` as the layer base and computes
+/// `physical_block * kv_blk_stride` directly (no per-block chunk-table
+/// load, no modulo). Safe because the worker installs one MTLBuffer per
+/// `(layer, K/V)` with `chunk_table[0]` filled to the layer base. Falls
+/// back to the chunked addressing path when
+/// [`force_chunked_attention_addressing`] has been called.
+fn attention_blocks_per_chunk() -> u32 {
+    if FORCE_CHUNKED_ADDRESSING.load(Ordering::Relaxed) {
+        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK
+    } else {
+        0
+    }
+}
 use ferrite_metal_kernels::quantized::{
     DequantDtype, QmmTKernel, QmvKernel, ScaleDtype, pick_qmm_t_kernel, pick_qmv_kernel,
     qmm_t_dispatch_shape, qmm_t_kernel_static_name, qmm_t_kernel_static_name_with_compute,
@@ -1579,6 +1612,9 @@ fn lower_one<W: CanonicalParams>(
                     num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
                     rot_dim: super::ids::RotDim(W::ROT_DIM),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -1637,6 +1673,9 @@ fn lower_one<W: CanonicalParams>(
                     rot_dim: super::ids::RotDim(W::ROT_DIM),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     bucket_m: super::ids::BucketM(bucket_m),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -2247,6 +2286,7 @@ fn lower_one<W: CanonicalParams>(
                     attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk()),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -2374,6 +2414,14 @@ fn lower_one<W: CanonicalParams>(
                 attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                 block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                 max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                // Prefill kernels (steel + sdpa paged) stay at the standard
+                // BPC; the steel loader (paged_loader.h) has its own chunk
+                // arithmetic that hasn't been adapted to the BPC=0 fast
+                // path. Decode reader (AttentionViaCache) is the only kernel
+                // currently consulting `attention_blocks_per_chunk()`.
+                blocks_per_chunk: super::ids::BlocksPerChunk(
+                    ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                ),
                 // Steel kernel reads slot 99; omitting it leaves Metal
                 // undefined and the kernel can hit a diagnostic path
                 // (the b3ddb3b46 regression). sdpa_vector ignores it.

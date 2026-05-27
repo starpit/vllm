@@ -34,7 +34,7 @@ nccl = []
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal"]
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal", "dep:ferrite-fusion-synth"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -55,6 +55,12 @@ probe = ["dep:hf-hub", "dep:clap", "dep:ureq", "dep:serde"]
 # and metal features pull it in via `dep:ferrite-kernels`.
 ferrite-kernels = { path = "../ferrite-kernels", optional = true }
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+# Single source of truth for the reactive (chunked) KV pool
+# granularity (`BLOCKS_PER_CHUNK`). The metal lowering reads it to set
+# the chunk-table `[[function_constant]]` on the hand-written KV
+# kernels so they agree with the macro-generated `SynthPreAttn`, which
+# bakes the same const via this crate. Metal-only (see `metal` feature).
+ferrite-fusion-synth = { path = "../ferrite-fusion-synth", optional = true }
 # `ferrite-vision` is gated on `cuda` because its lib.rs uses
 # `cudarc::CUstream` unconditionally; the Metal path doesn't touch it.
 ferrite-vision = { path = "../ferrite-vision", optional = true }

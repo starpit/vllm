@@ -534,8 +534,15 @@ impl Atom for RopeAppendAtom {
                 if (__slot != 0xFFFFFFFFu) {{
                     const uint __block_id     = __slot / __block_sz;
                     const uint __block_offset = __slot % __block_sz;
-                    device {t_act}* __k_dst = {kc}
-                        + (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                    // Chunked KV: {kc} is the per-layer chunk-address
+                    // table (device uint64 gpuAddresses), not the cache
+                    // buffer. Deref the chunk that backs this block,
+                    // then address with the block index WITHIN the chunk.
+                    const uint __chunk        = __block_id / BLOCKS_PER_CHUNK;
+                    const uint __blk_in_chunk = __block_id % BLOCKS_PER_CHUNK;
+                    device {t_act}* __k_base = (device {t_act}*){kc}[__chunk];
+                    device {t_act}* __k_dst = __k_base
+                        + (size_t)__blk_in_chunk * (size_t)(__num_kv * __block_sz * __head_dim)
                         + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
                         + (size_t)__block_offset * (size_t)__head_dim;
                     if (__base_d < __half_dim) {{
@@ -561,8 +568,12 @@ impl Atom for RopeAppendAtom {
                 if (__slot != 0xFFFFFFFFu) {{
                     const uint __block_id     = __slot / __block_sz;
                     const uint __block_offset = __slot % __block_sz;
-                    device {t_act}* __v_dst = {vc}
-                        + (size_t)__block_id     * (size_t)(__num_kv * __block_sz * __head_dim)
+                    // Chunked KV: {vc} is the per-layer chunk-address table.
+                    const uint __chunk        = __block_id / BLOCKS_PER_CHUNK;
+                    const uint __blk_in_chunk = __block_id % BLOCKS_PER_CHUNK;
+                    device {t_act}* __v_base = (device {t_act}*){vc}[__chunk];
+                    device {t_act}* __v_dst = __v_base
+                        + (size_t)__blk_in_chunk * (size_t)(__num_kv * __block_sz * __head_dim)
                         + (size_t)__kv_head      * (size_t)(__block_sz * __head_dim)
                         + (size_t)__block_offset * (size_t)__head_dim;
                     for (int __r = 0; __r < MK_ROWS_PER_SIMDGROUP; __r++)

@@ -20,9 +20,9 @@
 use ferrite_metal_kernels::specialized_pipeline_cache::{ConstSlot, ConstantValue};
 
 use super::ids::{
-    AttnDebugMode, AttnScale, BlockSize, BucketM, HeadDim, HiddenSize, IntermediateSize, KDim,
-    KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32, NumKvHeads, NumQHeads,
-    QSize, RmsNormEps, RotDim, SplitK,
+    AttnDebugMode, AttnScale, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
+    IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
+    NumKvHeads, NumQHeads, QSize, RmsNormEps, RotDim, SplitK,
 };
 
 // ── Embed (token gather) ───────────────────────────────────────────
@@ -72,6 +72,7 @@ pub struct RopeAppendConstants {
     pub num_kv_heads: NumKvHeads,
     pub rot_dim: RotDim,
     pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
 }
 
 impl From<RopeAppendConstants> for Vec<ConstantValue> {
@@ -82,6 +83,7 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
             ConstantValue::uint(ConstSlot(3), c.rot_dim.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
+            ConstantValue::uint(ConstSlot(5), c.blocks_per_chunk.get()),
         ]
     }
 }
@@ -98,6 +100,7 @@ pub struct FusedQkvRopeCacheConstants {
     pub rot_dim: RotDim,
     pub block_size: BlockSize,
     pub bucket_m: BucketM,
+    pub blocks_per_chunk: BlocksPerChunk,
 }
 
 impl From<FusedQkvRopeCacheConstants> for Vec<ConstantValue> {
@@ -110,6 +113,7 @@ impl From<FusedQkvRopeCacheConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(4), c.rot_dim.get()),
             ConstantValue::uint(ConstSlot(5), c.block_size.get()),
             ConstantValue::uint(ConstSlot(6), c.bucket_m.get()),
+            ConstantValue::uint(ConstSlot(7), c.blocks_per_chunk.get()),
         ]
     }
 }
@@ -125,6 +129,7 @@ pub struct AttentionViaCacheConstants {
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
     pub max_blocks: MaxBlocksPerSeq,
+    pub blocks_per_chunk: BlocksPerChunk,
 }
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
@@ -136,6 +141,7 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
         ]
     }
 }
@@ -159,6 +165,7 @@ pub struct AttentionPrefillPagedConstants {
     pub attn_scale: AttnScale,
     pub block_size: BlockSize,
     pub max_blocks: MaxBlocksPerSeq,
+    pub blocks_per_chunk: BlocksPerChunk,
     /// `Some(0)` for the steel kernel (production), `None` for the
     /// sdpa_vector kernel (declares no slot 99).
     pub debug_mode: Option<AttnDebugMode>,
@@ -173,6 +180,7 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
             ConstantValue::float(ConstSlot(3), c.attn_scale.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
         ];
         if let Some(dm) = c.debug_mode {
             v.push(ConstantValue::uint(ConstSlot(99), dm.get()));

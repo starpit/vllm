@@ -37,6 +37,15 @@ constant uint  ATTN_NUM_KV_HEADS       [[function_constant(2)]];
 constant float ATTN_SCALE_FC           [[function_constant(3)]];
 constant uint  ATTN_BLOCK_SIZE         [[function_constant(4)]];
 constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
+// Reactive (chunked) KV pool: the `k_cache`/`v_cache` bindings are
+// per-layer chunk-address TABLES (device uint64 gpuAddresses), not the
+// cache buffers. A resolved physical block id derefs
+// `table[physical_block / BLOCKS_PER_CHUNK]` then addresses with
+// `physical_block % BLOCKS_PER_CHUNK`. See
+// `ferrite_fusion_synth::BLOCKS_PER_CHUNK`. (`attention_via_cache_v2_*`
+// reads constant slot 6 via `AttentionViaCacheConstants`;
+// `attention_prefill_sdpa_v2_paged_*` via `AttentionPrefillPagedConstants`.)
+constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
 
 // Cap on `seq_used_k[seq]` the shared-logits buffer can hold.
 // Each token uses 4 bytes; this cap × 4 == threadgroup memory bytes
@@ -100,8 +109,8 @@ kernel void attention_via_cache_v2_f16_specialized(
     device const half* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
     device const uint* seq_used_k  [[buffer(2)]],   // [batch]
     device const uint* block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const half* k_cache     [[buffer(4)]],
-    device const half* v_cache     [[buffer(5)]],
+    device const uint64_t* k_cache [[buffer(4)]],   // chunk-address table
+    device const uint64_t* v_cache [[buffer(5)]],   // chunk-address table
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -168,15 +177,31 @@ kernel void attention_via_cache_v2_f16_specialized(
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
         const uint token_in_block = i - logical_block * block_size;
+        // Chunked KV: deref the chunk backing this physical block.
+        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // compiler dead-eliminates the chunked branch — used by the
+        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
+        // base address and physical_block is the full offset (no modulo,
+        // no per-block chunk_table load). When non-zero the path matches
+        // the reactive chunked KV pool.
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
         device const half* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
+            (device const half*)k_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
         device const half* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
+            (device const half*)v_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
@@ -263,8 +288,8 @@ kernel void attention_via_cache_v2_bf16_specialized(
     device const bfloat* q           [[buffer(1)]],   // [batch, num_q_heads, head_dim]
     device const uint*   seq_used_k  [[buffer(2)]],   // [batch]
     device const uint*   block_table [[buffer(3)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const bfloat* k_cache     [[buffer(4)]],
-    device const bfloat* v_cache     [[buffer(5)]],
+    device const uint64_t* k_cache   [[buffer(4)]],   // chunk-address table
+    device const uint64_t* v_cache   [[buffer(5)]],   // chunk-address table
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -323,15 +348,31 @@ kernel void attention_via_cache_v2_bf16_specialized(
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
         const uint token_in_block = i - logical_block * block_size;
+        // Chunked KV: deref the chunk backing this physical block.
+        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // compiler dead-eliminates the chunked branch — used by the
+        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
+        // base address and physical_block is the full offset (no modulo,
+        // no per-block chunk_table load). When non-zero the path matches
+        // the reactive chunked KV pool.
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
         device const bfloat* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
+            (device const bfloat*)k_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
         device const bfloat* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
+            (device const bfloat*)v_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
@@ -451,8 +492,8 @@ kernel void attention_prefill_sdpa_v2_paged_f16_specialized(
     device const uint* cu_seqlens_q [[buffer(2)]],   // [batch+1]
     device const uint* seq_used_k   [[buffer(3)]],   // [batch]
     device const uint* block_table  [[buffer(4)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const half* k_cache      [[buffer(5)]],
-    device const half* v_cache      [[buffer(6)]],
+    device const uint64_t* k_cache  [[buffer(5)]],   // chunk-address table
+    device const uint64_t* v_cache  [[buffer(6)]],   // chunk-address table
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -551,15 +592,31 @@ kernel void attention_prefill_sdpa_v2_paged_f16_specialized(
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
         const uint token_in_block = i - logical_block * block_size;
+        // Chunked KV: deref the chunk backing this physical block.
+        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // compiler dead-eliminates the chunked branch — used by the
+        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
+        // base address and physical_block is the full offset (no modulo,
+        // no per-block chunk_table load). When non-zero the path matches
+        // the reactive chunked KV pool.
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
         device const half* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
+            (device const half*)k_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
         device const half* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
+            (device const half*)v_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
@@ -623,8 +680,8 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
     device const uint*   cu_seqlens_q [[buffer(2)]],   // [batch+1]
     device const uint*   seq_used_k   [[buffer(3)]],   // [batch]
     device const uint*   block_table  [[buffer(4)]],   // [batch, MAX_BLOCKS_PER_SEQ]
-    device const bfloat* k_cache      [[buffer(5)]],
-    device const bfloat* v_cache      [[buffer(6)]],
+    device const uint64_t* k_cache    [[buffer(5)]],   // chunk-address table
+    device const uint64_t* v_cache    [[buffer(6)]],   // chunk-address table
     uint3  tg_pos    [[threadgroup_position_in_grid]],
     uint3  tid       [[thread_position_in_threadgroup]],
     uint   simd_gid  [[simdgroup_index_in_threadgroup]],
@@ -707,15 +764,31 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
         const uint token_in_block = i - logical_block * block_size;
+        // Chunked KV: deref the chunk backing this physical block.
+        // ATTN_BLOCKS_PER_CHUNK is a function constant. When set to 0 the
+        // compiler dead-eliminates the chunked branch — used by the
+        // single-buffer-per-layer mode where `k_cache[0]` holds the layer
+        // base address and physical_block is the full offset (no modulo,
+        // no per-block chunk_table load). When non-zero the path matches
+        // the reactive chunked KV pool.
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
         device const bfloat* k_ptr =
-            k_cache
-            + physical_block * kv_blk_stride
+            (device const bfloat*)k_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;
         device const bfloat* v_ptr =
-            v_cache
-            + physical_block * kv_blk_stride
+            (device const bfloat*)v_cache[chunk]
+            + blk_in_chunk   * kv_blk_stride
             + kv_head_idx    * kv_head_stride
             + token_in_block * kv_tok_stride
             + simd_lid * qk_per_thread;

@@ -260,6 +260,12 @@ constant uint ROPE_NUM_Q_HEADS  [[function_constant(1)]];
 constant uint ROPE_NUM_KV_HEADS [[function_constant(2)]];
 constant uint ROPE_ROT_DIM      [[function_constant(3)]];
 constant uint ROPE_BLOCK_SIZE   [[function_constant(4)]];
+// Reactive (chunked) KV pool: buffers 6/7 are per-layer chunk-address
+// TABLES (device uint64 gpuAddresses), not the cache buffers. A
+// physical block id derefs `table[block_id / BLOCKS_PER_CHUNK]` then
+// addresses with `block_id % BLOCKS_PER_CHUNK`. See
+// `ferrite_fusion_synth::BLOCKS_PER_CHUNK`.
+constant uint ROPE_BLOCKS_PER_CHUNK [[function_constant(5)]];
 
 kernel void rope_append_f16_specialized(
     device       half* q_inout      [[buffer(0)]],
@@ -268,8 +274,8 @@ kernel void rope_append_f16_specialized(
     device const half* cos_sin      [[buffer(3)]],
     device const uint* positions    [[buffer(4)]],
     device const uint* slot_mapping [[buffer(5)]],
-    device       half* kv_cache_k   [[buffer(6)]],
-    device       half* kv_cache_v   [[buffer(7)]],
+    device const uint64_t* kv_cache_k [[buffer(6)]],
+    device const uint64_t* kv_cache_v [[buffer(7)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -335,12 +341,16 @@ kernel void rope_append_f16_specialized(
     const uint kv_blk_stride  = num_kv * block_sz * head_dim;
     const uint kv_head_stride = block_sz * head_dim;
     const uint kv_tok_stride  = head_dim;
-    device half* k_dst = kv_cache_k
-        + block_id     * kv_blk_stride
+    // Chunked KV: deref the chunk that backs this physical block, then
+    // address with the block index WITHIN that chunk.
+    const uint chunk        = block_id / ROPE_BLOCKS_PER_CHUNK;
+    const uint blk_in_chunk = block_id % ROPE_BLOCKS_PER_CHUNK;
+    device half* k_dst = (device half*)kv_cache_k[chunk]
+        + blk_in_chunk * kv_blk_stride
         + kv_head      * kv_head_stride
         + block_offset * kv_tok_stride;
-    device half* v_dst = kv_cache_v
-        + block_id     * kv_blk_stride
+    device half* v_dst = (device half*)kv_cache_v[chunk]
+        + blk_in_chunk * kv_blk_stride
         + kv_head      * kv_head_stride
         + block_offset * kv_tok_stride;
 
@@ -363,8 +373,8 @@ kernel void rope_append_bf16_specialized(
     device const bfloat* cos_sin      [[buffer(3)]],
     device const uint*   positions    [[buffer(4)]],
     device const uint*   slot_mapping [[buffer(5)]],
-    device       bfloat* kv_cache_k   [[buffer(6)]],
-    device       bfloat* kv_cache_v   [[buffer(7)]],
+    device const uint64_t* kv_cache_k [[buffer(6)]],
+    device const uint64_t* kv_cache_v [[buffer(7)]],
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint3 tid    [[thread_position_in_threadgroup]])
 {
@@ -422,12 +432,16 @@ kernel void rope_append_bf16_specialized(
     const uint kv_blk_stride  = num_kv * block_sz * head_dim;
     const uint kv_head_stride = block_sz * head_dim;
     const uint kv_tok_stride  = head_dim;
-    device bfloat* k_dst = kv_cache_k
-        + block_id     * kv_blk_stride
+    // Chunked KV: deref the chunk that backs this physical block, then
+    // address with the block index WITHIN that chunk.
+    const uint chunk        = block_id / ROPE_BLOCKS_PER_CHUNK;
+    const uint blk_in_chunk = block_id % ROPE_BLOCKS_PER_CHUNK;
+    device bfloat* k_dst = (device bfloat*)kv_cache_k[chunk]
+        + blk_in_chunk * kv_blk_stride
         + kv_head      * kv_head_stride
         + block_offset * kv_tok_stride;
-    device bfloat* v_dst = kv_cache_v
-        + block_id     * kv_blk_stride
+    device bfloat* v_dst = (device bfloat*)kv_cache_v[chunk]
+        + blk_in_chunk * kv_blk_stride
         + kv_head      * kv_head_stride
         + block_offset * kv_tok_stride;
 

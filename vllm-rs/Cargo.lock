@@ -2022,6 +2022,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ferrite-cuda-core",
+ "ferrite-fusion-synth",
  "ferrite-kernels",
  "ferrite-metal-kernels",
  "ferrite-vision",

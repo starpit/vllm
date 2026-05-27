@@ -1606,6 +1606,21 @@ pub struct FerriteWorker {
     draft_queue: Option<
         ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLCommandQueue>>,
     >,
+    /// One `StorageModePrivate` MTLBuffer per (layer, K/V) for the target
+    /// KV pool — `layer * 2 + kv_idx` indexing. The pool's logical chunks
+    /// are byte offsets within these buffers; Apple's pager handles lazy
+    /// physical commit on first GPU access. Always populated on the metal
+    /// path (the alternative — one MTLBuffer per chunk — exposed too many
+    /// distinct VA ranges to the GPU's UAT, costing ~5% per decode
+    /// forward via the kernel's `chunk_table[chunk]` device load).
+    #[cfg(feature = "metal")]
+    target_kv_single_buffers: Vec<ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer>,
+    /// Same as `target_kv_single_buffers` for the draft pool. Required so
+    /// the `AttentionViaCache` pipeline's `chunk_table[0]` always points
+    /// at the layer base — both target's and draft's pipelines see the
+    /// same kernel function constants (set process-wide by lowering).
+    #[cfg(feature = "metal")]
+    draft_kv_single_buffers: Vec<ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer>,
 }
 
 // Safety: FerriteWorker contains raw GPU pointers (via GpuDevice, model weights,
@@ -7182,6 +7197,8 @@ impl FerriteWorker {
             argmax_kernels: None,
             chain_advance_kernel: None,
             draft_queue: None,
+            target_kv_single_buffers: Vec::new(),
+            draft_kv_single_buffers: Vec::new(),
         }
     }
 
@@ -7345,6 +7362,79 @@ impl FerriteWorker {
     /// target-pool path: StorageModePrivate buffers pinned into the
     /// allocator's shared residency set so attention reads don't race
     /// the Apple pager.
+    /// Reactive KV (2b): grow the chunked target pool so every block id
+    /// `<= max_block` is backed by a resident chunk before a forward
+    /// derefs the chunk-address table. Allocates missing chunks as
+    /// StorageModePrivate (residency-inserted) and commits the residency
+    /// set once if anything grew. No-op for non-chunked pools.
+    fn grow_metal_kv_to_cover(&mut self, max_block: usize) {
+        let Some(device) = self.gpu_device.as_ref() else {
+            return;
+        };
+        let _ = device;
+        let n_slots = self
+            .kv_cache
+            .as_ref()
+            .map(|kv| kv.num_layers * 2)
+            .unwrap_or(0);
+        if n_slots == 0 {
+            return;
+        }
+        let single_buf_ref = &mut self.target_kv_single_buffers;
+        let Some(kv) = self.kv_cache.as_mut() else {
+            return;
+        };
+        let alloc_chunk_counter = std::cell::Cell::new(0usize);
+        let _ = kv.grow_to_cover(
+            max_block,
+            |bytes| {
+                let c = alloc_chunk_counter.get();
+                alloc_chunk_counter.set(c + 1);
+                let slot = c % n_slots;
+                let layer = &mut single_buf_ref[slot];
+                let chunk_idx = layer.committed_chunks();
+                layer
+                    .commit_through(chunk_idx + 1)
+                    .map_err(|e| anyhow::anyhow!("KV grow slot={slot} chunk={chunk_idx}: {e}"))?;
+                Ok(RawGpuMem::from_buffer_with_offset(
+                    layer.buffer_clone(),
+                    chunk_idx * layer.chunk_bytes(),
+                    bytes,
+                ))
+            },
+            |m| m.gpu_address(),
+        );
+        // No residency.commit needed: the per-layer buffer was inserted +
+        // committed at init, and growth just bumps the bookkeeping counter
+        // and writes the new entry into the chunk-address table.
+    }
+
+    /// Reactive KV (2c): when the batch is fully idle (no live blocks), drop
+    /// the per-layer commit-counter back to 1 chunk. The `RawGpuMem` chunk
+    /// handles are clones of the layer buffer; dropping them does NOT free
+    /// memory. Apple's pager evicts physical pages for untouched offsets
+    /// under memory pressure. Only call when `input_batch.num_active() == 0`
+    /// so no in-flight forward references a dropped chunk index.
+    fn shrink_metal_kv_idle(&mut self) {
+        let freed = match self.kv_cache.as_mut() {
+            Some(kv) => kv.shrink_to_chunks(1),
+            None => return,
+        };
+        if freed.is_empty() {
+            return;
+        }
+        for layer in self.target_kv_single_buffers.iter_mut() {
+            let _ = layer.shrink_to(1);
+        }
+        let n = freed.len();
+        drop(freed);
+        info!(
+            "FerriteWorker(metal): reactive KV shrink — {} chunk handles dropped on {} layers",
+            n,
+            self.target_kv_single_buffers.len()
+        );
+    }
+
     fn initialize_draft_cache_metal(&mut self, num_gpu_blocks: usize) -> ExecutorResult<()> {
         let model = self.draft_model.as_ref().ok_or_else(|| {
             ExecutorError::WorkerInit(
@@ -7380,20 +7470,86 @@ impl FerriteWorker {
         let mtl_device = device.device.clone();
         let residency = device.allocator.residency().clone();
 
+        // The `attention_via_cache_v2_*` kernel's BPC=0 fast path has an
+        // unresolved interaction with the draft K-step chain on 3B-class+
+        // models (out-of-vocab token IDs from the draft proposer). The
+        // chunked-addressing path produces coherent output. Force it now
+        // — single-buffer backing still applies; only the kernel's per-
+        // block addressing differs.
+        ferrite_forward::interpreter::metal::lowering::force_chunked_attention_addressing();
+        info!(
+            "FerriteWorker(metal): draft model loaded — engaging chunked attention \
+             addressing (BPC=0 fast path off for spec-decode safety)"
+        );
+
         let t_pool = std::time::Instant::now();
+        let blocks_per_chunk = ferrite_forward::interpreter::metal::BLOCKS_PER_CHUNK as usize;
+        let num_layers_draft = model.num_hidden_layers() as usize;
+        let num_chunks_total_draft = draft_blocks.div_ceil(blocks_per_chunk);
+        let per_block_elems_draft = (model.num_key_value_heads() as usize)
+            * self.config.block_size
+            * (model.head_dim() as usize);
+        let chunk_bytes_logical_draft =
+            blocks_per_chunk * per_block_elems_draft * cache_dtype.size_bytes();
+
+        let mut draft_single_buf_layers: Vec<
+            ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer,
+        > = Vec::with_capacity(num_layers_draft * 2);
+        for _ in 0..(num_layers_draft * 2) {
+            let layer = ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer::new(
+                &mtl_device,
+                chunk_bytes_logical_draft,
+                num_chunks_total_draft,
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("draft SingleBufferKvLayer: {e}")))?;
+            residency.insert(layer.buffer());
+            draft_single_buf_layers.push(layer);
+        }
+        info!(
+            "FerriteWorker(metal): draft KV layer buffers — {} buffers",
+            draft_single_buf_layers.len()
+        );
+
         let pool = unsafe {
-            KvCachePool::new(
-                model.num_hidden_layers() as usize,
+            // Layer-major iteration: outer for layer, inner for chunk.
+            // Draft uses `initial_chunks = num_chunks_total` (eager: the
+            // spec-decode draft forward path has no growth hook). The slot
+            // formula `(c / (2 * chunks_per_layer)) * 2 + c % 2` matches
+            // the call sequence L0_K_c0, L0_V_c0, L0_K_c1, L0_V_c1, ...
+            let alloc_chunk_counter = std::cell::Cell::new(0usize);
+            let draft_single_ref = &mut draft_single_buf_layers;
+            let chunks_per_layer = num_chunks_total_draft;
+            KvCachePool::new_metal_chunked(
+                num_layers_draft,
                 draft_blocks,
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
                 cache_dtype,
+                blocks_per_chunk,
+                usize::MAX,
+                |bytes| {
+                    let c = alloc_chunk_counter.get();
+                    alloc_chunk_counter.set(c + 1);
+                    let kv = c % 2;
+                    let layer_idx = c / (2 * chunks_per_layer);
+                    let slot = layer_idx * 2 + kv;
+                    let layer = &mut draft_single_ref[slot];
+                    let chunk_idx = layer.committed_chunks();
+                    layer.commit_through(chunk_idx + 1).map_err(|e| {
+                        anyhow::anyhow!("draft KV commit slot={slot} chunk={chunk_idx}: {e}")
+                    })?;
+                    Ok(RawGpuMem::from_buffer_with_offset(
+                        layer.buffer_clone(),
+                        chunk_idx * layer.chunk_bytes(),
+                        bytes,
+                    ))
+                },
                 |bytes| {
                     let buffer = mtl_device
                         .newBufferWithLength_options(
                             bytes,
-                            ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                            ::objc2_metal::MTLResourceOptions::StorageModeShared,
                         )
                         .expect("newBufferWithLength_options returned nil");
                     residency.insert(&buffer);
@@ -7402,13 +7558,16 @@ impl FerriteWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("draft KvCachePool: {e}")))?;
+        self.draft_kv_single_buffers = draft_single_buf_layers;
+        pool.fill_chunk_tables(|m| m.gpu_address());
         info!(
             "FerriteWorker(metal): draft KV pool ready in {:?} ({} layers × {} blocks × {} tokens, \
-             1:1 mirror of target's {} blocks)",
+             {} blocks/chunk, 1:1 mirror of target's {} blocks)",
             t_pool.elapsed(),
             model.num_hidden_layers(),
             draft_blocks,
             self.config.block_size,
+            blocks_per_chunk,
             num_gpu_blocks,
         );
         self.draft_kv_cache = Some(pool);
@@ -8408,24 +8567,91 @@ impl Worker for FerriteWorker {
         let residency = device.allocator.residency().clone();
 
         let t_pool = std::time::Instant::now();
+        // Reactive (chunked) KV pool with single-buffer-per-layer backing:
+        // one `StorageModePrivate` MTLBuffer per `(layer, K/V)` sized to
+        // span all possible chunks; "chunks" are byte offsets within it.
+        // Apple's pager handles lazy physical commit on first GPU access,
+        // so the floor RSS stays tied to the touched-chunk count rather
+        // than the VA reservation. See `single_buffer_kv.rs` for the
+        // rationale and `attention.metal`'s `ATTN_BLOCKS_PER_CHUNK==0`
+        // branch for the kernel-side direct-addressing fast path that
+        // matches this layout.
+        let blocks_per_chunk = ferrite_forward::interpreter::metal::BLOCKS_PER_CHUNK as usize;
+        let num_layers_for_pool = model.num_hidden_layers() as usize;
+        let num_chunks_total = num_gpu_blocks.div_ceil(blocks_per_chunk);
+        let per_block_elems = (model.num_key_value_heads() as usize)
+            * self.config.block_size
+            * (model.head_dim() as usize);
+        let elem_bytes = cache_dtype.size_bytes();
+        let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
+
+        let mut single_buf_layers: Vec<
+            ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer,
+        > = Vec::with_capacity(num_layers_for_pool * 2);
+        for _ in 0..(num_layers_for_pool * 2) {
+            let layer = ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer::new(
+                &mtl_device,
+                chunk_bytes_logical,
+                num_chunks_total,
+            )
+            .map_err(|e| ExecutorError::WorkerInit(format!("SingleBufferKvLayer: {e}")))?;
+            residency.insert(layer.buffer());
+            single_buf_layers.push(layer);
+        }
+        let mb_per_layer = (chunk_bytes_logical * num_chunks_total) as f64 / (1024.0 * 1024.0);
+        info!(
+            "FerriteWorker(metal): KV layer buffers — {} buffers \
+             ({} chunks × {} bytes each, {:.0} MiB VA per layer, lazy via Apple pager)",
+            single_buf_layers.len(),
+            num_chunks_total,
+            chunk_bytes_logical,
+            mb_per_layer,
+        );
+
         let pool = unsafe {
-            KvCachePool::new(
-                model.num_hidden_layers() as usize,
+            // Closure-shared call counter — selects which layer buffer this
+            // `alloc_chunk` call belongs to via `counter % (2*num_layers)`.
+            // Works for both init (`initial_chunks=1` → exactly `2*num_layers`
+            // calls, one per slot) and grow (each grow step issues
+            // `2*num_layers` calls in slot order, repeated per added chunk).
+            let alloc_chunk_counter = std::cell::Cell::new(0usize);
+            let single_buf_ref = &mut single_buf_layers;
+            let n_slots = num_layers_for_pool * 2;
+            KvCachePool::new_metal_chunked(
+                num_layers_for_pool,
                 num_gpu_blocks,
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
                 cache_dtype,
+                blocks_per_chunk,
+                // Reactive: 1 chunk up front; the rest grow on demand via
+                // `grow_metal_kv_to_cover` (called from execute_model each
+                // step before the forward).
+                1,
                 |bytes| {
-                    // KV cache is GPU-only (no CPU touches between
-                    // forwards). StorageModePrivate avoids the
-                    // unified-memory first-touch cost that
-                    // StorageModeShared pays on each fresh cmdbuf
-                    // (~3s/forward observed at TinyLlama).
+                    let c = alloc_chunk_counter.get();
+                    alloc_chunk_counter.set(c + 1);
+                    let slot = c % n_slots;
+                    let layer = &mut single_buf_ref[slot];
+                    let chunk_idx = layer.committed_chunks();
+                    layer.commit_through(chunk_idx + 1).map_err(|e| {
+                        anyhow::anyhow!("KV chunk commit slot={slot} chunk={chunk_idx}: {e}")
+                    })?;
+                    Ok(RawGpuMem::from_buffer_with_offset(
+                        layer.buffer_clone(),
+                        chunk_idx * layer.chunk_bytes(),
+                        bytes,
+                    ))
+                },
+                // Chunk-address table: `StorageModeShared` so the CPU can
+                // write the chunk gpuAddresses (`fill_chunk_tables` below).
+                // Tiny — 8 bytes/chunk — so a regular allocation is fine.
+                |bytes| {
                     let buffer = mtl_device
                         .newBufferWithLength_options(
                             bytes,
-                            ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                            ::objc2_metal::MTLResourceOptions::StorageModeShared,
                         )
                         .expect("newBufferWithLength_options returned nil");
                     residency.insert(&buffer);
@@ -8434,8 +8660,22 @@ impl Worker for FerriteWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
+        self.target_kv_single_buffers = single_buf_layers;
+        // Commit the residency set NOW (before reading gpuAddresses):
+        // the chunk buffers are referenced only by raw address from the
+        // tables, so they must be resident, and we read each chunk's
+        // gpuAddress *after* commit to be sure the VA is finalized.
+        // (The pool's lazy commit at first forward re-commits + attaches
+        // — idempotent.)
+        residency.commit();
+        // Populate each per-layer chunk-address table with its chunks'
+        // GPU virtual addresses. `m.gpu_address()` handles BOTH the
+        // dense path (returns buffer.gpuAddress()) AND the sparse path
+        // (returns sparse_base + metal_offset).
+        pool.fill_chunk_tables(|m| m.gpu_address());
         info!(
-            "FerriteWorker(metal): init_cache phases — KvCachePool::new(56 buffers) {:?} (residency.commit deferred to first forward)",
+            "FerriteWorker(metal): init_cache phases — KvCachePool::new_metal_chunked({} blocks/chunk) {:?} (residency.commit deferred to first forward)",
+            blocks_per_chunk,
             t_pool.elapsed(),
         );
         // Attach the shared residency set to the device's queue so
@@ -8665,6 +8905,10 @@ impl Worker for FerriteWorker {
         }
 
         if self.input_batch.num_active() == 0 {
+            // Reactive KV (2c): batch fully idle → no live blocks, so
+            // release all grown chunks back to the OS (keep chunk 0).
+            #[cfg(feature = "metal")]
+            self.shrink_metal_kv_idle();
             return Ok(ModelRunnerOutput::empty());
         }
 
@@ -8681,6 +8925,24 @@ impl Worker for FerriteWorker {
         let num_tokens = attn.total_tokens;
         let num_reqs = attn.num_reqs;
         let block_size = self.config.block_size;
+
+        // Reactive KV (2b): grow the chunked pool to back every block
+        // this step touches (max over all per-seq block tables) before
+        // the forward dereferences the chunk-address table bindlessly.
+        // On metal-chunked pools this allocates chunks on demand; no-op
+        // on cuda / single-buffer. Compute the max into a local so no
+        // borrow of `attn` is held across the `&mut self` grow call.
+        #[cfg(feature = "metal")]
+        {
+            let max_block = attn
+                .block_ids
+                .iter()
+                .flat_map(|b| b.iter())
+                .copied()
+                .max()
+                .unwrap_or(0);
+            self.grow_metal_kv_to_cover(max_block);
+        }
 
         // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)
         // u32 under metal — the macro-emitted forward reads this as

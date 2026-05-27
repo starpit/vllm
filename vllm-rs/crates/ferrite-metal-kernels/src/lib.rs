@@ -41,6 +41,7 @@ pub mod quantized;
 pub mod residency;
 pub mod rope;
 pub mod shader_cache;
+pub mod single_buffer_kv;
 pub mod slice_trailing_cols;
 pub mod softmax;
 pub mod specialized_pipeline_cache;

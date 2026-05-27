@@ -374,6 +374,13 @@ constant constexpr uint  NUM_KV     = {num_kv_lit}u;
 constant constexpr uint  HEAD_DIM   = {head_dim_lit}u;
 constant constexpr uint  ROT_DIM    = {rot_dim_lit}u;
 constant constexpr uint  BLOCK_SIZE = {block_size_lit}u;
+// Reactive (chunked) KV pool granularity — see
+// `ferrite_fusion_synth::BLOCKS_PER_CHUNK`. The KV bindings (buffers
+// 16/17) are chunk-address TABLES (device uint64 gpuAddresses), not
+// the cache buffers directly; the RopeAppend atom derefs
+// `table[block_id / BLOCKS_PER_CHUNK]` and addresses with
+// `block_id % BLOCKS_PER_CHUNK`.
+constant constexpr uint  BLOCKS_PER_CHUNK = {blocks_per_chunk_lit}u;
 constant constexpr float EPS        = {eps_lit}f;
 // `M` (active token count up to bucket capacity) stays a
 // function constant — varies per dispatch bucket.
@@ -400,8 +407,8 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
     device const {t_act}*   {cos_sin_buf}    [[buffer(13)]],
     device const uint*      {positions_buf}  [[buffer(14)]],
     device const uint*      {slot_map_buf}   [[buffer(15)]],
-    device       {t_act}*   {kv_cache_k}     [[buffer(16)]],
-    device       {t_act}*   {kv_cache_v}     [[buffer(17)]],
+    device const uint64_t*  {kv_cache_k}     [[buffer(16)]],
+    device const uint64_t*  {kv_cache_v}     [[buffer(17)]],
 {maybe_bias_params}    device       {t_act}*   {residual_out}   [[buffer(21)]],
     uint3 __tg_pos    [[threadgroup_position_in_grid]],
     uint3 __tid_pos   [[thread_position_in_threadgroup]],
@@ -470,6 +477,7 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         head_dim_lit = consts.head_dim,
         rot_dim_lit = consts.rot_dim,
         block_size_lit = consts.block_size,
+        blocks_per_chunk_lit = crate::BLOCKS_PER_CHUNK,
         eps_lit = format_msl_float(consts.rms_norm_eps),
     );
 

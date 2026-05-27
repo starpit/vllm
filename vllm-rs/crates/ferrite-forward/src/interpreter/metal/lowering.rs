@@ -1129,6 +1129,137 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── NVFP4 int4 matmul (decode qmv / prefill qmm_t) ────────
+        //
+        // Mirrors the `AffineQmm` arm but with the NVFP4 kernels (E2M1
+        // decode, no per-group bias, gs=16). First cut routes only to
+        // the generic `nvfp4_qmv` (decode) and standard `nvfp4_qmm_t`
+        // (prefill) — the fast/quad/nax/splitk perf variants are a
+        // Phase-2 follow-on. Bindings are 4-buffer (no biases) via
+        // `nvfp4_qmm_bindings`.
+        I::Nvfp4Qmm(in_slot, out_slot, layer, n, k, group_size, _bits, vector_limit) => {
+            let dtype = dequant_dtype_for::<W>();
+            let n_v = *n;
+            let k_v = *k;
+            let gs = *group_size;
+            let vl = *vector_limit;
+            let locator = WeightLocator {
+                bucket: tape_index,
+                op_idx: index as u32,
+                slot: 0,
+            };
+            debug_assert_eq!(gs, 16, "NVFP4 group_size is always 16");
+
+            if bucket_m < vl {
+                // Decode matvec — generic qmv only (first cut).
+                let kernel = QmvKernel::Generic;
+                let (tg, tpg) = qmv_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                LoweredCommand {
+                    kernel: KernelId::Nvfp4Qmv,
+                    library: "quantized_qmv",
+                    function: nvfp4_qmv_name(dtype),
+                    constants: super::kernel_constants::AffineQmvConstants {
+                        k: super::ids::KDimI32(k_v as i32),
+                        n: super::ids::NDimI32(n_v as i32),
+                    }
+                    .into(),
+                    dispatch: DispatchShape {
+                        threadgroups: tg,
+                        threads_per_threadgroup: tpg,
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            axis: super::lowered::MScaleAxis::X,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                            seq_axis: None,
+                        }),
+                    },
+                    bindings: nvfp4_qmm_bindings(
+                        *in_slot,
+                        *out_slot,
+                        super::ids::LayerId(*layer + layer_offset),
+                        locator,
+                    ),
+                    gemm_dims: None,
+                }
+            } else {
+                // Prefill matmul. NAX (Apple9 / M4+) when the chip is
+                // NAX-capable and K % 64 == 0 (NAX tile BK=64); else the
+                // standard 32×32 qmm_t. NAX is the prefill perf path; the
+                // standard kernel is the non-NAX-hardware / K%64≠0 fallback.
+                // `FERRITE_DISABLE_NAX` forces the standard path (kill-switch
+                // + A/B toggle), mirroring the affine arm.
+                let is_nax = profile.is_some_and(|p| {
+                    ferrite_metal_kernels::ferrite_metal_targets::is_nax_capable(p.generation)
+                }) && std::env::var_os("FERRITE_DISABLE_NAX").is_none()
+                    && k_v.is_multiple_of(64);
+                if is_nax {
+                    // NAX tile is 64×64 → N alignment check uses 64.
+                    let aligned_n = n_v.is_multiple_of(64);
+                    let (tg, tpg) =
+                        qmm_t_dispatch_shape(QmmTKernel::Nax, bucket_m, n_v, /*B=*/ 1);
+                    LoweredCommand {
+                        kernel: KernelId::Nvfp4QmmTNax,
+                        library: "quantized_qmm_nax",
+                        function: nvfp4_qmm_t_nax_name(dtype, aligned_n),
+                        constants: super::kernel_constants::AffineQmmTConstants {
+                            k: super::ids::KDimI32(k_v as i32),
+                            n: super::ids::NDimI32(n_v as i32),
+                            m: super::ids::MDimI32(bucket_m as i32),
+                        }
+                        .into(),
+                        dispatch: DispatchShape {
+                            threadgroups: tg,
+                            threads_per_threadgroup: tpg,
+                            // qmm_t NAX grid = (n_tiles, m_tiles=ceil(M/64), B)
+                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                axis: super::lowered::MScaleAxis::Y,
+                                bucket_m: super::ids::BucketM(bucket_m),
+                                seq_axis: None,
+                            }),
+                        },
+                        bindings: nvfp4_qmm_bindings(
+                            *in_slot,
+                            *out_slot,
+                            super::ids::LayerId(*layer + layer_offset),
+                            locator,
+                        ),
+                        gemm_dims: None,
+                    }
+                } else {
+                    // Standard 32×32 qmm_t fallback. N alignment uses 32.
+                    let kernel = QmmTKernel::Standard;
+                    let aligned_n = n_v.is_multiple_of(32);
+                    let (tg, tpg) = qmm_t_dispatch_shape(kernel, bucket_m, n_v, /*B=*/ 1);
+                    LoweredCommand {
+                        kernel: KernelId::Nvfp4QmmT,
+                        library: "quantized_qmm",
+                        function: nvfp4_qmm_t_name(dtype, aligned_n),
+                        constants: super::kernel_constants::AffineQmmTConstants {
+                            k: super::ids::KDimI32(k_v as i32),
+                            n: super::ids::NDimI32(n_v as i32),
+                            m: super::ids::MDimI32(bucket_m as i32),
+                        }
+                        .into(),
+                        dispatch: DispatchShape {
+                            threadgroups: tg,
+                            threads_per_threadgroup: tpg,
+                            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                                axis: super::lowered::MScaleAxis::Y,
+                                bucket_m: super::ids::BucketM(bucket_m),
+                                seq_axis: None,
+                            }),
+                        },
+                        bindings: nvfp4_qmm_bindings(
+                            *in_slot,
+                            *out_slot,
+                            super::ids::LayerId(*layer + layer_offset),
+                            locator,
+                        ),
+                        gemm_dims: None,
+                    }
+                }
+            }
+        }
+
         // ── Fused silu(gate) * up for the decomposed q-MLP path ───
         //
         // C4 will start emitting `(AffineQmm gate, AffineQmm up,
@@ -2640,6 +2771,92 @@ fn scale_dtype_for<W: CanonicalParams>() -> ScaleDtype {
 /// order: (packed weight, scales, biases, x in, y out). Worker
 /// resolves the `Affine*` `WeightTensor` arms via
 /// `LinearLayer::AffineQuant` (`worker.rs:1414`).
+/// MSL symbol for the generic NVFP4 decode-matvec kernel. Scales are
+/// always folded to F16 at load (`Nvfp4Linear::load`) and group_size is
+/// always 16, so only the activation dtype varies. Must match the
+/// instantiations in `quantized_qmv.metal`.
+fn nvfp4_qmv_name(act: DequantDtype) -> &'static str {
+    match act {
+        DequantDtype::Bf16 => "nvfp4_qmv_bf16_s_f16_gs_16_b_4_batch_0",
+        DequantDtype::F16 => "nvfp4_qmv_f16_s_f16_gs_16_b_4_batch_0",
+    }
+}
+
+/// MSL symbol for the standard NVFP4 prefill matmul kernel. Must match
+/// the instantiations in `quantized_qmm.metal`.
+fn nvfp4_qmm_t_name(act: DequantDtype, aligned_n: bool) -> &'static str {
+    match (act, aligned_n) {
+        (DequantDtype::Bf16, true) => "nvfp4_qmm_t_bf16_s_f16_gs_16_b_4_alN_true_batch_0",
+        (DequantDtype::Bf16, false) => "nvfp4_qmm_t_bf16_s_f16_gs_16_b_4_alN_false_batch_0",
+        (DequantDtype::F16, true) => "nvfp4_qmm_t_f16_s_f16_gs_16_b_4_alN_true_batch_0",
+        (DequantDtype::F16, false) => "nvfp4_qmm_t_f16_s_f16_gs_16_b_4_alN_false_batch_0",
+    }
+}
+
+/// MSL symbol for the NAX (M4+) NVFP4 prefill matmul kernel. Must match
+/// the instantiations in `quantized_qmm_nax.metal`. `aligned_n` keys off
+/// `N % 64 == 0` (NAX tile BN=64), vs `N % 32` for the standard kernel.
+fn nvfp4_qmm_t_nax_name(act: DequantDtype, aligned_n: bool) -> &'static str {
+    match (act, aligned_n) {
+        (DequantDtype::Bf16, true) => "nvfp4_qmm_t_nax_bf16_s_f16_gs_16_b_4_alN_true_batch_0",
+        (DequantDtype::Bf16, false) => "nvfp4_qmm_t_nax_bf16_s_f16_gs_16_b_4_alN_false_batch_0",
+        (DequantDtype::F16, true) => "nvfp4_qmm_t_nax_f16_s_f16_gs_16_b_4_alN_true_batch_0",
+        (DequantDtype::F16, false) => "nvfp4_qmm_t_nax_f16_s_f16_gs_16_b_4_alN_false_batch_0",
+    }
+}
+
+/// Buffer bindings for an NVFP4 qmv / qmm_t dispatch. Four buffers —
+/// `weight[0]`, folded `scales[1]`, activation `x[2]`, output `y[3]`.
+/// NVFP4 has no per-group bias, so (unlike `affine_qmm_bindings`) there
+/// is no biases buffer and the activation/output indices shift down by
+/// one. The nvfp4 shaders in `quantized_qmv.metal` / `quantized_qmm.metal`
+/// declare exactly this layout.
+fn nvfp4_qmm_bindings(
+    in_slot: u32,
+    out_slot: u32,
+    layer: super::ids::LayerId,
+    locator: super::lowered::WeightLocator,
+) -> Vec<Binding> {
+    vec![
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer,
+            which: WeightTensor::Weight,
+            layer,
+            locator,
+            binding_index: 0,
+        },
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer,
+            which: WeightTensor::Nvfp4Scales,
+            layer,
+            locator,
+            binding_index: 1,
+        },
+        // Dummy `biases` at index 2 = the same scales buffer. NVFP4 has
+        // no per-group bias, but the 5-buffer layout MUST match affine's
+        // (w,scales,biases,x,y): MTL4 mis-dispatches the 4-buffer
+        // (x@2,y@3) layout — the kernel reads garbage for x/y under the
+        // MTL4 argument table even though the identical math is correct
+        // under MTL3 (unit test) and affine (5-buffer) is coherent under
+        // MTL4. Binding x@3/y@4 (matching affine) fixes it.
+        Binding::Weight {
+            kind: WeightBundleKind::LinearLayer,
+            which: WeightTensor::Nvfp4Scales,
+            layer,
+            locator,
+            binding_index: 2,
+        },
+        Binding::ArenaSlot {
+            slot: in_slot,
+            binding_index: 3,
+        },
+        Binding::ArenaSlot {
+            slot: out_slot,
+            binding_index: 4,
+        },
+    ]
+}
+
 fn affine_qmm_bindings(
     in_slot: u32,
     out_slot: u32,

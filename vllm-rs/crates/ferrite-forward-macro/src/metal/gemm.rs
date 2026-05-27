@@ -78,9 +78,13 @@ impl Implementation for MetalGemmImpl {
             return None;
         }
         // MLX-affine int4 weights are claimed by `MetalAffineQmmImpl`
-        // (forward-time qmv/qmm_t dispatch). MetalGemmImpl serves the
-        // Dense path only — bail on Affine so the affine impl wins.
-        if matches!(weight_storage_of(node), Some(StorageFormat::Affine { .. })) {
+        // and NVFP4 weights by `MetalNvfp4QmmImpl` (forward-time
+        // qmv/qmm_t dispatch). MetalGemmImpl serves the Dense path only —
+        // bail on either quantized storage so the quant impl wins.
+        if matches!(
+            weight_storage_of(node),
+            Some(StorageFormat::Affine { .. } | StorageFormat::Nvfp4 { .. })
+        ) {
             return None;
         }
 

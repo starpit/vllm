@@ -470,12 +470,17 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
         };
 
         for preset_name in &presets {
-            // Metal: only `mlx-affine-*` variants reach the solver as
-            // Dense (codegen dequantizes at load time). Every other
-            // preset routes through CUDA-only Impls (Marlin / Bnb4 /
-            // Fp8 / Ggml) that the metal impl pool has no claimants
-            // for, so the solver would explode with `UnclaimedTile`.
-            if cfg!(feature = "metal") && !preset_name.starts_with("mlx-affine-") {
+            // Metal: `mlx-affine-*` variants reach the solver as Dense
+            // (codegen dequantizes at load time), and `nvfp4` reaches it
+            // as a genuine metal quant claimed by `MetalNvfp4QmmImpl`
+            // (forward-time E2M1 dequant-on-read qmv/qmm_t). Every other
+            // preset routes through CUDA-only Impls (Marlin / Bnb4 / Fp8
+            // / Ggml) that the metal impl pool has no claimants for, so
+            // the solver would explode with `UnclaimedTile`.
+            if cfg!(feature = "metal")
+                && !preset_name.starts_with("mlx-affine-")
+                && preset_name != "nvfp4"
+            {
                 continue;
             }
             // CUDA: the mirror — `mlx-affine-*` weights are an Apple
@@ -525,6 +530,7 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
                 || matches!(
                     m.quantization.as_ref().map(|qc| &qc.method),
                     Some(crate::quantization::QuantMethod::Affine { .. })
+                        | Some(crate::quantization::QuantMethod::Nvfp4 { .. })
                 )
         });
     }

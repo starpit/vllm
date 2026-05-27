@@ -192,6 +192,22 @@ enum FieldLoad {
         group_size: u32,
         bits: u32,
     },
+    /// NVFP4 int4 quantized linear (Metal-only), single source. Emits
+    /// `LinearLayer::load_nvfp4_quant` (forward-time `nvfp4_qmv` /
+    /// `nvfp4_qmm_t`). `group_size` from `quantization_config` (16);
+    /// bits is always 4.
+    LinearNvfp4 { prefix: String, group_size: u32 },
+    /// Fused-concat NVFP4 int4 quantized linear (Metal-only). `qkv_proj`
+    /// / `gate_up_proj` ship as separate NVFP4 triples in ModelOpt
+    /// checkpoints; the forward DSL fuses them. Emits
+    /// `LinearLayer::load_nvfp4_quant_concat` (per-prefix fold, byte-
+    /// concat packed weight + folded scales along dim 0). Concat is
+    /// valid because each projection's global scale is folded into its
+    /// per-group F16 scales before concatenation.
+    LinearNvfp4Concat {
+        prefixes: Vec<String>,
+        group_size: u32,
+    },
     /// `LinearLayer::load_raw(gw, key)` — reads `<key>` verbatim
     /// (no `.weight` / `.bias` suffix). Used for `nn.Parameter` weights
     /// (e.g. Gemma3 MM projector's `mm_input_projection_weight`) declared
@@ -1189,6 +1205,50 @@ fn plan_field_load(
             };
         }
 
+        // NVFP4 int4 storage: every source weight resolves to
+        // `StorageFormat::Nvfp4`. Single-source → LinearNvfp4; fused
+        // (qkv_proj / gate_up_proj) → LinearNvfp4Concat. Mixed Nvfp4 /
+        // non-Nvfp4 fuse is an upstream manifest authoring error and
+        // panics at compile time.
+        let mut nvfp4_gs: Option<u32> = None;
+        let mut any_non_nvfp4 = false;
+        for (wid, _idx) in &accessor.source_weights {
+            match crate::quantization::storage_format_for_weight(program, fuf, *wid, model) {
+                crate::quantization::StorageFormat::Nvfp4 { group_size } => {
+                    if let Some(eg) = nvfp4_gs
+                        && eg != group_size
+                    {
+                        panic!(
+                            "accessor `{}` fuses Nvfp4 sources with mismatched group_size \
+                             ({eg} vs {group_size})",
+                            accessor.name,
+                        );
+                    }
+                    nvfp4_gs = Some(group_size);
+                }
+                _ => any_non_nvfp4 = true,
+            }
+        }
+        if let Some(group_size) = nvfp4_gs {
+            if any_non_nvfp4 {
+                panic!(
+                    "accessor `{}` fuses Nvfp4 and non-Nvfp4 source weights — \
+                     the macro can't emit a unified Linear arm for mixed storage",
+                    accessor.name,
+                );
+            }
+            if prefixes.len() == 1 {
+                return FieldLoad::LinearNvfp4 {
+                    prefix: prefixes.into_iter().next().unwrap(),
+                    group_size,
+                };
+            }
+            return FieldLoad::LinearNvfp4Concat {
+                prefixes,
+                group_size,
+            };
+        }
+
         if prefixes.len() == 1 {
             // `kind: "raw_linear"` opt-in (per the per-arch
             // weights manifest): the underlying tensor is an
@@ -1390,6 +1450,13 @@ fn emit_fingerprint_check(
         // because the affine `tensor_info` shape gate above keys on
         // `hidden_size / pack_factor` rather than `hidden_size`.
         Some(crate::quantization::QuantMethod::Affine { .. }) => ("weight", "qweight"),
+        // NVFP4 ships `.weight` (U8 packed E2M1) + `.weight_scale`
+        // (fp8 block scale) + `.weight_scale_2` (f32 global). The
+        // `.weight_scale_2` global is unique to NVFP4 — FP8 has only
+        // `.weight_scale`, dense/AWQ/GPTQ have neither — so it's the
+        // positive sniff that disambiguates NVFP4 from every other
+        // format. `.qweight` (absent) is the negative.
+        Some(crate::quantization::QuantMethod::Nvfp4 { .. }) => ("weight_scale_2", "qweight"),
         Some(_) => ("qweight", "weight"),
         None => ("weight", "qweight"),
     };
@@ -1459,9 +1526,14 @@ fn emit_fingerprint_check(
     // own qweight-shape gate on `.weight_packed` already makes it
     // disjoint from FP8, so skip the fp8 exclusion for it to avoid
     // false-rejecting CT-INT4 checkpoints.
+    // NVFP4 also carries `.weight_scale` (its fp8-e4m3 block scale), so
+    // it must be excluded from the FP8-marker rejection or it would
+    // reject its own checkpoint. Its positive sniff is `.weight_scale_2`,
+    // which FP8 lacks, so the two stay disjoint.
     let fp8_exclusion = matches!(
         model.quantization.as_ref().map(|qc| &qc.method),
         Some(crate::quantization::QuantMethod::Fp8 { .. })
+            | Some(crate::quantization::QuantMethod::Nvfp4 { .. })
             | Some(crate::quantization::QuantMethod::Gptq {
                 layout: crate::quantization::GptqLayout::WeightPacked,
                 ..
@@ -1669,6 +1741,14 @@ fn emit_fingerprint_check(
                     _ => return false,
                 }
             }
+        }
+        Some(crate::quantization::QuantMethod::Nvfp4 { .. }) => {
+            // NVFP4 fingerprint has no compile-time shape gate — the
+            // `.weight_scale` (float8_e4m3) + `.weight_scale_2` (f32)
+            // sibling presence and the `U8` dtype on `<prefix>.weight`
+            // are the load-time signals that distinguish it. Nothing
+            // to fingerprint at the shape level.
+            quote! {}
         }
     };
 
@@ -2075,6 +2155,16 @@ fn emit_weights_struct(
                     // separate AffineLinear runtime type is generated
                     // by the macro.
                     crate::quantization::StorageFormat::Affine { .. },
+                    false,
+                    false,
+                    false
+                ) | (
+                    // NVFP4 pairs with the dense-style `LinearLayer`
+                    // accessor too: the FieldLoad emits
+                    // `LinearLayer::load_nvfp4_quant`, producing a
+                    // `LinearLayer::Nvfp4(..)` at runtime — the accessor
+                    // type stays `LinearLayer`, like Affine.
+                    crate::quantization::StorageFormat::Nvfp4 { .. },
                     false,
                     false,
                     false
@@ -3594,6 +3684,42 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
                 )?;
             }
         }
+        FieldLoad::LinearNvfp4 { prefix, group_size } => {
+            // NVFP4 int4 (Metal-only), single source. Keeps packed E2M1
+            // weight + folded F16 scales on device for the forward-time
+            // `nvfp4_qmv` / `nvfp4_qmm_t` kernels via
+            // `Instruction::Nvfp4Qmm`.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            quote! {
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_nvfp4_quant(
+                    gw,
+                    #prefix,
+                    #gs_lit,
+                )?;
+            }
+        }
+        FieldLoad::LinearNvfp4Concat {
+            prefixes,
+            group_size,
+        } => {
+            // Fused gate_up_proj / qkv_proj on ModelOpt NVFP4 repos —
+            // see `FieldLoad::LinearNvfp4Concat` doc.
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            let prefix_lits: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let lit = syn::LitStr::new(p, proc_macro2::Span::call_site());
+                    quote! { #lit }
+                })
+                .collect();
+            quote! {
+                let #name = ::ferrite_kernels::layers::LinearLayer::load_nvfp4_quant_concat(
+                    gw,
+                    &[#(#prefix_lits),*],
+                    #gs_lit,
+                )?;
+            }
+        }
         FieldLoad::LinearTiedToEmbedding {
             embed_ident,
             affine,
@@ -4321,6 +4447,33 @@ fn emit_layered_load_body(
             quote! {
                 ::ferrite_forward::load_layered_linear_affine_dequant_concat_as_dense(
                     gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit,
+                )?
+            }
+        }
+        FieldLoad::LinearNvfp4 { prefix, group_size } => {
+            let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            quote! {
+                ::ferrite_forward::load_layered_linear_nvfp4_quant(
+                    gw, #n_lit, #dec_root_lit, #suffix, #gs_lit,
+                )?
+            }
+        }
+        FieldLoad::LinearNvfp4Concat {
+            prefixes,
+            group_size,
+        } => {
+            let suffixes: Vec<TokenStream> = prefixes
+                .iter()
+                .map(|p| {
+                    let s = layered_suffix(p, vision_zero_prefix_ref, decoder_zero_prefix_ref);
+                    quote! { #s }
+                })
+                .collect();
+            let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
+            quote! {
+                ::ferrite_forward::load_layered_linear_nvfp4_quant_concat(
+                    gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit,
                 )?
             }
         }
@@ -5868,7 +6021,19 @@ fn emit_canonical_params_impl(
             .architectures
             .iter()
             .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"));
-        if is_qwen3 {
+        // NVFP4 (NVIDIA ModelOpt) checkpoints ship BF16 RMSNorm gains
+        // (and BF16 embed/lm_head), unlike the mlx-community 4bit Llama
+        // convention of F16. `SCALE_DTYPE` selects the rmsnorm /
+        // fused_add_rmsnorm `_s_<dtype>_` symbol arm that reads the gain
+        // pointer; with the F16 default the BF16 gain bytes are
+        // mis-read (0x3D41 → 1.31 instead of 0.047) → garbage output.
+        // The NVFP4 GEMM scales are independently F16 (folded at load),
+        // so its kernels keep their hard-coded `_s_f16_` names.
+        let is_nvfp4 = matches!(
+            model.quantization.as_ref().map(|qc| &qc.method),
+            Some(crate::quantization::QuantMethod::Nvfp4 { .. })
+        );
+        if is_qwen3 || is_nvfp4 {
             quote! {
                 #[cfg(feature = "metal")]
                 const SCALE_DTYPE:

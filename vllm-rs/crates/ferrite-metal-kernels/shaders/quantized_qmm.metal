@@ -130,6 +130,30 @@ constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
 // vendored definitions on the same translation unit.
 
 // ─────────────────────────────────────────────────────────────────
+// NVFP4 E2M1 decode (sign-magnitude 4-bit; bit 3 = sign, bits 0-2 =
+// magnitude index). Same byte layout as affine int4, so the prefill
+// tile machinery is shared; only the per-code dequant differs (LUT,
+// no per-group bias). Duplicated from quantized_qmv.metal — each
+// .metal compiles to its own metallib. Matches Python vLLM's
+// `kE2M1ToFloat` (`nvfp4_emulation_utils.py`).
+// ─────────────────────────────────────────────────────────────────
+// E2M1 decode computed arithmetically — NO lookup table. A file-scope
+// `constant float[]` LUT compiles to a static initializer / global
+// constructor (`air.static_init`), which the MTL4 pipeline-compiler
+// path does NOT run → uninitialized table → garbage under MTL4 (MTL3 /
+// offline runs the ctor, so it only failed in production). E2M1 =
+// 1 sign · 2 exp · 1 mantissa: mag = (e==0) ? m·0.5 : (1+m·0.5)·2^(e-1)
+// → {0,.5,1,1.5,2,3,4,6} for codes 0..7, bit-identical to the old LUT.
+inline float nvfp4_decode(uint code) {
+  uint e = (code >> 1u) & 0x3u;
+  uint m = code & 0x1u;
+  float mant = (e == 0u) ? (float(m) * 0.5f) : (1.0f + float(m) * 0.5f);
+  float scale = (e == 0u) ? 1.0f : float(1u << (e - 1u));
+  float mag = mant * scale;
+  return (code & 0x8u) ? -mag : mag;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // qmm_t_impl — quantized.h:1094-1212. Implemented for bits=4 by
 // inlining the 4-bit branch of `dequantize` (`:521-527`) directly
 // into the W-loader. Other bits land alongside their first model.
@@ -158,7 +182,7 @@ constant int QMM_K_PARTITION_SIZE [[function_constant(3)]];
 // preserved (full-f16 streams break Llama-3.x exponent range — see
 // `instr.rs:199-202`).
 template <typename T_act, typename T_compute, typename T_scale,
-          int group_size, int bits, bool aligned_N>
+          int group_size, int bits, bool aligned_N, bool nvfp4 = false>
 METAL_FUNC void qmm_t_impl_inline(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -177,8 +201,10 @@ METAL_FUNC void qmm_t_impl_inline(
     uint3 tgid)
 {
   static_assert(bits == 4, "qmm_t_impl_inline only instantiated for bits=4");
-  static_assert(group_size == 32 || group_size == 64 || group_size == 128,
-                "qmm_t_impl_inline expects group_size in {32, 64, 128}");
+  static_assert(group_size == 16 || group_size == 32 || group_size == 64 ||
+                    group_size == 128,
+                "qmm_t_impl_inline expects group_size in {16, 32, 64, 128}");
+  static_assert(!nvfp4 || group_size == 16, "NVFP4 group_size is 16");
 
   constexpr int BM = 32;
   constexpr int BN = 32;
@@ -260,6 +286,12 @@ METAL_FUNC void qmm_t_impl_inline(
   //    `loader_w` is unused there. `if constexpr` (C++17, supported
   //    by metal-stdlib) keeps the unused branch from being
   //    instantiated.
+  // NVFP4 forces the inline W-dequant path (its group_size=16 < BK=32
+  // violates `QuantizedBlockLoader`'s `BCOLS <= group_size` assert), so
+  // the loader is constructed but never used. Instantiate its type with
+  // a valid placeholder group_size (BK=32) to keep the static_assert
+  // happy; the construction stores pointers only and is harmless.
+  constexpr int loader_gs = nvfp4 ? BK : group_size;
   using loader_w_t = QuantizedBlockLoader<
       /* T = */ T_scale,
       /* BROWS = */ BN,
@@ -267,7 +299,7 @@ METAL_FUNC void qmm_t_impl_inline(
       /* dst_ld = */ BK_padded,
       /* reduction_dim = */ 1,
       /* tgp_size = */ TGP,
-      /* group_size = */ group_size,
+      /* group_size = */ loader_gs,
       /* bits = */ bits>;
   loader_w_t loader_w(
       (const device uint8_t*)w_block,
@@ -358,7 +390,14 @@ METAL_FUNC void qmm_t_impl_inline(
     const device T_scale* Sc_row_inline = s_block + bi_w * K_g;
     const device T_scale* Bs_row_inline = b_block + bi_w * K_g;
     W_src_inline += kk * BCOLS_PACKED * bytes_per_pack;
-    const int sb_step = (group_steps > 1) ? (kk / group_steps) : kk;
+    // NVFP4 group_size (16) is smaller than BK (32), so a BK column-
+    // block spans two scale groups; index the scale generally by the
+    // thread's absolute K offset. The general formula reduces to the
+    // affine `sb_step` when group_size >= BK (the `bj_w*pack_factor`
+    // term is then < group_size, contributing 0 within a block).
+    const int sb_step = nvfp4
+        ? ((kk * BK + int(bj_w) * pack_factor) / group_size)
+        : ((group_steps > 1) ? (kk / group_steps) : kk);
     Sc_row_inline += sb_step;
     Bs_row_inline += sb_step;
     bool in_bounds = n_unsafe ? true : (bi_w < n_tile);
@@ -370,10 +409,19 @@ METAL_FUNC void qmm_t_impl_inline(
       MLX_MTL_PRAGMA_UNROLL
       for (int i = 0; i < N_READS; ++i) {
         uint8_t b = W_src_inline[i * bytes_per_pack];
-        Ws_dst_inline[i * pack_factor + 0] =
-            s0 * static_cast<T_compute>(b & 0x0f) + bias;
-        Ws_dst_inline[i * pack_factor + 1] =
-            s1 * static_cast<T_compute>(b & 0xf0) + bias;
+        if (nvfp4) {
+          // E2M1 LUT decode, no per-group bias. Low nibble = even K
+          // element, high nibble = odd (same byte layout as affine).
+          Ws_dst_inline[i * pack_factor + 0] =
+              scale * static_cast<T_compute>(nvfp4_decode(b & 0x0fu));
+          Ws_dst_inline[i * pack_factor + 1] =
+              scale * static_cast<T_compute>(nvfp4_decode((uint(b) >> 4) & 0x0fu));
+        } else {
+          Ws_dst_inline[i * pack_factor + 0] =
+              s0 * static_cast<T_compute>(b & 0x0f) + bias;
+          Ws_dst_inline[i * pack_factor + 1] =
+              s1 * static_cast<T_compute>(b & 0xf0) + bias;
+        }
       }
     } else {
       MLX_MTL_PRAGMA_UNROLL
@@ -383,14 +431,14 @@ METAL_FUNC void qmm_t_impl_inline(
     }
   };
   auto load_w_unsafe = [&](int kk) {
-    if (metal::is_same_v<T_compute, T_scale>) {
+    if (metal::is_same_v<T_compute, T_scale> && !nvfp4) {
       loader_w.load_unsafe();
     } else {
       load_w_inline(kk, /*n_unsafe=*/true);
     }
   };
   auto load_w_safe = [&](int kk) {
-    if (metal::is_same_v<T_compute, T_scale>) {
+    if (metal::is_same_v<T_compute, T_scale> && !nvfp4) {
       loader_w.load_safe(short2(BK, n_tile));
     } else {
       load_w_inline(kk, /*n_unsafe=*/false);
@@ -398,7 +446,7 @@ METAL_FUNC void qmm_t_impl_inline(
   };
   auto next_loaders = [&]() {
     X_src += BK;
-    if (metal::is_same_v<T_compute, T_scale>) {
+    if (metal::is_same_v<T_compute, T_scale> && !nvfp4) {
       loader_w.next();
     }
   };
@@ -1077,3 +1125,62 @@ INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  32, true,  true)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half,  32, false, false)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, true,  true)
 INST_QMM_T_SPLITK_C(bf16, bfloat, f16, half, f16, half, 128, false, false)
+
+// ─────────────────────────────────────────────────────────────────
+// nvfp4_qmm_t — NVFP4 prefill matmul (standard 32×32 tile)
+//
+// Reuses `qmm_t_impl_inline` with the `nvfp4` template flag: E2M1 LUT
+// decode, no per-group bias, and the inline W-dequant path forced (its
+// group_size=16 < BK=32 can't go through `QuantizedBlockLoader`).
+// 4-buffer layout (no biases buffer) — `scales` is passed as the
+// ignored bias pointer so the shared pointer arithmetic stays valid.
+// T_compute == T_act (no separate f16-compute fast-path wired for NVFP4
+// yet). Standard tile only; NAX prefill is the planned perf path.
+// ─────────────────────────────────────────────────────────────────
+template <typename T_act, typename T_compute, typename T_scale,
+          int group_size, int bits, bool aligned_N>
+[[kernel]] void nvfp4_qmm_t_kernel(
+    const device uint32_t*  w       [[buffer(0)]],
+    const device T_scale*   scales  [[buffer(1)]],
+    // biases [[buffer(2)]] = scales buffer (dummy). 5-buffer layout MUST
+    // match affine's (w,scales,biases,x,y); MTL4 mis-dispatches the
+    // 4-buffer (x@2,y@3) variant — see note in quantized_qmv.metal.
+    const device T_scale*   biases  [[buffer(2)]],
+    const device T_act*     x       [[buffer(3)]],
+    device T_act*           y       [[buffer(4)]],
+    uint  simd_group_id [[simdgroup_index_in_threadgroup]],
+    uint  simd_lane_id  [[thread_index_in_simdgroup]],
+    uint3 tgid          [[threadgroup_position_in_grid]])
+{
+  constexpr int BM = 32, BN = 32, BK = 32;
+  constexpr int BK_padded = BK + 16 / int(sizeof(T_compute));
+  threadgroup T_compute Xs[BM * BK_padded];
+  threadgroup T_compute Ws[BN * BK_padded];
+  threadgroup float out_scratch[BM * BN];
+  qmm_t_impl_inline<T_act, T_compute, T_scale, group_size, bits, aligned_N,
+                    /*nvfp4=*/true>(
+      w, scales, biases, x, y,
+      Xs, Ws, out_scratch,
+      QMM_K, QMM_N, QMM_M, /*K_eff=*/QMM_K,
+      simd_group_id, simd_lane_id, tgid);
+}
+
+#define INST_NVFP4_QMM_T(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  template [[host_name(                                                                  \
+      "nvfp4_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                                 \
+      "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                  \
+  nvfp4_qmm_t_kernel<act_type, act_type, scale_type, gs, 4, aln_val>(                      \
+      const device uint32_t*   w       [[buffer(0)]],                                     \
+      const device scale_type* scales  [[buffer(1)]],                                     \
+      const device scale_type* biases  [[buffer(2)]],                                     \
+      const device act_type*   x       [[buffer(3)]],                                     \
+      device act_type*         y       [[buffer(4)]],                                     \
+      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                             \
+      uint  simd_lane_id  [[thread_index_in_simdgroup]],                                  \
+      uint3 tgid          [[threadgroup_position_in_grid]]);
+
+// group_size always 16 for NVFP4; T_scale always half (folded F16).
+INST_NVFP4_QMM_T(f16, half, f16, half, 16, true, true)
+INST_NVFP4_QMM_T(f16, half, f16, half, 16, false, false)
+INST_NVFP4_QMM_T(bf16, bfloat, f16, half, 16, true, true)
+INST_NVFP4_QMM_T(bf16, bfloat, f16, half, 16, false, false)

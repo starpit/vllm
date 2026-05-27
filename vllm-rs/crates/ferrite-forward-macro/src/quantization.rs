@@ -116,6 +116,20 @@ pub enum StorageFormat {
     /// reads scales/biases as `T_scale = half` and casts to float
     /// in registers — see `INT4_PARITY_PROBES.md` §7.
     Affine { bits: u32, group_size: u32 },
+    /// NVIDIA ModelOpt NVFP4 weights. `.weight` is `uint8` `[N, K/2]`
+    /// (two packed E2M1 codes per byte: low nibble = even element,
+    /// high nibble = odd; each nibble is bit3 = sign, bits0‑2 =
+    /// magnitude index into `[0,0.5,1,1.5,2,3,4,6]`). `.weight_scale`
+    /// is `float8_e4m3` `[N, K/group_size]` per-block scale (stored
+    /// linear on disk — the CUTLASS swizzle is a post-load step we
+    /// don't apply for dequant-on-read). `.weight_scale_2` is an
+    /// `f32` per-tensor global scale. The Metal load folds
+    /// `f32(weight_scale)/weight_scale_2` into a single per-group F16
+    /// scale (`Nvfp4Linear`), and the `qmv`/`qmm_t` kernels dequant on
+    /// read — weight-only (activations stay bf16/f16). `group_size` is
+    /// 16 for every ModelOpt NVFP4 checkpoint. Matches Python vLLM's
+    /// `dequantize_to_dtype` (`nvfp4_emulation_utils.py`).
+    Nvfp4 { group_size: u32 },
 }
 
 /// FP8 activation quantization scheme. Matches
@@ -241,6 +255,13 @@ pub enum QuantMethod {
         group_size: u32,
         quantize_embed: bool,
     },
+    /// NVIDIA ModelOpt NVFP4. Detected via `quant_method: "modelopt"`
+    /// (or no `quant_method` in a standalone `hf_quant_config.json`)
+    /// with a `quant_algo` containing `"NVFP4"`. `group_size` is read
+    /// from the config (default 16). Weight-only dequant-on-read on
+    /// Metal; embeddings + `lm_head` stay dense (ModelOpt keeps them
+    /// high precision and usually lists `lm_head` in `exclude_modules`).
+    Nvfp4 { group_size: u32 },
 }
 
 /// Errors from [`QuantizationConfig::parse`]. All variants preserve
@@ -318,10 +339,25 @@ impl QuantizationConfig {
                 "compressed-tensors" => parse_compressed_tensors(obj)?,
                 "bitsandbytes" => parse_bitsandbytes(obj)?,
                 "fp8" => parse_fp8(obj)?,
+                // ModelOpt NVFP4 (and its `modelopt_fp4` / bare `nvfp4`
+                // aliases). The `quant_algo` discriminator distinguishes
+                // NVFP4 from ModelOpt FP8 — `parse_nvfp4` rejects the
+                // latter so it doesn't silently degrade.
+                "modelopt" | "modelopt_fp4" | "nvfp4" => parse_nvfp4(obj)?,
                 // GGML/GGUF block-quantized — no compile-time knobs.
                 "ggml" | "gguf" => QuantMethod::Ggml,
                 other => return Err(ParseError::UnsupportedMethod(other.to_string())),
             }
+        } else if obj.contains_key("quant_algo")
+            || obj
+                .get("quantization")
+                .and_then(|q| q.get("quant_algo"))
+                .is_some()
+        {
+            // ModelOpt ships a standalone `hf_quant_config.json` whose
+            // `quantization` subobject carries `quant_algo` with no
+            // `quant_method` field. Route it to the NVFP4 parser.
+            parse_nvfp4(obj)?
         } else if obj.contains_key("bits") && obj.contains_key("group_size") {
             parse_affine_no_method(obj)?
         } else {
@@ -329,11 +365,17 @@ impl QuantizationConfig {
         };
 
         // AWQ/GPTQ carry `modules_to_not_convert`; compressed-tensors
-        // carries the same list under `ignore`. Either field is
-        // accepted — whichever the upstream repo shipped.
+        // carries the same list under `ignore`; ModelOpt NVFP4 uses
+        // `exclude_modules`, possibly nested under `quantization`. Accept
+        // whichever the upstream repo shipped.
         let modules_to_not_convert = obj
             .get("modules_to_not_convert")
             .or_else(|| obj.get("ignore"))
+            .or_else(|| obj.get("exclude_modules"))
+            .or_else(|| {
+                obj.get("quantization")
+                    .and_then(|q| q.get("exclude_modules"))
+            })
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
@@ -395,6 +437,46 @@ fn parse_affine_no_method(
         group_size,
         quantize_embed,
     })
+}
+
+/// Parse a ModelOpt NVFP4 `quantization_config` / `hf_quant_config.json`
+/// payload. The discriminating field is `quant_algo`, which lives either
+/// directly under the section or nested under a `quantization` subobject
+/// (ModelOpt's standalone-file shape). We require it to contain `"NVFP4"`;
+/// a ModelOpt FP8 checkpoint (`quant_algo: "FP8"`) is a different path and
+/// is rejected here rather than silently mishandled. `group_size` defaults
+/// to 16 — the value every ModelOpt NVFP4 checkpoint ships.
+fn parse_nvfp4(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<QuantMethod, ParseError> {
+    // `quant_algo` may be top-level or nested under `quantization`.
+    let nested = obj.get("quantization").and_then(|q| q.as_object());
+    let lookup = |key: &str| -> Option<&serde_json::Value> {
+        obj.get(key).or_else(|| nested.and_then(|n| n.get(key)))
+    };
+
+    let quant_algo = lookup("quant_algo")
+        .and_then(|v| v.as_str())
+        .ok_or(ParseError::BadField {
+            field: "quant_algo",
+            reason: "missing or not a string",
+        })?;
+    if !quant_algo.to_uppercase().contains("NVFP4") {
+        return Err(ParseError::BadField {
+            field: "quant_algo",
+            reason: "ferrite NVFP4 path only handles `NVFP4` quant_algo (ModelOpt FP8 unsupported)",
+        });
+    }
+
+    let group_size = lookup("group_size").and_then(|v| v.as_u64()).unwrap_or(16) as u32;
+    if group_size == 0 {
+        return Err(ParseError::BadField {
+            field: "group_size",
+            reason: "must be > 0",
+        });
+    }
+
+    Ok(QuantMethod::Nvfp4 { group_size })
 }
 
 fn parse_awq(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMethod, ParseError> {
@@ -893,6 +975,16 @@ pub fn storage_format_for_weight(
         return StorageFormat::Dense;
     }
 
+    // ModelOpt NVFP4 convention: `lm_head` (and `embed_tokens`) stay
+    // high precision — ModelOpt keeps them dense and usually lists
+    // `lm_head` in `exclude_modules`. Belt-and-suspenders rule in case a
+    // checkpoint omits it from the list. (embed_tokens needs no rule: it
+    // only feeds an Embed op, which isn't a matmul consumer for NVFP4, so
+    // it already falls through to Dense below.)
+    if dotted == "lm_head" && matches!(qc.method, QuantMethod::Nvfp4 { .. }) {
+        return StorageFormat::Dense;
+    }
+
     // GGUF convention: the on-disk loader (`GgufGpuWeights::load`)
     // dequantizes `output.weight` (lm_head) and ships it via
     // `take_gguf_dense`. The codegen FieldLoad arm for GGUF lm_head
@@ -980,6 +1072,7 @@ pub fn storage_format_for_weight(
             group_size,
             quantize_embed: _,
         } => StorageFormat::Affine { bits, group_size },
+        QuantMethod::Nvfp4 { group_size } => StorageFormat::Nvfp4 { group_size },
     }
 }
 

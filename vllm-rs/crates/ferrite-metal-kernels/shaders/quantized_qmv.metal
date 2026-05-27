@@ -67,6 +67,32 @@ inline constexpr short get_bytes_per_pack() {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// NVFP4 E2M1 decode. The 4-bit code is sign-magnitude: bit 3 = sign,
+// bits 0-2 = magnitude index into the E2M1 value table. Byte/nibble
+// layout is identical to MLX-affine int4 (low nibble = even element),
+// so the surrounding qmv/qmm_t machinery is shared verbatim; only the
+// per-code dequant differs (LUT lookup vs raw integer, and no per-group
+// bias). Matches Python vLLM's `kE2M1ToFloat` (`nvfp4_emulation_utils`).
+// ─────────────────────────────────────────────────────────────────
+// E2M1 decode computed arithmetically — NO lookup table. A file-scope
+// `constant float[]` LUT compiles to a static initializer / global
+// constructor (`air.static_init` / `GLOBAL__sub_I`), which the MTL4
+// pipeline-compiler path does NOT run — leaving the table uninitialized
+// → garbage weights under MTL4 (MTL3 / offline-via-ShaderCache runs the
+// ctor, so the bug only surfaced in production, not in unit tests).
+// E2M1 = 1 sign · 2 exp · 1 mantissa: mag = (e==0) ? m·0.5
+// : (1 + m·0.5)·2^(e-1) → {0,.5,1,1.5,2,3,4,6} for codes 0..7,
+// bit-identical to the old LUT.
+inline float nvfp4_decode(uint code) {
+  uint e = (code >> 1u) & 0x3u;
+  uint m = code & 0x1u;
+  float mant = (e == 0u) ? (float(m) * 0.5f) : (1.0f + float(m) * 0.5f);
+  float scale = (e == 0u) ? 1.0f : float(1u << (e - 1u));
+  float mag = mant * scale;
+  return (code & 0x8u) ? -mag : mag;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // load_vector / load_vector_safe — quantized.h:28-189
 // ─────────────────────────────────────────────────────────────────
 
@@ -1036,6 +1062,216 @@ INST_QMV_ALL(bf16, bfloat, bf16, bfloat, 128)
 INST_QMV_ALL(f16,  half,   bf16, bfloat, 32)
 INST_QMV_ALL(f16,  half,   bf16, bfloat, 64)
 INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
+
+// ─────────────────────────────────────────────────────────────────
+// nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
+// (mlx/backend/metal/kernels/fp_quantized.h). NVFP4 is NOT bolted onto
+// the int4 `qmv_impl` via a template flag: MLX ships a *dedicated* fp4
+// kernel, and reusing the int4 path drags the entire affine machinery
+// (pre-division load, per-group bias, QuantizedBlockLoader) into the
+// nvfp4 function as dead code that the MTL4 pipeline compiler
+// miscompiles (MTL3 / unit tests are fine; MTL4 production = garbage).
+// This standalone function has ZERO affine code. The only deviation
+// from MLX is the scale: ferrite folds (e4m3·weight_scale_2) into one
+// F16 per-group value at load, so we read `T_scale` directly instead of
+// MLX's in-kernel `dequantize_scale<U,16>` fp8 path. group_size=16.
+// ─────────────────────────────────────────────────────────────────
+
+// nvfp4 dot — MLX `qdot` (fp4 branch): x·E2M1[code] over a group, ×scale,
+// no bias. `w` holds 4 codes per uint16 (low→high nibble = elems 4i..4i+3).
+template <typename U, int values_per_thread>
+inline U nvfp4_qdot(const device uint8_t* w, const thread U* x_thread, U scale) {
+  const device uint16_t* ws = (const device uint16_t*)w;
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    uint16_t word = ws[i];
+    accum += x_thread[4 * i] * nvfp4_decode(word & 0x000fu);
+    accum += x_thread[4 * i + 1] * nvfp4_decode((uint(word) >> 4) & 0x000fu);
+    accum += x_thread[4 * i + 2] * nvfp4_decode((uint(word) >> 8) & 0x000fu);
+    accum += x_thread[4 * i + 3] * nvfp4_decode((uint(word) >> 12) & 0x000fu);
+  }
+  return scale * accum;
+}
+
+template <typename U, int values_per_thread>
+inline U nvfp4_qdot_safe(
+    const device uint8_t* w, const thread U* x_thread, U scale, int N) {
+  const device uint16_t* ws = (const device uint16_t*)w;
+  U accum = 0;
+  for (int i = 0; i < (N / 4); i++) {
+    uint16_t word = ws[i];
+    accum += x_thread[4 * i] * nvfp4_decode(word & 0x000fu);
+    accum += x_thread[4 * i + 1] * nvfp4_decode((uint(word) >> 4) & 0x000fu);
+    accum += x_thread[4 * i + 2] * nvfp4_decode((uint(word) >> 8) & 0x000fu);
+    accum += x_thread[4 * i + 3] * nvfp4_decode((uint(word) >> 12) & 0x000fu);
+  }
+  return scale * accum;
+}
+
+// Clean nvfp4 matvec — mirrors MLX `fp_qmv_impl` line-for-line.
+template <typename T_act, typename T_scale, int group_size, int bits>
+inline void fp_qmv_impl(
+    const device uint32_t* w,
+    const device T_scale* scales,
+    const device T_act* x,
+    device T_act* y,
+    int in_vec_size,
+    int out_vec_size,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int packs_per_thread = 1;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * SIMD_SIZE;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  typedef float U;
+  thread U x_thread[values_per_thread];
+  thread U result[results_per_simdgroup] = {0};
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  const int used_out_row = min(out_vec_size - results_per_simdgroup, out_row);
+
+  if (out_row >= out_vec_size) {
+    return;
+  }
+
+  if (out_vec_size < (num_simdgroups * results_per_simdgroup)) {
+    ws +=
+        out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    x += tid.x * in_vec_size + simd_lid * values_per_thread;
+    y += tid.x * out_vec_size + out_row;
+
+    int k = 0;
+    for (; k < in_vec_size - block_size; k += block_size) {
+      for (int i = 0; i < values_per_thread; i++) {
+        x_thread[i] = x[i];
+      }
+      for (int row = 0;
+           row < results_per_simdgroup && out_row + row < out_vec_size;
+           row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T_scale* sl = scales + row * in_vec_size_g;
+        U s = static_cast<U>(sl[0]);
+        result[row] += nvfp4_qdot<U, values_per_thread>(wl, x_thread, s);
+      }
+      ws += block_size * bytes_per_pack / pack_factor;
+      scales += block_size / group_size;
+      x += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      for (int i = 0; i < remaining; i++) {
+        x_thread[i] = x[i];
+      }
+      for (int i = remaining; i < values_per_thread; i++) {
+        x_thread[i] = 0;
+      }
+      for (int row = 0;
+           row < results_per_simdgroup && out_row + row < out_vec_size;
+           row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T_scale* sl = scales + row * in_vec_size_g;
+        U s = static_cast<U>(sl[0]);
+        result[row] +=
+            nvfp4_qdot_safe<U, values_per_thread>(wl, x_thread, s, remaining);
+      }
+    }
+    for (int row = 0;
+         row < results_per_simdgroup && out_row + row < out_vec_size;
+         row++) {
+      result[row] = simd_sum(result[row]);
+      if (simd_lid == 0) {
+        y[row] = static_cast<T_act>(result[row]);
+      }
+    }
+  } else {
+    ws += used_out_row * in_vec_size_w +
+        simd_lid * packs_per_thread * bytes_per_pack;
+    scales += used_out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    x += tid.x * in_vec_size + simd_lid * values_per_thread;
+    y += tid.x * out_vec_size + used_out_row;
+
+    int k = 0;
+    for (; k < in_vec_size - block_size; k += block_size) {
+      for (int i = 0; i < values_per_thread; i++) {
+        x_thread[i] = x[i];
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T_scale* sl = scales + row * in_vec_size_g;
+        U s = static_cast<U>(sl[0]);
+        result[row] += nvfp4_qdot<U, values_per_thread>(wl, x_thread, s);
+      }
+      ws += block_size * bytes_per_pack / pack_factor;
+      scales += block_size / group_size;
+      x += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      for (int i = 0; i < remaining; i++) {
+        x_thread[i] = x[i];
+      }
+      for (int i = remaining; i < values_per_thread; i++) {
+        x_thread[i] = 0;
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T_scale* sl = scales + row * in_vec_size_g;
+        U s = static_cast<U>(sl[0]);
+        result[row] +=
+            nvfp4_qdot_safe<U, values_per_thread>(wl, x_thread, s, remaining);
+      }
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[row] = simd_sum(result[row]);
+      if (simd_lid == 0) {
+        y[row] = static_cast<T_act>(result[row]);
+      }
+    }
+  }
+}
+
+// nvfp4_qmv entry — 5-buffer signature kept (w,scales,biases,x,y) so the
+// binding/argument-table layout matches affine; `biases` is unused.
+template <typename T_act, typename T_scale, const int group_size, const int bits>
+[[kernel]] void nvfp4_qmv(
+    const device uint32_t* w [[buffer(0)]],
+    const device T_scale* scales [[buffer(1)]],
+    const device T_scale* biases [[buffer(2)]],
+    const device T_act* x [[buffer(3)]],
+    device T_act* y [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  fp_qmv_impl<T_act, T_scale, group_size, bits>(
+      w, scales, x, y, IN_VEC_SIZE, OUT_VEC_SIZE, tid, simd_gid, simd_lid);
+}
+
+#define INST_NVFP4_QMV(act_tag, act_type, scale_tag, scale_type, gs)      \
+  template [[host_name(                                                   \
+      "nvfp4_qmv_" #act_tag "_s_" #scale_tag "_gs_" #gs "_b_4_batch_0")]] \
+  [[kernel]] decltype(nvfp4_qmv<act_type, scale_type, gs, 4>)             \
+      nvfp4_qmv<act_type, scale_type, gs, 4>;
+
+// group_size is always 16 for NVFP4; T_scale always half (folded F16).
+INST_NVFP4_QMV(f16, half, f16, half, 16)
+INST_NVFP4_QMV(bf16, bfloat, f16, half, 16)
 
 // ─────────────────────────────────────────────────────────────────
 // affine_gather_qmv_{fast,} — quantized.h:1899-2021 (MoE rhs gather)

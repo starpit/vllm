@@ -62,6 +62,32 @@ constant int QMM_N [[function_constant(1)]];
 constant int QMM_M [[function_constant(2)]];
 
 // ─────────────────────────────────────────────────────────────────
+// NVFP4 E2M1 decode (sign-magnitude 4-bit). Same byte layout as affine
+// int4, so the NAX tile machinery is shared via a `bool nvfp4` flag;
+// the decode differs (LUT, no per-group bias) and — because NVFP4's
+// group_size (16) is smaller than BK (64) — the scale is indexed per
+// byte by absolute K position rather than once per thread. Duplicated
+// per-file (each .metal → its own metallib). Matches Python vLLM's
+// `kE2M1ToFloat`.
+// ─────────────────────────────────────────────────────────────────
+// E2M1 decode computed arithmetically — NO lookup table. A file-scope
+// `constant float[]` LUT compiles to a static initializer / global
+// constructor (`air.static_init`), which the MTL4 pipeline-compiler
+// path does NOT run → uninitialized table → garbage under MTL4. E2M1 =
+// 1 sign · 2 exp · 1 mantissa: mag = (e==0) ? m·0.5 : (1+m·0.5)·2^(e-1)
+// → {0,.5,1,1.5,2,3,4,6} for codes 0..7, bit-identical to the old LUT.
+// (NAX is runtime-source-compiled, but keep this consistent so all
+// three nvfp4 decoders share one ctor-free definition.)
+inline float nvfp4_decode(uint code) {
+  uint e = (code >> 1u) & 0x3u;
+  uint m = code & 0x1u;
+  float mant = (e == 0u) ? (float(m) * 0.5f) : (1.0f + float(m) * 0.5f);
+  float scale = (e == 0u) ? 1.0f : float(1u << (e - 1u));
+  float mag = mant * scale;
+  return (code & 0x8u) ? -mag : mag;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // qmm_t_nax_impl — port of qmm_t_nax_tgp_impl (quantized_nax.h)
 //
 // Template params:
@@ -92,7 +118,8 @@ constant int QMM_M [[function_constant(2)]];
 //     gs=128 → advance every 2 BK steps (group_steps == 2)
 // ─────────────────────────────────────────────────────────────────
 
-template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N,
+          bool nvfp4 = false>
 METAL_FUNC void qmm_t_nax_impl(
     const device uint32_t*  w,
     const device T_scale*   scales,
@@ -108,10 +135,12 @@ METAL_FUNC void qmm_t_nax_impl(
     uint3 tgid)
 {
     static_assert(bits == 4, "qmm_t_nax_impl: only bits=4 instantiated");
-    static_assert(group_size == 64 || group_size == 128,
-                  "qmm_t_nax_impl: group_size must be 64 or 128 (gs=32 needs "
-                  "the specialized QuantizedBlockLoader; dispatcher falls "
-                  "back to Standard qmm_t for gs=32)");
+    // Affine NAX requires gs ∈ {64,128} (gs ≥ BK=64, one scale per
+    // thread). NVFP4 is always gs=16 (< BK), handled by the per-byte
+    // general scale index in the W-loader below.
+    static_assert((!nvfp4 && (group_size == 64 || group_size == 128)) ||
+                      (nvfp4 && group_size == 16),
+                  "qmm_t_nax_impl: affine gs in {64,128}, NVFP4 gs=16");
 
     constexpr int BM = 64;
     constexpr int BN = 64;
@@ -221,26 +250,54 @@ METAL_FUNC void qmm_t_nax_impl(
                 // elements = BN×BK = 64×64. One scale per thread (since
                 // group_size ≥ BK=64, all 16 reads share the same group).
                 if constexpr (kAlignedN.value) {
-                    T_act scale = T_act(*Sc_row);
-                    T_act bias  = T_act(*Bs_row);
-                    T_act s0 = scale;
-                    T_act s1 = scale / T_act(16.0f);  // compensates for & 0xf0
-                    for (int i = 0; i < N_READS; ++i) {
-                        uint8_t b = W_src[i * bytes_per_pack];
-                        Ws_dst[i * pack_factor + 0] = s0 * T_act(b & 0x0f) + bias;
-                        Ws_dst[i * pack_factor + 1] = s1 * T_act(b & 0xf0) + bias;
-                    }
-                } else {
-                    // N-tail: zero rows past tgp_bn (bi_w is the N-row index)
-                    if (bi_w < uint(tgp_bn)) {
+                    if constexpr (nvfp4) {
+                        // NVFP4: gs=16 < BK=64, so this thread's 16-byte
+                        // read spans multiple scale groups — index the
+                        // scale per byte by absolute K position. E2M1
+                        // LUT decode, no per-group bias.
+                        for (int i = 0; i < N_READS; ++i) {
+                            uint8_t b = W_src[i * bytes_per_pack];
+                            int g = (k + (int(bj_w) + i) * pack_factor) / group_size;
+                            T_act scale = T_act(s_block[int(bi_w) * K_g + g]);
+                            Ws_dst[i * pack_factor + 0] =
+                                scale * T_act(nvfp4_decode(b & 0x0fu));
+                            Ws_dst[i * pack_factor + 1] =
+                                scale * T_act(nvfp4_decode((uint(b) >> 4) & 0x0fu));
+                        }
+                    } else {
                         T_act scale = T_act(*Sc_row);
                         T_act bias  = T_act(*Bs_row);
                         T_act s0 = scale;
-                        T_act s1 = scale / T_act(16.0f);
+                        T_act s1 = scale / T_act(16.0f);  // compensates for & 0xf0
                         for (int i = 0; i < N_READS; ++i) {
                             uint8_t b = W_src[i * bytes_per_pack];
                             Ws_dst[i * pack_factor + 0] = s0 * T_act(b & 0x0f) + bias;
                             Ws_dst[i * pack_factor + 1] = s1 * T_act(b & 0xf0) + bias;
+                        }
+                    }
+                } else {
+                    // N-tail: zero rows past tgp_bn (bi_w is the N-row index)
+                    if (bi_w < uint(tgp_bn)) {
+                        if constexpr (nvfp4) {
+                            for (int i = 0; i < N_READS; ++i) {
+                                uint8_t b = W_src[i * bytes_per_pack];
+                                int g = (k + (int(bj_w) + i) * pack_factor) / group_size;
+                                T_act scale = T_act(s_block[int(bi_w) * K_g + g]);
+                                Ws_dst[i * pack_factor + 0] =
+                                    scale * T_act(nvfp4_decode(b & 0x0fu));
+                                Ws_dst[i * pack_factor + 1] =
+                                    scale * T_act(nvfp4_decode((uint(b) >> 4) & 0x0fu));
+                            }
+                        } else {
+                            T_act scale = T_act(*Sc_row);
+                            T_act bias  = T_act(*Bs_row);
+                            T_act s0 = scale;
+                            T_act s1 = scale / T_act(16.0f);
+                            for (int i = 0; i < N_READS; ++i) {
+                                uint8_t b = W_src[i * bytes_per_pack];
+                                Ws_dst[i * pack_factor + 0] = s0 * T_act(b & 0x0f) + bias;
+                                Ws_dst[i * pack_factor + 1] = s1 * T_act(b & 0xf0) + bias;
+                            }
                         }
                     } else {
                         for (int i = 0; i < N_READS * pack_factor; ++i) {
@@ -284,18 +341,22 @@ METAL_FUNC void qmm_t_nax_impl(
                 x_ptr += BK;
                 W_src += BCOLS_PACKED * bytes_per_pack;  // 32 bytes
 
-                // Scale advance: every group_steps BK iters.
-                if constexpr (group_steps > 1) {
-                    group_step_cnt++;
-                    if (group_step_cnt == group_steps) {
-                        group_step_cnt = 0;
+                // Scale advance: every group_steps BK iters. NVFP4
+                // indexes the scale by absolute K position each iter
+                // (gs < BK), so its pointer never advances.
+                if constexpr (!nvfp4) {
+                    if constexpr (group_steps > 1) {
+                        group_step_cnt++;
+                        if (group_step_cnt == group_steps) {
+                            group_step_cnt = 0;
+                            Sc_row++;
+                            Bs_row++;
+                        }
+                    } else {
+                        // group_steps == 1 (gs=64=BK): advance every step
                         Sc_row++;
                         Bs_row++;
                     }
-                } else {
-                    // group_steps == 1 (gs=64=BK): advance every step
-                    Sc_row++;
-                    Bs_row++;
                 }
             }
 
@@ -386,3 +447,56 @@ INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64)
 INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128)
 INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64)
 INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128)
+
+// ─────────────────────────────────────────────────────────────────
+// nvfp4_qmm_t_nax — NVFP4 NAX prefill matmul
+//
+// Reuses qmm_t_nax_impl with the `nvfp4` flag: E2M1 LUT decode, no
+// per-group bias, and a per-byte scale index (gs=16 < BK=64, so a
+// thread's W read spans multiple scale groups). 4-buffer layout (no
+// biases) — `scales` passed as the ignored bias pointer. T_scale is
+// always half (folded F16). gs=16 only.
+// ─────────────────────────────────────────────────────────────────
+template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+[[kernel]] void nvfp4_qmm_t_nax_kernel(
+    const device uint32_t*  w       [[buffer(0)]],
+    const device T_scale*   scales  [[buffer(1)]],
+    // biases [[buffer(2)]] = scales (dummy). 5-buffer layout MUST match
+    // affine's; MTL4 mis-dispatches the 4-buffer variant — see note in
+    // quantized_qmv.metal.
+    const device T_scale*   biases  [[buffer(2)]],
+    const device T_act*     x       [[buffer(3)]],
+    device T_act*           y       [[buffer(4)]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint3 tgid     [[threadgroup_position_in_grid]])
+{
+    constexpr int BN = 64;
+    constexpr int BK = 64;
+    constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
+    threadgroup T_act Ws[BN * BK_padded];
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N, /*nvfp4=*/true>(
+        w, scales, biases, x, y, Ws,
+        QMM_K, QMM_N, QMM_M,
+        simd_gid, simd_lid, tgid);
+}
+
+#define INST_NVFP4_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+    template [[host_name(                                                                     \
+        "nvfp4_qmm_t_nax_" #act_tag "_s_" #scale_tag "_gs_" #gs                                \
+        "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                                     \
+    nvfp4_qmm_t_nax_kernel<act_type, scale_type, gs, 4, aln_val>(                              \
+        const device uint32_t*   w       [[buffer(0)]],                                       \
+        const device scale_type* scales  [[buffer(1)]],                                       \
+        const device scale_type* biases  [[buffer(2)]],                                       \
+        const device act_type*   x       [[buffer(3)]],                                       \
+        device act_type*         y       [[buffer(4)]],                                        \
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],                                    \
+        uint  simd_lid [[thread_index_in_simdgroup]],                                         \
+        uint3 tgid     [[threadgroup_position_in_grid]]);
+
+// gs=16 only for NVFP4; T_scale always half (folded F16).
+INST_NVFP4_QMM_T_NAX(f16, half, f16, half, 16, true, true)
+INST_NVFP4_QMM_T_NAX(f16, half, f16, half, 16, false, false)
+INST_NVFP4_QMM_T_NAX(bf16, bfloat, f16, half, 16, true, true)
+INST_NVFP4_QMM_T_NAX(bf16, bfloat, f16, half, 16, false, false)

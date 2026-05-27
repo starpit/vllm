@@ -331,6 +331,8 @@ mod tests {
                 | KernelId::AffineQmv
                 | KernelId::AffineQmmT
                 | KernelId::AffineQmmTSplitK
+                | KernelId::Nvfp4Qmv
+                | KernelId::Nvfp4QmmT
                 | KernelId::AffineEmbed
                 | KernelId::SiluMul
                 | KernelId::SplitKReduceSum
@@ -413,6 +415,8 @@ mod tests {
             | KernelId::AffineQmv
             | KernelId::AffineQmmT
             | KernelId::AffineQmmTSplitK
+            | KernelId::Nvfp4Qmv
+            | KernelId::Nvfp4QmmT
             | KernelId::AffineEmbed
             | KernelId::SiluMul
             | KernelId::SplitKReduceSum

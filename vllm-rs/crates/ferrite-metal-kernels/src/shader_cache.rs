@@ -146,6 +146,16 @@ impl ShaderCache {
             // affine_embed reuses the dequant math under a gather
             // indirection (P6).
             self.libraries.get("quantized_dequantize")
+        } else if name.starts_with("nvfp4_qmm_t_nax_") {
+            // NVFP4 NAX prefill — same metallib as affine NAX (both in
+            // quantized_qmm_nax.metal). Before the generic nvfp4_qmm_t_.
+            self.libraries.get("quantized_qmm_nax")
+        } else if name.starts_with("nvfp4_qmm_t_") {
+            // NVFP4 standard prefill qmm_t — lives in quantized_qmm.metal.
+            self.libraries.get("quantized_qmm")
+        } else if name.starts_with("nvfp4_qmv_") {
+            // NVFP4 decode matvec — shares quantized_qmv.metal with affine.
+            self.libraries.get("quantized_qmv")
         } else if name.starts_with("affine_qmm_t_nax_") {
             // NAX (Apple9 / M4+) qmm_t — lives in its own metallib
             // since `quantized_qmm_nax.metal` pulls in the

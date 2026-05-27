@@ -1982,6 +1982,11 @@ pub fn starter_library() -> ImplementationLibrary {
         // rejects Affine so these win on the quantized path.
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_fp16()));
         lib.push(Box::new(crate::metal::MetalAffineQmmImpl::new_bf16()));
+        // Metal NVFP4 int4 GEMM — fires on `StorageFormat::Nvfp4`
+        // (ModelOpt NVFP4 checkpoints). `MetalGemmImpl::matches` rejects
+        // Nvfp4 so these win on the nvfp4 quantized path.
+        lib.push(Box::new(crate::metal::MetalNvfp4QmmImpl::new_fp16()));
+        lib.push(Box::new(crate::metal::MetalNvfp4QmmImpl::new_bf16()));
         // Metal MoE singletons. Match `OpKind::Moe` on MLX-affine
         // int4 expert weights; emit the shape-bearing
         // `Instruction::Metal{Fused,SharedFused}Moe` variants for the

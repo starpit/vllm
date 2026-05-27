@@ -746,6 +746,17 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let h = lit_u32(h);
             quote! { AffineQmm(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
+        I::Nvfp4Qmm(a, b, c, d, e, f, g, h) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            let h = lit_u32(h);
+            quote! { Nvfp4Qmm(#a, #b, #c, #d, #e, #f, #g, #h) }
+        }
         I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -887,6 +898,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::MetalBiasAdd(..) => "MetalBiasAdd",
         I::AttentionPrefillPaged(..) => "AttentionPrefillPaged",
         I::AffineQmm(..) => "AffineQmm",
+        I::Nvfp4Qmm(..) => "Nvfp4Qmm",
         I::SynthPreAttn(..) => "SynthPreAttn",
         I::SynthMlpPreDown(..) => "SynthMlpPreDown",
         I::SiluMul(..) => "SiluMul",
@@ -1516,7 +1528,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
-        I::AffineQmm(a, b, c, d, e, f, g, h) => match idx {
+        I::AffineQmm(a, b, c, d, e, f, g, h) | I::Nvfp4Qmm(a, b, c, d, e, f, g, h) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -2196,6 +2208,17 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             6 => I::AffineQmm(a, b, c, d, e, f, n, h),
             7 => I::AffineQmm(a, b, c, d, e, f, g, n),
             _ => panic!("AffineQmm: bad idx {idx}"),
+        },
+        I::Nvfp4Qmm(a, b, c, d, e, f, g, h) => match idx {
+            0 => I::Nvfp4Qmm(n, b, c, d, e, f, g, h),
+            1 => I::Nvfp4Qmm(a, n, c, d, e, f, g, h),
+            2 => I::Nvfp4Qmm(a, b, n, d, e, f, g, h),
+            3 => I::Nvfp4Qmm(a, b, c, n, e, f, g, h),
+            4 => I::Nvfp4Qmm(a, b, c, d, n, f, g, h),
+            5 => I::Nvfp4Qmm(a, b, c, d, e, n, g, h),
+            6 => I::Nvfp4Qmm(a, b, c, d, e, f, n, h),
+            7 => I::Nvfp4Qmm(a, b, c, d, e, f, g, n),
+            _ => panic!("Nvfp4Qmm: bad idx {idx}"),
         },
         I::SynthPreAttn(a, b, c, d, e, f, g, h, i) => match idx {
             0 => I::SynthPreAttn(n, b, c, d, e, f, g, h, i),
@@ -3511,6 +3534,7 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         // their own typed accessor (`marlin_at`, `bnb4_at`,
         // `ggml_at`, `fp8_at`).
         I::AffineQmm(..)
+        | I::Nvfp4Qmm(..)
         | I::Gemm(..)
         | I::CutlassGemm(..)
         | I::CutlassGemv(..)

@@ -1110,6 +1110,26 @@ impl Instruction {
                     F::WeightShape { n, k },
                 ],
             ),
+            // NVFP4 int4 family — same metal-only shape as `AffineQmm`.
+            Instruction::Nvfp4Qmm(
+                in_slot,
+                out_slot,
+                layer,
+                n,
+                k,
+                _group_size,
+                _bits,
+                _vector_limit,
+            ) => (
+                "Nvfp4Qmm",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("LinearLayer"),
+                    F::WeightShape { n, k },
+                ],
+            ),
             Instruction::SynthPreAttn(
                 residual_slot,
                 delta_slot,

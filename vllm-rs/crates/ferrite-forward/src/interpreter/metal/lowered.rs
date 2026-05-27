@@ -137,6 +137,23 @@ pub enum KernelId {
     /// in `quantized_qmm_nax.metallib`. Only dispatched when
     /// `is_nax_capable(profile.generation)` and `K % 64 == 0`.
     AffineQmmTNax,
+    /// NVFP4 int4 decode matvec (generic). Maps to
+    /// `nvfp4_qmv_<dtype>_s_<scale>_gs_16_b_4_batch_0` in the
+    /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
+    /// the affine `qmv` ones). Same structure as `AffineQmv`; the only
+    /// difference is the E2M1-LUT weight decode (no per-group bias).
+    Nvfp4Qmv,
+    /// NVFP4 int4 prefill matmul (transpose=true, standard tile). Maps
+    /// to `nvfp4_qmm_t_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
+    /// in `quantized_qmm.metallib`. Mirrors `AffineQmmT`.
+    Nvfp4QmmT,
+    /// NVFP4 int4 prefill matmul on NAX (Apple9 / M4+) — 64×64 MPP
+    /// matmul2d tile. Maps to
+    /// `nvfp4_qmm_t_nax_<dtype>_s_<scale>_gs_16_b_4_alN_<bool>_batch_0`
+    /// in `quantized_qmm_nax.metallib`. Dispatched (in place of
+    /// `Nvfp4QmmT`) when `is_nax_capable(profile.generation)` and
+    /// `K % 64 == 0`. Mirrors `AffineQmmTNax`.
+    Nvfp4QmmTNax,
     /// Fused `silu(gate) * up` for the decomposed q-MLP path. The
     /// macro emits this after a pair of `AffineQmm` GEMMs when the
     /// gate/up Linears are MLX-affine quantized (plan P12 branch
@@ -577,6 +594,13 @@ pub enum WeightTensor {
     /// Worker reports `MissingBias` if the layer's `linear_bias` is
     /// `None`. Only valid against `LinearLayer::AffineQuant`.
     AffineLinearBias,
+    /// Per-group folded scales on an NVFP4 LinearLayer
+    /// (`Nvfp4Linear.scales`, `[N, K/group_size]` F16 —
+    /// `e4m3_to_f32(weight_scale) / weight_global_scale`). Only valid
+    /// against `LinearLayer::Nvfp4`. NVFP4 has no per-group bias, so
+    /// there is no `Nvfp4Biases` counterpart; the packed weight is
+    /// fetched via the shared `WeightTensor::Weight`.
+    Nvfp4Scales,
     // ── MoE bundle tensors ──────────────────────────────────────────
     //
     // Valid only against `WeightBundleKind::{FusedMoe, SharedFusedMoe}`.

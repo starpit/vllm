@@ -87,6 +87,7 @@ pub use loaders::{
 pub use loaders::{
     load_layered_linear_affine_dequant_as_dense,
     load_layered_linear_affine_dequant_concat_as_dense, load_layered_linear_affine_quant,
+    load_layered_linear_nvfp4_quant, load_layered_linear_nvfp4_quant_concat,
 };
 // Stream-using and quant helpers — cuda-only.
 #[cfg(feature = "cuda")]

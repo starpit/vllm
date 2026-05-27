@@ -17,6 +17,7 @@ use crate::impl_lib::{
     first_weight_ref, gemm_nk_from_fuf, weight_storage_of,
 };
 use crate::metal::affine_qmm::{affine_qmm_opcode_shape, affine_qmm_vector_limit};
+use crate::metal::nvfp4_qmm::nvfp4_qmm_opcode_shape;
 use crate::quantization::StorageFormat;
 use crate::target::{Backend, TargetProfile};
 
@@ -375,7 +376,8 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         let gate_storage = weight_storage_of(gate_gemm);
         let gate_is_dense = matches!(gate_storage, Some(StorageFormat::Dense));
         let gate_is_affine = matches!(gate_storage, Some(StorageFormat::Affine { .. }));
-        if !gate_is_dense && !gate_is_affine {
+        let gate_is_nvfp4 = matches!(gate_storage, Some(StorageFormat::Nvfp4 { .. }));
+        if !gate_is_dense && !gate_is_affine && !gate_is_nvfp4 {
             return None;
         }
 
@@ -404,7 +406,11 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         let up_storage = weight_storage_of(up_gemm);
         let up_is_dense = matches!(up_storage, Some(StorageFormat::Dense));
         let up_is_affine = matches!(up_storage, Some(StorageFormat::Affine { .. }));
-        if gate_is_dense != up_is_dense || gate_is_affine != up_is_affine {
+        let up_is_nvfp4 = matches!(up_storage, Some(StorageFormat::Nvfp4 { .. }));
+        if gate_is_dense != up_is_dense
+            || gate_is_affine != up_is_affine
+            || gate_is_nvfp4 != up_is_nvfp4
+        {
             return None;
         }
         if first_tile_input(gate_gemm)? != first_tile_input(up_gemm)? {
@@ -455,6 +461,12 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             let storage = weight_storage_of(gate_node);
             if let Some(StorageFormat::Affine { group_size, bits }) = storage {
                 return self.affine_decomposed_cost_us(gate_node, m, n, *group_size, *bits, ctx);
+            }
+            // NVFP4 decomposes the same way (Nvfp4Qmm gate + up + SiluMul)
+            // and has no competing fused kernel, so an analytical roofline
+            // (no nvfp4 cost-sweep rows yet) is sufficient for the solver.
+            if matches!(storage, Some(StorageFormat::Nvfp4 { .. })) {
+                return self.analytical_cost_us(m, n, ctx.profile.memory_bandwidth_gbps);
             }
 
             // Dense path: existing fused-kernel cost model.
@@ -560,7 +572,7 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         //     `LinearLayer::load_affine_quant` per source so the
         //     decomposed `AffineQmm` instructions emitted in
         //     `fan_out` can each address their own Linear.
-        if storage_of_first_gemm(claimed_tiles, fuf).is_affine() {
+        if storage_of_first_gemm(claimed_tiles, fuf).is_decomposed_quant() {
             return default_required_weights(claimed_tiles, fuf, program);
         }
         FusedGateUpSiluMulImpl.required_weights(claimed_tiles, fuf, program)
@@ -580,14 +592,18 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             return Vec::new();
         }
         // SiLU: the Affine path fans out into `AffineQmm` ×2 +
-        // `SiluMul`. Register both shapes here so the per-bucket
-        // static-slice validator typechecks them regardless of
-        // whether `MetalAffineQmmImpl` claimed any standalone Gemm
-        // in this model (e.g., an MoE-only arch with no standalone
-        // q/k/v/o/down_proj). `AffineQmm` shape must match
-        // `MetalAffineQmmImpl::opcode_shape` bit-exactly — they
-        // come from the same helper to enforce that.
-        vec![affine_qmm_opcode_shape(), silu_mul_opcode_shape()]
+        // `SiluMul`, and the NVFP4 path into `Nvfp4Qmm` ×2 + `SiluMul`.
+        // Register all decomposition shapes here so the per-bucket
+        // static-slice validator typechecks them regardless of whether
+        // `MetalAffineQmmImpl` / `MetalNvfp4QmmImpl` claimed any
+        // standalone Gemm in this model. The `*Qmm` shapes must match
+        // those impls' `opcode_shape` bit-exactly — they come from the
+        // same helpers to enforce that.
+        vec![
+            affine_qmm_opcode_shape(),
+            nvfp4_qmm_opcode_shape(),
+            silu_mul_opcode_shape(),
+        ]
     }
 
     fn fan_out(
@@ -605,10 +621,10 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         // (decomposed `AffineQmm` + `AffineQmm` + `SiluMul`) on the
         // gate Gemm's weight storage. `matches()` already enforces
         // gate/up agreement, so inspecting one suffices.
-        if !storage_of_first_gemm(&m.claimed_tiles, fuf).is_affine() {
+        if !storage_of_first_gemm(&m.claimed_tiles, fuf).is_decomposed_quant() {
             return FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots);
         }
-        Some(affine_decomposed_fan_out(m, fuf, program, bounds, slots))
+        Some(quant_decomposed_fan_out(m, fuf, program, bounds, slots))
     }
 }
 
@@ -619,12 +635,22 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
 enum GateStorage {
     Dense,
     Affine,
+    Nvfp4,
     Other,
 }
 
 impl GateStorage {
     fn is_affine(self) -> bool {
         matches!(self, GateStorage::Affine)
+    }
+    fn is_nvfp4(self) -> bool {
+        matches!(self, GateStorage::Nvfp4)
+    }
+    /// Both 4-bit dequant-on-read formats decompose the fused MLP into
+    /// `(qmm gate, qmm up, SiluMul)` — they share `required_weights` /
+    /// `fan_out` handling, differing only in the emitted opcode.
+    fn is_decomposed_quant(self) -> bool {
+        self.is_affine() || self.is_nvfp4()
     }
 }
 
@@ -635,6 +661,7 @@ fn storage_of_first_gemm(claimed_tiles: &[TileId], fuf: &Fuf) -> GateStorage {
             return match weight_storage_of(n) {
                 Some(StorageFormat::Dense) => GateStorage::Dense,
                 Some(StorageFormat::Affine { .. }) => GateStorage::Affine,
+                Some(StorageFormat::Nvfp4 { .. }) => GateStorage::Nvfp4,
                 _ => GateStorage::Other,
             };
         }
@@ -657,13 +684,13 @@ fn silu_mul_opcode_shape() -> OpcodeShape {
     )
 }
 
-/// Build the three-instruction decomposition (AffineQmm gate, AffineQmm
-/// up, SiluMul) used when the fused gate-up SiLU MLP claim's Gemms
-/// have MLX-affine storage. Mirrors plan P12 branch (i): the macro
-/// composes existing primitives instead of taking a hand-rolled
-/// fused-quant-MLP kernel (which would violate
-/// `feedback_no_handcoded_fusion`).
-fn affine_decomposed_fan_out(
+/// Build the three-instruction decomposition (`qmm` gate, `qmm` up,
+/// SiluMul) used when the fused gate-up SiLU MLP claim's Gemms have a
+/// dequant-on-read 4-bit storage (MLX-affine → `AffineQmm`, NVFP4 →
+/// `Nvfp4Qmm`; chosen per-Gemm by [`decomposed_qmm_inst`]). Mirrors
+/// plan P12 branch (i): the macro composes existing primitives instead
+/// of a hand-rolled fused-quant-MLP kernel (`feedback_no_handcoded_fusion`).
+fn quant_decomposed_fan_out(
     m: &MatchInfo,
     fuf: &Fuf,
     program: &Program,
@@ -739,50 +766,69 @@ fn affine_decomposed_fan_out(
         .expect("MetalFusedGateUpSiluMul(Affine): gate (N, K) must resolve from FUF + bounds");
     let (up_n, up_k) = gemm_nk_from_fuf(fuf, up_node, bounds)
         .expect("MetalFusedGateUpSiluMul(Affine): up (N, K) must resolve from FUF + bounds");
-    let (gate_gs, gate_bits) = match weight_storage_of(gate_node) {
-        Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
-        other => panic!(
-            "MetalFusedGateUpSiluMul(Affine) fan_out: gate Gemm storage isn't Affine ({other:?})"
-        ),
-    };
-    let (up_gs, up_bits) = match weight_storage_of(up_node) {
-        Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
-        other => panic!(
-            "MetalFusedGateUpSiluMul(Affine) fan_out: up Gemm storage isn't Affine ({other:?})"
-        ),
-    };
-    let gate_vl = affine_qmm_vector_limit(gate_k, gate_n);
-    let up_vl = affine_qmm_vector_limit(up_k, up_n);
-
     // Weight info (LinearLayer for gate/up) flows through
     // `required_weights()` — codegen attaches slots in declaration
-    // order, so each `AffineQmm` row gets its own
-    // `(tape_index, op_idx, slot=0)` arm against the right
-    // `Weights::<gate|up>_proj` base.
+    // order, so each `*Qmm` row gets its own `(tape_index, op_idx,
+    // slot=0)` arm against the right `Weights::<gate|up>_proj` base.
+    // The opcode (AffineQmm vs Nvfp4Qmm) is chosen per-Gemm from its
+    // weight storage by `decomposed_qmm_inst`.
     let _ = (gate_base_ident, up_base_ident);
-    let gate_inst = ferrite_forward::Instruction::AffineQmm(
+    let gate_inst = decomposed_qmm_inst(
+        gate_node,
         in_slot_idx,
         gate_out_idx,
         gate_layer_lit,
         gate_n,
         gate_k,
-        gate_gs,
-        gate_bits,
-        gate_vl,
     );
-    let up_inst = ferrite_forward::Instruction::AffineQmm(
-        in_slot_idx,
-        up_out_idx,
-        up_layer_lit,
-        up_n,
-        up_k,
-        up_gs,
-        up_bits,
-        up_vl,
-    );
+    let up_inst = decomposed_qmm_inst(up_node, in_slot_idx, up_out_idx, up_layer_lit, up_n, up_k);
     let silu_mul_inst =
         ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx);
     vec![gate_inst, up_inst, silu_mul_inst]
+}
+
+/// Emit the per-Gemm decode instruction for the decomposed quant MLP,
+/// choosing the opcode from the Gemm's weight storage: MLX-affine →
+/// `AffineQmm` (carries its `group_size`/`bits`), NVFP4 → `Nvfp4Qmm`
+/// (group_size from storage, bits always 4). The `vector_limit`
+/// (decode↔prefill boundary) comes from the same `(K, N)` helper both
+/// formats share.
+fn decomposed_qmm_inst(
+    node: &crate::fuf::FufNode,
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    n: u32,
+    k: u32,
+) -> ferrite_forward::Instruction {
+    let vl = affine_qmm_vector_limit(k, n);
+    match weight_storage_of(node) {
+        Some(StorageFormat::Affine { group_size, bits }) => {
+            ferrite_forward::Instruction::AffineQmm(
+                in_slot,
+                out_slot,
+                layer,
+                n,
+                k,
+                *group_size,
+                *bits,
+                vl,
+            )
+        }
+        Some(StorageFormat::Nvfp4 { group_size }) => ferrite_forward::Instruction::Nvfp4Qmm(
+            in_slot,
+            out_slot,
+            layer,
+            n,
+            k,
+            *group_size,
+            4,
+            vl,
+        ),
+        other => {
+            panic!("decomposed_qmm_inst: gate/up Gemm storage isn't a decomposed quant ({other:?})")
+        }
+    }
 }
 
 #[cfg(all(test, feature = "metal"))]

@@ -212,6 +212,50 @@ pub fn load_layered_linear_affine_quant(
         .collect()
 }
 
+/// NVFP4 int4 layered forward-time load (Metal-only). One
+/// `LinearLayer::Nvfp4` per decoder layer, packed E2M1 weight + folded
+/// F16 scales kept on device for the `nvfp4_qmv` / `nvfp4_qmm_t`
+/// dispatchers `MetalNvfp4QmmImpl` emits. Mirrors
+/// [`load_layered_linear_affine_quant`].
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_nvfp4_quant(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffix: &str,
+    group_size: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            LinearLayer::load_nvfp4_quant(
+                gw,
+                &layer_weight_path_with_root(root, layer, suffix),
+                group_size,
+            )
+        })
+        .collect()
+}
+
+/// Fused-concat sibling of [`load_layered_linear_nvfp4_quant`]. One
+/// `LinearLayer::Nvfp4` per layer, each the byte-concat of the per-layer
+/// NVFP4 prefixes (gate / up, or q / k / v).
+#[cfg(feature = "metal")]
+pub fn load_layered_linear_nvfp4_quant_concat(
+    gw: &mut GpuWeights,
+    n_layers: u32,
+    root: &str,
+    suffixes: &[&str],
+    group_size: u32,
+) -> Result<Vec<LinearLayer>> {
+    (0..n_layers)
+        .map(|layer| {
+            let paths = concat_paths_for_layer(root, layer, suffixes);
+            let refs = as_str_refs(&paths);
+            LinearLayer::load_nvfp4_quant_concat(gw, &refs, group_size)
+        })
+        .collect()
+}
+
 /// MLX-affine int4 layered dequant-as-dense load (Metal-only). INT4
 /// P2 slow-reference path: CPU-dequantize each per-layer affine
 /// triple into a BF16 Dense Linear. Mirrors

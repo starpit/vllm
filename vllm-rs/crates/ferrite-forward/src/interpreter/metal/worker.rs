@@ -1124,14 +1124,26 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                     .ok_or(WorkerError::WeightLookupFailed {
                         reason: "AffineQuant linear_bias requested but not present",
                     })?,
-                // Mismatch: affine WeightTensor on a Dense layer (or vice versa),
-                // or any quant arm we don't expect to reach the Metal worker.
+                // NVFP4 path: packed weight via the shared `Weight` role,
+                // folded per-group scales via `Nvfp4Scales`. No biases.
+                #[cfg(feature = "metal")]
+                (WeightTensor::Weight, ferrite_kernels::layers::LinearLayer::Nvfp4(_)) => {
+                    l.nvfp4_weight()
+                }
+                #[cfg(feature = "metal")]
+                (WeightTensor::Nvfp4Scales, ferrite_kernels::layers::LinearLayer::Nvfp4(_)) => {
+                    l.nvfp4_scales()
+                }
+                // Mismatch: affine/nvfp4 WeightTensor on a Dense layer (or
+                // vice versa), or any quant arm we don't expect to reach
+                // the Metal worker.
                 (WeightTensor::AffineScales, _)
                 | (WeightTensor::AffineBiases, _)
-                | (WeightTensor::AffineLinearBias, _) => {
+                | (WeightTensor::AffineLinearBias, _)
+                | (WeightTensor::Nvfp4Scales, _) => {
                     return Err(WorkerError::WeightLookupFailed {
-                        reason: "AffineScales/AffineBiases/AffineLinearBias requested \
-                                 but LinearLayer is not AffineQuant",
+                        reason: "AffineScales/AffineBiases/AffineLinearBias/Nvfp4Scales requested \
+                                 but LinearLayer is not the matching quant variant",
                     });
                 }
                 (WeightTensor::Weight | WeightTensor::Bias, _) => {
@@ -1184,10 +1196,10 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 WeightTensor::Weight => e.weight,
                 WeightTensor::AffineScales => e.scales,
                 WeightTensor::AffineBiases => e.affine_biases,
-                WeightTensor::Bias | WeightTensor::AffineLinearBias => {
+                WeightTensor::Bias | WeightTensor::AffineLinearBias | WeightTensor::Nvfp4Scales => {
                     return Err(WorkerError::WeightLookupFailed {
-                        reason: "AffineQuantEmbedding has no linear-layer bias \
-                                 — embeddings only carry (weight, scales, biases)",
+                        reason: "AffineQuantEmbedding carries only (weight, scales, biases) \
+                                 — no linear-layer bias, and NVFP4 embeddings stay dense",
                     });
                 }
                 WeightTensor::MoeRouterGate
@@ -1268,7 +1280,8 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 | WeightTensor::Bias
                 | WeightTensor::AffineScales
                 | WeightTensor::AffineBiases
-                | WeightTensor::AffineLinearBias => {
+                | WeightTensor::AffineLinearBias
+                | WeightTensor::Nvfp4Scales => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "non-Moe WeightTensor variant requested against FusedMoe bundle",
                     });
@@ -1320,7 +1333,8 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 | WeightTensor::Bias
                 | WeightTensor::AffineScales
                 | WeightTensor::AffineBiases
-                | WeightTensor::AffineLinearBias => {
+                | WeightTensor::AffineLinearBias
+                | WeightTensor::Nvfp4Scales => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "non-Moe WeightTensor variant requested against SharedFusedMoe \
                                  bundle",

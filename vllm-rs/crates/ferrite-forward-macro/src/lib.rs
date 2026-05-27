@@ -266,6 +266,9 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
             let qe = if *quantize_embed { "-qe" } else { "" };
             format!("q:affine-b{bits}-g{group_size}{qe}")
         }
+        Some(crate::quantization::QuantMethod::Nvfp4 { group_size }) => {
+            format!("q:nvfp4-g{group_size}")
+        }
     }
 }
 
@@ -1091,6 +1094,7 @@ fn compile_common(
                     } else if (cfg!(feature = "cuda") && name.starts_with("cutlass"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_gemm_"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_affine_qmm_"))
+                        || (cfg!(feature = "metal") && name.starts_with("metal_nvfp4_qmm_"))
                         || (cfg!(feature = "metal") && name.starts_with("metal_synth_"))
                     {
                         // Metal GEMM is currently routed through MPS

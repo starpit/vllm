@@ -827,6 +827,238 @@ impl AffineQuantLinear {
 }
 
 // ---------------------------------------------------------------------------
+// Nvfp4Linear — NVIDIA ModelOpt NVFP4 4-bit linear (Metal-only)
+// ---------------------------------------------------------------------------
+
+/// Decode one `float8_e4m3fn` byte to `f32`. Format: 1 sign / 4 exponent
+/// (bias 7) / 3 mantissa. e4m3fn has no infinities; the only NaN is the
+/// `S.1111.111` pattern (others in the `1111` exponent are normal numbers,
+/// max magnitude 448). Used to fold the per-block NVFP4 weight scales into
+/// `f32` at load time. Mirrors `torch.float8_e4m3fn → float32`.
+#[cfg(feature = "metal")]
+pub fn e4m3_to_f32(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = ((byte >> 3) & 0x0F) as i32;
+    let mant = (byte & 0x07) as i32;
+    if exp == 0x0F && mant == 0x07 {
+        return f32::NAN;
+    }
+    let mag = if exp == 0 {
+        // Subnormal: mant * 2^(1-7) / 8 = mant * 2^(-9).
+        (mant as f32) * 2.0f32.powi(-9)
+    } else {
+        // Normal: (1 + mant/8) * 2^(exp-7).
+        (1.0 + (mant as f32) / 8.0) * 2.0f32.powi(exp - 7)
+    };
+    sign * mag
+}
+
+/// NVIDIA ModelOpt NVFP4 4-bit quantized linear (Metal-only).
+///
+/// On disk: `.weight` is `uint8 [N, K/2]` (two packed E2M1 codes per byte,
+/// low nibble = even element), `.weight_scale` is `float8_e4m3 [N, K/16]`
+/// (per-block scale), `.weight_scale_2` is an `f32` per-tensor global scale.
+///
+/// At load we fold the two-level scale into a single per-group `F16` tensor
+/// `scales[n,g] = e4m3_to_f32(weight_scale[n,g]) * weight_scale_2`, so
+/// the `nvfp4_qmv` / `nvfp4_qmm_t` kernels reconstruct exactly
+/// `w = E2M1_signed[code] * scales[n, k/16]` (matching Python vLLM's
+/// `dequantize_to_dtype`). Weight-only dequant — activations stay bf16/f16.
+/// No per-group bias (NVFP4 is symmetric); `linear_bias` is the optional
+/// fp linear-layer bias, distinct from any quantization offset.
+///
+/// As with `AffineQuantLinear`, there's no `forward()` here — Metal forwards
+/// go through the macro-emitted `Instruction` stream and the worker resolver.
+#[cfg(feature = "metal")]
+pub struct Nvfp4Linear {
+    /// Packed E2M1 weights, shape `[N, K/2]`, dtype `U8`.
+    pub weight: ferrite_cuda_core::tensor::GpuTensor,
+    /// Per-group folded scales `[N, K/group_size]`, dtype `F16` —
+    /// `e4m3_to_f32(weight_scale) * weight_scale_2`.
+    pub scales: ferrite_cuda_core::tensor::GpuTensor,
+    /// Optional fp linear-layer bias `[N]` (`<prefix>.bias`).
+    pub linear_bias: Option<ferrite_cuda_core::tensor::GpuTensor>,
+    pub in_features: usize,
+    pub out_features: usize,
+    /// NVFP4 block size — 16 for every ModelOpt checkpoint.
+    pub group_size: u32,
+    /// Always 4 (NVFP4 is a 4-bit format).
+    pub bits: u32,
+}
+
+#[cfg(feature = "metal")]
+impl Nvfp4Linear {
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Load from `GpuWeights` by prefix. Reads `<prefix>.weight` (`U8`,
+    /// `[N, K/2]`), `<prefix>.weight_scale` (`float8_e4m3`, `[N, K/gs]`),
+    /// `<prefix>.weight_scale_2` (`f32` scalar / per-partition → `max`),
+    /// and optional `<prefix>.bias`. Folds the two-level scale into a
+    /// single `F16` per-group `scales` tensor on the CPU and uploads it.
+    pub fn load(weights: &mut GpuWeights, prefix: &str, group_size: u32) -> Result<Self> {
+        // Packed E2M1 codes — keep `U8`, no float cast.
+        let weight = weights.take(&format!("{prefix}.weight"))?;
+
+        // Per-block scale: float8_e4m3, [N, K/group_size]. Read raw bytes.
+        let (sf_bytes, sf_shape, sf_dtype) = weights.take_cpu(&format!("{prefix}.weight_scale"))?;
+        anyhow::ensure!(
+            sf_dtype == DType::Fp8E4m3,
+            "NVFP4 {prefix}.weight_scale must be float8_e4m3, got {sf_dtype}"
+        );
+
+        // Per-tensor global scale: f32 scalar, or per-partition vector
+        // collapsed via `max` (matches Python `weight_scale_2.max()`).
+        // ModelOpt names it `weight_scale_2`; compressed-tensors uses
+        // `weight_global_scale` — accept either.
+        let gscale_name = if weights.contains(&format!("{prefix}.weight_scale_2")) {
+            format!("{prefix}.weight_scale_2")
+        } else {
+            format!("{prefix}.weight_global_scale")
+        };
+        let gscale = weights
+            .take_to_cpu_f32(&gscale_name)?
+            .into_iter()
+            .fold(f32::NEG_INFINITY, f32::max);
+        anyhow::ensure!(
+            gscale.is_finite() && gscale != 0.0,
+            "NVFP4 {gscale_name} global scale is {gscale}, expected finite non-zero"
+        );
+
+        // Fold: scales[n,g] = e4m3_to_f32(sf[n,g]) * gscale, stored F16.
+        // (`weight_scale_2` is the per-tensor multiplier — the kernel
+        // reconstructs `w = E2M1[code] * e4m3(weight_scale) * weight_scale_2`.)
+        let folded: Vec<u8> = sf_bytes
+            .iter()
+            .flat_map(|&b| half::f16::from_f32(e4m3_to_f32(b) * gscale).to_le_bytes())
+            .collect();
+        let scales = weights.alloc_packed_from_host(&folded, &sf_shape, DType::F16)?;
+
+        let bias_name = format!("{prefix}.bias");
+        let linear_bias = if weights.contains(&bias_name) {
+            Some(weights.take(&bias_name)?)
+        } else {
+            None
+        };
+
+        let out_features = weight.dim(0);
+        // Two E2M1 codes per packed byte.
+        let in_features = weight.dim(1) * 2;
+        Ok(Self {
+            weight,
+            scales,
+            linear_bias,
+            in_features,
+            out_features,
+            group_size,
+            bits: 4,
+        })
+    }
+
+    /// Load a fused (qkv_proj / gate_up_proj) NVFP4 linear from multiple
+    /// on-disk prefixes. Each prefix is folded independently (its own
+    /// global scale baked into the per-group F16 scales), then the
+    /// packed weights and folded scales are byte-concatenated along
+    /// dim 0 (out_features) — valid because dim 0 is the outermost axis,
+    /// so rows are contiguous and per-row dequant is unaffected by the
+    /// concat. No fused linear bias (ModelOpt fused projections ship
+    /// none); panics if a prefix carries a `.bias` so it isn't silently
+    /// dropped.
+    pub fn load_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !prefixes.is_empty(),
+            "Nvfp4Linear::load_concat: empty prefix list"
+        );
+        let mut weight_bytes: Vec<u8> = Vec::new();
+        let mut scale_bytes: Vec<u8> = Vec::new();
+        let mut total_n = 0usize;
+        let mut packed_k: Option<usize> = None; // K/2
+        let mut scale_cols: Option<usize> = None; // K/group_size
+        for prefix in prefixes {
+            anyhow::ensure!(
+                !weights.contains(&format!("{prefix}.bias")),
+                "NVFP4 fused concat {prefix}.bias present — fused-projection bias not supported"
+            );
+            let (w_bytes, w_shape, w_dtype) = weights.take_cpu(&format!("{prefix}.weight"))?;
+            anyhow::ensure!(
+                w_dtype == DType::U8 && w_shape.len() == 2,
+                "NVFP4 {prefix}.weight must be U8 [N, K/2], got {w_dtype} {w_shape:?}"
+            );
+            let (ni, pk) = (w_shape[0], w_shape[1]);
+            match packed_k {
+                Some(pk0) => anyhow::ensure!(
+                    pk == pk0,
+                    "NVFP4 concat K mismatch: {prefix} packed_k {pk} != {pk0}"
+                ),
+                None => packed_k = Some(pk),
+            }
+
+            let (sf_bytes, sf_shape, sf_dtype) =
+                weights.take_cpu(&format!("{prefix}.weight_scale"))?;
+            anyhow::ensure!(
+                sf_dtype == DType::Fp8E4m3 && sf_shape.len() == 2 && sf_shape[0] == ni,
+                "NVFP4 {prefix}.weight_scale must be float8_e4m3 [{ni}, K/gs], got {sf_dtype} {sf_shape:?}"
+            );
+            match scale_cols {
+                Some(sc0) => anyhow::ensure!(
+                    sf_shape[1] == sc0,
+                    "NVFP4 concat scale-cols mismatch: {prefix} {} != {sc0}",
+                    sf_shape[1]
+                ),
+                None => scale_cols = Some(sf_shape[1]),
+            }
+
+            let gscale_name = if weights.contains(&format!("{prefix}.weight_scale_2")) {
+                format!("{prefix}.weight_scale_2")
+            } else {
+                format!("{prefix}.weight_global_scale")
+            };
+            let gscale = weights
+                .take_to_cpu_f32(&gscale_name)?
+                .into_iter()
+                .fold(f32::NEG_INFINITY, f32::max);
+            anyhow::ensure!(
+                gscale.is_finite() && gscale != 0.0,
+                "NVFP4 {gscale_name} global scale is {gscale}, expected finite non-zero"
+            );
+
+            // dim-0 byte concat: append this prefix's rows.
+            weight_bytes.extend_from_slice(&w_bytes);
+            scale_bytes.extend(
+                sf_bytes
+                    .iter()
+                    .flat_map(|&b| half::f16::from_f32(e4m3_to_f32(b) * gscale).to_le_bytes()),
+            );
+            total_n += ni;
+        }
+        let packed_k = packed_k.expect("at least one prefix");
+        let scale_cols = scale_cols.expect("at least one prefix");
+        let weight =
+            weights.alloc_packed_from_host(&weight_bytes, &[total_n, packed_k], DType::U8)?;
+        let scales =
+            weights.alloc_packed_from_host(&scale_bytes, &[total_n, scale_cols], DType::F16)?;
+        Ok(Self {
+            weight,
+            scales,
+            linear_bias: None,
+            in_features: packed_k * 2,
+            out_features: total_n,
+            group_size,
+            bits: 4,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AffineQuantEmbedding — MLX-affine int4 quantized token embedding (Metal-only)
 // ---------------------------------------------------------------------------
 
@@ -942,6 +1174,11 @@ pub enum LinearLayer {
     /// to the Metal backend.
     #[cfg(feature = "metal")]
     AffineQuant(Box<AffineQuantLinear>),
+    /// NVIDIA ModelOpt NVFP4 4-bit quantization (Metal-only). Like
+    /// `AffineQuant` it's dequant-on-read; the difference is the decode
+    /// (E2M1 LUT, no per-group bias) — see `Nvfp4Linear`.
+    #[cfg(feature = "metal")]
+    Nvfp4(Box<Nvfp4Linear>),
 }
 
 impl LinearLayer {
@@ -1081,6 +1318,11 @@ impl LinearLayer {
                 "dense_weight() called on AffineQuant LinearLayer — \
                  use affine_weight() / affine_scales() / affine_biases() instead"
             ),
+            #[cfg(feature = "metal")]
+            Self::Nvfp4(_) => panic!(
+                "dense_weight() called on Nvfp4 LinearLayer — \
+                 use nvfp4_weight() / nvfp4_scales() instead"
+            ),
         }
     }
 
@@ -1120,6 +1362,8 @@ impl LinearLayer {
             Self::Fp8Block(l) => l.out_features(),
             #[cfg(feature = "metal")]
             Self::AffineQuant(l) => l.out_features(),
+            #[cfg(feature = "metal")]
+            Self::Nvfp4(l) => l.out_features(),
             #[cfg(not(feature = "cuda"))]
             _ => panic!("out_features: non-Dense LinearLayer not supported on this backend"),
         }
@@ -1142,6 +1386,8 @@ impl LinearLayer {
             Self::Fp8Block(l) => l.in_features(),
             #[cfg(feature = "metal")]
             Self::AffineQuant(l) => l.in_features(),
+            #[cfg(feature = "metal")]
+            Self::Nvfp4(l) => l.in_features(),
             #[cfg(not(feature = "cuda"))]
             _ => panic!("in_features: non-Dense LinearLayer not supported on this backend"),
         }
@@ -1206,6 +1452,52 @@ impl LinearLayer {
         }
     }
 
+    /// Access the NVFP4 packed weight tensor (`[N, K/2]` U8, two E2M1
+    /// codes per byte). Panics on every other arm — gated to Metal /
+    /// Nvfp4 layers, like the `affine_*` accessors.
+    #[cfg(feature = "metal")]
+    pub fn nvfp4_weight(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::Nvfp4(l) => l.weight,
+            _ => panic!("nvfp4_weight() called on non-Nvfp4 LinearLayer"),
+        }
+    }
+
+    /// Per-group folded scales (`[N, K/group_size]` F16). See `nvfp4_weight`.
+    #[cfg(feature = "metal")]
+    pub fn nvfp4_scales(&self) -> ferrite_cuda_core::tensor::GpuTensor {
+        match self {
+            Self::Nvfp4(l) => l.scales,
+            _ => panic!("nvfp4_scales() called on non-Nvfp4 LinearLayer"),
+        }
+    }
+
+    /// Optional fp linear-layer bias on an NVFP4 layer. `[N]` in the
+    /// model's activation dtype. See `nvfp4_weight`.
+    #[cfg(feature = "metal")]
+    pub fn nvfp4_linear_bias(&self) -> Option<ferrite_cuda_core::tensor::GpuTensor> {
+        match self {
+            Self::Nvfp4(l) => l.linear_bias,
+            _ => panic!("nvfp4_linear_bias() called on non-Nvfp4 LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn nvfp4_group_size(&self) -> u32 {
+        match self {
+            Self::Nvfp4(l) => l.group_size,
+            _ => panic!("nvfp4_group_size() called on non-Nvfp4 LinearLayer"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn nvfp4_bits(&self) -> u32 {
+        match self {
+            Self::Nvfp4(l) => l.bits,
+            _ => panic!("nvfp4_bits() called on non-Nvfp4 LinearLayer"),
+        }
+    }
+
     /// Load a single dense bf16/fp16 linear layer by safetensors prefix
     /// (e.g. `"model.lm_head"` → reads `"model.lm_head.weight"` and an
     /// optional `".bias"`).
@@ -1248,6 +1540,34 @@ impl LinearLayer {
     ) -> Result<Self> {
         Ok(Self::AffineQuant(Box::new(AffineQuantLinear::load(
             weights, prefix, group_size, bits,
+        )?)))
+    }
+
+    /// Load an NVFP4 4-bit quantized linear by safetensors prefix
+    /// (Metal-only). Reads the `.weight` / `.weight_scale` /
+    /// `.weight_scale_2` triple and optional `.bias` via
+    /// [`Nvfp4Linear::load`].
+    #[cfg(feature = "metal")]
+    pub fn load_nvfp4_quant(
+        weights: &mut GpuWeights,
+        prefix: &str,
+        group_size: u32,
+    ) -> Result<Self> {
+        Ok(Self::Nvfp4(Box::new(Nvfp4Linear::load(
+            weights, prefix, group_size,
+        )?)))
+    }
+
+    /// Load a fused (qkv_proj / gate_up_proj) NVFP4 linear from multiple
+    /// safetensors prefixes (Metal-only). See [`Nvfp4Linear::load_concat`].
+    #[cfg(feature = "metal")]
+    pub fn load_nvfp4_quant_concat(
+        weights: &mut GpuWeights,
+        prefixes: &[&str],
+        group_size: u32,
+    ) -> Result<Self> {
+        Ok(Self::Nvfp4(Box::new(Nvfp4Linear::load_concat(
+            weights, prefixes, group_size,
         )?)))
     }
 

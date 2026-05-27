@@ -863,6 +863,22 @@ pub enum Instruction {
     ///
     /// CUDA eval is `unreachable!` — emit only on the metal forward.
     AffineQmm(u32, u32, u32, u32, u32, u32, u32, u32),
+    /// NVIDIA ModelOpt NVFP4 int4 matmul (transpose=true). Metal-only.
+    /// Identical shape and dispatch to `AffineQmm` — the only difference
+    /// is the in-shader weight decode (E2M1 LUT, no per-group bias). The
+    /// `LinearLayer` resolved through `WeightAccessors::linear_at` must be
+    /// `Nvfp4`; the metal worker reads the quant accessors (packed E2M1
+    /// weight, folded per-group scales, optional fp linear bias) through
+    /// the `WeightTensor::Nvfp4*` arms.
+    ///
+    /// Tuple fields: `(in_slot, out_slot, layer, n, k, group_size, bits,
+    /// vector_limit)` — `group_size` is 16, `bits` is 4. `vector_limit` is
+    /// the matvec/matmul boundary baked at codegen time (same source as
+    /// `AffineQmm`). M < limit → nvfp4_qmv (decode); M ≥ limit →
+    /// nvfp4_qmm_t (prefill).
+    ///
+    /// CUDA eval is `unreachable!` — emit only on the metal forward.
+    Nvfp4Qmm(u32, u32, u32, u32, u32, u32, u32, u32),
     /// Compiler-synthesized pre-attention chunk megakernel. Metal-only.
     /// Combines (Add → RmsNorm → 3×AffineQmv → RoPE → paged KV-cache
     /// write) into one dispatch. The kernel itself is generated at
@@ -3312,6 +3328,13 @@ impl Instruction {
                 unreachable!(
                     "Instruction::AffineQmm is metal-only — the macro must \
                      not emit it on the cuda forward (Affine weights stay \
+                     in StorageFormat::Dense on cuda by the FUF downgrade)"
+                );
+            }
+            Instruction::Nvfp4Qmm(..) => {
+                unreachable!(
+                    "Instruction::Nvfp4Qmm is metal-only — the macro must \
+                     not emit it on the cuda forward (NVFP4 weights stay \
                      in StorageFormat::Dense on cuda by the FUF downgrade)"
                 );
             }

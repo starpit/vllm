@@ -4768,6 +4768,32 @@ fn emit_weights_accessor_methods(accessors: &[WeightAccessor]) -> TokenStream {
     }
 }
 
+/// The `WeightAccessors` trait method a [`WeightKind`] resolves through.
+/// Shared by [`emit_weight_accessors_impl`] (which keys its per-(op_idx,
+/// kind) slot-ordinal walk on this) and the PD-wavefront bridge's
+/// `to_wavefront::build_base_to_loc` (which must reproduce the IDENTICAL
+/// slot ordinals so the wavefront `WeightLoc`s key the SAME runtime match
+/// arms). Keep the two in lockstep by routing both through this fn.
+pub(crate) fn weight_kind_accessor_method(kind: &crate::impl_lib::WeightKind) -> &'static str {
+    use crate::impl_lib::WeightKind;
+    match kind {
+        WeightKind::RmsNorm => "rms_norm_at",
+        WeightKind::Embedding => "embedding_at",
+        WeightKind::Linear => "linear_at",
+        WeightKind::LayerNorm => "layer_norm_at",
+        WeightKind::Marlin => "marlin_at",
+        WeightKind::Bnb4 => "bnb4_at",
+        WeightKind::Fp8 => "fp8_at",
+        WeightKind::DeepSeekMoe => "deepseek_moe_at",
+        WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
+        WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
+        WeightKind::FusedMoe => "fused_moe_at",
+        WeightKind::SharedFusedMoe => "shared_fused_moe_at",
+        WeightKind::CosSin => "cos_sin_at",
+        WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
+    }
+}
+
 /// Emit `impl ::ferrite_forward::WeightAccessors for Weights { ... }`
 /// keyed on `(tape_index, op_idx)` per the typed-fanout design.
 ///
@@ -4836,22 +4862,7 @@ fn emit_weight_accessors_impl(
                 let op_lit = proc_macro2::Literal::u32_unsuffixed(op_idx as u32);
                 let mut counts: HashMap<&'static str, u32> = HashMap::new();
                 for slot in slots {
-                    let key = match slot.kind {
-                        WeightKind::RmsNorm => "rms_norm_at",
-                        WeightKind::Embedding => "embedding_at",
-                        WeightKind::Linear => "linear_at",
-                        WeightKind::LayerNorm => "layer_norm_at",
-                        WeightKind::Marlin => "marlin_at",
-                        WeightKind::Bnb4 => "bnb4_at",
-                        WeightKind::Fp8 => "fp8_at",
-                        WeightKind::DeepSeekMoe => "deepseek_moe_at",
-                        WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
-                        WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
-                        WeightKind::FusedMoe => "fused_moe_at",
-                        WeightKind::SharedFusedMoe => "shared_fused_moe_at",
-                        WeightKind::CosSin => "cos_sin_at",
-                        WeightKind::AffineQuantEmbedding => "affine_quant_embedding_at",
-                    };
+                    let key = weight_kind_accessor_method(&slot.kind);
                     let n = counts.entry(key).or_insert(0);
                     let slot_lit = proc_macro2::Literal::u32_unsuffixed(*n);
                     inventory.push((
@@ -5905,6 +5916,111 @@ fn emit_canonical_params_impl(
     }
 }
 
+/// PD-wavefront macro-emission (env-gated, diagnostic): route the solved
+/// decode FUF through the FULL compile-time wavefront pipeline — bridge
+/// (`to_wavefront`) → silu·mul fusion → region N-block tiling → wavefront
+/// schedule → `mega::serialize` — with REAL per-weight [`WeightLoc`]s
+/// recovered from this decode bucket's `weight_slots`, and dump the result.
+///
+/// Lives here (not the pre-emit drive) because `weight_slots` — the real
+/// locator source — only exists after lowering + loop compression, and the
+/// `(bucket, op_idx, slot)` triples it produces must match the very match
+/// table [`emit_weight_accessors_impl`] builds from the same
+/// `canonical_lowered`. Strictly diagnostic: every fallible step logs and
+/// returns; it never gates a build.
+#[allow(clippy::too_many_arguments)]
+fn dump_wavefront_mega(
+    program: &Program,
+    model: &ModelParams,
+    fuf: &Fuf,
+    decode_asn: &crate::solver::Assignment,
+    inferred: &crate::shape::Inferred,
+    decode_bounds: &BTreeMap<String, u64>,
+    backbone_slots: &[Vec<WeightSlot>],
+    lm_head_slots: &[Vec<WeightSlot>],
+    bb_bucket_id: u32,
+) {
+    use crate::to_wavefront;
+    let stem = model.source_stem.as_str();
+    let lowered = match to_wavefront::lower_decode_to_wavefront(
+        fuf,
+        decode_asn,
+        inferred,
+        decode_bounds,
+        model,
+        0,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[wavefront] {stem}: not lowered — {e}");
+            return;
+        }
+    };
+    let g = ferrite_wavefront::lower::lower(&lowered.input);
+    let st = to_wavefront::stats(fuf, decode_asn, &lowered);
+    let valid = match ferrite_wavefront::subtile::validate(&g) {
+        Ok(n) => format!("valid ({n} nodes)"),
+        Err(e) => format!("INVALID: {e}"),
+    };
+    eprintln!(
+        "[wavefront] {stem}: {} fuf tiles, {} subgraphs → {} sources ({} weights, {} prefix-kv) , \
+         {} ops, {} subtile nodes [{}]; ops {:?}",
+        st.fuf_tiles,
+        st.subgraphs,
+        st.sources,
+        st.weight_sources,
+        st.prefix_sources,
+        st.ops,
+        g.nodes.len(),
+        valid,
+        st.op_histogram,
+    );
+
+    // The full compile-time artifact, now with REAL weight locators.
+    use ferrite_wavefront::region_schedule::{ScheduleParams, schedule_wavefront};
+    let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
+    let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
+    let (descs, report) =
+        to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
+    let rg = ferrite_wavefront::region::lower_region(&fused, 256);
+    let sched = schedule_wavefront(
+        &rg,
+        |n| (n.output.region.rows.len * n.output.region.cols.len) as f64,
+        ScheduleParams {
+            num_workers: 10,
+            wait_cost_us: 0.18,
+        },
+    );
+    let geom = ferrite_wavefront::mega::Geometry {
+        act_elem: 2,
+        block_size: 16,
+        max_blocks: 64,
+    };
+    match ferrite_wavefront::mega::serialize(&rg, &sched, &descs, geom) {
+        Ok(prog) => eprintln!(
+            "[wavefront-mega] {stem}: {} region nodes → {} tape instrs ({} node-computes, \
+             {} handoff), {} operands, {} buffers, {} arena slots, {} flags; \
+             weights {}/{} → real locators{}",
+            rg.nodes.len(),
+            prog.tape.len(),
+            prog.num_computes(),
+            prog.num_handoff_ops(),
+            prog.operands.len(),
+            prog.buffers.len(),
+            prog.arena_bytes.len(),
+            prog.num_flags,
+            report.weights_resolved,
+            report.weights_total,
+            if report.unresolved.is_empty() {
+                String::new()
+            } else {
+                format!(" — UNRESOLVED bases: {:?}", report.unresolved)
+            },
+        ),
+        Err(e) => eprintln!("[wavefront-mega] {stem}: serialize FAILED — {e}"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn emit_model(
     program: &Program,
@@ -5914,6 +6030,10 @@ pub fn emit_model(
     loops: &WorkloadLoops,
     lib: &ImplementationLibrary,
     manifest: &crate::weights_manifest::WeightsManifest,
+    // Shape inference for this arch — threaded only so the PD-wavefront
+    // macro-emission (`dump_wavefront_mega`) can resolve weight shapes;
+    // unused on the normal codegen path.
+    inferred: &crate::shape::Inferred,
     canonical_override: Option<&Ident>,
     tp_world_size: u8,
     emit_fingerprint: bool,
@@ -6329,6 +6449,49 @@ pub fn emit_model(
         .enumerate()
         .map(|(ci, (wp, _))| (*wp, (ci as u32) * 2))
         .collect();
+
+    // PD-wavefront macro-emission (env-gated, diagnostic). HERE — not in the
+    // pre-emit drive — because the decode bucket's `weight_slots` (the real
+    // weight-locator source) only exists post-lowering + post-loop-compression,
+    // and the `(bucket, op_idx, slot)` triples must match the very match table
+    // `emit_weight_accessors_impl` builds from this same `canonical_lowered`.
+    if std::env::var_os("FERRITE_WAVEFRONT").is_some() {
+        match sfufs.get_nt(1) {
+            Some(decode_asn) => {
+                // The canonical the decode (num_tokens=1) point folded into,
+                // and its `2*ci` backbone bucket id.
+                let decode_wp = bucket_points.iter().find(|wp| wp.num_tokens == 1).copied();
+                match decode_wp {
+                    Some(decode_wp) => {
+                        let idx = bucket_points.iter().position(|w| *w == decode_wp).unwrap();
+                        let canonical = bucket_canonical[idx];
+                        let bb_bucket_id = canonical_to_bucket_id[&canonical];
+                        let (cl, ..) = &canonical_lowered[&canonical];
+                        let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
+                        dump_wavefront_mega(
+                            program,
+                            model,
+                            fuf,
+                            decode_asn,
+                            inferred,
+                            &decode_bounds,
+                            &cl.backbone.weight_slots,
+                            &cl.lm_head.weight_slots,
+                            bb_bucket_id,
+                        );
+                    }
+                    None => eprintln!(
+                        "[wavefront] {}: no decode (num_tokens=1) workload point",
+                        model.source_stem
+                    ),
+                }
+            }
+            None => eprintln!(
+                "[wavefront] {}: no decode (num_tokens=1) workload point",
+                model.source_stem
+            ),
+        }
+    }
 
     let mut bucket_table_entries: Vec<TokenStream> = Vec::new();
     for (i, wp) in bucket_points.iter().enumerate() {

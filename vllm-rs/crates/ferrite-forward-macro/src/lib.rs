@@ -895,108 +895,11 @@ fn compile_common(
                 &solve_bounds,
             );
 
-            // PD-wavefront task T2b: route the solved decode FUF through
-            // the macro→wavefront bridge so a real model's forward flows
-            // into the host-validated subtile pipeline. Env-gated and
-            // strictly diagnostic — any error logs and continues, never
-            // gating the build. `FERRITE_WAVEFRONT=1` to dump.
-            if std::env::var_os("FERRITE_WAVEFRONT").is_some() {
-                match sfufs.get_nt(1) {
-                    Some(decode_asn) => {
-                        match to_wavefront::lower_decode_to_wavefront(
-                            &model_fuf,
-                            decode_asn,
-                            &inferred,
-                            &solve_bounds,
-                            model,
-                            /* prefix_len (structural) */ 0,
-                        ) {
-                            Ok(lowered) => {
-                                let g = ferrite_wavefront::lower::lower(&lowered.input);
-                                let st = to_wavefront::stats(&model_fuf, decode_asn, &lowered);
-                                let valid = match ferrite_wavefront::subtile::validate(&g) {
-                                    Ok(n) => format!("valid ({n} nodes)"),
-                                    Err(e) => format!("INVALID: {e}"),
-                                };
-                                eprintln!(
-                                    "[wavefront] {}: {} fuf tiles, {} subgraphs → \
-                                     {} sources ({} weights, {} prefix-kv) , {} ops, \
-                                     {} subtile nodes [{}]; ops {:?}",
-                                    model.source_stem,
-                                    st.fuf_tiles,
-                                    st.subgraphs,
-                                    st.sources,
-                                    st.weight_sources,
-                                    st.prefix_sources,
-                                    st.ops,
-                                    g.nodes.len(),
-                                    valid,
-                                    st.op_histogram,
-                                );
-
-                                // The full compile-time artifact: fuse Silu+Mul,
-                                // N-block-tile every matmul (region graph),
-                                // wavefront-schedule across 10 workers, and
-                                // serialize to the neutral MegaProgram the GPU
-                                // player runs. Proves the whole compile-time
-                                // pipeline on the real decode FUF. WeightLocs are
-                                // placeholders here (real ones come from the
-                                // lowered tape's weight_slots, next).
-                                use ferrite_wavefront::region_schedule::{
-                                    ScheduleParams, schedule_wavefront,
-                                };
-                                let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
-                                let descs =
-                                    to_wavefront::build_source_descs(&fused, &lowered.bindings);
-                                let rg = ferrite_wavefront::region::lower_region(&fused, 256);
-                                let sched = schedule_wavefront(
-                                    &rg,
-                                    |n| {
-                                        (n.output.region.rows.len * n.output.region.cols.len) as f64
-                                    },
-                                    ScheduleParams {
-                                        num_workers: 10,
-                                        wait_cost_us: 0.18,
-                                    },
-                                );
-                                let geom = ferrite_wavefront::mega::Geometry {
-                                    act_elem: 2,
-                                    block_size: 16,
-                                    max_blocks: 64,
-                                };
-                                match ferrite_wavefront::mega::serialize(&rg, &sched, &descs, geom)
-                                {
-                                    Ok(prog) => eprintln!(
-                                        "[wavefront-mega] {}: {} region nodes → {} tape instrs \
-                                         ({} node-computes, {} handoff), {} operands, \
-                                         {} buffers, {} arena slots, {} flags",
-                                        model.source_stem,
-                                        rg.nodes.len(),
-                                        prog.tape.len(),
-                                        prog.num_computes(),
-                                        prog.num_handoff_ops(),
-                                        prog.operands.len(),
-                                        prog.buffers.len(),
-                                        prog.arena_bytes.len(),
-                                        prog.num_flags,
-                                    ),
-                                    Err(e) => eprintln!(
-                                        "[wavefront-mega] {}: serialize FAILED — {e}",
-                                        model.source_stem
-                                    ),
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[wavefront] {}: not lowered — {e}", model.source_stem);
-                            }
-                        }
-                    }
-                    None => eprintln!(
-                        "[wavefront] {}: no decode (num_tokens=1) workload point",
-                        model.source_stem
-                    ),
-                }
-            }
+            // PD-wavefront macro-emission moved into `codegen::emit_model`
+            // (`dump_wavefront_mega`): the decode bucket's `weight_slots` —
+            // the real weight-locator source — only exists after lowering +
+            // loop compression, which happens inside `emit_model`, not in
+            // this pre-emit solve drive.
 
             let max_waves = loops
                 .per_workload
@@ -1374,6 +1277,7 @@ fn compile_common(
             &sm.loops,
             &library,
             &manifest,
+            &inferred,
             canonical_override.as_ref(),
             sm.tp_world_size,
             mode.emit_arch_dispatch,

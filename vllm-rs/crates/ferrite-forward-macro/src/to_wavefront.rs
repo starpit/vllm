@@ -10,10 +10,11 @@
 //! This is the one piece that *cannot* be `cargo test`-ed on a Mac (the
 //! macro crate's test suite is cuda-coupled), so it is kept deliberately
 //! thin and mechanical: every structural decision it makes — embed
-//! becomes a read-only `Source`, `rope_append` splits into two
-//! `RopeRotate`s with the un-roped V aliasing the V-proj output,
-//! `attention` reads the prefix KV cache as `Source` segments + the new
-//! token as `Sub` edges, `lm_head` is the result — is mirrored exactly
+//! becomes a read-only `Source`, `rope_append` splits into a Q-side
+//! `RopeRotate` + a K-side `RopeAppend` (the GPU cache-write) with the
+//! un-roped V aliasing the V-proj output, `attention` reads the prefix KV
+//! cache as `Source` segments + the new token as `Sub` edges, `lm_head` is
+//! the result — is mirrored exactly
 //! by the Mac-testable `full_forward_bit_exact` test in
 //! `ferrite_wavefront::lower`. The bridge resolves shapes and wires
 //! edges; the decomposition *semantics* it targets are already proven
@@ -32,17 +33,22 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
 use ferrite_wavefront::mega::SourceDesc;
 use ferrite_wavefront::subtile::SourceShape;
 use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
-use crate::classified::{ExternKind, OpKind};
+use crate::classified::{ExternKind, OpKind, Program, WeightId};
+use crate::codegen::{split_base_layer, weight_kind_accessor_method};
 use crate::config::ModelParams;
+use crate::emit::weight_field_name;
 use crate::fuf::{Fuf, FufInput, FufNode, TileId};
-use crate::impl_lib::{attention_scale_for, eval_shape_with, gemm_nk_from_fuf};
+use crate::impl_lib::{
+    WeightKind, WeightSlot, attention_scale_for, eval_shape_with, gemm_nk_from_fuf,
+};
+use crate::quantization::StorageFormat;
 use crate::shape::Inferred;
 use crate::solver::Assignment;
 
@@ -469,10 +475,14 @@ pub fn lower_decode_to_wavefront(
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }
-            // rope_append(q, k, v, positions, rotary, kv_cache) → (q', k', v):
-            // two RopeRotate nodes; the un-roped V (slot 2) aliases the
-            // V-proj output. The new K/V reach attention as Sub edges —
-            // no cache round-trip (decision #4).
+            // rope_append(q, k, v, positions, rotary, kv_cache[layer]) →
+            // (q', k', v): the Q slot rotates in place (`RopeRotate`); the K
+            // slot is the GPU cache-write `RopeAppend` (rotate K + write the
+            // rotated K / un-rotated V to the paged cache for `layer`), so it
+            // takes the un-roped V as a fourth input. The un-roped V (slot 2)
+            // still aliases the V-proj output for the attention dataflow edge;
+            // the serializer maps attention onto the runtime paged cache, so
+            // the new K/V are NOT a separate cache round-trip.
             OpKind::RopeAppend => {
                 let q = bx.input_at(tile, 0)?;
                 let k = bx.input_at(tile, 1)?;
@@ -483,14 +493,19 @@ pub fn lower_decode_to_wavefront(
                     detail: "rope_append missing v input",
                 })?;
                 let v = bx.resolve(tile, v_inp)?;
+                let layer = kv_cache_index(node).ok_or(BridgeError::MalformedOp {
+                    tile,
+                    op: node.op,
+                    detail: "rope_append missing kv_cache extern index",
+                })? as u32;
                 let (cos, sin) = bx.cos_sin();
                 let qi = bx.push_op(
                     LoweredOp::RopeRotate { head_dim },
                     vec![q, InputRef::Ext(cos), InputRef::Ext(sin)],
                 );
                 let ki = bx.push_op(
-                    LoweredOp::RopeRotate { head_dim },
-                    vec![k, InputRef::Ext(cos), InputRef::Ext(sin)],
+                    LoweredOp::RopeAppend { head_dim, layer },
+                    vec![k, InputRef::Ext(cos), InputRef::Ext(sin), v],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(qi));
                 bx.produced.insert((tile.0, 1), Producer::Op(ki));
@@ -563,21 +578,127 @@ pub fn lower_decode_to_wavefront(
     })
 }
 
+/// A per-arch weight locator recovered from a lowered decode bucket's
+/// `weight_slots`: the `(bucket, op_idx, slot)` triple the runtime
+/// `WeightAccessors::<kind>_at` match table keys on, plus the [`WeightKind`]
+/// selecting the accessor bundle. The unrolled `layer` is supplied
+/// per-source (it is the FUF's former loop-var), so this is layer-agnostic.
+#[derive(Clone, Debug)]
+pub struct WeightLocInfo {
+    pub bucket: u32,
+    pub op_idx: u32,
+    pub slot: u32,
+    pub kind: WeightKind,
+}
+
+/// Build `accessor-base-name → WeightLocInfo` from a decode bucket's
+/// backbone + lm_head `weight_slots`, reproducing
+/// [`crate::codegen::emit_weight_accessors_impl`]'s per-(op_idx, kind)
+/// slot-ordinal walk EXACTLY — both route the kind→method key through
+/// [`weight_kind_accessor_method`] — so a wavefront weight source resolves
+/// to the SAME `(bucket, op_idx, slot)` match arm the non-mega decode path
+/// uses. `bb_bucket_id` is the backbone tape-index (`2*ci`); lm_head is
+/// `bb_bucket_id + 1`.
+///
+/// First writer wins per base: within one (loop-compressed) decode body
+/// each accessor base occurs once per `(op_idx, kind)`, and every arm for a
+/// given base calls the same layer-parametric `self.<base>(layer)` getter,
+/// so any one arm is interchangeable given the right `layer`.
+pub fn build_base_to_loc(
+    backbone: &[Vec<WeightSlot>],
+    lm_head: &[Vec<WeightSlot>],
+    bb_bucket_id: u32,
+) -> HashMap<String, WeightLocInfo> {
+    let mut map: HashMap<String, WeightLocInfo> = HashMap::new();
+    let mut walk = |slots_arr: &[Vec<WeightSlot>], bucket: u32| {
+        for (op_idx, slots) in slots_arr.iter().enumerate() {
+            // Per-(op_idx, method) ordinal — identical to the runtime match
+            // table's `slot` axis.
+            let mut counts: HashMap<&'static str, u32> = HashMap::new();
+            for slot in slots {
+                let key = weight_kind_accessor_method(&slot.kind);
+                let n = counts.entry(key).or_insert(0);
+                let ordinal = *n;
+                *n += 1;
+                map.entry(slot.base.to_string())
+                    .or_insert_with(|| WeightLocInfo {
+                        bucket,
+                        op_idx: op_idx as u32,
+                        slot: ordinal,
+                        kind: slot.kind.clone(),
+                    });
+            }
+        }
+    };
+    walk(backbone, bb_bucket_id);
+    walk(lm_head, bb_bucket_id + 1);
+    map
+}
+
+/// Recover `(group_size, bits)` for a weight from its FUF `storage`
+/// annotation (the per-model `annotate_storage_formats` pass). `None` for
+/// dense / unquantized weights.
+fn affine_gs_bits(fuf: &Fuf, id: u32, index: Option<u64>) -> Option<(u32, u32)> {
+    for node in &fuf.nodes {
+        for inp in &node.inputs {
+            if let FufInput::Weight {
+                id: wid,
+                index: widx,
+                storage,
+            } = inp
+                && wid.0 == id
+                && *widx == index
+            {
+                return match storage {
+                    StorageFormat::Affine { bits, group_size } => Some((*group_size, *bits)),
+                    _ => None,
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Outcome of resolving the wavefront weight sources to real runtime
+/// locators — the macro-time dump reports this to verify every weight keys
+/// a real `WeightAccessors` match arm (the whole point of macro-emission
+/// increment 2).
+#[derive(Debug, Default, Clone)]
+pub struct ResolutionReport {
+    /// Total `SourceBinding::Weight` sources.
+    pub weights_total: usize,
+    /// How many resolved to a real `WeightLoc` (base found in the decode
+    /// bucket's `weight_slots`).
+    pub weights_resolved: usize,
+    /// Accessor base names that did NOT resolve (sorted, deduped) — each
+    /// fell back to a placeholder locator. Empty ⇒ every weight resolved.
+    pub unresolved: Vec<String>,
+}
+
 /// Map the bridge's [`SourceBinding`] manifest to the serializer's
-/// [`SourceDesc`] vector (parallel to `input.sources`), so a solved decode FUF
-/// can flow all the way to a [`ferrite_wavefront::mega::MegaProgram`]. The
-/// *structural* shape — which source is a quantized linear weight vs a dense
-/// rmsnorm gain / rotary row / prefix-cache half — is recovered from how each
-/// source is consumed. The per-weight runtime [`WeightLoc`] + quant params are
-/// PLACEHOLDERS here (unique `op_idx` per source); the REAL locators come from
-/// the lowered tape's `weight_slots` (codegen, where `linear_at` is built).
-/// This is enough to prove the compile-time pipeline (`lower_region` →
-/// `region_schedule` → `mega::serialize`) runs on the real FUF and yields a
-/// structurally sound MegaProgram.
-pub fn build_source_descs(input: &LoweringInput, bindings: &[SourceBinding]) -> Vec<SourceDesc> {
-    // A source read as a Gemm's weight (input 1) is a quantized linear weight;
-    // any other `Weight` binding is a dense gain (rmsnorm).
-    let mut gemm_weight: std::collections::HashSet<usize> = std::collections::HashSet::new();
+/// [`SourceDesc`] vector (parallel to `input.sources`), so a solved decode
+/// FUF flows all the way to a [`ferrite_wavefront::mega::MegaProgram`] with
+/// REAL per-weight [`WeightLoc`]s.
+///
+/// Each `SourceBinding::Weight{id, index}` is correlated to the non-mega
+/// decode path's `WeightAccessors` match arm: `weight_field_name` +
+/// `split_base_layer` recover the accessor base, looked up in `base_to_loc`
+/// (built from the lowered decode bucket's `weight_slots`) for the real
+/// `(bucket, op_idx, slot)`; `index` supplies the unrolled `layer`. Quant
+/// `(group_size, bits)` come from the FUF weight's resolved `storage`.
+/// Cos/sin resolve through the rotary `CosSin` accessor; the embedded
+/// hidden state is a host-gathered activation (runtime input — locator is
+/// a placeholder until increment 3 wires it).
+pub fn build_source_descs(
+    program: &Program,
+    fuf: &Fuf,
+    input: &LoweringInput,
+    bindings: &[SourceBinding],
+    base_to_loc: &HashMap<String, WeightLocInfo>,
+) -> (Vec<SourceDesc>, ResolutionReport) {
+    // A source read as a Gemm's weight (input 1) is a quantized linear
+    // weight; any other `Weight` binding is a dense gain (rmsnorm).
+    let mut gemm_weight: HashSet<usize> = HashSet::new();
     for od in &input.ops {
         if matches!(od.op, LoweredOp::Gemm { .. })
             && let Some(InputRef::Ext(e)) = od.inputs.get(1)
@@ -585,52 +706,106 @@ pub fn build_source_descs(input: &LoweringInput, bindings: &[SourceBinding]) -> 
             gemm_weight.insert(*e);
         }
     }
-    bindings
+
+    // The rotary cache resolves through `cos_sin_at`; its base
+    // (`rotary{,_local}`) was injected on the rope-consuming op in
+    // `lower_bucket`. Cos and sin share this one locator.
+    let cos_sin_loc = base_to_loc
+        .values()
+        .find(|li| li.kind == WeightKind::CosSin)
+        .cloned();
+
+    let mut report = ResolutionReport::default();
+    let mut unresolved: BTreeSet<String> = BTreeSet::new();
+
+    let descs = bindings
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            let bref = |bundle, role| BufferRef::Weight {
-                bundle,
-                role,
-                loc: WeightLoc {
-                    layer: 0,
-                    bucket: 0,
-                    op_idx: i as u32,
-                    slot: 0,
-                },
+            // Fallback locator — used only when a real one can't be
+            // recovered, so the pipeline still serializes for the dump.
+            let placeholder = WeightLoc {
+                layer: 0,
+                bucket: 0,
+                op_idx: i as u32,
+                slot: 0,
             };
+            let bref = |bundle, role, loc| BufferRef::Weight { bundle, role, loc };
             match b {
                 SourceBinding::EmbeddedHidden => SourceDesc::Dense {
-                    buffer: bref(WeightBundle::Embedding, WeightRole::Weight),
+                    buffer: bref(WeightBundle::Embedding, WeightRole::Weight, placeholder),
                     elem: 2,
                 },
-                SourceBinding::Cos | SourceBinding::Sin => SourceDesc::Dense {
-                    buffer: bref(WeightBundle::CosSin, WeightRole::Weight),
-                    elem: 2,
-                },
+                SourceBinding::Cos | SourceBinding::Sin => {
+                    let loc = cos_sin_loc
+                        .as_ref()
+                        .map(|li| WeightLoc {
+                            layer: 0,
+                            bucket: li.bucket,
+                            op_idx: li.op_idx,
+                            slot: li.slot,
+                        })
+                        .unwrap_or(placeholder);
+                    SourceDesc::Dense {
+                        buffer: bref(WeightBundle::CosSin, WeightRole::Weight, loc),
+                        elem: 2,
+                    }
+                }
                 SourceBinding::PrefixK { layer } => SourceDesc::PrefixK {
                     layer: *layer as u32,
                 },
                 SourceBinding::PrefixV { layer } => SourceDesc::PrefixV {
                     layer: *layer as u32,
                 },
-                SourceBinding::Weight { .. } if gemm_weight.contains(&i) => {
-                    SourceDesc::QuantWeight {
-                        weight: bref(WeightBundle::LinearLayer, WeightRole::Weight),
-                        scales: bref(WeightBundle::LinearLayer, WeightRole::AffineScales),
-                        biases: bref(WeightBundle::LinearLayer, WeightRole::AffineBiases),
-                        group_size: 64,
-                        bits: 4,
-                        scale_elem: 2,
+                SourceBinding::Weight { id, index } => {
+                    report.weights_total += 1;
+                    let name = weight_field_name(program, WeightId(*id), *index);
+                    let (base, _layer) = split_base_layer(&name.to_string());
+                    let layer = index.unwrap_or(0) as u32;
+                    let loc = match base_to_loc.get(&base) {
+                        Some(li) => {
+                            report.weights_resolved += 1;
+                            WeightLoc {
+                                layer,
+                                bucket: li.bucket,
+                                op_idx: li.op_idx,
+                                slot: li.slot,
+                            }
+                        }
+                        None => {
+                            unresolved.insert(base.clone());
+                            placeholder
+                        }
+                    };
+                    if gemm_weight.contains(&i) {
+                        // 4-bit affine linear: the qmv triple. gs/bits from the
+                        // FUF weight's resolved storage; the three roles share
+                        // the locator (one `linear_at` returns the LinearLayer,
+                        // role selects packed / scales / biases).
+                        let (group_size, bits) =
+                            affine_gs_bits(fuf, *id, *index).unwrap_or((64, 4));
+                        SourceDesc::QuantWeight {
+                            weight: bref(WeightBundle::LinearLayer, WeightRole::Weight, loc),
+                            scales: bref(WeightBundle::LinearLayer, WeightRole::AffineScales, loc),
+                            biases: bref(WeightBundle::LinearLayer, WeightRole::AffineBiases, loc),
+                            group_size,
+                            bits,
+                            scale_elem: 2,
+                        }
+                    } else {
+                        // Dense rmsnorm gain.
+                        SourceDesc::Dense {
+                            buffer: bref(WeightBundle::RmsNorm, WeightRole::Weight, loc),
+                            elem: 2,
+                        }
                     }
                 }
-                SourceBinding::Weight { .. } => SourceDesc::Dense {
-                    buffer: bref(WeightBundle::RmsNorm, WeightRole::Weight),
-                    elem: 2,
-                },
             }
         })
-        .collect()
+        .collect();
+
+    report.unresolved = unresolved.into_iter().collect();
+    (descs, report)
 }
 
 /// Compute dump stats for a lowered forward (the drive logs these).

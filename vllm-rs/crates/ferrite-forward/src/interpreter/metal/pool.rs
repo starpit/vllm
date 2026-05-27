@@ -23,8 +23,7 @@ use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::interpreter::metal::__re::{
-    Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus,
-    MTLCommandQueue,
+    Buffer, CommandQueue, Device, MTLBuffer, MTLCommandBufferStatus,
 };
 use objc2_metal::{
     MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandEncoder, MTL4CommandQueue, MTLDevice,
@@ -842,74 +841,6 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         });
     }
 
-    /// MTL4 forward path. Hard-asserts MTL4 availability on first use
-    /// (see `ensure_mtl4`).
-    /// MTL3 fallback dispatch path. Uses MTL3 cmdbuf + default
-    /// `MTLComputeCommandEncoder` (auto-serial dispatch type).
-    /// Avoids MTL4's ~27 ms per-dispatch overhead on M4 at the
-    /// cost of the per-dispatch `setBuffer`-per-binding bind cost
-    /// (still cheap; ~140 dispatches × ~10 binds = 1.4 ms total).
-    fn run_bucket_mtl3(
-        &self,
-        worker: &MetalWorker<W>,
-        queue: &CommandQueue,
-        bucket_idx: usize,
-        num_tokens: usize,
-        num_seqs: u32,
-        has_spec_tokens: bool,
-    ) -> Result<(), ForwardError> {
-        use ::objc2_metal::MTLCommandEncoder;
-        let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
-        let t_pre = std::time::Instant::now();
-        // FERRITE_DUMP_LAYER0 dump path — encode+sync per dispatch
-        // so layer-0 activations can be compared against an MLX
-        // reference. Returns early; slow but only used for parity.
-        if std::env::var_os("FERRITE_DUMP_LAYER0").is_some() {
-            worker
-                .run_bucket_mtl3_with_dumps(
-                    bucket_idx,
-                    num_tokens as u32,
-                    num_seqs,
-                    has_spec_tokens,
-                    queue,
-                )
-                .map_err(ForwardError::Worker)?;
-            return Ok(());
-        }
-        let cb = queue.commandBuffer().expect("commandBuffer");
-        let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
-        worker
-            .run_bucket_mtl3(
-                bucket_idx,
-                num_tokens as u32,
-                num_seqs,
-                has_spec_tokens,
-                &enc,
-            )
-            .map_err(ForwardError::Worker)?;
-        enc.endEncoding();
-        let encoded = t_pre.elapsed();
-        cb.commit();
-        let committed = t_pre.elapsed();
-        cb.waitUntilCompleted();
-        let waited = t_pre.elapsed();
-        let status = cb.status();
-        if status != MTLCommandBufferStatus::Completed {
-            return Err(ForwardError::ExecutionFailed(status));
-        }
-        if trace {
-            eprintln!(
-                "[forward bucket={} num_tokens={} mtl3] encode={:?} commit={:?} wait={:?}",
-                bucket_idx,
-                num_tokens,
-                encoded,
-                committed - encoded,
-                waited - committed,
-            );
-        }
-        Ok(())
-    }
-
     /// MTL4 forward dispatch + optional encoder-tail hook.
     ///
     /// When `tail = Some(f)`, after the worker has encoded the bucket's
@@ -1261,47 +1192,27 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let guard = self.checkout(weights)?;
         write_runtime_inputs(&guard.runtime, inputs)?;
 
-        // FERRITE_METAL_MTL3=1: use the MTL3 dispatch path (default
-        // Serial encoder, setBuffer/dispatchThreadgroups). On M4 this
-        // is ~3-4× faster end-to-end than the MTL4 path for prefill
-        // workloads because MTL4 carries a ~27 ms per-dispatch
-        // overhead that MTL3's auto-serial dispatch type avoids.
-        // Falls back to MTL4 for buckets that contain an MPS Gemm
-        // step (those can't be dispatched via the regular MTL3
-        // compute encoder).
-        let use_mtl3 = std::env::var_os("FERRITE_METAL_MTL3").is_some()
-            && guard.worker.bucket_bakings[bucket_idx]
-                .steps
-                .iter()
-                .all(|s| matches!(s, super::worker::BucketStep::Icb { .. }));
-        if use_mtl3 {
-            self.run_bucket_mtl3(
-                &guard.worker,
-                queue,
-                bucket_idx,
-                inputs.num_tokens as usize,
-                num_seqs,
-                has_spec_tokens,
-            )?;
-            // MTL3 path doesn't take an encoder tail (legacy path);
-            // caller's separate sync dispatch still applies.
-            let _ = &tail;
-        } else {
-            assert!(
-                guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
-                "bucket {} is not MTL4-eligible (contains an MPS f16 GEMM step or \
-                 exceeds the 31-binding argument-table cap)",
-                bucket_idx,
-            );
-            self.run_bucket_mtl4_with_tail(
-                &guard.worker,
-                bucket_idx,
-                inputs.num_tokens as usize,
-                num_seqs,
-                has_spec_tokens,
-                tail,
-            )?;
-        }
+        // All execution goes through the MTL4 path. (The opt-in MTL3
+        // dispatch path was removed — it only ever ran the all-ICB
+        // buckets that MTL4 already handles, and its M4-era latency edge
+        // no longer applies; see feedback_not_mtl3_vs_mtl4.) Buckets with
+        // an MPS f16 GEMM step or a >31-binding kernel have no MTL4 plan
+        // (`mtl4_steps == None`) and were never executable on the default
+        // path anyway.
+        assert!(
+            guard.worker.bucket_bakings[bucket_idx].mtl4_steps.is_some(),
+            "bucket {} is not MTL4-eligible (contains an MPS f16 GEMM step or \
+             exceeds the 31-binding argument-table cap)",
+            bucket_idx,
+        );
+        self.run_bucket_mtl4_with_tail(
+            &guard.worker,
+            bucket_idx,
+            inputs.num_tokens as usize,
+            num_seqs,
+            has_spec_tokens,
+            tail,
+        )?;
 
         // DIAGNOSTIC: dump non-zero counts for each arena slot. Tells
         // us where in the chain values transition from real to zero.

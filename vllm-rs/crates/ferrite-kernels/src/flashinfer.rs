@@ -267,21 +267,16 @@ struct PlanKey {
     cfg: FlashInferConfig,
 }
 
-/// One-slot FlashInfer plan cache. Workspaces are allocated once (at the
-/// first `ensure()` or when `cfg` changes) and reused across decode
-/// steps. The scheduler is re-run via `replan()` at each step to update
-/// `int_ws` with the current `(seqlen_k, num_pages)` — this is the
-/// graph-compatible fast path that mirrors Python vLLM's
-/// `fast_plan_decode`.
-pub struct FlashInferPlanCache {
-    key: Option<PlanKey>,
+/// One slot of the multi-slot plan cache: a single `(cfg)` plan with
+/// its own device workspaces and per-forward-pass replan memo.
+struct PlanSlot {
     handle: *mut c_void,
-    dispatch: Option<FiDispatch>,
+    dispatch: FiDispatch,
     /// `(seq_len, seqlen_k, num_pages)` the plan's scheduling was last
     /// computed for. Per-forward-pass memoization: `replan()` skips the
     /// planner call when the key matches, so layer 0 of a pass pays the
     /// planner cost once and layers 1..N reuse the fresh `int_ws_d`.
-    /// Reset to `None` on `clear()` / key change.
+    /// Reset to `None` when the slot is first created.
     ///
     /// All three dims must be keyed: `seq_len` is FI's total Q-token
     /// count (≠ batch_size for prefill, = batch_size for decode) and
@@ -294,6 +289,36 @@ pub struct FlashInferPlanCache {
     /// captured forward. Per-layer dedup is still intact: every layer
     /// of a forward pass sees the same three values.
     last_replan: Option<(u32, u32, u32)>,
+}
+
+/// Multi-slot FlashInfer plan cache. Each `(head_dim, softcap)` `cfg`
+/// gets its own persistent `PlanSlot` (one cudaMalloc'd
+/// float_ws/int_ws pair, one shim handle). Slots are NEVER evicted
+/// during a session — only on `clear()` (worker teardown) / `Drop`.
+///
+/// Why multi-slot: when a CUDA-graph capture pass picks
+/// `cfg=nosoftcap` and a subsequent eager call picks `cfg=softcap`
+/// (cost-solver alternation across decode shapes), evicting the
+/// nosoftcap plan would `cudaFree` workspaces that the captured graph
+/// still references via params_1/params_2 baked into kernel args at
+/// capture time. Replay then reads freed memory →
+/// `CUDA_ERROR_ILLEGAL_ADDRESS`. Holding one slot per cfg sidesteps
+/// the whole class of bug. ~93 MB per slot × 6 cfgs (3 head_dim × 2
+/// softcap) = ~558 MB worst case, easy on H100/L40S.
+///
+/// `current` is a cursor: the most recently `ensure()`d cfg, used by
+/// `replan()/set_io()/run()` so the existing call sites don't need to
+/// thread a cfg through every call.
+pub struct FlashInferPlanCache {
+    /// Linear vec of slots — at most 6 entries for the current
+    /// FLASHINFER_CONFIG_SET (3 head_dim × 2 softcap), so linear
+    /// search beats a HashMap and lets `new()` stay `const`
+    /// (HashMap::new() is not const because RandomState needs
+    /// runtime entropy, and the cache is held in a static Mutex).
+    slots: Vec<(PlanKey, PlanSlot)>,
+    /// Cursor: most recently `ensure()`d cfg. `replan/set_io/run`
+    /// operate on the corresponding slot.
+    current: Option<PlanKey>,
 }
 
 // Handle is a heap-allocated opaque pointer owned by this cache; the FI
@@ -309,11 +334,25 @@ impl Default for FlashInferPlanCache {
 impl FlashInferPlanCache {
     pub const fn new() -> Self {
         Self {
-            key: None,
-            handle: core::ptr::null_mut(),
-            dispatch: None,
-            last_replan: None,
+            slots: Vec::new(),
+            current: None,
         }
+    }
+
+    fn slot_idx(&self, key: &PlanKey) -> Option<usize> {
+        self.slots.iter().position(|(k, _)| k == key)
+    }
+
+    fn current_slot(&self) -> Option<&PlanSlot> {
+        let key = self.current.as_ref()?;
+        self.slots.iter().find_map(|(k, s)| (k == key).then_some(s))
+    }
+
+    fn current_slot_mut(&mut self) -> Option<&mut PlanSlot> {
+        let key = self.current.clone()?;
+        self.slots
+            .iter_mut()
+            .find_map(|(k, s)| (*k == key).then_some(s))
     }
 
     /// Ensure workspaces are allocated for `cfg`. Only rebuilds (plan_delete
@@ -349,13 +388,18 @@ impl FlashInferPlanCache {
         stream: CUstream,
     ) -> Option<FiDispatch> {
         let want = PlanKey { cfg };
-        if self.key == Some(want) {
-            return self.dispatch;
+        // Already have a slot for this cfg: just move the cursor.
+        // Do NOT touch other slots — captured graphs may still hold
+        // their handles' workspace pointers in baked kernel args.
+        if self.slot_idx(&want).is_some() {
+            self.current = Some(want);
+            return self.slots.iter().find_map(|(k, s)| (*k == want).then(|| s.dispatch));
         }
 
-        // Config changed (or first call) — tear down the previous plan.
-        self.clear();
-
+        // Need a new slot. Allocate via the FI shim's plan_new (which
+        // also runs the planner once for the supplied num_tokens /
+        // seqlen_k — the per-step replan() will overwrite that as
+        // forward passes progress).
         let dispatch = dispatch_for(cfg)?;
         let mut rc: i32 = 0;
         let handle = unsafe {
@@ -385,9 +429,15 @@ impl FlashInferPlanCache {
             tracing::error!(rc, "fi_plan_new returned null");
             return None;
         }
-        self.key = Some(want);
-        self.handle = handle;
-        self.dispatch = Some(dispatch);
+        self.slots.push((
+            want,
+            PlanSlot {
+                handle,
+                dispatch,
+                last_replan: None,
+            },
+        ));
+        self.current = Some(want);
         Some(dispatch)
     }
 
@@ -406,8 +456,10 @@ impl FlashInferPlanCache {
         kv_indices: *const i32,
         o: *mut c_void,
     ) {
-        if let (Some(d), false) = (self.dispatch, self.handle.is_null()) {
-            unsafe { (d.plan_set_io)(self.handle, q, k, v, kv_indices, o) };
+        if let Some(slot) = self.current_slot()
+            && !slot.handle.is_null()
+        {
+            unsafe { (slot.dispatch.plan_set_io)(slot.handle, q, k, v, kv_indices, o) };
         }
     }
 
@@ -435,17 +487,20 @@ impl FlashInferPlanCache {
         stream: CUstream,
     ) -> i32 {
         let want = (seq_len as u32, seqlen_k as u32, num_pages as u32);
-        if self.last_replan == Some(want) {
+        let Some(slot) = self.current_slot_mut() else {
+            return -1;
+        };
+        if slot.last_replan == Some(want) {
             return 0;
         }
-        let rc = match (self.dispatch, self.handle.is_null()) {
-            (Some(d), false) => unsafe {
-                (d.replan)(self.handle, seq_len, seqlen_k, num_pages, stream)
-            },
-            _ => -1,
+        if slot.handle.is_null() {
+            return -1;
+        }
+        let rc = unsafe {
+            (slot.dispatch.replan)(slot.handle, seq_len, seqlen_k, num_pages, stream)
         };
         if rc == 0 {
-            self.last_replan = Some(want);
+            slot.last_replan = Some(want);
         }
         rc
     }
@@ -457,23 +512,23 @@ impl FlashInferPlanCache {
     /// A plan must have been built via [`Self::ensure`] since the last
     /// [`Self::clear`].
     pub unsafe fn run(&self, stream: CUstream) -> i32 {
-        match (self.dispatch, self.handle.is_null()) {
-            (Some(d), false) => unsafe { (d.run)(self.handle, stream) },
+        match self.current_slot() {
+            Some(s) if !s.handle.is_null() => unsafe { (s.dispatch.run)(s.handle, stream) },
             _ => -1,
         }
     }
 
-    /// Destroy the current plan handle (if any) and reset the cache.
+    /// Destroy ALL plan handles and reset. Call only on worker
+    /// teardown — clearing mid-session would `cudaFree` workspaces
+    /// that captured CUDA graphs may still reference (the very bug
+    /// this multi-slot cache exists to avoid).
     pub fn clear(&mut self) {
-        if !self.handle.is_null()
-            && let Some(d) = self.dispatch
-        {
-            unsafe { (d.plan_delete)(self.handle) };
+        for (_, slot) in self.slots.drain(..) {
+            if !slot.handle.is_null() {
+                unsafe { (slot.dispatch.plan_delete)(slot.handle) };
+            }
         }
-        self.handle = core::ptr::null_mut();
-        self.dispatch = None;
-        self.key = None;
-        self.last_replan = None;
+        self.current = None;
     }
 }
 

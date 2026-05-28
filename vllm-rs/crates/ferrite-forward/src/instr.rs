@@ -1111,48 +1111,52 @@ unsafe fn attn_prefill_chunked_continuation(
         use_logits_soft_cap: attn_softcap > 0.0,
     };
     let sk_bucket = ah::sk_bucket_for(max_k);
-    let fi = ah::flashinfer_attention(
-        q,
-        cu_seqlens_q,
-        seqused_k,
-        block_table,
-        max_q,
-        max_k,
-        attn_scale,
-        attn_softcap,
-        kv_cache,
-        layer,
-        num_sm,
-        fi_cfg,
-        sk_bucket,
-        caching,
-        stream,
-    );
+    let fi = unsafe {
+        ah::flashinfer_attention(
+            q,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_q,
+            max_k,
+            attn_scale,
+            attn_softcap,
+            kv_cache,
+            layer,
+            num_sm,
+            fi_cfg,
+            sk_bucket,
+            caching,
+            stream,
+        )
+    };
     if let Some(t) = fi {
         return t;
     }
-    kernels::flash_attn_paged_ext(
-        *q,
-        *kv_cache.k_cache(layer),
-        *kv_cache.v_cache(layer),
-        *cu_seqlens_q,
-        *seqused_k,
-        *block_table,
-        max_q,
-        max_k,
-        attn_scale,
-        true,
-        attn_softcap,
-        -1,
-        kv_cache.block_size,
-        num_sm,
-        caching,
-        stream,
-        ::std::ptr::null::<u8>(),
-        0,
-        interleaved,
-        kv_cache.block_unrotated_gpu(),
-    )
+    unsafe {
+        kernels::flash_attn_paged_ext(
+            *q,
+            *kv_cache.k_cache(layer),
+            *kv_cache.v_cache(layer),
+            *cu_seqlens_q,
+            *seqused_k,
+            *block_table,
+            max_q,
+            max_k,
+            attn_scale,
+            true,
+            attn_softcap,
+            -1,
+            kv_cache.block_size,
+            num_sm,
+            caching,
+            stream,
+            ::std::ptr::null::<u8>(),
+            0,
+            interleaved,
+            kv_cache.block_unrotated_gpu(),
+        )
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1535,13 +1539,46 @@ impl Instruction {
                     nw.eps,
                     ctx.device.compute_stream,
                 );
+                // Last-token-per-seq narrow before lm_head GEMM. At
+                // prefill, lm_head only needs the row at
+                // `query_start_loc[i+1]-1` for each sequence; running
+                // the GEMM at full M=bucket_m wastes ~num_tokens/num_seqs×
+                // compute. Mirrors metal's `GatherLastToken` lowering
+                // and Python vLLM's
+                // `logits_indices = query_start_loc[1:] - 1`.
+                // The gather is gated on `idx.dim(0) < bucket_m` so the
+                // decode path (M=BS already) is byte-identical.
+                // `LMHEAD_NARROW=0` disables (debug-only A/B).
+                let narrow_disabled = matches!(
+                    std::env::var("LMHEAD_NARROW").as_deref(),
+                    Ok("0") | Ok("off") | Ok("false")
+                );
+                let gathered_owned: Option<OwnedTensor>;
+                let gemm_input = match ctx.fwd.last_token_indices {
+                    Some(idx) if !narrow_disabled && idx.dim(0) < normed_view.dim(0) => {
+                        let owned = kernels::embedding_gather(
+                            normed_view,
+                            *idx,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        );
+                        let view = owned.as_gpu_tensor();
+                        gathered_owned = Some(owned);
+                        view
+                    }
+                    _ => {
+                        gathered_owned = None;
+                        normed_view
+                    }
+                };
                 let out = cutlass::cutlass_gemm(
-                    normed_view,
+                    gemm_input,
                     gw.dense_weight(),
                     cutlass::CutlassTile::new(tile_m, tile_n, stages),
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
+                drop(gathered_owned);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::Gemm(in_slot, out_slot, layer, n, k) => unsafe {
@@ -1902,9 +1939,7 @@ impl Instruction {
                     // gate would route every decode step through flashinfer
                     // paged attention, which is what slowed `vllm bench
                     // latency` from ~1.27s to ~1.31s before this guard.
-                    if ctx.fwd.max_seqlen_q <= 1
-                        || ctx.fwd.max_seqlen_q == ctx.fwd.max_seqlen_k
-                    {
+                    if ctx.fwd.max_seqlen_q <= 1 || ctx.fwd.max_seqlen_q == ctx.fwd.max_seqlen_k {
                         // HOT path: fresh prefill (q == k) OR decode (q == 1).
                         // Byte-for-byte the pre-fix code; the cold branch's
                         // flashinfer/flash_attn_paged symbols live in a

@@ -306,6 +306,7 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_window_index: window_index_view,
             vision_reverse_indices: reverse_indices_view,
             vision_position_ids: position_ids_view,
+            last_token_indices: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

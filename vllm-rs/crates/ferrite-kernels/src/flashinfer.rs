@@ -349,7 +349,7 @@ impl FlashInferPlanCache {
     }
 
     fn current_slot_mut(&mut self) -> Option<&mut PlanSlot> {
-        let key = self.current.clone()?;
+        let key = self.current?;
         self.slots
             .iter_mut()
             .find_map(|(k, s)| (*k == key).then_some(s))
@@ -393,7 +393,10 @@ impl FlashInferPlanCache {
         // their handles' workspace pointers in baked kernel args.
         if self.slot_idx(&want).is_some() {
             self.current = Some(want);
-            return self.slots.iter().find_map(|(k, s)| (*k == want).then(|| s.dispatch));
+            return self
+                .slots
+                .iter()
+                .find_map(|(k, s)| (*k == want).then_some(s.dispatch));
         }
 
         // Need a new slot. Allocate via the FI shim's plan_new (which
@@ -496,9 +499,8 @@ impl FlashInferPlanCache {
         if slot.handle.is_null() {
             return -1;
         }
-        let rc = unsafe {
-            (slot.dispatch.replan)(slot.handle, seq_len, seqlen_k, num_pages, stream)
-        };
+        let rc =
+            unsafe { (slot.dispatch.replan)(slot.handle, seq_len, seqlen_k, num_pages, stream) };
         if rc == 0 {
             slot.last_replan = Some(want);
         }

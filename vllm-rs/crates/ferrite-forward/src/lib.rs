@@ -430,6 +430,19 @@ mod ctx {
         /// 2D RoPE via `vision_rope` instead).
         #[cfg(feature = "cuda")]
         pub vision_position_ids: Option<TensorView<'a>>,
+        /// Per-sequence final-token row indices, shape `[num_seqs]` u32.
+        /// At prefill, lm_head only needs the last token of each sequence
+        /// (Python vLLM: `logits_indices = query_start_loc[1:] - 1`); the
+        /// metal interpreter has a `GatherLastToken` lowering for the
+        /// same reason. `Some(_)` when `num_seqs < num_tokens` so the
+        /// lm_head GEMM gathers to `[num_seqs, hidden]` before the
+        /// matmul, turning a wasteful `M=num_tokens × N=vocab × K=hidden`
+        /// GEMM into `M=num_seqs`. `None` at decode (every row is a
+        /// sample row) or when not built by the worker. Consumed by
+        /// `Instruction::CutlassFusedAddRmsNormGemm` (and any future
+        /// lm_head op) — see ferrite_worker.rs:650 for context.
+        #[cfg(feature = "cuda")]
+        pub last_token_indices: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce
         // rows, so the field is never read). `Some(_)` only when

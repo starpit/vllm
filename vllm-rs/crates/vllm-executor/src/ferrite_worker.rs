@@ -483,6 +483,7 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    last_token_indices: None,
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
@@ -647,12 +648,15 @@ impl CudaModel {
             // macro-emitted impl delegates to that arch's specialized
             // `forward(&weights, &ctx, device, num_tokens)`.
             //
-            // Selective last-token gather for prefill: the ferrite
-            // DSL currently ends with `logits = gemm(.., lm_head)`
-            // which runs lm_head over ALL num_tokens rows — so we
-            // gather AFTER the matmul (correct, wasteful). A future
-            // ferrite-level optimization would expose a gather op
-            // in the DSL so the user can place it before lm_head.
+            // Selective last-token gather for prefill: when
+            // `last_token_indices` is set we plumb it through
+            // `ForwardCtx.last_token_indices` so the lm_head op
+            // (`Instruction::CutlassFusedAddRmsNormGemm`) gathers
+            // [num_seqs, hidden] from the post-norm activations
+            // BEFORE the GEMM. The post-forward gather then becomes
+            // a no-op (idx.dim(0) == logits.dim(0)). Mirrors metal's
+            // GatherLastToken lowering and Python vLLM's
+            // `logits_indices = query_start_loc[1:] - 1`.
             Self::Ferrite(m) => unsafe {
                 // Encoder arches (modernbert) have no lm_head — both `forward`
                 // and `forward_backbone` return hidden states. Routing those
@@ -693,12 +697,18 @@ impl CudaModel {
                     vision_window_index: None,
                     vision_reverse_indices: None,
                     vision_position_ids: None,
+                    last_token_indices: last_token_indices.as_ref().copied(),
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
+                // If the lm_head op already gathered (logits is at
+                // [num_seqs, vocab]), skip the post-forward gather.
+                // Otherwise (older codepaths / edge buckets that don't
+                // hit the lm_head-with-indices arm) fall back to the
+                // post-forward narrow.
                 match last_token_indices {
-                    Some(idx) if idx.dim(0) < num_tokens as usize => {
+                    Some(idx) if idx.dim(0) < num_tokens as usize && logits.dim(0) > idx.dim(0) => {
                         vllm_cuda::kernels::embedding_gather(
                             logits.as_gpu_tensor(),
                             *idx,
@@ -1720,12 +1730,15 @@ pub struct FerriteWorker {
     /// Draft model's resolved snapshot dir, populated when
     /// `config.draft_model_path` is set. See
     /// `DRAFT_SPEC_DECODE_PLAN.md` phase 3.
+    #[allow(dead_code)]
     draft_model_dir: Option<PathBuf>,
     /// Draft model's `config.json`, populated alongside `draft_model_dir`.
+    #[allow(dead_code)]
     draft_hf_config: Option<HfModelConfig>,
     /// Second KV cache pool, sized for the draft model. Lives on the
     /// same `MetalAllocator` / residency set as the target's pool —
     /// one allocator covers all weights + both pools.
+    #[allow(dead_code)]
     draft_kv_cache: Option<KvCachePool>,
     model_dtype: GpuDType,
     resolved_architecture: Option<String>,

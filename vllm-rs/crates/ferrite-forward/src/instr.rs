@@ -1067,6 +1067,94 @@ fn tp_active<W>(_ctx: &InterpreterCtx<'_, W>) -> bool {
     }
 }
 
+/// Cold path for `Instruction::AttentionPrefillContiguous` when
+/// `max_seqlen_q != max_seqlen_k` (chunked-prefill chunk 2+).
+///
+/// **Deliberately non-generic.** Callers pass HEAD_DIM / ATTN_SCALE /
+/// ATTN_SOFTCAP as runtime args instead of `W`-typed const-generics, so
+/// this compiles to ONE symbol regardless of how many model archs the
+/// crate emits. With `#[cold]` + `#[inline(never)]` the symbol stays
+/// out-of-line. eval<W>'s match arm reduces to a small forwarder; none
+/// of the `flashinfer_attention` / `flash_attn_paged_ext` symbol
+/// references end up in the per-arch eval<W> bodies, where they would
+/// otherwise grow the function and disturb LLVM's code layout for the
+/// hot fresh-prefill path.
+///
+/// Reads K/V from the paged cache (block_table + seqused_k); chunk 1's
+/// writes plus this chunk's upstream `RopeAndCacheKV` mean the cache
+/// spans the full sequence at this point, so q's q_len rows can attend
+/// over the full seqlen_k.
+#[cfg(feature = "cuda")]
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_prefill_chunked_continuation(
+    kv_cache: &ferrite_kernels::kv_cache::KvCachePool,
+    cu_seqlens_q: ferrite_cuda_core::tensor::TensorView<'_>,
+    seqused_k: ferrite_cuda_core::tensor::TensorView<'_>,
+    block_table: ferrite_cuda_core::tensor::TensorView<'_>,
+    q: ferrite_cuda_core::tensor::TensorView<'static>,
+    max_q: usize,
+    max_k: usize,
+    layer: usize,
+    head_dim: u32,
+    attn_scale: f32,
+    attn_softcap: f32,
+    num_sm: i32,
+    caching: &mut ferrite_cuda_core::CachingAllocator,
+    stream: ferrite_cuda_core::CUstream,
+    interleaved: bool,
+) -> OwnedTensor {
+    let fi_cfg = flashinfer::FlashInferConfig {
+        dtype: flashinfer::FiDType::Bf16,
+        head_dim,
+        use_logits_soft_cap: attn_softcap > 0.0,
+    };
+    let sk_bucket = ah::sk_bucket_for(max_k);
+    let fi = ah::flashinfer_attention(
+        q,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        max_q,
+        max_k,
+        attn_scale,
+        attn_softcap,
+        kv_cache,
+        layer,
+        num_sm,
+        fi_cfg,
+        sk_bucket,
+        caching,
+        stream,
+    );
+    if let Some(t) = fi {
+        return t;
+    }
+    kernels::flash_attn_paged_ext(
+        *q,
+        *kv_cache.k_cache(layer),
+        *kv_cache.v_cache(layer),
+        *cu_seqlens_q,
+        *seqused_k,
+        *block_table,
+        max_q,
+        max_k,
+        attn_scale,
+        true,
+        attn_softcap,
+        -1,
+        kv_cache.block_size,
+        num_sm,
+        caching,
+        stream,
+        ::std::ptr::null::<u8>(),
+        0,
+        interleaved,
+        kv_cache.block_unrotated_gpu(),
+    )
+}
+
 #[cfg(feature = "cuda")]
 impl Instruction {
     /// Evaluate one instruction. Closed match (no `_` arm).
@@ -1795,24 +1883,41 @@ impl Instruction {
                 out_slot,
                 interleaved,
             ) => {
-                let max_q = ctx.fwd.max_seqlen_q;
-                let max_k = ctx.fwd.max_seqlen_k;
                 let mut out = unsafe {
                     let q = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
-                    if max_q == max_k {
-                        // Fresh prefill (single-step, or chunk 1 of a chunked
-                        // prefill): no prior K/V in cache for this seq, attend
-                        // over the chunk's own contiguous K/V.
-                        let k = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
-                        let v = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
+                    let k = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
+                    let v = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
+                    // Cold-path gate: ONLY a chunked-prefill continuation
+                    // (chunk 2+ of a prompt > max_num_batched_tokens) needs
+                    // the paged read of prior K/V. That's the case when
+                    // `q_len > 1` AND `q_len < seq_len` — q_len > 1 because
+                    // it's a multi-token prefill chunk, q_len < seq_len
+                    // because chunk 1's K/V already sits in the cache.
+                    //
+                    // The cost solver also picks AttentionPrefillContiguousImpl
+                    // for DECODE workloads at bs>=2 (q=1, seq_len>1). Decode
+                    // ran through `flash_attn_contiguous` pre-fix and worked
+                    // because the K/V tiles get concatenated upstream — so the
+                    // hot path below must catch decode too. A naive `q != k`
+                    // gate would route every decode step through flashinfer
+                    // paged attention, which is what slowed `vllm bench
+                    // latency` from ~1.27s to ~1.31s before this guard.
+                    if ctx.fwd.max_seqlen_q <= 1
+                        || ctx.fwd.max_seqlen_q == ctx.fwd.max_seqlen_k
+                    {
+                        // HOT path: fresh prefill (q == k) OR decode (q == 1).
+                        // Byte-for-byte the pre-fix code; the cold branch's
+                        // flashinfer/flash_attn_paged symbols live in a
+                        // non-generic out-of-line helper, so eval<W>'s
+                        // monomorphizations don't pull them into this body.
                         kernels::flash_attn_contiguous(
                             *q,
                             *k,
                             *v,
                             *ctx.fwd.cu_seqlens_q,
                             *ctx.fwd.cu_seqlens_q,
-                            max_q,
-                            max_k,
+                            ctx.fwd.max_seqlen_q,
+                            ctx.fwd.max_seqlen_k,
                             W::ATTN_SCALE,
                             true,
                             W::ATTN_SOFTCAP,
@@ -1824,63 +1929,24 @@ impl Instruction {
                             interleaved,
                         )
                     } else {
-                        // Chunked-prefill continuation (chunk 2+): max_q < max_k
-                        // because chunk 1's K/V is already in the paged KV cache
-                        // and only this chunk's q_len rows are queried. Read K/V
-                        // from cache via the paged kernel — flash_attn_contiguous
-                        // would only see this chunk's K and miss the prefix.
-                        // Reshape-and-cache for this chunk's K/V ran upstream
-                        // (RopeAndCacheKV / equivalent) so the cache spans the
-                        // full sequence at this point.
-                        let layer = ctx.layer_offset as usize;
-                        let fi_cfg = flashinfer::FlashInferConfig {
-                            dtype: flashinfer::FiDType::Bf16,
-                            head_dim: W::HEAD_DIM,
-                            use_logits_soft_cap: W::ATTN_SOFTCAP > 0.0,
-                        };
-                        let sk_bucket = ah::sk_bucket_for(max_k);
-                        let fi = ah::flashinfer_attention(
-                            q,
+                        // COLD path: chunked-prefill continuation (chunk 2+).
+                        attn_prefill_chunked_continuation(
+                            ctx.fwd.kv_cache,
                             ctx.fwd.cu_seqlens_q,
                             ctx.fwd.seqused_k,
                             ctx.fwd.block_table,
-                            max_q,
-                            max_k,
+                            q,
+                            ctx.fwd.max_seqlen_q,
+                            ctx.fwd.max_seqlen_k,
+                            ctx.layer_offset as usize,
+                            W::HEAD_DIM,
                             W::ATTN_SCALE,
                             W::ATTN_SOFTCAP,
-                            ctx.fwd.kv_cache,
-                            layer,
                             ctx.device.num_sm,
-                            fi_cfg,
-                            sk_bucket,
                             &mut ctx.device.caching,
                             ctx.device.compute_stream,
-                        );
-                        match fi {
-                            Some(t) => t,
-                            None => kernels::flash_attn_paged_ext(
-                                *q,
-                                *ctx.fwd.kv_cache.k_cache(layer),
-                                *ctx.fwd.kv_cache.v_cache(layer),
-                                *ctx.fwd.cu_seqlens_q,
-                                *ctx.fwd.seqused_k,
-                                *ctx.fwd.block_table,
-                                max_q,
-                                max_k,
-                                W::ATTN_SCALE,
-                                true,
-                                W::ATTN_SOFTCAP,
-                                -1,
-                                ctx.fwd.kv_cache.block_size,
-                                ctx.device.num_sm,
-                                &mut ctx.device.caching,
-                                ctx.device.compute_stream,
-                                ::std::ptr::null::<u8>(),
-                                0,
-                                interleaved,
-                                ctx.fwd.kv_cache.block_unrotated_gpu(),
-                            ),
-                        }
+                            interleaved,
+                        )
                     }
                 };
                 unsafe {

@@ -50,7 +50,10 @@ METAL_FUNC void attention_decode_impl(
     uint seq_idx,
     uint q_head_idx,
     uint simd_gid,
-    uint simd_lid) {
+    uint simd_lid,
+    uint q_head_base) {
+  // NO DEFAULT — Metal `METAL_FUNC` does NOT reliably honour default args;
+  // every caller MUST pass q_head_base (0 for whole-op attention).
   constexpr int BN = 32; // simdgroups per threadgroup
   constexpr int BD = 32; // lanes per simdgroup
   typedef float U;
@@ -58,8 +61,13 @@ METAL_FUNC void attention_decode_impl(
   // qk_per_thread = HEAD_DIM / 32.
   const uint qk_per_thread = head_dim / uint(BD);
 
+  // HEAD-RANGE region contract: `q_head_idx` is LOCAL within this block (it
+  // indexes the block-based q/output operands), but the kv-head it reads is a
+  // GLOBAL mapping — `q_head_base` is the block's first global q-head, so a
+  // head-tiled attn (the partition) reads the right kv-head of the whole cache.
+  // `q_head_base == 0` ⇒ whole-op attention (unchanged).
   const uint group_ratio = num_q / num_kv;
-  const uint kv_head_idx = q_head_idx / group_ratio;
+  const uint kv_head_idx = (q_head_base + q_head_idx) / group_ratio;
   const uint kv_len = seq_used_k[seq_idx];
 
   const uint kv_blk_stride = num_kv * block_size * head_dim;

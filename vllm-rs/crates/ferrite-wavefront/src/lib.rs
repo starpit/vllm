@@ -18,6 +18,7 @@
 
 pub mod lower;
 pub mod mega;
+pub mod partition;
 pub mod region;
 pub mod region_schedule;
 pub mod scheduler;

@@ -1515,6 +1515,52 @@ fn wavefront_player_attention_bit_exact() {
         got, ref_bits,
         "player attention arm must be bit-exact vs whole attention_via_cache_v2"
     );
+
+    // HEAD-RANGE: a head-tiled attn block (q-heads [qh_start, qh_start+qh_count))
+    // must be bit-exact vs the whole attn's output for those same q-heads — each
+    // q-head's attention is independent, and the GLOBAL qh_start maps to the
+    // right kv-head of the whole cache. q/output operands are block-based (offset
+    // to qh_start*head_dim); shape head_range = (qh_start<<16)|qh_count.
+    let hd = head_dim;
+    for (qh_start, qh_count) in [(0usize, 1usize), (8, 1), (31, 1), (6, 4), (16, 8)] {
+        let blk_out = zeroed_buffer(&device, out_n * 2);
+        let head_range = ((qh_start as u32) << 16) | (qh_count as u32);
+        let off = (qh_start * hd * 2) as u64;
+        let got_blk = run_player_op_offsets(
+            &device,
+            &cache,
+            [
+                6,
+                hd as u32,
+                num_q as u32,
+                num_kv as u32,
+                scale.to_bits(),
+                block_size as u32,
+                max_blocks as u32,
+                head_range,
+            ],
+            &[
+                (&blk_out, off),
+                (&q_buf, off),
+                (&seq_used, 0),
+                (&block_table, 0),
+                (&k_buf, 0),
+                (&v_buf, 0),
+            ],
+            &blk_out,
+            out_n,
+        );
+        for h in 0..qh_count {
+            for d in 0..hd {
+                let i = (qh_start + h) * hd + d;
+                assert_eq!(
+                    got_blk[i], ref_bits[i],
+                    "head-range attn (qh_start={qh_start}, qh_count={qh_count}) head {h} d {d} \
+                     must match whole attn"
+                );
+            }
+        }
+    }
 }
 
 /// Residual Add arm bit-exact vs the CPU `bf16(f32(a)+f32(b))` (a plain
@@ -1558,6 +1604,352 @@ fn wavefront_player_add_bit_exact() {
     for (i, &g) in got.iter().enumerate() {
         let want = half::bf16::from_f32(af(&a, i) + af(&b, i)).to_bits();
         assert_eq!(g, want, "player add arm[{i}] mismatch");
+    }
+}
+
+/// sum_reduce arm bit-exact vs an f32-accumulate-then-round-once reference (the
+/// split-K all-reduce: `out[e] = round_bf16(Σ_k f32(partial_k[e]))`). The atom
+/// accumulates in f32 over the bindless operand sub-table and rounds ONCE —
+/// matching the region IR's f32 `SumReduce`. (Pairwise `add_impl` would round
+/// per step and mismatch — the point of a dedicated reduce primitive.)
+#[test]
+fn wavefront_player_sum_reduce_bit_exact() {
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+    let n = 2048u32;
+    let num_partials = 5usize; // odd, > the gqa fan-out, to exercise the loop
+
+    let bf16le = |v: f32| half::bf16::from_f32(v).to_bits().to_le_bytes();
+    let mut st = 0x5051_5052u64;
+    let mut next = || {
+        st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((st >> 40) as f32 / (1u64 << 24) as f32) * 4.0 - 2.0
+    };
+    let partials_bytes: Vec<Vec<u8>> = (0..num_partials)
+        .map(|_| (0..n).flat_map(|_| bf16le(next())).collect())
+        .collect();
+    let partial_bufs: Vec<Buffer> = partials_bytes
+        .iter()
+        .map(|b| buffer_from_bytes(&device, b))
+        .collect();
+    let out = zeroed_buffer(&device, (n * 2) as usize);
+
+    // operands [out, p0, p1, …]; shape (SUM_REDUCE=10, n, num_partials, …).
+    let mut operand_bufs: Vec<&Buffer> = vec![&out];
+    operand_bufs.extend(partial_bufs.iter());
+    let got = run_player_single(
+        &device,
+        &cache,
+        [10, n, num_partials as u32, 0, 0, 0, 0, 0],
+        &operand_bufs,
+        0,
+        n as usize,
+        1024,
+    );
+
+    let af = |bytes: &[u8], i: usize| {
+        half::bf16::from_bits(u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]])).to_f32()
+    };
+    for i in 0..n as usize {
+        // Left fold from 0.0 in operand order — the atom's exact accumulation.
+        let acc: f32 = partials_bytes.iter().map(|p| af(p, i)).sum();
+        let want = half::bf16::from_f32(acc).to_bits();
+        assert_eq!(got[i], want, "player sum_reduce arm[{i}] mismatch");
+    }
+    assert!(got.iter().any(|&b| b != 0), "sum_reduce all zeros");
+}
+
+fn read_bytes(buf: &Buffer, n: usize) -> Vec<u8> {
+    let ptr = buf.contents().as_ptr() as *const u8;
+    unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
+}
+
+/// Dispatch a single player op whose operands carry BYTE OFFSETS (the operand
+/// table is `gpuAddress(buf) + off`, exactly the production resolution). Used
+/// to exercise the split-K K-window, where w/scales/biases/x are read at a
+/// within-row K-offset. All operand buffers are made resident.
+fn run_player_op_offsets(
+    device: &Device,
+    cache: &SpecializedPipelineCache,
+    shape: [u32; 8],
+    operands: &[(&Buffer, u64)],
+    out: &Buffer,
+    out_n: usize,
+) -> Vec<u16> {
+    let operands_bytes: Vec<u8> = operands
+        .iter()
+        .flat_map(|(b, off)| (b.gpuAddress() + *off).to_le_bytes())
+        .collect();
+    let operands_buf = buffer_from_bytes(device, &operands_bytes);
+    let shapes = buffer_from_bytes(device, &bytes_of_u32(&shape));
+    let tape = buffer_from_bytes(device, &bytes_of_u32(&[0, 0, 0, 0]));
+    let tape_offsets = buffer_from_bytes(device, &bytes_of_u32(&[0, 1]));
+    let flags = zeroed_buffer(device, 4);
+    let player = cache
+        .get_or_build(&PipelineKey::new(
+            "wavefront_layer",
+            "wavefront_player_bf16_s_f16_gs_64_b_4",
+            vec![],
+        ))
+        .expect("wavefront_player pipeline");
+    let queue = device.newCommandQueue().expect("queue");
+    let cb = queue.commandBuffer().expect("cb");
+    let enc = cb.computeCommandEncoder().expect("enc");
+    enc.setComputePipelineState(&player);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&tape), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&shapes), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&operands_buf), 0, 2);
+        enc.setBuffer_offset_atIndex(Some(&tape_offsets), 0, 3);
+        enc.setBuffer_offset_atIndex(Some(&flags), 0, 4);
+    }
+    for (b, _) in operands {
+        use_resource(&enc, b, MTLResourceUsage::Read | MTLResourceUsage::Write);
+    }
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 1024,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+    read_bf16(out, out_n)
+}
+
+/// Split-K via the qmv K-WINDOW (the `row_vec` contract) + the sum_reduce arm.
+/// Two claims:
+///  1. **Bit-exact**: a window qmv reading the K-slice `[c0, c0+ck)` of an
+///     `[n, K]` weight (full-K row stride) equals a whole qmv over that slice
+///     extracted into a contiguous `[n, ck]` weight — i.e. the window arm reads
+///     exactly the slice, same f32 accumulation, same single round.
+///  2. **Within tol**: summing the `K/ck` partials (sum_reduce, f32 accum)
+///     reconstructs the whole qmv to within bf16 reassociation — the split-K
+///     all-reduce o_proj/down lower to (PLAN Tier A′).
+#[test]
+fn wavefront_player_split_k_qmv_bit_exact() {
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+    // qmv_fast reads block_size = values_per_thread(16) * SIMD(32) = 512 K-values
+    // per simdgroup pass, so K (and each split-K chunk) MUST be a multiple of 512
+    // — the qmv primitive's K contract. The lowering therefore tiles split-K at
+    // 512-granularity (NOT head_dim). Here: K=2048, 4 chunks of 512.
+    let (n, kk, gs, ck) = (512u32, 2048u32, 64u32, 512u32);
+    let nchunks = kk / ck;
+
+    let (w, s, b, x) = make_qmv(&device, n, kk, gs, 0x5D17_5D17);
+    let y_whole = qmv_ref(&device, &cache, &w, &s, &b, &x, n, kk, gs);
+
+    // Host copies of the packed buffers, to extract contiguous K-slices.
+    let w_bytes = read_bytes(&w, (n * kk / 2) as usize);
+    let s_bytes = read_bytes(&s, (n * (kk / gs) * 2) as usize);
+    let b_bytes = read_bytes(&b, (n * (kk / gs) * 2) as usize);
+    let x_bytes = read_bytes(&x, (kk * 2) as usize);
+
+    let mut partials: Vec<Buffer> = Vec::new();
+    for c in 0..nchunks {
+        let c0 = c * ck;
+        // Extract W[:, c0:c0+ck] → contiguous [n, ck] (4-bit packed, byte-aligned
+        // since c0, ck are multiples of 2). Scales/biases: groups [c0/gs, …).
+        let wrow = (kk / 2) as usize;
+        let woff = (c0 / 2) as usize;
+        let wslice = (ck / 2) as usize;
+        let w_c: Vec<u8> = (0..n as usize)
+            .flat_map(|i| w_bytes[i * wrow + woff..i * wrow + woff + wslice].to_vec())
+            .collect();
+        let ng = (kk / gs) as usize;
+        let goff = (c0 / gs) as usize;
+        let gslice = (ck / gs) as usize;
+        let extract_g = |g: &[u8]| -> Vec<u8> {
+            (0..n as usize)
+                .flat_map(|i| g[(i * ng + goff) * 2..(i * ng + goff + gslice) * 2].to_vec())
+                .collect()
+        };
+        let s_c = extract_g(&s_bytes);
+        let b_c = extract_g(&b_bytes);
+        let x_c = x_bytes[(c0 * 2) as usize..((c0 + ck) * 2) as usize].to_vec();
+        let (wc, sc, bc, xc) = (
+            buffer_from_bytes(&device, &w_c),
+            buffer_from_bytes(&device, &s_c),
+            buffer_from_bytes(&device, &b_c),
+            buffer_from_bytes(&device, &x_c),
+        );
+        let ref_c = qmv_ref(&device, &cache, &wc, &sc, &bc, &xc, n, ck, gs);
+
+        // Window qmv: operands at the within-row K-offset; shape (QMV, ck, n, K).
+        let partial = zeroed_buffer(&device, (n * 2) as usize);
+        let w_off = (c0 / 2) as u64; // packed_weight_row_bytes(c0, 4)
+        let g_off = ((c0 / gs) * 2) as u64; // affine_scale_row_bytes(c0, gs, 2)
+        let x_off = (c0 * 2) as u64;
+        let got_c = run_player_op_offsets(
+            &device,
+            &cache,
+            [0, ck, n, kk, 0, 0, 0, 0],
+            &[
+                (&w, w_off),
+                (&s, g_off),
+                (&b, g_off),
+                (&x, x_off),
+                (&partial, 0),
+            ],
+            &partial,
+            n as usize,
+        );
+        assert_eq!(
+            got_c, ref_c,
+            "split-K window qmv chunk {c} must be bit-exact vs whole qmv over the extracted slice"
+        );
+        partials.push(partial);
+    }
+
+    // Sum the partials (the all-reduce) and check it reconstructs the whole qmv.
+    let y_split = zeroed_buffer(&device, (n * 2) as usize);
+    let mut sr_ops: Vec<&Buffer> = vec![&y_split];
+    sr_ops.extend(partials.iter());
+    let got = run_player_single(
+        &device,
+        &cache,
+        [10, n, nchunks, 0, 0, 0, 0, 0],
+        &sr_ops,
+        0,
+        n as usize,
+        1024,
+    );
+    let f = |b: u16| half::bf16::from_bits(b).to_f32();
+    for i in 0..n as usize {
+        let (a, want) = (f(got[i]), f(y_whole[i]));
+        assert!(
+            (a - want).abs() <= 1e-2 + 1e-2 * want.abs(),
+            "split-K reconstruction[{i}] {a} vs whole {want} exceeds bf16-reassoc tol"
+        );
+    }
+}
+
+/// Split-K via the **qmv_quad** K-window — the Option-Q path: split-K chunks are
+/// head_dim-wide (64), below qmv_fast's 512-K minimum, so they lower to the
+/// tall-skinny qmv_quad primitive (one quad-load of D=64). Two claims, same as
+/// the qmv_fast split-K test:
+///  1. **Bit-exact**: a qmv_quad reading the 64-wide K-slice `[c0, c0+64)` with
+///     full-row stride == the same arm with NO window over that slice extracted
+///     contiguously (row_vec == k). Isolates the quad K-window.
+///  2. **Within tol**: the 8 quad partials summed (sum_reduce) reconstruct the
+///     whole qmv_fast (K=512) to within bf16 reassociation.
+#[test]
+fn wavefront_player_split_k_qmv_quad_bit_exact() {
+    let Some(md) = detect_device() else {
+        eprintln!("[skip] no Metal device");
+        return;
+    };
+    let device = md.device;
+    let cache =
+        SpecializedPipelineCache::with_standard_shaders(device.clone()).expect("shader cache");
+    // Real o_proj split-K shape: K_full=2048 (qdim), head_dim=64 chunks, n=2048.
+    let (n, kk, gs, ck) = (2048u32, 2048u32, 64u32, 64u32);
+    let nchunks = kk / ck;
+
+    let (w, s, b, x) = make_qmv(&device, n, kk, gs, 0x9114_0064);
+    let y_whole = qmv_ref(&device, &cache, &w, &s, &b, &x, n, kk, gs);
+    let w_bytes = read_bytes(&w, (n * kk / 2) as usize);
+    let s_bytes = read_bytes(&s, (n * (kk / gs) * 2) as usize);
+    let b_bytes = read_bytes(&b, (n * (kk / gs) * 2) as usize);
+    let x_bytes = read_bytes(&x, (kk * 2) as usize);
+
+    let mut partials: Vec<Buffer> = Vec::new();
+    for c in 0..nchunks {
+        let c0 = c * ck;
+        let wrow = (kk / 2) as usize;
+        let woff = (c0 / 2) as usize;
+        let wslice = (ck / 2) as usize;
+        let w_c: Vec<u8> = (0..n as usize)
+            .flat_map(|i| w_bytes[i * wrow + woff..i * wrow + woff + wslice].to_vec())
+            .collect();
+        let ng = (kk / gs) as usize;
+        let goff = (c0 / gs) as usize;
+        let gslice = (ck / gs) as usize;
+        let extract_g = |g: &[u8]| -> Vec<u8> {
+            (0..n as usize)
+                .flat_map(|i| g[(i * ng + goff) * 2..(i * ng + goff + gslice) * 2].to_vec())
+                .collect()
+        };
+        let (wc, sc, bc, xc) = (
+            buffer_from_bytes(&device, &w_c),
+            buffer_from_bytes(&device, &extract_g(&s_bytes)),
+            buffer_from_bytes(&device, &extract_g(&b_bytes)),
+            buffer_from_bytes(
+                &device,
+                &x_bytes[(c0 * 2) as usize..((c0 + ck) * 2) as usize],
+            ),
+        );
+
+        // No-window quad over the extracted contiguous slice (row_vec slot 0).
+        let p_ref = zeroed_buffer(&device, (n * 2) as usize);
+        let got_extracted = run_player_op_offsets(
+            &device,
+            &cache,
+            [11, ck, n, 0, 0, 0, 0, 0], // QMV_QUAD
+            &[(&wc, 0), (&sc, 0), (&bc, 0), (&xc, 0), (&p_ref, 0)],
+            &p_ref,
+            n as usize,
+        );
+        // Windowed quad over the K-slice of the full weight (row_vec = full K).
+        let partial = zeroed_buffer(&device, (n * 2) as usize);
+        let got_window = run_player_op_offsets(
+            &device,
+            &cache,
+            [11, ck, n, kk, 0, 0, 0, 0],
+            &[
+                (&w, (c0 / 2) as u64),
+                (&s, ((c0 / gs) * 2) as u64),
+                (&b, ((c0 / gs) * 2) as u64),
+                (&x, (c0 * 2) as u64),
+                (&partial, 0),
+            ],
+            &partial,
+            n as usize,
+        );
+        assert_eq!(
+            got_window, got_extracted,
+            "qmv_quad K-window chunk {c} must be bit-exact vs no-window over the extracted slice"
+        );
+        partials.push(partial);
+    }
+
+    let y_split = zeroed_buffer(&device, (n * 2) as usize);
+    let mut sr_ops: Vec<&Buffer> = vec![&y_split];
+    sr_ops.extend(partials.iter());
+    let got = run_player_single(
+        &device,
+        &cache,
+        [10, n, nchunks, 0, 0, 0, 0, 0],
+        &sr_ops,
+        0,
+        n as usize,
+        1024,
+    );
+    let f = |b: u16| half::bf16::from_bits(b).to_f32();
+    for i in 0..n as usize {
+        let (a, want) = (f(got[i]), f(y_whole[i]));
+        assert!(
+            (a - want).abs() <= 2e-2 + 2e-2 * want.abs(),
+            "quad split-K reconstruction[{i}] {a} vs whole {want} exceeds bf16-reassoc tol"
+        );
     }
 }
 

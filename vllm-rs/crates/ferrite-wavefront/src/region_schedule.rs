@@ -214,6 +214,37 @@ pub fn schedule_wavefront(
     schedule_from_assignment(graph, &preds, &worker_of, p)
 }
 
+/// **Slice-index owner assignment** — the partition's placement rule. Worker
+/// `w` owns column-slice `w` of EVERY op: `owner = (output column start / unit)
+/// mod P`. Because the decode chains preserve columns — matmul N-block →
+/// rope → attn (one q-head group), and gate/up → silu·mul (one intermediate
+/// block) — every op in a chain lands on the SAME worker, so the chain is
+/// local (no cross-worker wait). This replaces the greedy scatter of
+/// [`schedule_wavefront`], which balances load by splitting chains across
+/// workers (the source of the cross-worker dependency-wait the megakernel
+/// pays). `unit` is the tiling granularity the graph was lowered at (the
+/// `head_dim`, so head-structured ops and column-tiled ops align).
+///
+/// Cross-worker edges survive only at the genuine joins — the o_proj/down
+/// reductions and the rmsnorm broadcast — which the split-K + replication
+/// transforms remove ([`crate::partition`]).
+pub fn assign_owners_slice_index(graph: &RegionGraph, unit: u32, num_workers: u32) -> Vec<u32> {
+    let p = num_workers.max(1);
+    let unit = unit.max(1);
+    graph
+        .nodes
+        .iter()
+        .map(|n| (n.output.region.cols.start / unit) % p)
+        .collect()
+}
+
+/// Build a [`Schedule`] from the slice-index owner assignment.
+pub fn schedule_slice_index(graph: &RegionGraph, unit: u32, num_workers: u32) -> Schedule {
+    let preds = predecessors(graph);
+    let worker_of = assign_owners_slice_index(graph, unit, num_workers);
+    schedule_from_assignment(graph, &preds, &worker_of, num_workers.max(1) as usize)
+}
+
 /// Read P1 / P2 / total off a schedule under the given cost model.
 pub fn measure(
     graph: &RegionGraph,
@@ -428,6 +459,40 @@ mod tests {
                     "round-robin replay nb={nb} p={p}"
                 );
             }
+        }
+    }
+
+    /// **Slice-index scheduling co-locates chains.** gemm1(N-block) → silu
+    /// (tiled) → gemm2: with `unit = nb`, silu tile `i` shares columns with
+    /// gemm1 block `i`, so the slice-index puts them on the SAME worker (the
+    /// chain is local — no cross-worker wait), and the tape still replays
+    /// bit-exact (`play` is correct for any valid assignment).
+    #[test]
+    fn slice_index_co_locates_chains() {
+        let (input, data) = chain_input(24, 16, 20);
+        let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
+        let nb = 4u32;
+        let g = lower_region(&input, nb);
+        let want = result_buffer(&g, &crate::region::eval_dag(&g, &srcs)).to_vec();
+        // gemm1 → 4 blocks (ids 0..4, cols 0,4,8,12); silu → 4 tiles (ids 4..8,
+        // same cols); gemm2 → 5 blocks reading whole silu.
+        assert_eq!(g.nodes.len(), 13);
+        for p in [2u32, 4, 10] {
+            let owner = assign_owners_slice_index(&g, nb, p);
+            for i in 0..4 {
+                assert_eq!(
+                    owner[i],
+                    owner[4 + i],
+                    "silu tile {i} co-located with its matmul block (p={p})"
+                );
+            }
+            let si = schedule_slice_index(&g, nb, p);
+            assert_eq!(si.total_computes(), g.nodes.len());
+            assert_eq!(
+                result_buffer(&g, &play(&g, &si, &srcs)),
+                &want[..],
+                "slice-index replay p={p}"
+            );
         }
     }
 

@@ -125,6 +125,17 @@ pub mod op_kind {
     /// compute→publish barrier — the store itself is the readiness signal a
     /// consumer `ACQUIRE`-spins on. Operands `[w, scales, biases, x, y_coh]`.
     pub const QMV_COH: u32 = 9;
+    /// The split-K all-reduce: sum every partial (one per activation K-chunk)
+    /// into the output. Operands `[out, p0, p1, …]`; shape `(SUM_REDUCE, n,
+    /// num_partials, …)`. Cross-worker partials are read from the worker's
+    /// ACQUIREd private copy (`read_operand` redirect), so the reduce composes
+    /// the elementwise-add atom over whatever copies it sees locally.
+    pub const SUM_REDUCE: u32 = 10;
+    /// Tall-skinny qmv (small contiguous K == head_dim, large N): the variant
+    /// the shape-keyed selector picks for a split-K partial whose K-window is
+    /// below `qmv_fast`'s 512-K minimum. Same `[w, scales, biases, x, y]`
+    /// operands + `(_, k, n, row_vec)` shape as `QMV`; composes `qmv_quad_impl`.
+    pub const QMV_QUAD: u32 = 11;
 }
 
 /// `u32`s per shape-class record (`WL_SHAPE_STRIDE`). Wide enough for
@@ -178,6 +189,17 @@ pub struct MegaProgram {
     pub arena_bytes: Vec<u64>,
     /// The buffer holding the forward result (logits).
     pub result: BufId,
+    /// **Dynamic-dispatch path** — same compute ops as `tape` but laid out in
+    /// ASAP-level order (all level-L subtiles before any level-(L+1)). A
+    /// dynamic-dispatch player kernel grabs subtiles from this tape via an
+    /// atomic claim and processes them with whatever TG is free, removing the
+    /// per-worker fixed-chain ceiling. Empty when the schedule doesn't need
+    /// this path (the conventional per-worker `tape` is the default emit).
+    pub level_tape: Vec<[u32; 4]>,
+    /// `[num_levels + 1]` boundaries into `level_tape`. Level L's subtiles
+    /// occupy `[level_starts[L], level_starts[L + 1])`. Empty iff
+    /// `level_tape` is empty.
+    pub level_starts: Vec<u32>,
 }
 
 impl MegaProgram {
@@ -259,6 +281,9 @@ impl MegaProgram {
             op_kind::ATTN => "attn",
             op_kind::ADD => "add",
             op_kind::ROPE_APPEND => "ropeA",
+            op_kind::SUM_REDUCE => "sumr",
+            op_kind::QMV_COH => "qmvC",
+            op_kind::QMV_QUAD => "qmvQ",
             _ => "op?",
         };
         let mut out = String::new();
@@ -438,15 +463,14 @@ pub fn serialize_mode(
     // worker's plain arena writes are not coherent on the GPU, so a tensor
     // produced on one worker and read on another rides a PUBLISH (per
     // producer block) → ACQUIRE (per consuming worker) atomic round-trip.
-    let worker_of = reconstruct_worker_of(graph, schedule);
-    ser.plan_handoffs(&worker_of)?;
-
-    // Region-overlap predecessors (the RAW edges). They both split a worker's
-    // computes into tranches (a same-worker producer→consumer edge is a tranche
-    // boundary) and tell us which tranche boundaries need an intra-worker
-    // barrier. Cross-worker preds are gated by the schedule's Wait/Signal, not
-    // by these barriers.
+    // Region-overlap predecessors (the RAW edges). They drive the handoff plan
+    // (a cross-worker operand-read edge needs a coherent staging slot), split a
+    // worker's computes into tranches (a same-worker producer→consumer edge is a
+    // tranche boundary), and tell us which tranche boundaries need an intra-
+    // worker barrier. Cross-worker preds are gated by the schedule's Wait/Signal.
     let preds = predecessors(graph);
+    let worker_of = reconstruct_worker_of(graph, schedule);
+    ser.plan_handoffs(&worker_of, &preds)?;
 
     // ASAP level (longest path from a root) of every node. Nodes at the same
     // level are mutually independent AND have all inputs at strictly lower
@@ -465,6 +489,59 @@ pub fn serialize_mode(
             .map(|p| level[p.0 as usize] + 1)
             .max()
             .unwrap_or(0);
+    }
+    // PERF DIAG (one-shot): per-DAG-level subtile count = how much subtile-
+    // parallelism the schedule actually exposes. If max count per level is
+    // small (~P), the persistent-megakernel design with P TGs already covers
+    // it. If hundreds, a dynamic-dispatch kernel could fill the GPU much
+    // more fully. FERRITE_WAVEFRONT_LEVEL_PROFILE=1 to enable.
+    if std::env::var_os("FERRITE_WAVEFRONT_LEVEL_PROFILE").is_some() {
+        let max_lvl = *level.iter().max().unwrap_or(&0);
+        let mut per_level = vec![0u32; (max_lvl + 1) as usize];
+        for &l in &level {
+            per_level[l as usize] += 1;
+        }
+        let total_subtiles = level.len() as u32;
+        let mut count_max = 0u32;
+        let mut count_p2plus = 0u32; // levels with > 2 subtiles
+        let mut count_p10plus = 0u32;
+        let mut count_p32plus = 0u32;
+        let mut count_p128plus = 0u32;
+        for &c in &per_level {
+            if c > count_max {
+                count_max = c;
+            }
+            if c >= 2 {
+                count_p2plus += c;
+            }
+            if c >= 10 {
+                count_p10plus += c;
+            }
+            if c >= 32 {
+                count_p32plus += c;
+            }
+            if c >= 128 {
+                count_p128plus += c;
+            }
+        }
+        eprintln!(
+            "[wf-levels] num_levels={} total_subtiles={} max_per_level={} \
+             subtiles_in_levels_with_>=2={} (={:.1}%) \
+             subtiles_in_levels_with_>=10={} (={:.1}%) \
+             subtiles_in_levels_with_>=32={} (={:.1}%) \
+             subtiles_in_levels_with_>=128={} (={:.1}%)",
+            per_level.len(),
+            total_subtiles,
+            count_max,
+            count_p2plus,
+            100.0 * count_p2plus as f64 / total_subtiles as f64,
+            count_p10plus,
+            100.0 * count_p10plus as f64 / total_subtiles as f64,
+            count_p32plus,
+            100.0 * count_p32plus as f64 / total_subtiles as f64,
+            count_p128plus,
+            100.0 * count_p128plus as f64 / total_subtiles as f64,
+        );
     }
     // Each producer's Signal flag, read off the schedule (a `Compute(id)` trailed
     // by `Signal(f)`), so a consumer tranche can wait on its cross-worker inputs'
@@ -528,6 +605,37 @@ pub fn serialize_mode(
         pack_simdgroup_ranges(&mut tape, &tape_offsets, &ser.shapes);
     }
 
+    // Dynamic-dispatch path: emit a parallel `level_tape` of just the COMPUTE
+    // ops in ASAP-level order (no PUBLISH/ACQUIRE/BARRIER — the level barrier
+    // the new player kernel issues replaces those). `level_starts[L]` is the
+    // first level-L COMPUTE entry's index in `level_tape`. A worker subtile
+    // gets emitted twice — once in the per-worker `tape`, once here — so the
+    // `operands` table grows; `shapes` is interned, no duplication there. The
+    // existing player kernel ignores these fields; only the new dynamic-
+    // dispatch player reads them.
+    ser.acquired.clear();
+    let mut sorted_node_ids: Vec<u32> = (0..graph.nodes.len() as u32).collect();
+    sorted_node_ids.sort_by_key(|&id| (level[id as usize], id));
+    let max_level = level.iter().copied().max().unwrap_or(0) as usize;
+    let mut level_tape: Vec<[u32; 4]> = Vec::new();
+    let mut level_starts: Vec<u32> = vec![0; max_level + 2];
+    let mut current_level = 0u32;
+    for nid in &sorted_node_ids {
+        let node = &graph.nodes[*nid as usize];
+        let node_level = level[*nid as usize];
+        while current_level < node_level {
+            current_level += 1;
+            level_starts[current_level as usize] = level_tape.len() as u32;
+        }
+        let (sc, base) = ser.emit_compute(node)?;
+        level_tape.push([opcode::COMPUTE, sc, base, 0]);
+    }
+    // Final boundary (one past the last level).
+    while (current_level as usize + 1) < level_starts.len() {
+        current_level += 1;
+        level_starts[current_level as usize] = level_tape.len() as u32;
+    }
+
     let result = ser.arena_bufid(graph.result);
     Ok(MegaProgram {
         tape,
@@ -539,6 +647,8 @@ pub fn serialize_mode(
         elem_bytes: ser.elem_bytes,
         arena_bytes: ser.arena_bytes,
         result,
+        level_tape,
+        level_starts,
     })
 }
 
@@ -576,11 +686,12 @@ fn emit_worker_pipelined(
                 let (sc, base) = ser.emit_compute(node)?;
                 tape.push([opcode::COMPUTE, sc, base, 0]);
                 since.insert(id);
-                // A qmv handoff producer wrote the coherent slot DIRECTLY
-                // (QMV_COH) — no PUBLISH, no compute→publish barrier. Only a
-                // non-qmv handoff producer (rope/silu/add output crossing
-                // workers) still needs the barrier + PUBLISH from arena.
-                if ser.produces_handoff(node) && !matches!(node.op, SubOp::MatmulTile) {
+                // An N-block qmv handoff producer wrote the coherent slot
+                // DIRECTLY (QMV_COH) — no PUBLISH, no compute→publish barrier.
+                // A non-qmv handoff producer (rope/silu/add) AND a split-K
+                // matmul partial (which writes arena, not coherent) still need
+                // the barrier + PUBLISH from arena.
+                if ser.needs_publish(node) {
                     tape.push([opcode::BARRIER, 0, 0, 0]);
                     since.clear();
                     ser.emit_publish(node, tape)?;
@@ -692,7 +803,7 @@ fn emit_worker_tranches(
         let publishes: Vec<SubtileId> = tranche
             .iter()
             .copied()
-            .filter(|&id| ser.produces_handoff(&graph.nodes[id.0 as usize]))
+            .filter(|&id| ser.needs_publish(&graph.nodes[id.0 as usize]))
             .collect();
         if !publishes.is_empty() {
             tape.push([opcode::BARRIER, 0, 0, 0]);
@@ -724,7 +835,7 @@ fn emit_worker_tranches(
 fn is_packable(op: u32) -> bool {
     matches!(
         op,
-        op_kind::QMV | op_kind::SILU_MUL | op_kind::ROPE | op_kind::ADD
+        op_kind::QMV | op_kind::QMV_QUAD | op_kind::SILU_MUL | op_kind::ROPE | op_kind::ADD
     )
 }
 
@@ -733,8 +844,9 @@ fn is_packable(op: u32) -> bool {
 /// arms scale with their element count `N`.
 fn op_cost(shape: &[u32; SHAPE_STRIDE]) -> f64 {
     match shape[0] {
-        op_kind::QMV => shape[1] as f64 * shape[2] as f64, // K × N
-        _ => shape[1] as f64,                              // N
+        // qmv (fast or quad): bandwidth-bound on the K-slice × N weight read.
+        op_kind::QMV | op_kind::QMV_QUAD => shape[1] as f64 * shape[2] as f64, // K × N
+        _ => shape[1] as f64,                                                  // N
     }
 }
 
@@ -1045,36 +1157,51 @@ impl<'a> Ser<'a> {
         base
     }
 
-    /// Plan the cross-worker handoffs: find every op-output tensor whose
-    /// blocks are produced on one worker and read on another, and allocate a
-    /// coherent (atomic u32-packed, whole-tensor) staging slot for each. A
-    /// peer worker's plain arena writes are not coherent on the GPU; a
-    /// consumer must instead read a private copy it ACQUIREs from the staging
-    /// slot, which every producer block PUBLISHes its stripe into.
-    fn plan_handoffs(&mut self, worker_of: &[u32]) -> Result<(), SerializeError> {
-        // Producer / consumer worker-sets per op-output tensor.
+    /// Plan the cross-worker handoffs: a tensor needs a coherent staging slot
+    /// iff a region-overlap EDGE crosses workers — a consumer reads it AS A GPU
+    /// OPERAND on a different worker than a producer block wrote it. Using the
+    /// edges (not per-tensor producer/consumer worker-SETS) is the partition's
+    /// linchpin: a column-preserving chain (q-rope→attn, gate/up→silu→down-part)
+    /// reads the SAME columns its same-worker producer wrote, so NO edge crosses
+    /// ⇒ NO handoff (the data stays in the worker's arena — no broadcast wait).
+    /// Only the genuine joins cross: the split-K partials a SumReduce all-reduces
+    /// (and, for `lower_region`, a whole-op consumer reading an N-blocked
+    /// producer). Identical to the worker-set test where consumers read whole;
+    /// strictly tighter where they read aligned slices. Attn reads its new K/V
+    /// from the paged cache, NOT the arena rope/v output, so those edges are not
+    /// operand reads here (the cache write ordering is a separate concern).
+    fn plan_handoffs(
+        &mut self,
+        worker_of: &[u32],
+        preds: &[Vec<SubtileId>],
+    ) -> Result<(), SerializeError> {
+        // Workers that write each op-output tensor (for the per-worker PUBLISH /
+        // the consumer's ACQUIRE-from-peer decision).
         let mut producers: HashMap<TensorId, HashSet<u32>> = HashMap::new();
-        let mut consumers: HashMap<TensorId, HashSet<u32>> = HashMap::new();
         for node in &self.graph.nodes {
-            let w = worker_of[node.id.0 as usize];
-            producers.entry(node.output.tensor).or_default().insert(w);
-            for inp in &node.inputs {
-                if !self.is_source(inp.tensor) {
-                    consumers.entry(inp.tensor).or_default().insert(w);
+            producers
+                .entry(node.output.tensor)
+                .or_default()
+                .insert(worker_of[node.id.0 as usize]);
+        }
+        // Crossing tensors = those on a cross-worker operand-read edge.
+        let mut crossing: HashSet<TensorId> = HashSet::new();
+        for (cid, ps) in preds.iter().enumerate() {
+            let consumer = &self.graph.nodes[cid];
+            let cw = worker_of[cid];
+            for p in ps {
+                if worker_of[p.0 as usize] == cw {
+                    continue; // same-worker edge — local arena, no handoff
+                }
+                let t = self.graph.nodes[p.0 as usize].output.tensor;
+                if self.reads_as_operand(consumer, t) {
+                    crossing.insert(t);
                 }
             }
         }
-        let mut tids: Vec<TensorId> = producers.keys().copied().collect();
+        let mut tids: Vec<TensorId> = crossing.into_iter().collect();
         tids.sort_by_key(|t| t.0); // deterministic slot order
         for t in tids {
-            let prod = producers[&t].clone();
-            let Some(cons) = consumers.get(&t) else {
-                continue; // no reader (e.g. the result tensor) → no handoff
-            };
-            // Crosses iff some producer worker differs from some consumer worker.
-            if !prod.iter().any(|p| cons.iter().any(|c| p != c)) {
-                continue;
-            }
             let cols = self.graph.shape(t).cols;
             if !cols.is_multiple_of(2) {
                 return Err(SerializeError::NonDecodeShape {
@@ -1088,12 +1215,23 @@ impl<'a> Ser<'a> {
                 t,
                 Handoff {
                     coherent_slot,
-                    producers: prod,
+                    producers: producers[&t].clone(),
                     cols,
                 },
             );
         }
         Ok(())
+    }
+
+    /// Whether `node` reads tensor `t` as a GPU OPERAND (vs a dataflow-only
+    /// edge). All ops read every input as an operand EXCEPT attention, whose
+    /// new K/V (and the prefix K/V sources) are the paged cache, not arena
+    /// reads — only its q (input 0) is an arena operand.
+    fn reads_as_operand(&self, node: &SubtileNode, t: TensorId) -> bool {
+        match node.op {
+            SubOp::AttnDecode { .. } => node.inputs.first().map(|i| i.tensor) == Some(t),
+            _ => node.inputs.iter().any(|i| i.tensor == t),
+        }
     }
 
     /// Before a consumer `Compute`, emit an `ACQUIRE` for each cross-worker
@@ -1227,17 +1365,41 @@ impl<'a> Ser<'a> {
                 id: node.id.0,
                 detail: "standalone Mul — fuse Silu+Mul into SiluMul before scheduling",
             }),
-            SubOp::SumReduce => Err(SerializeError::UnsupportedOp {
-                id: node.id.0,
-                detail: "split-K SumReduce — no GPU arm yet (k_chunks=1 only)",
-            }),
+            SubOp::SumReduce => self.emit_sum_reduce(node),
         }
     }
 
-    /// QMV: operands `[w, scales, biases, x, y]`; shape `(QMV, K, N)`. The
-    /// N-block's output column start `r` is the weight's row block, so the
-    /// w/scales/biases/y bindings carry `r * row_stride` — the linchpin
-    /// that makes a block a standalone `N×K` matvec.
+    /// SUM_REDUCE: operands `[out, p0, p1, …]`; shape `(SUM_REDUCE, n,
+    /// num_partials, …)`. The split-K all-reduce — each replicated copy sums
+    /// every partial (one per activation K-chunk) into its own whole output.
+    /// A cross-worker partial is read from this worker's ACQUIREd private copy
+    /// (the `read_operand` redirect), so the arm just adds the operands it is
+    /// handed; `eval_node`'s `SumReduce` is the bit-exact reference.
+    fn emit_sum_reduce(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+        let id = node.id.0;
+        let n = node.output.region.cols.len;
+        let mut slots = Vec::with_capacity(node.inputs.len() + 1);
+        slots.push(self.write_operand(&node.output, id)?);
+        for inp in &node.inputs {
+            slots.push(self.read_operand(inp, id)?);
+        }
+        let num_partials = node.inputs.len() as u32;
+        let base = self.push_operands(&slots);
+        let sc = self.intern_shape([op_kind::SUM_REDUCE, n, num_partials, 0, 0, 0, 0, 0]);
+        Ok((sc, base))
+    }
+
+    /// QMV: operands `[w, scales, biases, x, y]`; shape `(QMV, k, n,
+    /// row_vec)`. Two region contracts, one primitive:
+    ///   - **N-block**: weight rows `blk`, full K. The output col start `r`
+    ///     is the weight's row block, so w/scales/biases/y carry `r * row_stride`
+    ///     — the linchpin that makes a block a standalone `n×K` matvec.
+    ///   - **split-K** (a partial of o_proj/down): weight rows full, K-slice
+    ///     `kb`. The weight is read as a K-WINDOW: `row_vec = K_full` is the
+    ///     full row stride (shape slot 3), `k = kb.len` the window length, and
+    ///     w/scales/biases carry the within-row K-offset `kb.start` (group-
+    ///     aligned). A split-K partial writes to ARENA + is PUBLISHed (the
+    ///     coherent fuse only applies to single-reduction N-block outputs).
     fn emit_qmv(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let act = &node.inputs[0];
@@ -1246,9 +1408,9 @@ impl<'a> Ser<'a> {
         self.check_row0(act, id)?;
         self.check_row0(out, id)?;
 
-        let k = act.region.cols.len;
+        let k = act.region.cols.len; // K-window length (== weight K-slice width)
         let n = out.region.cols.len;
-        let r = out.region.cols.start as u64;
+        let r = out.region.cols.start as u64; // N-block row offset (0 for split-K)
 
         if !self.is_source(wtr.tensor) {
             return Err(SerializeError::BadSource {
@@ -1274,39 +1436,71 @@ impl<'a> Ser<'a> {
                 }
             };
 
-        let w_off = r * packed_weight_row_bytes(k, bits);
-        let sb_off = r * affine_scale_row_bytes(k, group_size, scale_elem as u64);
+        // K-window: the weight row is `k_full` wide (the row stride); this op
+        // reduces the K-slice `[k_off, k_off + k)`. Off-window (N-block qmv)
+        // `k_full == k`, `k_off == 0` ⇒ `row_vec` slot stays 0, byte-identical
+        // to the previous emit. A split-K slice must be group-aligned (the qmv
+        // atom indexes scales per group). We read K_full from the ACTIVATION
+        // tensor (always `[m, K]` by convention) rather than the weight tensor,
+        // because the weight's stored layout can be transposed (`[K, N]` for
+        // some quant formats) — using the activation gives the true K.
+        let k_full = self.graph.shape(act.tensor).cols;
+        let k_off = act.region.cols.start;
+        let windowed = k_full != k;
+        if windowed && (!k_off.is_multiple_of(group_size) || !k.is_multiple_of(group_size)) {
+            return Err(SerializeError::NonDecodeShape {
+                id,
+                detail: "split-K weight K-slice is not group-aligned",
+            });
+        }
+        let row_vec = if windowed { k_full } else { 0 };
+
+        // Weight/scale offsets = N-block row offset (full-K stride) + within-row
+        // K-window offset. Both terms vanish in the respective other mode.
+        let w_off =
+            r * packed_weight_row_bytes(k_full, bits) + packed_weight_row_bytes(k_off, bits);
+        let sb_off = r * affine_scale_row_bytes(k_full, group_size, scale_elem as u64)
+            + affine_scale_row_bytes(k_off, group_size, scale_elem as u64);
         let y_off = r * self.geom.act_elem as u64;
 
         let w_buf = self.intern(weight, 4); // packed 4-bit weight read as u32
         let s_buf = self.intern(scales, scale_elem);
         let b_buf = self.intern(biases, scale_elem);
         let x = self.read_operand(act, id)?;
-        // PAT-4 producer fuse: if this qmv's output crosses workers, write it
-        // STRAIGHT into the handoff's coherent (atomic u32-packed) slot at this
-        // block's stripe — no arena, no separate PUBLISH, no compute→publish
-        // barrier (the qmv-coh arm stores each simdgroup's own rows, so nothing
-        // re-reads them; the store IS the readiness signal). `r` is even (nb /
-        // block starts even), so the pair offset `r/2` is exact.
+        // Shape-keyed primitive variant (the cost seam, [[project_pd_wavefront_cost_driven]]):
+        // K below qmv_fast's 512-value-per-pass minimum ⇒ the tall-skinny
+        // qmv_quad (the head_dim-wide split-K partials); else qmv_fast. Seeded
+        // with MLX's by-shape heuristic; a cost sweep can refine it later.
+        let variant = if k.is_multiple_of(512) {
+            op_kind::QMV
+        } else {
+            op_kind::QMV_QUAD
+        };
+        // PAT-4 producer fuse: an N-block (non-windowed) qmv_fast handoff writes
+        // STRAIGHT into the handoff's coherent slot — no arena, no PUBLISH, no
+        // compute→publish barrier (each simdgroup stores its own rows; the store
+        // IS the readiness signal; `r` even ⇒ pair offset `r/2` exact). A split-K
+        // partial CANNOT fuse (its output is a partial the SumReduce all-reduces)
+        // and qmv_quad has no coherent variant ⇒ it writes arena + is PUBLISHed.
         let handoff_slot = self.handoff.get(&out.tensor).map(|h| h.coherent_slot);
-        let (y, op) = match handoff_slot {
-            Some(coherent_slot) => {
-                let coh = self.intern(BufferRef::ArenaSlot(coherent_slot), 4);
-                (
-                    OperandSlot {
-                        buffer: coh,
-                        byte_offset: (r / 2) * 4,
-                    },
-                    op_kind::QMV_COH,
-                )
-            }
-            None => (
+        let use_coh = handoff_slot.is_some() && !windowed && variant == op_kind::QMV;
+        let (y, op) = if use_coh {
+            let coh = self.intern(BufferRef::ArenaSlot(handoff_slot.unwrap()), 4);
+            (
+                OperandSlot {
+                    buffer: coh,
+                    byte_offset: (r / 2) * 4,
+                },
+                op_kind::QMV_COH,
+            )
+        } else {
+            (
                 OperandSlot {
                     buffer: self.arena_bufid(out.tensor),
                     byte_offset: y_off,
                 },
-                op_kind::QMV,
-            ),
+                variant,
+            )
         };
         let base = self.push_operands(&[
             OperandSlot {
@@ -1324,8 +1518,30 @@ impl<'a> Ser<'a> {
             x,
             y,
         ]);
-        let sc = self.intern_shape([op, k, n, 0, 0, 0, 0, 0]);
+        let sc = self.intern_shape([op, k, n, row_vec, 0, 0, 0, 0]);
         Ok((sc, base))
+    }
+
+    /// Whether a `MatmulTile` is a split-K partial — its weight reads a K-window
+    /// narrower than the full weight row. Such a qmv carries `row_vec`, writes
+    /// to arena, and is PUBLISHed (vs the coherent fuse for N-block outputs).
+    fn qmv_is_split_k(&self, node: &SubtileNode) -> bool {
+        matches!(node.op, SubOp::MatmulTile)
+            && node.inputs.len() >= 2
+            && self.graph.shape(node.inputs[1].tensor).cols != node.inputs[1].region.cols.len
+    }
+
+    /// Whether this node's cross-worker output must be PUBLISHed from arena.
+    /// An N-block matmul handoff wrote the coherent slot directly (QMV_COH) →
+    /// NO publish; everything else with a cross-worker output (rope/silu/add,
+    /// and split-K matmul partials, which write arena) publishes from arena.
+    fn needs_publish(&self, node: &SubtileNode) -> bool {
+        // Publish iff it crosses workers AND it is not an N-block matmul (the
+        // only kind that fused into the coherent slot via QMV_COH). A split-K
+        // matmul partial and any non-matmul op write arena ⇒ they publish.
+        let fused_into_coherent =
+            matches!(node.op, SubOp::MatmulTile) && !self.qmv_is_split_k(node);
+        self.produces_handoff(node) && !fused_into_coherent
     }
 
     /// RMSNORM: operands `[out, in, weight]`; shape `(RMSNORM, hidden,
@@ -1441,7 +1657,14 @@ impl<'a> Ser<'a> {
                 detail: "rope_append output cols not a multiple of head_dim",
             });
         }
-        let num_kv = cols / head_dim;
+        // HEAD-RANGE (mirrors emit_attn): this block ropes + cache-writes a
+        // contiguous kv-head slice of the K tensor. The cache is indexed by the
+        // GLOBAL kv-head (`kvh_start + local`) with the GLOBAL kv-head count as
+        // its stride; the K/V operands are block-based (local heads). Whole-op
+        // rope_append (lower_region) is the special case start=0, block=global.
+        let num_kv_block = cols / head_dim; // heads this block writes (loop bound)
+        let num_kv_global = self.graph.shape(node.output.tensor).cols / head_dim;
+        let kvh_start = node.output.region.cols.start / head_dim;
         let kv_k = OperandSlot {
             buffer: self.intern(
                 BufferRef::Input(InputKind::KvCacheK { layer }),
@@ -1461,15 +1684,18 @@ impl<'a> Ser<'a> {
             byte_offset: 0,
         };
         let base = self.push_operands(&[k, cos_sin, positions, v, kv_k, kv_v, slot]);
-        // rot_dim == head_dim (full rope), matching RopeRotate.
+        // shape (ROPE_APPEND, head_dim, num_kv_block, rot_dim, block_size,
+        // num_kv_global, kvh_start). rot_dim == head_dim (full rope). The arm
+        // writes cache head `kvh_start + h` with `num_kv_global` as the cache
+        // stride; `num_kv_global == 0` ⇒ whole-op fallback (== num_kv_block).
         let sc = self.intern_shape([
             op_kind::ROPE_APPEND,
             head_dim,
-            num_kv,
+            num_kv_block,
             head_dim,
             self.geom.block_size,
-            0,
-            0,
+            num_kv_global,
+            kvh_start,
             0,
         ]);
         Ok((sc, base))
@@ -1502,9 +1728,15 @@ impl<'a> Ser<'a> {
 
     /// ATTN: operands `[output, q, seq_used_k, block_table, k_cache,
     /// v_cache]`; shape `(ATTN, head_dim, num_q, num_kv, scale_bits,
-    /// block_size, max_blocks)`. The region node is `[q, prefixK, prefixV,
-    /// newK, newV]`; the GPU reads the runtime paged cache, so prefixK/V
+    /// block_size, max_blocks, head_range)`. The region node is `[q, prefixK,
+    /// prefixV, newK, newV]`; the GPU reads the runtime paged cache, so prefixK/V
     /// only name the cache layer and the new-token edges are dataflow-only.
+    /// `num_q`/`num_kv` are the GLOBAL head counts (the GQA ratio + cache
+    /// stride); `head_range = (qh_start << 16) | qh_count` is THIS block's
+    /// q-head slice, derived from the output region — head-tiled (partitioned)
+    /// attn computes one head block, reading the matching kv-head of the whole
+    /// cache. q/output operands are block-based (their byte offset is the head
+    /// slice), so the arm loops local heads and maps `qh_start + local` → kv.
     fn emit_attn(
         &mut self,
         node: &SubtileNode,
@@ -1520,6 +1752,17 @@ impl<'a> Ser<'a> {
                 detail: "paged-cache mapping needs exactly [q, prefixK, prefixV, newK, newV]",
             });
         }
+        // This block's q-head slice (head-tiled in the partition; whole op in
+        // lower_region). The output column slice IS the q-head range.
+        if head_dim == 0 || !node.output.region.cols.len.is_multiple_of(head_dim) {
+            return Err(SerializeError::NonDecodeShape {
+                id,
+                detail: "attn output cols not a multiple of head_dim",
+            });
+        }
+        let qh_start = node.output.region.cols.start / head_dim;
+        let qh_count = node.output.region.cols.len / head_dim;
+        let head_range = (qh_start << 16) | qh_count;
         let layer = self.cache_layer(node.inputs[1].tensor, node.inputs[2].tensor, id)?;
         let out = self.write_operand(&node.output, id)?;
         let q = self.read_operand(&node.inputs[0], id)?;
@@ -1554,7 +1797,7 @@ impl<'a> Ser<'a> {
             scale.to_bits(),
             self.geom.block_size,
             self.geom.max_blocks,
-            0,
+            head_range,
         ]);
         Ok((sc, base))
     }
@@ -1667,6 +1910,14 @@ mod tests {
     /// The shape `op_kind` a compute instruction selects.
     fn op_of(prog: &MegaProgram, instr: &[u32; 4]) -> u32 {
         prog.shapes[instr[1] as usize][0]
+    }
+
+    /// Any qmv VARIANT — the shape-keyed selector emits `QMV` (fast, K%512==0),
+    /// `QMV_QUAD` (tall-skinny small-K, the toy fixtures + split-K), or `QMV_COH`
+    /// (the N-block coherent fuse). Structural tests care that it's a qmv, not
+    /// which variant the K shape picked.
+    fn is_qmv(op: u32) -> bool {
+        matches!(op, op_kind::QMV | op_kind::QMV_QUAD | op_kind::QMV_COH)
     }
 
     // ── QMV linchpin: per-block byte offsets + shape dedup ──────────
@@ -1860,7 +2111,7 @@ mod tests {
             .collect();
         let qmv = computes[0];
         let rope = computes[1];
-        assert_eq!(op_of(&prog, qmv), op_kind::QMV);
+        assert!(is_qmv(op_of(&prog, qmv)), "first compute is a qmv variant");
         assert_eq!(op_of(&prog, rope), op_kind::ROPE);
         assert_eq!(
             prog.tape.iter().filter(|i| i[0] == opcode::BARRIER).count(),
@@ -1984,9 +2235,10 @@ mod tests {
             .iter()
             .find(|i| op_of(&prog, i) == op_kind::ATTN)
             .expect("an ATTN compute");
+        // Whole-op attn: head_range = (qh_start=0 << 16) | qh_count=hq = hq.
         assert_eq!(
             prog.shapes[attn[1] as usize],
-            [op_kind::ATTN, hd, hq, hkv, scale.to_bits(), 16, 4, 0]
+            [op_kind::ATTN, hd, hq, hkv, scale.to_bits(), 16, 4, hq]
         );
         let ops = &prog.operands[attn[2] as usize..attn[2] as usize + 6];
         // [output, q, seq_used_k, block_table, k_cache, v_cache]
@@ -2130,8 +2382,10 @@ mod tests {
         let (input, sources) = attn_subchain();
         let nb = 8u32; // qdim 16→2, kvdim 8→1, h 16→2 blocks
         let g = lower_region(&input, nb);
-        // 1 rms + 2 q + 1 k + 1 v + 1 rope + 1 rope + 1 attn + 2 o + 1 add = 11.
-        assert_eq!(g.nodes.len(), 11);
+        // 1 rms + 2 q + 1 k + 1 v + 1 rope + 1 rope + 1 attn + 2 o + 2 add = 12
+        // (the residual add is elementwise ⇒ tiled by nb like the GEMMs; rope/
+        // attn stay whole in lower_region — head-tiling lives in lower_partitioned).
+        assert_eq!(g.nodes.len(), 12);
         for p in [1u32, 2, 4, 10] {
             let s = schedule_wavefront(
                 &g,
@@ -2175,7 +2429,7 @@ mod tests {
             assert_eq!(signals, 0, "no SIGNAL — data-is-flag (p={p})");
             assert_eq!(waits, 0, "no WAIT — data-is-flag (p={p})");
 
-            // Op histogram: 6 qmv, 1 rms, 2 rope, 1 attn, 1 add. (A cross-worker
+            // Op histogram: 6 qmv, 1 rms, 2 rope, 1 attn, 2 add. (A cross-worker
             // qmv producer is emitted as QMV_COH — coherent direct output — so
             // count QMV + QMV_COH for the total.)
             let mut hist = std::collections::HashMap::new();
@@ -2183,12 +2437,17 @@ mod tests {
                 *hist.entry(op_of(&prog, instr)).or_insert(0u32) += 1;
             }
             let qmv_total = hist.get(&op_kind::QMV).copied().unwrap_or(0)
-                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0);
+                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0)
+                + hist.get(&op_kind::QMV_QUAD).copied().unwrap_or(0);
             assert_eq!(qmv_total, 6, "p={p}");
             assert_eq!(hist.get(&op_kind::RMSNORM), Some(&1));
             assert_eq!(hist.get(&op_kind::ROPE), Some(&2));
             assert_eq!(hist.get(&op_kind::ATTN), Some(&1));
-            assert_eq!(hist.get(&op_kind::ADD), Some(&1));
+            assert_eq!(
+                hist.get(&op_kind::ADD),
+                Some(&2),
+                "residual add tiled (h=16,nb=8)"
+            );
             assert_eq!(
                 hist.get(&op_kind::SILU_MUL),
                 None,
@@ -2388,7 +2647,8 @@ mod tests {
             }
             // q,k,v,o,gate,up,down — a cross-worker producer is QMV_COH.
             let qmv_total = hist.get(&op_kind::QMV).copied().unwrap_or(0)
-                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0);
+                + hist.get(&op_kind::QMV_COH).copied().unwrap_or(0)
+                + hist.get(&op_kind::QMV_QUAD).copied().unwrap_or(0);
             assert_eq!(qmv_total, 7, "q,k,v,o,gate,up,down");
             assert_eq!(hist.get(&op_kind::RMSNORM), Some(&2));
             assert_eq!(hist.get(&op_kind::ROPE), Some(&2));
@@ -2480,9 +2740,20 @@ mod tests {
             .iter()
             .find(|i| op_of(&prog, i) == op_kind::ROPE_APPEND)
             .expect("a ROPE_APPEND compute");
+        // Whole-op rope_append: num_kv_block == num_kv_global == kvdim/hd,
+        // kvh_start == 0 (slots 2, 5, 6).
         assert_eq!(
             prog.shapes[ra[1] as usize],
-            [op_kind::ROPE_APPEND, hd, kvdim / hd, hd, 16, 0, 0, 0]
+            [
+                op_kind::ROPE_APPEND,
+                hd,
+                kvdim / hd,
+                hd,
+                16,
+                kvdim / hd,
+                0,
+                0
+            ]
         );
         let ops = &prog.operands[ra[2] as usize..ra[2] as usize + 7];
         let buf = |o: &OperandSlot| prog.buffers[o.buffer.0 as usize].clone();
@@ -2517,11 +2788,7 @@ mod tests {
         );
         assert_eq!(buf(&ops[6]), BufferRef::Input(InputKind::SlotMapping));
         // The K operand aliases the k-proj (first qmv) output slot.
-        let kproj = prog
-            .tape
-            .iter()
-            .find(|i| op_of(&prog, i) == op_kind::QMV)
-            .unwrap();
+        let kproj = prog.tape.iter().find(|i| is_qmv(op_of(&prog, i))).unwrap();
         let kproj_y = prog.operands[kproj[2] as usize + 4].buffer;
         assert_eq!(
             ops[0].buffer, kproj_y,

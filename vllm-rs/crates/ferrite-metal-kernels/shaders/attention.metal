@@ -122,7 +122,7 @@ kernel void attention_via_cache_v2_f16_specialized(
         tg_outputs, tg_max, tg_sum,
         ATTN_HEAD_DIM, ATTN_NUM_Q_HEADS, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
         ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
-        tg_pos.x, tg_pos.y, simd_gid, simd_lid);
+        tg_pos.x, tg_pos.y, simd_gid, simd_lid, /*q_head_base=*/0u);
 }
 
 /// BF16 sibling of `attention_via_cache_v2_f16_specialized`. Same
@@ -154,7 +154,7 @@ kernel void attention_via_cache_v2_bf16_specialized(
         tg_outputs, tg_max, tg_sum,
         ATTN_HEAD_DIM, ATTN_NUM_Q_HEADS, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
         ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
-        tg_pos.x, tg_pos.y, simd_gid, simd_lid);
+        tg_pos.x, tg_pos.y, simd_gid, simd_lid, /*q_head_base=*/0u);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -193,7 +193,7 @@ template <typename T>
         tg_outputs, tg_max, tg_sum,
         ATTN_HEAD_DIM, num_q, ATTN_NUM_KV_HEADS, ATTN_SCALE_FC,
         ATTN_BLOCK_SIZE, ATTN_MAX_BLOCKS_PER_SEQ,
-        g / num_q, g % num_q, simd_gid, simd_lid);
+        g / num_q, g % num_q, simd_gid, simd_lid, /*q_head_base=*/0u);
     threadgroup_barrier(mem_flags::mem_threadgroup); // serialise combine scratch reuse
   }
 }

@@ -439,7 +439,14 @@ METAL_FUNC void qmv_quad_impl(
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint quad_gid [[quadgroup_index_in_threadgroup]],
-    uint quad_lid [[thread_index_in_quadgroup]]) {
+    uint quad_lid [[thread_index_in_quadgroup]],
+    int row_vec_size) {
+  // K-SUBTILE region contract (mirrors qmv_fast_impl): `in_vec_size` is the
+  // K-window length == D (one quad-load, no K loop); `row_vec_size` is the
+  // weight's full row K (the row STRIDE). A split-K partial reads a head_dim-
+  // wide K-slice of a `[N, row_vec_size]` weight — the tall-skinny shape
+  // qmv_quad is FOR. Off-window callers pass `row_vec_size == in_vec_size`.
+  // NO DEFAULT (see qmv_fast_impl comment) — every caller MUST pass it.
   constexpr int quads_per_simd = SIMD_SIZE / QUAD_SIZE;
   constexpr int pack_factor = 32 / bits;
   constexpr int values_per_thread = D / QUAD_SIZE;
@@ -452,9 +459,10 @@ METAL_FUNC void qmv_quad_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_quadgroup] = {0};
 
-  // Adjust positions
-  const int in_vec_size_w = in_vec_size / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  // Adjust positions. Row STRIDE uses `row_vec_size` (full K); the single quad
+  // load reads `D == in_vec_size` window values from x. Equal off-window.
+  const int in_vec_size_w = row_vec_size / pack_factor;
+  const int in_vec_size_g = row_vec_size / group_size;
   const int out_row = tid.y * quads_per_simd * results_per_quadgroup + quad_gid;
 
   w += out_row * in_vec_size_w + quad_lid * packs_per_thread;
@@ -490,6 +498,15 @@ METAL_FUNC void qmv_quad_impl(
 // qmv_fast_impl — quantized.h:749-814
 // ─────────────────────────────────────────────────────────────────
 
+// K-SUBTILE region contract: `in_vec_size` is the K-WINDOW length (how many K
+// elements this call reduces, and the contiguous width of `x`); `row_vec_size`
+// is the weight's FULL row width K (the row STRIDE), so a split-K partial reads
+// a K-slice `[k_off, k_off+in_vec_size)` of a `[N, row_vec_size]` weight whose
+// rows stay `row_vec_size` apart. The caller pre-offsets `w`/`scales`/`biases`
+// to `k_off` (group-aligned). Off-window callers pass `row_vec_size ==
+// in_vec_size` (the whole-K matvec, byte-identical to the pre-extension impl).
+// NO DEFAULT — Metal `METAL_FUNC` does NOT reliably honour default args; an
+// omitted trailing arg can pass garbage. Every caller MUST pass row_vec_size.
 template <typename T_act, typename T_scale, int group_size, int bits>
 METAL_FUNC void qmv_fast_impl(
     const device uint32_t* w,
@@ -501,7 +518,8 @@ METAL_FUNC void qmv_fast_impl(
     int out_vec_size,
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    int row_vec_size) {
   constexpr int packs_per_thread = bits == 2 ? 1 : 2;
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = 4;
@@ -518,9 +536,10 @@ METAL_FUNC void qmv_fast_impl(
   thread U x_thread[values_per_thread];
   thread U result[results_per_simdgroup] = {0};
 
-  // Adjust positions
-  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
-  const int in_vec_size_g = in_vec_size / group_size;
+  // Adjust positions. Row STRIDE uses `row_vec_size` (full K); the K loop +
+  // `x` advance by `in_vec_size` (the window). They are equal off-window.
+  const int in_vec_size_w = row_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = row_vec_size / group_size;
   const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
       simd_gid * results_per_simdgroup;
 

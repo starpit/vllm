@@ -53,7 +53,8 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   const device T_act* x = (const device T_act*)(addrs[3]);
   device T_act* y = (device T_act*)(addrs[4]);
   mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
-      w, scales, biases, x, y, WL_K, WL_N, tid, simd_gid, simd_lid);
+      w, scales, biases, x, y, WL_K, WL_N, tid, simd_gid, simd_lid,
+      /*row_vec_size=*/WL_K);
 }
 
 #define INST_WL_QMV_BINDLESS(act_tag, act_type, scale_tag, scale_type, gs)  \
@@ -106,7 +107,11 @@ METAL_FUNC void wl_qmv_arm(
     uint n,
     uint local_sg,
     uint sg_count,
-    uint simd_lid) {
+    uint simd_lid,
+    uint row_vec) {
+  // `k` = K-window length (loop + x width); `row_vec` = weight full row K (the
+  // row stride). Equal off-window (N-block qmv); `row_vec > k` is a split-K
+  // partial whose weight/scales/biases operands are pre-offset to the K-slice.
   const device uint32_t* w = (const device uint32_t*)(operands[operand_base + 0u]);
   const device T_scale* s = (const device T_scale*)(operands[operand_base + 1u]);
   const device T_scale* b = (const device T_scale*)(operands[operand_base + 2u]);
@@ -120,7 +125,7 @@ METAL_FUNC void wl_qmv_arm(
     uint g = base + gi;
     if (g < num_groups) {
       mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
-          w, s, b, x, y, int(k), int(n), uint3(0u, g, 0u), role, simd_lid);
+          w, s, b, x, y, int(k), int(n), uint3(0u, g, 0u), role, simd_lid, int(row_vec));
     }
   }
 }
@@ -157,6 +162,38 @@ METAL_FUNC void wl_qmv_coh_arm(
   }
 }
 
+// Tall-skinny qmv arm — the matvec primitive for small CONTIGUOUS K (== D, the
+// head_dim) × large N. Used by split-K partials whose K-window is head_dim-wide,
+// below qmv_fast's 512-K minimum. One quad-simdgroup (8 quads) covers 64 output
+// rows per tile; `quad_gid`/`quad_lid` derive from `simd_lid` so the player needs
+// no quadgroup attributes. `row_vec` is the weight's full row K (the row stride),
+// so the operands pre-offset to the K-slice read it with the parent stride. `D`
+// is the decode head_dim — a compile-time specialization seam (the cost/shape-
+// driven choice of variant + chunk width; see project_pd_wavefront_cost_driven).
+template <typename T_act, typename T_scale, int group_size, int bits, int D>
+METAL_FUNC void wl_qmv_quad_arm(
+    const device ulong* operands,
+    uint operand_base,
+    uint k,
+    uint n,
+    uint local_sg,
+    uint sg_count,
+    uint simd_lid,
+    uint row_vec) {
+  const device uint32_t* w = (const device uint32_t*)(operands[operand_base + 0u]);
+  const device T_scale* s = (const device T_scale*)(operands[operand_base + 1u]);
+  const device T_scale* b = (const device T_scale*)(operands[operand_base + 2u]);
+  const device T_act* x = (const device T_act*)(operands[operand_base + 3u]);
+  device T_act* y = (device T_act*)(operands[operand_base + 4u]);
+  const uint quad_gid = simd_lid >> 2;  // 0..8 quads within this simdgroup
+  const uint quad_lid = simd_lid & 3u;  // 0..4 thread within the quad
+  const uint tiles = (n + 63u) / 64u;   // one quad-simdgroup covers 64 output rows
+  for (uint t = local_sg; t < tiles; t += sg_count) {
+    mittens::qmv_quad_impl<T_act, T_scale, group_size, bits, D>(
+        w, s, b, x, y, int(k), int(n), uint3(0u, t, 0u), quad_gid, quad_lid, int(row_vec));
+  }
+}
+
 // Opcodes (tape[pc].x) and op_kinds (shapes[sc].x).
 constant constexpr uint WL_OPC_COMPUTE = 0u;
 constant constexpr uint WL_OPC_SIGNAL = 1u;
@@ -172,6 +209,8 @@ constant constexpr uint WL_OP_ATTN = 6u;     // paged decode attention (loops q-
 constant constexpr uint WL_OP_ADD = 7u;      // elementwise residual add
 constant constexpr uint WL_OP_ROPE_APPEND = 8u; // rotate K in place + write K/V to paged cache
 constant constexpr uint WL_OP_QMV_COH = 9u; // qmv whose output is written DIRECTLY into the coherent handoff buffer (PAT-4; no compute→publish barrier)
+constant constexpr uint WL_OP_SUM_REDUCE = 10u; // split-K all-reduce: out = sum of num_partials operand regions (f32 accum, one round)
+constant constexpr uint WL_OP_QMV_QUAD = 11u; // tall-skinny qmv (small K == head_dim, large N) for split-K partials; K-window via row_vec
 
 // Each shape-class descriptor is a fixed-width record of WL_SHAPE_STRIDE u32s:
 // [op_kind, p1, p2, p3, p4, p5, p6, _]. Wide enough for attention's 6 dims;
@@ -187,10 +226,17 @@ template <typename T_act, typename T_scale, int group_size, int bits>
     device const uint* tape_offsets [[buffer(3)]],  // [P+1]; worker me runs [me, me+1)
     device atomic_uint* flags [[buffer(4)]],        // [num_flags], zeroed by host
     uint3 tgpos [[threadgroup_position_in_grid]],
+    uint3 grid_size [[threadgroups_per_grid]],
+    uint3 threads_per_tg [[threads_per_threadgroup]],
     uint tid_in_tg [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
   const uint me = tgpos.x;
+  const uint replica = tgpos.y;
+  const uint k_replicas = grid_size.y;
+  const uint simdgroups_per_tg = threads_per_tg.x >> 5u; // threads/32
+  const uint effective_simd_gid = replica * simdgroups_per_tg + simd_gid;
+  const uint effective_sg_default = k_replicas * simdgroups_per_tg;
   const uint start = tape_offsets[me];
   const uint end = tape_offsets[me + 1u];
   // Threadgroup scratch the arms reuse across instructions (a barrier between
@@ -220,18 +266,24 @@ template <typename T_act, typename T_scale, int group_size, int bits>
         uint sg_count = (ins.w >> 8u) & 0xFFu;
         if (sg_count == 0u) {
           sg_start = 0u;
-          sg_count = 32u;
+          sg_count = effective_sg_default;  // K-aware: K*simdgroups_per_TG
         }
-        const bool in_range = simd_gid >= sg_start && simd_gid < sg_start + sg_count;
-        const uint local_sg = simd_gid - sg_start;        // simdgroup index within the op
-        const uint op_threads = sg_count << 5u;            // sg_count * 32
-        const uint local_tid = (local_sg << 5u) + simd_lid; // thread index within the op
+        const bool in_range = effective_simd_gid >= sg_start && effective_simd_gid < sg_start + sg_count;
+        const uint local_sg = effective_simd_gid - sg_start;
+        const uint op_threads = sg_count << 5u;
+        const uint local_tid = (local_sg << 5u) + simd_lid;
         switch (op) {
           case WL_OP_QMV:
             if (in_range) {
+              // shape (QMV, k, n, row_vec); row_vec slot 0 ⇒ no K-window
+              // (row stride = k). row_vec > k ⇒ split-K partial.
+              uint row_vec = shapes[sb + 3u];
+              if (row_vec == 0u) {
+                row_vec = shapes[sb + 1u];
+              }
               wl_qmv_arm<T_act, T_scale, group_size, bits>(
                   operands, ins.z, shapes[sb + 1u], shapes[sb + 2u], local_sg, sg_count,
-                  simd_lid);
+                  simd_lid, row_vec);
             }
             break;
           case WL_OP_QMV_COH:
@@ -239,6 +291,30 @@ template <typename T_act, typename T_scale, int group_size, int bits>
               wl_qmv_coh_arm<T_act, T_scale, group_size, bits>(
                   operands, ins.z, shapes[sb + 1u], shapes[sb + 2u], local_sg, sg_count,
                   simd_lid);
+            }
+            break;
+          case WL_OP_QMV_QUAD:
+            if (in_range) {
+              // shape (QMV_QUAD, k==D, n, row_vec); row_vec 0 ⇒ stride == k.
+              // D is selected from k at runtime (compile-time specializations
+              // for the supported split-K chunk widths). Add more arms as the
+              // cost-sweep narrows down the productive granularities.
+              uint k_dim = shapes[sb + 1u];
+              uint n_out = shapes[sb + 2u];
+              uint row_vec = shapes[sb + 3u];
+              if (row_vec == 0u) {
+                row_vec = k_dim;
+              }
+              if (k_dim == 64u) {
+                wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 64>(
+                    operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+              } else if (k_dim == 128u) {
+                wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 128>(
+                    operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+              } else if (k_dim == 256u) {
+                wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 256>(
+                    operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+              }
             }
             break;
           case WL_OP_PUBLISH:
@@ -249,7 +325,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             mittens::wf_publish_pairs_nz_tg<T_act>(
                 (device atomic_uint*)(operands[ins.z + 0u]),
                 (const device T_act*)(operands[ins.z + 1u]),
-                shapes[sb + 1u], shapes[sb + 2u], tid_in_tg, 1024u);
+                shapes[sb + 1u], shapes[sb + 2u], tid_in_tg, threads_per_tg.x);
             break;
           case WL_OP_ACQUIRE:
             // PAT-4: SPIN on each coherent slot operands[base+1] (atomic u32)
@@ -260,7 +336,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             mittens::wf_acquire_pairs_spin_tg<T_act>(
                 (device T_act*)(operands[ins.z + 0u]),
                 (const device atomic_uint*)(operands[ins.z + 1u]),
-                shapes[sb + 1u], tid_in_tg, 1024u);
+                shapes[sb + 1u], tid_in_tg, threads_per_tg.x);
             break;
           case WL_OP_RMSNORM:
             // operands [out, in, weight]; shape (RMSNORM, hidden, eps_bits, ...).
@@ -271,7 +347,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
                 (const device T_act*)(operands[ins.z + 1u]),
                 (const device T_scale*)(operands[ins.z + 2u]),
                 shared_sum, 1u, shapes[sb + 1u], as_type<float>(shapes[sb + 2u]),
-                0u, tid_in_tg, 1024u);
+                0u, tid_in_tg, threads_per_tg.x);
             break;
           case WL_OP_SILU_MUL: {
             // operands [out, gate, up]; shape (SILU_MUL, n, ...). The op's
@@ -300,6 +376,24 @@ template <typename T_act, typename T_scale, int group_size, int bits>
                     (const device T_act*)(operands[ins.z + 1u]),
                     (const device T_act*)(operands[ins.z + 2u]),
                     e, n);
+              }
+            }
+            break;
+          }
+          case WL_OP_SUM_REDUCE: {
+            // operands [out, p0, p1, …]; shape (SUM_REDUCE, n, num_partials).
+            // The split-K all-reduce: out[e] = sum_k partial_k[e]. Each partial
+            // is one activation-K-chunk's contribution; a cross-worker partial
+            // was ACQUIREd into a local copy, so all operands are readable here.
+            // The atom accumulates in f32 and rounds once — so split-K differs
+            // from a whole matvec only by that single round (compose, not math).
+            if (in_range) {
+              uint n = shapes[sb + 1u];
+              uint num_partials = shapes[sb + 2u];
+              for (uint e = local_tid; e < n; e += op_threads) {
+                mittens::sum_reduce_impl<T_act>(
+                    (device T_act*)(operands[ins.z + 0u]),
+                    operands + ins.z + 1u, num_partials, e, n);
               }
             }
             break;
@@ -334,8 +428,13 @@ template <typename T_act, typename T_scale, int group_size, int bits>
           }
           case WL_OP_ATTN: {
             // operands [output, q, seq_used_k, block_table, k_cache, v_cache];
-            // shape (ATTN, head_dim, num_q, num_kv, scale_bits, block_size, max_blocks).
-            // One whole-TG attention per (seq 0, q_head); loop the q-heads.
+            // shape (ATTN, head_dim, num_q, num_kv, scale_bits, block_size,
+            // max_blocks, head_range). num_q/num_kv are GLOBAL (the GQA ratio +
+            // cache stride). head_range = (qh_start << 16) | qh_count selects a
+            // q-head block for a head-tiled (partitioned) attn; q/output are
+            // block-based, so q_head_idx loops LOCAL [0, qh_count) and the GLOBAL
+            // first head qh_start maps to the right kv-head of the whole cache.
+            // head_range == 0 ⇒ whole-op (all num_q heads, base 0).
             device T_act* output = (device T_act*)(operands[ins.z + 0u]);
             const device T_act* q = (const device T_act*)(operands[ins.z + 1u]);
             const device uint* seq_used_k = (const device uint*)(operands[ins.z + 2u]);
@@ -348,12 +447,20 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             float scale = as_type<float>(shapes[sb + 4u]);
             uint block_size = shapes[sb + 5u];
             uint max_blocks = shapes[sb + 6u];
-            for (uint h = 0u; h < num_q; h++) {
+            uint head_range = shapes[sb + 7u];
+            uint qh_start = head_range >> 16u;
+            uint qh_count = head_range & 0xFFFFu;
+            if (head_range == 0u) { // whole-op fallback
+              qh_start = 0u;
+              qh_count = num_q;
+            }
+            for (uint local = 0u; local < qh_count; local++) {
               mittens::attention_decode_impl<T_act>(
                   output, q, seq_used_k, block_table, k_cache, v_cache,
                   tg_outputs, tg_max, tg_sum,
                   head_dim, num_q, num_kv, scale, block_size, max_blocks,
-                  /*seq_idx=*/0u, /*q_head_idx=*/h, simd_gid, simd_lid);
+                  /*seq_idx=*/0u, /*q_head_idx=*/local, simd_gid, simd_lid,
+                  /*q_head_base=*/qh_start);
               threadgroup_barrier(mem_flags::mem_threadgroup); // scratch reuse across heads
             }
             break;
@@ -363,11 +470,14 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             // rotated K + un-rotated V into the paged cache at slot_mapping[0],
             // so attention reads the new token from the cache (Tier-B exact).
             // operands [k(in/out), cos_sin, positions, v, kv_cache_k,
-            // kv_cache_v, slot_mapping]; shape (ROPE_APPEND, head_dim, num_kv,
-            // rot_dim, block_size, ...). `cos_sin` is the WHOLE rotary table and
-            // the live decode position is `positions[0]` — indexed at runtime
-            // exactly like the oracle (`cos_sin + pos*rot_dim`), never a baked
-            // offset (the position changes every decode step).
+            // kv_cache_v, slot_mapping]; shape (ROPE_APPEND, head_dim,
+            // num_kv_block, rot_dim, block_size, num_kv_global, kvh_start).
+            // `cos_sin` is the WHOLE rotary table, position = `positions[0]`
+            // (runtime). HEAD-RANGE: this block ropes its `num_kv_block` local
+            // heads (k/v operands are block-based) and writes them to the GLOBAL
+            // cache heads `kvh_start + h` with `num_kv_global` as the cache
+            // stride — so a head-tiled (partitioned) K-rope lands in the right
+            // cache slots. num_kv_global == 0 ⇒ whole-op (== num_kv_block, base 0).
             device T_act* k = (device T_act*)(operands[ins.z + 0u]);
             const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
             const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
@@ -376,15 +486,21 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             device T_act* kv_cache_v = (device T_act*)(operands[ins.z + 5u]);
             const device uint* slot_mapping = (const device uint*)(operands[ins.z + 6u]);
             uint head_dim = shapes[sb + 1u];
-            uint num_kv = shapes[sb + 2u];
+            uint num_kv = shapes[sb + 2u]; // heads THIS block writes
             uint rot_dim = shapes[sb + 3u];
             uint block_size = shapes[sb + 4u];
+            uint num_kv_global = shapes[sb + 5u];
+            uint kvh_start = shapes[sb + 6u];
+            if (num_kv_global == 0u) { // whole-op fallback
+              num_kv_global = num_kv;
+              kvh_start = 0u;
+            }
             uint half_dim = rot_dim / 2u;
             uint pos = positions[0];
             const device T_act* cos_row = cos_sin + pos * rot_dim;
             const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
-            // Rotate K in place: each thread owns (kv_head, d<half) pairs.
-            for (uint idx = tid_in_tg; idx < num_kv * half_dim; idx += 1024u) {
+            // Rotate K in place: each thread owns (local kv_head, d<half) pairs.
+            for (uint idx = tid_in_tg; idx < num_kv * half_dim; idx += threads_per_tg.x) {
               mittens::rope_rotate_pair<T_act>(
                   k + (idx / half_dim) * head_dim, cos_row, sin_row, idx % half_dim, half_dim);
             }
@@ -392,11 +508,11 @@ template <typename T_act, typename T_scale, int group_size, int bits>
             // element was written by the d-half thread during rotation).
             threadgroup_barrier(mem_flags::mem_device);
             uint slot = slot_mapping[0];
-            for (uint idx = tid_in_tg; idx < num_kv * head_dim; idx += 1024u) {
-              uint h = idx / head_dim;
+            for (uint idx = tid_in_tg; idx < num_kv * head_dim; idx += threads_per_tg.x) {
+              uint h = idx / head_dim; // local head in this block
               mittens::kv_paged_write<T_act>(
                   kv_cache_k, kv_cache_v, k + h * head_dim, v + h * head_dim,
-                  slot, h, idx % head_dim, num_kv, block_size, head_dim);
+                  slot, kvh_start + h, idx % head_dim, num_kv_global, block_size, head_dim);
             }
             break;
           }
@@ -408,9 +524,16 @@ template <typename T_act, typename T_scale, int group_size, int bits>
         break;
       }
       case WL_OPC_BARRIER:
-        // Compiler-placed intra-worker device fence (a dependence boundary —
-        // the tranche boundary). Uniform across the TG (one tape per worker).
-        threadgroup_barrier(mem_flags::mem_device);
+        // Compiler-placed intra-worker fence at a real RAW edge between two
+        // ops on this same tape (same TG). Data flow here is one TG writing
+        // then one TG reading — intra-TG visibility. EXPERIMENTAL: use
+        // mem_threadgroup (cheaper than mem_device); if Apple's L1 is coherent
+        // across simdgroups in practice this is correct. Coherence check =
+        // Tier-B token-stream match. If it fails, the real fix is moving the
+        // chain-local arena slots out of MTLBuffer into threadgroup memory
+        // (the [[feedback_persistent_decode_objective]] thesis) and keeping
+        // mem_threadgroup for those.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         break;
       case WL_OPC_SIGNAL:
         // Data-before-flag fence (relaxed-only MSL device atomics ⇒ the barrier,
@@ -440,3 +563,156 @@ template <typename T_act, typename T_scale, int group_size, int bits>
       wavefront_player<act_type, scale_type, gs, 4>;
 INST_WL_PLAYER(bf16, bfloat, f16, half, 64)
 INST_WL_PLAYER(f16, half, f16, half, 64)
+
+// ── per-subtile player: many small TGs, each processes ONE subtile ───
+//
+// One TG per subtile of work. The dispatch grid sizes itself to the level's
+// subtile count (the host driver iterates DAG levels and dispatches this
+// kernel once per level). Smaller TG (256 threads = 8 simdgroups) lets Apple
+// fit ~4 TGs per core → 40 TGs concurrent across 10 cores = 320 simdgroups
+// in flight, matching per-op's grid behaviour without any per-worker tape
+// machinery. Each TG reads its instruction from `level_tape[level_start +
+// tgpos.x]` and dispatches the arm exactly like the persistent player does.
+//
+// TG-wide arms (rmsnorm/attn/publish/acquire/rope_append) get a 256-thread
+// pass via the impl's total_threads parameter; the simdgroup-distributed
+// arms (qmv/silu_mul/add/rope) use the TG's 8 simdgroups (sg_count = 8).
+template <typename T_act, typename T_scale, int group_size, int bits>
+[[kernel]] void wavefront_player_per_subtile(
+    device const uint4* level_tape [[buffer(0)]],
+    device const uint* shapes [[buffer(1)]],
+    device const ulong* operands [[buffer(2)]],
+    device atomic_uint* flags [[buffer(3)]],
+    constant uint& level_start [[buffer(4)]],
+    uint3 tgpos [[threadgroup_position_in_grid]],
+    uint tid_in_tg [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Per-TG threadgroup scratch sized for 256 threads (8 simdgroups).
+  threadgroup float shared_sum[256];
+  threadgroup float tg_outputs[256];
+  threadgroup float tg_max[8];
+  threadgroup float tg_sum[8];
+
+  const uint pc = level_start + tgpos.x;
+  uint4 ins = level_tape[pc];
+  // level_tape contains only COMPUTE entries; ins.x is always WL_OPC_COMPUTE.
+  const uint sb = ins.y * WL_SHAPE_STRIDE;
+  const uint op = shapes[sb + 0u];
+  // All 8 simdgroups participate in every op (no tranche packing in the per-
+  // subtile kernel — one subtile per TG, full TG budget).
+  const uint sg_count = 8u;
+  const uint local_sg = simd_gid;
+  const uint op_threads = sg_count << 5u; // 256
+  const uint local_tid = (local_sg << 5u) + simd_lid;
+  switch (op) {
+    case WL_OP_QMV: {
+      uint row_vec = shapes[sb + 3u];
+      if (row_vec == 0u) row_vec = shapes[sb + 1u];
+      wl_qmv_arm<T_act, T_scale, group_size, bits>(
+          operands, ins.z, shapes[sb + 1u], shapes[sb + 2u],
+          local_sg, sg_count, simd_lid, row_vec);
+      break;
+    }
+    case WL_OP_QMV_COH:
+      wl_qmv_coh_arm<T_act, T_scale, group_size, bits>(
+          operands, ins.z, shapes[sb + 1u], shapes[sb + 2u],
+          local_sg, sg_count, simd_lid);
+      break;
+    case WL_OP_QMV_QUAD: {
+      uint k_dim = shapes[sb + 1u];
+      uint n_out = shapes[sb + 2u];
+      uint row_vec = shapes[sb + 3u];
+      if (row_vec == 0u) row_vec = k_dim;
+      if (k_dim == 64u) {
+        wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 64>(
+            operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+      } else if (k_dim == 128u) {
+        wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 128>(
+            operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+      } else if (k_dim == 256u) {
+        wl_qmv_quad_arm<T_act, T_scale, group_size, bits, 256>(
+            operands, ins.z, k_dim, n_out, local_sg, sg_count, simd_lid, row_vec);
+      }
+      break;
+    }
+    case WL_OP_RMSNORM:
+      mittens::rmsnorm_impl<T_act, T_scale>(
+          (device T_act*)(operands[ins.z + 0u]),
+          (const device T_act*)(operands[ins.z + 1u]),
+          (const device T_scale*)(operands[ins.z + 2u]),
+          shared_sum, 1u, shapes[sb + 1u], as_type<float>(shapes[sb + 2u]),
+          0u, tid_in_tg, 256u);
+      break;
+    case WL_OP_SILU_MUL: {
+      uint n = shapes[sb + 1u];
+      for (uint e = local_tid; e < n; e += op_threads) {
+        mittens::silu_mul_impl<T_act>(
+            (device T_act*)(operands[ins.z + 0u]),
+            (const device T_act*)(operands[ins.z + 1u]),
+            (const device T_act*)(operands[ins.z + 2u]),
+            e, n);
+      }
+      break;
+    }
+    case WL_OP_ADD: {
+      uint n = shapes[sb + 1u];
+      for (uint e = local_tid; e < n; e += op_threads) {
+        mittens::add_impl<T_act>(
+            (device T_act*)(operands[ins.z + 0u]),
+            (const device T_act*)(operands[ins.z + 1u]),
+            (const device T_act*)(operands[ins.z + 2u]),
+            e, n);
+      }
+      break;
+    }
+    case WL_OP_SUM_REDUCE: {
+      uint n = shapes[sb + 1u];
+      uint num_partials = shapes[sb + 2u];
+      for (uint e = local_tid; e < n; e += op_threads) {
+        mittens::sum_reduce_impl<T_act>(
+            (device T_act*)(operands[ins.z + 0u]),
+            operands + ins.z + 1u, num_partials, e, n);
+      }
+      break;
+    }
+    case WL_OP_ROPE: {
+      device T_act* x = (device T_act*)(operands[ins.z + 0u]);
+      const device T_act* cos_sin = (const device T_act*)(operands[ins.z + 1u]);
+      const device uint* positions = (const device uint*)(operands[ins.z + 2u]);
+      uint head_dim = shapes[sb + 1u];
+      uint num_heads = shapes[sb + 2u];
+      uint rot_dim = shapes[sb + 3u];
+      uint half_dim = rot_dim / 2u;
+      uint pos = positions[0];
+      const device T_act* cos_row = cos_sin + pos * rot_dim;
+      const device T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
+      for (uint idx = local_tid; idx < num_heads * half_dim; idx += op_threads) {
+        uint h = idx / half_dim;
+        uint d = idx % half_dim;
+        mittens::rope_rotate_pair<T_act>(x + h * head_dim, cos_row, sin_row, d, half_dim);
+      }
+      break;
+    }
+    // The four big TG-wide ops (PUBLISH/ACQUIRE/ROPE_APPEND/ATTN) NEED 1024-
+    // thread cooperation. They cannot run safely at 256 threads. The level
+    // groups that contain them must be dispatched via the persistent
+    // `wavefront_player` instead — the host scheduler routes accordingly.
+    // (Default: subtile is no-op so an accidentally-dispatched non-supported
+    // op falls through silently rather than corrupting memory.)
+    default:
+      break;
+  }
+  (void)flags;
+  (void)tg_outputs;
+  (void)tg_max;
+  (void)tg_sum;
+}
+
+#define INST_WL_PLAYER_PS(act_tag, act_type, scale_tag, scale_type, gs)         \
+  template [[host_name("wavefront_player_per_subtile_" #act_tag "_s_"           \
+                       #scale_tag "_gs_" #gs "_b_4")]] [[kernel]]               \
+  decltype(wavefront_player_per_subtile<act_type, scale_type, gs, 4>)           \
+      wavefront_player_per_subtile<act_type, scale_type, gs, 4>;
+INST_WL_PLAYER_PS(bf16, bfloat, f16, half, 64)
+INST_WL_PLAYER_PS(f16, half, f16, half, 64)

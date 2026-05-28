@@ -189,7 +189,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, int D, boo
       OUT_VEC_SIZE,
       tid,
       quad_gid,
-      quad_lid);
+      quad_lid,
+      /*row_vec_size=*/IN_VEC_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -245,7 +246,8 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool batch
       OUT_VEC_SIZE,
       tid,
       simd_gid,
-      simd_lid);
+      simd_lid,
+      /*row_vec_size=*/IN_VEC_SIZE);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -337,7 +339,8 @@ template <typename T_act, typename T_scale, const int group_size, const int bits
     mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
         w, scales, biases, x, y,
         IN_VEC_SIZE, OUT_VEC_SIZE,
-        uint3(0u, g, 0u), simd_gid, simd_lid);
+        uint3(0u, g, 0u), simd_gid, simd_lid,
+        /*row_vec_size=*/IN_VEC_SIZE);
   }
 }
 
@@ -394,11 +397,13 @@ METAL_FUNC void wf_qmv_shape(
   switch (shape_class) {
     case 0u:
       mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
-          w0, s0, b0, x, y1, WF2_K0, WF2_N0, qtid, simd_gid, simd_lid);
+          w0, s0, b0, x, y1, WF2_K0, WF2_N0, qtid, simd_gid, simd_lid,
+          /*row_vec_size=*/WF2_K0);
       break;
     case 1u:
       mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
-          w1, s1, b1, y1_in, y2, WF2_K1, WF2_N1, qtid, simd_gid, simd_lid);
+          w1, s1, b1, y1_in, y2, WF2_K1, WF2_N1, qtid, simd_gid, simd_lid,
+          /*row_vec_size=*/WF2_K1);
       break;
   }
 }
@@ -590,7 +595,7 @@ template <typename T_act, typename T_scale, int group_size, int bits>
   uint3 inner_tid = uint3(0, tid.y, 0);
   mittens::qmv_fast_impl<T_act, T_scale, group_size, bits>(
       w_e, s_e, b_e, x_e, y_e, IN_VEC_SIZE, OUT_VEC_SIZE,
-      inner_tid, simd_gid, simd_lid);
+      inner_tid, simd_gid, simd_lid, /*row_vec_size=*/IN_VEC_SIZE);
 }
 
 template <typename T_act, typename T_scale, int group_size, int bits>

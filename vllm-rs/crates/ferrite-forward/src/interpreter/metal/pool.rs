@@ -269,6 +269,11 @@ pub struct MetalWorkerPool<W: CanonicalParams> {
     /// `FERRITE_WAVEFRONT_GPU` alt decode path in [`Self::forward_with_tail`]
     /// dispatches it through [`super::mega_player`].
     mega_program: std::sync::OnceLock<Option<ferrite_wavefront::mega::MegaProgram>>,
+    /// Per-step dispatch state cache for the wavefront megakernel — see
+    /// [`super::mega_player::MegaDispatchCache`]. Lazily built on the first
+    /// dispatch, reused on every subsequent decode step (eliminates ~5 ms/tok
+    /// of per-step Metal-buffer churn that otherwise dominates mega TPOT).
+    mega_dispatch_cache: std::sync::Mutex<Option<super::mega_player::MegaDispatchCache>>,
     /// Per-bucket embed-output arena slot — the output slot of the bucket's
     /// first `Embed`/`AffineEmbed` (embed is the decode's host gather). The
     /// `FERRITE_WAVEFRONT_GPU` alt path binds the megakernel's
@@ -573,6 +578,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }),
             cv: Condvar::new(),
             mega_program: std::sync::OnceLock::new(),
+            mega_dispatch_cache: std::sync::Mutex::new(None),
             embed_slots: Vec::new(),
             terminal_slots: Vec::new(),
         };
@@ -725,31 +731,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
     ) where
         W: crate::WeightAccessors,
     {
-        use super::mega_player::{
-            build_operand_table, dispatch_mega, player_pipeline_key, resolve_mega_buffers,
-        };
+        use super::mega_player::{MegaDispatchCache, dispatch_mega_cached, player_pipeline_key};
         // TODO(inc3): thread the real (group_size, bits) from the model. The
         // player ships only the affine g64/b4 instantiation today, which is
         // the Llama-3.2-1B-4bit target, so hardcode it for first bring-up.
         let (group_size, bits) = (64u32, 4u32);
 
-        let residency = self.allocator.residency();
-        let (resolved, _arena) = match resolve_mega_buffers(
-            prog,
-            &self.device,
-            weights,
-            &self.allocator,
-            runtime,
-            embedded_hidden,
-            Some(residency),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[wavefront-gpu] resolve_mega_buffers failed: {e:?}");
-                return;
-            }
-        };
-        let operands = build_operand_table(prog, &resolved);
         let pipeline = match self
             .pipelines
             .cache()
@@ -761,12 +748,34 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 return;
             }
         };
-        // PERF (droppable): time JUST the single-dispatch megakernel exec
-        // (commit+wait of the 16-layer + lm_head kernel) — the steady-state
-        // cost; `mega_total` (in forward_with_tail) additionally includes the
-        // per-step resolve/build/argmax overhead a production path would cache.
+        // Lazy-init the per-step dispatch cache: arena buffers, the resolved
+        // BufferRef→Buffer map, the gpuAddress operand table, and the four
+        // small static dispatch buffers (tape/shapes/operands/tape_offsets +
+        // flags). Reused across every subsequent decode step. Without this
+        // every step rebuilds ~3000 Metal buffers, adding ~5 ms/tok of pure
+        // Metal overhead on top of the kernel time.
+        let mut cache_guard = self.mega_dispatch_cache.lock().expect("mega cache mutex");
+        if cache_guard.is_none() {
+            match MegaDispatchCache::build(
+                prog,
+                &self.device,
+                weights,
+                &self.allocator,
+                runtime,
+                embedded_hidden,
+            ) {
+                Ok(c) => *cache_guard = Some(c),
+                Err(e) => {
+                    eprintln!("[wavefront-gpu] MegaDispatchCache::build failed: {e:?}");
+                    return;
+                }
+            }
+        }
+        let cache = cache_guard.as_ref().expect("cache just populated");
+        let resolved = &cache.resolved;
+
         let t_disp = std::time::Instant::now();
-        dispatch_mega(prog, &resolved, &operands, &pipeline, &self.device, queue);
+        dispatch_mega_cached(cache, &pipeline, queue);
         eprintln!(
             "[wf-perf] mega_dispatch={:.3}ms",
             t_disp.elapsed().as_secs_f64() * 1e3
@@ -815,6 +824,138 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             None => eprintln!(
                 "[wavefront-gpu] mega tok={mega_tok} ({mega_val:.3}); no per-op logits to compare"
             ),
+        }
+
+        // DIAGNOSTIC (droppable): classify the mega result + the embed input to
+        // localise where the decode degenerates (all -inf/NaN ⇒ a degenerate
+        // op upstream; all zero ⇒ result not written). FERRITE_WAVEFRONT_DUMP=1.
+        if std::env::var_os("FERRITE_WAVEFRONT_DUMP").is_some() {
+            let classify = |buf: &Buffer, base: u64, label: &str| {
+                let n = (buf.length().saturating_sub(base as usize) / 2).min(8192);
+                let s = unsafe {
+                    let p = (buf.contents().as_ptr() as *const u8).add(base as usize) as *const u16;
+                    std::slice::from_raw_parts(p, n)
+                };
+                let (mut zero, mut fin, mut pinf, mut ninf, mut nan) = (0, 0, 0, 0, 0);
+                let mut maxabs = 0.0f32;
+                for &b in s {
+                    let v = f32::from_bits((b as u32) << 16);
+                    if b == 0 {
+                        zero += 1;
+                    } else if v.is_nan() {
+                        nan += 1;
+                    } else if v == f32::INFINITY {
+                        pinf += 1;
+                    } else if v == f32::NEG_INFINITY {
+                        ninf += 1;
+                    } else {
+                        fin += 1;
+                        maxabs = maxabs.max(v.abs());
+                    }
+                }
+                eprintln!(
+                    "[wf-dump] {label}: n={n} zero={zero} fin={fin} +inf={pinf} -inf={ninf} \
+                     nan={nan} maxabs={maxabs:.4}"
+                );
+            };
+            classify(mbuf, *mbase, "result");
+            if let Some(eh) = embedded_hidden {
+                classify(eh, 0, "embed_in");
+            }
+            for slot in 0..cache.arena.len().min(12) {
+                classify(&cache.arena[slot], 0, &format!("slot{slot:2}"));
+            }
+            // Map the first ~24 computes (worker 0) → op_kind + output arena slot,
+            // so the first-NaN slot can be attributed to an op.
+            let opname = |o: u32| match o {
+                0 => "qmv",
+                3 => "rms",
+                4 => "silu",
+                5 => "rope",
+                6 => "attn",
+                7 => "add",
+                8 => "ropeA",
+                9 => "qmvC",
+                10 => "sumr",
+                11 => "qmvQ",
+                _ => "?",
+            };
+            let mut shown = 0;
+            for ins in prog.tape.iter() {
+                if ins[0] != 0 {
+                    continue; // COMPUTE only
+                }
+                let op = prog.shapes[ins[1] as usize][0];
+                let out_idx = ins[2] as usize + if op == 0 || op == 9 || op == 11 { 4 } else { 0 };
+                let slot = prog
+                    .operands
+                    .get(out_idx)
+                    .map(|o| match prog.buffers[o.buffer.0 as usize] {
+                        ferrite_wavefront::subtile_ir::BufferRef::ArenaSlot(s) => s as i64,
+                        _ => -1,
+                    })
+                    .unwrap_or(-2);
+                eprintln!(
+                    "[wf-dump] compute#{shown} op={} out_slot={slot}",
+                    opname(op)
+                );
+                // For the first compute writing slot 8 (the gate qmv — first op
+                // that NaNs), dump every operand's BufferRef + resolved address
+                // so we can spot a wrong buffer (e.g., scales pointing at weights).
+                if slot == 8 {
+                    let nopr = if op == 0 || op == 9 || op == 11 {
+                        5
+                    } else if op == 6 {
+                        6
+                    } else if op == 8 {
+                        7
+                    } else {
+                        3
+                    };
+                    for k in 0..nopr {
+                        let oi = ins[2] as usize + k;
+                        let o = &prog.operands[oi];
+                        let br = &prog.buffers[o.buffer.0 as usize];
+                        let (rb, rbase) = &resolved[o.buffer.0 as usize];
+                        eprintln!(
+                            "[wf-dump]   operand[{k}] BufId={} byte_offset={} BufferRef={:?} \
+                             gpuAddr=0x{:x} base={}",
+                            o.buffer.0,
+                            o.byte_offset,
+                            br,
+                            rb.gpuAddress() + *rbase as u64,
+                            rbase
+                        );
+                    }
+                }
+                shown += 1;
+                if shown >= 36 {
+                    break;
+                }
+            }
+            // First arena slot (≈ first op, slots assigned in node order) that
+            // holds a NaN — pinpoints the op that first degenerates.
+            for (slot, buf) in cache.arena.iter().enumerate() {
+                let n = (buf.length() / 2).min(8192);
+                let s =
+                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u16, n) };
+                let nan = s
+                    .iter()
+                    .filter(|&&b| f32::from_bits((b as u32) << 16).is_nan())
+                    .count();
+                if nan > 0 {
+                    let head: Vec<f32> = s
+                        .iter()
+                        .take(6)
+                        .map(|&b| f32::from_bits((b as u32) << 16))
+                        .collect();
+                    eprintln!(
+                        "[wf-dump] FIRST NaN arena slot={slot} (len={} bytes) nan={nan}/{n} head={head:?}",
+                        buf.length()
+                    );
+                    break;
+                }
+            }
         }
 
         // Replace-mode (plan decision #5, Tier B): DRIVE the decode with the
@@ -1378,14 +1519,30 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
              exceeds the 31-binding argument-table cap)",
             bucket_idx,
         );
-        self.run_bucket_mtl4_with_tail(
-            &guard.worker,
-            bucket_idx,
-            inputs.num_tokens as usize,
-            num_seqs,
-            has_spec_tokens,
-            tail,
-        )?;
+        // FERRITE_WAVEFRONT_MEGA_ONLY=1 (bench-only diag): skip the per-op
+        // decode forward at num_tokens == 1, so the only work in the iteration
+        // is the megakernel dispatch below. Output is GARBAGE (the per-op
+        // embedding never ran, so mega reads stale embed slot; downstream
+        // argmax loops on whatever token-0 decodes to) but the BENCH STILL
+        // TIMES THE ITERATION CORRECTLY — that's how we get the real mega-
+        // alone TPOT for an A/B vs per-op-alone. Prefill (num_tokens > 1)
+        // always goes through per-op (mega is decode-only).
+        let mega_only = inputs.num_tokens == 1
+            && std::env::var_os("FERRITE_WAVEFRONT_MEGA_ONLY").is_some()
+            && self
+                .mega_program
+                .get_or_init(|| W::wavefront_mega_program())
+                .is_some();
+        if !mega_only {
+            self.run_bucket_mtl4_with_tail(
+                &guard.worker,
+                bucket_idx,
+                inputs.num_tokens as usize,
+                num_seqs,
+                has_spec_tokens,
+                tail,
+            )?;
+        }
 
         // FERRITE_WAVEFRONT_GPU (diagnostic alt decode path): after the
         // trusted per-op decode, also dispatch the compile-time decode
@@ -1393,9 +1550,11 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // stats. Non-destructive (own fresh arena), so the result the caller
         // reads below is still the per-op one. Decode only (num_tokens == 1);
         // a no-op unless a program was installed (4bit decode) and the gate
-        // is set.
+        // is set. ALSO runs when FERRITE_WAVEFRONT_MEGA_ONLY=1 (the mega-only
+        // bench path above skipped per-op; here we run mega so the iteration
+        // does some real work to time).
         if inputs.num_tokens == 1
-            && std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
+            && (std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() || mega_only)
             && let Some(prog) = self
                 .mega_program
                 .get_or_init(|| W::wavefront_mega_program())

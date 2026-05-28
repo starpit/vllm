@@ -297,38 +297,55 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
             head_dim,
             scale,
         } => {
-            let (hq, hkv, hd) = (
-                num_q_heads as usize,
-                num_kv_heads as usize,
-                head_dim as usize,
-            );
+            // Head-block aware: this node computes a contiguous q-head range,
+            // derived from the OUTPUT region (its column slice), and reads the
+            // matching kv-head range — derived from the K input region. The
+            // SubOp keeps the GLOBAL head counts so the GQA ratio is exact; the
+            // block's own counts come from the slice widths. Each q-head's
+            // attention is independent ⇒ bit-exact vs the whole op.
+            let hd = head_dim as usize;
+            let gqa = (num_q_heads / num_kv_heads.max(1)) as usize;
             let (q, qr, qc) = gather(&node.inputs[0], graph, bufs);
-            assert_eq!(qc as usize, hq * hd, "attn Q width");
             let mq = qr as usize;
+            let qh_count = qc as usize / hd; // q-heads in this block
+            let qh_start = node.output.region.cols.start as usize / hd; // global first q-head
+            assert_eq!(
+                qc as usize,
+                qh_count * hd,
+                "attn Q width is a head multiple"
+            );
             assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
             assert_eq!(node.inputs.len() % 2, 1, "attn inputs = Q + (K,V) pairs");
+            // kv-head offset of this block (from the first K segment's column slice).
+            let kvh_start = node.inputs[1].region.cols.start as usize / hd;
+            // Concatenate K/V segments along sequence; each segment spans this
+            // block's kv-heads (kv_count * hd wide).
             let mut k_all: Vec<f32> = Vec::new();
             let mut v_all: Vec<f32> = Vec::new();
+            let mut kv_count = 0usize;
             let mut i = 1;
             while i < node.inputs.len() {
                 let (k, kr, kc) = gather(&node.inputs[i], graph, bufs);
                 let (v, vr, vc) = gather(&node.inputs[i + 1], graph, bufs);
-                assert_eq!(kc as usize, hkv * hd, "attn K seg width");
                 assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
+                kv_count = kc as usize / hd;
                 k_all.extend_from_slice(&k);
                 v_all.extend_from_slice(&v);
                 i += 2;
             }
-            let seq_len = k_all.len() / (hkv * hd);
-            let gqa = hq / hkv;
-            let mut out = vec![0f32; mq * hq * hd];
+            assert!(kv_count >= 1, "attn K seg has at least one kv-head");
+            let seg_w = kv_count * hd;
+            let seq_len = k_all.len() / seg_w;
+            let mut out = vec![0f32; mq * qh_count * hd];
             for qi in 0..mq {
-                for h in 0..hq {
-                    let kv_h = h / gqa;
-                    let q_off = qi * hq * hd + h * hd;
+                for hl in 0..qh_count {
+                    // local q-head hl → global q-head → global kv-head → local kv.
+                    let global_kv = (qh_start + hl) / gqa;
+                    let local_kv = global_kv - kvh_start;
+                    let q_off = qi * qh_count * hd + hl * hd;
                     let mut scores = vec![0f32; seq_len];
                     for (s, score) in scores.iter_mut().enumerate() {
-                        let k_off = s * hkv * hd + kv_h * hd;
+                        let k_off = s * seg_w + local_kv * hd;
                         let mut dot = 0f32;
                         for d in 0..hd {
                             dot += q[q_off + d] * k_all[k_off + d];
@@ -347,7 +364,7 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
                     for d in 0..hd {
                         let mut val = 0f32;
                         for (s, &wgt) in scores.iter().enumerate() {
-                            val += wgt * v_all[s * hkv * hd + kv_h * hd + d];
+                            val += wgt * v_all[s * seg_w + local_kv * hd + d];
                         }
                         out[q_off + d] = val;
                     }
@@ -493,7 +510,7 @@ pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
 
 /// Tile `[0, total)` into contiguous blocks of width `block` (last block
 /// may be shorter). `block >= total` yields a single whole block.
-fn n_blocks(total: u32, block: u32) -> Vec<Range> {
+pub(crate) fn n_blocks(total: u32, block: u32) -> Vec<Range> {
     assert!(block >= 1, "block width must be >= 1");
     let mut out = Vec::new();
     let mut start = 0;
@@ -508,9 +525,19 @@ fn n_blocks(total: u32, block: u32) -> Vec<Range> {
     out
 }
 
+/// Tile `[0, total)` into **head-aligned** blocks of width ~`nb`, snapped
+/// down to a whole number of `head_dim`-wide heads (at least one head). Used
+/// for rope/attention so every block is a clean set of heads — the q→rope→
+/// attn chain partitions on head boundaries (and o_proj split-Ks on them).
+pub(crate) fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
+    let hd = head_dim.max(1);
+    let heads_per_block = (nb / hd).max(1);
+    n_blocks(total, heads_per_block * hd)
+}
+
 /// Out-columns of an op (mirrors `crate::lower`): GEMM → n, attention →
 /// `num_q_heads * head_dim`, everything else preserves input-0 width.
-fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
+pub(crate) fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
     match op {
         LoweredOp::Gemm { n, .. } => n,
         LoweredOp::AttnDecode {
@@ -620,15 +647,6 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
                 }
             }
             other => {
-                // Whole-op node reading whole input tensors.
-                let inputs: Vec<TensorRegion> = desc
-                    .inputs
-                    .iter()
-                    .map(|r| {
-                        let (t, _, _) = resolve(*r, &op_tensor, &op_cols, &tensors);
-                        whole(t, &tensors)
-                    })
-                    .collect();
                 let subop = match other {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
@@ -652,20 +670,58 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
                     },
                     LoweredOp::Gemm { .. } => unreachable!("gemm handled above"),
                 };
-                let id = SubtileId(nodes.len() as u32);
-                nodes.push(SubtileNode {
-                    id,
-                    op: subop,
-                    inputs,
-                    output: TensorRegion {
-                        tensor: out_t,
-                        region: TensorShape {
-                            rows: m,
-                            cols: out_cols,
-                        }
-                        .whole(),
-                    },
-                });
+                // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the
+                // output column slice like the GEMM N-blocks, so the scheduler
+                // can spread it across workers. rope / attn (head structure) and
+                // rmsnorm (RMS reduction) stay WHOLE here — this is the bit-exact,
+                // GPU-correct reference lowering + the live per-op-schedule path.
+                // The head-tiling, split-K all-reduce and replication of the
+                // tensor-parallel partition live in
+                // [`crate::partition::lower_partitioned`], kept separate because
+                // split-K reassociates (breaks this fn's bit-exact contract) and
+                // because the partition needs the new GPU emit/player arms.
+                let elementwise = matches!(
+                    other,
+                    LoweredOp::Silu | LoweredOp::Mul | LoweredOp::Add | LoweredOp::SiluMul
+                );
+                let blocks = if elementwise {
+                    n_blocks(out_cols, nb)
+                } else {
+                    vec![Range::new(0, out_cols)]
+                };
+                for blk in blocks {
+                    let inputs: Vec<TensorRegion> = desc
+                        .inputs
+                        .iter()
+                        .map(|r| {
+                            let (t, _, _) = resolve(*r, &op_tensor, &op_cols, &tensors);
+                            if elementwise {
+                                TensorRegion {
+                                    tensor: t,
+                                    region: Region {
+                                        rows: Range::new(0, m),
+                                        cols: blk,
+                                    },
+                                }
+                            } else {
+                                whole(t, &tensors)
+                            }
+                        })
+                        .collect();
+                    let id = SubtileId(nodes.len() as u32);
+                    nodes.push(SubtileNode {
+                        id,
+                        op: subop,
+                        inputs,
+                        output: TensorRegion {
+                            tensor: out_t,
+                            region: Region {
+                                rows: Range::new(0, m),
+                                cols: blk,
+                            },
+                        },
+                    });
+                }
             }
         }
         op_tensor.push(out_t);
@@ -982,9 +1038,12 @@ mod tests {
     /// A consumer reading a whole N-block-tiled output depends on EVERY
     /// block; a reader of a leaf source has no dependency.
     #[test]
-    fn predecessors_join_on_all_blocks() {
-        // act[1,8] @ W[6,8] with nb=2 → 3 blocks; then a whole-tensor
-        // Silu consumer of the output must depend on all 3 blocks.
+    fn tiled_elementwise_depends_on_matching_block() {
+        // act[1,8] @ W[6,8] with nb=2 → 3 matmul blocks; then a Silu. Silu is a
+        // pure elementwise op, so the subtile-IR completion TILES it by the same
+        // nb — each silu tile reads ONLY its matching matmul block's slice (a
+        // local dependence), instead of one whole-tensor silu joining all 3
+        // blocks. That is what lets the scheduler keep the chain on one worker.
         let (m, n, k) = (1u32, 6u32, 8u32);
         let input = LoweringInput {
             sources: vec![
@@ -1007,18 +1066,16 @@ mod tests {
         };
         let g = lower_region(&input, 2);
         let preds = predecessors(&g);
-        // 3 matmul blocks (ids 0,1,2) + silu (id 3).
-        assert_eq!(g.nodes.len(), 4);
-        assert!(preds[0].is_empty(), "block 0 reads only sources");
+        // 3 matmul blocks (0,1,2) + 3 silu tiles (3,4,5).
+        assert_eq!(g.nodes.len(), 6);
         assert!(
-            preds[1].is_empty() && preds[2].is_empty(),
-            "blocks read only sources"
+            preds[0].is_empty() && preds[1].is_empty() && preds[2].is_empty(),
+            "matmul blocks read only sources"
         );
-        assert_eq!(
-            preds[3],
-            vec![SubtileId(0), SubtileId(1), SubtileId(2)],
-            "silu joins on all 3 matmul blocks"
-        );
+        // Each silu tile joins ONLY the matmul block that wrote its slice.
+        assert_eq!(preds[3], vec![SubtileId(0)], "silu tile 0 ← matmul block 0");
+        assert_eq!(preds[4], vec![SubtileId(1)], "silu tile 1 ← matmul block 1");
+        assert_eq!(preds[5], vec![SubtileId(2)], "silu tile 2 ← matmul block 2");
     }
 
     #[test]

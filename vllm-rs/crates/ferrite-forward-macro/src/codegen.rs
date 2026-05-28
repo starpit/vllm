@@ -6010,38 +6010,75 @@ fn dump_wavefront_mega(
     };
     let nb = env_u32("FERRITE_WAVEFRONT_NB", 256);
     let num_workers = env_u32("FERRITE_WAVEFRONT_P", 10);
-    let rg = ferrite_wavefront::region::lower_region(&fused, nb);
-    // PERF DIAG (droppable): cost a matmul block by its WEIGHT-READ bytes
-    // (N_block × K) — the bandwidth-bound cost — instead of output area
-    // (N_block), so the load-balancer doesn't leave workers idle at a join
-    // when blocks read very different K (e.g. down_proj K=8192 vs others 2048).
-    // `FERRITE_WAVEFRONT_COST=area` restores the old output-area cost.
-    let read_cost = std::env::var("FERRITE_WAVEFRONT_COST").as_deref() != Ok("area");
-    // PERF DIAG (droppable): the edge-cut (cross-worker handoff) price. The
-    // default 0.18 (µs/hop, measured) is ~6 orders below a block's compute cost
-    // (N_block·K ≈ 5e5 element-units), so the scheduler ignores communication and
-    // scatters every block → max handoff. FERRITE_WAVEFRONT_WAITCOST=<f64> raises
-    // it (in the SAME element-units as `cost`) so the cost-driven assignment
-    // co-locates producer→consumer chains and cuts cross-worker edges.
-    let wait_cost_us = std::env::var("FERRITE_WAVEFRONT_WAITCOST")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(0.18);
-    let sched = schedule_wavefront(
-        &rg,
-        |n| {
-            let area = (n.output.region.rows.len * n.output.region.cols.len) as f64;
-            if read_cost && matches!(n.op, ferrite_wavefront::subtile::SubOp::MatmulTile) {
-                (n.output.region.cols.len as f64) * (n.inputs[0].region.cols.len as f64)
-            } else {
-                area
-            }
-        },
-        ScheduleParams {
+    // FERRITE_WAVEFRONT_PARTITION=1 selects the tensor-parallel PARTITION
+    // (Option Q: head-mod-P local chains joined only at the split-K all-reduces;
+    // q/k/v/gate/up N-block, rope/attn head-tiled, o_proj/down split-K →
+    // qmv_quad partials + SumReduce). Default = the N-block lower_region path
+    // (the committed, GPU-correct reference). head_dim comes from the attn op.
+    let use_partition = std::env::var("FERRITE_WAVEFRONT_PARTITION").as_deref() == Ok("1");
+    let (rg, sched) = if use_partition {
+        let head_dim = fused
+            .ops
+            .iter()
+            .find_map(|o| match o.op {
+                ferrite_wavefront::lower::LoweredOp::AttnDecode { head_dim, .. } => Some(head_dim),
+                _ => None,
+            })
+            .unwrap_or(64);
+        // Cost-sweep knob: FERRITE_WAVEFRONT_MLP_UNIT (default = head_dim) sets
+        // the MLP chain's tile width. Coarser MLP tiles ⇒ better BW saturation
+        // (measured ~7.3ms COMPUTE_ONLY at 256 vs ~7.9ms at head_dim=64), but
+        // too coarse leaves cores idle (unit=512 = 8.3ms, unit=1024 = 8.8ms).
+        let mlp_unit = env_u32("FERRITE_WAVEFRONT_MLP_UNIT", head_dim);
+        let (g, owner) = ferrite_wavefront::partition::lower_partitioned(
+            &fused,
+            head_dim,
+            mlp_unit,
             num_workers,
-            wait_cost_us,
-        },
-    );
+        );
+        let preds = ferrite_wavefront::region::predecessors(&g);
+        let sched = ferrite_wavefront::region_schedule::schedule_from_assignment(
+            &g,
+            &preds,
+            &owner,
+            num_workers as usize,
+        );
+        (g, sched)
+    } else {
+        let rg = ferrite_wavefront::region::lower_region(&fused, nb);
+        // PERF DIAG (droppable): cost a matmul block by its WEIGHT-READ bytes
+        // (N_block × K) — the bandwidth-bound cost — instead of output area
+        // (N_block), so the load-balancer doesn't leave workers idle at a join
+        // when blocks read very different K (e.g. down_proj K=8192 vs others 2048).
+        // `FERRITE_WAVEFRONT_COST=area` restores the old output-area cost.
+        let read_cost = std::env::var("FERRITE_WAVEFRONT_COST").as_deref() != Ok("area");
+        // PERF DIAG (droppable): the edge-cut (cross-worker handoff) price. The
+        // default 0.18 (µs/hop, measured) is ~6 orders below a block's compute cost
+        // (N_block·K ≈ 5e5 element-units), so the scheduler ignores communication and
+        // scatters every block → max handoff. FERRITE_WAVEFRONT_WAITCOST=<f64> raises
+        // it (in the SAME element-units as `cost`) so the cost-driven assignment
+        // co-locates producer→consumer chains and cuts cross-worker edges.
+        let wait_cost_us = std::env::var("FERRITE_WAVEFRONT_WAITCOST")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.18);
+        let sched = schedule_wavefront(
+            &rg,
+            |n| {
+                let area = (n.output.region.rows.len * n.output.region.cols.len) as f64;
+                if read_cost && matches!(n.op, ferrite_wavefront::subtile::SubOp::MatmulTile) {
+                    (n.output.region.cols.len as f64) * (n.inputs[0].region.cols.len as f64)
+                } else {
+                    area
+                }
+            },
+            ScheduleParams {
+                num_workers,
+                wait_cost_us,
+            },
+        );
+        (rg, sched)
+    };
     let geom = ferrite_wavefront::mega::Geometry {
         act_elem: 2,
         block_size: 16,
@@ -6164,6 +6201,11 @@ fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStre
     let buffers = prog.buffers.iter().map(buffer_ref_to_tokens);
     let num_flags = prog.num_flags;
     let result = prog.result.0;
+    let level_tape = prog.level_tape.iter().map(|r| {
+        let (a, b, c, d) = (r[0], r[1], r[2], r[3]);
+        quote! { [#a, #b, #c, #d] }
+    });
+    let level_starts = prog.level_starts.iter();
 
     quote! {
         /// Compile-time PD-wavefront decode megakernel program, serialized by
@@ -6181,6 +6223,8 @@ fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStre
             static OPERANDS: &[(u32, u64)] = &[ #(#operands),* ];
             static ARENA: &[u64] = &[ #(#arena),* ];
             static ELEM: &[u32] = &[ #(#elem),* ];
+            static LEVEL_TAPE: &[[u32; 4]] = &[ #(#level_tape),* ];
+            static LEVEL_STARTS: &[u32] = &[ #(#level_starts),* ];
             MegaProgram {
                 tape: TAPE.to_vec(),
                 shapes: SHAPES.to_vec(),
@@ -6197,6 +6241,8 @@ fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStre
                 elem_bytes: ELEM.to_vec(),
                 arena_bytes: ARENA.to_vec(),
                 result: BufId(#result),
+                level_tape: LEVEL_TAPE.to_vec(),
+                level_starts: LEVEL_STARTS.to_vec(),
             }
         }
     }

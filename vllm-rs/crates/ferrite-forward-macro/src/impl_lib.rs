@@ -2552,28 +2552,46 @@ pub fn starter_library() -> ImplementationLibrary {
         // `vision_pool_factor`. Used by Gemma3-MM's SigLIP→text projector.
         lib.push(Box::new(AvgPool2dImpl));
 
-        // FlashInfer paged attention is disabled fleet-wide pending a fix
-        // for the persistent-kernel `CUDA_ERROR_ILLEGAL_ADDRESS`
-        // (`flashinfer/attention/persistent.cuh:641`) hit at tp>1 with
-        // `num_kv_heads = 1` (Qwen2.5-3B sharded). The DP solver falls
-        // back to the FA2 / gather-into-contiguous attention path. Re-enable
-        // by restoring the push loop below once the FlashInfer-side fix
-        // lands; `FLASHINFER_CONFIG_SET` in `ferrite-cuda-builder` and the
-        // extern-symbol bindings in `ferrite-kernels::flashinfer` still
-        // exist, so flipping this back on is a single block-uncomment.
+        // FlashInfer paged attention. Gated sm_89+ in each Impl's
+        // `target_compatible`; sm_80/sm_86 fall back to FA2 (untested
+        // with this shim).
         //
-        // for &head_dim in &[64u32, 128, 256] {
-        //     for &use_softcap in &[false, true] {
-        //         lib.push(Box::new(FlashInferAttentionDecodeImpl {
-        //             head_dim,
-        //             use_logits_soft_cap: use_softcap,
-        //         }));
-        //         lib.push(Box::new(FlashInferAttentionPrefillImpl {
-        //             head_dim,
-        //             use_logits_soft_cap: use_softcap,
-        //         }));
-        //     }
-        // }
+        // Apples-to-apples vs Python vLLM (`--attention-backend
+        // FLASHINFER`, CUDA graphs both sides, BF16, vllm 0.19.1):
+        //   H100  BS=1 in=8192   3B 0.265s vs 0.334s py  (-21%)
+        //                         7B 0.405s vs 0.583s py  (-30%)
+        //                        14B 0.777s vs 1.147s py  (-32%)
+        //   L40S  BS=1 in=8192   3B 0.651s vs 0.935s py  (-30%)
+        //                         7B 1.336s vs 1.956s py  (-32%)
+        //                        14B 2.647s vs 3.939s py  (-33%)
+        // Batched (BS=8/32) is -5..-13% across both arches.
+        //
+        // H100 TP=2 verified (Qwen2.5-7B 0.348s, Qwen2.5-14B 0.625s
+        // at BS=1 in=8192, faster than TP=1) including the
+        // num_kv_heads=1-per-rank shape (Qwen2.5-3B at TP=2).
+        //
+        // The sm_89 enable depends on the multi-slot plan cache in
+        // `ferrite_kernels::flashinfer::FlashInferPlanCache`. The
+        // cost solver alternates between (head_dim,
+        // use_logits_soft_cap) impls across decode shapes; with the
+        // older single-slot cache, switching cfg mid-session
+        // `cudaFree`d the previous plan's int_ws_d/float_ws_d, which
+        // captured CUDA graphs still referenced through params_1 /
+        // params_2 baked into kernel args at capture — replay then
+        // surfaced as `CUDA_ERROR_ILLEGAL_ADDRESS`. Holding one
+        // persistent slot per cfg fixes that.
+        for &head_dim in &[64u32, 128, 256] {
+            for &use_softcap in &[false, true] {
+                lib.push(Box::new(FlashInferAttentionDecodeImpl {
+                    head_dim,
+                    use_logits_soft_cap: use_softcap,
+                }));
+                lib.push(Box::new(FlashInferAttentionPrefillImpl {
+                    head_dim,
+                    use_logits_soft_cap: use_softcap,
+                }));
+            }
+        }
     } // end #[cfg(feature = "cuda")] CUDA-impls block
     lib
 }
@@ -14418,6 +14436,16 @@ impl Implementation for FlashInferAttentionDecodeImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // sm_89+ (Ada/Hopper). Older arches (sm_80 A100, sm_86 RTX30,
+        // sm_75 T4) fall back to FA2 via the `target_compatible
+        // == false` branch — they're untested with this shim.
+        let compute_cap = match &profile.backend_spec {
+            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
+            _ => return false,
+        };
+        if compute_cap < 89 {
+            return false;
+        }
         // O(1) membership check on the fully-qualified FI kernel name.
         // A row-less target (no sweep data for this head_dim × softcap)
         // silently falls back to FA2 via the `None` emit-call branch.
@@ -14552,6 +14580,14 @@ impl Implementation for FlashInferAttentionPrefillImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // sm_89+ — see FlashInferAttentionDecodeImpl::target_compatible.
+        let compute_cap = match &profile.backend_spec {
+            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
+            _ => return false,
+        };
+        if compute_cap < 89 {
+            return false;
+        }
         profile
             .cost_table
             .has_kernel(&fi_csv_name(self.head_dim, self.use_logits_soft_cap))

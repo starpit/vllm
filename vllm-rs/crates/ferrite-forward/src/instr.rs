@@ -1795,28 +1795,93 @@ impl Instruction {
                 out_slot,
                 interleaved,
             ) => {
+                let max_q = ctx.fwd.max_seqlen_q;
+                let max_k = ctx.fwd.max_seqlen_k;
                 let mut out = unsafe {
                     let q = tile_ref(ctx.tiles, q_slot).as_view(ctx.tiles);
-                    let k = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
-                    let v = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
-                    kernels::flash_attn_contiguous(
-                        *q,
-                        *k,
-                        *v,
-                        *ctx.fwd.cu_seqlens_q,
-                        *ctx.fwd.cu_seqlens_q,
-                        ctx.fwd.max_seqlen_q,
-                        ctx.fwd.max_seqlen_k,
-                        W::ATTN_SCALE,
-                        true,
-                        W::ATTN_SOFTCAP,
-                        -1,
-                        &mut ctx.device.caching,
-                        ctx.device.compute_stream,
-                        ::std::ptr::null::<u8>(),
-                        0,
-                        interleaved,
-                    )
+                    if max_q == max_k {
+                        // Fresh prefill (single-step, or chunk 1 of a chunked
+                        // prefill): no prior K/V in cache for this seq, attend
+                        // over the chunk's own contiguous K/V.
+                        let k = tile_ref(ctx.tiles, k_slot).as_view(ctx.tiles);
+                        let v = tile_ref(ctx.tiles, v_slot).as_view(ctx.tiles);
+                        kernels::flash_attn_contiguous(
+                            *q,
+                            *k,
+                            *v,
+                            *ctx.fwd.cu_seqlens_q,
+                            *ctx.fwd.cu_seqlens_q,
+                            max_q,
+                            max_k,
+                            W::ATTN_SCALE,
+                            true,
+                            W::ATTN_SOFTCAP,
+                            -1,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                            ::std::ptr::null::<u8>(),
+                            0,
+                            interleaved,
+                        )
+                    } else {
+                        // Chunked-prefill continuation (chunk 2+): max_q < max_k
+                        // because chunk 1's K/V is already in the paged KV cache
+                        // and only this chunk's q_len rows are queried. Read K/V
+                        // from cache via the paged kernel — flash_attn_contiguous
+                        // would only see this chunk's K and miss the prefix.
+                        // Reshape-and-cache for this chunk's K/V ran upstream
+                        // (RopeAndCacheKV / equivalent) so the cache spans the
+                        // full sequence at this point.
+                        let layer = ctx.layer_offset as usize;
+                        let fi_cfg = flashinfer::FlashInferConfig {
+                            dtype: flashinfer::FiDType::Bf16,
+                            head_dim: W::HEAD_DIM,
+                            use_logits_soft_cap: W::ATTN_SOFTCAP > 0.0,
+                        };
+                        let sk_bucket = ah::sk_bucket_for(max_k);
+                        let fi = ah::flashinfer_attention(
+                            q,
+                            ctx.fwd.cu_seqlens_q,
+                            ctx.fwd.seqused_k,
+                            ctx.fwd.block_table,
+                            max_q,
+                            max_k,
+                            W::ATTN_SCALE,
+                            W::ATTN_SOFTCAP,
+                            ctx.fwd.kv_cache,
+                            layer,
+                            ctx.device.num_sm,
+                            fi_cfg,
+                            sk_bucket,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        );
+                        match fi {
+                            Some(t) => t,
+                            None => kernels::flash_attn_paged_ext(
+                                *q,
+                                *ctx.fwd.kv_cache.k_cache(layer),
+                                *ctx.fwd.kv_cache.v_cache(layer),
+                                *ctx.fwd.cu_seqlens_q,
+                                *ctx.fwd.seqused_k,
+                                *ctx.fwd.block_table,
+                                max_q,
+                                max_k,
+                                W::ATTN_SCALE,
+                                true,
+                                W::ATTN_SOFTCAP,
+                                -1,
+                                ctx.fwd.kv_cache.block_size,
+                                ctx.device.num_sm,
+                                &mut ctx.device.caching,
+                                ctx.device.compute_stream,
+                                ::std::ptr::null::<u8>(),
+                                0,
+                                interleaved,
+                                ctx.fwd.kv_cache.block_unrotated_gpu(),
+                            ),
+                        }
+                    }
                 };
                 unsafe {
                     let nt = (*out).dim(0);

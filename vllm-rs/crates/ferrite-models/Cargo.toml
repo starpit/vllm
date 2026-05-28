@@ -95,9 +95,9 @@ metal = [
 
 # Tensor-parallel umbrella. Forwards `nccl` through to every per-arch
 # crate so a single `--features nccl` on this crate flips the whole
-# tree onto the TP-aware build. Until task #7's compile() outer-loop
-# fanout lands, this is purely additive — every per-arch macro
-# expansion still emits a tp=1 single-rank module set.
+# tree onto the TP-aware build. Each per-arch crate's `nccl` feature in
+# turn forwards `ferrite-forward-macro/nccl`, which is what flips the
+# proc-macro into emitting per-(model, tp) variants for tp ∈ {1, 2, 4, 8}.
 nccl = [
     "cuda",
     "ferrite-model-commandr?/nccl",
@@ -118,6 +118,7 @@ nccl = [
     "ferrite-model-qwen3-moe?/nccl",
     "ferrite-model-deepseek-v2?/nccl",
     "ferrite-model-deepseek-v3?/nccl",
+    "ferrite-model-deepseek-v3-flat?/nccl",
 ]
 
 [dependencies]

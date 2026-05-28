@@ -12,9 +12,18 @@ default = []
 # the emitted runtime types stay gated out.
 cuda = ["dep:ferrite-kernels", "ferrite-kernels/cuda", "ferrite-cuda-core/cuda", "dep:ferrite-vision"]
 # Enables tensor-parallel-aware IR (`Instruction::AllReduce` + the
-# `ForwardCtx::tp_group` field). At tp=1 the lowering pass never
-# emits AllReduce, so this feature is a strict superset of `cuda`.
-nccl = ["cuda", "ferrite-kernels/nccl", "ferrite-cuda-core/nccl", "ferrite-vision/nccl"]
+# `ForwardCtx::tp_group` field). Pure source-level cfg toggle — does
+# NOT activate cuda or any kernel/vision dep. Runtime consumers (per-
+# arch crates, vllm-executor) independently activate
+# `ferrite-cuda-core/nccl`, `ferrite-kernels/nccl`,
+# `ferrite-vision/nccl`. Keeping ferrite-forward's nccl feature
+# transitive-free is critical for `ferrite-forward-macro/nccl` —
+# the proc-macro pulls ferrite-forward via this feature to gate the
+# `Instruction::AllReduce` variant, but must not drag the runtime's
+# CUDA C ABI symbols (cast_from_f32_*, launch_dequantize_*, …) into
+# its host-side .so or rustc will refuse to dlopen the macro at
+# build time.
+nccl = []
 # Metal backend on Apple Silicon. Surfaces the `Instruction` enum +
 # `CanonicalParams` trait so the Metal interpreter
 # (`interpreter::metal`) can lower a per-bucket tape into

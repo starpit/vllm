@@ -1994,6 +1994,14 @@ fn initialize_stack_tp_pp(
     model_name: String,
     init_start: Instant,
 ) -> Result<InitializedStack> {
+    let _ = (config, model_name, init_start);
+    anyhow::bail!(
+        "Pipeline parallelism is not supported on the ferrite-only forwards \
+         (the previous PP path lived in `vllm_cuda::model::*` and has been \
+         removed). Run with `--pipeline-parallel-size 1`."
+    );
+    #[allow(unreachable_code)]
+    {
     #[cfg(not(feature = "nccl"))]
     {
         let _ = (config, model_name, init_start);
@@ -2358,6 +2366,7 @@ fn initialize_stack_tp_pp(
             max_model_len,
         })
     }
+    } // close `#[allow(unreachable_code)] {` wrapper
 }
 
 /// (via ColumnParallelLinear/RowParallelLinear sharding at load time).

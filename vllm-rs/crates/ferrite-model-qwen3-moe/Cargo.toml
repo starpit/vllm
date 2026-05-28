@@ -9,7 +9,7 @@ description = "Ferrite Qwen3-MoE architecture (one #[forward] body)"
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
 metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
-nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-forward-macro/nccl"]
 
 [dependencies]
 ferrite-cuda-core = { path = "../ferrite-cuda-core" }

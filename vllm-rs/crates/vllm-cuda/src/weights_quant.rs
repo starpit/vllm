@@ -1575,8 +1575,9 @@ pub fn load_fp8_moe_experts(
 /// Block scales are stacked into `[E, ceil(N/bn), ceil(K/bk)]` f32 tensors.
 /// For w1 (gate+up), gate and up scale rows are concatenated along dim=1.
 ///
-/// With TP (`tp != None`), each expert's intermediate dimension is sharded:
-/// gate/up weights sharded along dim=0, down along dim=1, scales correspondingly.
+/// With TP (`tp != None` as `Some((rank, world_size))`), each expert's
+/// intermediate dimension is sharded: gate/up weights sharded along dim=0,
+/// down along dim=1, scales correspondingly.
 #[allow(clippy::too_many_arguments)]
 pub fn load_fp8_block_moe_experts(
     weights: &mut GpuWeights,
@@ -1589,10 +1590,10 @@ pub fn load_fp8_block_moe_experts(
     gate_name: &str,
     up_name: &str,
     down_name: &str,
-    tp: Option<crate::model::llama::TpConfig>,
+    tp: Option<(usize, usize)>,
 ) -> Result<crate::layers_moe::Fp8BlockFusedMoELayer> {
     let stream = weights.stream();
-    let (rank, world_size) = tp.map_or((0, 1), |t| (t.rank, t.world_size));
+    let (rank, world_size) = tp.unwrap_or((0, 1));
     let ipp = intermediate_size / world_size; // per-partition intermediate size
 
     // Gate weight — always dense BF16 (not sharded, same on all ranks).

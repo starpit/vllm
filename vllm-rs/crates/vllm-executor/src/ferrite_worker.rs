@@ -486,23 +486,7 @@ impl CudaModel {
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
-                let result = m.weights.forward_backbone(&ctx, device, num_tokens);
-                // FERRITE_WAVEFRONT_GPU=1 (diagnostic alt path): after the
-                // trusted per-op `forward_backbone`, also dispatch the
-                // orchestrator-emitted megakernel through the model's
-                // CUDA mega hook. Default impl on FerriteWeights returns
-                // `None` (no megakernel wired up for this arch); per-arch
-                // overrides resolve the layer's weight pointers and call
-                // `ferrite_wavefront::dispatch::dispatch_one_layer_decode`.
-                // Non-destructive: the per-op result above stays the
-                // worker's output. Mirrors metal's `pool::run_wavefront_mega`.
-                #[cfg(feature = "cuda")]
-                if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
-                    let _ = m
-                        .weights
-                        .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens);
-                }
-                result
+                m.weights.forward_backbone(&ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -713,17 +697,6 @@ impl CudaModel {
                     tp_group: m.tp_group.as_ref(),
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
-                // FERRITE_WAVEFRONT_GPU=1 (diagnostic alt path): same
-                // hook as in `forward_backbone` above. Mirrors metal
-                // `pool::run_wavefront_mega`. Default impl is None;
-                // shape-matching arches (Llama-3.2-1B today) override
-                // it to dispatch the orchestrator-emitted megakernel.
-                #[cfg(feature = "cuda")]
-                if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
-                    let _ = m
-                        .weights
-                        .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens);
-                }
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(

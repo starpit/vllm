@@ -73,4 +73,80 @@ mod tests {
             launch_tk_decode_one_layer;
         assert_ne!(f as usize, 0);
     }
+
+    /// End-to-end smoke harness: allocate the full 26-buffer set of
+    /// zero-filled device memory, hand them to the orchestrator's
+    /// `launch_tk_decode_one_layer` wrapper with `__num_kv_pages = 1`,
+    /// and assert the launch + stream sync both report `cudaSuccess`.
+    ///
+    /// Currently `#[ignore]`d: when run on H100 the kernel launches
+    /// (cudaFuncSetAttribute and the triple-chevron return success)
+    /// but the persistent megakernel does not retire — `nvidia-smi`
+    /// reports 100% util on GPU 0 with `ferrite_wavefront-*` as the
+    /// owning process and `cuStreamSynchronize` blocks indefinitely.
+    /// All threads spin on a `mbarrier.try_wait.parity` somewhere in
+    /// the loader / storer / 8 consumer round protocol the orchestrator
+    /// emits. The harness still serves as the launch-path test bed; the
+    /// barrier-protocol audit is the next slice of work and will flip
+    /// this back on once a single-op reproducer pins down which round
+    /// participant is missing a matching `arrive`.
+    ///
+    /// Run manually with:
+    ///   cargo test -p ferrite-wavefront --features cuda \
+    ///       launcher_runs_on_zeros -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn launcher_runs_on_zeros() {
+        use crate::fixtures::{buf_byte_sizes, one_layer_input};
+        use cudarc::driver::{CudaContext, DevicePtr};
+
+        let ctx = CudaContext::new(0).expect("cuda init");
+        let stream = ctx.new_stream().expect("stream create");
+
+        let input = one_layer_input();
+        let raw_sizes = buf_byte_sizes(&input);
+
+        // Pad each allocation to at least 1 MiB (covers any single-page
+        // TMA load at PAGE_SIZE = 16 KiB with comfortable headroom) and
+        // round to 128 bytes (TMA alignment). Real shapes are kept where
+        // they exceed the floor so the larger weight tensors get their
+        // declared bytes.
+        let pad_floor = 1usize << 20;
+        let bufs: Vec<cudarc::driver::CudaSlice<u8>> = raw_sizes
+            .iter()
+            .map(|&n| {
+                let n_padded = n.max(pad_floor);
+                let n_aligned = n_padded.div_ceil(128) * 128;
+                stream.alloc_zeros::<u8>(n_aligned).expect("alloc_zeros")
+            })
+            .collect();
+
+        // Collect device pointers in BufId order. The `_records` keep
+        // the SyncOnDrop guards alive for the duration of the launch so
+        // cudarc treats the buffers as live across the kernel call.
+        let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(bufs.len());
+        let mut _records: Vec<cudarc::driver::SyncOnDrop<'_>> = Vec::with_capacity(bufs.len());
+        for buf in &bufs {
+            let (dptr, rec) = DevicePtr::device_ptr(buf, &stream);
+            ptrs.push(dptr as *mut c_void);
+            _records.push(rec);
+        }
+
+        // Make sure all the alloc_zeros memsets retire before the
+        // kernel reads them.
+        stream.synchronize().expect("pre-launch sync");
+
+        let u32_args: [u32; 1] = [1]; // __num_kv_pages = 1
+        let stream_raw = stream.cu_stream() as *mut c_void;
+
+        let err = unsafe { launch_decode_one_layer(&ptrs, &u32_args, stream_raw) };
+        assert_eq!(err, 0, "launch_tk_decode_one_layer returned cudaError {err}");
+
+        stream
+            .synchronize()
+            .expect("post-launch sync (kernel ran to completion)");
+
+        drop(_records);
+        drop(bufs);
+    }
 }

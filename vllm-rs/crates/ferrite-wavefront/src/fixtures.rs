@@ -118,6 +118,55 @@ pub fn one_layer_input() -> LoweringInput {
     }
 }
 
+/// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
+/// [`LoweringInput`], in `BufId` order: sources first, then per-op
+/// output staging buffers. Mirrors the shape inference in
+/// `tk_orchestrate::lower_to_tk` so the smoke-test harness can
+/// allocate the exact set of device buffers the orchestrator's
+/// emitted kernel expects.
+pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
+    let n_sources = input.sources.len();
+    let mut out = Vec::with_capacity(n_sources + input.ops.len());
+
+    for s in &input.sources {
+        out.push((s.rows as usize) * (s.cols as usize) * 2);
+    }
+
+    let shape_for = |r: InputRef,
+                     op_shapes: &[(u32, u32)],
+                     srcs: &[crate::subtile::SourceShape]|
+     -> (u32, u32) {
+        match r {
+            InputRef::Ext(e) => (srcs[e].rows, srcs[e].cols),
+            InputRef::Op(j) => op_shapes[j],
+        }
+    };
+
+    let mut op_shapes: Vec<(u32, u32)> = Vec::with_capacity(input.ops.len());
+    for desc in &input.ops {
+        let m = desc.m;
+        let cols = match desc.op {
+            LoweredOp::RmsNorm { .. }
+            | LoweredOp::Add
+            | LoweredOp::SiluMul
+            | LoweredOp::RopeRotate { .. }
+            | LoweredOp::RopeAppend { .. }
+            | LoweredOp::Silu
+            | LoweredOp::Mul => shape_for(desc.inputs[0], &op_shapes, &input.sources).1,
+            LoweredOp::Gemm { n, .. } => n,
+            LoweredOp::AttnDecode {
+                num_q_heads,
+                head_dim,
+                ..
+            } => num_q_heads * head_dim,
+        };
+        op_shapes.push((m, cols));
+        out.push((m as usize) * (cols as usize) * 2);
+    }
+
+    out
+}
+
 /// Synthesize the kernel arg signature for an orchestrator output.
 ///
 /// Buffer-id convention (see `tk_orchestrate`):

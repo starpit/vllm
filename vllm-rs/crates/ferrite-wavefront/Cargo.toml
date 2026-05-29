@@ -20,10 +20,16 @@ default = []
 # create a cycle through `ferrite-models -> ferrite-forward -> us`.
 # Build ordering is enforced by the top-level binary that uses both
 # crates.
-cuda = []
+cuda = ["dep:cudarc"]
 
 [dependencies]
 dirs = "6"
+# cudarc is the safe wrapper we use in the `cuda`-feature smoke test
+# (and any future production launcher caller) to allocate device
+# buffers and obtain a `cudaStream_t` to hand the orchestrator's
+# `launch_<name>` wrapper. The version is pinned to the workspace's
+# candle-core requirement so we link against the same FFI layer.
+cudarc = { workspace = true, optional = true, features = ["dynamic-linking", "cuda-version-from-build-system"] }
 
 [build-dependencies]
 dirs = "6"

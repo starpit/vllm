@@ -139,17 +139,21 @@ pub struct RmsNormOp {
 
 /// Lower one RmsNorm op into a `TkProgram` fragment.
 ///
-/// Tape shape (per round):
+/// Tape shape for one round (TK 2.0 mbarrier semantics — every wait in
+/// the round reads the *same* parity `R & 1`; only `complete_round`
+/// flips the typed parity for the next round):
 ///   1. Loader: wait `Consumed[id]@P` → TMA load `x[..]` into page →
-///      arrive `Ready[id]`. (Phase advances P → P::Next.)
-///   2. AllConsumers: wait `Ready[id]@P::Next` → inline RMS reduce +
-///      scale `Compute` → arrive `Done[id]`.
-///   3. Storer: wait `Done[id]@P` → TMA store page → arrive `Consumed`.
+///      arrive `Ready[id]`.
+///   2. AllConsumers: wait `Ready[id]@P` → inline RMS reduce + scale
+///      `Compute` → arrive `Done[id]`.
+///   3. Storer: wait `Done[id]@P` → TMA store page → arrive
+///      `Consumed[id]`.
+///   4. Round boundary: `complete_round` flips `P → P::Next`.
 ///
 /// Phase parity is *threaded through the type system*: the only way
 /// each `wait` sees the right parity is that the IR consumed a typed
-/// `PageHandle<P::Next>` from the prior `arrive`. Codegen emits the
-/// captured `P::VALUE`; phase drift is unrepresentable.
+/// `PageHandle<P>` whose phase came from the round boundary. Codegen
+/// emits the captured `P::VALUE`; phase drift is unrepresentable.
 pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
     let page = pages
         .alloc_p0()
@@ -166,22 +170,20 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
     };
 
     // ── Loader ──
-    // First round: wait on `Consumed` at Phase0. (TK 2.0 inits
-    // page_consumed via `arrive_pre`, so the *first* wait reads
-    // Phase1; we use `pages.alloc_p1()` for that case in callers that
-    // schedule round 0 explicitly. For the simplest layer-0 case the
-    // page starts at Phase0 because the persistent kernel pre-arrives
-    // page_consumed before any op runs. We follow the latter path
-    // here — `alloc_p0` — to keep the slice readable.)
+    // Round 0: wait on `Consumed` at Phase0. (TK 2.0 inits page_consumed
+    // via `arrive_pre` so its first wait *would* read 1 — but the
+    // persistent kernel scaffold pre-arrives page_consumed before any
+    // op runs, leaving the round-start parity at 0. Callers scheduling
+    // a non-pre-arrived slot use `pages.alloc_p1()`.)
     let page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, page);
     prog.load_async(page_id, op.x, x_region, tile);
     let page = prog.arrive(WarpRole::Loader, PageBarrier::Ready, page);
 
     // ── Consumer ──
-    // Wait reads Phase1 because of the prior arrive. Compute body is a
-    // raw fragment — pre-resolved by the per-op atom (RMS reduction +
-    // gain multiply + writeback to the same page region). We do NOT
-    // synthesise it here.
+    // Wait reads the SAME parity as the loader's wait — within one
+    // round every barrier's wait reads `R & 1`. The loader's arrive
+    // flipped the underlying `page_ready` mbarrier from 0 → 1, which is
+    // exactly what makes `wait(0)` return on the consumer side.
     let page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
     prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op));
     let page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
@@ -191,6 +193,10 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
     prog.store_async(page_id, op.out, out_region, tile);
     let page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, page);
 
+    // Round boundary — the only phase-advancing call. Releases the slot
+    // back to the allocator with its parity flipped, so the next op
+    // that grabs slot `id` starts its round at `P::Next`.
+    let page = prog.complete_round(page);
     pages.release(page);
 }
 
@@ -249,19 +255,21 @@ mod tests {
         }
     }
 
-    /// The lowered IR has the exact six-step loader/consumer/storer
-    /// handshake from the design doc — no blank-filling.
+    /// The lowered IR has the exact nine-instruction
+    /// loader/consumer/storer handshake from the design doc — no
+    /// blank-filling at emit time.
     #[test]
-    fn rmsnorm_lowers_to_six_step_handshake() {
+    fn rmsnorm_lowers_to_nine_instr_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
         lower_rmsnorm(op(), &mut pages, &mut prog);
 
-        // 8 instructions: wait+load+arrive (loader), wait+compute+arrive (consumer),
-        // wait+store+arrive (storer).
+        // 9 instructions: wait+load+arrive (loader), wait+compute+arrive (consumer),
+        // wait+store+arrive (storer). `complete_round` emits no IR.
         assert_eq!(prog.instrs.len(), 9, "{prog:?}");
 
-        // Phase parities the lowering picked.
+        // Phase parities the lowering picked: every wait within one
+        // round reads `R & 1` (round 0 → all 0).
         let phases: Vec<u32> = prog
             .instrs
             .iter()
@@ -270,7 +278,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(phases, vec![0, 1, 0], "ping-pong: P0 → P1 → P0");
+        assert_eq!(phases, vec![0, 0, 0], "round 0: every wait reads 0");
     }
 
     /// The page is released back to the allocator at the right parity:
@@ -318,9 +326,10 @@ mod tests {
         assert!(src.contains("page_ready[0]"), "{src}");
         assert!(src.contains("page_done[0]"), "{src}");
 
-        // Phase parities match the lowering's ping-pong (0, 1, 0).
+        // Phase parities match TK 2.0 round semantics: every wait in
+        // one round reads `R & 1` (round 0 → all 0).
         assert!(src.contains("page_consumed[0], 0"), "{src}");
-        assert!(src.contains("page_ready[0], 1"), "{src}");
+        assert!(src.contains("page_ready[0], 0"), "{src}");
         assert!(src.contains("page_done[0], 0"), "{src}");
 
         // Body fragment pasted verbatim.

@@ -19,8 +19,23 @@
 //! call site; one mis-counted op → silent drift → m=1 megakernel hang.
 //!
 //! Here phase is a TYPE: [`Phase0`] / [`Phase1`] with [`Phase::Next`]
-//! flipping under [`PageHandle::advance`]. A wait/arrive on the wrong
-//! parity is a Rust *compile* error, not a runtime deadlock.
+//! flipping under [`TkProgram::complete_round`]. A wait/arrive on the
+//! wrong parity is a Rust *compile* error, not a runtime deadlock.
+//!
+//! # The round invariant (TK 2.0 semantics, the part easy to get wrong)
+//!
+//! `mbarrier.wait(P)` blocks while `mbarrier.phase == P` and returns
+//! once it differs. `mbarrier.arrive()` flips the phase. Per round the
+//! sequence is loader-arrive-ready, consumer-arrive-done,
+//! storer-arrive-consumed — three flips, one per barrier. Within a
+//! round, every wait reads the SAME parity (`R & 1`); only at the
+//! round boundary does the next round's parity change to `(R+1) & 1`.
+//!
+//! Therefore [`TkProgram::arrive`] does NOT advance phase: the page's
+//! typed phase reflects the *round parity*, not the per-barrier flip.
+//! The round closes with [`TkProgram::complete_round`], which is the
+//! only phase-advancing call. (See the round-walk in
+//! `tk_warp_ir::tests::round_parities_match_tk20_semantics`.)
 
 #![allow(dead_code)]
 
@@ -258,20 +273,30 @@ impl TkProgram {
         page
     }
 
-    /// Push a typed `Arrive`. Returns the page handle with phase
-    /// advanced (`P → P::Next`) — the next `wait` on it will read the
-    /// flipped parity automatically.
+    /// Push a typed `Arrive`. Phase parity is the *round parity*, not
+    /// the per-barrier flip — every wait within one round reads the
+    /// same `(R & 1)`, so `arrive` returns the page handle UNCHANGED.
+    /// The round boundary advance is [`TkProgram::complete_round`].
     pub fn arrive<P: Phase>(
         &mut self,
         role: WarpRole,
         kind: PageBarrier,
         page: PageHandle<P>,
-    ) -> PageHandle<P::Next> {
+    ) -> PageHandle<P> {
         self.instrs.push(TkInstr::Arrive {
             role,
             page_id: page.id,
             kind,
         });
+        page
+    }
+
+    /// Close a round: flip the page's typed phase parity `P → P::Next`.
+    /// Emits no IR — codegen never sees this, since per round each
+    /// barrier flips exactly once and all three waits read the *old*
+    /// parity (the one this call flips OUT of). The next round's first
+    /// wait on this page will read `P::Next::VALUE`.
+    pub fn complete_round<P: Phase>(&mut self, page: PageHandle<P>) -> PageHandle<P::Next> {
         page.advance()
     }
 
@@ -323,18 +348,32 @@ impl TkProgram {
 mod tests {
     use super::*;
 
-    /// The phase moves through the type system. A `wait` after one
-    /// `arrive` reads `Phase1::VALUE`; after two arrives, back to
-    /// `Phase0::VALUE`.
+    /// TK 2.0 round semantics: every wait within one round reads the
+    /// SAME parity `(R & 1)`. Per round each of the three barriers
+    /// flips exactly once, but a wait reads the parity the barrier had
+    /// at the *start* of the round — i.e., `R & 1`. Phase advances
+    /// only at the round boundary via [`TkProgram::complete_round`].
     #[test]
-    fn phase_advances_through_arrive() {
+    fn round_parities_match_tk20_semantics() {
         let mut p = TkProgram::new();
         let page: PageHandle<Phase0> = PageHandle::fresh(0);
+
+        // ── Round 0: every wait reads 0 ──
         let page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
-        let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page); // P0 → P1
-        let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page); // reads P1
-        let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page); // P1 → P0
-        let _page = p.wait(WarpRole::Storer, PageBarrier::Done, page); // reads P0
+        let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page);
+        let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
+        let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
+        let page = p.wait(WarpRole::Storer, PageBarrier::Done, page);
+        let page = p.arrive(WarpRole::Storer, PageBarrier::Consumed, page);
+        // Round boundary: typed parity now Phase1.
+        let page = p.complete_round(page);
+
+        // ── Round 1: every wait reads 1 ──
+        let page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page);
+        let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
+        let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
+        let _page = p.wait(WarpRole::Storer, PageBarrier::Done, page);
 
         let phases: Vec<u32> = p
             .instrs
@@ -344,7 +383,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(phases, vec![0, 1, 0], "ping-pong from the type system");
+        assert_eq!(
+            phases,
+            vec![0, 0, 0, 1, 1, 1],
+            "round 0 reads 0, round 1 reads 1"
+        );
     }
 
     /// Page ids and roles round-trip through the program.

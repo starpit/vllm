@@ -240,7 +240,9 @@ mod tests {
         let mut p = TkProgram::new();
         let page: PageHandle<Phase0> = PageHandle::fresh(0);
 
-        // Loader: wait page consumed (phase 0), TMA load, arrive page ready.
+        // Round 0: every wait reads phase 0 (TK 2.0 round parity =
+        // R & 1; per-barrier flips happen but the wait sees the
+        // start-of-round parity).
         let page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
         p.load_async(
             0,
@@ -254,12 +256,10 @@ mod tests {
         );
         let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page);
 
-        // Consumer: wait page ready (phase 1 — flipped), Compute, arrive done.
         let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
         p.compute(WarpRole::AllConsumers, "/* rms reduce + scale */");
         let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
 
-        // Storer: wait done (phase 0), TMA store, arrive consumed.
         let page = p.wait(WarpRole::Storer, PageBarrier::Done, page);
         p.store_async(
             0,
@@ -276,9 +276,9 @@ mod tests {
         let src = emit_body(&p);
 
         // The phase parities the codegen emits are a literal copy of
-        // what the type system computed.
+        // what the type system computed: round 0 → all waits read 0.
         assert!(src.contains("page_consumed[0], 0"), "loader wait phase=0\n{src}");
-        assert!(src.contains("page_ready[0], 1"), "consumer wait phase=1\n{src}");
+        assert!(src.contains("page_ready[0], 0"), "consumer wait phase=0\n{src}");
         assert!(src.contains("page_done[0], 0"), "storer wait phase=0\n{src}");
 
         // Roles route correctly: loader/storer are gated on __role,

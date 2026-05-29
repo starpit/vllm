@@ -310,11 +310,25 @@ impl LoopBound {
 #[derive(Clone, Debug, Default)]
 pub struct TkProgram {
     pub instrs: Vec<TkInstr>,
+    /// CUDA text emitted at function scope BEFORE the role-routed body.
+    /// Use this for state that must outlive any single role-arm block:
+    /// type aliases, typed page views, persistent compute accumulators
+    /// (`__m_max`, `__l_sum`, `__o_accum`, …) that are written in one
+    /// compute step and read in a later one. The text is unguarded —
+    /// every warp executes it; consumers reference it from inside their
+    /// own role-arm blocks. Per-step locals (`__s`, …) stay inside the
+    /// fragment that declares them.
+    pub prelude: String,
 }
 
 impl TkProgram {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Append CUDA text to the function-scope prelude. See [`Self::prelude`].
+    pub fn add_prelude(&mut self, text: impl AsRef<str>) {
+        self.prelude.push_str(text.as_ref());
     }
 
     /// Push a typed `Wait` whose `phase` is taken from the [`PageHandle`].

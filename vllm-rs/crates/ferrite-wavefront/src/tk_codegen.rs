@@ -61,9 +61,20 @@ pub mod tk20 {
         format!("kittens::group<{n_warps}>::sync();")
     }
 
-    /// Lane-0-gated TMA load (`kittens::group<1>::tma::load_async`).
-    /// Caller has already resolved `(rows, cols, elem_bytes)` from the
-    /// IR's [`super::TileShape`]; this is just text.
+    /// Total bytes a tile of `(rows, cols)` occupies given `elem_bytes`.
+    fn tile_bytes(rows: u32, cols: u32, elem_bytes: u32) -> u32 {
+        rows * cols * elem_bytes
+    }
+
+    /// Lane-0-gated TMA load. Emits the production "non-tensor TMA"
+    /// pair: `expect_bytes` arms the page-ready barrier for the byte
+    /// count, then `load_async(dst, src, bytes, ready)` fires the load.
+    /// The barrier completes when the load delivers all expected bytes —
+    /// no separate `arrive(Ready)` call is needed (and emitting one
+    /// would over-count the arrivals and break round parity).
+    ///
+    /// Source: `include/ops/group/util/tma.cuh:18` (`expect_bytes`) and
+    /// `:72` (`load_async(void*, void*, uint32_t, semaphore&)`).
     pub fn tma_load_async(
         page_id: u8,
         src_buf: u32,
@@ -72,18 +83,25 @@ pub mod tk20 {
         cols: u32,
         elem_bytes: u32,
     ) -> String {
-        // The real TK 2.0 call binds a typed sv/st descriptor; the
-        // shape numerics flow as named template arguments. We carry
-        // them as comments here so an audit can compare against the
-        // ff-mega-codegen rendering unambiguously.
+        let bytes = tile_bytes(rows, cols, elem_bytes);
         format!(
-            "kittens::group<1>::tma::load_async(\
-             page_buf[{page_id}], \
-             buf{src_buf} /* +{src_byte_off} */, \
-             {{ {rows}, {cols} }} /* elem_bytes={elem_bytes} */);"
+            "kittens::group<1>::tma::expect_bytes(page_ready[{page_id}], {bytes}); \
+             kittens::group<1>::tma::load_async(\
+             reinterpret_cast<void*>(page_buf[{page_id}]), \
+             reinterpret_cast<void*>(reinterpret_cast<const char*>(buf{src_buf}) + {src_byte_off}), \
+             {bytes}, \
+             page_ready[{page_id}]);"
         )
     }
 
+    /// Lane-0-gated TMA store. Emits the production pair:
+    /// `store_async(dst, src, bytes)` queues the store and
+    /// `store_async_wait()` blocks the storer warp until the store
+    /// completes (so the subsequent `arrive(Consumed)` is safe to use
+    /// the page slot for the next round).
+    ///
+    /// Source: `include/ops/group/util/tma.cuh:82` (`store_async`) and
+    /// `:46` (`store_async_wait<N=0>`).
     pub fn tma_store_async(
         page_id: u8,
         dst_buf: u32,
@@ -92,11 +110,13 @@ pub mod tk20 {
         cols: u32,
         elem_bytes: u32,
     ) -> String {
+        let bytes = tile_bytes(rows, cols, elem_bytes);
         format!(
             "kittens::group<1>::tma::store_async(\
-             buf{dst_buf} /* +{dst_byte_off} */, \
-             page_buf[{page_id}], \
-             {{ {rows}, {cols} }} /* elem_bytes={elem_bytes} */);"
+             reinterpret_cast<void*>(reinterpret_cast<char*>(buf{dst_buf}) + {dst_byte_off}), \
+             reinterpret_cast<void*>(page_buf[{page_id}]), \
+             {bytes}); \
+             kittens::group<1>::tma::store_async_wait();"
         )
     }
 }
@@ -389,6 +409,18 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     ));
     out.push_str("\n");
 
+    // Function-scope prelude: typed page views, persistent compute
+    // accumulators that span multiple consumer compute steps. See
+    // `TkProgram::prelude` for the contract.
+    if !prog.prelude.is_empty() {
+        out.push_str("    // ── tk_warp_ir prelude ──\n");
+        out.push_str(&prog.prelude);
+        if !prog.prelude.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
     // The role-routed body.
     out.push_str("    // ── tk_warp_ir body ──\n");
     out.push_str(&emit_body(prog));
@@ -478,9 +510,10 @@ mod tests {
     }
 
     #[test]
-    fn tma_load_carries_src_byte_offset() {
+    fn tma_load_carries_src_byte_offset_and_arms_ready() {
         let mut p = TkProgram::new();
         // src region starts at column 128, elem_bytes=2 → byte_off=256.
+        // tile = 1×64×2 bytes → 128 bytes total.
         p.load_async(
             5,
             BufId(3),
@@ -492,8 +525,25 @@ mod tests {
             },
         );
         let src = emit_body(&p);
-        assert!(src.contains("buf3 /* +256 */"), "byte off baked in\n{src}");
-        assert!(src.contains("page_buf[5]"), "page id baked in\n{src}");
+        // expect_bytes arms page_ready[5] for 128 bytes.
+        assert!(
+            src.contains("kittens::group<1>::tma::expect_bytes(page_ready[5], 128);"),
+            "expect_bytes arms ready barrier\n{src}"
+        );
+        // load_async references the same page_buf[5] dst, the byte-
+        // offset src, and uses page_ready[5] as the semaphore.
+        assert!(
+            src.contains("reinterpret_cast<void*>(page_buf[5])"),
+            "page dst\n{src}"
+        );
+        assert!(
+            src.contains("reinterpret_cast<const char*>(buf3) + 256"),
+            "src byte offset\n{src}"
+        );
+        assert!(
+            src.contains(", 128, page_ready[5]);"),
+            "load takes bytes + page_ready barrier\n{src}"
+        );
     }
 
     #[test]

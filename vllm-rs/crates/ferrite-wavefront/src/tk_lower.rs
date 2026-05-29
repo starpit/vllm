@@ -170,14 +170,19 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
     };
 
     // ── Loader ──
-    // Round 0: wait on `Consumed` at Phase0. (TK 2.0 inits page_consumed
-    // via `arrive_pre` so its first wait *would* read 1 — but the
-    // persistent kernel scaffold pre-arrives page_consumed before any
-    // op runs, leaving the round-start parity at 0. Callers scheduling
-    // a non-pre-arrived slot use `pages.alloc_p1()`.)
+    // Round 0: wait on `Consumed` at Phase0. (Persistent-CTA scaffold
+    // pre-arrives `page_consumed` at init so its first wait reads 1 —
+    // and our typed parity for a fresh page slot starts at Phase0,
+    // so `wait(consumed, 0)` returns immediately because the barrier's
+    // observed phase is 1, != expected 0.)
+    //
+    // No explicit `arrive(Ready)` — `tma::load_async` ITSELF signals
+    // the page_ready barrier when the load completes. Emitting an
+    // arrive in addition to the load would over-count arrivals and
+    // shift the barrier's phase off the round parity, breaking the
+    // consumer's `wait(ready, 0)`.
     let page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, page);
     prog.load_async(page_id, op.x, x_region, tile);
-    let page = prog.arrive(WarpRole::Loader, PageBarrier::Ready, page);
 
     // ── Consumer ──
     // Wait reads the SAME parity as the loader's wait — within one
@@ -201,34 +206,52 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
 }
 
 /// The RMS reduce + scale body, as a string fragment. Const-resolved
-/// from the op's `(hidden, eps, m)` plus the act dtype. This is the
-/// ONE place the lowering pastes a kernel-body fragment; it does not
-/// touch sync, page IDs, or phase.
+/// from the op's `(hidden, eps, m)` plus the act dtype.
+///
+/// This is the slice version: weight multiply is omitted (allocate a
+/// second page for weight in a follow-up). The compute is gated to
+/// consumer warp 0 (`__consumer_idx == 0`); the other 7 consumer warps
+/// fall through to the role-routed `arrive(Done)`, which is what gives
+/// us the 8 arrivals the page_done init expects.
+///
+/// The body declares its own typed page view (`__page_smem`) and
+/// `T_act` alias up front so the body is self-contained — codegen
+/// pastes it inside `if (__role == ROLE_CONSUMER) { ... }` and that's
+/// the only context required. Reduction is a single-warp shfl chain
+/// (`__shfl_xor_sync` butterfly) — TK 2.0 ships warp-level register
+/// reductions but the slice doesn't need them yet, and using bare
+/// CUDA primitives keeps the emit independent of TK 2.0's typed-tile
+/// machinery for now.
 fn rmsnorm_compute_body(op: &RmsNormOp) -> String {
     let RmsNormOp {
-        hidden, eps, m, ..
+        hidden, eps, ..
     } = *op;
-    // Body convention matches today's atom_lib::AddRmsNormAtom but
-    // in the page-resident TK form: page is `__page_smem` (a typed
-    // smem array of T_act elements); `__weight_smem` is a separate
-    // page or scratch slot bound by the caller.
+    let page_id = 0u8; // matches `pages.alloc_p0()` for the slice.
     format!(
         r#"
-            // tk_warp_ir RmsNorm — pre-resolved body
-            const uint __hidden = {hidden};
-            const float __eps   = {eps:?}f;
-            const uint __m      = {m};
-            float __sumsq = 0.0f;
-            for (uint __i = threadIdx.x; __i < __hidden; __i += blockDim.x) {{
-                const float __v = float(__page_smem[__i]);
-                __sumsq += __v * __v;
-            }}
-            __sumsq = tk20::warp_reduce_sumsq(__sumsq);
-            const float __scale = rsqrtf(__sumsq / float(__hidden) + __eps);
-            for (uint __i = threadIdx.x; __i < __hidden; __i += blockDim.x) {{
-                const float __v = float(__page_smem[__i]);
-                const float __w = float(__weight_smem[__i]);
-                __page_smem[__i] = T_act(__v * __scale * __w);
+            // tk_warp_ir RmsNorm — slice body (consumer warp 0 only)
+            using T_act = __nv_bfloat16;
+            auto* __page_smem = reinterpret_cast<T_act*>(page_buf[{page_id}]);
+            if (__consumer_idx == 0) {{
+                const unsigned int __hidden = {hidden}u;
+                const float __eps = {eps:?}f;
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                float __sumsq = 0.0f;
+                for (unsigned int __i = static_cast<unsigned int>(__lane);
+                     __i < __hidden; __i += 32u) {{
+                    const float __v = __bfloat162float(__page_smem[__i]);
+                    __sumsq += __v * __v;
+                }}
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {{
+                    __sumsq += __shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o);
+                }}
+                const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
+                for (unsigned int __i = static_cast<unsigned int>(__lane);
+                     __i < __hidden; __i += 32u) {{
+                    const float __v = __bfloat162float(__page_smem[__i]);
+                    __page_smem[__i] = __float2bfloat16(__v * __scale);
+                }}
             }}
 "#
     )
@@ -286,9 +309,18 @@ pub struct AttnDecodeOp {
 ///   3. Final softmax-normalise + O-store. Consumer divides the
 ///      accumulator by `l_sum`, storer TMA-stores the result.
 pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
-    // ── Q page (one-shot) ──
+    // Allocate all three page slots up front so the function-scope
+    // prelude (typed page views, persistent compute accumulators) can
+    // bind to known ids before any handshake instruction is emitted.
     let q_page = pages.alloc_p0().expect("Q page");
+    let k_page = pages.alloc_p0().expect("K page");
+    let v_page = pages.alloc_p0().expect("V page");
     let q_id = q_page.id();
+    let k_id = k_page.id();
+    let v_id = v_page.id();
+    populate_attn_decode_prelude(prog, &op, q_id, k_id, v_id);
+
+    // ── Q page (one-shot) ──
     let q_region = RegionRef::rows_cols(op.q, 1, 0, op.head_dim);
     let q_tile = TileShape {
         rows: 1,
@@ -298,22 +330,19 @@ pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut
 
     let q_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, q_page);
     prog.load_async(q_id, op.q, q_region, q_tile);
-    let q_page = prog.arrive(WarpRole::Loader, PageBarrier::Ready, q_page);
+    // No `arrive(Ready)` — `tma::load_async` signals page_ready itself.
 
     let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
     prog.compute(WarpRole::AllConsumers, init_softmax_accum_body(&op));
-    let q_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, q_page);
-    // Q stays resident; the storer doesn't drain it. Its round closes
-    // when the consumer signals Done; the loader's next wait on
-    // Consumed never fires (no second Q-load) — perfectly fine, the
-    // page is held for the loop's duration. complete_round + release
-    // happen at the end (after the loop).
+    // No `arrive(Done)` here — the Q+O slot is ONE round: loader fills
+    // (TMA load_async signals page_ready), the consumer holds the page
+    // through the KV loop, writes O into the same page slot at the
+    // finalise step, then signals page_done; the storer waits on done,
+    // drains O, signals page_consumed. Two consumer arrives on
+    // page_done would flip the barrier twice, breaking the round
+    // invariant (storer's wait would hang on the wrong parity).
 
     // ── KV sweep ──
-    let k_page = pages.alloc_p0().expect("K page");
-    let v_page = pages.alloc_p0().expect("V page");
-    let k_id = k_page.id();
-    let v_id = v_page.id();
     let k_tile = TileShape {
         rows: 1,
         cols: op.head_dim,
@@ -340,7 +369,7 @@ pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut
                 RegionRef::rows_cols(op.k_cache, 1, 0, op.head_dim),
                 k_tile,
             );
-            body.arrive_loop(WarpRole::Loader, PageBarrier::Ready, k_id);
+            // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var);
             body.compute(WarpRole::AllConsumers, qkt_softmax_step_body(&op));
@@ -357,7 +386,7 @@ pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut
                 RegionRef::rows_cols(op.v_cache, 1, 0, op.head_dim),
                 v_tile,
             );
-            body.arrive_loop(WarpRole::Loader, PageBarrier::Ready, v_id);
+            // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var);
             body.compute(WarpRole::AllConsumers, sv_accum_step_body(&op));
@@ -392,7 +421,10 @@ pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut
         cols: op.head_dim,
         elem_bytes: op.act_elem,
     };
-    let o_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Consumed, o_page);
+    // No `wait(Consumed)` here — the consumer has been holding this
+    // page slot since the Q-load Ready handshake; the page is already
+    // owned. Going straight to compute + arrive(Done) closes the slot's
+    // single round (loader Ready → consumer Done → storer Consumed).
     prog.compute(WarpRole::AllConsumers, finalise_softmax_norm_body(&op));
     let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
 
@@ -404,61 +436,115 @@ pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut
     pages.release(o_page);
 }
 
-fn init_softmax_accum_body(op: &AttnDecodeOp) -> String {
+/// Function-scope state for the AttnDecode slice. Declared once at
+/// kernel entry; every consumer compute step references these names
+/// from inside its own role-arm block. Variables that are written in
+/// one step and read in a later one (`__m_max`, `__l_sum`, `__o_accum`,
+/// `__p`, `__renorm`) MUST live here, not in a per-step fragment, or
+/// the C++ scope rules will erase them between blocks.
+///
+/// Single-warp slice: only consumer warp 0 reads/writes; other warps
+/// also allocate the state (function scope, every thread) — wasted
+/// registers are a slice acceptable cost. A future widening that uses
+/// all 8 consumer warps will gate the prelude differently.
+fn populate_attn_decode_prelude(
+    prog: &mut TkProgram,
+    op: &AttnDecodeOp,
+    q_id: u8,
+    k_id: u8,
+    v_id: u8,
+) {
     let head_dim = op.head_dim;
     let scale = op.softmax_scale;
-    format!(
-        r#"
-            // tk_warp_ir AttnDecode — init softmax accumulator
-            const uint __head_dim = {head_dim};
-            const float __scale   = {scale:?}f;
-            float __m_max = -INFINITY;
-            float __l_sum = 0.0f;
-            float __o_accum[/*head_dim*/];
-            for (uint __j = threadIdx.x; __j < __head_dim; __j += blockDim.x) {{
-                __o_accum[__j] = 0.0f;
-            }}
+    let prelude = format!(
+        r#"    // ── AttnDecode prelude (slice; consumer warp 0 only reads) ──
+    using T_act = __nv_bfloat16;
+    auto* __q_smem   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    auto* __k_smem   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
+    auto* __v_smem   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
+    auto* __out_smem = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    const unsigned int __head_dim = {head_dim}u;
+    const float __scale = {scale:?}f;
+    float __m_max  = -INFINITY;
+    float __l_sum  = 0.0f;
+    float __renorm = 0.0f;
+    float __p      = 0.0f;
+    float __o_accum[{head_dim}];
 "#
-    )
+    );
+    prog.add_prelude(prelude);
+}
+
+fn init_softmax_accum_body(_op: &AttnDecodeOp) -> String {
+    r#"
+            // tk_warp_ir AttnDecode — init softmax accumulator (consumer warp 0)
+            if (__consumer_idx == 0) {
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                __m_max = -INFINITY;
+                __l_sum = 0.0f;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __head_dim; __j += 32u) {
+                    __o_accum[__j] = 0.0f;
+                }
+            }
+"#
+    .into()
 }
 
 fn qkt_softmax_step_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — Q @ K^T + online softmax step
-            float __s = 0.0f;
-            for (uint __j = threadIdx.x; __j < __head_dim; __j += blockDim.x) {{
-                __s += float(__q_smem[__j]) * float(__k_smem[__j]);
-            }}
-            __s = tk20::warp_reduce_sum(__s) * __scale;
-            const float __m_new   = fmaxf(__m_max, __s);
-            const float __renorm  = expf(__m_max - __m_new);
-            const float __p       = expf(__s - __m_new);
-            __l_sum   = __renorm * __l_sum + __p;
-            for (uint __j = threadIdx.x; __j < __head_dim; __j += blockDim.x) {{
-                __o_accum[__j] *= __renorm;
-            }}
-            __m_max = __m_new;
+            // tk_warp_ir AttnDecode — Q @ K^T + online softmax step (consumer warp 0)
+            if (__consumer_idx == 0) {
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                float __s = 0.0f;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __head_dim; __j += 32u) {
+                    __s += __bfloat162float(__q_smem[__j]) * __bfloat162float(__k_smem[__j]);
+                }
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {
+                    __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
+                }
+                __s *= __scale;
+                const float __m_new = fmaxf(__m_max, __s);
+                __renorm = expf(__m_max - __m_new);
+                __p      = expf(__s    - __m_new);
+                __l_sum  = __renorm * __l_sum + __p;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __head_dim; __j += 32u) {
+                    __o_accum[__j] *= __renorm;
+                }
+                __m_max = __m_new;
+            }
 "#
     .into()
 }
 
 fn sv_accum_step_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — softmax(P) @ V accumulate
-            for (uint __j = threadIdx.x; __j < __head_dim; __j += blockDim.x) {{
-                __o_accum[__j] += __p * float(__v_smem[__j]);
-            }}
+            // tk_warp_ir AttnDecode — softmax(P) @ V accumulate (consumer warp 0)
+            if (__consumer_idx == 0) {
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __head_dim; __j += 32u) {
+                    __o_accum[__j] += __p * __bfloat162float(__v_smem[__j]);
+                }
+            }
 "#
     .into()
 }
 
 fn finalise_softmax_norm_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — finalise: O = O_accum / l_sum
-            const float __inv_l = 1.0f / __l_sum;
-            for (uint __j = threadIdx.x; __j < __head_dim; __j += blockDim.x) {{
-                __out_smem[__j] = T_act(__o_accum[__j] * __inv_l);
-            }}
+            // tk_warp_ir AttnDecode — finalise: O = O_accum / l_sum (consumer warp 0)
+            if (__consumer_idx == 0) {
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                const float __inv_l = 1.0f / __l_sum;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __head_dim; __j += 32u) {
+                    __out_smem[__j] = __float2bfloat16(__o_accum[__j] * __inv_l);
+                }
+            }
 "#
     .into()
 }
@@ -484,18 +570,20 @@ mod tests {
         }
     }
 
-    /// The lowered IR has the exact nine-instruction
+    /// The lowered IR has the exact eight-instruction
     /// loader/consumer/storer handshake from the design doc — no
-    /// blank-filling at emit time.
+    /// blank-filling at emit time. (No explicit `arrive(Loader,Ready)`:
+    /// `tma::load_async` signals page_ready itself.)
     #[test]
-    fn rmsnorm_lowers_to_nine_instr_handshake() {
+    fn rmsnorm_lowers_to_eight_instr_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
         lower_rmsnorm(op(), &mut pages, &mut prog);
 
-        // 9 instructions: wait+load+arrive (loader), wait+compute+arrive (consumer),
-        // wait+store+arrive (storer). `complete_round` emits no IR.
-        assert_eq!(prog.instrs.len(), 9, "{prog:?}");
+        // 8 instructions: wait+load (loader), wait+compute+arrive (consumer),
+        // wait+store+arrive (storer). `complete_round` emits no IR; the
+        // load itself signals Ready (no extra arrive).
+        assert_eq!(prog.instrs.len(), 8, "{prog:?}");
 
         // Phase parities the lowering picked: every wait within one
         // round reads `R & 1` (round 0 → all 0).
@@ -614,14 +702,14 @@ mod tests {
             .collect();
         assert_eq!(loops.len(), 1, "exactly one KV sweep loop");
 
-        // K-handshake: wait+load+arrive (loader), wait+compute+arrive (consumer),
-        //              wait+arrive (storer) → 8 instrs.
-        // V-handshake: same → 8 instrs.
-        // Total per iteration: 16.
+        // K-handshake: wait+load (loader), wait+compute+arrive (consumer),
+        //              wait+arrive (storer) → 7 instrs.
+        // V-handshake: same → 7 instrs.
+        // Total per iteration: 14. (No `arrive(Ready)` — load signals it.)
         assert_eq!(
             loops[0].len(),
-            16,
-            "loop body has K + V handshakes, 16 instrs"
+            14,
+            "loop body has K + V handshakes, 14 instrs"
         );
     }
 

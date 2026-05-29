@@ -81,6 +81,8 @@ fn main() {
             v_cache: BufId(2),
             out: BufId(3),
             head_dim: 128,
+            num_q_heads: 8,
+            num_kv_heads: 8,
             act_elem: 2,
             softmax_scale: 0.088_388_35,
             num_kv_pages_arg: "__num_kv_pages",

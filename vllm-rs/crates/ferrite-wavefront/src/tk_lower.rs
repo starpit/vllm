@@ -31,7 +31,7 @@
 use crate::subtile_ir::{BufId, RegionRef};
 use crate::tk_warp_ir::{
     LoopBound, PageBarrier, PageHandle, Phase, Phase0, Phase1, TileShape, TkProgram, WarpRole,
-    NUM_PAGES, PAGE_SIZE,
+    NUM_CONSUMER_WARPS, NUM_PAGES, PAGE_SIZE,
 };
 
 // ── Allocators ──────────────────────────────────────────────────────
@@ -293,17 +293,30 @@ fn rmsnorm_compute_body(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
 /// parity at emit time.
 #[derive(Clone, Copy, Debug)]
 pub struct AttnDecodeOp {
-    /// `[1, hidden]` query (post-RoPE). Loaded once outside the loop.
+    /// `[1, num_q_heads * head_dim]` query (post-RoPE). Loaded once
+    /// outside the loop.
     pub q: BufId,
     /// Paged KV cache: `[num_blocks, page_size, num_kv_heads, head_dim]`.
     /// The page-block table is a separate runtime arg the kernel
     /// scaffold reads; the codegen here only needs the buffer id.
     pub k_cache: BufId,
     pub v_cache: BufId,
-    /// `[1, hidden]` output (one head_dim slice per attention head;
-    /// for the slice we model a single head).
+    /// `[1, num_q_heads * head_dim]` output. One head_dim slice per
+    /// q-head, concatenated.
     pub out: BufId,
+    /// Per-head dimensionality. Llama-3.2-1B = 64.
     pub head_dim: u32,
+    /// Number of query heads. Llama-3.2-1B = 32. GQA: q-heads are
+    /// grouped onto kv-heads at ratio `num_q_heads / num_kv_heads`.
+    /// MUST be divisible by `NUM_CONSUMER_WARPS` (today: 8) — the
+    /// lowering distributes q-heads across consumer warps evenly.
+    pub num_q_heads: u32,
+    /// Number of KV heads. Llama-3.2-1B = 8. MUST equal
+    /// `NUM_CONSUMER_WARPS` so each consumer warp owns exactly one
+    /// kv-head; relaxing this (to support models with `N_kv != 8`)
+    /// is a follow-up that distributes kv-heads round-robin across
+    /// warps and adds an inner-loop over the warp's kv-head set.
+    pub num_kv_heads: u32,
     pub act_elem: u32,
     /// `softmax_scale = 1 / sqrt(head_dim)`. Baked literal.
     pub softmax_scale: f32,
@@ -333,6 +346,27 @@ pub fn lower_attn_decode<P: Phase>(
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
 ) {
+    // GQA shape preconditions — the multi-head lowering distributes
+    // q-heads across the 8 consumer warps (one kv-head per warp).
+    // `num_q_heads` must be a multiple of NUM_CONSUMER_WARPS, and
+    // `num_kv_heads` must equal NUM_CONSUMER_WARPS so every warp
+    // owns exactly one kv-head. Llama-3.2-1B (32 q, 8 kv) satisfies
+    // both. Llama-3.2-3B (24 q, 8 kv) and other ratios will need a
+    // looser distribution; surface the constraint explicitly here
+    // rather than silently producing wrong output.
+    debug_assert!(
+        op.num_q_heads % (NUM_CONSUMER_WARPS as u32) == 0,
+        "lower_attn_decode: num_q_heads ({}) must be divisible by NUM_CONSUMER_WARPS ({})",
+        op.num_q_heads,
+        NUM_CONSUMER_WARPS,
+    );
+    debug_assert!(
+        op.num_kv_heads == NUM_CONSUMER_WARPS as u32,
+        "lower_attn_decode: num_kv_heads ({}) must equal NUM_CONSUMER_WARPS ({}) for the per-warp kv-head sharding",
+        op.num_kv_heads,
+        NUM_CONSUMER_WARPS,
+    );
+
     // Allocate all three page slots up front so the function-scope
     // prelude (typed page views, persistent compute accumulators) can
     // bind to known ids before any handshake instruction is emitted.
@@ -344,11 +378,18 @@ pub fn lower_attn_decode<P: Phase>(
     let v_id = v_page.id();
     populate_attn_decode_prelude(prog, &op, q_id, k_id, v_id);
 
+    // Tile shapes:
+    //   Q  : `[1, num_q_heads * head_dim]`  — full row, all heads.
+    //   K,V: `[1, num_kv_heads * head_dim]` — one row per KV iter, all kv-heads.
+    //   O  : same as Q.
+    let q_cols = op.num_q_heads * op.head_dim;
+    let kv_cols = op.num_kv_heads * op.head_dim;
+
     // ── Q page (one-shot) ──
-    let q_region = RegionRef::rows_cols(op.q, 1, 0, op.head_dim);
+    let q_region = RegionRef::rows_cols(op.q, 1, 0, q_cols);
     let q_tile = TileShape {
         rows: 1,
-        cols: op.head_dim,
+        cols: q_cols,
         elem_bytes: op.act_elem,
     };
 
@@ -367,9 +408,15 @@ pub fn lower_attn_decode<P: Phase>(
     // invariant (storer's wait would hang on the wrong parity).
 
     // ── KV sweep ──
+    // K and V tiles carry ALL kv-heads of the current iteration's
+    // token (not a single head): each consumer warp reads its own
+    // kv-head's slice from the tile via `__kv_head * __head_dim`
+    // offsetting in the compute body. The per-page byte budget at
+    // Llama-3.2-1B is 8 * 64 * 2 = 1024 B per K (and V) tile —
+    // far below PAGE_SIZE.
     let k_tile = TileShape {
         rows: 1,
-        cols: op.head_dim,
+        cols: kv_cols,
         elem_bytes: op.act_elem,
     };
     let v_tile = k_tile;
@@ -396,7 +443,7 @@ pub fn lower_attn_decode<P: Phase>(
             body.load_async(
                 k_id,
                 op.k_cache,
-                RegionRef::rows_cols(op.k_cache, 1, 0, op.head_dim),
+                RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
                 k_tile,
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
@@ -413,7 +460,7 @@ pub fn lower_attn_decode<P: Phase>(
             body.load_async(
                 v_id,
                 op.v_cache,
-                RegionRef::rows_cols(op.v_cache, 1, 0, op.head_dim),
+                RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
                 v_tile,
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
@@ -444,11 +491,12 @@ pub fn lower_attn_decode<P: Phase>(
     pages.release(v_page);
 
     // ── Final O-store ──
+    // Output is `[1, num_q_heads * head_dim]` (matches Q tile width).
     let o_page = q_page; // reuse Q's page slot for O after the loop.
-    let o_region = RegionRef::rows_cols(op.out, 1, 0, op.head_dim);
+    let o_region = RegionRef::rows_cols(op.out, 1, 0, q_cols);
     let o_tile = TileShape {
         rows: 1,
-        cols: op.head_dim,
+        cols: q_cols,
         elem_bytes: op.act_elem,
     };
     // No `wait(Consumed)` here — the consumer has been holding this
@@ -466,17 +514,26 @@ pub fn lower_attn_decode<P: Phase>(
     pages.release(o_page);
 }
 
-/// Function-scope state for the AttnDecode slice. Declared once at
-/// kernel entry; every consumer compute step references these names
-/// from inside its own role-arm block. Variables that are written in
-/// one step and read in a later one (`__m_max`, `__l_sum`, `__o_accum`,
-/// `__p`, `__renorm`) MUST live here, not in a per-step fragment, or
-/// the C++ scope rules will erase them between blocks.
+/// Function-scope state for the multi-head GQA AttnDecode lowering.
+/// Declared once at kernel entry; every consumer compute step
+/// references these names from inside its own role-arm block.
 ///
-/// Single-warp slice: only consumer warp 0 reads/writes; other warps
-/// also allocate the state (function scope, every thread) — wasted
-/// registers are a slice acceptable cost. A future widening that uses
-/// all 8 consumer warps will gate the prelude differently.
+/// **Per-warp head sharding.** With `num_q_heads = N_q` and 8 consumer
+/// warps, each warp owns `N_q / 8` q-heads. Per-warp accumulator
+/// arrays (`__m_max`, `__l_sum`, `__o_accum`, …) are sized to that
+/// per-warp count — every consumer warp keeps its own softmax state
+/// and writes its own slice of the output buffer.
+///
+/// **GQA grouping.** Each consumer warp `c ∈ [0, num_kv_heads)` is
+/// responsible for kv-head `c`. The `q_per_kv = num_q_heads /
+/// num_kv_heads` q-heads it sees all read from kv-head `c`. For
+/// Llama-3.2-1B (`N_q=32, N_kv=8, q_per_kv=4`): warp 0 handles q-heads
+/// 0..3 against kv-head 0; warp 1 handles q-heads 4..7 against
+/// kv-head 1; … warp 7 handles q-heads 28..31 against kv-head 7.
+///
+/// **Constraint:** `num_q_heads % 8 == 0` and `num_kv_heads == 8` —
+/// pre-checked at the orchestrator entry; the lowering panics in
+/// `lower_attn_decode` if violated.
 fn populate_attn_decode_prelude(
     prog: &mut TkProgram,
     op: &AttnDecodeOp,
@@ -485,21 +542,33 @@ fn populate_attn_decode_prelude(
     v_id: u8,
 ) {
     let head_dim = op.head_dim;
+    let num_q_heads = op.num_q_heads;
+    let num_kv_heads = op.num_kv_heads;
+    // 8 consumer warps; each owns N_q / 8 q-heads.
+    let q_heads_per_warp = num_q_heads / (NUM_CONSUMER_WARPS as u32);
+    let q_per_kv = num_q_heads / num_kv_heads;
     let scale = op.softmax_scale;
     let prelude = format!(
-        r#"    // ── AttnDecode prelude (slice; consumer warp 0 only reads) ──
+        r#"    // ── AttnDecode prelude (multi-head GQA; one kv-head per consumer warp) ──
     using T_act = __nv_bfloat16;
     auto* __q_smem   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
     auto* __k_smem   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
     auto* __v_smem   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
     auto* __out_smem = reinterpret_cast<T_act*>(page_buf[{q_id}]);
     const unsigned int __head_dim = {head_dim}u;
+    const unsigned int __num_q_heads = {num_q_heads}u;
+    const unsigned int __num_kv_heads = {num_kv_heads}u;
+    const unsigned int __q_heads_per_warp = {q_heads_per_warp}u;
+    const unsigned int __q_per_kv = {q_per_kv}u;
     const float __scale = {scale:?}f;
-    float __m_max  = -INFINITY;
-    float __l_sum  = 0.0f;
-    float __renorm = 0.0f;
-    float __p      = 0.0f;
-    float __o_accum[{head_dim}];
+    // Per-warp per-q-head softmax state. With Llama-3.2-1B
+    // (N_q=32, 8 warps, qpw=4): each consumer warp keeps 4
+    // independent softmax + accumulator states.
+    float __m_max[{q_heads_per_warp}];
+    float __l_sum[{q_heads_per_warp}];
+    float __renorm[{q_heads_per_warp}];
+    float __p[{q_heads_per_warp}];
+    float __o_accum[{q_heads_per_warp}][{head_dim}];
 "#
     );
     prog.add_prelude(prelude);
@@ -507,14 +576,16 @@ fn populate_attn_decode_prelude(
 
 fn init_softmax_accum_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — init softmax accumulator (consumer warp 0)
-            if (__consumer_idx == 0) {
+            // tk_warp_ir AttnDecode — init per-warp softmax state (every consumer warp)
+            {
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                __m_max = -INFINITY;
-                __l_sum = 0.0f;
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __head_dim; __j += 32u) {
-                    __o_accum[__j] = 0.0f;
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
+                    __m_max[__h] = -INFINITY;
+                    __l_sum[__h] = 0.0f;
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim; __j += 32u) {
+                        __o_accum[__h][__j] = 0.0f;
+                    }
                 }
             }
 "#
@@ -523,28 +594,38 @@ fn init_softmax_accum_body(_op: &AttnDecodeOp) -> String {
 
 fn qkt_softmax_step_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — Q @ K^T + online softmax step (consumer warp 0)
-            if (__consumer_idx == 0) {
+            // tk_warp_ir AttnDecode — Q@K^T + online softmax (per-warp, all consumer warps)
+            {
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                float __s = 0.0f;
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __head_dim; __j += 32u) {
-                    __s += __bfloat162float(__q_smem[__j]) * __bfloat162float(__k_smem[__j]);
+                // Warp `c` owns kv-head `c` and q-heads
+                // [c * qpw, (c+1) * qpw).
+                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
+                const unsigned int __q_head_base =
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp;
+                const unsigned int __k_off = __kv_head * __head_dim;
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
+                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim;
+                    float __s = 0.0f;
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim; __j += 32u) {
+                        __s += __bfloat162float(__q_smem[__q_off + __j])
+                             * __bfloat162float(__k_smem[__k_off + __j]);
+                    }
+                    #pragma unroll
+                    for (int __o = 16; __o > 0; __o >>= 1) {
+                        __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
+                    }
+                    __s *= __scale;
+                    const float __m_new = fmaxf(__m_max[__h], __s);
+                    __renorm[__h] = expf(__m_max[__h] - __m_new);
+                    __p[__h]      = expf(__s          - __m_new);
+                    __l_sum[__h]  = __renorm[__h] * __l_sum[__h] + __p[__h];
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim; __j += 32u) {
+                        __o_accum[__h][__j] *= __renorm[__h];
+                    }
+                    __m_max[__h] = __m_new;
                 }
-                #pragma unroll
-                for (int __o = 16; __o > 0; __o >>= 1) {
-                    __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
-                }
-                __s *= __scale;
-                const float __m_new = fmaxf(__m_max, __s);
-                __renorm = expf(__m_max - __m_new);
-                __p      = expf(__s    - __m_new);
-                __l_sum  = __renorm * __l_sum + __p;
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __head_dim; __j += 32u) {
-                    __o_accum[__j] *= __renorm;
-                }
-                __m_max = __m_new;
             }
 "#
     .into()
@@ -552,12 +633,17 @@ fn qkt_softmax_step_body(_op: &AttnDecodeOp) -> String {
 
 fn sv_accum_step_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — softmax(P) @ V accumulate (consumer warp 0)
-            if (__consumer_idx == 0) {
+            // tk_warp_ir AttnDecode — softmax(P) @ V (per-warp, all consumer warps)
+            {
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __head_dim; __j += 32u) {
-                    __o_accum[__j] += __p * __bfloat162float(__v_smem[__j]);
+                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
+                const unsigned int __v_off = __kv_head * __head_dim;
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim; __j += 32u) {
+                        __o_accum[__h][__j] += __p[__h]
+                            * __bfloat162float(__v_smem[__v_off + __j]);
+                    }
                 }
             }
 "#
@@ -566,13 +652,19 @@ fn sv_accum_step_body(_op: &AttnDecodeOp) -> String {
 
 fn finalise_softmax_norm_body(_op: &AttnDecodeOp) -> String {
     r#"
-            // tk_warp_ir AttnDecode — finalise: O = O_accum / l_sum (consumer warp 0)
-            if (__consumer_idx == 0) {
+            // tk_warp_ir AttnDecode — finalise: O = O_accum / l_sum (per-warp, all consumer warps)
+            {
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                const float __inv_l = 1.0f / __l_sum;
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __head_dim; __j += 32u) {
-                    __out_smem[__j] = __float2bfloat16(__o_accum[__j] * __inv_l);
+                const unsigned int __q_head_base =
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp;
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
+                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim;
+                    const float __inv_l = 1.0f / __l_sum[__h];
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim; __j += 32u) {
+                        __out_smem[__out_off + __j] =
+                            __float2bfloat16(__o_accum[__h][__j] * __inv_l);
+                    }
                 }
             }
 "#
@@ -1240,6 +1332,13 @@ mod tests {
             v_cache: BufId(12),
             out: BufId(13),
             head_dim: 128,
+            // Test shape: 8 q-heads × 8 kv-heads (q_per_kv=1) — must
+            // match `NUM_CONSUMER_WARPS` for the per-warp kv-head
+            // sharding the lowering does. Real Llama-3.2-1B is
+            // 32 q × 8 kv (q_per_kv=4), exercised end-to-end via
+            // `fixtures::one_layer_input`.
+            num_q_heads: 8,
+            num_kv_heads: 8,
             act_elem: 2,
             softmax_scale: 0.088388_35,
             num_kv_pages_arg: "__num_kv_pages",

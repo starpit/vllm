@@ -64,9 +64,11 @@ pub fn one_layer_input() -> LoweringInput {
                 inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
             },
             OpDesc {
+                // Llama-3.2-1B GQA: 32 q-heads, 8 kv-heads, head_dim=64
+                // (q_dim = h = 2048, kv_dim = kv = 512, hd = 64).
                 op: LoweredOp::AttnDecode {
-                    num_q_heads: 1,
-                    num_kv_heads: 1,
+                    num_q_heads: h / hd,    // 32
+                    num_kv_heads: kv / hd,  // 8
                     head_dim: hd,
                     scale: 0.125,
                 },

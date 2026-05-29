@@ -239,17 +239,15 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
 
             LoweredOp::AttnDecode {
                 num_q_heads,
-                num_kv_heads: _,
+                num_kv_heads,
                 head_dim,
                 scale,
             } => {
-                // Slice contract: lower_attn_decode handles a single
-                // attention head with one paged K/V buffer pair. The
-                // multi-head GQA orchestration (one K/V cache pair, sweep
-                // over q-heads with shared K/V) is the next slice
-                // extension; for now we lower one head per op call,
-                // wiring inputs[1] = K cache, inputs[2] = V cache.
-                // num_q_heads is folded into the output's column count.
+                // Multi-head GQA: q has `num_q_heads` heads of `head_dim`
+                // each (`[1, num_q_heads * head_dim]`); kv has
+                // `num_kv_heads` heads (`num_q_heads / num_kv_heads`
+                // q-heads share each kv-head). Output is per-head
+                // attention concatenated.
                 let q = buf_for(desc.inputs[0], &op_out_buf);
                 let k_cache = buf_for(desc.inputs[1], &op_out_buf);
                 let v_cache = buf_for(desc.inputs[2], &op_out_buf);
@@ -262,6 +260,8 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         v_cache,
                         out: out_buf,
                         head_dim,
+                        num_q_heads,
+                        num_kv_heads,
                         act_elem: ACT_ELEM,
                         softmax_scale: scale,
                         num_kv_pages_arg: "__num_kv_pages",

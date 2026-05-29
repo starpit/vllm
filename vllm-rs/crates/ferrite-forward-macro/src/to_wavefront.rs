@@ -845,8 +845,40 @@ pub fn build_source_descs(
                             }
                         }
                         None => {
-                            unresolved.insert(base.clone());
-                            placeholder
+                            // Fused-fallback: cuda's solver picks fused
+                            // impls (FusedQkvRopeCacheImpl,
+                            // FusedGateUpSiluMulImpl) whose accessor base
+                            // is the `__fused__`-joined sorted list of
+                            // constituent unfused bases. The unfused FUF
+                            // (q/k/v_proj, gate/up_proj) refs miss in
+                            // base_to_loc; look for any fused key that
+                            // contains `base` as a `__fused__`-token and
+                            // resolve to the fused locator. Per-position
+                            // byte-offset slicing happens at dispatch
+                            // time (the runtime dispatcher knows each
+                            // constituent's row count from
+                            // CanonicalParams::Q_SIZE / KV_SIZE /
+                            // INTERMEDIATE_SIZE).
+                            let fused_key = base_to_loc.keys().find(|k| {
+                                k.contains("__fused__")
+                                    && k.split("__fused__").any(|tok| tok == base)
+                            });
+                            match fused_key {
+                                Some(k) => {
+                                    let li = &base_to_loc[k];
+                                    report.weights_resolved += 1;
+                                    WeightLoc {
+                                        layer,
+                                        bucket: li.bucket,
+                                        op_idx: li.op_idx,
+                                        slot: li.slot,
+                                    }
+                                }
+                                None => {
+                                    unresolved.insert(base.clone());
+                                    placeholder
+                                }
+                            }
                         }
                     };
                     if gemm_weight.contains(&i) {

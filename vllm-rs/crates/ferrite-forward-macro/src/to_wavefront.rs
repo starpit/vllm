@@ -433,7 +433,58 @@ pub fn lower_decode_to_wavefront(
     // The result is the last value-producing op (the lm_head GEMM).
     let mut result: Option<usize> = None;
 
-    for node in &fuf.nodes {
+    // Topological walk over `fuf.nodes`. The bridge's resolver looks
+    // up each input's producer in `bx.produced`, so a tile must be
+    // visited only AFTER every tile-input it references. Metal's
+    // post-fusion FUF happens to be stored in ascending-id topo order
+    // (which is why the original `for node in &fuf.nodes` loop
+    // sufficed), but cuda's fusion pass reorders ids — so we must
+    // sort. Standard Kahn: unmet-input count per tile, queue of
+    // ready tiles, process in order, decrement successors. Result is
+    // a permutation of `fuf.nodes` that respects every tile→tile
+    // edge regardless of how fusion happened to assign ids.
+    let topo: Vec<TileId> = {
+        let n = fuf.nodes.len();
+        let mut indeg: Vec<u32> = vec![0; n];
+        let mut succs: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for node in &fuf.nodes {
+            let me = node.id.0 as usize;
+            for inp in &node.inputs {
+                if let FufInput::Tile { id, .. } = inp {
+                    let dep = id.0 as usize;
+                    indeg[me] += 1;
+                    succs[dep].push(node.id.0);
+                }
+            }
+        }
+        let mut queue: std::collections::VecDeque<u32> = (0..n as u32)
+            .filter(|&i| indeg[i as usize] == 0)
+            .collect();
+        let mut out: Vec<TileId> = Vec::with_capacity(n);
+        while let Some(t) = queue.pop_front() {
+            out.push(TileId(t));
+            for &s in &succs[t as usize] {
+                indeg[s as usize] -= 1;
+                if indeg[s as usize] == 0 {
+                    queue.push_back(s);
+                }
+            }
+        }
+        if out.len() != n {
+            // Cycle in the FUF — that's structurally impossible
+            // (the FUF is a DAG built from straight-line DSL +
+            // unrolled `for`), so surface it loudly.
+            return Err(BridgeError::MalformedOp {
+                tile: TileId(0),
+                op: fuf.nodes[0].op,
+                detail: "FUF has a cycle; cannot topologically order",
+            });
+        }
+        out
+    };
+
+    for tile_id in topo {
+        let node = fuf.get(tile_id);
         let tile = node.id;
         // Every tile must be claimed by the solve — otherwise codegen
         // would have errored. A coverage gap here is a real bug, so
@@ -454,6 +505,23 @@ pub fn lower_decode_to_wavefront(
                 let cols = bx.out_cols(tile, 0, "embed output")?;
                 let e = bx.push_source(m, cols, SourceBinding::EmbeddedHidden);
                 bx.produced.insert((tile.0, 0), Producer::Ext(e));
+            }
+            // MmEmbedSplice is the multimodal placeholder splice the
+            // tp-lowering pass inserts after every Embed to overwrite
+            // placeholder positions with vision-encoder rows. For
+            // text-only forwards (no `ctx.embed_patches`) it's a
+            // runtime no-op — the megakernel sees its input slot
+            // verbatim. Pass the upstream (Embed's output) through to
+            // the splice's output slot so downstream tiles read the
+            // same `EmbeddedHidden` source. No `LoweredOp` is emitted
+            // — this op is structurally absent from the megakernel.
+            OpKind::MmEmbedSplice => {
+                let upstream = bx.input_at(tile, 0)?;
+                let producer = match upstream {
+                    InputRef::Op(j) => Producer::Op(j),
+                    InputRef::Ext(e) => Producer::Ext(e),
+                };
+                bx.produced.insert((tile.0, 0), producer);
             }
             OpKind::RmsNorm => {
                 let x = bx.input_at(tile, 0)?;

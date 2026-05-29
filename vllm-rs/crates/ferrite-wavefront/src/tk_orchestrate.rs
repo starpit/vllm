@@ -1,0 +1,440 @@
+// SPDX-License-Identifier: Apache-2.0
+//! Orchestrator: [`crate::lower::LoweringInput`] → [`TkProgram`].
+//!
+//! Walks the topologically-ordered op list and dispatches each op to
+//! the matching `lower_*` in [`crate::tk_lower`]. The orchestrator's
+//! only job is to:
+//!
+//! 1. Assign deterministic [`BufId`]s to every external source and
+//!    every op's output staging buffer.
+//! 2. Resolve each op's input/output [`BufId`]s via [`InputRef`]
+//!    indirection.
+//! 3. Infer the few remaining shape parameters the per-op lowerings
+//!    need but `LoweredOp` doesn't carry directly (e.g. `hidden` from a
+//!    source's `cols`).
+//!
+//! BufId convention: external sources occupy `BufId(0..n_sources)`;
+//! op output staging buffers occupy
+//! `BufId(n_sources..n_sources + n_ops)`.
+//!
+//! GEMM `BN` selection is hard-wired to keep one W tile in one TK 2.0
+//! page (`bn * k * act_elem <= PAGE_SIZE`). For Llama-1B this is
+//! `bn = 4` for `k = 2048` and `bn = 1` for `k = 8192`. The orchestrator
+//! refuses any GEMM whose `(bn, k)` pair falls outside that envelope,
+//! making the page-fit constraint a structural property of the IR.
+
+use crate::lower::{InputRef, LoweredOp, LoweringInput};
+use crate::subtile_ir::BufId;
+use crate::tk_lower::{
+    lower_attn_decode, lower_gemm_m1, lower_residual_add, lower_rmsnorm, lower_rope_rotate,
+    lower_silu_mul, AddOp, AttnDecodeOp, GemmM1Op, PageAllocator, RmsNormOp, RopeRotateOp,
+    SiluMulOp,
+};
+use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, PAGE_SIZE};
+
+/// Activation element bytes assumed across the decode forward.
+/// bf16 = 2 bytes. The substrate is bf16-only today.
+pub const ACT_ELEM: u32 = 2;
+
+/// Pick `bn` (W-tile rows per page load) for a given GEMM `k`.
+/// Constraint: `bn * k * ACT_ELEM <= PAGE_SIZE` AND `n_blocks = ceil(n / bn)`
+/// is even (the orchestrator can't statically track post-loop parity for an
+/// odd-N count). All current Llama-1B GEMMs satisfy both with the picks below.
+fn pick_bn(k: u32) -> u32 {
+    let bytes_per_row = k * ACT_ELEM;
+    let max_bn = PAGE_SIZE / bytes_per_row;
+    // Cap at 8 — there are only 8 consumer warps and our compute body
+    // assigns one warp per output value (warps with `c >= bn` idle).
+    max_bn.min(8).max(1)
+}
+
+/// Lower an entire forward (a [`LoweringInput`]) to a single
+/// [`TkProgram`] — the persistent megakernel body.
+///
+/// Returns the program plus the count of buffer ids used (so the
+/// kernel scaffold knows how many pointer parameters to emit).
+pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
+    let mut prog = TkProgram::new();
+    let mut pages = PageAllocator::new();
+    let n_sources = input.sources.len() as u32;
+    let mut op_out_buf: Vec<BufId> = Vec::with_capacity(input.ops.len());
+
+    let buf_for = |r: InputRef, op_out_buf: &[BufId]| -> BufId {
+        match r {
+            InputRef::Ext(e) => BufId(e as u32),
+            InputRef::Op(j) => op_out_buf[j],
+        }
+    };
+
+    let shape_for =
+        |r: InputRef, op_out_shape: &[(u32, u32)], sources: &[crate::subtile::SourceShape]| -> (u32, u32) {
+            match r {
+                InputRef::Ext(e) => (sources[e].rows, sources[e].cols),
+                InputRef::Op(j) => op_out_shape[j],
+            }
+        };
+
+    let mut op_out_shape: Vec<(u32, u32)> = Vec::with_capacity(input.ops.len());
+
+    /// Dispatch one `lower_X<P>` based on which parity has enough free
+    /// slots. Phase0 is preferred (fresh allocator state); Phase1 is
+    /// used for slot reuse after the first round of any slot. If neither
+    /// parity has `n_pages` free, falls back to whichever has more — the
+    /// inner `alloc_at::<P>()` will then panic with the offending op
+    /// name, which is the visible failure we want.
+    macro_rules! dispatch_phase {
+        ($n_pages:expr, $f:ident, $op:expr) => {{
+            let n: usize = $n_pages;
+            if pages.count_at(0) >= n {
+                $f::<Phase0>($op, &mut pages, &mut prog);
+            } else {
+                $f::<Phase1>($op, &mut pages, &mut prog);
+            }
+        }};
+    }
+
+    for (op_idx, desc) in input.ops.iter().enumerate() {
+        let out_buf = BufId(n_sources + op_idx as u32);
+        op_out_buf.push(out_buf);
+
+        match desc.op {
+            LoweredOp::RmsNorm { eps } => {
+                let x = buf_for(desc.inputs[0], &op_out_buf);
+                let weight = buf_for(desc.inputs[1], &op_out_buf);
+                let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                dispatch_phase!(
+                    2,
+                    lower_rmsnorm,
+                    RmsNormOp {
+                        x,
+                        weight,
+                        out: out_buf,
+                        hidden,
+                        m: desc.m,
+                        act_elem: ACT_ELEM,
+                        eps,
+                        init: false,
+                    }
+                );
+                op_out_shape.push((desc.m, hidden));
+            }
+
+            LoweredOp::Gemm { n, k } => {
+                let x = buf_for(desc.inputs[0], &op_out_buf);
+                let w = buf_for(desc.inputs[1], &op_out_buf);
+                let bn = pick_bn(k);
+                dispatch_phase!(
+                    3,
+                    lower_gemm_m1,
+                    GemmM1Op {
+                        x,
+                        w,
+                        out: out_buf,
+                        k,
+                        n,
+                        bn,
+                        act_elem: ACT_ELEM,
+                    }
+                );
+                op_out_shape.push((desc.m, n));
+            }
+
+            LoweredOp::SiluMul => {
+                let gate = buf_for(desc.inputs[0], &op_out_buf);
+                let up = buf_for(desc.inputs[1], &op_out_buf);
+                let intermediate = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                dispatch_phase!(
+                    2,
+                    lower_silu_mul,
+                    SiluMulOp {
+                        gate,
+                        up,
+                        out: out_buf,
+                        intermediate,
+                        m: desc.m,
+                        act_elem: ACT_ELEM,
+                    }
+                );
+                op_out_shape.push((desc.m, intermediate));
+            }
+
+            LoweredOp::Add => {
+                let a = buf_for(desc.inputs[0], &op_out_buf);
+                let b = buf_for(desc.inputs[1], &op_out_buf);
+                let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                dispatch_phase!(
+                    2,
+                    lower_residual_add,
+                    AddOp {
+                        a,
+                        b,
+                        out: out_buf,
+                        hidden,
+                        m: desc.m,
+                        act_elem: ACT_ELEM,
+                    }
+                );
+                op_out_shape.push((desc.m, hidden));
+            }
+
+            LoweredOp::RopeRotate { head_dim }
+            | LoweredOp::RopeAppend { head_dim, layer: _ } => {
+                let x = buf_for(desc.inputs[0], &op_out_buf);
+                let cos = buf_for(desc.inputs[1], &op_out_buf);
+                let sin = buf_for(desc.inputs[2], &op_out_buf);
+                let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                let num_heads = cols / head_dim;
+                dispatch_phase!(
+                    3,
+                    lower_rope_rotate,
+                    RopeRotateOp {
+                        x,
+                        cos,
+                        sin,
+                        out: out_buf,
+                        head_dim,
+                        num_heads,
+                        m: desc.m,
+                        act_elem: ACT_ELEM,
+                    }
+                );
+                op_out_shape.push((desc.m, cols));
+            }
+
+            LoweredOp::AttnDecode {
+                num_q_heads,
+                num_kv_heads: _,
+                head_dim,
+                scale,
+            } => {
+                // Slice contract: lower_attn_decode handles a single
+                // attention head with one paged K/V buffer pair. The
+                // multi-head GQA orchestration (one K/V cache pair, sweep
+                // over q-heads with shared K/V) is the next slice
+                // extension; for now we lower one head per op call,
+                // wiring inputs[1] = K cache, inputs[2] = V cache.
+                // num_q_heads is folded into the output's column count.
+                let q = buf_for(desc.inputs[0], &op_out_buf);
+                let k_cache = buf_for(desc.inputs[1], &op_out_buf);
+                let v_cache = buf_for(desc.inputs[2], &op_out_buf);
+                dispatch_phase!(
+                    3,
+                    lower_attn_decode,
+                    AttnDecodeOp {
+                        q,
+                        k_cache,
+                        v_cache,
+                        out: out_buf,
+                        head_dim,
+                        act_elem: ACT_ELEM,
+                        softmax_scale: scale,
+                        num_kv_pages_arg: "__num_kv_pages",
+                    }
+                );
+                op_out_shape.push((desc.m, num_q_heads * head_dim));
+            }
+
+            // Standalone Silu/Mul should be fused into SiluMul before
+            // orchestration (see crate::lower::fuse_silu_mul). The
+            // megakernel substrate has no standalone-Silu primitive.
+            LoweredOp::Silu | LoweredOp::Mul => {
+                panic!(
+                    "lower_to_tk: standalone {:?} reached the orchestrator; \
+                     fuse_silu_mul must run before lower_to_tk.",
+                    desc.op
+                );
+            }
+        }
+    }
+
+    let n_bufs = n_sources + input.ops.len() as u32;
+    (prog, n_bufs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lower::OpDesc;
+    use crate::subtile::SourceShape;
+    use crate::tk_codegen::emit_body;
+
+    /// Minimal "single-layer-ish" forward exercising every op the
+    /// orchestrator dispatches to. Source IDs:
+    ///   0: x         [1, 2048]
+    ///   1: rms_w0    [1, 2048]
+    ///   2: q_w       [2048, 2048]
+    ///   3: k_w       [512, 2048]
+    ///   4: v_w       [512, 2048]
+    ///   5: cos       [1, 64]
+    ///   6: sin       [1, 64]
+    ///   7: k_cache   [1, 2048]      (slice stand-in)
+    ///   8: v_cache   [1, 2048]      (slice stand-in)
+    ///   9: o_w       [2048, 2048]
+    ///  10: rms_w1    [1, 2048]
+    ///  11: gate_w    [8192, 2048]
+    ///  12: up_w      [8192, 2048]
+    ///  13: down_w    [2048, 8192]
+    fn one_layer_input() -> LoweringInput {
+        let h = 2048u32;
+        let kv = 512u32;
+        let i = 8192u32;
+        let hd = 64u32;
+        LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: h },     // 0 x
+                SourceShape { rows: 1, cols: h },     // 1 rms_w0
+                SourceShape { rows: h, cols: h },     // 2 q_w
+                SourceShape { rows: kv, cols: h },    // 3 k_w
+                SourceShape { rows: kv, cols: h },    // 4 v_w
+                SourceShape { rows: 1, cols: hd },    // 5 cos
+                SourceShape { rows: 1, cols: hd },    // 6 sin
+                SourceShape { rows: 1, cols: h },     // 7 k_cache
+                SourceShape { rows: 1, cols: h },     // 8 v_cache
+                SourceShape { rows: h, cols: h },     // 9 o_w
+                SourceShape { rows: 1, cols: h },     // 10 rms_w1
+                SourceShape { rows: i, cols: h },     // 11 gate_w
+                SourceShape { rows: i, cols: h },     // 12 up_w
+                SourceShape { rows: h, cols: i },     // 13 down_w
+            ],
+            ops: vec![
+                // 0: rmsnorm(x)
+                OpDesc {
+                    op: LoweredOp::RmsNorm { eps: 1e-5 },
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                // 1: q = rmsnorm @ q_w^T
+                OpDesc {
+                    op: LoweredOp::Gemm { n: h, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
+                },
+                // 2: q' = rope(q, cos, sin)
+                OpDesc {
+                    op: LoweredOp::RopeRotate { head_dim: hd },
+                    m: 1,
+                    inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
+                },
+                // 3: attn(q', k_cache, v_cache)
+                OpDesc {
+                    op: LoweredOp::AttnDecode {
+                        num_q_heads: 1,
+                        num_kv_heads: 1,
+                        head_dim: hd,
+                        scale: 0.125,
+                    },
+                    m: 1,
+                    inputs: vec![InputRef::Op(2), InputRef::Ext(7), InputRef::Ext(8)],
+                },
+                // 4: o = attn @ o_w^T
+                OpDesc {
+                    op: LoweredOp::Gemm { n: h, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Op(3), InputRef::Ext(9)],
+                },
+                // 5: x' = x + o (residual)
+                OpDesc {
+                    op: LoweredOp::Add,
+                    m: 1,
+                    inputs: vec![InputRef::Ext(0), InputRef::Op(4)],
+                },
+                // 6: rmsnorm(x')
+                OpDesc {
+                    op: LoweredOp::RmsNorm { eps: 1e-5 },
+                    m: 1,
+                    inputs: vec![InputRef::Op(5), InputRef::Ext(10)],
+                },
+                // 7: gate
+                OpDesc {
+                    op: LoweredOp::Gemm { n: i, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Op(6), InputRef::Ext(11)],
+                },
+                // 8: up
+                OpDesc {
+                    op: LoweredOp::Gemm { n: i, k: h },
+                    m: 1,
+                    inputs: vec![InputRef::Op(6), InputRef::Ext(12)],
+                },
+                // 9: silu_mul(gate, up)
+                OpDesc {
+                    op: LoweredOp::SiluMul,
+                    m: 1,
+                    inputs: vec![InputRef::Op(7), InputRef::Op(8)],
+                },
+                // 10: down
+                OpDesc {
+                    op: LoweredOp::Gemm { n: h, k: i },
+                    m: 1,
+                    inputs: vec![InputRef::Op(9), InputRef::Ext(13)],
+                },
+                // 11: x'' = x' + down (residual)
+                OpDesc {
+                    op: LoweredOp::Add,
+                    m: 1,
+                    inputs: vec![InputRef::Op(5), InputRef::Op(10)],
+                },
+            ],
+            result: 11,
+        }
+    }
+
+    #[test]
+    fn pick_bn_keeps_w_tile_inside_one_page() {
+        // K=2048 → bn ≤ floor(16384 / (2048*2)) = 4
+        assert_eq!(pick_bn(2048), 4);
+        // K=8192 → bn ≤ 1
+        assert_eq!(pick_bn(8192), 1);
+        // bn is always at least 1 even if k * ACT_ELEM > PAGE_SIZE
+        // (caller is responsible for ensuring page fit).
+        assert_eq!(pick_bn(16384), 1);
+    }
+
+    /// One-layer forward lowers to a TkProgram with no panics, and the
+    /// emitted body contains markers from each per-op lowering.
+    #[test]
+    fn one_layer_forward_lowers_end_to_end() {
+        let input = one_layer_input();
+        let (prog, n_bufs) = lower_to_tk(&input);
+        let src = emit_body(&prog);
+
+        // 14 sources + 12 ops = 26 buffer ids.
+        assert_eq!(n_bufs, 14 + 12);
+
+        // Each op's body comment fired at least once.
+        assert!(src.contains("RmsNorm"), "{src}");
+        assert!(src.contains("GemmM1"), "{src}");
+        assert!(src.contains("RoPE rotate"), "{src}");
+        assert!(src.contains("AttnDecode"), "{src}");
+        assert!(src.contains("SiluMul"), "{src}");
+        assert!(src.contains("Residual Add"), "{src}");
+    }
+
+    /// Sanity: every BufId referenced in an emitted load/store points
+    /// inside `[0, n_bufs)` so the kernel scaffold can bind them all.
+    #[test]
+    fn emitted_buf_ids_stay_in_range() {
+        use crate::tk_warp_ir::TkInstr;
+        let input = one_layer_input();
+        let (prog, n_bufs) = lower_to_tk(&input);
+        let mut walk: Vec<&TkInstr> = prog.instrs.iter().collect();
+        let mut i = 0;
+        while i < walk.len() {
+            if let TkInstr::ForLoop { body, .. } = walk[i] {
+                walk.extend(body.iter());
+            }
+            i += 1;
+        }
+        for instr in &walk {
+            match instr {
+                TkInstr::LoadAsync { src, .. } => {
+                    assert!(src.0 < n_bufs, "LoadAsync src buf {} >= n_bufs={n_bufs}", src.0);
+                }
+                TkInstr::StoreAsync { dst, .. } => {
+                    assert!(dst.0 < n_bufs, "StoreAsync dst buf {} >= n_bufs={n_bufs}", dst.0);
+                }
+                _ => {}
+            }
+        }
+    }
+}

@@ -30,7 +30,8 @@
 
 use crate::subtile_ir::{BufId, RegionRef};
 use crate::tk_warp_ir::{
-    LoopBound, PageBarrier, PageHandle, Phase0, Phase1, TileShape, TkProgram, WarpRole, NUM_PAGES,
+    LoopBound, PageBarrier, PageHandle, Phase, Phase0, Phase1, TileShape, TkProgram, WarpRole,
+    NUM_PAGES, PAGE_SIZE,
 };
 
 // ── Allocators ──────────────────────────────────────────────────────
@@ -70,29 +71,35 @@ impl PageAllocator {
     /// Returns `None` if every page is in use; callers handle the
     /// out-of-pages case explicitly (the megakernel scheduler decides
     /// whether to spill to scratch or stall the consumer).
-    pub fn alloc_p0(&mut self) -> Option<PageHandle<Phase0>> {
-        let id = self.in_use.iter().position(|u| !u)? as u8;
-        if self.phase_bit[id as usize] != 0 {
-            // Slot's previous round ended on Phase1 — the next round's
-            // first wait must read Phase1 (not Phase0). Caller should
-            // request the right parity; we return None here so the
-            // mistake is visible.
-            return None;
-        }
+    /// Allocate a free slot whose current parity matches the requested
+    /// `P` (the caller's typed phase). Returns `None` if no free slot is
+    /// at that parity — the orchestrator should then probe the OTHER
+    /// parity and dispatch to the matching `lower_X::<P::Next>`.
+    pub fn alloc_at<P: Phase>(&mut self) -> Option<PageHandle<P>> {
+        let id = (0..NUM_PAGES as usize)
+            .find(|&i| !self.in_use[i] && self.phase_bit[i] == P::VALUE)?
+            as u8;
         self.in_use[id as usize] = true;
-        Some(PageHandle::fresh(id))
+        Some(P::fresh_handle(id))
     }
 
+    /// How many slots are currently free at the given runtime parity.
+    /// Used by the orchestrator to pick `Phase0` vs `Phase1` per-op so
+    /// page reuse keeps working across many ops in one forward.
+    pub fn count_at(&self, phase_value: u32) -> usize {
+        (0..NUM_PAGES as usize)
+            .filter(|&i| !self.in_use[i] && self.phase_bit[i] == phase_value)
+            .count()
+    }
+
+    /// Convenience wrapper for `alloc_at::<Phase0>()`.
+    pub fn alloc_p0(&mut self) -> Option<PageHandle<Phase0>> {
+        self.alloc_at::<Phase0>()
+    }
+
+    /// Convenience wrapper for `alloc_at::<Phase1>()`.
     pub fn alloc_p1(&mut self) -> Option<PageHandle<Phase1>> {
-        let id = self.in_use.iter().position(|u| !u)? as u8;
-        if self.phase_bit[id as usize] != 1 {
-            return None;
-        }
-        self.in_use[id as usize] = true;
-        // Synthesise a Phase1 handle directly — only valid because
-        // we've checked the slot's phase_bit IS 1 (so the next wait
-        // really should read 1).
-        Some(PageHandle::<Phase0>::fresh(id).advance())
+        self.alloc_at::<Phase1>()
     }
 
     /// Release a page slot whose round has completed. The handle's
@@ -154,22 +161,32 @@ pub struct RmsNormOp {
 /// each `wait` sees the right parity is that the IR consumed a typed
 /// `PageHandle<P>` whose phase came from the round boundary. Codegen
 /// emits the captured `P::VALUE`; phase drift is unrepresentable.
-pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
-    let page = pages
-        .alloc_p0()
-        .expect("page exhaustion: out of mbarrier slots");
-    let page_id = page.id();
+pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
+    let x_page = pages
+        .alloc_at::<P>()
+        .expect("page exhaustion: out of mbarrier slots (x)");
+    let w_page = pages
+        .alloc_at::<P>()
+        .expect("page exhaustion: out of mbarrier slots (weight)");
+    let x_id = x_page.id();
+    let w_id = w_page.id();
 
     // x's region for the TMA: full hidden columns, m rows.
     let x_region = RegionRef::rows_cols(op.x, op.m, 0, op.hidden);
     let out_region = RegionRef::rows_cols(op.out, op.m, 0, op.hidden);
-    let tile = TileShape {
+    let weight_region = RegionRef::rows_cols(op.weight, 1, 0, op.hidden);
+    let x_tile = TileShape {
         rows: op.m,
         cols: op.hidden,
         elem_bytes: op.act_elem,
     };
+    let weight_tile = TileShape {
+        rows: 1,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
 
-    // ── Loader ──
+    // ── Loader: fill x and weight pages ──
     // Round 0: wait on `Consumed` at Phase0. (Persistent-CTA scaffold
     // pre-arrives `page_consumed` at init so its first wait reads 1 —
     // and our typed parity for a fresh page slot starts at Phase0,
@@ -181,28 +198,32 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
     // arrive in addition to the load would over-count arrivals and
     // shift the barrier's phase off the round parity, breaking the
     // consumer's `wait(ready, 0)`.
-    let page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, page);
-    prog.load_async(page_id, op.x, x_region, tile);
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, x_region, x_tile);
 
-    // ── Consumer ──
-    // Wait reads the SAME parity as the loader's wait — within one
-    // round every barrier's wait reads `R & 1`. The loader's arrive
-    // flipped the underlying `page_ready` mbarrier from 0 → 1, which is
-    // exactly what makes `wait(0)` return on the consumer side.
-    let page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
-    prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op));
-    let page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
+    let w_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, w_page);
+    prog.load_async(w_id, op.weight, weight_region, weight_tile);
 
-    // ── Storer ──
-    let page = prog.wait(WarpRole::Storer, PageBarrier::Done, page);
-    prog.store_async(page_id, op.out, out_region, tile);
-    let page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, page);
+    // ── Consumer: wait both Ready, RMS reduce + scale + multiply weight,
+    //    arrive Done on both. ──
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
+    prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op, x_id, w_id));
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
 
-    // Round boundary — the only phase-advancing call. Releases the slot
-    // back to the allocator with its parity flipped, so the next op
-    // that grabs slot `id` starts its round at `P::Next`.
-    let page = prog.complete_round(page);
-    pages.release(page);
+    // ── Storer: drain x_page → out, free weight slot. ──
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    prog.store_async(x_id, op.out, out_region, x_tile);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let w_page = prog.wait(WarpRole::Storer, PageBarrier::Done, w_page);
+    let w_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, w_page);
+
+    let x_page = prog.complete_round(x_page);
+    let w_page = prog.complete_round(w_page);
+    pages.release(x_page);
+    pages.release(w_page);
 }
 
 /// The RMS reduce + scale body, as a string fragment. Const-resolved
@@ -222,16 +243,14 @@ pub fn lower_rmsnorm(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProg
 /// reductions but the slice doesn't need them yet, and using bare
 /// CUDA primitives keeps the emit independent of TK 2.0's typed-tile
 /// machinery for now.
-fn rmsnorm_compute_body(op: &RmsNormOp) -> String {
-    let RmsNormOp {
-        hidden, eps, ..
-    } = *op;
-    let page_id = 0u8; // matches `pages.alloc_p0()` for the slice.
+fn rmsnorm_compute_body(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
+    let RmsNormOp { hidden, eps, .. } = *op;
     format!(
         r#"
-            // tk_warp_ir RmsNorm — slice body (consumer warp 0 only)
+            // tk_warp_ir RmsNorm — RMS reduce + scale + apply weight (consumer warp 0)
             using T_act = __nv_bfloat16;
-            auto* __page_smem = reinterpret_cast<T_act*>(page_buf[{page_id}]);
+            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
             if (__consumer_idx == 0) {{
                 const unsigned int __hidden = {hidden}u;
                 const float __eps = {eps:?}f;
@@ -239,7 +258,7 @@ fn rmsnorm_compute_body(op: &RmsNormOp) -> String {
                 float __sumsq = 0.0f;
                 for (unsigned int __i = static_cast<unsigned int>(__lane);
                      __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__page_smem[__i]);
+                    const float __v = __bfloat162float(__x_smem[__i]);
                     __sumsq += __v * __v;
                 }}
                 #pragma unroll
@@ -249,8 +268,9 @@ fn rmsnorm_compute_body(op: &RmsNormOp) -> String {
                 const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
                 for (unsigned int __i = static_cast<unsigned int>(__lane);
                      __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__page_smem[__i]);
-                    __page_smem[__i] = __float2bfloat16(__v * __scale);
+                    const float __v = __bfloat162float(__x_smem[__i]);
+                    const float __g = __bfloat162float(__w_smem[__i]);
+                    __x_smem[__i] = __float2bfloat16(__v * __scale * __g);
                 }}
             }}
 "#
@@ -308,13 +328,17 @@ pub struct AttnDecodeOp {
 ///      the parity to the loop variable directly.
 ///   3. Final softmax-normalise + O-store. Consumer divides the
 ///      accumulator by `l_sum`, storer TMA-stores the result.
-pub fn lower_attn_decode(op: AttnDecodeOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
+pub fn lower_attn_decode<P: Phase>(
+    op: AttnDecodeOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
     // Allocate all three page slots up front so the function-scope
     // prelude (typed page views, persistent compute accumulators) can
     // bind to known ids before any handshake instruction is emitted.
-    let q_page = pages.alloc_p0().expect("Q page");
-    let k_page = pages.alloc_p0().expect("K page");
-    let v_page = pages.alloc_p0().expect("V page");
+    let q_page = pages.alloc_at::<P>().expect("Q page");
+    let k_page = pages.alloc_at::<P>().expect("K page");
+    let v_page = pages.alloc_at::<P>().expect("V page");
     let q_id = q_page.id();
     let k_id = k_page.id();
     let v_id = v_page.id();
@@ -549,6 +573,506 @@ fn finalise_softmax_norm_body(_op: &AttnDecodeOp) -> String {
     .into()
 }
 
+// ── Residual Add — element-wise add into TkProgram ─────────────────
+
+/// Inputs to lower one decode-shape element-wise add (e.g. the
+/// post-attention residual `o + x_residual`). Mirrors `LoweredOp::Add`.
+#[derive(Clone, Copy, Debug)]
+pub struct AddOp {
+    /// `[m, hidden]` first input.
+    pub a: BufId,
+    /// `[m, hidden]` second input.
+    pub b: BufId,
+    /// `[m, hidden]` output (may alias `a` for in-place residual).
+    pub out: BufId,
+    pub hidden: u32,
+    pub m: u32,
+    pub act_elem: u32,
+}
+
+/// Lower one element-wise Add into a `TkProgram` fragment.
+///
+/// Tape shape — two pages (one per input), same round parity, single
+/// consumer step. Output is written to `a`'s page in place; the storer
+/// drains that page to `out`. The B page is released a half-round
+/// earlier (after the consumer's read), and lives in a sub-round whose
+/// closing arrive is on the *consumed* barrier so it's free again for
+/// the next op.
+///
+/// We emit ONE round's worth of barriers per page slot:
+/// - A page (slot α): loader fills, consumer reads + writes A+B back,
+///   storer drains.
+/// - B page (slot β): loader fills, consumer reads, storer arrives
+///   `Consumed` to release the slot. (Storer does NO TMA store on B —
+///   B is read-only; we use the storer warp purely to flip the
+///   `Consumed` barrier so the next op can reuse the slot.)
+pub fn lower_residual_add<P: Phase>(
+    op: AddOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let a_page = pages.alloc_at::<P>().expect("residual add: A page");
+    let b_page = pages.alloc_at::<P>().expect("residual add: B page");
+    let a_id = a_page.id();
+    let b_id = b_page.id();
+
+    let region = |buf, rows, hidden| RegionRef::rows_cols(buf, rows, 0, hidden);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Loader fills A ──
+    let a_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, a_page);
+    prog.load_async(a_id, op.a, region(op.a, op.m, op.hidden), tile);
+
+    // ── Loader fills B ──
+    let b_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, b_page);
+    prog.load_async(b_id, op.b, region(op.b, op.m, op.hidden), tile);
+
+    // ── Consumer waits on Ready for both, computes A+B in place on A,
+    //    arrives Done on both. ──
+    let a_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, a_page);
+    let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
+    prog.compute(WarpRole::AllConsumers, residual_add_compute_body(&op, a_id, b_id));
+    let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
+    let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
+
+    // ── Storer drains A → out, then frees both pages. ──
+    let a_page = prog.wait(WarpRole::Storer, PageBarrier::Done, a_page);
+    prog.store_async(a_id, op.out, region(op.out, op.m, op.hidden), tile);
+    let a_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, a_page);
+
+    let b_page = prog.wait(WarpRole::Storer, PageBarrier::Done, b_page);
+    let b_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, b_page);
+
+    pages.release(prog.complete_round(a_page));
+    pages.release(prog.complete_round(b_page));
+}
+
+fn residual_add_compute_body(op: &AddOp, a_id: u8, b_id: u8) -> String {
+    let AddOp { hidden, m, .. } = *op;
+    let total = hidden as u64 * m as u64;
+    format!(
+        r#"
+            // tk_warp_ir Residual Add — A+B in place on A's page (all consumer warps)
+            using T_act = __nv_bfloat16;
+            auto* __a_smem = reinterpret_cast<T_act*>(page_buf[{a_id}]);
+            auto* __b_smem = reinterpret_cast<T_act*>(page_buf[{b_id}]);
+            const unsigned int __total = {total}u;
+            const int __tid_in_consumers =
+                static_cast<int>(threadIdx.x) - 2 * 32;
+            const int __consumer_threads = 8 * 32;
+            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
+                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
+                const float __a = __bfloat162float(__a_smem[__i]);
+                const float __b = __bfloat162float(__b_smem[__i]);
+                __a_smem[__i] = __float2bfloat16(__a + __b);
+            }}
+"#
+    )
+}
+
+// ── SiluMul — fused SwiGLU element-wise ────────────────────────────
+
+/// Inputs to lower one fused `silu(gate) * up` op (the LLaMA SwiGLU
+/// activation), mirroring `LoweredOp::SiluMul`.
+#[derive(Clone, Copy, Debug)]
+pub struct SiluMulOp {
+    /// `[m, intermediate]` gate projection.
+    pub gate: BufId,
+    /// `[m, intermediate]` up projection.
+    pub up: BufId,
+    /// `[m, intermediate]` output (may alias `gate`).
+    pub out: BufId,
+    /// Intermediate size (8192 for Llama-1B).
+    pub intermediate: u32,
+    pub m: u32,
+    pub act_elem: u32,
+}
+
+/// Lower one `silu(gate) * up` op into a `TkProgram` fragment.
+///
+/// Two pages — gate page is overwritten in place with the result and
+/// drained to `out`; up page is read-only (storer arrives Consumed only).
+/// One round on both slots, parity 0.
+pub fn lower_silu_mul<P: Phase>(
+    op: SiluMulOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let g_page = pages.alloc_at::<P>().expect("silu_mul: gate page");
+    let u_page = pages.alloc_at::<P>().expect("silu_mul: up page");
+    let g_id = g_page.id();
+    let u_id = u_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.intermediate,
+        elem_bytes: op.act_elem,
+    };
+
+    let g_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, g_page);
+    prog.load_async(g_id, op.gate, region(op.gate, op.m, op.intermediate), tile);
+
+    let u_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, u_page);
+    prog.load_async(u_id, op.up, region(op.up, op.m, op.intermediate), tile);
+
+    let g_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, g_page);
+    let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
+    prog.compute(WarpRole::AllConsumers, silu_mul_compute_body(&op, g_id, u_id));
+    let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
+    let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
+
+    let g_page = prog.wait(WarpRole::Storer, PageBarrier::Done, g_page);
+    prog.store_async(g_id, op.out, region(op.out, op.m, op.intermediate), tile);
+    let g_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, g_page);
+
+    let u_page = prog.wait(WarpRole::Storer, PageBarrier::Done, u_page);
+    let u_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, u_page);
+
+    pages.release(prog.complete_round(g_page));
+    pages.release(prog.complete_round(u_page));
+}
+
+fn silu_mul_compute_body(op: &SiluMulOp, g_id: u8, u_id: u8) -> String {
+    let SiluMulOp { intermediate, m, .. } = *op;
+    let total = intermediate as u64 * m as u64;
+    format!(
+        r#"
+            // tk_warp_ir SiluMul — silu(gate) * up in place on gate's page (all consumer warps)
+            using T_act = __nv_bfloat16;
+            auto* __g_smem = reinterpret_cast<T_act*>(page_buf[{g_id}]);
+            auto* __u_smem = reinterpret_cast<T_act*>(page_buf[{u_id}]);
+            const unsigned int __total = {total}u;
+            const int __tid_in_consumers =
+                static_cast<int>(threadIdx.x) - 2 * 32;
+            const int __consumer_threads = 8 * 32;
+            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
+                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
+                const float __g = __bfloat162float(__g_smem[__i]);
+                const float __u = __bfloat162float(__u_smem[__i]);
+                const float __silu_g = __g / (1.0f + expf(-__g));
+                __g_smem[__i] = __float2bfloat16(__silu_g * __u);
+            }}
+"#
+    )
+}
+
+// ── RoPE rotate — NeoX rotary on Q or K ────────────────────────────
+
+/// Inputs to lower one NeoX-style RoPE rotate, mirroring
+/// `LoweredOp::RopeRotate { head_dim }`.
+///
+/// Acts on `[m, num_heads * head_dim]` x in place. cos/sin are
+/// `[1, head_dim]` (the model's per-token RoPE frequencies for the
+/// current decode position).
+#[derive(Clone, Copy, Debug)]
+pub struct RopeRotateOp {
+    pub x: BufId,
+    pub cos: BufId,
+    pub sin: BufId,
+    /// Output buffer (typically aliases `x`).
+    pub out: BufId,
+    /// Per-head dim (64 for Llama-1B Q, 64 for K/V).
+    pub head_dim: u32,
+    /// Number of heads sharing this RoPE invocation. Q has 32, K/V have 8.
+    pub num_heads: u32,
+    pub m: u32,
+    pub act_elem: u32,
+}
+
+/// Lower one NeoX-RoPE rotate into a `TkProgram` fragment.
+///
+/// Three pages — x (in-place + drained), cos (read-only), sin (read-only).
+pub fn lower_rope_rotate<P: Phase>(
+    op: RopeRotateOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let x_page = pages.alloc_at::<P>().expect("rope: x page");
+    let c_page = pages.alloc_at::<P>().expect("rope: cos page");
+    let s_page = pages.alloc_at::<P>().expect("rope: sin page");
+    let x_id = x_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let x_cols = op.num_heads * op.head_dim;
+    let x_tile = TileShape {
+        rows: op.m,
+        cols: x_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+
+    // Loader fills all three pages.
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, region(op.x, op.m, x_cols), x_tile);
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    prog.load_async(c_id, op.cos, region(op.cos, 1, op.head_dim), cs_tile);
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    prog.load_async(s_id, op.sin, region(op.sin, 1, op.head_dim), cs_tile);
+
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    prog.compute(WarpRole::AllConsumers, rope_compute_body(&op, x_id, c_id, s_id));
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    prog.store_async(x_id, op.out, region(op.out, op.m, x_cols), x_tile);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    pages.release(prog.complete_round(x_page));
+    pages.release(prog.complete_round(c_page));
+    pages.release(prog.complete_round(s_page));
+}
+
+fn rope_compute_body(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String {
+    let RopeRotateOp { head_dim, num_heads, m, .. } = *op;
+    let half = head_dim / 2;
+    let total_pairs = (m as u64) * (num_heads as u64) * (half as u64);
+    format!(
+        r#"
+            // tk_warp_ir RoPE rotate (NeoX) — in place on x's page (all consumer warps)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem   = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __cos_smem = reinterpret_cast<T_act*>(page_buf[{c_id}]);
+            auto* __sin_smem = reinterpret_cast<T_act*>(page_buf[{s_id}]);
+            const unsigned int __head_dim = {head_dim}u;
+            const unsigned int __half     = {half}u;
+            const unsigned int __pairs    = {total_pairs}u;
+            const int __tid_in_consumers =
+                static_cast<int>(threadIdx.x) - 2 * 32;
+            const int __consumer_threads = 8 * 32;
+            for (unsigned int __p = static_cast<unsigned int>(__tid_in_consumers);
+                 __p < __pairs; __p += static_cast<unsigned int>(__consumer_threads)) {{
+                // Decompose pair index → (row * head, lane in head_dim/2).
+                const unsigned int __row_head = __p / __half;
+                const unsigned int __lane     = __p % __half;
+                const unsigned int __i_lo     = __row_head * __head_dim + __lane;
+                const unsigned int __i_hi     = __i_lo + __half;
+                const float __c   = __bfloat162float(__cos_smem[__lane]);
+                const float __s   = __bfloat162float(__sin_smem[__lane]);
+                const float __x_lo = __bfloat162float(__x_smem[__i_lo]);
+                const float __x_hi = __bfloat162float(__x_smem[__i_hi]);
+                __x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);
+                __x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);
+            }}
+"#
+    )
+}
+
+// ── GemmM1 — M=1 vec-mat decode GEMM ───────────────────────────────
+
+/// Inputs to lower one M=1 vec-mat decode GEMM, mirroring
+/// `LoweredOp::Gemm` for the decode path. Computes
+/// `out[1, n] = x[1, k] @ w[n, k]^T`.
+///
+/// The decoder uses this for q/k/v/o, gate/up/down, and lm_head. Caller
+/// picks `bn` such that one `[bn, k]` W tile fits in a single TK 2.0
+/// page (`bn * k * act_elem <= PAGE_SIZE`); typical Llama-1B pickings:
+/// - K=2048 (q/k/v/o, gate/up, lm_head): `bn = 4` → 16384 bytes per tile.
+/// - K=8192 (down): `bn = 1` → 16384 bytes per tile.
+///
+/// Page layout (3 slots): `x_page` loaded once before the loop and
+/// held read-only by the consumer through every iteration; `w_page`
+/// streams a fresh `[bn, k]` tile per iteration; `y_page` stages the
+/// `[1, bn]` output values which the storer drains to `out` per
+/// iteration. Output streaming is required because the full `[1, n]`
+/// output (e.g. `n = 128256` for lm_head) does not fit in a single
+/// page.
+#[derive(Clone, Copy, Debug)]
+pub struct GemmM1Op {
+    /// `[1, k]` input vector.
+    pub x: BufId,
+    /// `[n, k]` weight (row-major: `w[row, col]` with row in
+    /// `[0, n)`, col in `[0, k)`).
+    pub w: BufId,
+    /// `[1, n]` output (must NOT alias `x`; output streaming reuses a
+    /// dedicated page slot).
+    pub out: BufId,
+    pub k: u32,
+    pub n: u32,
+    /// N-tile rows per W page load. Caller MUST satisfy
+    /// `bn * k * act_elem <= PAGE_SIZE`.
+    pub bn: u32,
+    pub act_elem: u32,
+}
+
+/// Lower one M=1 GEMM into a `TkProgram` fragment.
+///
+/// Tape shape:
+///   1. Load X once before the N-block loop (one round on `x_page`,
+///      consumer waits Ready and holds the slot through the whole
+///      loop).
+///   2. `for (__n_i = 0; __n_i < ceil(n/bn); ++__n_i)` — each
+///      iteration is one complete round on `w_page` and one on
+///      `y_page`. Wait parities use `(__n_i & 1)`.
+///      - Loader streams W[bn, k] from `w[n_i*bn .. (n_i+1)*bn, :]`.
+///      - Consumer (one warp per output value: warp `c` computes
+///        `y[c]` if `c < bn`, else idles) does a lane-parallel dot
+///        product `acc[c] = sum_k x[k] * w[n_i*bn+c, k]`, butterfly-
+///        reduces inside the warp, lane 0 writes `y_page[c]`.
+///      - Storer drains `y_page` to `out[n_i*bn .. (n_i+1)*bn]`.
+///   3. Close X's single round (consumer arrives Done, storer waits
+///      Done + arrives Consumed without storing — X is read-only).
+pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &mut TkProgram) {
+    debug_assert!(
+        op.bn.saturating_mul(op.k).saturating_mul(op.act_elem) <= PAGE_SIZE,
+        "lower_gemm_m1: W tile {}x{} ({} bytes) exceeds PAGE_SIZE={}",
+        op.bn,
+        op.k,
+        op.bn * op.k * op.act_elem,
+        PAGE_SIZE,
+    );
+    debug_assert!(
+        op.bn.saturating_mul(op.act_elem) <= PAGE_SIZE,
+        "lower_gemm_m1: Y tile [1,{}] ({} bytes) exceeds PAGE_SIZE={}",
+        op.bn,
+        op.bn * op.act_elem,
+        PAGE_SIZE,
+    );
+
+    let x_page = pages.alloc_at::<P>().expect("gemm_m1: x page");
+    let w_page = pages.alloc_at::<P>().expect("gemm_m1: w page");
+    let y_page = pages.alloc_at::<P>().expect("gemm_m1: y page");
+    let x_id = x_page.id();
+    let w_id = w_page.id();
+    let y_id = y_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let x_tile = TileShape {
+        rows: 1,
+        cols: op.k,
+        elem_bytes: op.act_elem,
+    };
+    let w_tile = TileShape {
+        rows: op.bn,
+        cols: op.k,
+        elem_bytes: op.act_elem,
+    };
+    let y_tile = TileShape {
+        rows: 1,
+        cols: op.bn,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Load X once before the N-block loop ──
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, region(op.x, 1, op.k), x_tile);
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+
+    // ── N-block loop ──
+    let n_blocks = op.n.div_ceil(op.bn);
+    let w_byte_step = (op.bn as u64) * (op.k as u64) * (op.act_elem as u64);
+    let y_byte_step = (op.bn as u64) * (op.act_elem as u64);
+    let loop_var = "__n_i";
+
+    prog.for_loop(loop_var, LoopBound::Const(n_blocks), |body| {
+        // Loader streams the next W tile.
+        body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, w_id, loop_var);
+        body.load_async_dyn(
+            w_id,
+            op.w,
+            region(op.w, op.bn, op.k),
+            w_tile,
+            format!("(__n_i * {w_byte_step}u)"),
+        );
+
+        // Consumer: wait y free, wait W ready, compute, signal both done.
+        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var);
+        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var);
+        body.compute(WarpRole::AllConsumers, gemm_m1_compute_body(&op, x_id, w_id, y_id));
+        body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
+        body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, y_id);
+
+        // Storer: free W slot (read-only — no actual store), drain Y.
+        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, w_id, loop_var);
+        body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, w_id);
+
+        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, y_id, loop_var);
+        body.store_async_dyn(
+            y_id,
+            op.out,
+            region(op.out, 1, op.bn),
+            y_tile,
+            format!("(__n_i * {y_byte_step}u)"),
+        );
+        body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, y_id);
+    });
+
+    // After the loop the W and Y page slots have been ping-ponged a
+    // runtime number of times. We can't statically track post-loop
+    // parity; `complete_round` advances and releases at Phase1 so the
+    // allocator records the slot as "next round starts at Phase1",
+    // which is correct for the typical even-N case (the static-typed
+    // odd-N case must be handled by the caller picking `bn` to make
+    // `n_blocks` even, which all Llama-1B layers satisfy).
+    let w_page = prog.complete_round(w_page);
+    let y_page = prog.complete_round(y_page);
+    pages.release(w_page);
+    pages.release(y_page);
+
+    // Close X's single round. X was loaded once (loader Ready), held by
+    // the consumer through every loop iteration, and is now released.
+    // No store — X is read-only — but the storer still flips Consumed
+    // so the slot is freed for the next op.
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+    let x_page = prog.complete_round(x_page);
+    pages.release(x_page);
+}
+
+fn gemm_m1_compute_body(op: &GemmM1Op, x_id: u8, w_id: u8, y_id: u8) -> String {
+    let GemmM1Op { k, bn, .. } = *op;
+    format!(
+        r#"
+            // tk_warp_ir GemmM1 — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
+            // (per-warp output: warp c -> y[c] when c < bn; lane-parallel K reduce.)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
+            auto* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
+            const unsigned int __k  = {k}u;
+            const unsigned int __bn = {bn}u;
+            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
+                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                float __acc = 0.0f;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __k; __j += 32u) {{
+                    __acc += __bfloat162float(__x_smem[__j])
+                           * __bfloat162float(__w_smem[__row * __k + __j]);
+                }}
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {{
+                    __acc += __shfl_xor_sync(0xFFFFFFFFu, __acc, __o);
+                }}
+                if (__lane == 0) {{
+                    __y_smem[__row] = __float2bfloat16(__acc);
+                }}
+            }}
+"#
+    )
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -570,23 +1094,30 @@ mod tests {
         }
     }
 
-    /// The lowered IR has the exact eight-instruction
-    /// loader/consumer/storer handshake from the design doc — no
-    /// blank-filling at emit time. (No explicit `arrive(Loader,Ready)`:
-    /// `tma::load_async` signals page_ready itself.)
+    /// The lowered IR has the exact 13-instruction handshake covering
+    /// the X page AND the weight page in one round (no blank-filling at
+    /// emit time, no explicit `arrive(Loader,Ready)`: `tma::load_async`
+    /// signals page_ready itself).
+    ///
+    /// Layout:
+    ///   loader   (4): wait Consumed[x], load[x],
+    ///                 wait Consumed[w], load[w]
+    ///   consumer (5): wait Ready[x], wait Ready[w], compute,
+    ///                 arrive Done[x], arrive Done[w]
+    ///   storer   (5): wait Done[x], store[x], arrive Consumed[x],
+    ///                 wait Done[w], arrive Consumed[w]
+    /// (Total 14; weight is read-only so the storer arrives Consumed
+    /// without a TMA store.)
     #[test]
-    fn rmsnorm_lowers_to_eight_instr_handshake() {
+    fn rmsnorm_lowers_to_two_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_rmsnorm(op(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
 
-        // 8 instructions: wait+load (loader), wait+compute+arrive (consumer),
-        // wait+store+arrive (storer). `complete_round` emits no IR; the
-        // load itself signals Ready (no extra arrive).
-        assert_eq!(prog.instrs.len(), 8, "{prog:?}");
+        assert_eq!(prog.instrs.len(), 14, "{prog:?}");
 
         // Phase parities the lowering picked: every wait within one
-        // round reads `R & 1` (round 0 → all 0).
+        // round reads `R & 1` (round 0 → all 0). Six waits total.
         let phases: Vec<String> = prog
             .instrs
             .iter()
@@ -595,23 +1126,26 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(phases, vec!["0", "0", "0"], "round 0: every wait reads 0");
+        assert_eq!(
+            phases,
+            vec!["0", "0", "0", "0", "0", "0"],
+            "round 0: every wait reads 0"
+        );
     }
 
     /// The page is released back to the allocator at the right parity:
-    /// the storer's last arrive flipped it once more, so the slot's
+    /// the storer's last arrive flipped it once more, so each slot's
     /// next round starts at Phase1.
     #[test]
     fn page_released_at_correct_parity() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_rmsnorm(op(), &mut pages, &mut prog);
-        // Slot 0 was used; its phase_bit reflects the post-storer state.
-        assert_eq!(
-            pages.phase_bit[0], 1,
-            "after one round, slot 0 lives on Phase1"
-        );
-        assert!(!pages.in_use[0], "slot released");
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
+        // Both x (slot 0) and weight (slot 1) live on Phase1 after one round.
+        assert_eq!(pages.phase_bit[0], 1, "x slot on Phase1 after one round");
+        assert_eq!(pages.phase_bit[1], 1, "weight slot on Phase1 after one round");
+        assert!(!pages.in_use[0]);
+        assert!(!pages.in_use[1]);
     }
 
     /// Codegen on the lowered program produces source containing the
@@ -621,7 +1155,7 @@ mod tests {
     fn rmsnorm_codegen_walks_match_arms() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_rmsnorm(op(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         // Three role-routed arms.
@@ -649,8 +1183,12 @@ mod tests {
         assert!(src.contains("page_ready[0], 0"), "{src}");
         assert!(src.contains("page_done[0], 0"), "{src}");
 
-        // Body fragment pasted verbatim.
+        // Body fragment pasted verbatim, including the weight multiply.
         assert!(src.contains("rsqrtf"), "compute body present\n{src}");
+        assert!(
+            src.contains("__v * __scale * __g"),
+            "weight gain applied to normalised value\n{src}"
+        );
     }
 
     /// Two adjacent RmsNorm ops use distinct page slots — the
@@ -659,7 +1197,7 @@ mod tests {
     fn two_rmsnorms_use_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_rmsnorm(op(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
         // Pretend the first op's slot is still owned (skip the release).
         // Re-simulate by manually marking slot 0 as in_use:
         let mut pages2 = PageAllocator::new();
@@ -689,7 +1227,7 @@ mod tests {
     fn attn_decode_lowers_to_typed_outer_plus_kv_loop() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode(attn_op(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
 
         // Count ForLoops and their body lengths.
         let loops: Vec<&Vec<TkInstr>> = prog
@@ -720,7 +1258,7 @@ mod tests {
         use crate::tk_warp_ir::WaitPhase;
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode(attn_op(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
 
         let mut outer_phases = Vec::<WaitPhase>::new();
         let mut inner_phases = Vec::<WaitPhase>::new();
@@ -759,7 +1297,7 @@ mod tests {
     fn attn_decode_codegen_emits_for_and_runtime_parity() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode(attn_op(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         assert!(
@@ -783,7 +1321,7 @@ mod tests {
     fn attn_decode_uses_three_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode(attn_op(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         for instr in &prog.instrs {
@@ -802,5 +1340,316 @@ mod tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), 3, "Q + K + V → three distinct page slots; loads: {load_pages:?}");
+    }
+
+    fn add_op() -> AddOp {
+        AddOp {
+            a: BufId(20),
+            b: BufId(21),
+            out: BufId(22),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    /// Residual Add lowers to two-page handshake: A is loaded + drained
+    /// (full round), B is loaded + read + freed (no TMA store on B).
+    #[test]
+    fn add_lowers_to_two_page_handshake() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
+
+        let mut load_pages = Vec::<u8>::new();
+        let mut store_pages = Vec::<u8>::new();
+        for instr in &prog.instrs {
+            match instr {
+                TkInstr::LoadAsync { page_id, .. } => load_pages.push(*page_id),
+                TkInstr::StoreAsync { page_id, .. } => store_pages.push(*page_id),
+                _ => {}
+            }
+        }
+        // Two distinct loads (A + B), one store (out via A's slot).
+        assert_eq!(load_pages.len(), 2, "two loads (A + B)");
+        let mut uniq_loads = load_pages.clone();
+        uniq_loads.sort();
+        uniq_loads.dedup();
+        assert_eq!(uniq_loads.len(), 2, "A and B on distinct pages");
+        assert_eq!(store_pages.len(), 1, "one store (A → out)");
+        assert_eq!(store_pages[0], load_pages[0], "store drains A's page");
+    }
+
+    /// Codegen on Add produces the expected role-routed arms for both
+    /// pages plus an A+B compute body.
+    #[test]
+    fn add_codegen_emits_two_page_handshake() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
+        let src = emit_body(&prog);
+
+        // Both pages get loader+consumer+storer arms.
+        assert!(src.contains("page_consumed[0]"), "{src}");
+        assert!(src.contains("page_consumed[1]"), "{src}");
+        assert!(src.contains("page_ready[0]"), "{src}");
+        assert!(src.contains("page_ready[1]"), "{src}");
+        assert!(src.contains("page_done[0]"), "{src}");
+        assert!(src.contains("page_done[1]"), "{src}");
+        // Compute body is in the consumer arm and references both pages.
+        assert!(src.contains("__a_smem"), "{src}");
+        assert!(src.contains("__b_smem"), "{src}");
+        // Round 0: every wait reads parity 0.
+        assert!(src.contains("page_consumed[0], 0"), "{src}");
+        assert!(src.contains("page_consumed[1], 0"), "{src}");
+        assert!(src.contains("page_ready[0], 0"), "{src}");
+        assert!(src.contains("page_ready[1], 0"), "{src}");
+        assert!(src.contains("page_done[0], 0"), "{src}");
+        assert!(src.contains("page_done[1], 0"), "{src}");
+    }
+
+    /// Both pages release at parity 1 after one full round (storer's
+    /// arrive on Consumed flips them once each).
+    fn silu_mul_op_() -> SiluMulOp {
+        SiluMulOp {
+            gate: BufId(30),
+            up: BufId(31),
+            out: BufId(32),
+            intermediate: 8192,
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    #[test]
+    fn silu_mul_lowers_to_two_page_handshake() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_silu_mul::<Phase0>(silu_mul_op_(), &mut pages, &mut prog);
+
+        let mut load_pages = Vec::<u8>::new();
+        let mut store_pages = Vec::<u8>::new();
+        for instr in &prog.instrs {
+            match instr {
+                TkInstr::LoadAsync { page_id, .. } => load_pages.push(*page_id),
+                TkInstr::StoreAsync { page_id, .. } => store_pages.push(*page_id),
+                _ => {}
+            }
+        }
+        assert_eq!(load_pages.len(), 2, "two loads (gate + up)");
+        let mut uniq = load_pages.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 2);
+        assert_eq!(store_pages.len(), 1, "one store (gate slot → out)");
+    }
+
+    #[test]
+    fn silu_mul_codegen_emits_silu_and_mul() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_silu_mul::<Phase0>(silu_mul_op_(), &mut pages, &mut prog);
+        let src = emit_body(&prog);
+        // SiLU formula: g / (1 + exp(-g))
+        assert!(src.contains("__silu_g"), "{src}");
+        assert!(src.contains("expf(-"), "{src}");
+        // Mul: silu(g) * u
+        assert!(src.contains("__silu_g * __u"), "{src}");
+    }
+
+    fn rope_op() -> RopeRotateOp {
+        RopeRotateOp {
+            x: BufId(40),
+            cos: BufId(41),
+            sin: BufId(42),
+            out: BufId(40), // alias x
+            head_dim: 64,
+            num_heads: 32, // Q heads
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    #[test]
+    fn rope_lowers_to_three_page_handshake() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_rope_rotate::<Phase0>(rope_op(), &mut pages, &mut prog);
+
+        let mut load_pages = Vec::<u8>::new();
+        let mut store_pages = Vec::<u8>::new();
+        for instr in &prog.instrs {
+            match instr {
+                TkInstr::LoadAsync { page_id, .. } => load_pages.push(*page_id),
+                TkInstr::StoreAsync { page_id, .. } => store_pages.push(*page_id),
+                _ => {}
+            }
+        }
+        assert_eq!(load_pages.len(), 3, "x + cos + sin");
+        let mut uniq = load_pages.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "three distinct pages");
+        assert_eq!(store_pages.len(), 1, "x is the only store");
+    }
+
+    #[test]
+    fn rope_codegen_emits_neox_rotation() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_rope_rotate::<Phase0>(rope_op(), &mut pages, &mut prog);
+        let src = emit_body(&prog);
+        assert!(src.contains("__cos_smem"), "{src}");
+        assert!(src.contains("__sin_smem"), "{src}");
+        // NeoX: lo = lo*c - hi*s; hi = lo*s + hi*c.
+        assert!(src.contains("__x_lo * __c - __x_hi * __s"), "{src}");
+        assert!(src.contains("__x_lo * __s + __x_hi * __c"), "{src}");
+    }
+
+    #[test]
+    fn add_releases_both_pages_at_phase1() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
+        assert_eq!(pages.phase_bit[0], 1, "A page on Phase1 after one round");
+        assert_eq!(pages.phase_bit[1], 1, "B page on Phase1 after one round");
+        assert!(!pages.in_use[0]);
+        assert!(!pages.in_use[1]);
+    }
+
+    fn gemm_qkv_op() -> GemmM1Op {
+        // Llama-3.2-1B q_proj shape: x[1, 2048] @ W[2048, 2048]^T → out[1, 2048].
+        // BN=4 keeps W tile = [4, 2048] bf16 = 16384 bytes (one full page).
+        GemmM1Op {
+            x: BufId(20),
+            w: BufId(21),
+            out: BufId(22),
+            k: 2048,
+            n: 2048,
+            bn: 4,
+            act_elem: 2,
+        }
+    }
+
+    fn gemm_down_op() -> GemmM1Op {
+        // Llama-3.2-1B down_proj shape: x[1, 8192] @ W[2048, 8192]^T → out[1, 2048].
+        // BN=1 keeps W tile = [1, 8192] bf16 = 16384 bytes (one full page).
+        GemmM1Op {
+            x: BufId(30),
+            w: BufId(31),
+            out: BufId(32),
+            k: 8192,
+            n: 2048,
+            bn: 1,
+            act_elem: 2,
+        }
+    }
+
+    /// GemmM1 lowers to: X-load (outside) + ForLoop over n_blocks +
+    /// X-close (outside). The loop body has 10 instrs:
+    /// loader (wait+load) + consumer (wait+wait+compute+arrive+arrive)
+    /// + storer-w (wait+arrive) + storer-y (wait+store+arrive).
+    #[test]
+    fn gemm_m1_lowers_to_xload_plus_loop_plus_xclose() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_gemm_m1::<Phase0>(gemm_qkv_op(), &mut pages, &mut prog);
+
+        let loops: Vec<&Vec<TkInstr>> = prog
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                TkInstr::ForLoop { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loops.len(), 1, "one N-block loop");
+        // Loop body: 12 instrs.
+        //  loader  (2): wait Consumed[w], LoadAsync[w]
+        //  consumer(5): wait Consumed[y], wait Ready[w], Compute,
+        //               arrive Done[w], arrive Done[y]
+        //  storer-w(2): wait Done[w], arrive Consumed[w]   (W is read-only)
+        //  storer-y(3): wait Done[y], StoreAsync[y], arrive Consumed[y]
+        assert_eq!(loops[0].len(), 12, "loop body has 12 instrs (see comment)");
+    }
+
+    /// GemmM1 uses three distinct page slots (x, w, y) — none alias.
+    #[test]
+    fn gemm_m1_uses_three_distinct_pages() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_gemm_m1::<Phase0>(gemm_qkv_op(), &mut pages, &mut prog);
+
+        // Find every page id referenced in any TMA load/store.
+        let mut ids = Vec::<u8>::new();
+        for instr in &prog.instrs {
+            match instr {
+                TkInstr::LoadAsync { page_id, .. } | TkInstr::StoreAsync { page_id, .. } => {
+                    ids.push(*page_id);
+                }
+                TkInstr::ForLoop { body, .. } => {
+                    for inner in body {
+                        match inner {
+                            TkInstr::LoadAsync { page_id, .. }
+                            | TkInstr::StoreAsync { page_id, .. } => ids.push(*page_id),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "three distinct page slots: {ids:?}");
+    }
+
+    /// Codegen on GemmM1 emits the runtime parity `(__n_i & 1)` inside
+    /// the loop and the runtime W byte-offset `(__n_i * <step>u)`.
+    #[test]
+    fn gemm_m1_codegen_emits_for_loop_runtime_offsets() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let op = gemm_qkv_op();
+        lower_gemm_m1::<Phase0>(op, &mut pages, &mut prog);
+        let src = emit_body(&prog);
+
+        let n_blocks = op.n.div_ceil(op.bn);
+        assert!(
+            src.contains(&format!("for (uint __n_i = 0; __n_i < {n_blocks};")),
+            "compile-time N-block loop bound\n{src}"
+        );
+        assert!(
+            src.contains("(__n_i & 1)"),
+            "runtime parity inside the loop\n{src}"
+        );
+        // W byte step = bn * k * act_elem = 4 * 2048 * 2 = 16384.
+        assert!(
+            src.contains("(__n_i * 16384u)"),
+            "W TMA load uses runtime byte-offset\n{src}"
+        );
+        // Y byte step = bn * act_elem = 4 * 2 = 8.
+        assert!(
+            src.contains("(__n_i * 8u)"),
+            "Y TMA store uses runtime byte-offset\n{src}"
+        );
+        assert!(
+            src.contains("__shfl_xor_sync"),
+            "lane butterfly reduction in compute body\n{src}"
+        );
+    }
+
+    /// down_proj shape (K=8192, BN=1) compiles cleanly and emits the
+    /// expected page tile sizes.
+    #[test]
+    fn gemm_m1_down_proj_shape_lowers() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_gemm_m1::<Phase0>(gemm_down_op(), &mut pages, &mut prog);
+        let src = emit_body(&prog);
+        // W byte step = 1 * 8192 * 2 = 16384.
+        assert!(src.contains("(__n_i * 16384u)"), "{src}");
+        // Y byte step = 1 * 2 = 2.
+        assert!(src.contains("(__n_i * 2u)"), "{src}");
     }
 }

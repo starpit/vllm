@@ -82,8 +82,13 @@ pub mod tk20 {
         rows: u32,
         cols: u32,
         elem_bytes: u32,
+        dyn_byte_off: Option<&str>,
     ) -> String {
         let bytes = tile_bytes(rows, cols, elem_bytes);
+        let off_expr = match dyn_byte_off {
+            Some(e) => format!("({src_byte_off}u + ({e}))"),
+            None => format!("{src_byte_off}"),
+        };
         // Cast through `uintptr_t` to drop `const` from the buffer arg
         // (the kernel signature uses `const __nv_bfloat16* __restrict__`
         // for inputs, but TK 2.0 `tma::load_async(void*, void*, ...)`
@@ -94,7 +99,7 @@ pub mod tk20 {
              kittens::group<1>::tma::load_async(\
              reinterpret_cast<void*>(page_buf[{page_id}]), \
              reinterpret_cast<void*>(\
-             reinterpret_cast<uintptr_t>(buf{src_buf}) + {src_byte_off}), \
+             reinterpret_cast<uintptr_t>(buf{src_buf}) + {off_expr}), \
              {bytes}, \
              page_ready[{page_id}]);"
         )
@@ -115,11 +120,16 @@ pub mod tk20 {
         rows: u32,
         cols: u32,
         elem_bytes: u32,
+        dyn_byte_off: Option<&str>,
     ) -> String {
         let bytes = tile_bytes(rows, cols, elem_bytes);
+        let off_expr = match dyn_byte_off {
+            Some(e) => format!("({dst_byte_off}u + ({e}))"),
+            None => format!("{dst_byte_off}"),
+        };
         format!(
             "kittens::group<1>::tma::store_async(\
-             reinterpret_cast<void*>(reinterpret_cast<char*>(buf{dst_buf}) + {dst_byte_off}), \
+             reinterpret_cast<void*>(reinterpret_cast<char*>(buf{dst_buf}) + {off_expr}), \
              reinterpret_cast<void*>(page_buf[{page_id}]), \
              {bytes}); \
              kittens::group<1>::tma::store_async_wait();"
@@ -196,6 +206,7 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             src,
             src_region,
             tile,
+            dyn_byte_off,
         } => {
             // src_region.region carries (rows, cols) — use the IR tile
             // for the TMA descriptor and the region's column-offset
@@ -208,7 +219,15 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             let byte_off = (src_region.region.cols.start as u64) * (elem_bytes as u64);
             (
                 WarpRole::Loader,
-                tk20::tma_load_async(*page_id, src.0, byte_off, rows, cols, elem_bytes),
+                tk20::tma_load_async(
+                    *page_id,
+                    src.0,
+                    byte_off,
+                    rows,
+                    cols,
+                    elem_bytes,
+                    dyn_byte_off.as_deref(),
+                ),
             )
         }
         TkInstr::StoreAsync {
@@ -216,6 +235,7 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             dst,
             dst_region,
             tile,
+            dyn_byte_off,
         } => {
             let TileShape {
                 rows,
@@ -225,7 +245,15 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             let byte_off = (dst_region.region.cols.start as u64) * (elem_bytes as u64);
             (
                 WarpRole::Storer,
-                tk20::tma_store_async(*page_id, dst.0, byte_off, rows, cols, elem_bytes),
+                tk20::tma_store_async(
+                    *page_id,
+                    dst.0,
+                    byte_off,
+                    rows,
+                    cols,
+                    elem_bytes,
+                    dyn_byte_off.as_deref(),
+                ),
             )
         }
         TkInstr::Compute { role, body } => (*role, body.clone()),
@@ -631,10 +659,11 @@ mod tests {
     #[test]
     fn end_to_end_rmsnorm_kernel_snapshot() {
         use crate::tk_lower::{lower_rmsnorm, PageAllocator, RmsNormOp};
+        use crate::tk_warp_ir::Phase0;
 
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_rmsnorm(
+        lower_rmsnorm::<Phase0>(
             RmsNormOp {
                 x: BufId(0),
                 weight: BufId(1),

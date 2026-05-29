@@ -69,6 +69,14 @@ pub trait Phase: Copy + 'static {
     /// Runtime value the codegen passes to
     /// `kittens::group<N>::wait(sem, P::VALUE)`.
     const VALUE: u32;
+    /// Construct a fresh `PageHandle<Self>` for slot `id`. Used by
+    /// `PageAllocator::alloc_at::<P>()` so the lowerings can be generic
+    /// over the starting parity of a slot (slots reused across ops
+    /// alternate parity per round, and the allocator hands them out at
+    /// whichever phase they're currently observed at).
+    fn fresh_handle(id: u8) -> PageHandle<Self>
+    where
+        Self: Sized;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,10 +87,16 @@ pub struct Phase1;
 impl Phase for Phase0 {
     type Next = Phase1;
     const VALUE: u32 = 0;
+    fn fresh_handle(id: u8) -> PageHandle<Self> {
+        PageHandle::<Phase0>::fresh(id)
+    }
 }
 impl Phase for Phase1 {
     type Next = Phase0;
     const VALUE: u32 = 1;
+    fn fresh_handle(id: u8) -> PageHandle<Self> {
+        PageHandle::<Phase0>::fresh(id).advance()
+    }
 }
 
 // ── Page + scratch handles ──────────────────────────────────────────
@@ -220,20 +234,29 @@ pub enum TkInstr {
 
     /// TMA load: fill `page_id`'s tile from `src[src_region]`. Loader
     /// role only.
+    ///
+    /// `dyn_byte_off`: optional CUDA expression for a runtime byte
+    /// offset added to the static `src_region` start. Used inside
+    /// for-loop bodies whose byte offset depends on the loop variable
+    /// (e.g. `"(__n_i * 16384u)"` for a streaming GEMM W-tile offset).
+    /// When `None`, only the static `src_region.region.cols.start * elem_bytes`
+    /// is emitted.
     LoadAsync {
         page_id: u8,
         src: BufId,
         src_region: RegionRef,
         tile: TileShape,
+        dyn_byte_off: Option<String>,
     },
 
     /// TMA store: drain `page_id`'s tile to `dst[dst_region]`. Storer
-    /// role only.
+    /// role only. See [`TkInstr::LoadAsync::dyn_byte_off`].
     StoreAsync {
         page_id: u8,
         dst: BufId,
         dst_region: RegionRef,
         tile: TileShape,
+        dyn_byte_off: Option<String>,
     },
 
     /// Inline compute fragment in a consumer warp. Used for ops
@@ -418,6 +441,27 @@ impl TkProgram {
             src,
             src_region,
             tile,
+            dyn_byte_off: None,
+        });
+    }
+
+    /// TMA load with a runtime CUDA byte-offset expression added to
+    /// the static `src_region` byte offset. Used inside for-loop
+    /// bodies whose offset depends on the loop variable.
+    pub fn load_async_dyn(
+        &mut self,
+        page_id: u8,
+        src: BufId,
+        src_region: RegionRef,
+        tile: TileShape,
+        dyn_byte_off: impl Into<String>,
+    ) {
+        self.instrs.push(TkInstr::LoadAsync {
+            page_id,
+            src,
+            src_region,
+            tile,
+            dyn_byte_off: Some(dyn_byte_off.into()),
         });
     }
 
@@ -433,6 +477,24 @@ impl TkProgram {
             dst,
             dst_region,
             tile,
+            dyn_byte_off: None,
+        });
+    }
+
+    pub fn store_async_dyn(
+        &mut self,
+        page_id: u8,
+        dst: BufId,
+        dst_region: RegionRef,
+        tile: TileShape,
+        dyn_byte_off: impl Into<String>,
+    ) {
+        self.instrs.push(TkInstr::StoreAsync {
+            page_id,
+            dst,
+            dst_region,
+            tile,
+            dyn_byte_off: Some(dyn_byte_off.into()),
         });
     }
 

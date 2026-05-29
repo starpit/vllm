@@ -84,11 +84,17 @@ pub mod tk20 {
         elem_bytes: u32,
     ) -> String {
         let bytes = tile_bytes(rows, cols, elem_bytes);
+        // Cast through `uintptr_t` to drop `const` from the buffer arg
+        // (the kernel signature uses `const __nv_bfloat16* __restrict__`
+        // for inputs, but TK 2.0 `tma::load_async(void*, void*, ...)`
+        // wants non-const). `reinterpret_cast<void*>(const char*)` is
+        // rejected — `cannot cast away const`.
         format!(
             "kittens::group<1>::tma::expect_bytes(page_ready[{page_id}], {bytes}); \
              kittens::group<1>::tma::load_async(\
              reinterpret_cast<void*>(page_buf[{page_id}]), \
-             reinterpret_cast<void*>(reinterpret_cast<const char*>(buf{src_buf}) + {src_byte_off}), \
+             reinterpret_cast<void*>(\
+             reinterpret_cast<uintptr_t>(buf{src_buf}) + {src_byte_off}), \
              {bytes}, \
              page_ready[{page_id}]);"
         )
@@ -380,8 +386,22 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
         "    __shared__ kittens::semaphore page_consumed[{}];\n",
         NUM_PAGES
     ));
+    // Dynamic shared memory: TK 2.0 production pattern. The launcher must
+    // set `cudaFuncAttributeMaxDynamicSharedMemorySize` to at least
+    // `NUM_PAGES * PAGE_SIZE` so the pool fits. nvcc itself only requires
+    // the `extern __shared__` declaration; ptxas will not count it against
+    // the static smem cap (default 0xc000 on H100). Per-page typed views
+    // are the per-op atom's responsibility; we expose `page_buf[i]` as
+    // an array-of-PAGE_SIZE-byte rows so the rest of the emit code can
+    // keep using `page_buf[id]` as before.
+    // `__align__(128)` is the CUDA-canonical alignment attribute for an
+    // `extern __shared__` array. `alignas(...)` collides with the
+    // `__attribute__((shared))` that the `__shared__` macro expands to.
+    out.push_str("    extern __shared__ __align__(128) uint8_t __dynamic_smem[];\n");
     out.push_str(&format!(
-        "    __shared__ alignas(128) uint8_t page_buf[{}][{}];\n",
+        "    auto (&page_buf)[{}][{}] = *reinterpret_cast<uint8_t(*)[{}][{}]>(__dynamic_smem);\n",
+        NUM_PAGES,
+        crate::tk_warp_ir::PAGE_SIZE,
         NUM_PAGES,
         crate::tk_warp_ir::PAGE_SIZE
     ));
@@ -404,9 +424,11 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     out.push_str("            kittens::arrive(page_consumed[__i]);\n");
     out.push_str("        }\n");
     out.push_str("    }\n");
-    out.push_str(&format!(
-        "    kittens::group<{total_warps}>::sync();\n"
-    ));
+    // CTA-wide sync. `kittens::group<N>::sync()` (barrier-less) is
+    // only legal for single-warp groups (asserts `GROUP_WARPS==1`); the
+    // multi-warp form takes a `bar.sync` barrier id. Easiest portable
+    // choice for "all 10 warps converge" is just `__syncthreads()`.
+    out.push_str("    __syncthreads();\n");
     out.push_str("\n");
 
     // Function-scope prelude: typed page views, persistent compute
@@ -427,9 +449,11 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     out.push_str("\n");
 
     // Final sync: every warp waits for the others before retiring.
-    out.push_str(&format!(
-        "    kittens::group<{total_warps}>::sync();\n"
-    ));
+    // CTA-wide sync. `kittens::group<N>::sync()` (barrier-less) is
+    // only legal for single-warp groups (asserts `GROUP_WARPS==1`); the
+    // multi-warp form takes a `bar.sync` barrier id. Easiest portable
+    // choice for "all 10 warps converge" is just `__syncthreads()`.
+    out.push_str("    __syncthreads();\n");
     out.push_str("}\n");
     out
 }
@@ -537,8 +561,8 @@ mod tests {
             "page dst\n{src}"
         );
         assert!(
-            src.contains("reinterpret_cast<const char*>(buf3) + 256"),
-            "src byte offset\n{src}"
+            src.contains("reinterpret_cast<uintptr_t>(buf3) + 256"),
+            "src byte offset (uintptr_t form so const is dropped)\n{src}"
         );
         assert!(
             src.contains(", 128, page_ready[5]);"),
@@ -592,8 +616,10 @@ mod tests {
         assert!(src.contains("kittens::init_semaphore(page_consumed"), "{src}");
         assert!(src.contains("kittens::arrive(page_consumed[__i])"), "{src}");
 
-        // Sync after init (group<10>: 8 consumers + loader + storer).
-        assert!(src.contains("kittens::group<10>::sync();"), "init+final sync\n{src}");
+        // CTA-wide sync after init (10 warps = 320 threads). TK 2.0
+        // `group<N>::sync()` is barrier-less and asserts N==1, so for
+        // multi-warp the scaffold uses `__syncthreads()`.
+        assert!(src.contains("__syncthreads();"), "init+final sync\n{src}");
 
         // Body lands inside the kernel.
         assert!(src.contains("if (__role == ROLE_LOADER)"), "body merged\n{src}");

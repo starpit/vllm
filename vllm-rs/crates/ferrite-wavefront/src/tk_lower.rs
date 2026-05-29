@@ -375,12 +375,18 @@ pub fn lower_attn_decode<P: Phase>(
     let v_tile = k_tile;
 
     let loop_var = "__kv_i";
+    // Capture K and V pages' static phase at loop entry. See the
+    // `wait_loop_parity` doc on `tk_warp_ir.rs` for why iter-0 must
+    // read the page's static phase, not a hardcoded 0 — same root
+    // cause as the op4/Gemm deadlock when slot reuse straddled an
+    // odd number of prior cycles.
+    let start = P::VALUE;
     prog.for_loop(
         loop_var,
         LoopBound::RuntimeU32(op.num_kv_pages_arg.into()),
         |body| {
-            // Per-iteration K round. Parity = (__kv_i & 1).
-            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var);
+            // Per-iteration K round. Parity = (__kv_i & 1) ^ P::VALUE.
+            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
             // Region uses a runtime expression for the page-table
             // lookup; here we use a placeholder — the codegen's
             // `LoadAsync` arm pastes `(__kv_i)` as the row index when
@@ -395,15 +401,15 @@ pub fn lower_attn_decode<P: Phase>(
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
-            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var);
+            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
             body.compute(WarpRole::AllConsumers, qkt_softmax_step_body(&op));
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
 
-            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var);
+            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, k_id);
 
             // Per-iteration V round.
-            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, v_id, loop_var);
+            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, v_id, loop_var, start);
             body.load_async(
                 v_id,
                 op.v_cache,
@@ -412,11 +418,11 @@ pub fn lower_attn_decode<P: Phase>(
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
-            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var);
+            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
             body.compute(WarpRole::AllConsumers, sv_accum_step_body(&op));
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
 
-            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var);
+            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var, start);
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, v_id);
         },
     );
@@ -985,9 +991,16 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
     let y_byte_step = (op.bn as u64) * (op.act_elem as u64);
     let loop_var = "__n_i";
 
+    // Capture the page's static phase at loop entry — fed to every
+    // `wait_loop_parity` so iter-0 reads the page's actual mbarrier
+    // parity (the page was just allocated at type P, which the
+    // allocator records as `phase_bit[id] = P::VALUE`; the underlying
+    // mbarrier parity matches when the prior user closed the slot
+    // cleanly via `complete_round + release`).
+    let start = P::VALUE;
     prog.for_loop(loop_var, LoopBound::Const(n_blocks), |body| {
         // Loader streams the next W tile.
-        body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, w_id, loop_var);
+        body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, w_id, loop_var, start);
         body.load_async_dyn(
             w_id,
             op.w,
@@ -997,17 +1010,17 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         );
 
         // Consumer: wait y free, wait W ready, compute, signal both done.
-        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var);
-        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var);
+        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var, start);
+        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
         body.compute(WarpRole::AllConsumers, gemm_m1_compute_body(&op, x_id, w_id, y_id));
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, y_id);
 
         // Storer: free W slot (read-only — no actual store), drain Y.
-        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, w_id, loop_var);
+        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, w_id, loop_var, start);
         body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, w_id);
 
-        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, y_id, loop_var);
+        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, y_id, loop_var, start);
         body.store_async_dyn(
             y_id,
             op.out,
@@ -1018,17 +1031,30 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, y_id);
     });
 
-    // After the loop the W and Y page slots have been ping-ponged a
-    // runtime number of times. We can't statically track post-loop
-    // parity; `complete_round` advances the typed phase by one, which
-    // is correct for the even-N case. The caller MUST pick `bn` so
-    // `n_blocks = ceil(n / bn)` is even — odd-N would leave the slot
-    // at the same parity it started at, mis-aligning the allocator's
-    // recorded phase with the runtime barrier state.
-    let w_page = prog.complete_round(w_page);
-    let y_page = prog.complete_round(y_page);
-    pages.release(w_page);
-    pages.release(y_page);
+    // After the loop the W and Y page slots have been ping-ponged
+    // exactly `n_blocks` times. Each iteration flips each barrier
+    // (consumed/ready/done) once, so the post-loop runtime parity
+    // is `start_parity XOR (n_blocks & 1)`:
+    //   - odd  n_blocks → parity flipped from start ⇒ advance type by 1
+    //                     (== `complete_round`).
+    //   - even n_blocks → parity back at start ⇒ DON'T advance the
+    //                     type, just release at the unchanged phase.
+    //                     `complete_round` here would record
+    //                     `phase_bit = !P::VALUE` while the actual
+    //                     mbarrier sits at `P::VALUE`, and the next
+    //                     op picking up the slot would emit waits
+    //                     with one parity while the barrier polls the
+    //                     other → deadlock at the op boundary.
+    //                     This was the op5/Add hang post-op4/Gemm.
+    if n_blocks % 2 == 1 {
+        let w_page = prog.complete_round(w_page);
+        let y_page = prog.complete_round(y_page);
+        pages.release(w_page);
+        pages.release(y_page);
+    } else {
+        pages.release(w_page);
+        pages.release(y_page);
+    }
 
     // Close X's single round. X was loaded once (loader Ready), held by
     // the consumer through every loop iteration, and is now released.

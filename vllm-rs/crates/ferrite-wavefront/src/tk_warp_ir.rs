@@ -370,22 +370,46 @@ impl TkProgram {
         page
     }
 
-    /// Push a `Wait` whose phase is the *runtime* expression
-    /// `(<var> & 1)` — the TK 2.0 KV round-robin parity for iteration
-    /// `<var>`. Used inside [`TkProgram::for_loop`] bodies, where the
-    /// typed-phase model cannot statically track per-iteration flips.
+    /// Push a `Wait` whose phase is the *runtime* expression for the
+    /// current iteration's TK 2.0 round-robin parity. Used inside
+    /// [`TkProgram::for_loop`] bodies, where the typed-phase model
+    /// cannot statically track per-iteration flips.
+    ///
+    /// `start_phase` is the page's mbarrier parity at iter 0 — i.e.
+    /// the static `Phase::VALUE` of the [`PageHandle`] the caller
+    /// allocated outside the loop. Without it, the runtime expression
+    /// `(loop_var & 1)` would assume start parity 0; reusing a page
+    /// slot whose previous user closed it at the *opposite* parity
+    /// (every other op cycle on a typical decode forward) would then
+    /// emit a wait at parity 0 against an mbarrier whose actual
+    /// parity is also 0 — and the wait would block forever waiting
+    /// for a flip that the prior round already exhausted. This was
+    /// the deadlock at op4/Gemm of the one-layer megakernel: w_page
+    /// reused page-slot 1 (left at Phase1 by op0/RmsNorm), but the
+    /// loop body emitted parity 0 for iter 0, mismatching the actual
+    /// barrier parity by one.
+    ///
+    /// Per-iter parity = `(loop_var & 1) XOR start_phase`. For
+    /// `start_phase=0` this collapses to `(loop_var & 1)` (the
+    /// original always-start-fresh assumption). For `start_phase=1`
+    /// it emits `((loop_var & 1) ^ 1)`.
     pub fn wait_loop_parity(
         &mut self,
         role: WarpRole,
         kind: PageBarrier,
         page_id: u8,
         loop_var: &str,
+        start_phase: u32,
     ) {
+        let phase_expr = match start_phase & 1 {
+            0 => format!("({loop_var} & 1)"),
+            _ => format!("(({loop_var} & 1) ^ 1)"),
+        };
         self.instrs.push(TkInstr::Wait {
             role,
             page_id,
             kind,
-            phase: WaitPhase::Runtime(format!("({loop_var} & 1)")),
+            phase: WaitPhase::Runtime(phase_expr),
         });
     }
 

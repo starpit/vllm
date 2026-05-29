@@ -116,17 +116,21 @@ mod tests {
     /// `launch_tk_decode_one_layer` wrapper with `__num_kv_pages = 1`,
     /// and assert the launch + stream sync both report `cudaSuccess`.
     ///
-    /// Currently `#[ignore]`d: when run on H100 the kernel launches
-    /// (cudaFuncSetAttribute and the triple-chevron return success)
-    /// but the persistent megakernel does not retire — `nvidia-smi`
-    /// reports 100% util on GPU 0 with `ferrite_wavefront-*` as the
-    /// owning process and `cuStreamSynchronize` blocks indefinitely.
-    /// All threads spin on a `mbarrier.try_wait.parity` somewhere in
-    /// the loader / storer / 8 consumer round protocol the orchestrator
-    /// emits. The harness still serves as the launch-path test bed; the
-    /// barrier-protocol audit is the next slice of work and will flip
-    /// this back on once a single-op reproducer pins down which round
-    /// participant is missing a matching `arrive`.
+    /// `#[ignore]`d so the test only runs when explicitly invoked
+    /// (it requires H100 + the cudaforge cache to have been
+    /// populated by `bin/tk_emit_decode` and `ferrite-cuda-builder`).
+    /// Verified passing on H100 in 0.65 s after the three round-
+    /// protocol fixes:
+    ///   1. `Arrive` lowers to `kittens::group<1>::arrive` so each
+    ///      consumer warp's lane 0 fires (8 arrives, not 1).
+    ///   2. `wait_loop_parity` takes `start_phase` so iter 0 reads
+    ///      the page's static phase, not a hardcoded 0 — fixes
+    ///      slot reuse mid-forward when a prior op closed the slot
+    ///      at the opposite parity (op4/Gemm hang).
+    ///   3. `lower_gemm_m1` skips `complete_round` when
+    ///      `n_blocks % 2 == 0` so the typed phase tracks the
+    ///      runtime barrier parity at the op boundary
+    ///      (op5/Add hang post-op4/Gemm).
     ///
     /// Run manually with:
     ///   cargo test -p ferrite-wavefront --features cuda \

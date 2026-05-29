@@ -30,11 +30,28 @@ use crate::tk_lower::{
     lower_silu_mul, AddOp, AttnDecodeOp, GemmM1Op, PageAllocator, RmsNormOp, RopeRotateOp,
     SiluMulOp,
 };
-use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, PAGE_SIZE};
+use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, WarpRole, PAGE_SIZE};
 
 /// Activation element bytes assumed across the decode forward.
 /// bf16 = 2 bytes. The substrate is bf16-only today.
 pub const ACT_ELEM: u32 = 2;
+
+/// Short kind tag for each [`LoweredOp`] — used by the per-op trace
+/// marker the orchestrator inserts before every op's lowering, so
+/// `EmitOpts::debug_handshake` printf traces can be partitioned by op.
+fn op_kind_name(op: &LoweredOp) -> &'static str {
+    match op {
+        LoweredOp::Gemm { .. } => "Gemm",
+        LoweredOp::RmsNorm { .. } => "RmsNorm",
+        LoweredOp::Silu => "Silu",
+        LoweredOp::Mul => "Mul",
+        LoweredOp::SiluMul => "SiluMul",
+        LoweredOp::Add => "Add",
+        LoweredOp::RopeRotate { .. } => "RopeRotate",
+        LoweredOp::RopeAppend { .. } => "RopeAppend",
+        LoweredOp::AttnDecode { .. } => "AttnDecode",
+    }
+}
 
 /// Pick `bn` (W-tile rows per page load) for a given GEMM `k`.
 /// Constraint: `bn * k * ACT_ELEM <= PAGE_SIZE` AND `n_blocks = ceil(n / bn)`
@@ -97,6 +114,24 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
     for (op_idx, desc) in input.ops.iter().enumerate() {
         let out_buf = BufId(n_sources + op_idx as u32);
         op_out_buf.push(out_buf);
+
+        // Per-op trace marker — fires from thread 0 (warp 0 lane 0) so
+        // the printf trace tagged by `EmitOpts::debug_handshake` can be
+        // partitioned by op. Wrapped in `#ifdef TK_DEBUG_HANDSHAKE` so
+        // it's a compile-time no-op when the dbg-handshake instrumentation
+        // is off (the same macro `tk_codegen` toggles for the per-op
+        // wait/arrive printfs). One thread, one line per op — negligible
+        // even if always on.
+        let op_tag = format!("op{op_idx}/{}", op_kind_name(&desc.op));
+        prog.compute(
+            WarpRole::All,
+            format!(
+                "#ifdef TK_DEBUG_HANDSHAKE\n        \
+                 if (threadIdx.x == 0) {{ \
+                 printf(\"[BEGIN {op_tag}]\\n\"); }}\n        \
+                 #endif"
+            ),
+        );
 
         match desc.op {
             LoweredOp::RmsNorm { eps } => {

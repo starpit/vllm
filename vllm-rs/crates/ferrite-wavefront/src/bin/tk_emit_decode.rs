@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use ferrite_wavefront::fixtures::{one_layer_input, orchestrator_kernel_args};
-use ferrite_wavefront::tk_codegen::emit_kernel;
+use ferrite_wavefront::tk_codegen::{emit_kernel_with_opts, EmitOpts};
 use ferrite_wavefront::tk_orchestrate::lower_to_tk;
 
 const KERNEL_NAME: &str = "tk_decode_one_layer";
@@ -33,15 +33,21 @@ fn main() {
     let input = one_layer_input();
     let (prog, n_bufs) = lower_to_tk(&input);
     let args = orchestrator_kernel_args(&input, n_bufs);
-    let src = emit_kernel(KERNEL_NAME, &args, &prog);
+
+    let debug_handshake = std::env::var("TK_EMIT_DEBUG_HANDSHAKE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let opts = EmitOpts { debug_handshake };
+    let src = emit_kernel_with_opts(KERNEL_NAME, &args, &prog, &opts);
 
     let path = out_dir.join(format!("{KERNEL_NAME}.cu"));
     std::fs::write(&path, &src).expect("write .cu");
     eprintln!(
-        "wrote {} ({} bytes, {} bufs, {} ops)",
+        "wrote {} ({} bytes, {} bufs, {} ops, debug_handshake={})",
         path.display(),
         src.len(),
         n_bufs,
-        input.ops.len()
+        input.ops.len(),
+        debug_handshake,
     );
 }

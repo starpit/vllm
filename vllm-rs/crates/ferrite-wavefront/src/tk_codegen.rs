@@ -513,6 +513,10 @@ pub fn emit_kernel_with_opts(
         // `printf` from device code lives in `<cstdio>`; some TK 2.0
         // headers don't transitively include it on Hopper.
         out.push_str("#include <cstdio>\n");
+        // The orchestrator emits per-op trace markers wrapped in
+        // `#ifdef TK_DEBUG_HANDSHAKE`; defining the macro here lights
+        // them up alongside the wait/arrive/TMA printfs.
+        out.push_str("#define TK_DEBUG_HANDSHAKE 1\n");
     }
     out.push_str("\n");
 

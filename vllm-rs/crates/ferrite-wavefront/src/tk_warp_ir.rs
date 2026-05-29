@@ -1,0 +1,382 @@
+// SPDX-License-Identifier: Apache-2.0
+//! `TkProgram` — the warp-tier IR for one persistent TK 2.0 megakernel
+//! CTA.
+//!
+//! This is the layer below [`subtile_ir`]: where `subtile_ir` is per-
+//! WORKER (one tape per CTA on CUDA, one per threadgroup on Metal) and
+//! whole-op-granular, `tk_warp_ir` is per-WARP-ROLE inside one CTA. It
+//! exists so the CUDA TK megakernel codegen is a literal `match`-walk
+//! instead of synthesising warp roles, mbarrier pages, and phase parity
+//! at emit time. See `SUBTILE_TK_PLAN.md` at the worktree root for the
+//! design rationale.
+//!
+//! # The phase invariant
+//!
+//! Every TK 2.0 mbarrier handoff has a `u32` phase parity that flips
+//! `0 ↔ 1` on each round; the loader, consumer, and storer must agree
+//! on which parity belongs to "this round" or the wait blocks forever.
+//! Today's `MegaDispatchState::page_rounds` re-derives parity per op
+//! call site; one mis-counted op → silent drift → m=1 megakernel hang.
+//!
+//! Here phase is a TYPE: [`Phase0`] / [`Phase1`] with [`Phase::Next`]
+//! flipping under [`PageHandle::advance`]. A wait/arrive on the wrong
+//! parity is a Rust *compile* error, not a runtime deadlock.
+
+#![allow(dead_code)]
+
+use std::marker::PhantomData;
+
+use crate::subtile_ir::{BufId, RegionRef};
+
+// ── Substrate constants (TK 2.0 default; see header
+//    `include/kittens.cuh::page` and the persistent kernel scaffold) ──
+
+/// Number of mbarrier pages in the persistent CTA.
+pub const NUM_PAGES: u32 = 13;
+
+/// Size of one mbarrier page in bytes (TK 2.0 default).
+pub const PAGE_SIZE: u32 = 16384;
+
+/// Bytes of CTA-level scratch outside the page pool.
+pub const SCRATCH_BYTES: u32 = 1024;
+
+/// Number of consumer warps in the persistent CTA.
+pub const NUM_CONSUMER_WARPS: u8 = 8;
+
+// ── Phase as a type ─────────────────────────────────────────────────
+
+/// A phase parity, encoded as a marker type so phase advance is a type-
+/// level move (`P → P::Next`) and a wait on the wrong parity is a
+/// compile error.
+pub trait Phase: Copy + 'static {
+    /// The other parity: `Phase0::Next == Phase1` and vice versa.
+    type Next: Phase<Next = Self>;
+    /// Runtime value the codegen passes to
+    /// `kittens::group<N>::wait(sem, P::VALUE)`.
+    const VALUE: u32;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Phase0;
+#[derive(Clone, Copy, Debug)]
+pub struct Phase1;
+
+impl Phase for Phase0 {
+    type Next = Phase1;
+    const VALUE: u32 = 0;
+}
+impl Phase for Phase1 {
+    type Next = Phase0;
+    const VALUE: u32 = 1;
+}
+
+// ── Page + scratch handles ──────────────────────────────────────────
+
+/// One mbarrier page in the persistent CTA, carrying its CURRENT phase
+/// parity as a type parameter. The `id` is the runtime page slot
+/// `0..NUM_PAGES`; the phase is `P::VALUE`.
+///
+/// Phase moves only through [`PageHandle::advance`], which is the only
+/// way to obtain a `PageHandle<P::Next>` from a `PageHandle<P>`. So a
+/// codegen that emits a `Wait` reading `P::VALUE` on a page whose
+/// (latest) handle was `P::Next` is rejected at the *call site* of the
+/// instruction constructor, not at validation, and not at runtime.
+#[derive(Clone, Copy, Debug)]
+pub struct PageHandle<P: Phase> {
+    pub id: u8,
+    _phase: PhantomData<P>,
+}
+
+impl PageHandle<Phase0> {
+    /// First handle on a freshly-initialised page. The
+    /// initialisation convention matches TK 2.0:
+    /// `page_ready[i].init(0)`, `page_done[i].init(0)`,
+    /// `page_consumed[i].arrive_pre()` so its first wait reads phase 1.
+    pub const fn fresh(id: u8) -> Self {
+        Self {
+            id,
+            _phase: PhantomData,
+        }
+    }
+}
+
+impl<P: Phase> PageHandle<P> {
+    pub const fn id(&self) -> u8 {
+        self.id
+    }
+    pub const fn phase(&self) -> u32 {
+        P::VALUE
+    }
+    /// Advance the phase. Call this when the program logically performs
+    /// `arrive` on this page slot.
+    pub fn advance(self) -> PageHandle<P::Next> {
+        PageHandle {
+            id: self.id,
+            _phase: PhantomData,
+        }
+    }
+}
+
+/// A scratch byte region, with offset+length carried as const generics
+/// so a slice that overlaps another's range fails to type-check.
+///
+/// SAFETY (typed): the construction site is responsible for proving
+/// `OFF + LEN <= SCRATCH_BYTES`. A future tightening will move this to
+/// a `where (OFF + LEN <= SCRATCH_BYTES):` bound once
+/// `generic_const_exprs` stabilises; for now the construction is in
+/// this crate only.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScratchSlice<const OFF: u32, const LEN: u32>;
+
+// ── Warp roles ──────────────────────────────────────────────────────
+
+/// Which warp role inside the persistent CTA owns an instruction. The
+/// CUDA emit routes the instruction to a `if (warp_role == X) { ... }`
+/// arm; instructions tagged [`WarpRole::All`] are emitted unguarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WarpRole {
+    /// The producer warp that issues TMA loads into pages.
+    Loader,
+    /// One of the `NUM_CONSUMER_WARPS` consumer warps. The runtime
+    /// `u8` is the warp index inside the consumer group; instructions
+    /// that all consumer warps share use [`WarpRole::AllConsumers`].
+    Consumer(u8),
+    /// All consumer warps execute the instruction.
+    AllConsumers,
+    /// The storer warp that issues TMA stores out of pages.
+    Storer,
+    /// All warps in the CTA execute the instruction (init, final sync).
+    All,
+}
+
+// ── Page barriers ───────────────────────────────────────────────────
+
+/// Which TK 2.0 mbarrier of a page slot a `Wait` / `Arrive` is talking
+/// to. One slot has THREE mbarriers ([`PageBarrier::Ready`],
+/// [`PageBarrier::Done`], [`PageBarrier::Consumed`]) so the loader →
+/// consumer → storer → next-round-loader cycle is a closed three-step
+/// handshake instead of one shared phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageBarrier {
+    /// Loader signals → consumer waits. "Page filled."
+    Ready,
+    /// Consumer signals → storer waits. "Compute done; flush to DRAM."
+    Done,
+    /// Storer signals → loader waits. "Page free for next round."
+    Consumed,
+}
+
+// ── Tile descriptor ─────────────────────────────────────────────────
+
+/// A 2-D tile within a page or scratch region. Const generics carry
+/// the shape so a Mma whose A.K and B.K disagree is a compile error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileShape {
+    pub rows: u32,
+    pub cols: u32,
+    pub elem_bytes: u32,
+}
+
+// ── Instructions ────────────────────────────────────────────────────
+
+/// One instruction in a [`TkProgram`]. The CUDA codegen is a literal
+/// `match`-walk over this enum; nothing else is decided at emit time.
+#[derive(Clone, Debug)]
+pub enum TkInstr {
+    /// Wait on `page_done[page_id]` (or `page_ready` / `page_consumed`,
+    /// per `kind`) at the typed `phase`.
+    Wait {
+        role: WarpRole,
+        page_id: u8,
+        kind: PageBarrier,
+        /// `P::VALUE` of the [`PageHandle`] the constructor saw.
+        phase: u32,
+    },
+
+    /// Arrive on the matching mbarrier. Caller is responsible for
+    /// having already advanced the corresponding [`PageHandle`] in the
+    /// program-builder state.
+    Arrive {
+        role: WarpRole,
+        page_id: u8,
+        kind: PageBarrier,
+    },
+
+    /// TMA load: fill `page_id`'s tile from `src[src_region]`. Loader
+    /// role only.
+    LoadAsync {
+        page_id: u8,
+        src: BufId,
+        src_region: RegionRef,
+        tile: TileShape,
+    },
+
+    /// TMA store: drain `page_id`'s tile to `dst[dst_region]`. Storer
+    /// role only.
+    StoreAsync {
+        page_id: u8,
+        dst: BufId,
+        dst_region: RegionRef,
+        tile: TileShape,
+    },
+
+    /// Inline compute fragment in a consumer warp. Used for ops
+    /// without a TK 2.0 primitive (RMS reduction, residual add). The
+    /// `body` text has been pre-resolved by the per-op atom — codegen
+    /// pastes it into the role-routed arm verbatim. (Equivalent of
+    /// today's atom_lib `emit_*_body` but shorter, single-warp scope.)
+    Compute { role: WarpRole, body: String },
+
+    /// Group sync (`kittens::group<NUM_CONSUMER_WARPS>::sync()`).
+    Sync { role: WarpRole },
+}
+
+/// One persistent-CTA tape.
+#[derive(Clone, Debug, Default)]
+pub struct TkProgram {
+    pub instrs: Vec<TkInstr>,
+}
+
+impl TkProgram {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push a typed `Wait` whose `phase` is taken from the [`PageHandle`].
+    pub fn wait<P: Phase>(
+        &mut self,
+        role: WarpRole,
+        kind: PageBarrier,
+        page: PageHandle<P>,
+    ) -> PageHandle<P> {
+        self.instrs.push(TkInstr::Wait {
+            role,
+            page_id: page.id,
+            kind,
+            phase: P::VALUE,
+        });
+        page
+    }
+
+    /// Push a typed `Arrive`. Returns the page handle with phase
+    /// advanced (`P → P::Next`) — the next `wait` on it will read the
+    /// flipped parity automatically.
+    pub fn arrive<P: Phase>(
+        &mut self,
+        role: WarpRole,
+        kind: PageBarrier,
+        page: PageHandle<P>,
+    ) -> PageHandle<P::Next> {
+        self.instrs.push(TkInstr::Arrive {
+            role,
+            page_id: page.id,
+            kind,
+        });
+        page.advance()
+    }
+
+    pub fn load_async(
+        &mut self,
+        page_id: u8,
+        src: BufId,
+        src_region: RegionRef,
+        tile: TileShape,
+    ) {
+        self.instrs.push(TkInstr::LoadAsync {
+            page_id,
+            src,
+            src_region,
+            tile,
+        });
+    }
+
+    pub fn store_async(
+        &mut self,
+        page_id: u8,
+        dst: BufId,
+        dst_region: RegionRef,
+        tile: TileShape,
+    ) {
+        self.instrs.push(TkInstr::StoreAsync {
+            page_id,
+            dst,
+            dst_region,
+            tile,
+        });
+    }
+
+    pub fn compute(&mut self, role: WarpRole, body: impl Into<String>) {
+        self.instrs.push(TkInstr::Compute {
+            role,
+            body: body.into(),
+        });
+    }
+
+    pub fn sync(&mut self, role: WarpRole) {
+        self.instrs.push(TkInstr::Sync { role });
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The phase moves through the type system. A `wait` after one
+    /// `arrive` reads `Phase1::VALUE`; after two arrives, back to
+    /// `Phase0::VALUE`.
+    #[test]
+    fn phase_advances_through_arrive() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page); // P0 → P1
+        let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page); // reads P1
+        let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page); // P1 → P0
+        let _page = p.wait(WarpRole::Storer, PageBarrier::Done, page); // reads P0
+
+        let phases: Vec<u32> = p
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                TkInstr::Wait { phase, .. } => Some(*phase),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(phases, vec![0, 1, 0], "ping-pong from the type system");
+    }
+
+    /// Page ids and roles round-trip through the program.
+    #[test]
+    fn instrs_carry_role_page_kind() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(7);
+        p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        match &p.instrs[0] {
+            TkInstr::Wait {
+                role,
+                page_id,
+                kind,
+                phase,
+            } => {
+                assert_eq!(*role, WarpRole::Loader);
+                assert_eq!(*page_id, 7);
+                assert_eq!(*kind, PageBarrier::Consumed);
+                assert_eq!(*phase, 0);
+            }
+            _ => panic!("expected Wait"),
+        }
+    }
+
+    /// `advance` flips parity at the type level: this test would not
+    /// compile if `advance` returned the same `Phase` it consumed.
+    #[test]
+    fn phase_advance_is_typed() {
+        let p0: PageHandle<Phase0> = PageHandle::fresh(3);
+        let p1: PageHandle<Phase1> = p0.advance();
+        let p0_again: PageHandle<Phase0> = p1.advance();
+        assert_eq!(p0_again.id(), 3);
+        assert_eq!(p0_again.phase(), 0);
+    }
+}

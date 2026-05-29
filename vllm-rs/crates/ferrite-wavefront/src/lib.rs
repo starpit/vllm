@@ -25,3 +25,6 @@ pub mod scheduler;
 pub mod subtile;
 pub mod subtile_ir;
 pub mod tape;
+pub mod tk_codegen;
+pub mod tk_lower;
+pub mod tk_warp_ir;

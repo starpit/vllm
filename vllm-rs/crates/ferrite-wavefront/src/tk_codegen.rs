@@ -241,6 +241,167 @@ pub fn emit_body(prog: &TkProgram) -> String {
     out
 }
 
+// ── Kernel scaffold ────────────────────────────────────────────────
+
+/// One typed buffer argument to the persistent-CTA kernel. The emit
+/// puts these in the kernel signature in declaration order; the
+/// in-IR `BufId` indexes into this list (`buf{id}` in the body matches
+/// `args[id].name`).
+#[derive(Clone, Debug)]
+pub struct KernelArg {
+    /// CUDA type, e.g. `"const __nv_bfloat16* __restrict__"`.
+    pub ty: String,
+    /// Identifier name in the kernel signature; the body references
+    /// `buf{i}` where `i` is the position in [`KernelArgs::bufs`].
+    /// The codegen synthesises a `#define buf{i} <name>` so the body's
+    /// `buf3 /* +256 */` substitution lands on the right argument.
+    pub name: String,
+}
+
+/// The full kernel arg pack. Runtime u32 args (e.g. the
+/// [`crate::tk_warp_ir::LoopBound::RuntimeU32`] names referenced by
+/// the body's ForLoops) must be present here too; the codegen
+/// otherwise has nowhere to declare them.
+#[derive(Clone, Debug, Default)]
+pub struct KernelArgs {
+    pub bufs: Vec<KernelArg>,
+    /// Names of runtime u32 args (no type — always `uint32_t`).
+    pub u32_args: Vec<String>,
+}
+
+/// Emit a complete TK 2.0 persistent-CTA kernel. The output is a
+/// `.cu` snippet with `#include "kittens.cuh"`, the kernel signature
+/// (`__global__ __launch_bounds__(...) void <name>(...)`), the page
+/// pool / mbarrier declarations, the init handshake (matches TK 2.0:
+/// `page_ready[i].init(0)`, `page_done[i].init(0)`,
+/// `page_consumed[i].init(0)` then `arrive_pre`), the role dispatch
+/// (warpid 0 = loader, 1 = storer, 2..9 = consumer), the body the
+/// caller built via [`emit_body`], and the final group sync.
+///
+/// The total warp count is `1 (loader) + 1 (storer) +
+/// NUM_CONSUMER_WARPS (consumers) = 10`, so threadIdx.x ranges over
+/// `[0, 320)` and `__launch_bounds__(320)` is emitted.
+///
+/// This is a *placeholder* in the sense that the body's compute
+/// fragments still reference symbols (`__page_smem`, `__weight_smem`,
+/// `__q_smem`, etc.) the per-op atom is responsible for binding. The
+/// scaffold does not synthesise those bindings — they're the per-op
+/// pre-resolved fragments that today's atom_lib produces. What this
+/// scaffold *does* guarantee is that the role dispatch, mbarrier
+/// init, and final sync are byte-identical to TK 2.0.
+pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
+    use crate::tk_warp_ir::{NUM_CONSUMER_WARPS, NUM_PAGES};
+
+    let total_warps = NUM_CONSUMER_WARPS as u32 + 2; // 1 loader + 1 storer + N consumers
+    let total_threads = total_warps * 32;
+
+    let mut out = String::new();
+    out.push_str("#include \"kittens.cuh\"\n");
+    out.push_str("\n");
+
+    // Role constants. Matches the WarpRole emit in role_guard().
+    out.push_str("#define ROLE_LOADER   0\n");
+    out.push_str("#define ROLE_STORER   1\n");
+    out.push_str("#define ROLE_CONSUMER 2\n");
+    out.push_str("\n");
+
+    // Kernel signature.
+    out.push_str(&format!(
+        "__global__ __launch_bounds__({total_threads}) void {name}(\n"
+    ));
+    let mut first = true;
+    for arg in &args.bufs {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push_str(&format!("    {} {}", arg.ty, arg.name));
+    }
+    for u32_name in &args.u32_args {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push_str(&format!("    const uint32_t {u32_name}"));
+    }
+    out.push_str("\n) {\n");
+    out.push_str("    using namespace kittens;\n");
+    out.push_str("\n");
+
+    // `buf{i}` aliases so the body's `buf3 /* +256 */` substitutions
+    // resolve to the right named arg.
+    for (i, arg) in args.bufs.iter().enumerate() {
+        out.push_str(&format!("    auto& buf{i} = {};\n", arg.name));
+    }
+    out.push_str("\n");
+
+    // Role dispatch.
+    out.push_str("    const int __warpid = threadIdx.x / 32;\n");
+    out.push_str("    int __role;\n");
+    out.push_str("    if      (__warpid == 0) __role = ROLE_LOADER;\n");
+    out.push_str("    else if (__warpid == 1) __role = ROLE_STORER;\n");
+    out.push_str("    else                    __role = ROLE_CONSUMER;\n");
+    out.push_str("    const int __consumer_idx = __warpid - 2;\n");
+    out.push_str("    (void)__consumer_idx;\n");
+    out.push_str("\n");
+
+    // Page pool + mbarriers. The page byte-buffer is allocated as
+    // dynamic shared memory; per-page typed views are the per-op
+    // atom's responsibility.
+    out.push_str(&format!(
+        "    __shared__ kittens::semaphore page_ready[{}];\n",
+        NUM_PAGES
+    ));
+    out.push_str(&format!(
+        "    __shared__ kittens::semaphore page_done[{}];\n",
+        NUM_PAGES
+    ));
+    out.push_str(&format!(
+        "    __shared__ kittens::semaphore page_consumed[{}];\n",
+        NUM_PAGES
+    ));
+    out.push_str(&format!(
+        "    __shared__ alignas(128) uint8_t page_buf[{}][{}];\n",
+        NUM_PAGES,
+        crate::tk_warp_ir::PAGE_SIZE
+    ));
+    out.push_str("\n");
+
+    // Init: lane-0 of warp-0 sets up all mbarriers; consumed is
+    // pre-arrived so its first wait reads the post-arrive parity.
+    // (TK 2.0 default; matches kittens header `page_consumed[i].arrive_pre()`.)
+    out.push_str("    if (__warpid == 0 && (threadIdx.x & 31) == 0) {\n");
+    out.push_str(&format!(
+        "        for (int __i = 0; __i < {}; ++__i) {{\n",
+        NUM_PAGES
+    ));
+    out.push_str("            kittens::init_semaphore(page_ready[__i], 0, 1);\n");
+    out.push_str(&format!(
+        "            kittens::init_semaphore(page_done[__i], 0, {});\n",
+        NUM_CONSUMER_WARPS
+    ));
+    out.push_str("            kittens::init_semaphore(page_consumed[__i], 0, 1);\n");
+    out.push_str("            kittens::arrive(page_consumed[__i]);\n");
+    out.push_str("        }\n");
+    out.push_str("    }\n");
+    out.push_str(&format!(
+        "    kittens::group<{total_warps}>::sync();\n"
+    ));
+    out.push_str("\n");
+
+    // The role-routed body.
+    out.push_str("    // ── tk_warp_ir body ──\n");
+    out.push_str(&emit_body(prog));
+    out.push_str("\n");
+
+    // Final sync: every warp waits for the others before retiring.
+    out.push_str(&format!(
+        "    kittens::group<{total_warps}>::sync();\n"
+    ));
+    out.push_str("}\n");
+    out
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -333,6 +494,113 @@ mod tests {
         let src = emit_body(&p);
         assert!(src.contains("buf3 /* +256 */"), "byte off baked in\n{src}");
         assert!(src.contains("page_buf[5]"), "page id baked in\n{src}");
+    }
+
+    #[test]
+    fn kernel_scaffold_has_role_dispatch_and_mbarrier_init() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let _page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+
+        let args = KernelArgs {
+            bufs: vec![
+                KernelArg {
+                    ty: "const __nv_bfloat16* __restrict__".into(),
+                    name: "x".into(),
+                },
+                KernelArg {
+                    ty: "__nv_bfloat16* __restrict__".into(),
+                    name: "out".into(),
+                },
+            ],
+            u32_args: vec!["__num_kv_pages".into()],
+        };
+        let src = emit_kernel("tk_kernel_smoke", &args, &p);
+
+        // Sanity: kernel signature references all args.
+        assert!(src.contains("__global__ __launch_bounds__(320) void tk_kernel_smoke("), "{src}");
+        assert!(src.contains("const __nv_bfloat16* __restrict__ x"), "{src}");
+        assert!(src.contains("__nv_bfloat16* __restrict__ out"), "{src}");
+        assert!(src.contains("const uint32_t __num_kv_pages"), "{src}");
+
+        // Aliases: `buf0`, `buf1` map to named args.
+        assert!(src.contains("auto& buf0 = x;"), "{src}");
+        assert!(src.contains("auto& buf1 = out;"), "{src}");
+
+        // Role dispatch.
+        assert!(src.contains("__role = ROLE_LOADER"), "{src}");
+        assert!(src.contains("__role = ROLE_STORER"), "{src}");
+        assert!(src.contains("__role = ROLE_CONSUMER"), "{src}");
+        assert!(src.contains("const int __consumer_idx"), "{src}");
+
+        // Mbarrier init.
+        assert!(src.contains("__shared__ kittens::semaphore page_ready[13]"), "{src}");
+        assert!(src.contains("__shared__ kittens::semaphore page_done[13]"), "{src}");
+        assert!(src.contains("__shared__ kittens::semaphore page_consumed[13]"), "{src}");
+        assert!(src.contains("kittens::init_semaphore(page_ready"), "{src}");
+        assert!(src.contains("kittens::init_semaphore(page_done"), "{src}");
+        assert!(src.contains("kittens::init_semaphore(page_consumed"), "{src}");
+        assert!(src.contains("kittens::arrive(page_consumed[__i])"), "{src}");
+
+        // Sync after init (group<10>: 8 consumers + loader + storer).
+        assert!(src.contains("kittens::group<10>::sync();"), "init+final sync\n{src}");
+
+        // Body lands inside the kernel.
+        assert!(src.contains("if (__role == ROLE_LOADER)"), "body merged\n{src}");
+    }
+
+    /// End-to-end smoke: lower one RmsNorm and emit a complete kernel.
+    /// Snapshot test — write the .cu next to the test so we can `oc
+    /// rsync` it to the pod and feed nvcc.
+    #[test]
+    fn end_to_end_rmsnorm_kernel_snapshot() {
+        use crate::tk_lower::{lower_rmsnorm, PageAllocator, RmsNormOp};
+
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        lower_rmsnorm(
+            RmsNormOp {
+                x: BufId(0),
+                weight: BufId(1),
+                out: BufId(2),
+                hidden: 2048,
+                m: 1,
+                act_elem: 2,
+                eps: 1e-5,
+                init: true,
+            },
+            &mut pages,
+            &mut prog,
+        );
+
+        let args = KernelArgs {
+            bufs: vec![
+                KernelArg {
+                    ty: "const __nv_bfloat16* __restrict__".into(),
+                    name: "x".into(),
+                },
+                KernelArg {
+                    ty: "const __nv_bfloat16* __restrict__".into(),
+                    name: "weight".into(),
+                },
+                KernelArg {
+                    ty: "__nv_bfloat16* __restrict__".into(),
+                    name: "out".into(),
+                },
+            ],
+            u32_args: vec![],
+        };
+        let src = emit_kernel("tk_rmsnorm_decode_h2048", &args, &prog);
+
+        // Sanity: the body's six-step handshake is inside the kernel.
+        assert!(src.contains("kittens::group<1>::wait(page_consumed[0], 0)"), "{src}");
+        assert!(src.contains("kittens::group<8>::wait(page_ready[0], 0)"), "{src}");
+        assert!(src.contains("kittens::group<1>::wait(page_done[0], 0)"), "{src}");
+        // Mbarrier init.
+        assert!(src.contains("kittens::init_semaphore(page_ready[__i], 0, 1);"));
+        assert!(src.contains("kittens::init_semaphore(page_done[__i], 0, 8);"));
+        // Compute body.
+        assert!(src.contains("rsqrtf"));
     }
 
     #[test]

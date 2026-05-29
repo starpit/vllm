@@ -152,7 +152,8 @@ fn role_guard(role: WarpRole) -> Option<String> {
 }
 
 /// `kittens::group<N>` width for a role: TMA/sync gates are sized to
-/// the role's warp count.
+/// the role's warp count. Used by Wait / Sync emit, where every thread
+/// in the group is a participant.
 fn role_group_width(role: WarpRole) -> u32 {
     match role {
         WarpRole::All => NUM_CONSUMER_WARPS as u32 + 2, // 8 consumers + loader + storer (illustrative)
@@ -161,9 +162,120 @@ fn role_group_width(role: WarpRole) -> u32 {
     }
 }
 
+/// `kittens::group<N>` width for an *Arrive*. ALWAYS 1 — the TK 2.0
+/// `group<N>::arrive(semaphore&)` is gated on the GROUP's lane 0
+/// (`threadIdx.x % (N*32) == 0`), so a multi-warp group<N>::arrive
+/// fires `mbarrier.arrive` exactly ONCE total, not once per warp.
+/// Our role-routed arms have each participating warp execute the
+/// arrive independently; we want each warp's per-warp lane 0 to
+/// fire, which is precisely what `group<1>` (a.k.a. `kittens::warp`)
+/// gives us. The barrier's expected arrival count then equals the
+/// number of warps that hit the role arm — the consumer's
+/// `init_semaphore(page_done, 0, NUM_CONSUMER_WARPS)` matches 8
+/// warps each firing once.
+///
+/// This was the deadlock root cause for `tk_decode_one_layer` and
+/// `tk_decode_rmsnorm`: emitting `group<8>::arrive(page_done[i])`
+/// produced ONE mbarrier.arrive against an init expecting 8 → arrive
+/// count went 8→7 → parity never flipped → storer's `try_wait.parity`
+/// polled forever. The trace in
+/// `feedback_ff_subtile_smoke_handoff` showed all 8 ARRIVE printfs
+/// firing (printfs are at the call-site lane gate, not the
+/// per-arrive-PTX gate), masking the underlying single-fire arrive.
+fn arrive_group_width(_role: WarpRole) -> u32 {
+    1
+}
+
+// ── Emit options ───────────────────────────────────────────────────
+
+/// Per-emit knobs. Defaults give the production CUDA source; setting
+/// flags here turns on debug instrumentation that's safe to ship in a
+/// `.cu` file but adds a printf line per handshake.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EmitOpts {
+    /// When true, every emitted `Wait` / `Arrive` / `LoadAsync` /
+    /// `StoreAsync` is wrapped in lane-0-gated `printf`s tagged with
+    /// the warp id, page id, barrier kind, and (for Wait) the phase
+    /// expression. Used by the RmsNorm-only repro to identify the
+    /// first wait in the round protocol that blocks without a matching
+    /// arrive trace; off by default so production kernels stay quiet.
+    pub debug_handshake: bool,
+}
+
+/// Render a single lane-0-gated `printf` line. Always wraps in
+/// `if ((threadIdx.x & 31) == 0)` so each warp prints exactly once.
+fn dbg_printf(tag: &str) -> String {
+    format!(
+        "if ((threadIdx.x & 31) == 0) {{ \
+         printf(\"[wid=%d] {tag}\\n\", (int)(threadIdx.x / 32)); }}"
+    )
+}
+
+fn instr_dbg_pre(instr: &TkInstr, opts: &EmitOpts) -> Option<String> {
+    if !opts.debug_handshake {
+        return None;
+    }
+    match instr {
+        TkInstr::Wait {
+            page_id,
+            kind,
+            phase,
+            ..
+        } => Some(dbg_printf(&format!(
+            "WAIT_START kind={:?} page={} phase={}",
+            kind,
+            page_id,
+            phase.cuda_expr()
+        ))),
+        TkInstr::LoadAsync { page_id, src, .. } => Some(dbg_printf(&format!(
+            "TMA_LOAD_START page={} src_buf={}",
+            page_id, src.0
+        ))),
+        TkInstr::StoreAsync { page_id, dst, .. } => Some(dbg_printf(&format!(
+            "TMA_STORE_START page={} dst_buf={}",
+            page_id, dst.0
+        ))),
+        _ => None,
+    }
+}
+
+fn instr_dbg_post(instr: &TkInstr, opts: &EmitOpts) -> Option<String> {
+    if !opts.debug_handshake {
+        return None;
+    }
+    match instr {
+        TkInstr::Wait {
+            page_id,
+            kind,
+            phase,
+            ..
+        } => Some(dbg_printf(&format!(
+            "WAIT_DONE kind={:?} page={} phase={}",
+            kind,
+            page_id,
+            phase.cuda_expr()
+        ))),
+        TkInstr::Arrive {
+            page_id, kind, ..
+        } => Some(dbg_printf(&format!(
+            "ARRIVE kind={:?} page={}",
+            kind, page_id
+        ))),
+        TkInstr::LoadAsync { page_id, .. } => Some(dbg_printf(&format!(
+            "TMA_LOAD_ISSUED page={}",
+            page_id
+        ))),
+        TkInstr::StoreAsync { page_id, .. } => Some(dbg_printf(&format!(
+            "TMA_STORE_ISSUED page={}",
+            page_id
+        ))),
+        _ => None,
+    }
+}
+
 // ── Walk ───────────────────────────────────────────────────────────
 
-fn emit_one(instr: &TkInstr, out: &mut String) {
+fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
     if let TkInstr::ForLoop { var, count, body } = instr {
         // The loop hosts every role together; per-instr role guards
         // inside the body still route work to the right warp.
@@ -177,7 +289,7 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
         out.push_str(var);
         out.push_str(") {\n");
         for inner in body {
-            emit_one(inner, out);
+            emit_one(inner, opts, out);
         }
         out.push_str("    }\n");
         return;
@@ -198,7 +310,10 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             page_id,
             kind,
         } => {
-            let n = role_group_width(*role);
+            // Always emit `group<1>::arrive` — see [`arrive_group_width`]
+            // for why a `group<N>::arrive` from N warps fires only once
+            // total, not N times.
+            let n = arrive_group_width(*role);
             (*role, tk20::arrive(n, *kind, *page_id))
         }
         TkInstr::LoadAsync {
@@ -267,18 +382,43 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
         TkInstr::ForLoop { .. } => unreachable!("ForLoop handled by early return"),
     };
 
+    let pre = instr_dbg_pre(instr, opts);
+    let post = instr_dbg_post(instr, opts);
+
     match role_guard(role) {
         None => {
+            if let Some(p) = &pre {
+                out.push_str("    ");
+                out.push_str(p);
+                out.push('\n');
+            }
             out.push_str("    ");
             out.push_str(&body);
             out.push('\n');
+            if let Some(p) = &post {
+                out.push_str("    ");
+                out.push_str(p);
+                out.push('\n');
+            }
         }
         Some(g) => {
             out.push_str("    ");
             out.push_str(&g);
-            out.push_str(" {\n        ");
+            out.push_str(" {\n");
+            if let Some(p) = &pre {
+                out.push_str("        ");
+                out.push_str(p);
+                out.push('\n');
+            }
+            out.push_str("        ");
             out.push_str(&body);
-            out.push_str("\n    }\n");
+            out.push('\n');
+            if let Some(p) = &post {
+                out.push_str("        ");
+                out.push_str(p);
+                out.push('\n');
+            }
+            out.push_str("    }\n");
         }
     }
 }
@@ -288,9 +428,15 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
 /// dispatch (`__role`, `__consumer_idx`); this fn is *only* the body
 /// the role-routed match arms produce.
 pub fn emit_body(prog: &TkProgram) -> String {
+    emit_body_with_opts(prog, &EmitOpts::default())
+}
+
+/// As [`emit_body`] but takes an explicit [`EmitOpts`] so debug knobs
+/// (e.g. handshake printf wrapping) can be toggled at the call site.
+pub fn emit_body_with_opts(prog: &TkProgram, opts: &EmitOpts) -> String {
     let mut out = String::new();
     for instr in &prog.instrs {
-        emit_one(instr, &mut out);
+        emit_one(instr, opts, &mut out);
     }
     out
 }
@@ -344,6 +490,18 @@ pub struct KernelArgs {
 /// scaffold *does* guarantee is that the role dispatch, mbarrier
 /// init, and final sync are byte-identical to TK 2.0.
 pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
+    emit_kernel_with_opts(name, args, prog, &EmitOpts::default())
+}
+
+/// As [`emit_kernel`] but takes an explicit [`EmitOpts`]. Used by the
+/// `bin/tk_emit_rmsnorm` reproducer to flip on `debug_handshake`
+/// instrumentation when the `TK_EMIT_DEBUG_HANDSHAKE` env var is set.
+pub fn emit_kernel_with_opts(
+    name: &str,
+    args: &KernelArgs,
+    prog: &TkProgram,
+    opts: &EmitOpts,
+) -> String {
     use crate::tk_warp_ir::{NUM_CONSUMER_WARPS, NUM_PAGES};
 
     let total_warps = NUM_CONSUMER_WARPS as u32 + 2; // 1 loader + 1 storer + N consumers
@@ -351,6 +509,11 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
 
     let mut out = String::new();
     out.push_str("#include \"kittens.cuh\"\n");
+    if opts.debug_handshake {
+        // `printf` from device code lives in `<cstdio>`; some TK 2.0
+        // headers don't transitively include it on Hopper.
+        out.push_str("#include <cstdio>\n");
+    }
     out.push_str("\n");
 
     // Role constants. Matches the WarpRole emit in role_guard().
@@ -452,6 +615,20 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     out.push_str("            kittens::arrive(page_consumed[__i]);\n");
     out.push_str("        }\n");
     out.push_str("    }\n");
+    // Async-proxy fence: `mbarrier.init` and `mbarrier.arrive` write
+    // through the ASYNC proxy of shared memory; without an explicit
+    // `fence.proxy.async.shared::cta` other threads' subsequent
+    // `mbarrier.arrive` / `mbarrier.try_wait.parity` against the same
+    // barrier may observe stale (pre-init) parity bits even after a
+    // `__syncthreads()` barrier — `__syncthreads` only orders generic-
+    // proxy ops with each other. This was the root cause of the
+    // `launcher_runs_on_zeros_rmsnorm_only` storer deadlock: 8
+    // consumer arrives on `page_done[i]` flipped the real parity, but
+    // the storer's `try_wait.parity` against the same barrier kept
+    // polling against its stale view. TK 2.0's KVM scaffold issues
+    // this exact fence at
+    // `third_party/thunderkittens/prototype/vm/vm.cuh:99`.
+    out.push_str("    asm volatile(\"fence.proxy.async.shared::cta;\\n\" ::: \"memory\");\n");
     // CTA-wide sync. `kittens::group<N>::sync()` (barrier-less) is
     // only legal for single-warp groups (asserts `GROUP_WARPS==1`); the
     // multi-warp form takes a `bar.sync` barrier id. Easiest portable
@@ -473,7 +650,7 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
 
     // The role-routed body.
     out.push_str("    // ── tk_warp_ir body ──\n");
-    out.push_str(&emit_body(prog));
+    out.push_str(&emit_body_with_opts(prog, opts));
     out.push_str("\n");
 
     // Final sync: every warp waits for the others before retiring.
@@ -703,6 +880,16 @@ mod tests {
         // multi-warp the scaffold uses `__syncthreads()`.
         assert!(src.contains("__syncthreads();"), "init+final sync\n{src}");
 
+        // Async-proxy fence between mbarrier init and the cross-warp
+        // sync. Without this fence the storer's `mbarrier.try_wait`
+        // sees stale parity bits and never observes the consumer
+        // arrives — repro confirmed via the rmsnorm-only smoke test
+        // and matches TK 2.0's KVM init pattern at vm.cuh:99.
+        assert!(
+            src.contains("fence.proxy.async.shared::cta"),
+            "async-proxy fence after mbarrier init\n{src}"
+        );
+
         // Body lands inside the kernel.
         assert!(src.contains("if (__role == ROLE_LOADER)"), "body merged\n{src}");
 
@@ -791,6 +978,114 @@ mod tests {
         assert!(src.contains("kittens::init_semaphore(page_done[__i], 0, 8);"));
         // Compute body.
         assert!(src.contains("rsqrtf"));
+    }
+
+    /// `EmitOpts { debug_handshake: true }` interleaves a lane-0-gated
+    /// `printf` before every Wait / TMA load / TMA store and after
+    /// every Arrive — the trace the deadlock audit walks to find the
+    /// first wait without a matching arrive.
+    #[test]
+    fn debug_handshake_wraps_handshakes_with_lane_gated_printf() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        p.load_async(
+            0,
+            BufId(0),
+            rr(0, 0, 64),
+            TileShape {
+                rows: 1,
+                cols: 64,
+                elem_bytes: 2,
+            },
+        );
+        let _page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
+
+        let opts = EmitOpts {
+            debug_handshake: true,
+        };
+        let src = emit_body_with_opts(&p, &opts);
+
+        // Every printf is gated to lane 0 of its warp.
+        assert!(
+            src.contains("if ((threadIdx.x & 31) == 0)"),
+            "lane-0 gate present\n{src}"
+        );
+        // WAIT_START fires BEFORE the loader's wait.
+        assert!(
+            src.contains("WAIT_START kind=Consumed page=0 phase=0"),
+            "wait pre-printf\n{src}"
+        );
+        // WAIT_DONE fires AFTER the same wait.
+        assert!(
+            src.contains("WAIT_DONE kind=Consumed page=0 phase=0"),
+            "wait post-printf\n{src}"
+        );
+        // TMA load gets START/ISSUED bookends.
+        assert!(
+            src.contains("TMA_LOAD_START page=0 src_buf=0"),
+            "tma load pre-printf\n{src}"
+        );
+        assert!(
+            src.contains("TMA_LOAD_ISSUED page=0"),
+            "tma load post-printf\n{src}"
+        );
+        // Arrive only has a post-printf (the body itself is the action).
+        assert!(
+            src.contains("ARRIVE kind=Done page=0"),
+            "arrive printf\n{src}"
+        );
+
+        // Default opts: no printf.
+        let plain = emit_body(&p);
+        assert!(!plain.contains("printf"), "default opts stay quiet\n{plain}");
+    }
+
+    /// `emit_kernel_with_opts(debug_handshake=true)` pulls in `<cstdio>`
+    /// so device printf links on Hopper without depending on a
+    /// transitive include from `kittens.cuh`.
+    #[test]
+    fn debug_handshake_kernel_includes_cstdio() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let _page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        let args = KernelArgs {
+            bufs: vec![KernelArg {
+                ty: "__nv_bfloat16* __restrict__".into(),
+                name: "buf".into(),
+            }],
+            u32_args: vec![],
+        };
+        let opts = EmitOpts {
+            debug_handshake: true,
+        };
+        let src = emit_kernel_with_opts("tk_dbg_smoke", &args, &p, &opts);
+        assert!(src.contains("#include <cstdio>"), "cstdio pulled in\n{src}");
+        // Sanity: default emit doesn't pull cstdio.
+        let plain = emit_kernel("tk_dbg_smoke", &args, &p);
+        assert!(!plain.contains("#include <cstdio>"));
+    }
+
+    /// Every `Arrive` lowers to `kittens::group<1>::arrive(...)`, even
+    /// when the role is `AllConsumers` (8 warps). TK 2.0
+    /// `group<N>::arrive(semaphore&)` is gated on the GROUP's lane 0,
+    /// so a multi-warp `group<8>::arrive` would fire ONCE total, not
+    /// 8 times — and the storer's `wait(done, 0)` would deadlock
+    /// against an init expecting 8 arrives. See `arrive_group_width`.
+    #[test]
+    fn arrive_always_emits_group1_to_avoid_single_fire_deadlock() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let _page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
+        let src = emit_body(&p);
+        assert!(
+            src.contains("kittens::group<1>::arrive(page_done[0])"),
+            "AllConsumers arrive must be group<1> not group<N>\n{src}"
+        );
+        assert!(
+            !src.contains("kittens::group<8>::arrive("),
+            "no group<8>::arrive on the emit path (single-fire bug)\n{src}"
+        );
     }
 
     #[test]

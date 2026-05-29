@@ -10,6 +10,10 @@ license.workspace = true
 name = "tk_emit_decode"
 path = "src/bin/tk_emit_decode.rs"
 
+[[bin]]
+name = "tk_emit_rmsnorm"
+path = "src/bin/tk_emit_rmsnorm.rs"
+
 [features]
 default = []
 # `cuda` enables the FFI binding to the orchestrator's emitted

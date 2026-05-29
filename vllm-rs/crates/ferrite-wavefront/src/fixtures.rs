@@ -118,6 +118,37 @@ pub fn one_layer_input() -> LoweringInput {
     }
 }
 
+/// Single-op RmsNorm reproducer for the orchestrator deadlock audit.
+///
+/// Layout:
+///   Sources: 0 = x [1, hidden], 1 = rms_w [1, hidden]
+///   Ops:     0 = RmsNorm(x, rms_w)
+///   Result:  op 0
+///
+/// Buffer count: 2 sources + 1 op output = 3.
+///
+/// Used by `bin/tk_emit_rmsnorm` and the
+/// `launcher_runs_on_zeros_rmsnorm_only` smoke test in
+/// [`crate::launcher`]. The fixture isolates the round protocol of one
+/// op so a deadlock can be pinned to RmsNorm's specific
+/// loader/consumer/storer handshake — versus the 12-op forward, where a
+/// bug anywhere in the orchestrator hangs the whole tape.
+pub fn rmsnorm_only_input() -> LoweringInput {
+    let h = 2048u32;
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: h }, // 0  x
+            SourceShape { rows: 1, cols: h }, // 1  rms_w
+        ],
+        ops: vec![OpDesc {
+            op: LoweredOp::RmsNorm { eps: 1e-5 },
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    }
+}
+
 /// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
 /// [`LoweringInput`], in `BufId` order: sources first, then per-op
 /// output staging buffers. Mirrors the shape inference in

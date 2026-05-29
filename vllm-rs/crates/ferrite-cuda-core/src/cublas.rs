@@ -20,8 +20,12 @@ use cudarc::cublas::sys::{self, cublasComputeType_t, cublasHandle_t, cublasOpera
 use cudarc::cublaslt::sys as lt;
 use cudarc::driver::sys::CUstream;
 
-/// cuBLAS workspace size (32 MB — matches Python vLLM).
-const CUBLAS_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+/// cuBLAS-Lt workspace size — matches PyTorch's `getCUDABlasLtWorkspaceSize`
+/// default of 1024 KiB on every arch (per `aten/src/ATen/cuda/CublasHandlePool.cpp`,
+/// upstream PR #73328). The previous 32 MiB matched PyTorch's separate non-Lt
+/// cuBLAS workspace on Hopper (`parseChosenWorkspaceSize`) but cuBLAS-Lt itself
+/// stays at 1 MiB, and that's the path ferrite uses for all GEMMs.
+const CUBLAS_WORKSPACE_SIZE: usize = 1024 * 1024;
 
 /// Cache key for a GEMM plan.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]

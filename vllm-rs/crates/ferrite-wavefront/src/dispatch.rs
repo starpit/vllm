@@ -2,18 +2,18 @@
 //! CUDA megakernel dispatch — runtime glue between the orchestrator-
 //! emitted `tk_decode_*` kernels and a real ferrite forward path.
 //!
-//! Mirrors `interpreter/metal/mega_player.rs` for CUDA: resolves each
-//! source slot to a device pointer (the caller hands them in already-
-//! resolved, since the macro-emitted weight accessors live per-model
-//! and aren't easy to thread through a generic trait at this layer),
-//! allocates op-output staging buffers as a flat arena per the
-//! `LoweringInput`'s shape inference, and calls `launch_<name>(...)`.
+//! Mirrors `interpreter/metal/mega_player.rs` for CUDA: caller hands
+//! us 14 source pointers (already resolved to device addresses by
+//! the model-specific weight accessors / runtime context), we
+//! allocate the 12-buf op-output staging arena per the
+//! `LoweringInput`'s shape inference, and call `launch_<name>(...)`.
 //!
-//! The narrow API is intentional: the caller (worker / model crate) is
-//! the only place that knows where `weights.layer[0].q_proj` lives in
-//! HBM, what the runtime hidden-state pointer is, etc. This module
-//! takes those pointers as a slice and does only the byte-level
-//! plumbing the orchestrator's kernel signature dictates.
+//! Uses raw `CUstream` + `*mut u8` allocation directly so it sits in
+//! the same layer as `ferrite_cuda_core::GpuDevice` (the worker's
+//! existing primitive), with no cudarc bridging required. The
+//! launcher's C ABI takes a `*mut c_void` stream — stream-agnostic —
+//! so the cudarc-flavored smoke tests in `launcher.rs` keep working
+//! unchanged.
 
 #![cfg(feature = "cuda")]
 
@@ -21,15 +21,27 @@ use std::ffi::c_void;
 
 use crate::fixtures::{buf_byte_sizes, one_layer_input};
 
-/// Allocate op-output staging buffers for the orchestrator's
-/// `tk_decode_one_layer` kernel and dispatch with the caller-supplied
-/// source pointers. Returns the allocated buffers (typed as
-/// `cudarc::driver::CudaSlice<u8>`) so the caller can read back any
-/// op's intermediate / final output.
+/// One arena buffer's raw allocation. The dispatcher returns these so
+/// the caller can read op outputs back / hand them to a follow-on
+/// kernel. The pointer is owned: the caller is responsible for
+/// freeing it (via the same allocator that produced it). For the
+/// worker integration this typically means dropping into the next
+/// step's tile reuse, or letting the caching allocator reclaim it
+/// at end-of-step.
+pub struct ArenaBuf {
+    pub ptr: *mut u8,
+    pub bytes: usize,
+}
+
+/// Allocate the op-output arena via `alloc_fn` and dispatch
+/// `launch_tk_decode_one_layer` with the caller-supplied 14 source
+/// pointers + the freshly-allocated arena. Returns the arena buffers
+/// (pointer + size) so the caller can read any op's intermediate /
+/// final output. `op_outputs[i]` is op `i`'s output (`op11_out` is
+/// the post-MLP residual final).
 ///
 /// `source_ptrs[i]` MUST point to a device-side bf16 buffer matching
-/// the `i`-th source in [`one_layer_input`] (same convention as
-/// `bin/tk_emit_decode`):
+/// the `i`-th source in [`one_layer_input`]:
 ///   0 = x (post-embed hidden state)
 ///   1 = rms_w0
 ///   2..4 = q_w / k_w / v_w
@@ -39,27 +51,32 @@ use crate::fixtures::{buf_byte_sizes, one_layer_input};
 ///   10 = rms_w1
 ///   11..13 = gate_w / up_w / down_w
 ///
-/// The op-output buffers (positions 14..25 in the kernel arg list) are
-/// allocated here as a fresh per-step arena, sized to the per-op
-/// shape inference in [`crate::fixtures::buf_byte_sizes`]. `op_outputs[i]`
-/// is op `i`'s output (`op11_out` is the final post-MLP residual).
+/// `alloc_fn(bytes) -> *mut u8` allocates `bytes` of zero-initialized
+/// device memory; the implementation should typically be a closure
+/// over the worker's `GpuDevice::caching.alloc(bytes)` followed by
+/// `cuMemsetD8Async(ptr, 0, bytes, stream)`. Caller controls the
+/// lifetime of the returned arena pointers.
 ///
 /// `num_kv_pages` is the runtime u32 the kernel reads to bound the
-/// AttnDecode KV sweep.
+/// AttnDecode KV sweep (typically `1` for the single-layer slice
+/// fixture).
+///
+/// `stream` is the raw `cudaStream_t` (cast to `*mut c_void`) the
+/// kernel launches on.
 ///
 /// # Safety
 /// `source_ptrs[i]` must point to valid device memory of at least the
-/// declared bf16 size of source `i`. `stream` must be a valid
-/// `cudaStream_t` cast to `*mut c_void` belonging to the active CUDA
-/// context that allocated `op_outputs`. Returns `Err(cudaError)` from
-/// the launcher if the kernel or `cudaFuncSetAttribute` fails.
+/// declared bf16 size of source `i`. `alloc_fn` must return device
+/// pointers from the same CUDA context as `stream`. `stream` must be
+/// a valid `cudaStream_t` belonging to the active CUDA context.
+/// Returns `Err(cudaError)` from the launcher if the kernel or
+/// `cudaFuncSetAttribute` fails.
 pub unsafe fn dispatch_one_layer_decode(
     source_ptrs: &[*mut c_void; 14],
     num_kv_pages: u32,
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<Vec<cudarc::driver::CudaSlice<u8>>, i32> {
-    use cudarc::driver::DevicePtr;
-
+    stream: *mut c_void,
+    mut alloc_fn: impl FnMut(usize) -> *mut u8,
+) -> Result<Vec<ArenaBuf>, i32> {
     let input = one_layer_input();
     let raw_sizes = buf_byte_sizes(&input);
     let n_sources = input.sources.len();
@@ -67,43 +84,34 @@ pub unsafe fn dispatch_one_layer_decode(
     debug_assert_eq!(raw_sizes.len(), 14 + 12);
 
     // Allocate op-output arena: one zeroed slice per op output. Pad
-    // each to 128-byte alignment (TMA requirement); op outputs are
-    // small (≤ hidden bf16 = 4096 B), but the larger Gemm outputs at
-    // intermediate-size (8192 bf16 = 16384 B = 1 page) need their full
-    // bytes. The kernel writes one tile per op, sized by the op's
-    // declared output shape.
-    let mut op_outputs: Vec<cudarc::driver::CudaSlice<u8>> = Vec::with_capacity(12);
+    // each to 128-byte alignment (TMA requirement). The kernel writes
+    // one tile per op, sized by the op's declared output shape; the
+    // post-padding bytes stay zero (initialized by `alloc_fn`).
+    let mut arena: Vec<ArenaBuf> = Vec::with_capacity(12);
     for &n in &raw_sizes[n_sources..] {
-        let n_aligned = n.div_ceil(128) * 128;
-        let buf = stream
-            .alloc_zeros::<u8>(n_aligned.max(128))
-            .map_err(|_| -1_i32)?;
-        op_outputs.push(buf);
+        let bytes = (n.max(128).div_ceil(128)) * 128;
+        let ptr = alloc_fn(bytes);
+        if ptr.is_null() {
+            return Err(-1);
+        }
+        arena.push(ArenaBuf { ptr, bytes });
     }
 
     // Build the kernel pointer table: 14 caller-supplied source ptrs,
-    // followed by 12 op-output ptrs (in BufId order). cudarc gives us
-    // device pointers via `DevicePtr::device_ptr(buf, stream)`; we
-    // hold the resulting `SyncOnDrop` records alive across the launch.
+    // followed by 12 op-output ptrs (in BufId order).
     let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(14 + 12);
     for &p in source_ptrs.iter() {
         ptrs.push(p);
     }
-    let mut _records: Vec<cudarc::driver::SyncOnDrop<'_>> = Vec::with_capacity(12);
-    for buf in &op_outputs {
-        let (dptr, rec) = DevicePtr::device_ptr(buf, stream.as_ref());
-        ptrs.push(dptr as *mut c_void);
-        _records.push(rec);
+    for buf in &arena {
+        ptrs.push(buf.ptr as *mut c_void);
     }
 
     let u32_args: [u32; 1] = [num_kv_pages];
-    let stream_raw = stream.cu_stream() as *mut c_void;
-
-    let err = unsafe { crate::launcher::launch_decode_one_layer(&ptrs, &u32_args, stream_raw) };
+    let err = unsafe { crate::launcher::launch_decode_one_layer(&ptrs, &u32_args, stream) };
     if err != 0 {
         return Err(err);
     }
 
-    drop(_records);
-    Ok(op_outputs)
+    Ok(arena)
 }

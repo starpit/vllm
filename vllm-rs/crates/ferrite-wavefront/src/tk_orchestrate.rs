@@ -17,11 +17,11 @@
 //! op output staging buffers occupy
 //! `BufId(n_sources..n_sources + n_ops)`.
 //!
-//! GEMM `BN` selection is hard-wired to keep one W tile in one TK 2.0
-//! page (`bn * k * act_elem <= PAGE_SIZE`). For Llama-1B this is
-//! `bn = 4` for `k = 2048` and `bn = 1` for `k = 8192`. The orchestrator
-//! refuses any GEMM whose `(bn, k)` pair falls outside that envelope,
-//! making the page-fit constraint a structural property of the IR.
+//! GEMM `BN` selection is derived per call from the page-fit constraint
+//! `bn * k * act_elem <= PAGE_SIZE` (see [`pick_bn`]) — independent of
+//! any specific model. The orchestrator refuses any GEMM whose `(bn, k)`
+//! pair falls outside that envelope, making the page-fit constraint a
+//! structural property of the IR.
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
 use crate::subtile_ir::BufId;
@@ -38,8 +38,9 @@ pub const ACT_ELEM: u32 = 2;
 
 /// Pick `bn` (W-tile rows per page load) for a given GEMM `k`.
 /// Constraint: `bn * k * ACT_ELEM <= PAGE_SIZE` AND `n_blocks = ceil(n / bn)`
-/// is even (the orchestrator can't statically track post-loop parity for an
-/// odd-N count). All current Llama-1B GEMMs satisfy both with the picks below.
+/// must be even (the orchestrator can't statically track post-loop parity
+/// for an odd-N count). The caller is responsible for shaping `n` so the
+/// resulting `n_blocks` is even.
 fn pick_bn(k: u32) -> u32 {
     let bytes_per_row = k * ACT_ELEM;
     let max_bn = PAGE_SIZE / bytes_per_row;

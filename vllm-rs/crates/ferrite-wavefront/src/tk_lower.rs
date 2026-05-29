@@ -676,7 +676,7 @@ fn residual_add_compute_body(op: &AddOp, a_id: u8, b_id: u8) -> String {
 
 // ── SiluMul — fused SwiGLU element-wise ────────────────────────────
 
-/// Inputs to lower one fused `silu(gate) * up` op (the LLaMA SwiGLU
+/// Inputs to lower one fused `silu(gate) * up` op (the SwiGLU
 /// activation), mirroring `LoweredOp::SiluMul`.
 #[derive(Clone, Copy, Debug)]
 pub struct SiluMulOp {
@@ -686,7 +686,7 @@ pub struct SiluMulOp {
     pub up: BufId,
     /// `[m, intermediate]` output (may alias `gate`).
     pub out: BufId,
-    /// Intermediate size (8192 for Llama-1B).
+    /// Intermediate size (the inner dim of the SwiGLU MLP).
     pub intermediate: u32,
     pub m: u32,
     pub act_elem: u32,
@@ -776,9 +776,10 @@ pub struct RopeRotateOp {
     pub sin: BufId,
     /// Output buffer (typically aliases `x`).
     pub out: BufId,
-    /// Per-head dim (64 for Llama-1B Q, 64 for K/V).
+    /// Per-head dim (the rotary dimension; same for Q and K/V).
     pub head_dim: u32,
-    /// Number of heads sharing this RoPE invocation. Q has 32, K/V have 8.
+    /// Number of heads sharing this RoPE invocation (Q heads when
+    /// rotating Q; KV heads when rotating K).
     pub num_heads: u32,
     pub m: u32,
     pub act_elem: u32,
@@ -886,9 +887,9 @@ fn rope_compute_body(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String 
 ///
 /// The decoder uses this for q/k/v/o, gate/up/down, and lm_head. Caller
 /// picks `bn` such that one `[bn, k]` W tile fits in a single TK 2.0
-/// page (`bn * k * act_elem <= PAGE_SIZE`); typical Llama-1B pickings:
-/// - K=2048 (q/k/v/o, gate/up, lm_head): `bn = 4` → 16384 bytes per tile.
-/// - K=8192 (down): `bn = 1` → 16384 bytes per tile.
+/// page (`bn * k * act_elem <= PAGE_SIZE`); the orchestrator's
+/// [`crate::tk_orchestrate::pick_bn`] derives this purely from `k` and
+/// `PAGE_SIZE` — no per-model knowledge.
 ///
 /// Page layout (3 slots): `x_page` loaded once before the loop and
 /// held read-only by the consumer through every iteration; `w_page`
@@ -1019,11 +1020,11 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
 
     // After the loop the W and Y page slots have been ping-ponged a
     // runtime number of times. We can't statically track post-loop
-    // parity; `complete_round` advances and releases at Phase1 so the
-    // allocator records the slot as "next round starts at Phase1",
-    // which is correct for the typical even-N case (the static-typed
-    // odd-N case must be handled by the caller picking `bn` to make
-    // `n_blocks` even, which all Llama-1B layers satisfy).
+    // parity; `complete_round` advances the typed phase by one, which
+    // is correct for the even-N case. The caller MUST pick `bn` so
+    // `n_blocks = ceil(n / bn)` is even — odd-N would leave the slot
+    // at the same parity it started at, mis-aligning the allocator's
+    // recorded phase with the runtime barrier state.
     let w_page = prog.complete_round(w_page);
     let y_page = prog.complete_round(y_page);
     pages.release(w_page);

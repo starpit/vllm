@@ -199,13 +199,14 @@ pub struct TileShape {
 #[derive(Clone, Debug)]
 pub enum TkInstr {
     /// Wait on `page_done[page_id]` (or `page_ready` / `page_consumed`,
-    /// per `kind`) at the typed `phase`.
+    /// per `kind`) at the captured `phase`.
     Wait {
         role: WarpRole,
         page_id: u8,
         kind: PageBarrier,
-        /// `P::VALUE` of the [`PageHandle`] the constructor saw.
-        phase: u32,
+        /// Either a compile-time parity from a [`PageHandle<P>`] or a
+        /// runtime CUDA parity expression (TK 2.0 KV round-robin).
+        phase: WaitPhase,
     },
 
     /// Arrive on the matching mbarrier. Caller is responsible for
@@ -244,6 +245,65 @@ pub enum TkInstr {
 
     /// Group sync (`kittens::group<NUM_CONSUMER_WARPS>::sync()`).
     Sync { role: WarpRole },
+
+    /// `for (uint <var> = 0; <var> < <count>; ++<var>) { <body> }`.
+    /// The loop emits inside the role guard each instruction in `body`
+    /// already chose (so a `body` mixing loader + consumer arrives is
+    /// fine: the codegen routes each body instr separately, and the
+    /// `for` is hoisted around all of them — i.e. all roles execute
+    /// the same trip count, which is the TK 2.0 KV-page sweep idiom).
+    ForLoop {
+        var: String,
+        /// Loop bound. Compile-time constants are baked literally;
+        /// runtime bounds are emitted as the named u32 kernel argument
+        /// the persistent-CTA scaffold defines (e.g. `__num_kv_pages`).
+        count: LoopBound,
+        body: Vec<TkInstr>,
+    },
+}
+
+/// Loop trip count for [`TkInstr::ForLoop`]: either a const baked at
+/// codegen time or a named runtime u32 the kernel scaffold provides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoopBound {
+    Const(u32),
+    RuntimeU32(String),
+}
+
+/// The phase argument to [`TkInstr::Wait`].
+///
+/// `Static` is the typed-phase path: the value came from a
+/// [`PageHandle<P>::VALUE`], so a wait reading the wrong parity is a
+/// Rust compile error at the call site. `Runtime` is the path used
+/// inside TK 2.0 KV round-robin loops, where the parity is `(i & 1)`
+/// for the current iteration `i` and the kernel must compute it at
+/// run time. Inside a loop, the typed model can't track per-iteration
+/// flips; the lowering uses [`TkProgram::wait_loop_parity`] to bind
+/// the parity expression directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitPhase {
+    Static(u32),
+    Runtime(String),
+}
+
+impl WaitPhase {
+    pub fn cuda_expr(&self) -> String {
+        match self {
+            WaitPhase::Static(n) => n.to_string(),
+            WaitPhase::Runtime(s) => s.clone(),
+        }
+    }
+}
+
+impl LoopBound {
+    /// CUDA expression for this bound — what the codegen drops into
+    /// the `for (...; i < THIS; ...)` slot.
+    pub fn cuda_expr(&self) -> String {
+        match self {
+            LoopBound::Const(n) => n.to_string(),
+            LoopBound::RuntimeU32(name) => name.clone(),
+        }
+    }
 }
 
 /// One persistent-CTA tape.
@@ -268,9 +328,41 @@ impl TkProgram {
             role,
             page_id: page.id,
             kind,
-            phase: P::VALUE,
+            phase: WaitPhase::Static(P::VALUE),
         });
         page
+    }
+
+    /// Push a `Wait` whose phase is the *runtime* expression
+    /// `(<var> & 1)` — the TK 2.0 KV round-robin parity for iteration
+    /// `<var>`. Used inside [`TkProgram::for_loop`] bodies, where the
+    /// typed-phase model cannot statically track per-iteration flips.
+    pub fn wait_loop_parity(
+        &mut self,
+        role: WarpRole,
+        kind: PageBarrier,
+        page_id: u8,
+        loop_var: &str,
+    ) {
+        self.instrs.push(TkInstr::Wait {
+            role,
+            page_id,
+            kind,
+            phase: WaitPhase::Runtime(format!("({loop_var} & 1)")),
+        });
+    }
+
+    /// Push an `Arrive` by raw `page_id`. Used inside
+    /// [`TkProgram::for_loop`] bodies where the typed `arrive` cannot
+    /// be called (no typed [`PageHandle<P>`] survives the loop's
+    /// per-iteration parity flip). The barrier itself flips at run
+    /// time as it always did; we just emit the call.
+    pub fn arrive_loop(&mut self, role: WarpRole, kind: PageBarrier, page_id: u8) {
+        self.instrs.push(TkInstr::Arrive {
+            role,
+            page_id,
+            kind,
+        });
     }
 
     /// Push a typed `Arrive`. Phase parity is the *round parity*, not
@@ -340,6 +432,23 @@ impl TkProgram {
     pub fn sync(&mut self, role: WarpRole) {
         self.instrs.push(TkInstr::Sync { role });
     }
+
+    /// Build a `ForLoop` body in a sub-program. The closure receives a
+    /// fresh [`TkProgram`] to populate; on return its `instrs` become
+    /// the loop body. This keeps lowering code shaped like ordinary
+    /// straight-line tape — no manual `Vec<TkInstr>` plumbing.
+    pub fn for_loop<F>(&mut self, var: impl Into<String>, count: LoopBound, build: F)
+    where
+        F: FnOnce(&mut TkProgram),
+    {
+        let mut body = TkProgram::new();
+        build(&mut body);
+        self.instrs.push(TkInstr::ForLoop {
+            var: var.into(),
+            count,
+            body: body.instrs,
+        });
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -375,17 +484,17 @@ mod tests {
         let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
         let _page = p.wait(WarpRole::Storer, PageBarrier::Done, page);
 
-        let phases: Vec<u32> = p
+        let phases: Vec<String> = p
             .instrs
             .iter()
             .filter_map(|i| match i {
-                TkInstr::Wait { phase, .. } => Some(*phase),
+                TkInstr::Wait { phase, .. } => Some(phase.cuda_expr()),
                 _ => None,
             })
             .collect();
         assert_eq!(
             phases,
-            vec![0, 0, 0, 1, 1, 1],
+            vec!["0", "0", "0", "1", "1", "1"],
             "round 0 reads 0, round 1 reads 1"
         );
     }
@@ -406,7 +515,7 @@ mod tests {
                 assert_eq!(*role, WarpRole::Loader);
                 assert_eq!(*page_id, 7);
                 assert_eq!(*kind, PageBarrier::Consumed);
-                assert_eq!(*phase, 0);
+                assert_eq!(phase, &WaitPhase::Static(0));
             }
             _ => panic!("expected Wait"),
         }

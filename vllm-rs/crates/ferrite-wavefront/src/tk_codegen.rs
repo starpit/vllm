@@ -20,7 +20,9 @@
 
 #![allow(dead_code)]
 
-use crate::tk_warp_ir::{PageBarrier, TkInstr, TkProgram, TileShape, WarpRole, NUM_CONSUMER_WARPS};
+use crate::tk_warp_ir::{
+    LoopBound, PageBarrier, TileShape, TkInstr, TkProgram, WarpRole, NUM_CONSUMER_WARPS,
+};
 
 // ── tk20 — typed CUDA-source emitters ───────────────────────────────
 
@@ -40,10 +42,12 @@ pub mod tk20 {
     }
 
     /// `kittens::group<N>::wait(barrier, phase)`. `n_warps` is the
-    /// thread group the call is gated on.
-    pub fn wait(n_warps: u32, kind: PageBarrier, page_id: u8, phase: u32) -> String {
+    /// thread group the call is gated on. `phase_expr` is the literal
+    /// CUDA expression — `"0"` / `"1"` for static phases, `"(__i & 1)"`
+    /// or similar for runtime parities.
+    pub fn wait(n_warps: u32, kind: PageBarrier, page_id: u8, phase_expr: &str) -> String {
         let bar = barrier_field(kind);
-        format!("kittens::group<{n_warps}>::wait({bar}[{page_id}], {phase});")
+        format!("kittens::group<{n_warps}>::wait({bar}[{page_id}], {phase_expr});")
     }
 
     /// `kittens::group<N>::arrive(barrier)`.
@@ -124,6 +128,25 @@ fn role_group_width(role: WarpRole) -> u32 {
 // ── Walk ───────────────────────────────────────────────────────────
 
 fn emit_one(instr: &TkInstr, out: &mut String) {
+    if let TkInstr::ForLoop { var, count, body } = instr {
+        // The loop hosts every role together; per-instr role guards
+        // inside the body still route work to the right warp.
+        out.push_str("    for (uint ");
+        out.push_str(var);
+        out.push_str(" = 0; ");
+        out.push_str(var);
+        out.push_str(" < ");
+        out.push_str(&LoopBound::cuda_expr(count));
+        out.push_str("; ++");
+        out.push_str(var);
+        out.push_str(") {\n");
+        for inner in body {
+            emit_one(inner, out);
+        }
+        out.push_str("    }\n");
+        return;
+    }
+
     let (role, body) = match instr {
         TkInstr::Wait {
             role,
@@ -132,7 +155,7 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             phase,
         } => {
             let n = role_group_width(*role);
-            (*role, tk20::wait(n, *kind, *page_id, *phase))
+            (*role, tk20::wait(n, *kind, *page_id, &phase.cuda_expr()))
         }
         TkInstr::Arrive {
             role,
@@ -184,6 +207,10 @@ fn emit_one(instr: &TkInstr, out: &mut String) {
             let n = role_group_width(*role);
             (*role, tk20::sync(n))
         }
+        // Handled by the early return above. Reachable only if a
+        // future refactor breaks that contract; an `unreachable!` is
+        // the right tripwire.
+        TkInstr::ForLoop { .. } => unreachable!("ForLoop handled by early return"),
     };
 
     match role_guard(role) {

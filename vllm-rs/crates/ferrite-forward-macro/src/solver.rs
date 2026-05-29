@@ -255,6 +255,7 @@ pub fn solve(
         bounds,
         num_tokens_points,
         sk_points,
+        1,
     )
 }
 
@@ -276,6 +277,7 @@ pub fn solve_with_arch_filter(
     bounds: &BTreeMap<String, u64>,
     num_tokens_points: &[u64],
     sk_points: &[u64],
+    tp_world_size: u8,
 ) -> Result<WorkloadAssignments, SolveError> {
     use rayon::prelude::*;
 
@@ -323,6 +325,7 @@ pub fn solve_with_arch_filter(
             program,
             model,
             profile: target,
+            tp_world_size,
         };
         lib.iter_enumerated()
             .map(|(_, imp)| !imp.applies_to(&ctx))

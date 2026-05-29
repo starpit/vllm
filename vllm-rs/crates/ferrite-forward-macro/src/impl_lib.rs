@@ -49,6 +49,16 @@ pub struct MatchContext<'a> {
     pub program: &'a Program,
     pub model: &'a ModelParams,
     pub profile: &'a TargetProfile,
+    /// Tensor-parallel world size this canonical is being solved at. The
+    /// `forward!` macro fans out one solver run per `(model, tp)` pair (see
+    /// `lib.rs::SolvedModel`), so this is a per-canonical constant — at TP>1
+    /// the FUF was already TP-lowered (AllReduce / AllGather inserted) and
+    /// the solve_bounds shrunk the per-rank `num_kv_heads` /
+    /// `num_attention_heads` / `intermediate_size` before the solver ran.
+    /// Impls that aren't graph-capture-safe at multi-rank (FI's persistent
+    /// kernel) or that only make sense at one tp (sharded-broadcast moes)
+    /// can gate on this in `applies_to`.
+    pub tp_world_size: u8,
 }
 
 /// Ambient context passed to [`Implementation::cost_us`]. Carries
@@ -14441,6 +14451,25 @@ impl Implementation for FlashInferAttentionDecodeImpl {
         "flashinfer_attention_decode"
     }
 
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // FI's `BatchPagedAttentionPersistent` uses `cudaLaunchCooperativeKernel`
+        // and `grid.sync()` from cooperative groups. That kernel is
+        // structurally not graph-capture-safe at multi-rank: the captured
+        // node loses its cooperative property at instantiation, `grid.sync()`
+        // degrades, and replay produces nondeterministic / hung output. The
+        // FlashInfer Python wrapper for this kernel (`BatchAttention`) has
+        // no `use_cuda_graph` parameter for this reason, while
+        // `BatchDecodeWithPagedKVCacheWrapper` (the non-cooperative path)
+        // does — Python vLLM uses that one at TP>1+graph.
+        //
+        // At TP>1 the per-rank shape (num_kv_heads halved, etc.) is also
+        // exactly when the kernel needs the cross-rank context isolation
+        // that the FI shim's static plan cache fails to provide. Defer to
+        // `AttentionViaCacheImpl` (FA2) on sm<90 and to
+        // `FlashAttention3DecodeImpl` on sm>=90; both are graph-capture-safe.
+        ctx.tp_world_size <= 1
+    }
+
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
         // sm_89+ (Ada/Hopper). Older arches (sm_80 A100, sm_86 RTX30,
         // sm_75 T4) fall back to FA2 via the `target_compatible
@@ -14759,6 +14788,14 @@ pub struct FlashInferAttentionPrefillImpl {
 impl Implementation for FlashInferAttentionPrefillImpl {
     fn name(&self) -> &'static str {
         "flashinfer_attention_prefill"
+    }
+
+    fn applies_to(&self, ctx: &MatchContext) -> bool {
+        // Same TP>1 exclusion as the decode sister Impl —
+        // `BatchPagedAttentionPersistent`'s cooperative-launch path isn't
+        // graph-capture-safe at multi-rank. See
+        // `FlashInferAttentionDecodeImpl::applies_to` for the full reasoning.
+        ctx.tp_world_size <= 1
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
@@ -16002,6 +16039,7 @@ mod tests {
             program: &program,
             model: &m_ds,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             imp.applies_to(&ctx_ds),
@@ -16014,6 +16052,7 @@ mod tests {
             program: &program,
             model: &m_mix,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_mix),
@@ -16026,6 +16065,7 @@ mod tests {
             program: &program,
             model: &m_qwen,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_qwen),
@@ -16080,6 +16120,7 @@ mod tests {
             program: &program,
             model: &m_mix,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             imp.applies_to(&ctx_mix),
@@ -16098,6 +16139,7 @@ mod tests {
             program: &program,
             model: &m_qwen_shared,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_qwen_shared),
@@ -16113,6 +16155,7 @@ mod tests {
             program: &program,
             model: &m_ds,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_ds),
@@ -16125,6 +16168,7 @@ mod tests {
             program: &program,
             model: &m_dense,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_dense),
@@ -16183,6 +16227,7 @@ mod tests {
             program: &program,
             model: &m_qwen3,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             imp.applies_to(&ctx_qwen3),
@@ -16201,6 +16246,7 @@ mod tests {
             program: &program,
             model: &m_qwen2,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             imp.applies_to(&ctx_qwen2),
@@ -16213,6 +16259,7 @@ mod tests {
             program: &program,
             model: &m_mix,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_mix),
@@ -16228,6 +16275,7 @@ mod tests {
             program: &program,
             model: &m_ds,
             profile: &profile,
+            tp_world_size: 1,
         };
         assert!(
             !imp.applies_to(&ctx_ds),

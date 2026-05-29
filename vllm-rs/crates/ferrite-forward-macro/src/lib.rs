@@ -881,6 +881,7 @@ fn compile_common(
                 &solve_bounds,
                 &args.workloads,
                 &args.sk_buckets,
+                tp_world_size,
             )
             .map_err(|e| {
                 syn::Error::new(args.span, format!("solve [{}]: {e}", model.source_stem))

@@ -2347,6 +2347,14 @@ impl Instruction {
                         use_logits_soft_cap,
                     };
                     let sk_bucket = ah::sk_bucket_for(ctx.fwd.max_seqlen_k);
+                    // The TP>1 path runs through `AttentionViaCacheImpl`
+                    // (FA2) on sm<90 and `FlashAttention3DecodeImpl` (FA3)
+                    // on sm>=90 — both graph-capture-safe. The solver
+                    // doesn't emit `Instruction::FlashInferAttentionDecode`
+                    // when `tp_world_size > 1` (gated in
+                    // `FlashInferAttentionDecodeImpl::applies_to`), so any
+                    // execution of this arm is a TP=1 path where FI's
+                    // cooperative persistent kernel is the right choice.
                     let fi = ah::flashinfer_attention(
                         q,
                         ctx.fwd.cu_seqlens_q,
@@ -2464,6 +2472,10 @@ impl Instruction {
                         use_logits_soft_cap,
                     };
                     let sk_bucket = ah::sk_bucket_for(ctx.fwd.max_seqlen_k);
+                    // Solver-gated to TP=1 in
+                    // `FlashInferAttentionPrefillImpl::applies_to`. See
+                    // FlashInferAttentionDecode arm above for the full
+                    // explanation.
                     let fi = ah::flashinfer_attention(
                         q,
                         ctx.fwd.cu_seqlens_q,

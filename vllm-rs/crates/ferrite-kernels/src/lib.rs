@@ -17,6 +17,8 @@
 pub mod attention_helpers;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
+#[cfg(all(feature = "cuda", fa3_built))]
+pub mod flash_attn_3;
 #[cfg(feature = "cuda")]
 pub mod flashinfer;
 #[cfg(feature = "cuda")]

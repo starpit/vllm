@@ -45,6 +45,16 @@ fn cuda_link() {
     println!("cargo:rustc-link-lib=static=cutlass_gemm_silu_mul");
     println!("cargo:rustc-link-lib=static=cutlass_gemm_bias");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
+    // FA3 is sm_90+ only — `build_flash_attention_3` skips emission on
+    // pre-Hopper hosts. Mirror vllm-cuda/build.rs: link only if the .a
+    // is present, so a calibration sweep on L4/A100 still builds.
+    let cache_dir = dirs::cache_dir()
+        .expect("no cache directory")
+        .join("cudaforge")
+        .join("vllm-cuda");
+    if cache_dir.join("libvllm_flash_attn_3.a").exists() {
+        println!("cargo:rustc-link-lib=static=vllm_flash_attn_3");
+    }
     println!("cargo:rustc-link-lib=static=flashinfer_attn");
 
     // CUDA runtime. cudart_static requires rt + dl; cublas stays

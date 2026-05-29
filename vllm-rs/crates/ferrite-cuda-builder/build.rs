@@ -170,6 +170,19 @@ fn cuda_build() {
     // 5. FlashAttention-2 paged kernels
     build_flash_attention(&cache_str, &mut rerun_files);
 
+    // 5a. FlashAttention-3 paged decode (Hopper-only). Skipped on
+    //     pre-sm_90 build hosts since the kernels are sm_90a-only and
+    //     nvcc would refuse to emit them on older toolchains.
+    let arch = detect_cuda_arch();
+    if arch.parse::<u32>().unwrap_or(0) >= 90 {
+        build_flash_attention_3(&cache_str, &mut rerun_files);
+    } else {
+        println!(
+            "cargo:warning=FA3 build skipped (CUDA_ARCH={} < 90, Hopper-only)",
+            arch
+        );
+    }
+
     // 5b. FlashInfer per-tuple paged-attention shims. Rendered at build
     //     time from `templates/` into `$OUT_DIR/flashinfer_inst/` and
     //     compiled into `libflashinfer_attn.a`.
@@ -326,6 +339,94 @@ fn build_flash_attention(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("-fPIC")
         .build_lib(format!("{}/libvllm_flash_attn.a", cache_dir))
         .expect("Failed to build flash attention");
+}
+
+#[cfg(feature = "cuda")]
+fn build_flash_attention_3(cache_dir: &str, rerun_files: &mut Vec<String>) {
+    // FA3 is the Hopper-native FlashAttention. We compile the paged-KV
+    // forward path for bf16, hdim128, sm_90a only — the slice we need for
+    // Qwen-family decode. Other dtypes/hdims are excluded via the
+    // FLASHATTENTION_DISABLE_* defines below; adding a new shape is just
+    // dropping the matching instantiation file from
+    // third_party/vllm-flash-attn-3/hopper/instantiations/ into
+    // `kernel_files` and clearing the corresponding DISABLE flag.
+    let fa3_src = std::path::Path::new("../../third_party/vllm-flash-attn-3/hopper");
+    let shim_dir = std::path::Path::new("../../third_party/flash-attn-3-shim");
+
+    const CUTLASS_COMMIT: &str = "62750a2b75c802660e4894434dc55e839f322277";
+
+    let kernel_files: Vec<String> = [
+        // forward instantiations (hdim128 bf16 paged, both Split=false and Split=true)
+        fa3_src.join("instantiations/flash_fwd_hdim128_bf16_paged_sm90.cu"),
+        fa3_src.join("instantiations/flash_fwd_hdim128_bf16_paged_split_sm90.cu"),
+        // shared support .cu files
+        fa3_src.join("flash_fwd_combine.cu"),
+        fa3_src.join("flash_prepare_scheduler.cu"),
+        // raw-ptr ABI shim
+        shim_dir.join("ffi_shim.cu"),
+    ]
+    .into_iter()
+    .map(|p| p.to_string_lossy().into_owned())
+    .collect();
+
+    // Watch every header so nvcc reruns when the vendored sources change.
+    let mut watch_files: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fa3_src) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                if ext == "h" || ext == "hpp" {
+                    watch_files.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    watch_files.push(
+        shim_dir
+            .join("compat/c10/util/Exception.h")
+            .to_string_lossy()
+            .into_owned(),
+    );
+
+    rerun_files.extend(kernel_files.iter().cloned());
+    rerun_files.extend(watch_files.iter().cloned());
+
+    let compat_include = shim_dir.join("compat");
+
+    // DISABLE flags trim the .o size: we only want hdim128 bf16 forward,
+    // paged, no softcap. Without these, every instantiation file would
+    // try to expand all hdims/dtypes via PAGEDKV_SWITCH and friends.
+    cudaforge::KernelBuilder::new()
+        .out_dir(cache_dir)
+        .source_files(kernel_files)
+        .watch(watch_files)
+        .include_path(compat_include.to_string_lossy().as_ref())
+        .include_path(fa3_src.to_string_lossy().as_ref())
+        .with_cutlass(Some(CUTLASS_COMMIT))
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-arch=sm_90a")
+        .arg("--expt-relaxed-constexpr")
+        .arg("--expt-extended-lambda")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .arg("-DFLASHATTENTION_DISABLE_BACKWARD")
+        .arg("-DFLASHATTENTION_DISABLE_DROPOUT")
+        .arg("-DFLASHATTENTION_DISABLE_SOFTCAP")
+        .arg("-DFLASHATTENTION_DISABLE_FP16")
+        .arg("-DFLASHATTENTION_DISABLE_FP8")
+        .arg("-DFLASHATTENTION_DISABLE_HDIM32")
+        .arg("-DFLASHATTENTION_DISABLE_HDIM64")
+        .arg("-DFLASHATTENTION_DISABLE_HDIM96")
+        .arg("-DFLASHATTENTION_DISABLE_HDIM192")
+        .arg("-DFLASHATTENTION_DISABLE_HDIM256")
+        .arg("-DFLASHATTENTION_DISABLE_HDIMDIFF192")
+        .arg("-DFLASHATTENTION_DISABLE_HDIMDIFF64")
+        .arg("-DFLASHATTENTION_DISABLE_APPENDKV")
+        .arg("-DFLASHATTENTION_DISABLE_LOCAL")
+        .build_lib(format!("{}/libvllm_flash_attn_3.a", cache_dir))
+        .expect("Failed to build flash attention 3");
 }
 
 #[cfg(feature = "cuda")]

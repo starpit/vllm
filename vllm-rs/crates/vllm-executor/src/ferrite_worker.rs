@@ -2973,6 +2973,23 @@ impl Worker for FerriteWorker {
                 SealPadProcessor::new(eos_token_ids, 0, self.config.block_size);
         }
 
+        // Pre-allocate the FA3 scheduler-metadata buffer on Hopper
+        // (sm_90+) before `determine_available_memory` runs its profile.
+        // The 4 KB allocation lands as non-torch persistent memory and
+        // is correctly accounted for in the KV-cache budget. On non-
+        // Hopper devices the buffer is never read, so don't allocate.
+        // FERRITE_DISABLE_FA3=1 also skips this — keeps the budget
+        // identical between FA3-on and FA3-off A/B comparisons.
+        #[cfg(fa3_built)]
+        if let Some(ref dev) = self.device
+            && dev.sm_version >= 90
+            && std::env::var("FERRITE_DISABLE_FA3").ok().as_deref() != Some("1")
+        {
+            unsafe {
+                ferrite_kernels::flash_attn_3::fa3_init_metadata();
+            }
+        }
+
         info!(
             "FerriteWorker: model loaded in {:.1}s",
             t0.elapsed().as_secs_f64()

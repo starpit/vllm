@@ -66,7 +66,10 @@ fn main() {
     println!("kernel,M,N,K,cost_us");
     println!("launch_overhead,0,0,0,{launch_overhead_us:.2}");
 
-    gemm_sweep::run(launch_overhead_us);
+    let attn_only = std::env::var("ATTENTION_SWEEP_ONLY").ok().is_some();
+    if !attn_only {
+        gemm_sweep::run(launch_overhead_us);
+    }
     attention_sweep::run(launch_overhead_us);
 
     eprintln!("gpu_cost_sweep: done");

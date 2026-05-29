@@ -376,6 +376,14 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let e = lit_bool(e);
             quote! { FlashInferAttentionDecode(#a, #b, #c, #d, #e) }
         }
+        #[cfg(fa3_built)]
+        I::FlashAttention3Decode(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            quote! { FlashAttention3Decode(#a, #b, #c, #d) }
+        }
         I::FlashInferAttentionPrefill(a, b, c, d, e, f, g) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -851,6 +859,8 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::AvgPool2d(..) => "AvgPool2d",
         I::StripCls(..) => "StripCls",
         I::FlashInferAttentionDecode(..) => "FlashInferAttentionDecode",
+        #[cfg(fa3_built)]
+        I::FlashAttention3Decode(..) => "FlashAttention3Decode",
         I::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
         I::RopeAppend(..) => "RopeAppend",
         I::MlaSplit(..) => "MlaSplit",
@@ -1175,6 +1185,14 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             _ => None,
         },
         I::FlashInferAttentionDecode(a, b, c, d, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        #[cfg(fa3_built)]
+        I::FlashAttention3Decode(a, b, c, d) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -1850,6 +1868,14 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             2 => I::FlashInferAttentionDecode(a, b, n, d, e),
             3 => I::FlashInferAttentionDecode(a, b, c, n, e),
             _ => panic!("FlashInferAttentionDecode: bad idx {idx}"),
+        },
+        #[cfg(fa3_built)]
+        I::FlashAttention3Decode(a, b, c, d) => match idx {
+            0 => I::FlashAttention3Decode(n, b, c, d),
+            1 => I::FlashAttention3Decode(a, n, c, d),
+            2 => I::FlashAttention3Decode(a, b, n, d),
+            3 => I::FlashAttention3Decode(a, b, c, n),
+            _ => panic!("FlashAttention3Decode: bad idx {idx}"),
         },
         I::FlashInferAttentionPrefill(a, b, c, d, e, f, g) => match idx {
             0 => I::FlashInferAttentionPrefill(n, b, c, d, e, f, g),

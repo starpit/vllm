@@ -758,6 +758,14 @@ pub enum Instruction {
     StripCls(u32, u32),
     FlashInferAttentionDecode(u32, u32, u32, u32, bool),
     FlashInferAttentionPrefill(u32, u32, u32, u32, u32, u32, bool),
+    /// Hopper-native FA3 paged decode. Selected by the solver when
+    /// `cuda_arch >= 90` and the cost CSV calibrated FA3 below FI for
+    /// this `(num_tokens, sk_bucket)` cell. No softcap field — the
+    /// vendored FA3 build excludes softcap variants
+    /// (`FLASHATTENTION_DISABLE_SOFTCAP`).
+    /// Args: (in_slot, out_slot, layer, head_dim).
+    #[cfg(fa3_built)]
+    FlashAttention3Decode(u32, u32, u32, u32),
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool),
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32),
@@ -2387,6 +2395,47 @@ impl Instruction {
                             )
                         }
                     }
+                };
+                unsafe {
+                    let nt = (*out).dim(0);
+                    let dt = (*out).dtype();
+                    out.reshape(&[nt, W::Q_SIZE], dt);
+                }
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            }
+            #[cfg(fa3_built)]
+            Instruction::FlashAttention3Decode(in_slot, out_slot, layer, _head_dim) => {
+                // Solver-selected: this Instruction is emitted only when
+                // `FlashAttention3DecodeImpl::target_compatible()` passed
+                // (sm_90+, head_dim==128, no softcap, FA3 cost-CSV row
+                // present). No fallback inside — if FA3 dispatch fails,
+                // the bug is at the Impl/cost-CSV level, not runtime.
+                if std::env::var("FERRITE_FA3_TRACE").ok().as_deref() == Some("1") {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+                    if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+                        eprintln!("[FA3] solver picked Instruction::FlashAttention3Decode");
+                    }
+                }
+                let step_layer = layer as usize;
+                let layer = ctx.layer_offset + layer;
+                let mut out = unsafe {
+                    let q = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
+                    ah::flash_attn_3_decode(
+                        q,
+                        ctx.fwd.cu_seqlens_q,
+                        ctx.fwd.seqused_k,
+                        ctx.fwd.block_table,
+                        ctx.fwd.max_seqlen_q,
+                        ctx.fwd.max_seqlen_k,
+                        W::ATTN_SCALE,
+                        ctx.fwd.kv_cache,
+                        layer as usize,
+                        step_layer,
+                        ctx.device.num_sm,
+                        &mut ctx.device.caching,
+                        ctx.device.compute_stream,
+                    )
                 };
                 unsafe {
                     let nt = (*out).dim(0);

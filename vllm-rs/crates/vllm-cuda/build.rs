@@ -41,6 +41,13 @@ fn cuda_link() {
     println!("cargo:rustc-link-lib=static=cutlass_gemm_silu_mul");
     println!("cargo:rustc-link-lib=static=cutlass_gemm_bias");
     println!("cargo:rustc-link-lib=static=vllm_flash_attn");
+    // FA3 is Hopper-only and may not have been built (build.rs in
+    // ferrite-cuda-builder skips it on pre-sm_90 hosts). Link only if the
+    // .a is present so non-Hopper builds keep working.
+    let fa3_lib = std::path::Path::new(&cache_str).join("libvllm_flash_attn_3.a");
+    if fa3_lib.exists() {
+        println!("cargo:rustc-link-lib=static=vllm_flash_attn_3");
+    }
     println!("cargo:rustc-link-lib=static=flashinfer_attn");
 
     // cudart_static requires rt + dl; cublas/cublasLt remain dynamic.

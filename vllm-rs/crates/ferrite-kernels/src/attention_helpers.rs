@@ -732,6 +732,88 @@ where
     result
 }
 
+/// True if the given stream is currently inside a `cuStreamBeginCapture`
+/// region. Used at FA3/FA2 dispatch sites to skip backends whose workspace
+/// sizing varies per call (and would therefore be unsafe to capture once
+/// and replay across different shapes).
+///
+/// # Safety
+/// `stream` must be a valid CUDA stream.
+pub unsafe fn is_stream_capturing(stream: CUstream) -> bool {
+    let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let rc = cudarc::driver::sys::cuStreamIsCapturing(stream, &mut status);
+    rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+        && status == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+}
+
+// ---------------------------------------------------------------------------
+// FlashAttention-3 (Hopper-native) decode
+// ---------------------------------------------------------------------------
+
+/// Hopper-native FA3 paged decode wrapper. Mirrors [`flashinfer_attention`]'s
+/// argument shape so the call site in `FlashInferAttentionDecode` can swap
+/// between the two without restructuring.
+///
+/// Caller must verify `cuda_arch >= 90` (Hopper) before invoking — the
+/// underlying `libvllm_flash_attn_3.a` is built with `-arch=sm_90a` and won't
+/// run on older devices. The build skips the lib on pre-sm_90 hosts so this
+/// function exists but the linker will refuse to resolve it without FA3 —
+/// see `crates/vllm-cuda/build.rs`.
+///
+/// `layer_idx`: 0-based layer index within the forward step. The FA3
+/// wrapper uses `layer_idx == 0` as the AOT-build trigger — at layer 0
+/// the scheduler prelude (`prepare_varlen_num_blocks`) runs once into a
+/// process-persistent metadata workspace; subsequent layers (1..N-1) skip
+/// the prelude and read the pre-built metadata. This matches Python vLLM's
+/// AOT-scheduling behavior and saves N-1 prelude kernel launches per
+/// captured forward step.
+///
+/// Currently only bf16 hdim=128 is supported (matches the single
+/// instantiation we vendor). Other shapes panic in debug.
+#[cfg(fa3_built)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_attn_3_decode(
+    q: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
+    seqused_k: TensorView<'_>,
+    block_table: TensorView<'_>,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    scale: f32,
+    kv_cache: &KvCachePool,
+    // kv_layer: absolute layer index into kv_cache (includes layer_offset
+    // for pipeline-parallel sub-models).
+    // step_layer: 0-based layer index WITHIN this forward step (resets to 0
+    // at the start of each forward, even on the second pp stage). Used to
+    // detect the "first FA3 call this step" so the wrapper can run the AOT
+    // scheduler-prelude exactly once per step.
+    kv_layer: usize,
+    step_layer: usize,
+    num_sm: i32,
+    alloc: &mut CachingAllocator,
+    stream: CUstream,
+) -> OwnedTensor {
+    let k_layer = kv_cache.k_cache(kv_layer).as_raw();
+    let v_layer = kv_cache.v_cache(kv_layer).as_raw();
+    let block_size = kv_cache.block_size;
+    crate::flash_attn_3::flash_attn_3_paged_decode_bf16_hdim128(
+        q.as_raw(),
+        k_layer,
+        v_layer,
+        cu_seqlens_q.as_raw(),
+        seqused_k.as_raw(),
+        block_table.as_raw(),
+        max_seqlen_q,
+        max_seqlen_k,
+        scale,
+        block_size,
+        num_sm,
+        step_layer,
+        alloc,
+        stream,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // FlashInfer attention
 // ---------------------------------------------------------------------------

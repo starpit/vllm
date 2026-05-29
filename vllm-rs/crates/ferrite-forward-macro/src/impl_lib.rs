@@ -2592,6 +2592,12 @@ pub fn starter_library() -> ImplementationLibrary {
                 }));
             }
         }
+        // FA3 Hopper-native decode (sm_90+, hdim128, no softcap). Solver
+        // weighs it against `FlashInferAttentionDecodeImpl` per cell;
+        // when the cost CSV doesn't have an `fa3_*` row, target_compatible
+        // returns false and FI wins by default (zero-config fallback).
+        #[cfg(fa3_built)]
+        lib.push(Box::new(FlashAttention3DecodeImpl { head_dim: 128 }));
     } // end #[cfg(feature = "cuda")] CUDA-impls block
     lib
 }
@@ -14564,6 +14570,182 @@ impl Implementation for FlashInferAttentionDecodeImpl {
             layer,
             head_dim,
             softcap,
+        )])
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// FlashAttention-3 (Hopper-native) decode Impl.
+//
+// Sister to `FlashInferAttentionDecodeImpl`. Only emits the Instruction
+// when the calibrated cost CSV says FA3 is cheaper than FI at this
+// `(num_tokens, sk_bucket)` cell. Cost rows come from
+// `ferrite-cost-sweep::attention_sweep` keyed by
+// [`fa3_csv_name`].
+//
+// Vendored FA3 build (`third_party/vllm-flash-attn-3/`) currently
+// supports only bf16 hdim128 paged decode without softcap; the Impl's
+// `target_compatible` reflects that. Adding more (dtype, hdim) tuples
+// requires (a) a new instantiation in
+// `crates/ferrite-cuda-builder/build.rs::build_flash_attention_3`,
+// (b) a matching CSV row family from the sweep, (c) loosening the
+// gate here.
+// ─────────────────────────────────────────────────────────────────────
+
+/// CSV row family for FA3 decode. Keep in sync with
+/// `ferrite-cost-sweep/src/attention_sweep.rs` row emission.
+fn fa3_csv_name(head_dim: u32) -> String {
+    format!("fa3_attn_bf16_h{head_dim}_nosoftcap_decode")
+}
+
+fn fa3_cost_us(head_dim: u32, ctx: &CostCtx) -> f64 {
+    let Some(model_head_dim) = ctx.bounds.get("head_dim").copied() else {
+        return UNCALIBRATED_COST_US;
+    };
+    if model_head_dim as u32 != head_dim {
+        return UNCALIBRATED_COST_US;
+    }
+    let name = fa3_csv_name(head_dim);
+    let nt = ctx.num_tokens() as u32;
+    let sk = ctx.sk_bucket() as u32;
+    ctx.profile
+        .cost_us_for(&name, nt, sk, head_dim)
+        .unwrap_or(UNCALIBRATED_COST_US)
+}
+
+#[cfg(fa3_built)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttention3DecodeImpl {
+    pub head_dim: u32,
+}
+
+#[cfg(fa3_built)]
+impl Implementation for FlashAttention3DecodeImpl {
+    fn name(&self) -> &'static str {
+        "flash_attention_3_decode"
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        let compute_cap = match &profile.backend_spec {
+            crate::target::BackendSpec::Cuda(s) => s.compute_capability,
+            _ => return false,
+        };
+        // FA3 is sm_90a-only. The vendored library is built with
+        // `-arch=sm_90a` (see `build_flash_attention_3` in
+        // `ferrite-cuda-builder/build.rs`); calling on older arches
+        // would link-fail or runtime-fault.
+        if compute_cap < 90 {
+            return false;
+        }
+        // Currently only hdim128 is instantiated. Other shapes need a
+        // new instantiation file dropped into
+        // `third_party/vllm-flash-attn-3/hopper/instantiations/`
+        // and added to `build_flash_attention_3::kernel_files`.
+        if self.head_dim != 128 {
+            return false;
+        }
+        // No-softcap only: FLASHATTENTION_DISABLE_SOFTCAP is set in the
+        // build flags, so the softcap variant doesn't link. Models that
+        // use logits soft-cap (Gemma2 etc.) skip this Impl by virtue of
+        // their `Instruction::FlashInferAttentionDecode` carrying
+        // `use_logits_soft_cap = true`; the solver picks FI for those.
+        // The match here is on softcap=false flowing into the Impl.
+        profile.cost_table.has_kernel(&fa3_csv_name(self.head_dim))
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::NumTokensAndSkRange {
+            num_tokens: (1, 1),
+            sk_bucket: (FI_SK_BUCKET_MIN, FI_SK_BUCKET_MAX),
+        }
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        if !attention_has_kv_cache_extern(fuf, seed) {
+            return None;
+        }
+        single_tile_match(fuf, seed, OpKind::Attention)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        fa3_cost_us(self.head_dim, ctx)
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "FlashAttention3Decode",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("head_dim", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("FlashAttention3Decode: input 0 (Q) must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Extern {
+                    kind: ExternKind::KvCache,
+                    index: Some(layer),
+                } => Some(*layer),
+                _ => None,
+            })
+            .expect("FlashAttention3Decode: kv_cache extern with layer index")
+            as u32;
+        Some(vec![Instruction::FlashAttention3Decode(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+            self.head_dim,
         )])
     }
 }

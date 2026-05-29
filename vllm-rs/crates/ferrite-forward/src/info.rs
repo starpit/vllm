@@ -515,6 +515,16 @@ impl Instruction {
                     F::ConstBool(use_logits_soft_cap),
                 ],
             ),
+            #[cfg(fa3_built)]
+            Instruction::FlashAttention3Decode(in_slot, out_slot, layer, head_dim) => (
+                "FlashAttention3Decode",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::ConstU32(head_dim),
+                ],
+            ),
             Instruction::FlashInferAttentionPrefill(
                 q_slot,
                 k_slot,

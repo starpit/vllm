@@ -70,6 +70,16 @@ pub fn query_num_sm() -> i32 {
         .expect("cuDeviceGetAttribute(MULTIPROCESSOR_COUNT) failed")
 }
 
+/// True iff device 0 is sm_90 or newer. Used by the attention sweep to
+/// gate the FA3 row emission — `libvllm_flash_attn_3.a` is built for
+/// sm_90a and refuses to launch on older arches.
+pub fn fa3_supported_on_this_host() -> bool {
+    let device = result::device::get(0).expect("cuDeviceGet failed");
+    unsafe { ferrite_cuda_core::driver::device_get_sm_version(device) }
+        .map(|sm| sm >= 90)
+        .unwrap_or(false)
+}
+
 /// Benchmark a closure that launches a single kernel:
 /// warmup + timed iterations via `cuEventElapsedTime`. Returns mean
 /// µs per launch. Caller subtracts `launch_overhead_us` to report

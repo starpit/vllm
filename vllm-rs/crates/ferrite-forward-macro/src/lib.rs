@@ -1066,6 +1066,13 @@ fn compile_common(
                     // `cutlass` etc. from being silently mis-classed.
                     let bucket = if cfg!(feature = "cuda") && name.starts_with("flashinfer") {
                         Some(1) // fi
+                    } else if cfg!(feature = "cuda") && name.starts_with("flash_attention_3") {
+                        // FA3 paged decode (Hopper-native, sm_90+).
+                        // Same class as FlashInfer for the cost-model
+                        // mix line — both are persistent-scheduler
+                        // attention kernels and exclude each other in
+                        // the per-cell solver pick.
+                        Some(1) // fi
                     } else if name.starts_with("mla_") {
                         // MLA singletons (`mla_split_ref`, `mla_attention_ref`)
                         // and `DeepSeekMoeRefImpl`-family are registered under

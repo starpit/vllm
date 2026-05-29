@@ -515,14 +515,12 @@ fn build_cutlass_gemm_bias(cache_dir: &str, rerun_files: &mut Vec<String>) {
 
 #[cfg(feature = "cuda")]
 fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
-    // Megakernels build is disabled on this branch — the forward!()
-    // macro emits .cu files that #include "kittens.cuh", but
-    // ThunderKittens isn't on this branch's include path. The
-    // ff-interpreter cuBLAS-freedom workstream doesn't ship
-    // megakernels; re-enable only when this branch needs them.
-    let _ = (cache_dir, rerun_files);
-    return;
-    #[allow(unreachable_code)]
+    // Pick up any .cu the orchestrator (ferrite-wavefront's
+    // tk_orchestrate / tk_codegen) has dropped into the cudaforge
+    // megakernel cache and compile each into the shared
+    // libmegakernels.a archive. The emitted .cu only `#include
+    // "kittens.cuh"` — no cutlass, no ferrite substrate headers —
+    // so the include path is just the vendored TK 2.0 tree.
     let megakernel_cache = dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
         .join("cudaforge/megakernels");
@@ -551,15 +549,33 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         "-std=c++17"
     };
 
-    // The megakernel .cu files include megakernel_ops.cuh from vllm-cuda/csrc.
-    const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+    // Architecture gate for TK primitives. Hopper-first (the
+    // orchestrator's TMA / mbarrier emit assumes Hopper); sm_89 is a
+    // future extension that would need KITTENS_AMPERE shims.
+    let kittens_arch_flag = if arch_num >= 100 {
+        "-DKITTENS_BLACKWELL"
+    } else if arch_num >= 90 {
+        "-DKITTENS_HOPPER"
+    } else {
+        "-DKITTENS_AMPERE"
+    };
+
+    // Hopper TK primitives (`setmaxnreg`, `wgmma`, `tma::*_async`)
+    // require the `sm_90a` architecture extension, not plain
+    // `sm_90`. Rewrite the gencode target on Hopper.
+    let gencode_arch = if arch_num == 90 {
+        "90a".to_string()
+    } else {
+        arch.clone()
+    };
+
+    let tk_include = "../../third_party/thunderkittens/include";
 
     let mut mk_builder = cudaforge::KernelBuilder::new();
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
-        .include_path("../../crates/vllm-cuda/csrc")
-        .with_cutlass(Some(CUTLASS_COMMIT));
+        .include_path(tk_include);
     mk_builder
         .arg(std_flag)
         .arg("-O3")
@@ -567,10 +583,13 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("--expt-extended-lambda")
         .arg("--expt-relaxed-constexpr")
         .arg("-DNDEBUG")
+        .arg(kittens_arch_flag)
         .arg("-Xcompiler=-fPIC")
         .arg("-Xcompiler=-fno-strict-aliasing")
         .arg("-Xcompiler=-Wno-psabi")
-        .arg(&format!("-gencode=arch=compute_{arch},code=sm_{arch}"))
+        .arg(&format!(
+            "-gencode=arch=compute_{gencode_arch},code=sm_{gencode_arch}"
+        ))
         .arg("-lineinfo")
         .build_lib(format!("{cache_dir}/libmegakernels.a"))
         .expect("failed to build megakernel .cu files");

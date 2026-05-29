@@ -1543,6 +1543,18 @@ fn emit_arch_dispatcher(
             }
         })
         .collect();
+    let forward_piecewise_capture_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::forward_piecewise_capture(w, ctx, device, num_tokens)
+                },
+            }
+        })
+        .collect();
 
     // Per-variant dispatch arms for `forward_with_metal_followup`.
     let forward_with_followup_arms: Vec<proc_macro2::TokenStream> = arms
@@ -1931,6 +1943,23 @@ fn emit_arch_dispatcher(
             }
         }
 
+        /// Dispatching piecewise CUDA-graph capture. Matches the
+        /// `Weights` variant and calls the per-canonical
+        /// `forward_piecewise_capture`. cuda-only; metal has no
+        /// piecewise path because nccl isn't a metal concept.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_piecewise_capture(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
+            match w {
+                #(#forward_piecewise_capture_arms)*
+            }
+        }
+
         // ── Auto-registration with ferrite_forward::try_load ──────
         //
         // `FerriteWeights` impl routes trait methods to the just-
@@ -1974,6 +2003,16 @@ fn emit_arch_dispatcher(
                          ranks aren't supported on metal yet (no PP fanout)"
                     )
                 }
+            }
+
+            #[cfg(feature = "cuda")]
+            unsafe fn forward_piecewise_capture(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
+                num_tokens: u64,
+            ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
+                unsafe { forward_piecewise_capture(self, ctx, device, num_tokens) }
             }
 
             #[cfg(feature = "metal")]

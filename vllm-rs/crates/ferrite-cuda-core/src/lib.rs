@@ -86,6 +86,11 @@ pub use device_metal::GpuDevice;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub use weights::GpuWeights;
 
+/// Re-export of `CUgraphExec` for downstream crates that need to hold
+/// instantiated CUDA graph handles (ferrite-forward's piecewise runner)
+/// without pulling cudarc into their own Cargo.toml.
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::sys::CUgraphExec;
 /// Re-export `cudarc::driver::sys::CUstream` at a stable path so
 /// generated code (ferrite-forward, ferrite-models) doesn't have to
 /// pull cudarc into its own Cargo.toml. Under metal this resolves

@@ -7373,6 +7373,29 @@ pub fn emit_model(
             }
         }
 
+        /// Piecewise CUDA-graph capture for the bucket `(num_tokens,
+        /// max_seqlen_k)` selects. Caller MUST have called
+        /// `device.caching.begin_allocate_to_pool()` before this fn so
+        /// the captured addresses come from a private pool that stays
+        /// alive for the runner's lifetime.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn forward_piecewise_capture(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
+            let e = ::ferrite_forward::find_bucket(
+                FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
+            );
+            unsafe {
+                ::ferrite_forward::piecewise::run_piecewise_capture(
+                    e.4, e.9, e.5, e.10, wm, ctx, device, e.6, e.8,
+                )
+            }
+        }
+
         #forward_backbone_fn
 
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
@@ -7469,7 +7492,7 @@ fn emit_shim_model(
         pub use super::#canonical::dump;
 
         #[cfg(feature = "cuda")]
-        pub use super::#canonical::{forward, forward_backbone};
+        pub use super::#canonical::{forward, forward_backbone, forward_piecewise_capture};
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{

@@ -39,6 +39,12 @@ pub mod info;
 // The cuda eval body + `InterpreterCtx` + `run` / `run_backbone`
 // inside `instr.rs` are individually `#[cfg(feature = "cuda")]`-gated.
 pub mod instr;
+// Piecewise CUDA-graph capture/replay for tp>1 decode. Splits a tape
+// at NCCL boundaries; each segment is its own captured CUgraph,
+// collectives run eagerly between graphs. tp=1 still uses the
+// monolithic capture path in `vllm_cuda::graph`.
+#[cfg(feature = "cuda")]
+pub mod piecewise;
 // Layered-load helpers are dual-mode like `layers` / `rotary`: stream-free
 // helpers (Embedding, RmsNorm, LinearDense, plus the new `_concat_packed`
 // variant) compile under metal too; cuda-stream-using and quant variants are
@@ -521,6 +527,36 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
+
+        /// Capture this arch's tape into a piecewise CUDA-graph runner.
+        /// Used at tp>1 where NCCL inside a monolithic graph fails on
+        /// L40S (verified). Runs eager NCCL between captured segments.
+        ///
+        /// Caller MUST have called
+        /// `device.caching.begin_allocate_to_pool()` before invoking
+        /// this fn so captured addresses come from a private pool that
+        /// stays alive for the runner's lifetime.
+        ///
+        /// Default impl panics; the proc-macro emits a per-arch
+        /// override that delegates to the canonical's
+        /// `forward_piecewise_capture` free fn.
+        ///
+        /// # Safety
+        /// Same as [`Self::forward`], plus the private-pool contract
+        /// above.
+        #[cfg(feature = "cuda")]
+        unsafe fn forward_piecewise_capture(
+            &self,
+            ctx: &ForwardCtx,
+            device: &mut GpuDevice,
+            num_tokens: u64,
+        ) -> anyhow::Result<crate::piecewise::PiecewiseRunner> {
+            let _ = (ctx, device, num_tokens);
+            unimplemented!(
+                "forward_piecewise_capture: per-arch override not emitted \
+                 — rebuild ferrite-models with the latest macro"
+            )
+        }
 
         /// Per-worker arena peak in bytes (metal only).
         ///

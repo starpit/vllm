@@ -501,7 +501,6 @@ impl CudaModel {
 // parses HF config inside its emitted per-arch `Weights::load` body.
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Pinned host staging buffers
 // ---------------------------------------------------------------------------
@@ -581,6 +580,822 @@ impl HostStaging {
         }
         &bt[..n]
     }
+}
+
+// ---------------------------------------------------------------------------
+// PiecewiseDecodeRunner — TP>1 decode runner backed by piecewise CUDA graphs.
+// ---------------------------------------------------------------------------
+//
+// At tp>1 the monolithic graph capture path is gated off: NCCL inside a graph
+// fails with `CUDA_ERROR_ILLEGAL_ADDRESS` on L40S sm_89. Without graphs the
+// decode forward runs eager — but on this branch the eager path also fails at
+// tp>1 (something about the per-step input buffers / FI plan freshness or
+// per-rank kernel ordering — the empirical failure is `H2D u32:
+// CUDA_ERROR_ILLEGAL_ADDRESS` on the very first decode step). Piecewise graphs
+// fix both: each segment is a separate CUgraph, NCCL collectives run eagerly
+// between graphs, captured-pool input addresses are stable across replays.
+//
+// Mirrors `vllm_cuda::graph::CudaGraphRunner`'s shape: one set of pre-allocated
+// stable input buffers shared across batch sizes, one captured `PiecewiseRunner`
+// per `cuda_graph_sizes` entry. `replay()` H2D-copies the step's inputs into
+// the stable buffers, then walks the captured segments calling eager NCCL
+// between them.
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct PiecewiseDecodeRunner {
+    /// One captured piecewise runner per batch size.
+    runners: std::collections::HashMap<usize, ferrite_forward::piecewise::PiecewiseRunner>,
+    /// Stable per-step input buffers, sized for `max_batch`. Captured graphs
+    /// reference these addresses; replay H2Ds new per-step contents in.
+    input_ids: vllm_cuda::RawGpuMem,
+    positions: vllm_cuda::RawGpuMem,
+    slot_mapping: vllm_cuda::RawGpuMem,
+    cu_seqlens_q: vllm_cuda::RawGpuMem,
+    seqused_k: vllm_cuda::RawGpuMem,
+    block_table: vllm_cuda::RawGpuMem,
+    max_batch: usize,
+    max_blocks_per_seq: usize,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+impl PiecewiseDecodeRunner {
+    /// # Safety
+    /// CUDA context must be current on this thread.
+    unsafe fn new(max_batch: usize, max_blocks_per_seq: usize) -> anyhow::Result<Self> {
+        unsafe {
+            let input_ids =
+                vllm_cuda::RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+            let positions =
+                vllm_cuda::RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+            let slot_mapping =
+                vllm_cuda::RawGpuMem::new(driver::mem_alloc(max_batch * 8)?, max_batch * 8);
+            let cu_seqlens_q = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc((max_batch + 1) * 4)?,
+                (max_batch + 1) * 4,
+            );
+            let seqused_k =
+                vllm_cuda::RawGpuMem::new(driver::mem_alloc(max_batch * 4)?, max_batch * 4);
+            let block_table = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc(max_batch * max_blocks_per_seq * 4)?,
+                max_batch * max_blocks_per_seq * 4,
+            );
+            Ok(Self {
+                runners: std::collections::HashMap::new(),
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                max_batch,
+                max_blocks_per_seq,
+            })
+        }
+    }
+
+    /// Build per-batch-size GpuTensor views over the stable buffers.
+    /// The captured graph reads from these addresses every replay.
+    unsafe fn ctx_views(&self, bs: usize) -> PiecewiseInputs {
+        unsafe {
+            PiecewiseInputs {
+                input_ids: GpuTensor::new(
+                    self.input_ids.ptr(),
+                    &[bs],
+                    ferrite_cuda_core::dtype::DType::U32,
+                ),
+                positions: GpuTensor::new(
+                    self.positions.ptr(),
+                    &[bs],
+                    ferrite_cuda_core::dtype::DType::U32,
+                ),
+                slot_mapping: GpuTensor::new(
+                    self.slot_mapping.ptr(),
+                    &[bs],
+                    ferrite_cuda_core::dtype::DType::I64,
+                ),
+                cu_seqlens_q: GpuTensor::new(
+                    self.cu_seqlens_q.ptr(),
+                    &[bs + 1],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+                seqused_k: GpuTensor::new(
+                    self.seqused_k.ptr(),
+                    &[bs],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+                block_table: GpuTensor::new(
+                    self.block_table.ptr(),
+                    &[bs, self.max_blocks_per_seq],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+            }
+        }
+    }
+
+    /// Fill the input buffers with dummy decode contents at batch_size=bs.
+    /// Mirrors `vllm_cuda::graph::CudaGraphRunner::fill_dummy_decode`.
+    unsafe fn fill_dummy(
+        &self,
+        bs: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            driver::memset_d8(self.input_ids.ptr(), 0, bs * 4, stream)?;
+            let pos: Vec<u32> = (0..bs as u32).collect();
+            driver::memcpy_htod_async(
+                self.positions.ptr(),
+                pos.as_ptr() as *const u8,
+                bs * 4,
+                stream,
+            )?;
+            let slots: Vec<i64> = (0..bs as i64).collect();
+            driver::memcpy_htod_async(
+                self.slot_mapping.ptr(),
+                slots.as_ptr() as *const u8,
+                bs * 8,
+                stream,
+            )?;
+            let cu_q: Vec<i32> = (0..=bs as i32).collect();
+            driver::memcpy_htod_async(
+                self.cu_seqlens_q.ptr(),
+                cu_q.as_ptr() as *const u8,
+                (bs + 1) * 4,
+                stream,
+            )?;
+            let sk: Vec<i32> = vec![1; bs];
+            driver::memcpy_htod_async(
+                self.seqused_k.ptr(),
+                sk.as_ptr() as *const u8,
+                bs * 4,
+                stream,
+            )?;
+            driver::memset_d8(
+                self.block_table.ptr(),
+                0,
+                bs * self.max_blocks_per_seq * 4,
+                stream,
+            )?;
+            driver::stream_synchronize(stream)?;
+        }
+        Ok(())
+    }
+
+    fn captured_sizes(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.runners.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    fn nearest_size(&self, bs: usize) -> Option<usize> {
+        self.runners.keys().filter(|&&s| s >= bs).min().copied()
+    }
+
+    /// Capture piecewise CUDA graphs for batch_size = `bs`.
+    ///
+    /// Caller MUST have already called
+    /// `device.caching.begin_allocate_to_pool()` so the captured tile
+    /// addresses come from a private pool that stays live for the
+    /// runner's lifetime.
+    ///
+    /// Two-pass: warmup forward populates the pool with stable
+    /// addresses, then `forward_piecewise_capture` records each
+    /// segment's kernel launches at those addresses. Replays at the
+    /// same `bs` reuse the same addresses.
+    ///
+    /// # Safety
+    /// CUDA context current; `model` is `CudaModel::Ferrite`; `kv_cache`
+    /// outlives the call.
+    unsafe fn capture(
+        &mut self,
+        bs: usize,
+        max_seqlen_k: usize,
+        model: &CudaModel,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> anyhow::Result<()> {
+        assert!(bs <= self.max_batch);
+        let CudaModel::Ferrite(fm) = model;
+
+        // Fill stable buffers with dummy decode contents at this bs.
+        unsafe {
+            self.fill_dummy(bs, device.compute_stream)?;
+        }
+
+        // FI replan happens at replay time only (matching
+        // CudaGraphRunner). Calling it during capture triggers
+        // `fi_plan_new returned null rc=-1` — appears to be a
+        // double-init or state-collision against the plan already
+        // built during model-load profiling.
+        let _ = max_seqlen_k;
+
+        let inputs = unsafe { self.ctx_views(bs) };
+        let tp_group = fm.tp_group.as_ref();
+
+        let build_ctx = || ferrite_forward::ForwardCtx {
+            input_ids: unsafe { TensorView::from_raw(inputs.input_ids) },
+            positions: unsafe { TensorView::from_raw(inputs.positions) },
+            slot_mapping: unsafe { TensorView::from_raw(inputs.slot_mapping) },
+            cu_seqlens_q: unsafe { TensorView::from_raw(inputs.cu_seqlens_q) },
+            seqused_k: unsafe { TensorView::from_raw(inputs.seqused_k) },
+            block_table: unsafe { TensorView::from_raw(inputs.block_table) },
+            max_seqlen_q: 1,
+            max_seqlen_k,
+            kv_cache,
+            mm_embeds: None,
+            embed_patches: &[],
+            vision_rope_cos: None,
+            vision_rope_sin: None,
+            pixels: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_max_seqlen_full: None,
+            vision_max_seqlen_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            last_token_indices: None,
+            tp_group,
+        };
+
+        // Warmup forward with NCCL suppressed — populates the private
+        // allocator pool AND triggers FI's first-call `fi_plan_new`
+        // (which does cudaMalloc) BEFORE we begin graph capture.
+        // cudaMalloc inside `cuStreamBeginCapture` would fail. NCCL is
+        // suppressed via the same guard `forward_piecewise_capture`
+        // uses internally, so collectives don't fire here either —
+        // ranks don't need to coordinate during this warmup.
+        {
+            let _suppress = ferrite_cuda_core::nccl::SuppressNcclGuard::new();
+            let warmup = {
+                let ctx = build_ctx();
+                unsafe { fm.weights.forward(&ctx, device, bs as u64) }
+            };
+            unsafe {
+                driver::stream_synchronize(device.compute_stream)?;
+            }
+            drop(warmup);
+        }
+
+        // Capture: forward_piecewise_capture splits the tape at NCCL
+        // boundaries, each segment becomes a CUgraph.
+        let runner = {
+            let ctx = build_ctx();
+            unsafe {
+                fm.weights
+                    .forward_piecewise_capture(&ctx, device, bs as u64)?
+            }
+        };
+        self.runners.insert(bs, runner);
+        Ok(())
+    }
+
+    /// Replay piecewise graphs for batch_size = `bs` with this step's
+    /// host-side inputs.
+    ///
+    /// Returns the forward's logits as an `OwnedTensor` allocated from
+    /// the regular caching allocator (not the private pool — independent
+    /// lifetime, caller frees on drop).
+    ///
+    /// # Safety
+    /// Buffers in `&[…]` slices have at least `bs` elements (or `bs+1`
+    /// for cu_seqlens_q); `device` is the runner's capture device;
+    /// caller has the NCCL group attached on `model.tp_group`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn replay(
+        &self,
+        bs: usize,
+        input_ids: &[u32],
+        positions: &[u32],
+        slot_mapping: &[i64],
+        cu_seqlens_q: &[i32],
+        seqused_k: &[i32],
+        block_table: &[i32],
+        kv_cache: &KvCachePool,
+        model: &CudaModel,
+        device: &mut GpuDevice,
+    ) -> anyhow::Result<OwnedTensor> {
+        let runner = self.runners.get(&bs).ok_or_else(|| {
+            anyhow::anyhow!("PiecewiseDecodeRunner: no captured runner for bs={bs}")
+        })?;
+        let CudaModel::Ferrite(fm) = model;
+        let xfer = device.transfer_stream;
+
+        // H2D the step's inputs into the stable buffers on the transfer
+        // stream, then sync xfer→compute so the captured graph reads
+        // the new contents.
+        unsafe {
+            driver::memcpy_htod_async(
+                self.input_ids.ptr(),
+                input_ids.as_ptr() as *const u8,
+                bs * 4,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.positions.ptr(),
+                positions.as_ptr() as *const u8,
+                bs * 4,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.slot_mapping.ptr(),
+                slot_mapping.as_ptr() as *const u8,
+                bs * 8,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.cu_seqlens_q.ptr(),
+                cu_seqlens_q.as_ptr() as *const u8,
+                (bs + 1) * 4,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.seqused_k.ptr(),
+                seqused_k.as_ptr() as *const u8,
+                bs * 4,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.block_table.ptr(),
+                block_table.as_ptr() as *const u8,
+                bs * self.max_blocks_per_seq * 4,
+                xfer,
+            )?;
+            device.sync_transfer_to_compute()?;
+        }
+
+        // FI replan with this step's max KV span. The captured graph's
+        // FI kernels read int_ws_d, which replan rewrites on the
+        // compute stream — same pattern `CudaGraphRunner::replay` uses.
+        let max_seqlen_k = seqused_k.iter().copied().max().unwrap_or(0) as usize;
+        unsafe {
+            ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                bs,
+                max_seqlen_k,
+                kv_cache.block_size,
+                device.compute_stream,
+            );
+        }
+
+        // Build the same ctx shape capture saw — captured kernels read
+        // the GpuTensor pointers, but the eager NCCL between segments
+        // reads `tp_group` from this fresh ForwardCtx.
+        let inputs = unsafe { self.ctx_views(bs) };
+        let tp_group = fm.tp_group.as_ref();
+        let ctx = ferrite_forward::ForwardCtx {
+            input_ids: unsafe { TensorView::from_raw(inputs.input_ids) },
+            positions: unsafe { TensorView::from_raw(inputs.positions) },
+            slot_mapping: unsafe { TensorView::from_raw(inputs.slot_mapping) },
+            cu_seqlens_q: unsafe { TensorView::from_raw(inputs.cu_seqlens_q) },
+            seqused_k: unsafe { TensorView::from_raw(inputs.seqused_k) },
+            block_table: unsafe { TensorView::from_raw(inputs.block_table) },
+            max_seqlen_q: 1,
+            max_seqlen_k,
+            kv_cache,
+            mm_embeds: None,
+            embed_patches: &[],
+            vision_rope_cos: None,
+            vision_rope_sin: None,
+            pixels: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_max_seqlen_full: None,
+            vision_max_seqlen_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            last_token_indices: None,
+            tp_group,
+        };
+
+        let logits =
+            unsafe { ferrite_forward::piecewise::run_piecewise_replay(runner, &ctx, device) };
+        Ok(logits)
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct PiecewiseInputs {
+    input_ids: GpuTensor,
+    positions: GpuTensor,
+    slot_mapping: GpuTensor,
+    cu_seqlens_q: GpuTensor,
+    seqused_k: GpuTensor,
+    block_table: GpuTensor,
+}
+
+// ---------------------------------------------------------------------------
+// PiecewisePrefillRunner — TP>1 prefill runner backed by piecewise CUDA graphs.
+// ---------------------------------------------------------------------------
+//
+// Mirror of `vllm_cuda::graph::PrefillGraphRunner` but emits one captured
+// `PiecewiseRunner` per `cuda_graph_sizes` prefill bucket. The monolithic
+// PrefillGraphRunner deadlocks at tp>1 because its captured forward calls
+// NCCL inside a single CUgraph; piecewise splits the tape at NCCL boundaries
+// so collectives run eagerly between segments. Mirrors Python vLLM's
+// FULL_AND_PIECEWISE mode (full graphs for decode, piecewise for prefill).
+//
+// Single-sequence shape: `cu_seqlens_q = [0, num_tokens]`, `seqused_k = [seq_len]`,
+// `block_table = [1, max_blocks_per_seq]`, `last_token_indices = [num_tokens-1]`
+// for selective lm_head gather (matching the monolithic prefill graph).
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct PiecewisePrefillRunner {
+    /// One captured piecewise runner per num_tokens bucket.
+    runners: std::collections::HashMap<usize, ferrite_forward::piecewise::PiecewiseRunner>,
+    /// Stable per-step input buffers, sized for `max_prefill_tokens`.
+    input_ids: vllm_cuda::RawGpuMem,
+    positions: vllm_cuda::RawGpuMem,
+    slot_mapping: vllm_cuda::RawGpuMem,
+    /// `[2]` i32 — `[0, num_tokens]`.
+    cu_seqlens_q: vllm_cuda::RawGpuMem,
+    /// `[1]` i32 — `[seq_len]`.
+    seqused_k: vllm_cuda::RawGpuMem,
+    /// `[1, max_blocks_per_seq]` i32.
+    block_table: vllm_cuda::RawGpuMem,
+    /// `[1]` u32 — `[num_tokens - 1]` for selective lm_head gather.
+    last_token_indices: vllm_cuda::RawGpuMem,
+    max_prefill_tokens: usize,
+    max_blocks_per_seq: usize,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+impl PiecewisePrefillRunner {
+    /// # Safety
+    /// CUDA context must be current on this thread.
+    unsafe fn new(max_prefill_tokens: usize, max_blocks_per_seq: usize) -> anyhow::Result<Self> {
+        unsafe {
+            let input_ids = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc(max_prefill_tokens * 4)?,
+                max_prefill_tokens * 4,
+            );
+            let positions = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc(max_prefill_tokens * 4)?,
+                max_prefill_tokens * 4,
+            );
+            let slot_mapping = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc(max_prefill_tokens * 8)?,
+                max_prefill_tokens * 8,
+            );
+            // single-seq: cu_seqlens_q = [0, num_tokens], seqused_k = [seq_len].
+            let cu_seqlens_q = vllm_cuda::RawGpuMem::new(driver::mem_alloc(2 * 4)?, 2 * 4);
+            let seqused_k = vllm_cuda::RawGpuMem::new(driver::mem_alloc(4)?, 4);
+            let block_table = vllm_cuda::RawGpuMem::new(
+                driver::mem_alloc(max_blocks_per_seq * 4)?,
+                max_blocks_per_seq * 4,
+            );
+            let last_token_indices = vllm_cuda::RawGpuMem::new(driver::mem_alloc(4)?, 4);
+            Ok(Self {
+                runners: std::collections::HashMap::new(),
+                input_ids,
+                positions,
+                slot_mapping,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                last_token_indices,
+                max_prefill_tokens,
+                max_blocks_per_seq,
+            })
+        }
+    }
+
+    /// Build GpuTensor views over the stable buffers at this num_tokens.
+    unsafe fn ctx_views(&self, num_tokens: usize) -> PiecewisePrefillInputs {
+        unsafe {
+            PiecewisePrefillInputs {
+                input_ids: GpuTensor::new(
+                    self.input_ids.ptr(),
+                    &[num_tokens],
+                    ferrite_cuda_core::dtype::DType::U32,
+                ),
+                positions: GpuTensor::new(
+                    self.positions.ptr(),
+                    &[num_tokens],
+                    ferrite_cuda_core::dtype::DType::U32,
+                ),
+                slot_mapping: GpuTensor::new(
+                    self.slot_mapping.ptr(),
+                    &[num_tokens],
+                    ferrite_cuda_core::dtype::DType::I64,
+                ),
+                cu_seqlens_q: GpuTensor::new(
+                    self.cu_seqlens_q.ptr(),
+                    &[2],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+                seqused_k: GpuTensor::new(
+                    self.seqused_k.ptr(),
+                    &[1],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+                block_table: GpuTensor::new(
+                    self.block_table.ptr(),
+                    &[1, self.max_blocks_per_seq],
+                    ferrite_cuda_core::dtype::DType::I32,
+                ),
+                last_token_indices: GpuTensor::new(
+                    self.last_token_indices.ptr(),
+                    &[1],
+                    ferrite_cuda_core::dtype::DType::U32,
+                ),
+            }
+        }
+    }
+
+    /// Fill stable buffers with dummy fresh-prefill contents at this
+    /// num_tokens. Mirrors `vllm_cuda::graph::PrefillGraphRunner::fill_dummy_prefill`.
+    unsafe fn fill_dummy(
+        &self,
+        num_tokens: usize,
+        stream: ferrite_cuda_core::CUstream,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            driver::memset_d8(self.input_ids.ptr(), 0, num_tokens * 4, stream)?;
+            let pos: Vec<u32> = (0..num_tokens as u32).collect();
+            driver::memcpy_htod_async(
+                self.positions.ptr(),
+                pos.as_ptr() as *const u8,
+                num_tokens * 4,
+                stream,
+            )?;
+            let slots: Vec<i64> = (0..num_tokens as i64).collect();
+            driver::memcpy_htod_async(
+                self.slot_mapping.ptr(),
+                slots.as_ptr() as *const u8,
+                num_tokens * 8,
+                stream,
+            )?;
+            let cu_q: [i32; 2] = [0, num_tokens as i32];
+            driver::memcpy_htod_async(
+                self.cu_seqlens_q.ptr(),
+                cu_q.as_ptr() as *const u8,
+                2 * 4,
+                stream,
+            )?;
+            let sk: [i32; 1] = [num_tokens as i32];
+            driver::memcpy_htod_async(
+                self.seqused_k.ptr(),
+                sk.as_ptr() as *const u8,
+                4,
+                stream,
+            )?;
+            driver::memset_d8(
+                self.block_table.ptr(),
+                0,
+                self.max_blocks_per_seq * 4,
+                stream,
+            )?;
+            let lti: [u32; 1] = [(num_tokens - 1) as u32];
+            driver::memcpy_htod_async(
+                self.last_token_indices.ptr(),
+                lti.as_ptr() as *const u8,
+                4,
+                stream,
+            )?;
+            driver::stream_synchronize(stream)?;
+        }
+        Ok(())
+    }
+
+    fn captured_sizes(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.runners.keys().copied().collect();
+        v.sort();
+        v
+    }
+
+    fn nearest_size(&self, num_tokens: usize) -> Option<usize> {
+        self.runners.keys().filter(|&&s| s >= num_tokens).min().copied()
+    }
+
+    /// Capture piecewise CUDA graphs for `num_tokens` prefill.
+    ///
+    /// Caller MUST have already called `device.caching.begin_allocate_to_pool()`
+    /// so captured tile addresses come from a private pool that stays live for
+    /// the runner's lifetime.
+    ///
+    /// # Safety
+    /// CUDA context current; `model` is `CudaModel::Ferrite`; `kv_cache` outlives
+    /// the call.
+    unsafe fn capture(
+        &mut self,
+        num_tokens: usize,
+        model: &CudaModel,
+        kv_cache: &KvCachePool,
+        device: &mut GpuDevice,
+    ) -> anyhow::Result<()> {
+        assert!(num_tokens <= self.max_prefill_tokens);
+        let CudaModel::Ferrite(fm) = model;
+
+        unsafe {
+            self.fill_dummy(num_tokens, device.compute_stream)?;
+        }
+
+        let inputs = unsafe { self.ctx_views(num_tokens) };
+        let tp_group = fm.tp_group.as_ref();
+
+        let build_ctx = || ferrite_forward::ForwardCtx {
+            input_ids: unsafe { TensorView::from_raw(inputs.input_ids) },
+            positions: unsafe { TensorView::from_raw(inputs.positions) },
+            slot_mapping: unsafe { TensorView::from_raw(inputs.slot_mapping) },
+            cu_seqlens_q: unsafe { TensorView::from_raw(inputs.cu_seqlens_q) },
+            seqused_k: unsafe { TensorView::from_raw(inputs.seqused_k) },
+            block_table: unsafe { TensorView::from_raw(inputs.block_table) },
+            max_seqlen_q: num_tokens,
+            max_seqlen_k: num_tokens,
+            kv_cache,
+            mm_embeds: None,
+            embed_patches: &[],
+            vision_rope_cos: None,
+            vision_rope_sin: None,
+            pixels: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_max_seqlen_full: None,
+            vision_max_seqlen_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            last_token_indices: Some(unsafe { TensorView::from_raw(inputs.last_token_indices) }),
+            tp_group,
+        };
+
+        // Warmup forward with NCCL suppressed — populates the private
+        // allocator pool AND triggers FI's first-call `fi_plan_new`
+        // (which does cudaMalloc) BEFORE we begin graph capture.
+        // cudaMalloc inside `cuStreamBeginCapture` would fail. NCCL is
+        // suppressed via the same guard `forward_piecewise_capture`
+        // uses internally, so collectives don't fire here either —
+        // ranks don't need to coordinate during this warmup.
+        {
+            let _suppress = ferrite_cuda_core::nccl::SuppressNcclGuard::new();
+            let warmup = {
+                let ctx = build_ctx();
+                unsafe { fm.weights.forward(&ctx, device, num_tokens as u64) }
+            };
+            unsafe {
+                driver::stream_synchronize(device.compute_stream)?;
+            }
+            drop(warmup);
+        }
+
+        let runner = {
+            let ctx = build_ctx();
+            unsafe {
+                fm.weights
+                    .forward_piecewise_capture(&ctx, device, num_tokens as u64)?
+            }
+        };
+        self.runners.insert(num_tokens, runner);
+        Ok(())
+    }
+
+    /// Replay piecewise prefill graphs at `padded_num_tokens` with this step's
+    /// host-side inputs.
+    ///
+    /// # Safety
+    /// `device` matches the runner's capture device; caller has the NCCL group
+    /// attached on `model.tp_group`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn replay(
+        &self,
+        padded_num_tokens: usize,
+        input_ids: &[u32],
+        positions: &[u32],
+        slot_mapping: &[i64],
+        seq_len: usize,
+        block_table: &[i32],
+        last_token_idx: u32,
+        block_size: usize,
+        kv_cache: &KvCachePool,
+        model: &CudaModel,
+        device: &mut GpuDevice,
+    ) -> anyhow::Result<OwnedTensor> {
+        let runner = self.runners.get(&padded_num_tokens).ok_or_else(|| {
+            anyhow::anyhow!(
+                "PiecewisePrefillRunner: no captured runner for num_tokens={padded_num_tokens}"
+            )
+        })?;
+        let CudaModel::Ferrite(fm) = model;
+        let xfer = device.transfer_stream;
+        let num_real = input_ids.len();
+
+        // H2D real inputs into the stable buffers, padding the rest with
+        // zeros (input_ids/positions) or -1 (slot_mapping).
+        unsafe {
+            if num_real < padded_num_tokens {
+                driver::memset_d8(self.input_ids.ptr(), 0, padded_num_tokens * 4, xfer)?;
+            }
+            driver::memcpy_htod_async(
+                self.input_ids.ptr(),
+                input_ids.as_ptr() as *const u8,
+                num_real * 4,
+                xfer,
+            )?;
+
+            if num_real < padded_num_tokens {
+                driver::memset_d8(self.positions.ptr(), 0, padded_num_tokens * 4, xfer)?;
+            }
+            driver::memcpy_htod_async(
+                self.positions.ptr(),
+                positions.as_ptr() as *const u8,
+                num_real * 4,
+                xfer,
+            )?;
+
+            let mut padded_slots = vec![-1i64; padded_num_tokens];
+            padded_slots[..num_real].copy_from_slice(slot_mapping);
+            driver::memcpy_htod_async(
+                self.slot_mapping.ptr(),
+                padded_slots.as_ptr() as *const u8,
+                padded_num_tokens * 8,
+                xfer,
+            )?;
+
+            let cu_q: [i32; 2] = [0, padded_num_tokens as i32];
+            let sk_val: [i32; 1] = [seq_len as i32];
+            driver::memcpy_htod_async(
+                self.cu_seqlens_q.ptr(),
+                cu_q.as_ptr() as *const u8,
+                8,
+                xfer,
+            )?;
+            driver::memcpy_htod_async(
+                self.seqused_k.ptr(),
+                sk_val.as_ptr() as *const u8,
+                4,
+                xfer,
+            )?;
+
+            driver::memcpy_htod_async(
+                self.block_table.ptr(),
+                block_table.as_ptr() as *const u8,
+                block_table.len().min(self.max_blocks_per_seq) * 4,
+                xfer,
+            )?;
+
+            driver::memcpy_htod_async(
+                self.last_token_indices.ptr(),
+                &last_token_idx as *const u32 as *const u8,
+                4,
+                xfer,
+            )?;
+
+            device.sync_transfer_to_compute()?;
+        }
+
+        // FI replan with this step's max KV span. Fresh prefill: max_seqlen_k == seq_len.
+        if block_size > 0 {
+            unsafe {
+                ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                    seq_len,
+                    seq_len,
+                    block_size,
+                    device.compute_stream,
+                );
+            }
+        }
+
+        let inputs = unsafe { self.ctx_views(padded_num_tokens) };
+        let tp_group = fm.tp_group.as_ref();
+        let ctx = ferrite_forward::ForwardCtx {
+            input_ids: unsafe { TensorView::from_raw(inputs.input_ids) },
+            positions: unsafe { TensorView::from_raw(inputs.positions) },
+            slot_mapping: unsafe { TensorView::from_raw(inputs.slot_mapping) },
+            cu_seqlens_q: unsafe { TensorView::from_raw(inputs.cu_seqlens_q) },
+            seqused_k: unsafe { TensorView::from_raw(inputs.seqused_k) },
+            block_table: unsafe { TensorView::from_raw(inputs.block_table) },
+            max_seqlen_q: padded_num_tokens,
+            max_seqlen_k: seq_len,
+            kv_cache,
+            mm_embeds: None,
+            embed_patches: &[],
+            vision_rope_cos: None,
+            vision_rope_sin: None,
+            pixels: None,
+            vision_cu_seqlens_full: None,
+            vision_cu_seqlens_window: None,
+            vision_max_seqlen_full: None,
+            vision_max_seqlen_window: None,
+            vision_window_index: None,
+            vision_reverse_indices: None,
+            vision_position_ids: None,
+            last_token_indices: Some(unsafe { TensorView::from_raw(inputs.last_token_indices) }),
+            tp_group,
+        };
+
+        let logits =
+            unsafe { ferrite_forward::piecewise::run_piecewise_replay(runner, &ctx, device) };
+        Ok(logits)
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+struct PiecewisePrefillInputs {
+    input_ids: GpuTensor,
+    positions: GpuTensor,
+    slot_mapping: GpuTensor,
+    cu_seqlens_q: GpuTensor,
+    seqused_k: GpuTensor,
+    block_table: GpuTensor,
+    last_token_indices: GpuTensor,
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +1487,22 @@ pub struct FerriteWorker {
     /// CUDA graph runner for decode batches (monolithic mode).
     #[cfg(feature = "cuda")]
     graph_runner: Option<CudaGraphRunner>,
+    /// Piecewise CUDA graph runner for decode batches at tp>1. Captured
+    /// once per `cuda_graph_sizes` entry in `compile_or_warm_up_model`;
+    /// `execute_model_inner` routes pure-decode batches through
+    /// `replay()` when batch matches a captured size, falling back to
+    /// eager forward otherwise. `None` at tp=1 (monolithic graphs cover
+    /// the same workload there).
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    piecewise_decode: Option<PiecewiseDecodeRunner>,
+    /// Piecewise CUDA graph runner for single-sequence prefill at tp>1.
+    /// Mirrors `prefill_graph_runner`'s shape but each tape segment is a
+    /// separate CUgraph with eager NCCL between, so the cooperative collective
+    /// inside-graph deadlock that monolithic prefill capture hits at tp>1
+    /// doesn't apply. `None` at tp=1 (`prefill_graph_runner` covers the same
+    /// workload there). Matches Python vLLM's FULL_AND_PIECEWISE mode.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    piecewise_prefill: Option<PiecewisePrefillRunner>,
     /// CUDA graph runner for single-sequence prefill batches.
     #[cfg(feature = "cuda")]
     prefill_graph_runner: Option<PrefillGraphRunner>,
@@ -996,6 +1827,10 @@ impl FerriteWorker {
             resolved_architecture: None,
             is_shutdown: false,
             graph_runner: None,
+            #[cfg(feature = "nccl")]
+            piecewise_decode: None,
+            #[cfg(feature = "nccl")]
+            piecewise_prefill: None,
             prefill_graph_runner: None,
             last_graph_batch_size: None,
             graph_metadata_valid: false,
@@ -3298,11 +4133,10 @@ impl Worker for FerriteWorker {
 
         let max_blocks_per_seq = self.max_blocks_per_seq();
 
-        let (model, kv_cache, device) =
-            match (&self.model, &self.kv_cache, &mut self.device) {
-                (Some(m), Some(kv), Some(d)) => (m, kv, d),
-                _ => return Ok(()), // Not fully initialized yet.
-            };
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => return Ok(()), // Not fully initialized yet.
+        };
 
         // Resolve Auto mode now that we know the SM version and TP config.
         {
@@ -3497,6 +4331,118 @@ impl Worker for FerriteWorker {
         } // end should_capture_monolithic
 
         // -----------------------------------------------------------------------
+        // 2b. Capture Piecewise Decode CUDA Graphs (TP>1)
+        // -----------------------------------------------------------------------
+        // At tp>1 monolithic graphs are off (NCCL inside a graph fails on
+        // L40S). Piecewise splits the tape at AllReduce/AllGather boundaries:
+        // each segment is its own captured CUgraph; collectives run eagerly
+        // between graphs. Required because the eager fallback at tp>1 also
+        // fails today (`H2D u32: ILLEGAL_ADDRESS` first decode step) — the
+        // handoff in `PIECEWISE_HANDOFF.md` explains why.
+        //
+        // MoE arches stay eager (router + expert dispatch produces too many
+        // graph nodes; same node-count limit that disqualified them from
+        // monolithic capture).
+        #[cfg(feature = "nccl")]
+        {
+            let want_piecewise = self.config.tp_world_size > 1
+                && !monolithic_failed
+                && model_supports_monolithic // not MoE
+                && self.config.cuda_graph_mode != CudaGraphMode::None;
+
+            if want_piecewise {
+                info!(
+                    "FerriteWorker: capturing piecewise CUDA graphs for tp>{} decode \
+                     ({} batch sizes)",
+                    1,
+                    capture_sizes.len()
+                );
+                let pdr_res = unsafe { PiecewiseDecodeRunner::new(max_bs, max_blocks_per_seq) };
+                match pdr_res {
+                    Ok(mut pdr) => {
+                        // FI plan replan for each sk_bucket BEFORE entering
+                        // the private pool. The plan workspace lives outside
+                        // the caching pool, and its int_ws_d is updated by
+                        // these calls. Each captured kernel reads the plan
+                        // for its (q=1, k, num_pages) tuple — without a
+                        // pre-built plan the captured kernel hits a runtime
+                        // fi_plan_new which is forbidden during graph
+                        // capture. Mirrors the implicit warmup the eager
+                        // path gets from per-step replans during profiling.
+                        for &bs in capture_sizes.iter() {
+                            unsafe {
+                                ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                                    bs,
+                                    padded_max_seqlen_k,
+                                    kv_cache.block_size,
+                                    device.compute_stream,
+                                );
+                            }
+                        }
+                        // One private allocator pool shared across all batch
+                        // sizes — pinned addresses across captures.
+                        device.caching.begin_allocate_to_pool();
+                        let mut any_failed = false;
+                        for &bs in capture_sizes.iter().rev() {
+                            info!(
+                                "Piecewise: capturing for batch_size={bs} (max_seqlen_k={padded_max_seqlen_k})…"
+                            );
+                            let res = unsafe {
+                                pdr.capture(bs, padded_max_seqlen_k, model, kv_cache, device)
+                            };
+                            match res {
+                                Ok(()) => {
+                                    info!("Piecewise CUDA graphs captured for batch_size={bs}")
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Piecewise capture failed at bs={bs}: {e}");
+                                    any_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        device.caching.end_allocate_to_pool();
+
+                        if any_failed {
+                            tracing::warn!(
+                                "Discarding piecewise runner — partial captures unsafe \
+                                 to use. Decode will run eager."
+                            );
+                        } else if !pdr.captured_sizes().is_empty() {
+                            info!(
+                                "Piecewise CUDA graphs captured for batch_sizes: {:?}",
+                                pdr.captured_sizes()
+                            );
+                            // Need pinned host staging for replay's H2D
+                            // step — same as monolithic.
+                            if self.host_staging.is_none() {
+                                let staging_max_bs = *pdr.captured_sizes().last().unwrap();
+                                match unsafe {
+                                    HostStaging::new(staging_max_bs, max_blocks_per_seq)
+                                } {
+                                    Ok(staging) => {
+                                        info!(
+                                            "Pinned host staging allocated for max_batch={} (piecewise)",
+                                            staging_max_bs
+                                        );
+                                        self.host_staging = Some(staging);
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        "Failed to allocate pinned staging (piecewise): {e}"
+                                    ),
+                                }
+                            }
+                            self.piecewise_decode = Some(pdr);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("PiecewiseDecodeRunner::new failed: {e}");
+                    }
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
         // 3. Capture Prefill CUDA Graphs
         // -----------------------------------------------------------------------
         // Skip if monolithic capture poisoned the CUDA context — prefill graphs
@@ -3520,7 +4466,98 @@ impl Worker for FerriteWorker {
             .filter(|&s| s <= max_prefill_tokens)
             .collect();
 
-        if !prefill_sizes.is_empty() && !skip_prefill_graphs {
+        // At tp>1, the monolithic PrefillGraphRunner deadlocks: its captured
+        // forward calls NCCL inside a single CUgraph, and the all-reduce
+        // points across ranks don't synchronize cleanly during capture
+        // (rank-0 reaches the captured allreduce while rank-1 is still in
+        // PiecewiseDecodeRunner::capture's NCCL-suppressed warmup, etc.).
+        // Use piecewise prefill instead — splits the tape at NCCL boundaries
+        // exactly like piecewise decode. Matches Python vLLM's
+        // FULL_AND_PIECEWISE default.
+        #[cfg(feature = "nccl")]
+        let use_piecewise_prefill = self.config.tp_world_size > 1;
+        #[cfg(not(feature = "nccl"))]
+        let use_piecewise_prefill = false;
+
+        #[cfg(feature = "nccl")]
+        if use_piecewise_prefill && !prefill_sizes.is_empty() && !skip_prefill_graphs {
+            let max_prefill = *prefill_sizes.last().unwrap();
+            match unsafe { PiecewisePrefillRunner::new(max_prefill, max_blocks_per_seq) } {
+                Ok(mut ppr) => {
+                    info!(
+                        "FerriteWorker: capturing piecewise prefill CUDA graphs for tp>1 \
+                         ({} prefill sizes)",
+                        prefill_sizes.len()
+                    );
+                    // FI plan replan for prefill sizes BEFORE entering the
+                    // private pool (cudaMalloc on first plan call would fail
+                    // inside cuStreamBeginCapture). Mirrors the decode-side
+                    // pre-capture replan loop above.
+                    for &num_tokens in prefill_sizes.iter() {
+                        unsafe {
+                            ferrite_kernels::attention_helpers::replan_fi_for_decode(
+                                num_tokens,
+                                num_tokens,
+                                kv_cache.block_size,
+                                device.compute_stream,
+                            );
+                        }
+                    }
+                    // The piecewise decode capture above (and any prior
+                    // monolithic pass) already opened the private pool —
+                    // `end_allocate_to_pool` is a no-op, so the pool stays
+                    // live and a second `begin` would assert. Reuse the
+                    // existing active pool, mirroring how the monolithic
+                    // PrefillGraphRunner branch shares the decode pool.
+                    let opened_pool_here = if !device.caching.is_pool_active() {
+                        device.caching.begin_allocate_to_pool();
+                        true
+                    } else {
+                        false
+                    };
+                    let mut any_failed = false;
+                    for &num_tokens in prefill_sizes.iter().rev() {
+                        info!(
+                            "Piecewise prefill: capturing for num_tokens={num_tokens}…"
+                        );
+                        let res = unsafe { ppr.capture(num_tokens, model, kv_cache, device) };
+                        match res {
+                            Ok(()) => info!(
+                                "Piecewise prefill CUDA graphs captured for num_tokens={num_tokens}"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Piecewise prefill capture failed at num_tokens={num_tokens}: {e}"
+                                );
+                                any_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if opened_pool_here {
+                        device.caching.end_allocate_to_pool();
+                    }
+
+                    if any_failed {
+                        tracing::warn!(
+                            "Discarding piecewise prefill runner — partial captures unsafe \
+                             to use. Prefill will run eager."
+                        );
+                    } else if !ppr.captured_sizes().is_empty() {
+                        info!(
+                            "Piecewise prefill CUDA graphs captured for sizes: {:?}",
+                            ppr.captured_sizes()
+                        );
+                        self.piecewise_prefill = Some(ppr);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("PiecewisePrefillRunner::new failed: {e}");
+                }
+            }
+        }
+
+        if !use_piecewise_prefill && !prefill_sizes.is_empty() && !skip_prefill_graphs {
             let max_prefill = *prefill_sizes.last().unwrap();
             match unsafe {
                 PrefillGraphRunner::new(
@@ -3612,6 +4649,11 @@ impl Worker for FerriteWorker {
 
         // Drop CUDA graphs (Drop impl frees GPU memory).
         self.graph_runner = None;
+        #[cfg(feature = "nccl")]
+        {
+            self.piecewise_decode = None;
+            self.piecewise_prefill = None;
+        }
         self.prefill_graph_runner = None;
         self.last_graph_batch_size = None;
         self.graph_metadata_valid = false;
@@ -4457,7 +5499,21 @@ impl FerriteWorker {
         };
         let use_graph = graph_bs.is_some();
 
-        if is_decode && !use_graph {
+        // At tp>1 monolithic graph_runner is None; piecewise_decode is the
+        // graph path. Same gating: pure decode, no MM in batch.
+        #[cfg(feature = "nccl")]
+        let piecewise_bs: Option<usize> = if !use_graph && is_decode && !any_mm_in_batch {
+            self.piecewise_decode
+                .as_ref()
+                .and_then(|r| r.nearest_size(num_reqs))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "nccl"))]
+        let piecewise_bs: Option<usize> = None;
+        let use_piecewise = piecewise_bs.is_some();
+
+        if is_decode && !use_graph && !use_piecewise {
             tracing::debug!("CUDA graph miss: decode bs={num_reqs} has no matching graph");
         }
 
@@ -5207,6 +6263,83 @@ impl FerriteWorker {
                 replay_out.logits
             };
             (None, logits)
+        } else if use_piecewise {
+            // -------------------------------------------------------------
+            // Piecewise CUDA-graph decode (tp>1 path). Build padded inputs
+            // matching the captured `pw_bs`, H2D into the runner's stable
+            // buffers, replay segments with eager NCCL between them.
+            // -------------------------------------------------------------
+            #[cfg(feature = "nccl")]
+            let result = {
+                let pw_bs = piecewise_bs.unwrap();
+                let meta = &prepared.attn_meta;
+
+                // Build padded host vecs (same shape as the eager fallback
+                // builds for monolithic graph replay below — easier to
+                // reuse the existing pattern than to plumb staging here).
+                let mut input_ids = prepared.flat_token_ids.clone();
+                input_ids.resize(pw_bs, 0);
+                let mut positions = prepared.flat_positions.clone();
+                positions.resize(pw_bs, 0);
+                let mut cu_seqlens_q: Vec<i32> = (0..=num_reqs as i32).collect();
+                for _ in num_reqs..pw_bs {
+                    cu_seqlens_q.push(num_reqs as i32);
+                }
+                let mut seqused_k: Vec<i32> = meta.seq_lens.iter().map(|&sl| sl as i32).collect();
+                seqused_k.resize(pw_bs, 1);
+                let mut slot_mapping = Vec::with_capacity(pw_bs);
+                for i in 0..num_reqs {
+                    let abs_pos = meta.tokens_before[i];
+                    let block_idx = abs_pos / block_size;
+                    let offset = abs_pos % block_size;
+                    let block_ids = &meta.block_ids[i];
+                    if block_idx < block_ids.len() {
+                        slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
+                    } else {
+                        slot_mapping.push(-1i64);
+                    }
+                }
+                slot_mapping.resize(pw_bs, -1i64);
+                let mut block_table = vec![0i32; pw_bs * max_blocks_per_seq];
+                for (i, blocks) in meta.block_ids.iter().enumerate() {
+                    for (j, &bid) in blocks.iter().enumerate() {
+                        if j < max_blocks_per_seq {
+                            block_table[i * max_blocks_per_seq + j] = bid as i32;
+                        }
+                    }
+                }
+
+                let pdr = self.piecewise_decode.as_ref().unwrap();
+                unsafe {
+                    pdr.replay(
+                        pw_bs,
+                        &input_ids,
+                        &positions,
+                        &slot_mapping,
+                        &cu_seqlens_q,
+                        &seqused_k,
+                        &block_table,
+                        kv_cache,
+                        model,
+                        device,
+                    )
+                }
+                .map_err(|e| ExecutorError::WorkerExecution(format!("piecewise replay: {e}")))?
+            };
+            #[cfg(not(feature = "nccl"))]
+            let result: OwnedTensor =
+                unreachable!("use_piecewise true requires nccl feature; gating bug");
+
+            // logits is [pw_bs, vocab]; narrow to real reqs if padded.
+            let logits_full = result;
+            let logits_view = if num_reqs < piecewise_bs.unwrap() {
+                logits_full.as_gpu_tensor().narrow_dim0(0, num_reqs)
+            } else {
+                logits_full.as_gpu_tensor()
+            };
+            self.last_graph_batch_size = None;
+            self.graph_metadata_valid = false;
+            (Some(logits_full), logits_view)
         } else {
             // Non-decode path: try prefill graph, fall back to eager.
             self.last_graph_batch_size = None;
@@ -5221,7 +6354,23 @@ impl FerriteWorker {
             // tokens with no visual content (hallucinated output).
             let meta = &prepared.attn_meta;
             let req_has_mm = self.mm_data_buffers.contains_key(&meta.req_ids[0]);
-            let use_prefill_graph = num_reqs == 1
+
+            // At tp>1: piecewise prefill replay (NCCL eager between captured segments).
+            // At tp=1: monolithic prefill replay.
+            #[cfg(feature = "nccl")]
+            let use_piecewise_prefill_replay = num_reqs == 1
+                && meta.tokens_before[0] == 0
+                && !req_has_mm
+                && self
+                    .piecewise_prefill
+                    .as_ref()
+                    .and_then(|r| r.nearest_size(total_tokens))
+                    .is_some();
+            #[cfg(not(feature = "nccl"))]
+            let use_piecewise_prefill_replay = false;
+
+            let use_prefill_graph = !use_piecewise_prefill_replay
+                && num_reqs == 1
                 && meta.tokens_before[0] == 0
                 && !req_has_mm
                 && self
@@ -5230,7 +6379,64 @@ impl FerriteWorker {
                     .and_then(|r| r.nearest_graph_size(total_tokens))
                     .is_some();
 
-            if use_prefill_graph {
+            if use_piecewise_prefill_replay {
+                #[cfg(feature = "nccl")]
+                {
+                    let ppr = self.piecewise_prefill.as_ref().unwrap();
+                    let padded = ppr.nearest_size(total_tokens).unwrap();
+
+                    let mut block_table = vec![0i32; max_blocks_per_seq];
+                    for (j, &bid) in meta.block_ids[0].iter().enumerate() {
+                        if j < max_blocks_per_seq {
+                            block_table[j] = bid as i32;
+                        }
+                    }
+
+                    let mut slot_mapping = Vec::with_capacity(total_tokens);
+                    let block_ids = &meta.block_ids[0];
+                    for t in 0..total_tokens {
+                        let abs_pos = meta.tokens_before[0] + t;
+                        let block_idx = abs_pos / block_size;
+                        let offset = abs_pos % block_size;
+                        if block_idx < block_ids.len() {
+                            slot_mapping
+                                .push((block_ids[block_idx] * block_size + offset) as i64);
+                        } else {
+                            slot_mapping.push(-1i64);
+                        }
+                    }
+
+                    let last_token_idx = (total_tokens - 1) as u32;
+
+                    let logits = unsafe {
+                        ppr.replay(
+                            padded,
+                            &prepared.flat_token_ids,
+                            &prepared.flat_positions,
+                            &slot_mapping,
+                            meta.seq_lens[0],
+                            &block_table,
+                            last_token_idx,
+                            block_size,
+                            kv_cache,
+                            model,
+                            device,
+                        )
+                    }
+                    .map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("piecewise prefill replay: {e}"))
+                    })?;
+
+                    let logits_view = logits.as_gpu_tensor();
+                    (Some(logits), logits_view)
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    unreachable!(
+                        "use_piecewise_prefill_replay true requires nccl feature; gating bug"
+                    )
+                }
+            } else if use_prefill_graph {
                 let padded = self
                     .prefill_graph_runner
                     .as_ref()

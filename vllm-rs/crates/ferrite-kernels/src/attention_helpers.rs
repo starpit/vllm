@@ -891,6 +891,30 @@ pub unsafe fn flashinfer_attention(
     );
     debug_assert_eq!(q.dim(2) as u32, cfg.head_dim, "Q head_dim != cfg.head_dim");
 
+    // FI's BatchPagedAttentionPersistent kernel returns rc=-1 at TP>1
+    // decode geometry on L40S sm_89 (kernel launch failure that
+    // poisons the CUDA context — subsequent kernels then error with
+    // ILLEGAL_ADDRESS, breaking the whole forward). Short-circuit to
+    // None so callers take the FA2 fallback (which works on this
+    // hardware). Set `FERRITE_USE_FLASHINFER=1` to re-enable FI for
+    // the cases where it's known good.
+    if std::env::var("FERRITE_USE_FLASHINFER").ok().as_deref() != Some("1") {
+        let _ = (
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            softcap,
+            kv_cache,
+            layer_idx,
+            num_sm,
+            sk_bucket,
+            alloc,
+            stream,
+        );
+        return None;
+    }
+
     let seq_len = q.dim(0);
     let num_qo_heads = q.dim(1);
     let num_kv_heads = kv_cache.num_kv_heads;
@@ -985,7 +1009,13 @@ pub unsafe fn flashinfer_attention(
             );
             let rc = cache.run(stream);
             if rc != 0 {
-                tracing::error!(rc, "fi_run returned nonzero");
+                tracing::error!(rc, "fi_run returned nonzero — falling back to FA2");
+                // The kernel launch failed; `o` contains garbage. Returning
+                // Some(o) here would propagate that garbage downstream and
+                // poison the CUDA context (subsequent kernels error with
+                // ILLEGAL_ADDRESS). Return None so the caller takes the FA2
+                // fallback path.
+                return None;
             }
         }
     }

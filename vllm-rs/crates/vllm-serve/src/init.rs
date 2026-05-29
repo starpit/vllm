@@ -2002,332 +2002,343 @@ fn initialize_stack_tp_pp(
     );
     #[allow(unreachable_code)]
     {
-    #[cfg(not(feature = "nccl"))]
-    {
-        let _ = (config, model_name, init_start);
-        anyhow::bail!(
-            "Pipeline parallelism requires the `nccl` feature; \
+        #[cfg(not(feature = "nccl"))]
+        {
+            let _ = (config, model_name, init_start);
+            anyhow::bail!(
+                "Pipeline parallelism requires the `nccl` feature; \
              rebuild with --features nccl"
-        );
-    }
-
-    #[cfg(feature = "nccl")]
-    {
-        use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
-        use vllm_executor::parallel::ResolvedParallelConfig;
-        use vllm_executor::threadpool::ThreadPoolExecutor;
-
-        let tp_size = config.tensor_parallel_size;
-        let pp_size = config.pipeline_parallel_size;
-        let world_size = tp_size * pp_size;
-        let is_pooling = config.runner == "pooling";
-
-        info!(
-            "Pipeline parallelism: {} PP stages × {} TP ranks = {} GPUs",
-            pp_size, tp_size, world_size
-        );
-
-        // Generate NCCL unique IDs:
-        // - One TP NcclId per PP stage (pp_size total — ranks in same stage share it).
-        // - One PP NcclId per TP position (tp_size total — ranks with same tp_rank share it).
-        let tp_nccl_ids: Vec<vllm_cuda::NcclId> = (0..pp_size)
-            .map(|_| vllm_cuda::NcclId::new().context("failed to generate TP NCCL ID"))
-            .collect::<Result<Vec<_>>>()?;
-        let pp_nccl_ids: Vec<vllm_cuda::NcclId> = (0..tp_size)
-            .map(|_| vllm_cuda::NcclId::new().context("failed to generate PP NCCL ID"))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Build per-rank configs.
-        // Rank layout: global_rank = pp_rank * tp_size + tp_rank.
-        let worker_configs: Vec<FerriteWorkerConfig> = (0..world_size)
-            .map(|global_rank| {
-                let tp_rank = global_rank % tp_size;
-                let pp_rank = global_rank / tp_size;
-                FerriteWorkerConfig {
-                    model_path: config.model.clone(),
-                    dtype: config.dtype.clone(),
-                    hf_token: config.hf_token.clone(),
-                    block_size: config.block_size,
-                    device_id: global_rank as i32,
-                    enforce_eager: config.enforce_eager,
-                    max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                    cuda_graph_sizes: config
-                        .cuda_graph_config
-                        .as_ref()
-                        .map(|c| c.capture_sizes.clone())
-                        .unwrap_or_default(),
-                    cublas_autotune: config.cublas_autotune,
-                    gpu_memory_utilization: config.gpu_memory_utilization,
-                    pooling_strategy: config.pooling_strategy.clone(),
-                    is_pooling,
-                    tp_rank,
-                    tp_world_size: tp_size,
-                    pp_rank,
-                    pp_size,
-                    gguf_file: config.gguf_file.clone(),
-                    lora_adapter: config.lora_adapter.clone(),
-                    kv_cache_dtype: config.kv_cache_dtype.clone(),
-                    calculate_kv_scales: config.calculate_kv_scales,
-                    cuda_graph_mode: config
-                        .cuda_graph_mode
-                        .parse()
-                        .unwrap_or(CudaGraphMode::Auto),
-                    eos_token_ids: vec![],
-                    max_model_len: config.max_model_len,
-                    draft_model_path: spec_decode_draft_model_path(config),
-                    draft_model_dtype: config.draft_model_dtype.clone(),
-                }
-            })
-            .collect();
-
-        // Download barrier: rank 0 downloads first, others wait.
-        let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(world_size));
-
-        // Phase 1: Spawn one thread per GPU — init device + load model (PP-aware).
-        let handles: Vec<_> = worker_configs
-            .into_iter()
-            .enumerate()
-            .map(|(global_rank, cfg)| {
-                let barrier = download_barrier.clone();
-                std::thread::spawn(move || -> Result<FerriteWorker> {
-                    let mut worker = FerriteWorker::new(cfg);
-                    worker.init_device().context("init_device failed")?;
-
-                    // Rank 0 loads first (downloads model files to cache).
-                    if global_rank == 0 {
-                        worker.load_model().context("load_model failed")?;
-                        barrier.wait();
-                    } else {
-                        barrier.wait();
-                        worker.load_model().context("load_model failed")?;
-                    }
-
-                    Ok(worker)
-                })
-            })
-            .collect();
-
-        // Collect workers.
-        let mut ferrite_workers: Vec<FerriteWorker> = Vec::with_capacity(world_size);
-        let mut hf_config = None;
-        let mut model_dir = None;
-        let mut dtype_elem_bytes: usize = 2; // BF16 default
-
-        for (rank, handle) in handles.into_iter().enumerate() {
-            let worker = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
-                .with_context(|| format!("worker {rank} init failed"))?;
-
-            if rank == 0 {
-                hf_config = worker.hf_config().cloned();
-                model_dir = worker.model_dir().map(|p| p.to_path_buf());
-                dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
-            }
-            ferrite_workers.push(worker);
+            );
         }
 
-        let hf_config = hf_config.context("model config not available after load")?;
+        #[cfg(feature = "nccl")]
+        {
+            use vllm_executor::ferrite_worker::{FerriteWorker, FerriteWorkerConfig};
+            use vllm_executor::parallel::ResolvedParallelConfig;
+            use vllm_executor::threadpool::ThreadPoolExecutor;
 
-        let max_model_len = config
-            .max_model_len
-            .or(hf_config.max_position_embeddings)
-            .unwrap_or(4096);
-        let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+            let tp_size = config.tensor_parallel_size;
+            let pp_size = config.pipeline_parallel_size;
+            let world_size = tp_size * pp_size;
+            let is_pooling = config.runner == "pooling";
 
-        info!(
-            "Model: {}, max_model_len={}, num_layers={}, tp={}, pp={}",
-            model_name, max_model_len, num_layers, tp_size, pp_size
-        );
+            info!(
+                "Pipeline parallelism: {} PP stages × {} TP ranks = {} GPUs",
+                pp_size, tp_size, world_size
+            );
 
-        // Phase 2: Create NCCL comms (TP + PP) + profile memory + warmup.
-        // All NCCL init calls require ranks in the same group to participate
-        // simultaneously, so we use scoped threads.
-        //
-        // We create TP comms first (all ranks in each TP group sync), then PP
-        // comms (all ranks in each PP group sync). This ordering ensures no
-        // deadlock since all ranks follow the same order.
-        let init_results: Vec<Result<(usize, FerriteWorker)>> = std::thread::scope(|s| {
-            let handles: Vec<_> = ferrite_workers
+            // Generate NCCL unique IDs:
+            // - One TP NcclId per PP stage (pp_size total — ranks in same stage share it).
+            // - One PP NcclId per TP position (tp_size total — ranks with same tp_rank share it).
+            let tp_nccl_ids: Vec<vllm_cuda::NcclId> = (0..pp_size)
+                .map(|_| vllm_cuda::NcclId::new().context("failed to generate TP NCCL ID"))
+                .collect::<Result<Vec<_>>>()?;
+            let pp_nccl_ids: Vec<vllm_cuda::NcclId> = (0..tp_size)
+                .map(|_| vllm_cuda::NcclId::new().context("failed to generate PP NCCL ID"))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Build per-rank configs.
+            // Rank layout: global_rank = pp_rank * tp_size + tp_rank.
+            let worker_configs: Vec<FerriteWorkerConfig> = (0..world_size)
+                .map(|global_rank| {
+                    let tp_rank = global_rank % tp_size;
+                    let pp_rank = global_rank / tp_size;
+                    FerriteWorkerConfig {
+                        model_path: config.model.clone(),
+                        dtype: config.dtype.clone(),
+                        hf_token: config.hf_token.clone(),
+                        block_size: config.block_size,
+                        device_id: global_rank as i32,
+                        enforce_eager: config.enforce_eager,
+                        max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                        cuda_graph_sizes: config
+                            .cuda_graph_config
+                            .as_ref()
+                            .map(|c| c.capture_sizes.clone())
+                            .unwrap_or_default(),
+                        cublas_autotune: config.cublas_autotune,
+                        gpu_memory_utilization: config.gpu_memory_utilization,
+                        pooling_strategy: config.pooling_strategy.clone(),
+                        is_pooling,
+                        tp_rank,
+                        tp_world_size: tp_size,
+                        pp_rank,
+                        pp_size,
+                        gguf_file: config.gguf_file.clone(),
+                        lora_adapter: config.lora_adapter.clone(),
+                        kv_cache_dtype: config.kv_cache_dtype.clone(),
+                        calculate_kv_scales: config.calculate_kv_scales,
+                        cuda_graph_mode: config
+                            .cuda_graph_mode
+                            .parse()
+                            .unwrap_or(CudaGraphMode::Auto),
+                        eos_token_ids: vec![],
+                        max_model_len: config.max_model_len,
+                        draft_model_path: spec_decode_draft_model_path(config),
+                        draft_model_dtype: config.draft_model_dtype.clone(),
+                    }
+                })
+                .collect();
+
+            // Download barrier: rank 0 downloads first, others wait.
+            let download_barrier = std::sync::Arc::new(std::sync::Barrier::new(world_size));
+
+            // Phase 1: Spawn one thread per GPU — init device + load model (PP-aware).
+            let handles: Vec<_> = worker_configs
                 .into_iter()
                 .enumerate()
-                .map(|(global_rank, mut worker)| {
-                    let tp_nccl_ids = &tp_nccl_ids;
-                    let pp_nccl_ids = &pp_nccl_ids;
-                    s.spawn(move || -> Result<(usize, FerriteWorker)> {
-                        let tp_rank = global_rank % tp_size;
-                        let pp_rank = global_rank / tp_size;
+                .map(|(global_rank, cfg)| {
+                    let barrier = download_barrier.clone();
+                    std::thread::spawn(move || -> Result<FerriteWorker> {
+                        let mut worker = FerriteWorker::new(cfg);
+                        worker.init_device().context("init_device failed")?;
 
-                        // Set CUDA context.
-                        let device = worker.device_ref().expect("device not initialized");
-                        unsafe {
-                            vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+                        // Rank 0 loads first (downloads model files to cache).
+                        if global_rank == 0 {
+                            worker.load_model().context("load_model failed")?;
+                            barrier.wait();
+                        } else {
+                            barrier.wait();
+                            worker.load_model().context("load_model failed")?;
                         }
 
-                        // Create TP NCCL comm (ranks in the same PP stage).
-                        if tp_size > 1 {
-                            let tp_nccl_id = tp_nccl_ids[pp_rank];
-                            let nccl_group = vllm_cuda::NcclGroup::new(
-                                tp_rank,
-                                tp_size,
-                                tp_nccl_id,
+                        Ok(worker)
+                    })
+                })
+                .collect();
+
+            // Collect workers.
+            let mut ferrite_workers: Vec<FerriteWorker> = Vec::with_capacity(world_size);
+            let mut hf_config = None;
+            let mut model_dir = None;
+            let mut dtype_elem_bytes: usize = 2; // BF16 default
+
+            for (rank, handle) in handles.into_iter().enumerate() {
+                let worker = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("worker thread {rank} panicked"))?
+                    .with_context(|| format!("worker {rank} init failed"))?;
+
+                if rank == 0 {
+                    hf_config = worker.hf_config().cloned();
+                    model_dir = worker.model_dir().map(|p| p.to_path_buf());
+                    dtype_elem_bytes = worker.resolved_dtype_elem_bytes();
+                }
+                ferrite_workers.push(worker);
+            }
+
+            let hf_config = hf_config.context("model config not available after load")?;
+
+            let max_model_len = config
+                .max_model_len
+                .or(hf_config.max_position_embeddings)
+                .unwrap_or(4096);
+            let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+
+            info!(
+                "Model: {}, max_model_len={}, num_layers={}, tp={}, pp={}",
+                model_name, max_model_len, num_layers, tp_size, pp_size
+            );
+
+            // Phase 2: Create NCCL comms (TP + PP) + profile memory + warmup.
+            // All NCCL init calls require ranks in the same group to participate
+            // simultaneously, so we use scoped threads.
+            //
+            // We create TP comms first (all ranks in each TP group sync), then PP
+            // comms (all ranks in each PP group sync). This ordering ensures no
+            // deadlock since all ranks follow the same order.
+            let init_results: Vec<Result<(usize, FerriteWorker)>> = std::thread::scope(|s| {
+                let handles: Vec<_> = ferrite_workers
+                    .into_iter()
+                    .enumerate()
+                    .map(|(global_rank, mut worker)| {
+                        let tp_nccl_ids = &tp_nccl_ids;
+                        let pp_nccl_ids = &pp_nccl_ids;
+                        s.spawn(move || -> Result<(usize, FerriteWorker)> {
+                            let tp_rank = global_rank % tp_size;
+                            let pp_rank = global_rank / tp_size;
+
+                            // Set CUDA context.
+                            let device = worker.device_ref().expect("device not initialized");
+                            unsafe {
+                                vllm_cuda::driver::ctx_set_current(device.ctx).unwrap();
+                            }
+
+                            // Create TP NCCL comm (ranks in the same PP stage).
+                            if tp_size > 1 {
+                                let tp_nccl_id = tp_nccl_ids[pp_rank];
+                                let nccl_group = vllm_cuda::NcclGroup::new(
+                                    tp_rank,
+                                    tp_size,
+                                    tp_nccl_id,
+                                    device.compute_stream,
+                                )
+                                .with_context(|| {
+                                    format!("TP NCCL comm init failed for rank {global_rank}")
+                                })?;
+                                worker.set_tp_group(std::sync::Arc::new(nccl_group));
+                            }
+
+                            // Create PP NCCL comm (ranks with the same TP rank).
+                            let pp_nccl_id = pp_nccl_ids[tp_rank];
+                            let device = worker.device_ref().unwrap();
+                            let pp_group = vllm_cuda::NcclGroup::new(
+                                pp_rank,
+                                pp_size,
+                                pp_nccl_id,
                                 device.compute_stream,
                             )
                             .with_context(|| {
-                                format!("TP NCCL comm init failed for rank {global_rank}")
+                                format!("PP NCCL comm init failed for rank {global_rank}")
                             })?;
-                            worker.set_tp_group(std::sync::Arc::new(nccl_group));
-                        }
+                            worker.set_pp_group(std::sync::Arc::new(pp_group));
 
-                        // Create PP NCCL comm (ranks with the same TP rank).
-                        let pp_nccl_id = pp_nccl_ids[tp_rank];
-                        let device = worker.device_ref().unwrap();
-                        let pp_group = vllm_cuda::NcclGroup::new(
-                            pp_rank,
-                            pp_size,
-                            pp_nccl_id,
-                            device.compute_stream,
-                        )
-                        .with_context(|| {
-                            format!("PP NCCL comm init failed for rank {global_rank}")
-                        })?;
-                        worker.set_pp_group(std::sync::Arc::new(pp_group));
+                            // Allocate PP recv buffers on non-first stages.
+                            worker.allocate_pp_recv_buffers();
 
-                        // Allocate PP recv buffers on non-first stages.
-                        worker.allocate_pp_recv_buffers();
+                            // Profile activation memory with dummy forward.
+                            let avail = worker.determine_available_memory().map_err(|e| {
+                                anyhow::anyhow!(
+                                    "determine_available_memory rank {global_rank}: {e}"
+                                )
+                            })?;
 
-                        // Profile activation memory with dummy forward.
-                        let avail = worker.determine_available_memory().map_err(|e| {
-                            anyhow::anyhow!("determine_available_memory rank {global_rank}: {e}")
-                        })?;
-
-                        Ok((avail, worker))
+                            Ok((avail, worker))
+                        })
                     })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
-        let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(world_size);
-        let mut min_avail = usize::MAX;
-        for res in init_results {
-            let (avail, worker) = res?;
-            min_avail = min_avail.min(avail);
-            workers.push(Box::new(worker));
-        }
+            let mut workers: Vec<Box<dyn Worker>> = Vec::with_capacity(world_size);
+            let mut min_avail = usize::MAX;
+            for res in init_results {
+                let (avail, worker) = res?;
+                min_avail = min_avail.min(avail);
+                workers.push(Box::new(worker));
+            }
 
-        // num_gpu_blocks = min across ALL workers (matches Python).
-        let num_gpu_blocks = compute_num_blocks(
-            min_avail,
-            config.block_size,
-            &hf_config,
-            dtype_elem_bytes,
-            config.gpu_memory_utilization,
-            &config.kv_cache_dtype,
-        );
+            // num_gpu_blocks = min across ALL workers (matches Python).
+            let num_gpu_blocks = compute_num_blocks(
+                min_avail,
+                config.block_size,
+                &hf_config,
+                dtype_elem_bytes,
+                config.gpu_memory_utilization,
+                &config.kv_cache_dtype,
+            );
 
-        // Initialize cache: each worker allocates KV for its layer count only.
-        for w in &mut workers {
-            w.initialize_cache(num_gpu_blocks, 0)
-                .context("initialize_cache")?;
-        }
+            // Initialize cache: each worker allocates KV for its layer count only.
+            for w in &mut workers {
+                w.initialize_cache(num_gpu_blocks, 0)
+                    .context("initialize_cache")?;
+            }
 
-        info!(
-            "TP+PP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
-            min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
-            num_gpu_blocks,
-        );
+            info!(
+                "TP+PP: min available memory across ranks: {:.1} GB, num_gpu_blocks={}",
+                min_avail as f64 / (1024.0 * 1024.0 * 1024.0),
+                num_gpu_blocks,
+            );
 
-        // Warm up (CUDA graph capture) concurrently — forwards use NCCL collectives.
-        let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
-            let handles: Vec<_> = workers
-                .iter_mut()
-                .enumerate()
-                .map(|(rank, w)| {
-                    s.spawn(move || {
-                        w.compile_or_warm_up_model()
-                            .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
+            // Warm up (CUDA graph capture) concurrently — forwards use NCCL collectives.
+            let warmup_results: Vec<Result<()>> = std::thread::scope(|s| {
+                let handles: Vec<_> = workers
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(rank, w)| {
+                        s.spawn(move || {
+                            w.compile_or_warm_up_model()
+                                .with_context(|| format!("compile_or_warm_up_model rank {rank}"))
+                        })
                     })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for res in warmup_results {
+                res?;
+            }
+
+            // Wrap in ThreadPoolExecutor with TP+PP config.
+            let parallel_config =
+                ResolvedParallelConfig::tensor_pipeline_parallel(tp_size, pp_size, 0);
+            let executor = ThreadPoolExecutor::new(workers, parallel_config);
+
+            // Build engine (same as TP-only path).
+            let eos_token_ids: Vec<u32> = hf_config
+                .extra
+                .get("eos_token_id")
+                .map(|v| {
+                    if let Some(id) = v.as_u64() {
+                        vec![id as u32]
+                    } else if let Some(arr) = v.as_array() {
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|id| id as u32))
+                            .collect()
+                    } else {
+                        vec![]
+                    }
                 })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for res in warmup_results {
-            res?;
-        }
+                .unwrap_or_default();
 
-        // Wrap in ThreadPoolExecutor with TP+PP config.
-        let parallel_config = ResolvedParallelConfig::tensor_pipeline_parallel(tp_size, pp_size, 0);
-        let executor = ThreadPoolExecutor::new(workers, parallel_config);
-
-        // Build engine (same as TP-only path).
-        let eos_token_ids: Vec<u32> = hf_config
-            .extra
-            .get("eos_token_id")
-            .map(|v| {
-                if let Some(id) = v.as_u64() {
-                    vec![id as u32]
-                } else if let Some(arr) = v.as_array() {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64().map(|id| id as u32))
-                        .collect()
-                } else {
-                    vec![]
-                }
-            })
-            .unwrap_or_default();
-
-        // PP: force sync scheduling — async scheduling with PP requires token broadcast
-        // from last stage to non-last stages, which is not yet implemented.
-        let use_async_scheduling = false;
-        let enable_prefix_caching = config.enable_prefix_caching;
-        let engine_config = EngineCoreConfig {
-            scheduler_config: SchedulerConfig {
-                max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
-                max_num_seqs: config.max_num_seqs,
-                policy: SchedulerPolicy::Fcfs,
-                enable_chunked_prefill: true,
-                async_scheduling: Some(use_async_scheduling),
-                num_lookahead_tokens: if config.speculative_model.is_some() {
-                    config.num_speculative_tokens
-                } else {
-                    0
+            // PP: force sync scheduling — async scheduling with PP requires token broadcast
+            // from last stage to non-last stages, which is not yet implemented.
+            let use_async_scheduling = false;
+            let enable_prefix_caching = config.enable_prefix_caching;
+            let engine_config = EngineCoreConfig {
+                scheduler_config: SchedulerConfig {
+                    max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
+                    max_num_seqs: config.max_num_seqs,
+                    policy: SchedulerPolicy::Fcfs,
+                    enable_chunked_prefill: true,
+                    async_scheduling: Some(use_async_scheduling),
+                    num_lookahead_tokens: if config.speculative_model.is_some() {
+                        config.num_speculative_tokens
+                    } else {
+                        0
+                    },
+                    use_pp: true,
+                    ..Default::default()
                 },
-                use_pp: true,
-                ..Default::default()
-            },
-            max_model_len,
-            num_gpu_blocks,
-            block_size: config.block_size,
-            engine_index: 0,
-            async_scheduling: use_async_scheduling,
-            use_spec_decode: config.speculative_model.is_some(),
-            proposer_config: None,
-            eos_token_ids,
-            is_pooling: config.runner == "pooling",
-            enable_prefix_caching,
-        };
+                max_model_len,
+                num_gpu_blocks,
+                block_size: config.block_size,
+                engine_index: 0,
+                async_scheduling: use_async_scheduling,
+                use_spec_decode: config.speculative_model.is_some(),
+                proposer_config: None,
+                eos_token_ids,
+                is_pooling: config.runner == "pooling",
+                enable_prefix_caching,
+            };
 
-        let client: Box<dyn vllm_engine::core_client::EngineCoreClient + Send> =
-            Box::new(InprocClient::new(engine_config, Box::new(executor)));
+            let client: Box<dyn vllm_engine::core_client::EngineCoreClient + Send> =
+                Box::new(InprocClient::new(engine_config, Box::new(executor)));
 
-        // Load tokenizer and build engine.
-        let tokenizer = model_dir
-            .as_ref()
-            .and_then(|dir| try_load_tokenizer(dir).ok());
+            // Load tokenizer and build engine.
+            let tokenizer = model_dir
+                .as_ref()
+                .and_then(|dir| try_load_tokenizer(dir).ok());
 
-        let mut engine = if let Some(tok) = tokenizer {
-            let tokenizer = Arc::new(tok);
-            if let Some(ref dir) = model_dir {
-                if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
-                    info!("Chat template loaded from tokenizer_config.json");
-                    AsyncEngine::with_tokenizer_and_template(
-                        client,
-                        model_name.clone(),
-                        max_model_len,
-                        tokenizer,
-                        Arc::new(ct),
-                    )
+            let mut engine = if let Some(tok) = tokenizer {
+                let tokenizer = Arc::new(tok);
+                if let Some(ref dir) = model_dir {
+                    if let Some(ct) = resolve_chat_template(config.chat_template.as_deref(), dir) {
+                        info!("Chat template loaded from tokenizer_config.json");
+                        AsyncEngine::with_tokenizer_and_template(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                            Arc::new(ct),
+                        )
+                    } else {
+                        AsyncEngine::with_tokenizer(
+                            client,
+                            model_name.clone(),
+                            max_model_len,
+                            tokenizer,
+                        )
+                    }
                 } else {
                     AsyncEngine::with_tokenizer(
                         client,
@@ -2337,35 +2348,32 @@ fn initialize_stack_tp_pp(
                     )
                 }
             } else {
-                AsyncEngine::with_tokenizer(client, model_name.clone(), max_model_len, tokenizer)
+                AsyncEngine::new(client, model_name.clone(), max_model_len)
+            };
+
+            if false {
+                // PP: sync scheduling forced
+                engine.set_async_scheduling(true);
             }
-        } else {
-            AsyncEngine::new(client, model_name.clone(), max_model_len)
-        };
+            if config.runner == "pooling" {
+                engine.set_is_pooling(true);
+            }
 
-        if false {
-            // PP: sync scheduling forced
-            engine.set_async_scheduling(true);
+            let engine = Arc::new(engine);
+
+            info!(
+                "Stack initialized with TP={}, PP={} in {:.1}s",
+                tp_size,
+                pp_size,
+                init_start.elapsed().as_secs_f64()
+            );
+
+            Ok(InitializedStack {
+                engine,
+                model_name,
+                max_model_len,
+            })
         }
-        if config.runner == "pooling" {
-            engine.set_is_pooling(true);
-        }
-
-        let engine = Arc::new(engine);
-
-        info!(
-            "Stack initialized with TP={}, PP={} in {:.1}s",
-            tp_size,
-            pp_size,
-            init_start.elapsed().as_secs_f64()
-        );
-
-        Ok(InitializedStack {
-            engine,
-            model_name,
-            max_model_len,
-        })
-    }
     } // close `#[allow(unreachable_code)] {` wrapper
 }
 

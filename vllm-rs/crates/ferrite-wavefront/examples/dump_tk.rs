@@ -16,8 +16,7 @@
 
 use std::path::PathBuf;
 
-use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-use ferrite_wavefront::subtile::SourceShape;
+use ferrite_wavefront::fixtures::{one_layer_input, orchestrator_kernel_args};
 use ferrite_wavefront::subtile_ir::BufId;
 use ferrite_wavefront::tk_codegen::{emit_kernel, KernelArg, KernelArgs};
 use ferrite_wavefront::tk_lower::{
@@ -116,9 +115,6 @@ fn main() {
     eprintln!("wrote {} ({} bytes)", path2.display(), src2.len());
 
     // ── Full decode: one-layer forward via the orchestrator ──
-    //
-    // Source shapes match a Llama-3.2-1B-style decode (test fixture only
-    // — production pipeline picks shapes from `LoweringInput.sources`).
     let input = one_layer_input();
     let (prog3, n_bufs) = lower_to_tk(&input);
     let args3 = orchestrator_kernel_args(&input, n_bufs);
@@ -132,137 +128,4 @@ fn main() {
         n_bufs,
         input.ops.len()
     );
-}
-
-/// Synthesize the kernel arg signature for an orchestrator output.
-///
-/// Buffer-id convention (see `tk_orchestrate`):
-///   `BufId(0..n_sources)`         — external inputs (model weights /
-///                                   activations / KV slices).
-///   `BufId(n_sources..n_sources+n_ops)` — per-op output staging buffers.
-///
-/// Production wiring will derive types and names from the macro-side
-/// `BufferRef` table; the example just emits one `__nv_bfloat16*` per
-/// buffer and a single `__num_kv_pages` runtime arg (used by every
-/// AttnDecode op).
-fn orchestrator_kernel_args(input: &LoweringInput, n_bufs: u32) -> KernelArgs {
-    let n_sources = input.sources.len() as u32;
-    let mut bufs = Vec::with_capacity(n_bufs as usize);
-    for i in 0..n_sources {
-        bufs.push(KernelArg {
-            ty: "const __nv_bfloat16* __restrict__".into(),
-            name: format!("src{i}"),
-        });
-    }
-    for i in 0..(n_bufs - n_sources) {
-        bufs.push(KernelArg {
-            ty: "__nv_bfloat16* __restrict__".into(),
-            name: format!("op{i}_out"),
-        });
-    }
-    let mut u32_args = vec![];
-    if input
-        .ops
-        .iter()
-        .any(|d| matches!(d.op, LoweredOp::AttnDecode { .. }))
-    {
-        u32_args.push("__num_kv_pages".into());
-    }
-    KernelArgs { bufs, u32_args }
-}
-
-/// Minimal one-layer decode forward (Llama-3.2-1B-style). Test fixture
-/// only — the production pipeline (proc-macro → `lower_decode_to_wavefront`)
-/// produces a `LoweringInput` directly from the solved decode FUF.
-fn one_layer_input() -> LoweringInput {
-    let h = 2048u32;
-    let kv = 512u32;
-    let i = 8192u32;
-    let hd = 64u32;
-    LoweringInput {
-        sources: vec![
-            SourceShape { rows: 1, cols: h },  // 0  x
-            SourceShape { rows: 1, cols: h },  // 1  rms_w0
-            SourceShape { rows: h, cols: h },  // 2  q_w
-            SourceShape { rows: kv, cols: h }, // 3  k_w
-            SourceShape { rows: kv, cols: h }, // 4  v_w
-            SourceShape { rows: 1, cols: hd }, // 5  cos
-            SourceShape { rows: 1, cols: hd }, // 6  sin
-            SourceShape { rows: 1, cols: h },  // 7  k_cache slice
-            SourceShape { rows: 1, cols: h },  // 8  v_cache slice
-            SourceShape { rows: h, cols: h },  // 9  o_w
-            SourceShape { rows: 1, cols: h },  // 10 rms_w1
-            SourceShape { rows: i, cols: h },  // 11 gate_w
-            SourceShape { rows: i, cols: h },  // 12 up_w
-            SourceShape { rows: h, cols: i },  // 13 down_w
-        ],
-        ops: vec![
-            OpDesc {
-                op: LoweredOp::RmsNorm { eps: 1e-5 },
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
-                m: 1,
-                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
-            },
-            OpDesc {
-                op: LoweredOp::RopeRotate { head_dim: hd },
-                m: 1,
-                inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
-            },
-            OpDesc {
-                op: LoweredOp::AttnDecode {
-                    num_q_heads: 1,
-                    num_kv_heads: 1,
-                    head_dim: hd,
-                    scale: 0.125,
-                },
-                m: 1,
-                inputs: vec![InputRef::Op(2), InputRef::Ext(7), InputRef::Ext(8)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
-                m: 1,
-                inputs: vec![InputRef::Op(3), InputRef::Ext(9)],
-            },
-            OpDesc {
-                op: LoweredOp::Add,
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Op(4)],
-            },
-            OpDesc {
-                op: LoweredOp::RmsNorm { eps: 1e-5 },
-                m: 1,
-                inputs: vec![InputRef::Op(5), InputRef::Ext(10)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
-                m: 1,
-                inputs: vec![InputRef::Op(6), InputRef::Ext(11)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
-                m: 1,
-                inputs: vec![InputRef::Op(6), InputRef::Ext(12)],
-            },
-            OpDesc {
-                op: LoweredOp::SiluMul,
-                m: 1,
-                inputs: vec![InputRef::Op(7), InputRef::Op(8)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: i },
-                m: 1,
-                inputs: vec![InputRef::Op(9), InputRef::Ext(13)],
-            },
-            OpDesc {
-                op: LoweredOp::Add,
-                m: 1,
-                inputs: vec![InputRef::Ext(0), InputRef::Op(10)],
-            },
-        ],
-        result: 11,
-    }
 }

@@ -6,7 +6,12 @@ license.workspace = true
 
 [lib]
 
+[[bin]]
+name = "tk_emit_decode"
+path = "src/bin/tk_emit_decode.rs"
+
 [dependencies]
+dirs = "6"
 
 [dev-dependencies]
 # `cpu_golden` is the host calculator the VALIDATION tests compute with

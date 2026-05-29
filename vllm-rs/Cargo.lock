@@ -2430,6 +2430,7 @@ dependencies = [
 name = "ferrite-wavefront"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "ferrite-forward",
 ]
 

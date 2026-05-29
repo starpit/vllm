@@ -16,6 +16,7 @@
 //! validation computes with — not the correctness *oracle* (that is
 //! ferrite-metal non-mega at temp=0).
 
+pub mod fixtures;
 pub mod lower;
 pub mod mega;
 pub mod partition;

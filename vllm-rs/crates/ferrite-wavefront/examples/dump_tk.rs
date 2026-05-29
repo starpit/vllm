@@ -86,6 +86,7 @@ fn main() {
             act_elem: 2,
             softmax_scale: 0.088_388_35,
             num_kv_pages_arg: "__num_kv_pages",
+            unique_id: 0,
         },
         &mut pages2,
         &mut prog2,

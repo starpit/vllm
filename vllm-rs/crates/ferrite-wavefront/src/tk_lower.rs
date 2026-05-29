@@ -325,6 +325,13 @@ pub struct AttnDecodeOp {
     /// `"__num_kv_pages"`). The lowering does not invent this — the
     /// scaffold's signature defines it.
     pub num_kv_pages_arg: &'static str,
+    /// Per-AttnDecode unique id, used as a suffix on the function-
+    /// scope prelude variable names (`__q_smem_a0`, `__m_max_a0`, …)
+    /// so multiple AttnDecode ops in one TkProgram (e.g. one per
+    /// transformer block in a multi-layer Llama forward) don't
+    /// collide on the same identifiers. The orchestrator passes the
+    /// LoweringInput op index — unique across all ops in a forward.
+    pub unique_id: u32,
 }
 
 /// Lower one decode-attention op into a `TkProgram` fragment.
@@ -548,127 +555,134 @@ fn populate_attn_decode_prelude(
     let q_heads_per_warp = num_q_heads / (NUM_CONSUMER_WARPS as u32);
     let q_per_kv = num_q_heads / num_kv_heads;
     let scale = op.softmax_scale;
+    let u = op.unique_id;
     let prelude = format!(
-        r#"    // ── AttnDecode prelude (multi-head GQA; one kv-head per consumer warp) ──
+        r#"    // ── AttnDecode #{u} prelude (multi-head GQA; one kv-head per consumer warp) ──
     using T_act = __nv_bfloat16;
-    auto* __q_smem   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
-    auto* __k_smem   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
-    auto* __v_smem   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
-    auto* __out_smem = reinterpret_cast<T_act*>(page_buf[{q_id}]);
-    const unsigned int __head_dim = {head_dim}u;
-    const unsigned int __num_q_heads = {num_q_heads}u;
-    const unsigned int __num_kv_heads = {num_kv_heads}u;
-    const unsigned int __q_heads_per_warp = {q_heads_per_warp}u;
-    const unsigned int __q_per_kv = {q_per_kv}u;
-    const float __scale = {scale:?}f;
+    auto* __q_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    auto* __k_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
+    auto* __v_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
+    auto* __out_smem_a{u} = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    const unsigned int __head_dim_a{u} = {head_dim}u;
+    const unsigned int __num_q_heads_a{u} = {num_q_heads}u;
+    const unsigned int __num_kv_heads_a{u} = {num_kv_heads}u;
+    const unsigned int __q_heads_per_warp_a{u} = {q_heads_per_warp}u;
+    const unsigned int __q_per_kv_a{u} = {q_per_kv}u;
+    const float __scale_a{u} = {scale:?}f;
     // Per-warp per-q-head softmax state. With Llama-3.2-1B
     // (N_q=32, 8 warps, qpw=4): each consumer warp keeps 4
     // independent softmax + accumulator states.
-    float __m_max[{q_heads_per_warp}];
-    float __l_sum[{q_heads_per_warp}];
-    float __renorm[{q_heads_per_warp}];
-    float __p[{q_heads_per_warp}];
-    float __o_accum[{q_heads_per_warp}][{head_dim}];
+    float __m_max_a{u}[{q_heads_per_warp}];
+    float __l_sum_a{u}[{q_heads_per_warp}];
+    float __renorm_a{u}[{q_heads_per_warp}];
+    float __p_a{u}[{q_heads_per_warp}];
+    float __o_accum_a{u}[{q_heads_per_warp}][{head_dim}];
 "#
     );
     prog.add_prelude(prelude);
 }
 
-fn init_softmax_accum_body(_op: &AttnDecodeOp) -> String {
-    r#"
-            // tk_warp_ir AttnDecode — init per-warp softmax state (every consumer warp)
-            {
+fn init_softmax_accum_body(op: &AttnDecodeOp) -> String {
+    let u = op.unique_id;
+    format!(
+        r#"
+            // tk_warp_ir AttnDecode #{u} — init per-warp softmax state
+            {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
-                    __m_max[__h] = -INFINITY;
-                    __l_sum[__h] = 0.0f;
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    __m_max_a{u}[__h] = -INFINITY;
+                    __l_sum_a{u}[__h] = 0.0f;
                     for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim; __j += 32u) {
-                        __o_accum[__h][__j] = 0.0f;
-                    }
-                }
-            }
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] = 0.0f;
+                    }}
+                }}
+            }}
 "#
-    .into()
+    )
 }
 
-fn qkt_softmax_step_body(_op: &AttnDecodeOp) -> String {
-    r#"
-            // tk_warp_ir AttnDecode — Q@K^T + online softmax (per-warp, all consumer warps)
-            {
+fn qkt_softmax_step_body(op: &AttnDecodeOp) -> String {
+    let u = op.unique_id;
+    format!(
+        r#"
+            // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
+            {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
-                // Warp `c` owns kv-head `c` and q-heads
-                // [c * qpw, (c+1) * qpw).
                 const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
                 const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp;
-                const unsigned int __k_off = __kv_head * __head_dim;
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
-                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim;
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
+                const unsigned int __k_off = __kv_head * __head_dim_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim_a{u};
                     float __s = 0.0f;
                     for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim; __j += 32u) {
-                        __s += __bfloat162float(__q_smem[__q_off + __j])
-                             * __bfloat162float(__k_smem[__k_off + __j]);
-                    }
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __s += __bfloat162float(__q_smem_a{u}[__q_off + __j])
+                             * __bfloat162float(__k_smem_a{u}[__k_off + __j]);
+                    }}
                     #pragma unroll
-                    for (int __o = 16; __o > 0; __o >>= 1) {
+                    for (int __o = 16; __o > 0; __o >>= 1) {{
                         __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
-                    }
-                    __s *= __scale;
-                    const float __m_new = fmaxf(__m_max[__h], __s);
-                    __renorm[__h] = expf(__m_max[__h] - __m_new);
-                    __p[__h]      = expf(__s          - __m_new);
-                    __l_sum[__h]  = __renorm[__h] * __l_sum[__h] + __p[__h];
+                    }}
+                    __s *= __scale_a{u};
+                    const float __m_new = fmaxf(__m_max_a{u}[__h], __s);
+                    __renorm_a{u}[__h] = expf(__m_max_a{u}[__h] - __m_new);
+                    __p_a{u}[__h]      = expf(__s              - __m_new);
+                    __l_sum_a{u}[__h]  = __renorm_a{u}[__h] * __l_sum_a{u}[__h] + __p_a{u}[__h];
                     for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim; __j += 32u) {
-                        __o_accum[__h][__j] *= __renorm[__h];
-                    }
-                    __m_max[__h] = __m_new;
-                }
-            }
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] *= __renorm_a{u}[__h];
+                    }}
+                    __m_max_a{u}[__h] = __m_new;
+                }}
+            }}
 "#
-    .into()
+    )
 }
 
-fn sv_accum_step_body(_op: &AttnDecodeOp) -> String {
-    r#"
-            // tk_warp_ir AttnDecode — softmax(P) @ V (per-warp, all consumer warps)
-            {
+fn sv_accum_step_body(op: &AttnDecodeOp) -> String {
+    let u = op.unique_id;
+    format!(
+        r#"
+            // tk_warp_ir AttnDecode #{u} — softmax(P) @ V
+            {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
-                const unsigned int __v_off = __kv_head * __head_dim;
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
+                const unsigned int __v_off = __kv_head * __head_dim_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
                     for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim; __j += 32u) {
-                        __o_accum[__h][__j] += __p[__h]
-                            * __bfloat162float(__v_smem[__v_off + __j]);
-                    }
-                }
-            }
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] += __p_a{u}[__h]
+                            * __bfloat162float(__v_smem_a{u}[__v_off + __j]);
+                    }}
+                }}
+            }}
 "#
-    .into()
+    )
 }
 
-fn finalise_softmax_norm_body(_op: &AttnDecodeOp) -> String {
-    r#"
-            // tk_warp_ir AttnDecode — finalise: O = O_accum / l_sum (per-warp, all consumer warps)
-            {
+fn finalise_softmax_norm_body(op: &AttnDecodeOp) -> String {
+    let u = op.unique_id;
+    format!(
+        r#"
+            // tk_warp_ir AttnDecode #{u} — finalise: O = O_accum / l_sum
+            {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp;
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp; ++__h) {
-                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim;
-                    const float __inv_l = 1.0f / __l_sum[__h];
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim_a{u};
+                    const float __inv_l = 1.0f / __l_sum_a{u}[__h];
                     for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim; __j += 32u) {
-                        __out_smem[__out_off + __j] =
-                            __float2bfloat16(__o_accum[__h][__j] * __inv_l);
-                    }
-                }
-            }
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __out_smem_a{u}[__out_off + __j] =
+                            __float2bfloat16(__o_accum_a{u}[__h][__j] * __inv_l);
+                    }}
+                }}
+            }}
 "#
-    .into()
+    )
 }
 
 // ── Residual Add — element-wise add into TkProgram ─────────────────
@@ -1342,6 +1356,7 @@ mod tests {
             act_elem: 2,
             softmax_scale: 0.088388_35,
             num_kv_pages_arg: "__num_kv_pages",
+            unique_id: 0,
         }
     }
 

@@ -265,6 +265,7 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         act_elem: ACT_ELEM,
                         softmax_scale: scale,
                         num_kv_pages_arg: "__num_kv_pages",
+                        unique_id: op_idx as u32,
                     }
                 );
                 op_out_shape.push((desc.m, num_q_heads * head_dim));

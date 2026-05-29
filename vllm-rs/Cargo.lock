@@ -2433,6 +2433,7 @@ dependencies = [
  "cudarc",
  "dirs 6.0.0",
  "ferrite-forward",
+ "half",
 ]
 
 [[package]]

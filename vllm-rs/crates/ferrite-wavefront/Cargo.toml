@@ -48,3 +48,8 @@ dirs = "6"
 # ferrite-forward builds backend-agnostic here (no cuda/metal feature),
 # so the tests stay host-runnable on any platform.
 ferrite-forward = { path = "../ferrite-forward" }
+# `half::bf16` for the dev-side bf16 round-trip in the
+# `*_kernel_matches_cpu_golden` validation tests — the kernel reads
+# bf16 from HBM, so the host reference must apply the same lossy
+# conversion to compare on equal terms.
+half = { workspace = true }

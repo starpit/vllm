@@ -57,16 +57,24 @@ pub mod interpreter;
 
 // PD-wavefront: the neutral megakernel IR types the macro-emitted
 // `wavefront_mega_decode()` builder constructs. The generated model crates
-// depend on `ferrite-forward`, not `ferrite-wavefront` (which is pulled in
-// only under `metal`), so this thin re-export gives the emitted code a
-// stable `::ferrite_forward::wavefront::…` path. The runtime dispatch glue
-// (`interpreter::metal::mega_player`) reaches `ferrite_wavefront` directly.
+// depend on `ferrite-forward`, not `ferrite-wavefront` directly. This
+// re-export gives the emitted code a stable `::ferrite_forward::wavefront::…`
+// path. Metal pulls in the MegaProgram/SubtileIR types for its mega_player;
+// CUDA pulls in the orchestrator-emitted megakernel `dispatch` module +
+// fixtures (kernel-arg shapes) so per-model emission can dispatch
+// `tk_decode_one_layer` from the worker hook.
 #[cfg(feature = "metal")]
 pub mod wavefront {
     pub use ferrite_wavefront::mega::{MegaProgram, OperandSlot};
     pub use ferrite_wavefront::subtile_ir::{
         BufId, BufferRef, InputKind, WeightBundle, WeightLoc, WeightRole,
     };
+}
+
+#[cfg(feature = "cuda")]
+pub mod wavefront_cuda {
+    pub use ferrite_wavefront::dispatch;
+    pub use ferrite_wavefront::fixtures;
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -521,6 +529,34 @@ mod dispatcher {
             device: &mut GpuDevice,
             num_tokens: u64,
         ) -> OwnedTensor;
+
+        /// CUDA mega-dispatch hook — when `Some`, the worker invokes
+        /// this AFTER `forward_backbone` (under `FERRITE_WAVEFRONT_GPU=1`)
+        /// to also run the orchestrator-emitted persistent megakernel
+        /// against the same runtime context. Mirrors metal
+        /// `pool::run_wavefront_mega`.
+        ///
+        /// Default impl returns `None`; the macro-emitted dispatcher
+        /// override matches `self` to a per-model fn that resolves the
+        /// kernel's source pointers from `wm: &model::Weights` via
+        /// `WeightAccessors`. Per-model fns are SHAPE-GATED — only
+        /// arches matching the orchestrator fixture today
+        /// (Llama-3.2-1B: hidden=2048, intermediate=8192, head_dim=64,
+        /// num_q_heads=32, num_kv_heads=8) actually dispatch; others
+        /// return `None`.
+        ///
+        /// # Safety
+        /// Same as [`Self::forward_backbone`].
+        #[cfg(feature = "cuda")]
+        #[allow(unused_variables)]
+        unsafe fn wavefront_megakernel_dispatch_cuda(
+            &self,
+            ctx: &ForwardCtx,
+            device: &mut GpuDevice,
+            num_tokens: u64,
+        ) -> Option<()> {
+            None
+        }
 
         /// Per-worker arena peak in bytes (metal only).
         ///

@@ -10,7 +10,22 @@ license.workspace = true
 name = "tk_emit_decode"
 path = "src/bin/tk_emit_decode.rs"
 
+[features]
+default = []
+# `cuda` enables the FFI binding to the orchestrator's emitted
+# `launch_<name>` C-linkage host wrapper. Linking is done by this
+# crate's `build.rs`, which emits `rustc-link-lib=static=megakernels`
+# pointing at the cudaforge cache `ferrite-cuda-builder` populates.
+# We can't depend on `ferrite-cuda-builder` directly here — it would
+# create a cycle through `ferrite-models -> ferrite-forward -> us`.
+# Build ordering is enforced by the top-level binary that uses both
+# crates.
+cuda = []
+
 [dependencies]
+dirs = "6"
+
+[build-dependencies]
 dirs = "6"
 
 [dev-dependencies]

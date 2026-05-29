@@ -597,6 +597,18 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     for cu in &megakernel_cus {
         rerun_files.push(cu.clone());
     }
+
+    // Make the produced libmegakernels.a linkable from any downstream
+    // ferrite crate that depends on this one (e.g. ferrite-wavefront's
+    // FFI to `launch_<name>`). Link directives in a build.rs propagate
+    // up the dep graph, so the final binary picks them up automatically.
+    println!("cargo:rustc-link-search=native={cache_dir}");
+    println!("cargo:rustc-link-lib=static=megakernels");
+    println!("cargo:rustc-link-lib=static=cudart_static");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=dl");
+    println!("cargo:rustc-link-lib=dylib=rt");
+    println!("cargo:rustc-link-lib=dylib=pthread");
 }
 
 #[cfg(feature = "cuda")]

@@ -17,6 +17,8 @@
 //! ferrite-metal non-mega at temp=0).
 
 pub mod fixtures;
+#[cfg(feature = "cuda")]
+pub mod launcher;
 pub mod lower;
 pub mod mega;
 pub mod partition;

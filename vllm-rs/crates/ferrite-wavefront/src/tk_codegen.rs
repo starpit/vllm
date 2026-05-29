@@ -483,6 +483,60 @@ pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     // choice for "all 10 warps converge" is just `__syncthreads()`.
     out.push_str("    __syncthreads();\n");
     out.push_str("}\n");
+    out.push_str("\n");
+
+    // ── Host launcher (C linkage) ──────────────────────────────────
+    //
+    // Emit `extern "C" cudaError_t launch_<name>(void* const* bufs,
+    // const uint32_t* u32_args, cudaStream_t stream)` so the ferrite
+    // CUDA runtime can call the kernel without knowing its mangled
+    // C++ name or its arg list — both are baked into this wrapper.
+    //
+    // The wrapper:
+    //   1. Calls `cudaFuncSetAttribute(...,
+    //      cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM)` so
+    //      the H100 default 48 KB dynamic-smem cap is lifted to
+    //      `NUM_PAGES * PAGE_SIZE` (the page pool size the kernel
+    //      requests via `extern __shared__`).
+    //   2. Launches with `<<<1, total_threads, DYN_SMEM, stream>>>`
+    //      (single-CTA persistent megakernel pattern).
+    //   3. Forwards `bufs[i]` cast to the declared kernel arg type and
+    //      `u32_args[j]` for each runtime u32.
+    let dyn_smem = (NUM_PAGES * crate::tk_warp_ir::PAGE_SIZE) as u64;
+    out.push_str(&format!(
+        "extern \"C\" cudaError_t launch_{name}(\n    \
+            void* const* bufs,\n    \
+            const uint32_t* u32_args,\n    \
+            cudaStream_t stream\n) {{\n"
+    ));
+    out.push_str(&format!("    constexpr size_t DYN_SMEM = {dyn_smem}u;\n"));
+    out.push_str("    (void)u32_args;\n");
+    out.push_str(&format!(
+        "    cudaError_t __err = cudaFuncSetAttribute(\n        \
+            (const void*)&{name},\n        \
+            cudaFuncAttributeMaxDynamicSharedMemorySize,\n        \
+            (int)DYN_SMEM);\n    \
+            if (__err != cudaSuccess) return __err;\n"
+    ));
+    out.push_str(&format!("    {name}<<<1, {total_threads}, DYN_SMEM, stream>>>(\n"));
+    let mut first = true;
+    for (i, arg) in args.bufs.iter().enumerate() {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push_str(&format!("        ({})bufs[{i}]", arg.ty));
+    }
+    for (j, _u32_name) in args.u32_args.iter().enumerate() {
+        if !first {
+            out.push_str(",\n");
+        }
+        first = false;
+        out.push_str(&format!("        u32_args[{j}]"));
+    }
+    out.push_str("\n    );\n");
+    out.push_str("    return cudaGetLastError();\n");
+    out.push_str("}\n");
     out
 }
 
@@ -651,6 +705,37 @@ mod tests {
 
         // Body lands inside the kernel.
         assert!(src.contains("if (__role == ROLE_LOADER)"), "body merged\n{src}");
+
+        // C-linkage launcher.
+        // - signature is `extern "C" cudaError_t launch_<name>(void* const*,
+        //   const uint32_t*, cudaStream_t)`
+        // - sets `cudaFuncAttributeMaxDynamicSharedMemorySize` to
+        //   `NUM_PAGES * PAGE_SIZE` (13 * 16384 = 212992)
+        // - launches with `<<<1, total_threads, DYN_SMEM, stream>>>`
+        // - forwards each `bufs[i]` cast to the declared kernel arg type
+        //   and each `u32_args[j]` for runtime u32 args
+        assert!(
+            src.contains("extern \"C\" cudaError_t launch_tk_kernel_smoke("),
+            "C-linkage launcher\n{src}"
+        );
+        assert!(src.contains("constexpr size_t DYN_SMEM = 212992u;"), "dynsmem cap\n{src}");
+        assert!(
+            src.contains("cudaFuncAttributeMaxDynamicSharedMemorySize"),
+            "smem attr lifted\n{src}"
+        );
+        assert!(
+            src.contains("tk_kernel_smoke<<<1, 320, DYN_SMEM, stream>>>("),
+            "triple-chevron launch\n{src}"
+        );
+        assert!(
+            src.contains("(const __nv_bfloat16* __restrict__)bufs[0]"),
+            "buf0 cast\n{src}"
+        );
+        assert!(
+            src.contains("(__nv_bfloat16* __restrict__)bufs[1]"),
+            "buf1 cast\n{src}"
+        );
+        assert!(src.contains("u32_args[0]"), "u32 forward\n{src}");
     }
 
     /// End-to-end smoke: lower one RmsNorm and emit a complete kernel.

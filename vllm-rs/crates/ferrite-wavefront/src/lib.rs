@@ -18,6 +18,8 @@
 
 pub mod fixtures;
 #[cfg(feature = "cuda")]
+pub mod dispatch;
+#[cfg(feature = "cuda")]
 pub mod launcher;
 pub mod lower;
 pub mod mega;

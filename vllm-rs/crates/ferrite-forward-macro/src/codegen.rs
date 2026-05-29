@@ -5997,6 +5997,68 @@ fn dump_wavefront_mega(
     use ferrite_wavefront::region_schedule::{ScheduleParams, schedule_wavefront};
     let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
     let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
+
+    // Probe: try lowering the full-forward `LoweringInput` through the
+    // CUDA orchestrator (`tk_orchestrate::lower_to_tk`). Surfaces what
+    // the orchestrator can / cannot handle at Llama-3.2-1B scale; logs
+    // success or panic location so the next slice (per-op lowering
+    // gaps) is concrete. Best-effort; never gates the build.
+    if std::env::var_os("FERRITE_WAVEFRONT_CUDA_PROBE").is_some() {
+        let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ferrite_wavefront::tk_orchestrate::lower_to_tk(&fused)
+        }));
+        match probe {
+            Ok((prog, n_bufs)) => {
+                eprintln!(
+                    "[wavefront-cuda-probe] {stem}: lower_to_tk OK — {} TkInstrs, {} bufs",
+                    prog.instrs.len(),
+                    n_bufs,
+                );
+                // Emit the kernel `.cu` source to the cudaforge cache so
+                // `ferrite-cuda-builder`'s `build_megakernels` picks it up
+                // on the next build. Per-canonical kernel name keeps
+                // multiple arches' kernels from colliding.
+                let kernel_name = format!(
+                    "tk_decode_full_{}",
+                    stem.replace('-', "_").replace('.', "_")
+                );
+                let args = ferrite_wavefront::fixtures::orchestrator_kernel_args(&fused, n_bufs);
+                let src = ferrite_wavefront::tk_codegen::emit_kernel(
+                    &kernel_name, &args, &prog,
+                );
+                let cache_dir = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+                )
+                .join(".cache/cudaforge/megakernels");
+                if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                    eprintln!(
+                        "[wavefront-cuda-probe] {stem}: mkdir cache failed — {e}"
+                    );
+                } else {
+                    let path = cache_dir.join(format!("{kernel_name}.cu"));
+                    match std::fs::write(&path, &src) {
+                        Ok(()) => eprintln!(
+                            "[wavefront-cuda-probe] {stem}: wrote {} ({} bytes)",
+                            path.display(),
+                            src.len(),
+                        ),
+                        Err(e) => eprintln!(
+                            "[wavefront-cuda-probe] {stem}: write failed — {e}"
+                        ),
+                    }
+                }
+            }
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                eprintln!("[wavefront-cuda-probe] {stem}: lower_to_tk PANICKED — {msg}");
+            }
+        }
+    }
+
     let (descs, report) =
         to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
     // PERF DIAG (droppable): nb (N-block size) and P (worker count) sweep the

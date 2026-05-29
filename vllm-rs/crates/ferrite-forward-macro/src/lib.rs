@@ -1541,21 +1541,6 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
-    let wavefront_dispatch_arms: Vec<proc_macro2::TokenStream> = arms
-        .iter()
-        .map(|a| {
-            let variant_ident = pascal_case(&a.model_ident);
-            let model_ident = &a.model_ident;
-            quote! {
-                Weights::#variant_ident(w) => unsafe {
-                    #model_ident::wavefront_megakernel_layer0_dispatch(
-                        w, ctx, device, num_tokens,
-                    )
-                },
-            }
-        })
-        .collect();
-
     // Per-variant dispatch arms for `forward_with_metal_followup`.
     let forward_with_followup_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -1985,18 +1970,6 @@ fn emit_arch_dispatcher(
                         "metal forward_backbone — pipeline-parallel intermediate \
                          ranks aren't supported on metal yet (no PP fanout)"
                     )
-                }
-            }
-
-            #[cfg(feature = "cuda")]
-            unsafe fn wavefront_megakernel_dispatch_cuda(
-                &self,
-                ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::GpuDevice,
-                num_tokens: u64,
-            ) -> ::core::option::Option<()> {
-                match self {
-                    #(#wavefront_dispatch_arms)*
                 }
             }
 

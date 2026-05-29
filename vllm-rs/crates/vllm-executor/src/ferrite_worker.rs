@@ -486,15 +486,7 @@ impl CudaModel {
                     #[cfg(feature = "nccl")]
                     tp_group: m.tp_group.as_ref(),
                 };
-                let result = m.weights.forward_backbone(&ctx, device, num_tokens);
-                // FERRITE_WAVEFRONT_GPU=1: mirror metal `pool::run_wavefront_mega`.
-                #[cfg(feature = "cuda")]
-                if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
-                    let _ = m
-                        .weights
-                        .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens);
-                }
-                result
+                m.weights.forward_backbone(&ctx, device, num_tokens)
             },
             Self::Gemma3(m) => unsafe {
                 m.model.forward(
@@ -705,12 +697,6 @@ impl CudaModel {
                     tp_group: m.tp_group.as_ref(),
                 };
                 let logits = m.weights.forward(&ctx, device, num_tokens);
-                #[cfg(feature = "cuda")]
-                if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
-                    let _ = m
-                        .weights
-                        .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens);
-                }
                 match last_token_indices {
                     Some(idx) if idx.dim(0) < num_tokens as usize => {
                         vllm_cuda::kernels::embedding_gather(

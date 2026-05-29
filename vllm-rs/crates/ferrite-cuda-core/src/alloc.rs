@@ -232,15 +232,26 @@ impl CachingAllocator {
         self.private_large_pool = Some(BlockPool::new(false));
     }
 
-    /// Stop allocating to the private pool, but keep the pools alive so their
-    /// blocks can be reused. This prevents memory leaks when CUDA graphs are
-    /// captured multiple times (e.g., for different batch sizes).
+    /// Stop allocating to the private pool. Future `alloc()` calls go to the
+    /// regular pools, leaving captured-kernel addresses (which live in the
+    /// private pool's segments) frozen for the lifetime of the captured graph.
+    ///
+    /// Why: at piecewise CUDA graph replay, host-side helpers (e.g.,
+    /// `copy_to_fresh_owned`, `all_gather_last_dim`) allocate logits buffers
+    /// from `device.caching`. If those allocs come back from the private pool,
+    /// they alias scratch addresses the captured kernels still write to —
+    /// producing replay-time data races that look like garbage logits past the
+    /// first decode token at TP>1.
+    ///
+    /// The dropped `BlockPool::free_blocks` set holds Block pointers that
+    /// were freed during capture. Those Block structs still live in
+    /// `all_blocks` (so cuMemFree fires on `Drop`), but their entries are no
+    /// longer in any free list — they become permanently held until allocator
+    /// teardown. Acceptable: the private-pool free-list is small (per-step
+    /// scratch tensors) and the trade is correctness vs a few-MB hold.
     pub fn end_allocate_to_pool(&mut self) {
-        // Don't discard the private pools — keep them so blocks stay tracked
-        // and can be reused for future graph captures. Setting to None would
-        // leak all blocks allocated during capture.
-        // self.private_small_pool = None;
-        // self.private_large_pool = None;
+        self.private_small_pool = None;
+        self.private_large_pool = None;
     }
 
     pub fn is_pool_active(&self) -> bool {

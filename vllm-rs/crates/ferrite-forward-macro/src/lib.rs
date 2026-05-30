@@ -1541,6 +1541,27 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant dispatch arms for the PD-wavefront cuda megakernel
+    // entry. Every canonical mod emits a
+    // `wavefront_megakernel_dispatch_cuda(w, ctx, device, num_tokens)`
+    // -> `Option<OwnedTensor>`; the body returns `None` for canonicals
+    // without an orchestrator-emitted megakernel and `Some(logits)`
+    // for ones that have one wired up.
+    let wavefront_megakernel_dispatch_cuda_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(w) => unsafe {
+                    #model_ident::wavefront_megakernel_dispatch_cuda(
+                        w, ctx, device, num_tokens,
+                    )
+                },
+            }
+        })
+        .collect();
+
     // Per-variant dispatch arms for `forward_with_metal_followup`.
     let forward_with_followup_arms: Vec<proc_macro2::TokenStream> = arms
         .iter()
@@ -1928,6 +1949,25 @@ fn emit_arch_dispatcher(
             }
         }
 
+        /// PD-wavefront megakernel forward dispatch (cuda). `Some(_)`
+        /// when the matched canonical has a fully-resolved
+        /// orchestrator-emitted megakernel wired up; `None` otherwise.
+        ///
+        /// # Safety
+        /// Same as [`forward`].
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn wavefront_megakernel_dispatch_cuda(
+            w: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::core::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> {
+            match w {
+                #(#wavefront_megakernel_dispatch_cuda_arms)*
+            }
+        }
+
         // ── Auto-registration with ferrite_forward::try_load ──────
         //
         // `FerriteWeights` impl routes trait methods to the just-
@@ -1971,6 +2011,16 @@ fn emit_arch_dispatcher(
                          ranks aren't supported on metal yet (no PP fanout)"
                     )
                 }
+            }
+
+            #[cfg(feature = "cuda")]
+            unsafe fn wavefront_megakernel_dispatch_cuda(
+                &self,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
+                num_tokens: u64,
+            ) -> ::core::option::Option<::ferrite_cuda_core::OwnedTensor> {
+                unsafe { wavefront_megakernel_dispatch_cuda(self, ctx, device, num_tokens) }
             }
 
             #[cfg(feature = "metal")]

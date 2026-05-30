@@ -7743,6 +7743,28 @@ pub fn emit_model(
 
         #forward_backbone_fn
 
+        /// PD-wavefront megakernel forward dispatch (cuda).
+        ///
+        /// Skeleton emit: returns `None` for every canonical until the
+        /// per-canonical body lands (per-source recipe + FFI launch
+        /// over the orchestrator-emitted `tk_decode_full_*` symbol in
+        /// `libmegakernels.a`). Worker hook gates on
+        /// `FERRITE_WAVEFRONT_GPU=1` and falls back to per-op
+        /// `forward` when this returns `None`.
+        ///
+        /// # Safety
+        /// Same as [`forward`].
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments, unused_variables)]
+        pub unsafe fn wavefront_megakernel_dispatch_cuda(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::core::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> {
+            ::core::option::Option::None
+        }
+
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic
         /// inspection (no `&Weights`, no GPU). Used by
@@ -7837,7 +7859,9 @@ fn emit_shim_model(
         pub use super::#canonical::dump;
 
         #[cfg(feature = "cuda")]
-        pub use super::#canonical::{forward, forward_backbone};
+        pub use super::#canonical::{
+            forward, forward_backbone, wavefront_megakernel_dispatch_cuda,
+        };
 
         #[cfg(feature = "metal")]
         pub use super::#canonical::{

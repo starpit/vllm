@@ -522,6 +522,31 @@ mod dispatcher {
             num_tokens: u64,
         ) -> OwnedTensor;
 
+        /// PD-wavefront megakernel forward dispatch (cuda).
+        ///
+        /// `Some(_)` means this canonical has a fully-resolved
+        /// orchestrator-emitted megakernel (TK 2.0 `tk_decode_full_*`
+        /// in `libmegakernels.a`) that the per-arch macro emit wired
+        /// up. The implementation runs embed → resolves source ptrs
+        /// from the per-canonical recipe → allocates op-output arena
+        /// → calls the FFI launcher → returns logits.
+        ///
+        /// Default `None` so canonicals without a kernel keep the
+        /// per-op `forward` path. Worker hook gates on
+        /// `FERRITE_WAVEFRONT_GPU=1` and falls back if `None`.
+        ///
+        /// # Safety
+        /// Same as [`Self::forward`].
+        #[cfg(feature = "cuda")]
+        unsafe fn wavefront_megakernel_dispatch_cuda(
+            &self,
+            _ctx: &ForwardCtx,
+            _device: &mut GpuDevice,
+            _num_tokens: u64,
+        ) -> Option<OwnedTensor> {
+            None
+        }
+
         /// Per-worker arena peak in bytes (metal only).
         ///
         /// `MetalWorkerPool::for_buckets` derives the per-worker arena

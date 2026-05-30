@@ -49,6 +49,13 @@ pub mod loaders;
 pub mod tile_table;
 #[cfg(feature = "cuda")]
 pub mod vision_arch;
+// PD-wavefront cuda dispatch glue — runtime helper that walks a
+// per-canonical static `SourceRecipeEntry` slice and calls the
+// orchestrator-emitted `tk_decode_full_*` FFI launcher. The macro
+// emits the per-canonical static recipe + a thin `wavefront_megakernel_dispatch_cuda`
+// fn that forwards here.
+#[cfg(feature = "cuda")]
+pub mod wavefront_cuda;
 
 // Metal interpreter: lowering pass + worker pool. Phase 5.A lands the
 // lowering data model and `From<&[Instruction<W>]>` impl.

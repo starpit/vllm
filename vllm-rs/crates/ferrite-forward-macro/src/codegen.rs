@@ -5927,6 +5927,74 @@ fn emit_canonical_params_impl(
     }
 }
 
+/// One source's resolution recipe, shadowing
+/// [`ferrite_forward::wavefront_cuda::SourceRecipeEntry`] at macro time.
+/// Computed alongside the wavefront `MegaProgram` and emitted as a
+/// per-canonical static recipe by [`emit_wavefront_dispatch_cuda`].
+#[derive(Clone, Debug)]
+enum SourceRecipeEntryRepr {
+    EmbeddedHidden,
+    Cos {
+        bucket: u32,
+        op_idx: u32,
+        slot: u32,
+        layer: u32,
+    },
+    Sin {
+        bucket: u32,
+        op_idx: u32,
+        slot: u32,
+        layer: u32,
+        byte_offset: u64,
+    },
+    PrefixK {
+        layer: u32,
+    },
+    PrefixV {
+        layer: u32,
+    },
+    RmsNormWeight {
+        bucket: u32,
+        op_idx: u32,
+        slot: u32,
+        layer: u32,
+    },
+    LinearDenseWeight {
+        bucket: u32,
+        op_idx: u32,
+        slot: u32,
+        layer: u32,
+        byte_offset: u64,
+    },
+    EmbeddingWeight {
+        bucket: u32,
+        op_idx: u32,
+        slot: u32,
+        layer: u32,
+    },
+}
+
+/// Per-canonical baked dispatch data for the orchestrator-emitted
+/// PD-wavefront megakernel — kernel name, source resolution recipe,
+/// op-output staging byte sizes, runtime arg gates, and the result
+/// op index. [`emit_wavefront_dispatch_cuda`] consumes one of these
+/// to emit the per-canonical `wavefront_megakernel_dispatch_cuda`
+/// body.
+#[derive(Clone, Debug)]
+struct CudaDispatchData {
+    /// `tk_decode_full_<sanitized stem>` — matches the kernel name
+    /// the cuda-probe passes to `tk_codegen::emit_kernel`.
+    kernel_name: String,
+    source_recipe: Vec<SourceRecipeEntryRepr>,
+    op_output_bytes: Vec<u64>,
+    has_attn_decode: bool,
+    has_rope: bool,
+    result_op_idx: u32,
+    vocab_size: u64,
+    embed_bucket: u32,
+    embed_op_idx: u32,
+}
+
 /// PD-wavefront macro-emission (env-gated, diagnostic): route the solved
 /// decode FUF through the FULL compile-time wavefront pipeline — bridge
 /// (`to_wavefront`) → silu·mul fusion → region N-block tiling → wavefront
@@ -5945,6 +6013,12 @@ fn emit_canonical_params_impl(
 /// target — so the caller can emit it as a compile-time builder. Returns
 /// `None` (still dumping diagnostics) otherwise: a program with placeholder
 /// locators (e.g. dense gate/up fused under one accessor) is not runnable.
+///
+/// The second tuple element is the cuda-side dispatch artifacts (per-source
+/// recipe + op-output byte sizes + runtime arg gates) when every linear in
+/// the lowered decode is `Dense` storage AND every weight resolved — so the
+/// macro can emit a real `wavefront_megakernel_dispatch_cuda` body. `None`
+/// when any linear is quantized (the recipe would need different variants).
 #[allow(clippy::too_many_arguments)]
 fn dump_wavefront_mega(
     program: &Program,
@@ -5956,7 +6030,10 @@ fn dump_wavefront_mega(
     backbone_slots: &[Vec<WeightSlot>],
     lm_head_slots: &[Vec<WeightSlot>],
     bb_bucket_id: u32,
-) -> Option<ferrite_wavefront::mega::MegaProgram> {
+) -> (
+    Option<ferrite_wavefront::mega::MegaProgram>,
+    Option<CudaDispatchData>,
+) {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
     let lowered = match to_wavefront::lower_decode_to_wavefront(
@@ -5970,7 +6047,7 @@ fn dump_wavefront_mega(
         Ok(l) => l,
         Err(e) => {
             eprintln!("[wavefront] {stem}: not lowered — {e}");
-            return None;
+            return (None, None);
         }
     };
     let g = ferrite_wavefront::lower::lower(&lowered.input);
@@ -6061,6 +6138,23 @@ fn dump_wavefront_mega(
 
     let (descs, report) =
         to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
+
+    // Build cuda dispatch artifacts in lockstep with `descs`. Walks
+    // `lowered.bindings` parallel to the kernel's `bufs[..n_sources]`
+    // ordering: each `SourceBinding` becomes a `SourceRecipeEntryRepr`
+    // entry. Returns `None` when any linear weight isn't `Dense` —
+    // the first cut only emits dense `LinearDenseWeight` recipe
+    // entries (Llama-3.2-1B BF16 invariant).
+    let cuda_dispatch = build_cuda_dispatch_data(
+        program,
+        fuf,
+        &fused,
+        &lowered.bindings,
+        &base_to_loc,
+        decode_bounds,
+        bb_bucket_id,
+        stem,
+    );
     // PERF DIAG (droppable): nb (N-block size) and P (worker count) sweep the
     // cross-tape-communication tradeoff. Coarser nb / smaller P ⇒ fewer joins;
     // both trade off bandwidth spread. Defaults nb=256, P=10.
@@ -6222,16 +6316,290 @@ fn dump_wavefront_mega(
             // a placeholder locator (e.g. dense gate/up fused under one
             // accessor) must not be baked into a runtime builder.
             if report.unresolved.is_empty() {
-                Some(prog)
+                (Some(prog), cuda_dispatch)
             } else {
-                None
+                (None, cuda_dispatch)
             }
         }
         Err(e) => {
             eprintln!("[wavefront-mega] {stem}: serialize FAILED — {e}");
-            None
+            (None, cuda_dispatch)
         }
     }
+}
+
+/// Compute per-canonical cuda dispatch artifacts for the
+/// orchestrator-emitted `tk_decode_full_<stem>` kernel. Walks the
+/// bridge's `SourceBinding` manifest in lockstep with the kernel's
+/// `bufs[0..n_sources]` order, resolving each entry to a typed
+/// recipe variant; computes op-output staging byte sizes via
+/// [`ferrite_wavefront::fixtures::buf_byte_sizes`]; gates
+/// `__num_kv_pages` / `__decode_position` runtime args by op
+/// presence. Returns `None` for any quantized linear (the first
+/// cut only emits dense `LinearDenseWeight` recipe entries).
+#[allow(clippy::too_many_arguments)]
+fn build_cuda_dispatch_data(
+    program: &Program,
+    fuf: &Fuf,
+    fused: &ferrite_wavefront::lower::LoweringInput,
+    bindings: &[crate::to_wavefront::SourceBinding],
+    base_to_loc: &HashMap<String, crate::to_wavefront::WeightLocInfo>,
+    decode_bounds: &BTreeMap<String, u64>,
+    bb_bucket_id: u32,
+    stem: &str,
+) -> Option<CudaDispatchData> {
+    use crate::quantization::StorageFormat;
+    use crate::to_wavefront::SourceBinding;
+    use ferrite_wavefront::lower::LoweredOp;
+
+    // Sources read as a Gemm's weight (input 1) are linear weights;
+    // any other `SourceBinding::Weight` is an rmsnorm gain. Mirrors
+    // the same set `build_source_descs` builds.
+    let mut gemm_weight: HashSet<usize> = HashSet::new();
+    for od in &fused.ops {
+        if matches!(od.op, LoweredOp::Gemm { .. })
+            && let Some(ferrite_wavefront::lower::InputRef::Ext(e)) = od.inputs.get(1)
+        {
+            gemm_weight.insert(*e);
+        }
+    }
+
+    // Linear-quant guard: every `SourceBinding::Weight` that is read
+    // as a Gemm input MUST resolve to `StorageFormat::Dense` for the
+    // first-cut emit. If any quantized weight exists in the FUF,
+    // bail — the recipe shape doesn't cover Marlin / Bnb4 / Fp8 yet.
+    let weight_storage = |id: u32, index: Option<u64>| -> Option<StorageFormat> {
+        for node in &fuf.nodes {
+            for inp in &node.inputs {
+                if let FufInput::Weight {
+                    id: wid,
+                    index: widx,
+                    storage,
+                } = inp
+                    && wid.0 == id
+                    && *widx == index
+                {
+                    return Some(storage.clone());
+                }
+            }
+        }
+        None
+    };
+
+    // Required bounds for fused-base byte offset arithmetic.
+    let h = decode_bounds.get("hidden_size").copied();
+    let head_dim = decode_bounds.get("head_dim").copied();
+    let nq = decode_bounds.get("num_attention_heads").copied();
+    let nkv = decode_bounds.get("num_key_value_heads").copied();
+    let inter = decode_bounds.get("intermediate_size").copied();
+    let vocab_size = decode_bounds.get("vocab_size").copied();
+    let (Some(h), Some(head_dim), Some(nq), Some(nkv), Some(inter), Some(vocab_size)) =
+        (h, head_dim, nq, nkv, inter, vocab_size)
+    else {
+        eprintln!(
+            "[wavefront-cuda-dispatch] {stem}: missing bounds (hidden_size/head_dim/\
+             num_attention_heads/num_key_value_heads/intermediate_size/vocab_size); \
+             skipping cuda dispatch emit"
+        );
+        return None;
+    };
+
+    let cos_sin_loc = base_to_loc
+        .values()
+        .find(|li| li.kind == crate::impl_lib::WeightKind::CosSin)
+        .cloned();
+
+    // act_elem = 2 (bf16). Cos lives at offset 0; sin at the
+    // half-cache split (`rotary_dim/2 * rotary_dim` in bf16 — or
+    // equivalently `head_dim/2` cols × act_elem within a row, but the
+    // rope kernel reads `[1, head_dim]` slices and adds
+    // `__decode_position * head_dim * 2` at runtime, so the sin
+    // pointer is the cos base + `head_dim/2 * 2` BYTES). Wait — the
+    // packed cache is `[max_pos, head_dim]` with cos at cols
+    // `[0..head_dim/2]` and sin at cols `[head_dim/2..head_dim]`, so
+    // sin's base is `head_dim/2 * act_elem` bytes after cos's base.
+    let sin_byte_offset: u64 = head_dim / 2 * 2;
+
+    let mut recipe: Vec<SourceRecipeEntryRepr> = Vec::with_capacity(bindings.len());
+
+    for b in bindings {
+        let entry = match b {
+            SourceBinding::EmbeddedHidden => SourceRecipeEntryRepr::EmbeddedHidden,
+            SourceBinding::Cos => {
+                let li = cos_sin_loc.as_ref()?;
+                SourceRecipeEntryRepr::Cos {
+                    bucket: li.bucket,
+                    op_idx: li.op_idx,
+                    slot: li.slot,
+                    layer: 0,
+                }
+            }
+            SourceBinding::Sin => {
+                let li = cos_sin_loc.as_ref()?;
+                SourceRecipeEntryRepr::Sin {
+                    bucket: li.bucket,
+                    op_idx: li.op_idx,
+                    slot: li.slot,
+                    layer: 0,
+                    byte_offset: sin_byte_offset,
+                }
+            }
+            SourceBinding::PrefixK { layer } => SourceRecipeEntryRepr::PrefixK {
+                layer: *layer as u32,
+            },
+            SourceBinding::PrefixV { layer } => SourceRecipeEntryRepr::PrefixV {
+                layer: *layer as u32,
+            },
+            SourceBinding::Weight { id, index } => {
+                let storage = weight_storage(*id, *index).unwrap_or(StorageFormat::Dense);
+                if !matches!(storage, StorageFormat::Dense) {
+                    eprintln!(
+                        "[wavefront-cuda-dispatch] {stem}: weight id={id} index={index:?} \
+                         is non-Dense ({storage:?}); skipping cuda dispatch emit"
+                    );
+                    return None;
+                }
+                let name = crate::emit::weight_field_name(program, WeightId(*id), *index);
+                let (base, _layer) = split_base_layer(&name.to_string());
+                let layer = index.unwrap_or(0) as u32;
+                let i = recipe.len();
+                let is_gemm = gemm_weight.contains(&i);
+
+                // Resolve loc — direct base, or fused-base fallback
+                // matching `build_source_descs`'s rule. Fused fallback
+                // also requires we compute the per-constituent byte
+                // offset from the fused key's alphabetically-sorted
+                // constituent list.
+                let (li, byte_offset) = match base_to_loc.get(&base) {
+                    Some(li) => (li.clone(), 0u64),
+                    None => {
+                        let fused_key = base_to_loc.keys().find(|k| {
+                            k.contains("__fused__")
+                                && k.split("__fused__").any(|tok| tok == base)
+                        });
+                        match fused_key {
+                            Some(k) => {
+                                let li = base_to_loc[k].clone();
+                                let off = fused_byte_offset(
+                                    &base, k, h, head_dim, nq, nkv, inter,
+                                );
+                                (li, off)
+                            }
+                            None => {
+                                eprintln!(
+                                    "[wavefront-cuda-dispatch] {stem}: weight base \
+                                     `{base}` (id={id} index={index:?}) did not resolve; \
+                                     skipping cuda dispatch emit"
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                };
+
+                if is_gemm {
+                    SourceRecipeEntryRepr::LinearDenseWeight {
+                        bucket: li.bucket,
+                        op_idx: li.op_idx,
+                        slot: li.slot,
+                        layer,
+                        byte_offset,
+                    }
+                } else {
+                    SourceRecipeEntryRepr::RmsNormWeight {
+                        bucket: li.bucket,
+                        op_idx: li.op_idx,
+                        slot: li.slot,
+                        layer,
+                    }
+                }
+            }
+        };
+        recipe.push(entry);
+    }
+
+    let raw_op_output_bytes: Vec<u64> = ferrite_wavefront::fixtures::buf_byte_sizes(fused)
+        .into_iter()
+        .skip(bindings.len())
+        .map(|b| b as u64)
+        .collect();
+
+    let has_attn_decode = fused
+        .ops
+        .iter()
+        .any(|d| matches!(d.op, LoweredOp::AttnDecode { .. }));
+    let has_rope = fused
+        .ops
+        .iter()
+        .any(|d| matches!(d.op, LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. }));
+
+    // The orchestrator's `BufId(n_sources + j)` for op j; the lowered
+    // input's `result: usize` is the op index whose output is the
+    // forward's logits row.
+    let result_op_idx = fused.result as u32;
+
+    let kernel_name = format!(
+        "tk_decode_full_{}",
+        stem.replace('-', "_").replace('.', "_")
+    );
+
+    Some(CudaDispatchData {
+        kernel_name,
+        source_recipe: recipe,
+        op_output_bytes: raw_op_output_bytes,
+        has_attn_decode,
+        has_rope,
+        result_op_idx,
+        vocab_size,
+        embed_bucket: bb_bucket_id,
+        embed_op_idx: 0,
+    })
+}
+
+/// Compute the byte offset of `base` within a fused-base linear
+/// weight. The fused key joins constituents with `__fused__` in
+/// alphabetical order; each constituent's row count comes from the
+/// model bounds (`q_proj` = `nq * head_dim`, `k_proj` / `v_proj` =
+/// `nkv * head_dim`, `gate_proj` / `up_proj` = `intermediate_size`).
+/// The fused tensor lives at `[sum(rows_i), hidden]` row-major; the
+/// byte offset is `sum_{i < pos} rows_i * hidden * 2` (bf16 = 2
+/// bytes). Returns 0 if `base` doesn't appear in `fused_key` (the
+/// caller's lookup already verified it's a member, so this is just
+/// defense in depth).
+fn fused_byte_offset(
+    base: &str,
+    fused_key: &str,
+    hidden: u64,
+    head_dim: u64,
+    nq: u64,
+    nkv: u64,
+    inter: u64,
+) -> u64 {
+    let constituents: Vec<&str> = fused_key.split("__fused__").collect();
+    let pos = match constituents.iter().position(|c| *c == base) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mut sum: u64 = 0;
+    for c in &constituents[..pos] {
+        let rows = if c.ends_with("k_proj") || c.ends_with("v_proj") {
+            nkv * head_dim
+        } else if c.ends_with("q_proj") {
+            nq * head_dim
+        } else if c.ends_with("gate_proj") || c.ends_with("up_proj") {
+            inter
+        } else {
+            // Unrecognized constituent — let the runtime hit a hard
+            // error rather than silently emit a wrong offset.
+            eprintln!(
+                "[wavefront-cuda-dispatch] unknown fused constituent `{c}` in `{fused_key}`; \
+                 falling back to offset 0"
+            );
+            return 0;
+        };
+        sum += rows * hidden;
+    }
+    sum * 2
 }
 
 // ── PD-wavefront: MegaProgram → compile-time Rust ────────────────────
@@ -6307,6 +6675,178 @@ fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStre
                 level_starts: LEVEL_STARTS.to_vec(),
             }
         }
+    }
+}
+
+/// Emit the per-canonical `wavefront_megakernel_dispatch_cuda` body
+/// from the orchestrator-baked [`CudaDispatchData`]. Drops in a
+/// matching `extern "C"` decl for the `tk_decode_full_<stem>` host
+/// wrapper, two `static` tables (the source recipe + per-op-output
+/// byte sizes), and the dispatch fn that constructs a
+/// [`ferrite_forward::wavefront_cuda::DispatchSpec`] and delegates to
+/// [`ferrite_forward::wavefront_cuda::dispatch_cuda`].
+fn emit_wavefront_dispatch_cuda(d: &CudaDispatchData) -> TokenStream {
+    let kernel_ident = format_ident!("{}", d.kernel_name);
+    let recipe_entries: Vec<TokenStream> = d
+        .source_recipe
+        .iter()
+        .map(source_recipe_entry_to_tokens)
+        .collect();
+    let op_output_bytes_lits = d
+        .op_output_bytes
+        .iter()
+        .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
+    let has_attn_decode = d.has_attn_decode;
+    let has_rope = d.has_rope;
+    let result_op_idx = proc_macro2::Literal::u32_unsuffixed(d.result_op_idx);
+    let vocab_size = proc_macro2::Literal::u64_unsuffixed(d.vocab_size);
+    let embed_bucket = proc_macro2::Literal::u32_unsuffixed(d.embed_bucket);
+    let embed_op_idx = proc_macro2::Literal::u32_unsuffixed(d.embed_op_idx);
+
+    quote! {
+        #[cfg(feature = "cuda")]
+        unsafe extern "C" {
+            /// Host wrapper emitted by `tk_codegen::emit_kernel`,
+            /// linked from `libmegakernels.a`. Sets dynamic shmem
+            /// attribute and launches the kernel on `stream` —
+            /// returns a `cudaError` (0 == success).
+            fn #kernel_ident(
+                bufs: *const *mut ::core::ffi::c_void,
+                u32_args: *const u32,
+                stream: *mut ::core::ffi::c_void,
+            ) -> i32;
+        }
+
+        #[cfg(feature = "cuda")]
+        static WAVEFRONT_SOURCE_RECIPE:
+            &[::ferrite_forward::wavefront_cuda::SourceRecipeEntry]
+            = &[ #(#recipe_entries),* ];
+
+        #[cfg(feature = "cuda")]
+        static WAVEFRONT_OP_OUTPUT_BYTES: &[u64] = &[ #(#op_output_bytes_lits),* ];
+
+        /// PD-wavefront megakernel decode forward.
+        ///
+        /// Builds the per-canonical [`DispatchSpec`] from the baked
+        /// source recipe + op-output staging table + FFI launcher
+        /// pointer, then runs one decode step through
+        /// [`ferrite_forward::wavefront_cuda::dispatch_cuda`].
+        ///
+        /// # Safety
+        /// Same as the per-op `forward`. Caller must hold the
+        /// device's compute stream, the weights table, and the
+        /// forward context as live references for the call's
+        /// duration.
+        #[cfg(feature = "cuda")]
+        #[allow(clippy::too_many_arguments)]
+        pub unsafe fn wavefront_megakernel_dispatch_cuda(
+            wm: &Weights,
+            ctx: &::ferrite_forward::ForwardCtx,
+            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            num_tokens: u64,
+        ) -> ::core::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> {
+            let spec = ::ferrite_forward::wavefront_cuda::DispatchSpec {
+                embed_bucket: #embed_bucket,
+                embed_op_idx: #embed_op_idx,
+                source_recipe: WAVEFRONT_SOURCE_RECIPE,
+                op_output_bytes: WAVEFRONT_OP_OUTPUT_BYTES,
+                has_attn_decode: #has_attn_decode,
+                has_rope: #has_rope,
+                result_op_idx: #result_op_idx,
+                vocab_size: #vocab_size,
+                launch_fn: #kernel_ident,
+            };
+            unsafe {
+                ::ferrite_forward::wavefront_cuda::dispatch_cuda(
+                    wm, ctx, device, num_tokens, &spec,
+                )
+            }
+        }
+    }
+}
+
+/// One [`SourceRecipeEntryRepr`] as a typed Rust literal — emits the
+/// matching `::ferrite_forward::wavefront_cuda::SourceRecipeEntry`
+/// variant.
+fn source_recipe_entry_to_tokens(e: &SourceRecipeEntryRepr) -> TokenStream {
+    let path = quote! { ::ferrite_forward::wavefront_cuda::SourceRecipeEntry };
+    match e {
+        SourceRecipeEntryRepr::EmbeddedHidden => quote! { #path::EmbeddedHidden },
+        SourceRecipeEntryRepr::Cos {
+            bucket,
+            op_idx,
+            slot,
+            layer,
+        } => quote! {
+            #path::Cos {
+                bucket: #bucket,
+                op_idx: #op_idx,
+                slot: #slot,
+                layer: #layer,
+            }
+        },
+        SourceRecipeEntryRepr::Sin {
+            bucket,
+            op_idx,
+            slot,
+            layer,
+            byte_offset,
+        } => quote! {
+            #path::Sin {
+                bucket: #bucket,
+                op_idx: #op_idx,
+                slot: #slot,
+                layer: #layer,
+                byte_offset: #byte_offset,
+            }
+        },
+        SourceRecipeEntryRepr::PrefixK { layer } => quote! {
+            #path::PrefixK { layer: #layer }
+        },
+        SourceRecipeEntryRepr::PrefixV { layer } => quote! {
+            #path::PrefixV { layer: #layer }
+        },
+        SourceRecipeEntryRepr::RmsNormWeight {
+            bucket,
+            op_idx,
+            slot,
+            layer,
+        } => quote! {
+            #path::RmsNormWeight {
+                bucket: #bucket,
+                op_idx: #op_idx,
+                slot: #slot,
+                layer: #layer,
+            }
+        },
+        SourceRecipeEntryRepr::LinearDenseWeight {
+            bucket,
+            op_idx,
+            slot,
+            layer,
+            byte_offset,
+        } => quote! {
+            #path::LinearDenseWeight {
+                bucket: #bucket,
+                op_idx: #op_idx,
+                slot: #slot,
+                layer: #layer,
+                byte_offset: #byte_offset,
+            }
+        },
+        SourceRecipeEntryRepr::EmbeddingWeight {
+            bucket,
+            op_idx,
+            slot,
+            layer,
+        } => quote! {
+            #path::EmbeddingWeight {
+                bucket: #bucket,
+                op_idx: #op_idx,
+                slot: #slot,
+                layer: #layer,
+            }
+        },
     }
 }
 
@@ -6813,6 +7353,11 @@ pub fn emit_model(
     // `Some(wavefront_mega_decode())` when the builder was emitted, else
     // `None` (the megakernel alt path stays off).
     let mut wavefront_mega_program_body = quote! { ::core::option::Option::None };
+    // Per-canonical cuda dispatch artifacts for the orchestrator-emitted
+    // `tk_decode_full_<stem>` kernel. `Some(_)` ⇒ emit a real
+    // `wavefront_megakernel_dispatch_cuda` body; `None` ⇒ emit the
+    // skeleton-returns-None body (per-op forward fallback).
+    let mut cuda_dispatch_data: Option<CudaDispatchData> = None;
 
     // PD-wavefront macro-emission (env-gated, diagnostic + the const builder).
     // HERE — not in the pre-emit drive — because the decode bucket's
@@ -6833,7 +7378,7 @@ pub fn emit_model(
                         let bb_bucket_id = canonical_to_bucket_id[&canonical];
                         let (cl, ..) = &canonical_lowered[&canonical];
                         let decode_bounds = bounds_for_wp(model, decode_wp, tp_world_size);
-                        if let Some(prog) = dump_wavefront_mega(
+                        let (prog_opt, dispatch_opt) = dump_wavefront_mega(
                             program,
                             model,
                             fuf,
@@ -6843,12 +7388,14 @@ pub fn emit_model(
                             &cl.backbone.weight_slots,
                             &cl.lm_head.weight_slots,
                             bb_bucket_id,
-                        ) {
+                        );
+                        if let Some(prog) = prog_opt {
                             wavefront_mega_builder = emit_wavefront_mega(&prog);
                             wavefront_mega_program_body = quote! {
                                 ::core::option::Option::Some(wavefront_mega_decode())
                             };
                         }
+                        cuda_dispatch_data = dispatch_opt;
                     }
                     None => eprintln!(
                         "[wavefront] {}: no decode (num_tokens=1) workload point",
@@ -7708,6 +8255,28 @@ pub fn emit_model(
         },
     };
 
+    // PD-wavefront cuda dispatch fn body — emitted per-canonical from
+    // the orchestrator-baked recipe when the decode lowers + every
+    // weight resolves to a real `Dense` locator; skeleton-returns-None
+    // body otherwise (the worker hook then falls back to per-op
+    // `forward`).
+    let wavefront_dispatch_fn = if let Some(d) = cuda_dispatch_data.as_ref() {
+        emit_wavefront_dispatch_cuda(d)
+    } else {
+        quote! {
+            #[cfg(feature = "cuda")]
+            #[allow(clippy::too_many_arguments, unused_variables)]
+            pub unsafe fn wavefront_megakernel_dispatch_cuda(
+                wm: &Weights,
+                ctx: &::ferrite_forward::ForwardCtx,
+                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                num_tokens: u64,
+            ) -> ::core::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> {
+                ::core::option::Option::None
+            }
+        }
+    };
+
     quote! {
         #weights
 
@@ -7743,27 +8312,14 @@ pub fn emit_model(
 
         #forward_backbone_fn
 
-        /// PD-wavefront megakernel forward dispatch (cuda).
-        ///
-        /// Skeleton emit: returns `None` for every canonical until the
-        /// per-canonical body lands (per-source recipe + FFI launch
-        /// over the orchestrator-emitted `tk_decode_full_*` symbol in
-        /// `libmegakernels.a`). Worker hook gates on
-        /// `FERRITE_WAVEFRONT_GPU=1` and falls back to per-op
-        /// `forward` when this returns `None`.
-        ///
-        /// # Safety
-        /// Same as [`forward`].
-        #[cfg(feature = "cuda")]
-        #[allow(clippy::too_many_arguments, unused_variables)]
-        pub unsafe fn wavefront_megakernel_dispatch_cuda(
-            wm: &Weights,
-            ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
-            num_tokens: u64,
-        ) -> ::core::option::Option<::ferrite_cuda_core::alloc::OwnedTensor> {
-            ::core::option::Option::None
-        }
+        /// PD-wavefront megakernel forward dispatch (cuda). Either a
+        /// real per-canonical dispatch body emitted from the
+        /// orchestrator-baked source recipe + FFI launch over the
+        /// `tk_decode_full_<stem>` symbol in `libmegakernels.a`, or
+        /// — when the decode didn't fully resolve — a skeleton that
+        /// returns `None` so the worker falls back to per-op
+        /// `forward`. Gated downstream on `FERRITE_WAVEFRONT_GPU=1`.
+        #wavefront_dispatch_fn
 
         /// Walk `FORWARD_TABLE` and return one [`BucketDump`] per
         /// row, with backbone + lm_head normalized for non-generic

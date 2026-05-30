@@ -50,10 +50,15 @@ __global__ void act_and_mul_kernel(
 {
     constexpr int VEC_SIZE = VecType<T>::SIZE;
 
-    const int row = blockIdx.x;
-    const T* g = gate + row * d;
-    const T* u = up + row * d;
-    T* o = out + row * d;
+    // Use 64-bit row offset to compute pointers — `(int)row * d` overflows
+    // int32 for M ≥ 2^31/d (e.g. M ≥ 131072 at d=18944), wrapping to a
+    // negative offset that lands in unrelated GPU mappings (silent
+    // illegal-address fault that surfaces at the next launch).
+    const size_t row = blockIdx.x;
+    const size_t row_stride = (size_t)d;
+    const T* g = gate + row * row_stride;
+    const T* u = up + row * row_stride;
+    T* o = out + row * row_stride;
 
     const int num_vecs = d / VEC_SIZE;
     const int tail_start = num_vecs * VEC_SIZE;
@@ -179,11 +184,19 @@ __global__ void act_and_mul_fused_kernel(
 {
     constexpr int VEC_SIZE = VecType<T>::SIZE;
 
-    const int row = blockIdx.x;
-    const int stride = 2 * d;
-    const T* g = gate_up + row * stride;       // gate half
-    const T* u = gate_up + row * stride + d;   // up half
-    T* o = out + row * d;
+    // Use 64-bit row offset. The fused variant uses stride = 2 * d which
+    // doubles the multiplication, so overflow hits at half the M of the
+    // non-fused kernel: at d=18944 (Qwen2.5-7B intermediate), row=57389
+    // causes (int)row * 2*d to wrap negative on M=65536 prefill — the
+    // exact failure block compute-sanitizer flagged ("block (57390, 0,
+    // 0)"). Cast to `size_t` so the offset is computed in 64-bit and any
+    // M that fits in gridDim.x is safe.
+    const size_t row = blockIdx.x;
+    const size_t stride = 2 * (size_t)d;
+    const size_t d_off = (size_t)d;
+    const T* g = gate_up + row * stride;          // gate half
+    const T* u = gate_up + row * stride + d_off;  // up half
+    T* o = out + row * d_off;
 
     const int num_vecs = d / VEC_SIZE;
     const int tail_start = num_vecs * VEC_SIZE;

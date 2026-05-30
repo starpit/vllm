@@ -237,5 +237,18 @@ pub fn orchestrator_kernel_args(
     {
         u32_args.push("__num_kv_pages".into());
     }
+    // Runtime decode position — the rope arms read this to compute the
+    // per-row cos/sin TMA offset (`__decode_position * row_bytes`).
+    // Passed as a host-side u32 (the dispatcher D2H copies
+    // `ctx.positions[0]` once per dispatch). Registered whenever any
+    // op rotates; AttnDecode alone doesn't need it (its position is
+    // implicit in the prefix-K/V cache rows the kernel reads).
+    if input
+        .ops
+        .iter()
+        .any(|d| matches!(d.op, LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. }))
+    {
+        u32_args.push("__decode_position".into());
+    }
     KernelArgs { bufs, u32_args }
 }

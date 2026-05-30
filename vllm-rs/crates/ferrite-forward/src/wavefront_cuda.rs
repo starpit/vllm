@@ -126,6 +126,11 @@ pub struct DispatchSpec {
     /// True if any op in the lowered decode is `AttnDecode`; gates
     /// the `__num_kv_pages` u32 arg the kernel signature expects.
     pub has_attn_decode: bool,
+    /// True if any op rotates (`RopeRotate` / `RopeAppend`); gates the
+    /// `__decode_position` u32 arg. The dispatcher D2H copies
+    /// `ctx.positions[0]` and pushes it after `__num_kv_pages` so the
+    /// rope TMA loads can index `cos_sin_cache + pos * row_bytes`.
+    pub has_rope: bool,
     /// Op index whose output buffer is the final logits row. Within
     /// `op_output_bytes`. Reshaped on return to
     /// `[num_tokens, vocab_size]` bf16.
@@ -271,12 +276,36 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
         bufs.push(buf.as_gpu_tensor().as_mut_ptr::<u8>() as *mut c_void);
     }
 
-    // ── 4. u32 args — only `__num_kv_pages` for AttnDecode-bearing
-    //     kernels. Equals the cache pool's static `num_blocks` (the
-    //     paged-attention block count, not a per-seq quantity).
+    // ── 4. u32 args — order matches the kernel signature:
+    //   `__num_kv_pages` (gated by `has_attn_decode`)
+    //   `__decode_position` (gated by `has_rope`)
+    //
+    // `__num_kv_pages` is the cache pool's static `num_blocks` (the
+    // paged-attention block count). `__decode_position` is the
+    // current decode token's position in its sequence — D2H copied
+    // from `ctx.positions[0]` (`[1]` u32 for decode `num_tokens=1`).
+    // The kernel's rope arms add `pos * row_bytes` to the cos/sin
+    // TMA source pointer so each token reads its own row of
+    // `cos_sin_cache`. `event_synchronize` on the dedicated d2h
+    // event blocks the host ~5 us while the value lands; the
+    // compute stream is gated downstream.
     let mut u32_args: Vec<u32> = Vec::new();
     if spec.has_attn_decode {
         u32_args.push(ctx.kv_cache.num_blocks as u32);
+    }
+    if spec.has_rope {
+        let mut pos_host: u32 = 0;
+        unsafe {
+            device
+                .async_d2h(
+                    (&raw mut pos_host).cast::<u8>(),
+                    ctx.positions.raw_ptr().cast::<u8>(),
+                    std::mem::size_of::<u32>(),
+                )
+                .expect("d2h decode position");
+        }
+        device.sync_d2h().expect("sync d2h decode position");
+        u32_args.push(pos_host);
     }
 
     // ── 5. Call the FFI wrapper. Pointer table + u32 table are kept

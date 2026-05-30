@@ -925,13 +925,34 @@ pub fn lower_rope_rotate<P: Phase>(
         elem_bytes: op.act_elem,
     };
 
-    // Loader fills all three pages.
+    // Loader fills all three pages. Cos/sin are runtime-positional:
+    // the dispatcher passes `cos_sin_cache.base` (cos) and
+    // `cos_sin_cache.base + half_offset` (sin); the kernel adds
+    // `__decode_position * row_bytes` so each decode token reads its
+    // own row. `row_bytes = head_dim * act_elem` (one full row of the
+    // packed `[max_pos, head_dim]` cache; the load deliberately fetches
+    // 128 B = full row even though the rotation only touches the first
+    // half_dim, since TMA loads benefit from row-aligned sizes).
+    let row_bytes = op.head_dim * op.act_elem;
+    let pos_off = format!("__decode_position * {row_bytes}u");
     let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
     prog.load_async(x_id, op.x, region(op.x, op.m, x_cols), x_tile);
     let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
-    prog.load_async(c_id, op.cos, region(op.cos, 1, op.head_dim), cs_tile);
+    prog.load_async_dyn(
+        c_id,
+        op.cos,
+        region(op.cos, 1, op.head_dim),
+        cs_tile,
+        pos_off.clone(),
+    );
     let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
-    prog.load_async(s_id, op.sin, region(op.sin, 1, op.head_dim), cs_tile);
+    prog.load_async_dyn(
+        s_id,
+        op.sin,
+        region(op.sin, 1, op.head_dim),
+        cs_tile,
+        pos_off,
+    );
 
     let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
     let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
@@ -1645,6 +1666,14 @@ mod tests {
         // NeoX: lo = lo*c - hi*s; hi = lo*s + hi*c.
         assert!(src.contains("__x_lo * __c - __x_hi * __s"), "{src}");
         assert!(src.contains("__x_lo * __s + __x_hi * __c"), "{src}");
+        // Cos/sin TMA loads add the per-decode-token row offset
+        // `__decode_position * row_bytes` (rope_op is head_dim=64,
+        // act_elem=2 → 128 B/row). Without this the kernel would read
+        // position 0's cos/sin every decode step.
+        assert!(
+            src.contains("__decode_position * 128u"),
+            "rope cos/sin TMA must add runtime row offset; got:\n{src}"
+        );
     }
 
     #[test]

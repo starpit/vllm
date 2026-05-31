@@ -1131,12 +1131,7 @@ impl PiecewisePrefillRunner {
                 stream,
             )?;
             let sk: [i32; 1] = [num_tokens as i32];
-            driver::memcpy_htod_async(
-                self.seqused_k.ptr(),
-                sk.as_ptr() as *const u8,
-                4,
-                stream,
-            )?;
+            driver::memcpy_htod_async(self.seqused_k.ptr(), sk.as_ptr() as *const u8, 4, stream)?;
             driver::memset_d8(
                 self.block_table.ptr(),
                 0,
@@ -1162,7 +1157,11 @@ impl PiecewisePrefillRunner {
     }
 
     fn nearest_size(&self, num_tokens: usize) -> Option<usize> {
-        self.runners.keys().filter(|&&s| s >= num_tokens).min().copied()
+        self.runners
+            .keys()
+            .filter(|&&s| s >= num_tokens)
+            .min()
+            .copied()
     }
 
     /// Capture piecewise CUDA graphs for `num_tokens` prefill.
@@ -1317,12 +1316,7 @@ impl PiecewisePrefillRunner {
                 8,
                 xfer,
             )?;
-            driver::memcpy_htod_async(
-                self.seqused_k.ptr(),
-                sk_val.as_ptr() as *const u8,
-                4,
-                xfer,
-            )?;
+            driver::memcpy_htod_async(self.seqused_k.ptr(), sk_val.as_ptr() as *const u8, 4, xfer)?;
 
             driver::memcpy_htod_async(
                 self.block_table.ptr(),
@@ -1507,7 +1501,7 @@ pub struct FerriteWorker {
     #[cfg(feature = "cuda")]
     prefill_graph_runner: Option<PrefillGraphRunner>,
     #[cfg(feature = "cuda")]
-    last_graph_batch_size: Option<usize>,
+    last_graph_batch_size: Option<(usize, u32)>,
     #[cfg(feature = "cuda")]
     graph_metadata_valid: bool,
     /// True when the model uses GGML quantized layers (disables CUDA graphs).
@@ -4200,6 +4194,15 @@ impl Worker for FerriteWorker {
         // permanently poisons the CUDA context. This matches Python vLLM's
         // approach of validating before capture rather than recovering after
         // failure. Piecewise graphs handle MoE models with ~1-3% decode overhead.
+        //
+        // Monolithic capture (TP=1) uses one captured graph per
+        // `(batch_size, sk_bucket)` pair so each baked kernel matches
+        // the cost solver's pick at that sk range; piecewise capture
+        // (TP>1, `#[cfg(feature = "nccl")]` below) still uses a single
+        // `padded_max_seqlen_k` constant since multi-bucket piecewise
+        // would multiply NCCL coordination cost across each captured
+        // segment — left as a follow-up.
+        #[cfg(feature = "nccl")]
         let padded_max_seqlen_k: usize = 2048;
         let mut monolithic_failed = false;
 
@@ -4228,11 +4231,13 @@ impl Worker for FerriteWorker {
             .map_err(|e| ExecutorError::WorkerInit(format!("CudaGraphRunner::new: {e}")))?;
 
             // FP8 KV cache: allocate persistent dequant buffers and cache scales.
+            // Buffer is sized for the LARGEST decode sk bucket so it covers
+            // every captured `(bs, sk_bucket)` graph below.
             if self.kv_cache_is_fp8 {
                 unsafe {
                     runner
                         .init_fp8_buffers(
-                            padded_max_seqlen_k,
+                            8192, // matches max of DECODE_SK_BUCKETS below
                             kv_cache.num_kv_heads,
                             kv_cache.head_dim,
                             self.model_dtype,
@@ -4253,42 +4258,63 @@ impl Worker for FerriteWorker {
                 vllm_cuda::model::attention_helpers::set_fp8_graph_ctx(ctx);
             }
 
-            // Capture largest batch sizes first (matching Python vLLM). The first
-            // capture establishes the pool's high-water mark; subsequent smaller
-            // captures reuse the same memory — preventing incremental pool growth
-            // that could OOM the driver.
-            for &bs in capture_sizes.iter().rev() {
-                info!("Capturing CUDA graph for batch_size={bs}...");
-                let kv_ref = kv_cache;
-                let model_ref = model;
+            // Capture multiple decode graphs per batch size — one per sk
+            // bucket. The cost solver picks the cheapest Instruction
+            // (FA2 vs FlashInfer paged attention) per `(num_tokens=1,
+            // sk_bucket)` cell, so a single capture-time
+            // `padded_max_seqlen_k` would bake the kernel that wins
+            // ONLY at that sk and run it at every replay regardless of
+            // the runtime span. Capturing one graph per declared sk
+            // bucket lets replay dispatch (`pick_sk_bucket`) pick the
+            // graph whose baked kernel matches the runtime
+            // `max_seqlen_k` — short-context replays land on FA2,
+            // long-context replays land on FlashInfer.
+            //
+            // Capture order: largest sk × largest bs first. The first
+            // capture establishes the allocator pool's high-water mark
+            // (sized by attention-workspace * KV span); subsequent
+            // smaller (sk, bs) reuse the same memory rather than
+            // growing the pool incrementally.
+            const DECODE_SK_BUCKETS: &[u32] = &[128, 512, 2048, 8192];
+            'capture: for &sk_bucket in DECODE_SK_BUCKETS.iter().rev() {
+                for &bs in capture_sizes.iter().rev() {
+                    info!("Capturing CUDA graph for batch_size={bs}, sk_bucket={sk_bucket}...");
+                    let kv_ref = kv_cache;
+                    let model_ref = model;
 
-                let result = unsafe {
-                    runner.capture(bs, device, |inputs, dev| {
-                        model_ref.forward(
-                            TensorView::from_raw(inputs.input_ids),
-                            TensorView::from_raw(inputs.positions),
-                            TensorView::from_raw(inputs.slot_mapping),
-                            TensorView::from_raw(inputs.cu_seqlens_q),
-                            TensorView::from_raw(inputs.seqused_k),
-                            TensorView::from_raw(inputs.block_table),
-                            1, // max_seqlen_q = 1 for decode
-                            padded_max_seqlen_k,
-                            kv_ref,
-                            dev,
-                            None, // no last_token_indices (decode: all tokens are last)
-                            None, // text-only decode: no MM splice
-                        )
-                    })
-                };
+                    let result = unsafe {
+                        runner.capture(bs, sk_bucket, device, |inputs, dev| {
+                            model_ref.forward(
+                                TensorView::from_raw(inputs.input_ids),
+                                TensorView::from_raw(inputs.positions),
+                                TensorView::from_raw(inputs.slot_mapping),
+                                TensorView::from_raw(inputs.cu_seqlens_q),
+                                TensorView::from_raw(inputs.seqused_k),
+                                TensorView::from_raw(inputs.block_table),
+                                1, // max_seqlen_q = 1 for decode
+                                sk_bucket as usize,
+                                kv_ref,
+                                dev,
+                                None, // no last_token_indices (decode: all tokens are last)
+                                None, // text-only decode: no MM splice
+                            )
+                        })
+                    };
 
-                match result {
-                    Ok(()) => info!("CUDA graph captured for batch_size={bs}"),
-                    Err(e) => {
-                        tracing::warn!("Failed to capture CUDA graph for bs={bs}: {e}");
-                        // Stop immediately — CUDA_ERROR_ILLEGAL_ADDRESS poisons the
-                        // entire CUDA context. Piecewise graphs are the fallback.
-                        monolithic_failed = true;
-                        break;
+                    match result {
+                        Ok(()) => {
+                            info!("CUDA graph captured for batch_size={bs}, sk_bucket={sk_bucket}")
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to capture CUDA graph for bs={bs}, sk={sk_bucket}: {e}"
+                            );
+                            // Stop immediately — CUDA_ERROR_ILLEGAL_ADDRESS
+                            // poisons the entire CUDA context. Piecewise
+                            // graphs are the fallback.
+                            monolithic_failed = true;
+                            break 'capture;
+                        }
                     }
                 }
             }
@@ -4309,11 +4335,11 @@ impl Worker for FerriteWorker {
                 );
             } else if !runner.captured_sizes().is_empty() {
                 info!(
-                    "CUDA graphs captured for batch sizes: {:?}",
+                    "CUDA graphs captured for (batch_size, sk_bucket): {:?}",
                     runner.captured_sizes()
                 );
                 // Allocate pinned host staging buffers sized for the largest captured graph.
-                let staging_max_bs = *runner.captured_sizes().last().unwrap();
+                let staging_max_bs = *runner.captured_batch_sizes().last().unwrap();
                 match unsafe { HostStaging::new(staging_max_bs, max_blocks_per_seq) } {
                     Ok(staging) => {
                         info!(
@@ -4517,9 +4543,7 @@ impl Worker for FerriteWorker {
                     };
                     let mut any_failed = false;
                     for &num_tokens in prefill_sizes.iter().rev() {
-                        info!(
-                            "Piecewise prefill: capturing for num_tokens={num_tokens}…"
-                        );
+                        info!("Piecewise prefill: capturing for num_tokens={num_tokens}…");
                         let res = unsafe { ppr.capture(num_tokens, model, kv_cache, device) };
                         match res {
                             Ok(()) => info!(
@@ -5057,16 +5081,40 @@ impl FerriteWorker {
         // to AFTER the graph launch so it overlaps with GPU execution.
         // ---------------------------------------------------------------
         let num_active = self.input_batch.num_active();
+        // Compute the runtime sk_bucket from the previous step's tokens-in-pool
+        // (each will gain one this step), then look up the captured graph that
+        // matches both `(num_active, sk_bucket)`. The fast-path stickiness
+        // check (`last_graph_batch_size`) extends to the sk_bucket too: if the
+        // bucket changed across steps (e.g. seq grew past 512), the captured
+        // graph differs and we must fall through to the regular path so the
+        // FlashInfer plan slot for the new bucket gets seeded.
+        let fast_sk_bucket: Option<u32> = if self.graph_metadata_valid && !has_chunked_prefill {
+            self.graph_runner.as_ref().and_then(|r| {
+                let (_, _, tokens_in_pool) = self.input_batch.fast_path_info();
+                let max_k = tokens_in_pool
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                r.pick_sk_bucket(max_k)
+            })
+        } else {
+            None
+        };
         let fast_graph_bs = if self.graph_metadata_valid && !has_chunked_prefill {
-            self.graph_runner
-                .as_ref()
-                .and_then(|r| r.nearest_graph_size(num_active))
-                .filter(|&gbs| self.last_graph_batch_size == Some(gbs))
+            fast_sk_bucket.and_then(|sk| {
+                self.graph_runner
+                    .as_ref()
+                    .and_then(|r| r.nearest_graph_size(num_active, sk))
+                    .filter(|&gbs| self.last_graph_batch_size == Some((gbs, sk)))
+            })
         } else {
             None
         };
 
         if let Some(graph_bs) = fast_graph_bs
+            && let Some(sk_bucket) = fast_sk_bucket
             && let Some(ref mut stg) = self.host_staging
             && let Some(ref mut device) = self.device
         {
@@ -5118,6 +5166,7 @@ impl FerriteWorker {
                 let replay_out = unsafe {
                     runner.replay_decode_fast(
                         graph_bs,
+                        sk_bucket,
                         None,
                         new_bt,
                         block_size,
@@ -5493,10 +5542,35 @@ impl FerriteWorker {
             .req_inputs
             .iter()
             .any(|r| self.mm_data_buffers.contains_key(&r.req_id));
-        let graph_bs = if is_decode && !any_mm_in_batch {
+        // Pure-decode batch: each request contributes 1 query token; the
+        // KV span the captured kernel must cover is `max(seq_lens)` (already
+        // includes the token-about-to-be-decoded since meta.seq_lens is
+        // post-RopeAndCacheKV). Pick the captured graph keyed on
+        // `(num_reqs, sk_bucket_for(max_seqlen_k))`.
+        let decode_max_seqlen_k: usize = if is_decode && !any_mm_in_batch {
+            prepared
+                .attn_meta
+                .seq_lens
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        let decode_sk_bucket: Option<u32> = if is_decode && !any_mm_in_batch {
             self.graph_runner
                 .as_ref()
-                .and_then(|r| r.nearest_graph_size(num_reqs))
+                .and_then(|r| r.pick_sk_bucket(decode_max_seqlen_k))
+        } else {
+            None
+        };
+        let graph_bs = if is_decode && !any_mm_in_batch {
+            decode_sk_bucket.and_then(|sk| {
+                self.graph_runner
+                    .as_ref()
+                    .and_then(|r| r.nearest_graph_size(num_reqs, sk))
+            })
         } else {
             None
         };
@@ -5539,15 +5613,39 @@ impl FerriteWorker {
             .iter()
             .any(|r| !r.spec_token_ids.is_empty());
         let is_mixed = !is_decode && has_decode;
+        // Mixed batch: the decode subset's KV span is the max `seq_lens`
+        // among rows with `q_len == 1`. Match against captured graphs by
+        // `(n_decode, sk_bucket_for(max_seqlen_k_decode))`.
+        let mixed_decode_max_seqlen_k: usize = if is_mixed && !any_spec_in_batch {
+            prepared
+                .attn_meta
+                .q_lens
+                .iter()
+                .zip(prepared.attn_meta.seq_lens.iter())
+                .filter_map(|(&q, &sk)| (q == 1).then_some(sk))
+                .max()
+                .unwrap_or(1)
+        } else {
+            0
+        };
+        let mixed_decode_sk_bucket: Option<u32> = if is_mixed && !any_spec_in_batch {
+            self.graph_runner
+                .as_ref()
+                .and_then(|r| r.pick_sk_bucket(mixed_decode_max_seqlen_k))
+        } else {
+            None
+        };
         let decode_graph_bs = if is_mixed && !any_spec_in_batch {
-            self.graph_runner.as_ref().and_then(|r| {
-                let n_decode = prepared
-                    .attn_meta
-                    .q_lens
-                    .iter()
-                    .filter(|&&q| q == 1)
-                    .count();
-                r.nearest_graph_size(n_decode)
+            mixed_decode_sk_bucket.and_then(|sk| {
+                self.graph_runner.as_ref().and_then(|r| {
+                    let n_decode = prepared
+                        .attn_meta
+                        .q_lens
+                        .iter()
+                        .filter(|&&q| q == 1)
+                        .count();
+                    r.nearest_graph_size(n_decode, sk)
+                })
             })
         } else {
             None
@@ -5617,9 +5715,12 @@ impl FerriteWorker {
                 seqused_k.resize(decode_graph_bs, 1);
 
                 let runner = self.graph_runner.as_ref().unwrap();
+                let sk_bucket = mixed_decode_sk_bucket
+                    .expect("mixed_decode_sk_bucket present when decode_graph_bs is Some");
                 let replay_out = unsafe {
                     runner.replay(
                         decode_graph_bs,
+                        sk_bucket,
                         &input_ids,
                         &positions,
                         &slot_mapping,
@@ -5858,11 +5959,13 @@ impl FerriteWorker {
             // Fast path: CUDA graph with in-graph argmax. No separate sampling
             // kernel launch — argmax + D2D scatter are captured in the graph.
             let graph_bs = graph_bs.unwrap();
+            let sk_bucket =
+                decode_sk_bucket.expect("decode_sk_bucket present when graph_bs is Some");
             let meta = &prepared.attn_meta;
             let staging = self.host_staging.as_ref();
 
             let replay_out = if self.graph_metadata_valid
-                && self.last_graph_batch_size == Some(graph_bs)
+                && self.last_graph_batch_size == Some((graph_bs, sk_bucket))
             {
                 // GPU-side metadata update: positions, slot_mapping, seqused_k
                 // are incremented on GPU in a single kernel. Only block_table is
@@ -5881,6 +5984,7 @@ impl FerriteWorker {
                 unsafe {
                     runner.replay_decode_fast(
                         graph_bs,
+                        sk_bucket,
                         None, // input_ids already scattered by previous graph
                         new_bt,
                         block_size,
@@ -5935,12 +6039,13 @@ impl FerriteWorker {
 
                     let bt = stg.fill_block_table(&meta.block_ids, graph_bs);
 
-                    let skip_input_ids =
-                        self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
+                    let skip_input_ids = self.last_graph_batch_size == Some((graph_bs, sk_bucket))
+                        && num_reqs == graph_bs;
 
                     let runner = self.graph_runner.as_ref().unwrap();
                     runner.replay(
                         graph_bs,
+                        sk_bucket,
                         stg.input_ids.slice::<u32>(graph_bs),
                         stg.positions.slice::<u32>(graph_bs),
                         stg.slot_mapping.slice::<i64>(graph_bs),
@@ -5993,13 +6098,14 @@ impl FerriteWorker {
                     }
                 }
 
-                let skip_input_ids =
-                    self.last_graph_batch_size == Some(graph_bs) && num_reqs == graph_bs;
+                let skip_input_ids = self.last_graph_batch_size == Some((graph_bs, sk_bucket))
+                    && num_reqs == graph_bs;
 
                 let runner = self.graph_runner.as_ref().unwrap();
                 unsafe {
                     runner.replay(
                         graph_bs,
+                        sk_bucket,
                         &input_ids,
                         &positions,
                         &slot_mapping,
@@ -6015,7 +6121,7 @@ impl FerriteWorker {
             };
 
             // Record that graph buffers now have valid metadata for next step.
-            self.last_graph_batch_size = Some(graph_bs);
+            self.last_graph_batch_size = Some((graph_bs, sk_bucket));
             self.graph_metadata_valid = true;
 
             // Deferred D2H: enqueue async copy on transfer stream, return
@@ -6095,11 +6201,13 @@ impl FerriteWorker {
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();
+            let sk_bucket =
+                decode_sk_bucket.expect("decode_sk_bucket present when graph_bs is Some");
             let meta = &prepared.attn_meta;
             let staging = self.host_staging.as_ref();
 
             let replay_out = if self.graph_metadata_valid
-                && self.last_graph_batch_size == Some(graph_bs)
+                && self.last_graph_batch_size == Some((graph_bs, sk_bucket))
             {
                 // Fast path: GPU-side metadata update (same as greedy).
                 // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
@@ -6130,6 +6238,7 @@ impl FerriteWorker {
                 unsafe {
                     runner.replay_decode_fast(
                         graph_bs,
+                        sk_bucket,
                         Some(input_ids_slice),
                         new_bt,
                         block_size,
@@ -6185,6 +6294,7 @@ impl FerriteWorker {
                     let runner = self.graph_runner.as_ref().unwrap();
                     runner.replay(
                         graph_bs,
+                        sk_bucket,
                         stg.input_ids.slice::<u32>(graph_bs),
                         stg.positions.slice::<u32>(graph_bs),
                         stg.slot_mapping.slice::<i64>(graph_bs),
@@ -6241,6 +6351,7 @@ impl FerriteWorker {
                 unsafe {
                     runner.replay(
                         graph_bs,
+                        sk_bucket,
                         &input_ids,
                         &positions,
                         &slot_mapping,
@@ -6256,7 +6367,7 @@ impl FerriteWorker {
             };
 
             // Track metadata validity for next step (works for non-greedy too).
-            self.last_graph_batch_size = Some(graph_bs);
+            self.last_graph_batch_size = Some((graph_bs, sk_bucket));
             self.graph_metadata_valid = true;
 
             // Slice logits to only the real requests (discard padded rows).
@@ -6402,8 +6513,7 @@ impl FerriteWorker {
                         let block_idx = abs_pos / block_size;
                         let offset = abs_pos % block_size;
                         if block_idx < block_ids.len() {
-                            slot_mapping
-                                .push((block_ids[block_idx] * block_size + offset) as i64);
+                            slot_mapping.push((block_ids[block_idx] * block_size + offset) as i64);
                         } else {
                             slot_mapping.push(-1i64);
                         }

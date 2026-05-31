@@ -27,16 +27,26 @@ use crate::dtype::DType;
 use crate::kernels;
 use crate::tensor::GpuTensor;
 
-/// A single captured CUDA graph for a specific batch size.
+/// A single captured CUDA graph for a specific `(batch_size, sk_bucket)`
+/// pair. The `sk_bucket` was the `max_seqlen_k` value passed to
+/// `model.forward()` at capture time, which the cost solver uses to
+/// pick which Instruction (FA2 vs FlashInfer) gets baked into the
+/// graph. A given replay must dispatch to the graph whose `sk_bucket`
+/// matches `sk_bucket_for(actual_max_seqlen_k)`.
 struct CapturedGraph {
     exec: CUgraphExec,
     #[allow(dead_code)]
     batch_size: usize,
+    #[allow(dead_code)]
+    sk_bucket: u32,
 }
 
-/// CUDA graph runner for decode batches.
+/// CUDA graph runner for decode batches. Indexed by
+/// `(batch_size, sk_bucket)` so a single batch size can have multiple
+/// captured graphs — one per sk-range over which the cost solver picks
+/// a different attention kernel.
 pub struct CudaGraphRunner {
-    graphs: HashMap<usize, CapturedGraph>,
+    graphs: HashMap<(usize, u32), CapturedGraph>,
     input_ids: RawGpuMem,
     positions: RawGpuMem,
     slot_mapping: RawGpuMem,
@@ -128,8 +138,8 @@ impl CudaGraphRunner {
         })
     }
 
-    pub fn has_graph(&self, batch_size: usize) -> bool {
-        self.graphs.contains_key(&batch_size)
+    pub fn has_graph(&self, batch_size: usize, sk_bucket: u32) -> bool {
+        self.graphs.contains_key(&(batch_size, sk_bucket))
     }
 
     /// Allocate FP8 dequant buffers for CUDA graph capture/replay.
@@ -252,12 +262,53 @@ impl CudaGraphRunner {
         self.fp8_k_buf.is_some()
     }
 
-    pub fn nearest_graph_size(&self, batch_size: usize) -> Option<usize> {
+    /// Pick the smallest captured `batch_size >= requested` that has a
+    /// graph for `sk_bucket`. Returns `None` if no graph for the bucket
+    /// is at-or-above the requested batch size.
+    pub fn nearest_graph_size(&self, batch_size: usize, sk_bucket: u32) -> Option<usize> {
         self.graphs
             .keys()
-            .filter(|&&s| s >= batch_size)
+            .filter(|&&(bs, sk)| sk == sk_bucket && bs >= batch_size)
+            .map(|&(bs, _)| bs)
             .min()
+    }
+
+    /// Distinct sk_buckets the runner has captured (across all batch
+    /// sizes). Sorted ascending. Used by callers that want to pick the
+    /// nearest captured bucket for a given runtime `max_seqlen_k`.
+    pub fn captured_sk_buckets(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .graphs
+            .keys()
+            .map(|&(_, sk)| sk)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// For a runtime `max_seqlen_k`, pick the smallest captured
+    /// `sk_bucket >= sk_bucket_for(max_seqlen_k)`. If the runtime span
+    /// exceeds the largest captured bucket, fall back to that largest
+    /// bucket — the captured FlashInfer plan's workspace was sized at
+    /// capture and `replan_fi_for_decode` adjusts the per-step
+    /// scheduling to the live `max_seqlen_k` within that workspace, so
+    /// running sk slightly beyond the captured ceiling is correct (the
+    /// FI shim's workspace allocation has slack for typical
+    /// `max-model-len` headroom). Returns `None` only when no graphs
+    /// are captured.
+    pub fn pick_sk_bucket(&self, max_seqlen_k: usize) -> Option<u32> {
+        let want = ferrite_kernels::attention_helpers::sk_bucket_for(max_seqlen_k);
+        let captured = self.captured_sk_buckets();
+        if captured.is_empty() {
+            return None;
+        }
+        captured
+            .iter()
             .copied()
+            .find(|&b| b >= want)
+            .or_else(|| captured.last().copied())
     }
 
     fn input_tensors(&self, batch_size: usize) -> InputTensors {
@@ -289,6 +340,7 @@ impl CudaGraphRunner {
     pub unsafe fn capture<F>(
         &mut self,
         batch_size: usize,
+        sk_bucket: u32,
         device: &mut GpuDevice,
         mut forward_fn: F,
     ) -> Result<()>
@@ -349,12 +401,17 @@ impl CudaGraphRunner {
         drop(logits);
         drop(argmax_out);
 
-        let captured = CapturedGraph { exec, batch_size };
-        self.graphs.insert(batch_size, captured);
+        let captured = CapturedGraph {
+            exec,
+            batch_size,
+            sk_bucket,
+        };
+        self.graphs.insert((batch_size, sk_bucket), captured);
 
         tracing::info!(
-            "CUDA graph captured for batch_size={} (with argmax), shared output ({} logit elements)",
+            "CUDA graph captured for batch_size={}, sk_bucket={} (with argmax), shared output ({} logit elements)",
             batch_size,
+            sk_bucket,
             batch_size * self.vocab_size,
         );
 
@@ -370,6 +427,7 @@ impl CudaGraphRunner {
     pub unsafe fn replay(
         &self,
         batch_size: usize,
+        sk_bucket: u32,
         input_ids: &[u32],
         positions: &[u32],
         slot_mapping: &[i64],
@@ -380,10 +438,9 @@ impl CudaGraphRunner {
         device: &mut GpuDevice,
         skip_input_ids_h2d: bool,
     ) -> Result<ReplayOutput> {
-        let graph = self
-            .graphs
-            .get(&batch_size)
-            .ok_or_else(|| anyhow::anyhow!("no captured graph for batch_size={batch_size}"))?;
+        let graph = self.graphs.get(&(batch_size, sk_bucket)).ok_or_else(|| {
+            anyhow::anyhow!("no captured graph for batch_size={batch_size}, sk_bucket={sk_bucket}")
+        })?;
 
         let xfer = device.transfer_stream;
 
@@ -489,16 +546,16 @@ impl CudaGraphRunner {
     pub unsafe fn replay_decode_fast(
         &self,
         batch_size: usize,
+        sk_bucket: u32,
         input_ids: Option<&[u32]>,
         new_block_table: Option<&[i32]>,
         block_size: usize,
         max_seqlen_k: usize,
         device: &mut GpuDevice,
     ) -> Result<ReplayOutput> {
-        let graph = self
-            .graphs
-            .get(&batch_size)
-            .ok_or_else(|| anyhow::anyhow!("no captured graph for batch_size={batch_size}"))?;
+        let graph = self.graphs.get(&(batch_size, sk_bucket)).ok_or_else(|| {
+            anyhow::anyhow!("no captured graph for batch_size={batch_size}, sk_bucket={sk_bucket}")
+        })?;
 
         let stream = device.compute_stream;
 
@@ -622,10 +679,25 @@ impl CudaGraphRunner {
         Ok(())
     }
 
-    pub fn captured_sizes(&self) -> Vec<usize> {
-        let mut sizes: Vec<usize> = self.graphs.keys().copied().collect();
+    /// All captured `(batch_size, sk_bucket)` pairs, sorted ascending.
+    pub fn captured_sizes(&self) -> Vec<(usize, u32)> {
+        let mut sizes: Vec<(usize, u32)> = self.graphs.keys().copied().collect();
         sizes.sort();
         sizes
+    }
+
+    /// Distinct captured batch sizes, sorted ascending. Each may have
+    /// multiple sk_bucket variants captured against it.
+    pub fn captured_batch_sizes(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self
+            .graphs
+            .keys()
+            .map(|&(bs, _)| bs)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        v.sort();
+        v
     }
 }
 

@@ -232,6 +232,12 @@ pub unsafe fn run_piecewise_capture<W: CanonicalParams>(
 
     // Open the first segment.
     unsafe { driver::stream_begin_capture(stream)? };
+    // `mut` is required at `--features nccl` (the AllReduce/AllGather
+    // arms below reassign it); without nccl those arms cfg-out and
+    // `capture_open` stays `true` the whole loop, so clippy flags the
+    // unused-mut. Allow it locally so both build configurations stay
+    // clean under `-D warnings`.
+    #[allow(unused_mut)]
     let mut capture_open = true;
 
     for ex in &expanded {
@@ -321,6 +327,11 @@ pub unsafe fn run_piecewise_capture<W: CanonicalParams>(
 /// All ForwardCtx tensors at the same shapes/dtypes as capture-time;
 /// `device` matches the runner's capture device; tp_group is set when
 /// any segment terminator is AllReduce or AllGatherFinal.
+// `fwd` is read only inside the `#[cfg(feature = "nccl")]` arms below
+// (AllReduce/AllGather terminators that pull `tp_group` from ForwardCtx);
+// without nccl those arms cfg-out and `fwd` becomes unused. Allow at the
+// fn level so both configurations stay clean under `-D warnings`.
+#[allow(unused_variables)]
 pub unsafe fn run_piecewise_replay(
     runner: &PiecewiseRunner,
     fwd: &ForwardCtx,

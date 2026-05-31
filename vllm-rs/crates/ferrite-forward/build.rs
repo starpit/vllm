@@ -20,14 +20,12 @@ fn cuda_arch_ge_90() -> bool {
     if let Ok(out) = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
+        && let Ok(s) = std::str::from_utf8(&out.stdout)
+        && let Some(line) = s.lines().next()
     {
-        if let Ok(s) = std::str::from_utf8(&out.stdout) {
-            if let Some(line) = s.lines().next() {
-                let digits: String = line.trim().chars().filter(|c| c.is_ascii_digit()).collect();
-                if let Ok(arch) = digits.parse::<u32>() {
-                    return arch >= 90;
-                }
-            }
+        let digits: String = line.trim().chars().filter(|c| c.is_ascii_digit()).collect();
+        if let Ok(arch) = digits.parse::<u32>() {
+            return arch >= 90;
         }
     }
     false

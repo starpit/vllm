@@ -2169,9 +2169,10 @@ impl FerriteWorker {
         prepared: &PreparedInputs,
         device: &mut GpuDevice,
     ) -> Option<(OwnedTensor, Vec<ferrite_forward::EmbedPatch>)> {
-        let CudaModel::Ferrite(fm) = model else {
-            return None;
-        };
+        // `CudaModel` collapsed to a single `Ferrite(_)` variant in
+        // cbc59cc2d when the hand-written CUDA model forwards were
+        // removed; the destructure is irrefutable.
+        let CudaModel::Ferrite(fm) = model;
         let mm = fm.mm.as_ref()?;
         let meta = &prepared.attn_meta;
         let mut pixel_inputs: Vec<ferrite_forward::PixelInput<'_>> = Vec::new();
@@ -2231,9 +2232,8 @@ impl FerriteWorker {
         prepared: &PreparedInputs,
     ) -> Vec<Vec<SeqMmInfo>> {
         let mut per_req: Vec<Vec<SeqMmInfo>> = vec![Vec::new(); prepared.req_inputs.len()];
-        let CudaModel::Ferrite(fm) = model else {
-            return per_req;
-        };
+        // `CudaModel` is a single-variant enum; the destructure is irrefutable.
+        let CudaModel::Ferrite(fm) = model;
         let Some(mm) = fm.mm.as_ref() else {
             return per_req;
         };
@@ -5437,15 +5437,14 @@ impl FerriteWorker {
 
         // Split borrows: model + kv_cache (shared) vs device (mutable).
         // Use direct field access so the borrow checker sees disjoint borrows.
-        let (mut model, mut kv_cache, mut device) =
-            match (&self.model, &self.kv_cache, &mut self.device) {
-                (Some(m), Some(kv), Some(d)) => (m, kv, d),
-                _ => {
-                    return Err(ExecutorError::WorkerExecution(
-                        "model, KV cache, or device not initialized".into(),
-                    ));
-                }
-            };
+        let (model, kv_cache, device) = match (&self.model, &self.kv_cache, &mut self.device) {
+            (Some(m), Some(kv), Some(d)) => (m, kv, d),
+            _ => {
+                return Err(ExecutorError::WorkerExecution(
+                    "model, KV cache, or device not initialized".into(),
+                ));
+            }
+        };
         let num_reqs = prepared.req_inputs.len();
 
         // Build batch_req_ids for this step (used by processor updates after forward).
@@ -6440,20 +6439,28 @@ impl FerriteWorker {
                 }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("piecewise replay: {e}")))?
             };
+            // Without nccl, `piecewise_bs` is hardcoded to None at the
+            // dispatch site (see the `#[cfg(not(feature = "nccl"))]`
+            // arm of `piecewise_bs:`), so `use_piecewise` is always
+            // false and this branch is statically unreachable. Diverge
+            // cleanly so clippy doesn't see a `let result = unreachable!()`
+            // followed by dead-but-typed code.
             #[cfg(not(feature = "nccl"))]
-            let result: OwnedTensor =
-                unreachable!("use_piecewise true requires nccl feature; gating bug");
+            unreachable!("use_piecewise true requires nccl feature; gating bug");
 
-            // logits is [pw_bs, vocab]; narrow to real reqs if padded.
-            let logits_full = result;
-            let logits_view = if num_reqs < piecewise_bs.unwrap() {
-                logits_full.as_gpu_tensor().narrow_dim0(0, num_reqs)
-            } else {
-                logits_full.as_gpu_tensor()
-            };
-            self.last_graph_batch_size = None;
-            self.graph_metadata_valid = false;
-            (Some(logits_full), logits_view)
+            #[cfg(feature = "nccl")]
+            {
+                // logits is [pw_bs, vocab]; narrow to real reqs if padded.
+                let logits_full = result;
+                let logits_view = if num_reqs < piecewise_bs.unwrap() {
+                    logits_full.as_gpu_tensor().narrow_dim0(0, num_reqs)
+                } else {
+                    logits_full.as_gpu_tensor()
+                };
+                self.last_graph_batch_size = None;
+                self.graph_metadata_valid = false;
+                (Some(logits_full), logits_view)
+            }
         } else {
             // Non-decode path: try prefill graph, fall back to eager.
             self.last_graph_batch_size = None;
@@ -6705,14 +6712,13 @@ impl FerriteWorker {
                     // `MultimodalForward::mm_metadata().mrope_positions`,
                     // declared per-arch on `pub const PROCESSOR:
                     // ferrite_vision::MmMetadata`.
-                    let mrope = if let CudaModel::Ferrite(fm) = model {
-                        fm.mm
-                            .as_ref()
-                            .map(|m| m.mm_metadata().mrope_positions)
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
+                    // Single-variant enum — see `extract_mm_embeds`.
+                    let CudaModel::Ferrite(fm) = model;
+                    let mrope = fm
+                        .mm
+                        .as_ref()
+                        .map(|m| m.mm_metadata().mrope_positions)
+                        .unwrap_or(false);
                     let gpu_positions_2d = if mrope && !per_req_mm.is_empty() {
                         let pos_2d = Self::build_mrope_positions_2d(&prepared, &per_req_mm);
                         let mut t = Self::h2d_u32(&pos_2d, device)?;

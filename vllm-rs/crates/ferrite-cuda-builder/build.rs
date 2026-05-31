@@ -374,10 +374,10 @@ fn build_flash_attention_3(cache_dir: &str, rerun_files: &mut Vec<String>) {
     if let Ok(entries) = std::fs::read_dir(fa3_src) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if ext == "h" || ext == "hpp" {
-                    watch_files.push(p.to_string_lossy().into_owned());
-                }
+            if let Some(ext) = p.extension().and_then(|e| e.to_str())
+                && (ext == "h" || ext == "hpp")
+            {
+                watch_files.push(p.to_string_lossy().into_owned());
             }
         }
     }

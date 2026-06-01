@@ -1228,7 +1228,23 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         // Consumer: wait y free, wait W ready, compute, signal both done.
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var, start);
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
-        body.compute(WarpRole::AllConsumers, gemm_m1_compute_body(&op, x_id, w_id, y_id));
+        // Phase 3: typed `Tk20Call::GemmM1ConsumerBody`. See
+        // `lower_rmsnorm` for the env-gate rationale. `bn`/`k` baked
+        // into the typed atom at instruction-build time.
+        if std::env::var_os("FERRITE_NEW_GEMM_M1").is_some() {
+            body.compute_calls(
+                WarpRole::AllConsumers,
+                vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
+                    x_id,
+                    w_id,
+                    y_id,
+                    k: op.k,
+                    bn: op.bn,
+                }],
+            );
+        } else {
+            body.compute(WarpRole::AllConsumers, gemm_m1_compute_body(&op, x_id, w_id, y_id));
+        }
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, y_id);
 
@@ -1281,6 +1297,17 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
     let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
     let x_page = prog.complete_round(x_page);
     pages.release(x_page);
+}
+
+/// Test-only wrapper for the legacy `gemm_m1_compute_body`.
+#[cfg(test)]
+pub fn gemm_m1_compute_body_for_test(
+    op: &GemmM1Op,
+    x_id: u8,
+    w_id: u8,
+    y_id: u8,
+) -> String {
+    gemm_m1_compute_body(op, x_id, w_id, y_id)
 }
 
 fn gemm_m1_compute_body(op: &GemmM1Op, x_id: u8, w_id: u8, y_id: u8) -> String {

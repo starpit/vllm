@@ -358,6 +358,52 @@ pub mod tk20 {
         )
     }
 
+    /// Emit the GemmM1 consumer body. M=1 dot product computed per
+    /// consumer warp (warp `c` produces `y[c]` when `c < bn`), with
+    /// lane-parallel K reduction via `__shfl_xor_sync` butterfly.
+    /// `kittens::warp::mma_AB` (16x16 register tiles) doesn't fit
+    /// the m=1 case naturally — a single output value at row=1 would
+    /// need 15 zeroed pad rows; the per-thread form matches both
+    /// mk-v2's RmsNorm idiom and the natural decode m=1 fast path.
+    /// Phase 3 adds `Tk20Call::WarpMmaAB` and `WarpgroupMmaAB`
+    /// bindings (Phase 0) for future m>1 prefill lowerings, while
+    /// keeping the m=1 body's per-thread shape.
+    ///
+    /// `x_id` / `w_id` / `y_id`: page slots. `k` / `bn`: GEMM tile
+    /// dims. Consumer warp count enforced ≤ NUM_CONSUMER_WARPS by
+    /// the caller (`tk_orchestrate::pick_bn`).
+    pub fn gemm_m1_consumer_body(x_id: u8, w_id: u8, y_id: u8, k: u32, bn: u32) -> String {
+        format!(
+            r#"
+            // tk_warp_ir GemmM1 — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
+            // (per-warp output: warp c -> y[c] when c < bn; lane-parallel K reduce.)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
+            auto* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
+            const unsigned int __k  = {k}u;
+            const unsigned int __bn = {bn}u;
+            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
+                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                float __acc = 0.0f;
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __k; __j += 32u) {{
+                    __acc += __bfloat162float(__x_smem[__j])
+                           * __bfloat162float(__w_smem[__row * __k + __j]);
+                }}
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {{
+                    __acc += __shfl_xor_sync(0xFFFFFFFFu, __acc, __o);
+                }}
+                if (__lane == 0) {{
+                    __y_smem[__row] = __float2bfloat16(__acc);
+                }}
+            }}
+"#
+        )
+    }
+
     /// Emit the SiluMul consumer body. Fused `silu(gate) * up` in
     /// place on gate's page, all-consumer-warp parallel. Same per-
     /// thread bf16 + sigmoid-via-`expf` pattern as the legacy fused
@@ -1253,6 +1299,18 @@ pub enum Tk20Call {
         head_dim: u32,
         total_pairs: u64,
     },
+
+    /// GemmM1 consumer compute body. M=1 dot product per consumer
+    /// warp (warp `c` produces `y[c]` for `c < bn`), lane-parallel K
+    /// reduce via `__shfl_xor_sync`. Bound through
+    /// `tk20::gemm_m1_consumer_body`.
+    GemmM1ConsumerBody {
+        x_id: u8,
+        w_id: u8,
+        y_id: u8,
+        k: u32,
+        bn: u32,
+    },
 }
 
 impl Tk20Call {
@@ -1319,6 +1377,14 @@ impl Tk20Call {
                 head_dim,
                 total_pairs,
             } => tk20::rope_consumer_body(*x_id, *c_id, *s_id, *head_dim, *total_pairs),
+
+            Tk20Call::GemmM1ConsumerBody {
+                x_id,
+                w_id,
+                y_id,
+                k,
+                bn,
+            } => tk20::gemm_m1_consumer_body(*x_id, *w_id, *y_id, *k, *bn),
         }
     }
 }
@@ -1973,6 +2039,54 @@ mod tests {
         assert!(body.contains("__float2bfloat16(__x_lo * __s + __x_hi * __c)"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn tk20_gemm_m1_consumer_body_emits_legacy_compatible_cuda() {
+        let body = tk20::gemm_m1_consumer_body(0, 1, 2, 2048, 4);
+        assert!(body.contains("auto* __x_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
+        assert!(body.contains("auto* __w_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+        assert!(body.contains("auto* __y_smem = reinterpret_cast<T_act*>(page_buf[2]);"));
+        assert!(body.contains("const unsigned int __k  = 2048u;"));
+        assert!(body.contains("const unsigned int __bn = 4u;"));
+        assert!(body.contains("if (static_cast<unsigned int>(__consumer_idx) < __bn)"));
+        assert!(body.contains("__shfl_xor_sync(0xFFFFFFFFu, __acc, __o)"));
+        assert!(body.contains("__y_smem[__row] = __float2bfloat16(__acc);"));
+        assert!(!body.contains("kittens::tma::"));
+        assert!(!body.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn tk20_gemm_m1_atom_byte_identical_to_legacy_format_body() {
+        use crate::subtile_ir::BufId;
+        use crate::tk_lower::GemmM1Op;
+        let op = GemmM1Op {
+            x: BufId(0),
+            w: BufId(1),
+            out: BufId(2),
+            k: 2048,
+            n: 4096,
+            bn: 4,
+            act_elem: 2,
+        };
+        let typed = Tk20Call::GemmM1ConsumerBody {
+            x_id: 5,
+            w_id: 6,
+            y_id: 7,
+            k: op.k,
+            bn: op.bn,
+        }
+        .emit();
+        let mut p = TkProgram::new();
+        p.compute(
+            WarpRole::AllConsumers,
+            crate::tk_lower::gemm_m1_compute_body_for_test(&op, 5, 6, 7),
+        );
+        let legacy_body = match &p.instrs[0] {
+            TkInstr::Compute { calls, .. } => calls[0].emit(),
+            _ => panic!("expected Compute"),
+        };
+        assert_eq!(legacy_body, typed);
     }
 
     #[test]

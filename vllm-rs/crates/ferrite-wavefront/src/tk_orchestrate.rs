@@ -54,15 +54,22 @@ fn op_kind_name(op: &LoweredOp) -> &'static str {
 }
 
 /// Pick `bn` (W-tile rows per page load) for a given GEMM `k`.
-/// Constraint: `bn * k * ACT_ELEM <= PAGE_SIZE` AND `n_blocks = ceil(n / bn)`
-/// must be even (the orchestrator can't statically track post-loop parity
-/// for an odd-N count). The caller is responsible for shaping `n` so the
-/// resulting `n_blocks` is even.
+///
+/// Constraint: `bn * k * ACT_ELEM <= PAGE_SIZE` AND `n_blocks =
+/// ceil(n / bn)` must be even (the orchestrator can't statically track
+/// post-loop parity for an odd-N count). The caller is responsible for
+/// shaping `n` so the resulting `n_blocks` is even.
+///
+/// Phase 8a's TK 2.0 register-vector K-reduce body
+/// (`tk20::gemm_m1_consumer_body`) keeps the same per-warp parallelism
+/// shape as the legacy `__shfl_xor_sync` body — warp `c < bn` produces
+/// y[c]; only the K-axis reduction changes. The W tile per N-iter
+/// stays at one 16 KB page.
 fn pick_bn(k: u32) -> u32 {
     let bytes_per_row = k * ACT_ELEM;
     let max_bn = PAGE_SIZE / bytes_per_row;
-    // Cap at 8 — there are only 8 consumer warps and our compute body
-    // assigns one warp per output value (warps with `c >= bn` idle).
+    // Cap at 8 — the legacy max; bigger BN would idle more consumer
+    // warps but doesn't improve the per-N-iter throughput at m=1.
     max_bn.min(8).max(1)
 }
 
@@ -298,7 +305,7 @@ mod tests {
     fn pick_bn_keeps_w_tile_inside_one_page() {
         // K=2048 → bn ≤ floor(16384 / (2048*2)) = 4
         assert_eq!(pick_bn(2048), 4);
-        // K=8192 → bn ≤ 1
+        // K=8192 → bn ≤ 1 (Llama-1B down_proj)
         assert_eq!(pick_bn(8192), 1);
         // bn is always at least 1 even if k * ACT_ELEM > PAGE_SIZE
         // (caller is responsible for ensuring page fit).

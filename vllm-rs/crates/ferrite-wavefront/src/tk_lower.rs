@@ -208,25 +208,15 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
     //    arrive Done on both. ──
     let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
     let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
-    // Phase 1: route the compute body through a typed `Tk20Call`
-    // atom. `FERRITE_NEW_RMSNORM=1` opts in to the typed path; the
-    // emit is byte-identical to the legacy `format!()` body (the
-    // typed atom delegates to `tk20::rmsnorm_consumer_body`, which
-    // emits the same CUDA) — the gate is a safety net for the
-    // cutover phase per the plan, not a behavior change.
-    if std::env::var_os("FERRITE_NEW_RMSNORM").is_some() {
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
-                x_id,
-                w_id,
-                hidden: op.hidden,
-                eps: op.eps,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op, x_id, w_id));
-    }
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
+            x_id,
+            w_id,
+            hidden: op.hidden,
+            eps: op.eps,
+        }],
+    );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
 
@@ -242,66 +232,6 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
     let w_page = prog.complete_round(w_page);
     pages.release(x_page);
     pages.release(w_page);
-}
-
-/// The RMS reduce + scale body, as a string fragment. Const-resolved
-/// from the op's `(hidden, eps, m)` plus the act dtype.
-///
-/// This is the slice version: weight multiply is omitted (allocate a
-/// second page for weight in a follow-up). The compute is gated to
-/// consumer warp 0 (`__consumer_idx == 0`); the other 7 consumer warps
-/// fall through to the role-routed `arrive(Done)`, which is what gives
-/// us the 8 arrivals the page_done init expects.
-///
-/// The body declares its own typed page view (`__page_smem`) and
-/// `T_act` alias up front so the body is self-contained — codegen
-/// pastes it inside `if (__role == ROLE_CONSUMER) { ... }` and that's
-/// the only context required. Reduction is a single-warp shfl chain
-/// (`__shfl_xor_sync` butterfly) — TK 2.0 ships warp-level register
-/// reductions but the slice doesn't need them yet, and using bare
-/// CUDA primitives keeps the emit independent of TK 2.0's typed-tile
-/// machinery for now.
-/// Test-only wrapper exposing the legacy `rmsnorm_compute_body` so
-/// the byte-identity test in `tk_codegen` can compare typed-atom
-/// output against the legacy `format!()` output without making the
-/// private fn `pub`.
-#[cfg(test)]
-pub fn rmsnorm_compute_body_for_test(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
-    rmsnorm_compute_body(op, x_id, w_id)
-}
-
-fn rmsnorm_compute_body(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
-    let RmsNormOp { hidden, eps, .. } = *op;
-    format!(
-        r#"
-            // tk_warp_ir RmsNorm — RMS reduce + scale + apply weight (consumer warp 0)
-            using T_act = __nv_bfloat16;
-            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
-            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
-            if (__consumer_idx == 0) {{
-                const unsigned int __hidden = {hidden}u;
-                const float __eps = {eps:?}f;
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                float __sumsq = 0.0f;
-                for (unsigned int __i = static_cast<unsigned int>(__lane);
-                     __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__x_smem[__i]);
-                    __sumsq += __v * __v;
-                }}
-                #pragma unroll
-                for (int __o = 16; __o > 0; __o >>= 1) {{
-                    __sumsq += __shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o);
-                }}
-                const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
-                for (unsigned int __i = static_cast<unsigned int>(__lane);
-                     __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__x_smem[__i]);
-                    const float __g = __bfloat162float(__w_smem[__i]);
-                    __x_smem[__i] = __float2bfloat16(__v * __scale * __g);
-                }}
-            }}
-"#
-    )
 }
 
 // ── AttnDecode — the m=1 deadlock canonical ────────────────────────
@@ -432,18 +362,12 @@ pub fn lower_attn_decode<P: Phase>(
     // No `arrive(Ready)` — `tma::load_async` signals page_ready itself.
 
     let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
-    // Phase 4: typed `Tk20Call::AttnDecodeInitSoftmaxBody`. See
-    // `lower_rmsnorm` for the env-gate rationale.
-    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
-                unique_id: op.unique_id,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, init_softmax_accum_body(&op));
-    }
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
+            unique_id: op.unique_id,
+        }],
+    );
     // No `arrive(Done)` here — the Q+O slot is ONE round: loader fills
     // (TMA load_async signals page_ready), the consumer holds the page
     // through the KV loop, writes O into the same page slot at the
@@ -494,17 +418,12 @@ pub fn lower_attn_decode<P: Phase>(
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
-            // Phase 4: typed Tk20Call::AttnDecodeQktSoftmaxStepBody.
-            if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
-                body.compute_calls(
-                    WarpRole::AllConsumers,
-                    vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
-                        unique_id: op.unique_id,
-                    }],
-                );
-            } else {
-                body.compute(WarpRole::AllConsumers, qkt_softmax_step_body(&op));
-            }
+            body.compute_calls(
+                WarpRole::AllConsumers,
+                vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
+                    unique_id: op.unique_id,
+                }],
+            );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
 
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);
@@ -521,17 +440,12 @@ pub fn lower_attn_decode<P: Phase>(
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
-            // Phase 4: typed Tk20Call::AttnDecodeSvAccumStepBody.
-            if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
-                body.compute_calls(
-                    WarpRole::AllConsumers,
-                    vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
-                        unique_id: op.unique_id,
-                    }],
-                );
-            } else {
-                body.compute(WarpRole::AllConsumers, sv_accum_step_body(&op));
-            }
+            body.compute_calls(
+                WarpRole::AllConsumers,
+                vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
+                    unique_id: op.unique_id,
+                }],
+            );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
 
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var, start);
@@ -568,17 +482,12 @@ pub fn lower_attn_decode<P: Phase>(
     // page slot since the Q-load Ready handshake; the page is already
     // owned. Going straight to compute + arrive(Done) closes the slot's
     // single round (loader Ready → consumer Done → storer Consumed).
-    // Phase 4: typed Tk20Call::AttnDecodeFinaliseSoftmaxNormBody.
-    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
-                unique_id: op.unique_id,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, finalise_softmax_norm_body(&op));
-    }
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
+            unique_id: op.unique_id,
+        }],
+    );
     let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
 
     let o_page = prog.wait(WarpRole::Storer, PageBarrier::Done, o_page);
@@ -616,184 +525,29 @@ fn populate_attn_decode_prelude(
     k_id: u8,
     v_id: u8,
 ) {
-    let head_dim = op.head_dim;
-    let num_q_heads = op.num_q_heads;
-    let num_kv_heads = op.num_kv_heads;
     // 8 consumer warps; each owns N_q / 8 q-heads.
-    let q_heads_per_warp = num_q_heads / (NUM_CONSUMER_WARPS as u32);
-    let q_per_kv = num_q_heads / num_kv_heads;
-    let scale = op.softmax_scale;
-    let u = op.unique_id;
-
-    // Phase 4: route the prelude through the typed `tk20::*` API when
-    // FERRITE_NEW_ATTN_DECODE is set. Both paths produce byte-identical
-    // text (the typed binding's body IS the legacy `format!()` body
-    // moved into `tk20::attn_decode_prelude`).
-    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
-        let prelude = crate::tk_codegen::tk20::attn_decode_prelude(
-            q_id,
-            k_id,
-            v_id,
-            head_dim,
-            num_q_heads,
-            num_kv_heads,
-            q_heads_per_warp,
-            q_per_kv,
-            scale,
-            u,
-        );
-        prog.add_prelude(prelude);
-        return;
-    }
-
-    let prelude = format!(
-        r#"    // ── AttnDecode #{u} prelude (multi-head GQA; one kv-head per consumer warp) ──
-    using T_act = __nv_bfloat16;
-    auto* __q_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
-    auto* __k_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
-    auto* __v_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
-    auto* __out_smem_a{u} = reinterpret_cast<T_act*>(page_buf[{q_id}]);
-    const unsigned int __head_dim_a{u} = {head_dim}u;
-    const unsigned int __num_q_heads_a{u} = {num_q_heads}u;
-    const unsigned int __num_kv_heads_a{u} = {num_kv_heads}u;
-    const unsigned int __q_heads_per_warp_a{u} = {q_heads_per_warp}u;
-    const unsigned int __q_per_kv_a{u} = {q_per_kv}u;
-    const float __scale_a{u} = {scale:?}f;
-    // Per-warp per-q-head softmax state. With Llama-3.2-1B
-    // (N_q=32, 8 warps, qpw=4): each consumer warp keeps 4
-    // independent softmax + accumulator states.
-    float __m_max_a{u}[{q_heads_per_warp}];
-    float __l_sum_a{u}[{q_heads_per_warp}];
-    float __renorm_a{u}[{q_heads_per_warp}];
-    float __p_a{u}[{q_heads_per_warp}];
-    float __o_accum_a{u}[{q_heads_per_warp}][{head_dim}];
-"#
+    let q_heads_per_warp = op.num_q_heads / (NUM_CONSUMER_WARPS as u32);
+    let q_per_kv = op.num_q_heads / op.num_kv_heads;
+    let prelude = crate::tk_codegen::tk20::attn_decode_prelude(
+        q_id,
+        k_id,
+        v_id,
+        op.head_dim,
+        op.num_q_heads,
+        op.num_kv_heads,
+        q_heads_per_warp,
+        q_per_kv,
+        op.softmax_scale,
+        op.unique_id,
     );
     prog.add_prelude(prelude);
 }
 
-/// Test-only wrappers exposing the legacy AttnDecode body fns so the
-/// byte-identity tests in `tk_codegen` can compare typed-atom output
-/// against legacy `format!()` output.
-#[cfg(test)]
-pub fn init_softmax_accum_body_for_test(op: &AttnDecodeOp) -> String {
-    init_softmax_accum_body(op)
-}
-#[cfg(test)]
-pub fn qkt_softmax_step_body_for_test(op: &AttnDecodeOp) -> String {
-    qkt_softmax_step_body(op)
-}
-#[cfg(test)]
-pub fn sv_accum_step_body_for_test(op: &AttnDecodeOp) -> String {
-    sv_accum_step_body(op)
-}
-#[cfg(test)]
-pub fn finalise_softmax_norm_body_for_test(op: &AttnDecodeOp) -> String {
-    finalise_softmax_norm_body(op)
-}
-
-fn init_softmax_accum_body(op: &AttnDecodeOp) -> String {
-    let u = op.unique_id;
-    format!(
-        r#"
-            // tk_warp_ir AttnDecode #{u} — init per-warp softmax state
-            {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    __m_max_a{u}[__h] = -INFINITY;
-                    __l_sum_a{u}[__h] = 0.0f;
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] = 0.0f;
-                    }}
-                }}
-            }}
-"#
-    )
-}
-
-fn qkt_softmax_step_body(op: &AttnDecodeOp) -> String {
-    let u = op.unique_id;
-    format!(
-        r#"
-            // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
-            {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
-                const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
-                const unsigned int __k_off = __kv_head * __head_dim_a{u};
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim_a{u};
-                    float __s = 0.0f;
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __s += __bfloat162float(__q_smem_a{u}[__q_off + __j])
-                             * __bfloat162float(__k_smem_a{u}[__k_off + __j]);
-                    }}
-                    #pragma unroll
-                    for (int __o = 16; __o > 0; __o >>= 1) {{
-                        __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
-                    }}
-                    __s *= __scale_a{u};
-                    const float __m_new = fmaxf(__m_max_a{u}[__h], __s);
-                    __renorm_a{u}[__h] = expf(__m_max_a{u}[__h] - __m_new);
-                    __p_a{u}[__h]      = expf(__s              - __m_new);
-                    __l_sum_a{u}[__h]  = __renorm_a{u}[__h] * __l_sum_a{u}[__h] + __p_a{u}[__h];
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] *= __renorm_a{u}[__h];
-                    }}
-                    __m_max_a{u}[__h] = __m_new;
-                }}
-            }}
-"#
-    )
-}
-
-fn sv_accum_step_body(op: &AttnDecodeOp) -> String {
-    let u = op.unique_id;
-    format!(
-        r#"
-            // tk_warp_ir AttnDecode #{u} — softmax(P) @ V
-            {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
-                const unsigned int __v_off = __kv_head * __head_dim_a{u};
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] += __p_a{u}[__h]
-                            * __bfloat162float(__v_smem_a{u}[__v_off + __j]);
-                    }}
-                }}
-            }}
-"#
-    )
-}
-
-fn finalise_softmax_norm_body(op: &AttnDecodeOp) -> String {
-    let u = op.unique_id;
-    format!(
-        r#"
-            // tk_warp_ir AttnDecode #{u} — finalise: O = O_accum / l_sum
-            {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim_a{u};
-                    const float __inv_l = 1.0f / __l_sum_a{u}[__h];
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __out_smem_a{u}[__out_off + __j] =
-                            __float2bfloat16(__o_accum_a{u}[__h][__j] * __inv_l);
-                    }}
-                }}
-            }}
-"#
-    )
-}
+// Phase 5 cutover: legacy AttnDecode body fns deleted. Canonical
+// emit lives at `tk_codegen::tk20::attn_decode_{init_softmax_body,
+// qkt_softmax_step_body, sv_accum_step_body,
+// finalise_softmax_norm_body}`, invoked through the corresponding
+// Tk20Call::AttnDecode* variants.
 
 // ── Residual Add — element-wise add into TkProgram ─────────────────
 
@@ -857,20 +611,14 @@ pub fn lower_residual_add<P: Phase>(
     //    arrives Done on both. ──
     let a_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, a_page);
     let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
-    // Phase 1: typed `Tk20Call::ResidualAddConsumerBody`. See
-    // `lower_rmsnorm` for the env-gate rationale.
-    if std::env::var_os("FERRITE_NEW_ADD").is_some() {
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
-                a_id,
-                b_id,
-                total: op.hidden as u64 * op.m as u64,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, residual_add_compute_body(&op, a_id, b_id));
-    }
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+            a_id,
+            b_id,
+            total: op.hidden as u64 * op.m as u64,
+        }],
+    );
     let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
     let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
 
@@ -886,35 +634,8 @@ pub fn lower_residual_add<P: Phase>(
     pages.release(prog.complete_round(b_page));
 }
 
-/// Test-only wrapper for the legacy `residual_add_compute_body`. See
-/// `rmsnorm_compute_body_for_test`.
-#[cfg(test)]
-pub fn residual_add_compute_body_for_test(op: &AddOp, a_id: u8, b_id: u8) -> String {
-    residual_add_compute_body(op, a_id, b_id)
-}
-
-fn residual_add_compute_body(op: &AddOp, a_id: u8, b_id: u8) -> String {
-    let AddOp { hidden, m, .. } = *op;
-    let total = hidden as u64 * m as u64;
-    format!(
-        r#"
-            // tk_warp_ir Residual Add — A+B in place on A's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __a_smem = reinterpret_cast<T_act*>(page_buf[{a_id}]);
-            auto* __b_smem = reinterpret_cast<T_act*>(page_buf[{b_id}]);
-            const unsigned int __total = {total}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
-            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
-                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
-                const float __a = __bfloat162float(__a_smem[__i]);
-                const float __b = __bfloat162float(__b_smem[__i]);
-                __a_smem[__i] = __float2bfloat16(__a + __b);
-            }}
-"#
-    )
-}
+// Phase 5 cutover: legacy `residual_add_compute_body` deleted.
+// Canonical emit at `tk_codegen::tk20::residual_add_consumer_body`.
 
 // ── SiluMul — fused SwiGLU element-wise ────────────────────────────
 
@@ -964,20 +685,14 @@ pub fn lower_silu_mul<P: Phase>(
 
     let g_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, g_page);
     let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
-    // Phase 2: typed `Tk20Call::SiluMulConsumerBody`. See
-    // `lower_rmsnorm` for the env-gate rationale.
-    if std::env::var_os("FERRITE_NEW_SILU_MUL").is_some() {
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
-                g_id,
-                u_id,
-                total: op.intermediate as u64 * op.m as u64,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, silu_mul_compute_body(&op, g_id, u_id));
-    }
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+            g_id,
+            u_id,
+            total: op.intermediate as u64 * op.m as u64,
+        }],
+    );
     let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
     let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
 
@@ -992,35 +707,8 @@ pub fn lower_silu_mul<P: Phase>(
     pages.release(prog.complete_round(u_page));
 }
 
-/// Test-only wrapper for the legacy `silu_mul_compute_body`.
-#[cfg(test)]
-pub fn silu_mul_compute_body_for_test(op: &SiluMulOp, g_id: u8, u_id: u8) -> String {
-    silu_mul_compute_body(op, g_id, u_id)
-}
-
-fn silu_mul_compute_body(op: &SiluMulOp, g_id: u8, u_id: u8) -> String {
-    let SiluMulOp { intermediate, m, .. } = *op;
-    let total = intermediate as u64 * m as u64;
-    format!(
-        r#"
-            // tk_warp_ir SiluMul — silu(gate) * up in place on gate's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __g_smem = reinterpret_cast<T_act*>(page_buf[{g_id}]);
-            auto* __u_smem = reinterpret_cast<T_act*>(page_buf[{u_id}]);
-            const unsigned int __total = {total}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
-            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
-                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
-                const float __g = __bfloat162float(__g_smem[__i]);
-                const float __u = __bfloat162float(__u_smem[__i]);
-                const float __silu_g = __g / (1.0f + expf(-__g));
-                __g_smem[__i] = __float2bfloat16(__silu_g * __u);
-            }}
-"#
-    )
-}
+// Phase 5 cutover: legacy `silu_mul_compute_body` deleted.
+// Canonical emit at `tk_codegen::tk20::silu_mul_consumer_body`.
 
 // ── RoPE rotate — NeoX rotary on Q or K ────────────────────────────
 
@@ -1106,24 +794,18 @@ pub fn lower_rope_rotate<P: Phase>(
     let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
     let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
     let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
-    // Phase 2: typed `Tk20Call::RopeConsumerBody`. See `lower_rmsnorm`
-    // for the env-gate rationale.
-    if std::env::var_os("FERRITE_NEW_ROPE").is_some() {
-        let half = op.head_dim / 2;
-        let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
-        prog.compute_calls(
-            WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
-                x_id,
-                c_id,
-                s_id,
-                head_dim: op.head_dim,
-                total_pairs,
-            }],
-        );
-    } else {
-        prog.compute(WarpRole::AllConsumers, rope_compute_body(&op, x_id, c_id, s_id));
-    }
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
     let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
@@ -1143,46 +825,8 @@ pub fn lower_rope_rotate<P: Phase>(
     pages.release(prog.complete_round(s_page));
 }
 
-/// Test-only wrapper for the legacy `rope_compute_body`.
-#[cfg(test)]
-pub fn rope_compute_body_for_test(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String {
-    rope_compute_body(op, x_id, c_id, s_id)
-}
-
-fn rope_compute_body(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String {
-    let RopeRotateOp { head_dim, num_heads, m, .. } = *op;
-    let half = head_dim / 2;
-    let total_pairs = (m as u64) * (num_heads as u64) * (half as u64);
-    format!(
-        r#"
-            // tk_warp_ir RoPE rotate (NeoX) — in place on x's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __x_smem   = reinterpret_cast<T_act*>(page_buf[{x_id}]);
-            auto* __cos_smem = reinterpret_cast<T_act*>(page_buf[{c_id}]);
-            auto* __sin_smem = reinterpret_cast<T_act*>(page_buf[{s_id}]);
-            const unsigned int __head_dim = {head_dim}u;
-            const unsigned int __half     = {half}u;
-            const unsigned int __pairs    = {total_pairs}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
-            for (unsigned int __p = static_cast<unsigned int>(__tid_in_consumers);
-                 __p < __pairs; __p += static_cast<unsigned int>(__consumer_threads)) {{
-                // Decompose pair index → (row * head, lane in head_dim/2).
-                const unsigned int __row_head = __p / __half;
-                const unsigned int __lane     = __p % __half;
-                const unsigned int __i_lo     = __row_head * __head_dim + __lane;
-                const unsigned int __i_hi     = __i_lo + __half;
-                const float __c   = __bfloat162float(__cos_smem[__lane]);
-                const float __s   = __bfloat162float(__sin_smem[__lane]);
-                const float __x_lo = __bfloat162float(__x_smem[__i_lo]);
-                const float __x_hi = __bfloat162float(__x_smem[__i_hi]);
-                __x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);
-                __x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);
-            }}
-"#
-    )
-}
+// Phase 5 cutover: legacy `rope_compute_body` deleted. Canonical
+// emit at `tk_codegen::tk20::rope_consumer_body`.
 
 // ── GemmM1 — M=1 vec-mat decode GEMM ───────────────────────────────
 
@@ -1311,23 +955,16 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         // Consumer: wait y free, wait W ready, compute, signal both done.
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var, start);
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
-        // Phase 3: typed `Tk20Call::GemmM1ConsumerBody`. See
-        // `lower_rmsnorm` for the env-gate rationale. `bn`/`k` baked
-        // into the typed atom at instruction-build time.
-        if std::env::var_os("FERRITE_NEW_GEMM_M1").is_some() {
-            body.compute_calls(
-                WarpRole::AllConsumers,
-                vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
-                    x_id,
-                    w_id,
-                    y_id,
-                    k: op.k,
-                    bn: op.bn,
-                }],
-            );
-        } else {
-            body.compute(WarpRole::AllConsumers, gemm_m1_compute_body(&op, x_id, w_id, y_id));
-        }
+        body.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
+                x_id,
+                w_id,
+                y_id,
+                k: op.k,
+                bn: op.bn,
+            }],
+        );
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, y_id);
 
@@ -1382,49 +1019,8 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
     pages.release(x_page);
 }
 
-/// Test-only wrapper for the legacy `gemm_m1_compute_body`.
-#[cfg(test)]
-pub fn gemm_m1_compute_body_for_test(
-    op: &GemmM1Op,
-    x_id: u8,
-    w_id: u8,
-    y_id: u8,
-) -> String {
-    gemm_m1_compute_body(op, x_id, w_id, y_id)
-}
-
-fn gemm_m1_compute_body(op: &GemmM1Op, x_id: u8, w_id: u8, y_id: u8) -> String {
-    let GemmM1Op { k, bn, .. } = *op;
-    format!(
-        r#"
-            // tk_warp_ir GemmM1 — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
-            // (per-warp output: warp c -> y[c] when c < bn; lane-parallel K reduce.)
-            using T_act = __nv_bfloat16;
-            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
-            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
-            auto* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
-            const unsigned int __k  = {k}u;
-            const unsigned int __bn = {bn}u;
-            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
-                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                float __acc = 0.0f;
-                for (unsigned int __j = static_cast<unsigned int>(__lane);
-                     __j < __k; __j += 32u) {{
-                    __acc += __bfloat162float(__x_smem[__j])
-                           * __bfloat162float(__w_smem[__row * __k + __j]);
-                }}
-                #pragma unroll
-                for (int __o = 16; __o > 0; __o >>= 1) {{
-                    __acc += __shfl_xor_sync(0xFFFFFFFFu, __acc, __o);
-                }}
-                if (__lane == 0) {{
-                    __y_smem[__row] = __float2bfloat16(__acc);
-                }}
-            }}
-"#
-    )
-}
+// Phase 5 cutover: legacy `gemm_m1_compute_body` deleted. Canonical
+// emit at `tk_codegen::tk20::gemm_m1_consumer_body`.
 
 // ── Tests ──────────────────────────────────────────────────────────
 

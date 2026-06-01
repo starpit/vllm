@@ -2180,46 +2180,12 @@ mod tests {
         assert_eq!(direct, via_atom);
     }
 
-    #[test]
-    fn tk20_rmsnorm_atom_byte_identical_to_legacy_format_body() {
-        // Phase 1 contract: the typed atom emits byte-identical CUDA
-        // to the legacy `tk_lower::rmsnorm_compute_body`. This ensures
-        // the existing `rmsnorm_kernel_matches_cpu_golden` golden test
-        // passes when FERRITE_NEW_RMSNORM is set without any tolerance
-        // change.
-        use crate::lower::LoweredOp;
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::RmsNormOp;
-        let op = RmsNormOp {
-            x: BufId(0),
-            weight: BufId(1),
-            out: BufId(2),
-            hidden: 2048,
-            m: 1,
-            act_elem: 2,
-            eps: 1.0e-5,
-            init: false,
-        };
-        let _ = LoweredOp::RmsNorm { eps: op.eps }; // type-check the op exists
-        let typed = Tk20Call::RmsNormConsumerBody {
-            x_id: 0,
-            w_id: 1,
-            hidden: 2048,
-            eps: 1.0e-5,
-        }
-        .emit();
-        // Build the legacy body via the existing public path (the
-        // `prog.compute(role, body)` setter exposes it). We can't
-        // call the private `rmsnorm_compute_body` directly, so reach
-        // through the lowering's emit:
-        let mut p = TkProgram::new();
-        p.compute(WarpRole::AllConsumers, crate::tk_lower::rmsnorm_compute_body_for_test(&op, 0, 1));
-        let legacy_body = match &p.instrs[0] {
-            TkInstr::Compute { calls, .. } => calls[0].emit(),
-            _ => panic!("expected Compute"),
-        };
-        assert_eq!(legacy_body, typed);
-    }
+    // Phase 5 cutover: byte-identity-vs-legacy tests deleted. They
+    // were Phase 1-4 transition gates; the legacy `format!()` body fns
+    // they compared against are gone in this commit. The
+    // `*_emits_legacy_compatible_cuda` per-binding tests above stay
+    // — they assert the typed atom emits the expected TK 2.0
+    // spelling, which is the load-bearing audit gate.
 
     #[test]
     fn tk20_silu_mul_consumer_body_emits_legacy_compatible_cuda() {
@@ -2264,38 +2230,8 @@ mod tests {
         assert!(!body.contains("kittens::warp::mma_AB"));
     }
 
-    #[test]
-    fn tk20_gemm_m1_atom_byte_identical_to_legacy_format_body() {
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::GemmM1Op;
-        let op = GemmM1Op {
-            x: BufId(0),
-            w: BufId(1),
-            out: BufId(2),
-            k: 2048,
-            n: 4096,
-            bn: 4,
-            act_elem: 2,
-        };
-        let typed = Tk20Call::GemmM1ConsumerBody {
-            x_id: 5,
-            w_id: 6,
-            y_id: 7,
-            k: op.k,
-            bn: op.bn,
-        }
-        .emit();
-        let mut p = TkProgram::new();
-        p.compute(
-            WarpRole::AllConsumers,
-            crate::tk_lower::gemm_m1_compute_body_for_test(&op, 5, 6, 7),
-        );
-        let legacy_body = match &p.instrs[0] {
-            TkInstr::Compute { calls, .. } => calls[0].emit(),
-            _ => panic!("expected Compute"),
-        };
-        assert_eq!(legacy_body, typed);
-    }
+    // GemmM1 byte-identity test deleted in Phase 5 cutover (legacy
+    // body fn gone).
 
     #[test]
     fn tk20_attn_decode_prelude_emits_legacy_compatible_cuda() {
@@ -2338,144 +2274,11 @@ mod tests {
         assert!(fin.contains("__float2bfloat16(__o_accum_a7[__h][__j] * __inv_l)"));
     }
 
-    #[test]
-    fn tk20_attn_decode_atoms_byte_identical_to_legacy_format_bodies() {
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::AttnDecodeOp;
-        let op = AttnDecodeOp {
-            q: BufId(0),
-            k_cache: BufId(1),
-            v_cache: BufId(2),
-            out: BufId(3),
-            head_dim: 64,
-            num_q_heads: 32,
-            num_kv_heads: 8,
-            act_elem: 2,
-            softmax_scale: 0.125_f32,
-            num_kv_pages_arg: "__num_kv_pages",
-            unique_id: 7,
-        };
+    // AttnDecode + SiluMul byte-identity tests deleted in Phase 5
+    // cutover (legacy body fns gone).
 
-        // Compare typed-atom emit against legacy fn output for each
-        // of the four AttnDecode compute bodies.
-        let atoms = [
-            (
-                Tk20Call::AttnDecodeInitSoftmaxBody { unique_id: 7 }.emit(),
-                crate::tk_lower::init_softmax_accum_body_for_test(&op),
-            ),
-            (
-                Tk20Call::AttnDecodeQktSoftmaxStepBody { unique_id: 7 }.emit(),
-                crate::tk_lower::qkt_softmax_step_body_for_test(&op),
-            ),
-            (
-                Tk20Call::AttnDecodeSvAccumStepBody { unique_id: 7 }.emit(),
-                crate::tk_lower::sv_accum_step_body_for_test(&op),
-            ),
-            (
-                Tk20Call::AttnDecodeFinaliseSoftmaxNormBody { unique_id: 7 }.emit(),
-                crate::tk_lower::finalise_softmax_norm_body_for_test(&op),
-            ),
-        ];
-        for (typed, legacy) in atoms.iter() {
-            assert_eq!(typed, legacy);
-        }
-    }
-
-    #[test]
-    fn tk20_silu_mul_atom_byte_identical_to_legacy_format_body() {
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::SiluMulOp;
-        let op = SiluMulOp {
-            gate: BufId(0),
-            up: BufId(1),
-            out: BufId(2),
-            intermediate: 8192,
-            m: 1,
-            act_elem: 2,
-        };
-        let typed = Tk20Call::SiluMulConsumerBody {
-            g_id: 4,
-            u_id: 5,
-            total: op.intermediate as u64 * op.m as u64,
-        }
-        .emit();
-        let mut p = TkProgram::new();
-        p.compute(
-            WarpRole::AllConsumers,
-            crate::tk_lower::silu_mul_compute_body_for_test(&op, 4, 5),
-        );
-        let legacy_body = match &p.instrs[0] {
-            TkInstr::Compute { calls, .. } => calls[0].emit(),
-            _ => panic!("expected Compute"),
-        };
-        assert_eq!(legacy_body, typed);
-    }
-
-    #[test]
-    fn tk20_rope_atom_byte_identical_to_legacy_format_body() {
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::RopeRotateOp;
-        let op = RopeRotateOp {
-            x: BufId(0),
-            cos: BufId(1),
-            sin: BufId(2),
-            out: BufId(3),
-            head_dim: 64,
-            num_heads: 32,
-            m: 1,
-            act_elem: 2,
-        };
-        let half = op.head_dim / 2;
-        let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
-        let typed = Tk20Call::RopeConsumerBody {
-            x_id: 6,
-            c_id: 7,
-            s_id: 8,
-            head_dim: op.head_dim,
-            total_pairs,
-        }
-        .emit();
-        let mut p = TkProgram::new();
-        p.compute(
-            WarpRole::AllConsumers,
-            crate::tk_lower::rope_compute_body_for_test(&op, 6, 7, 8),
-        );
-        let legacy_body = match &p.instrs[0] {
-            TkInstr::Compute { calls, .. } => calls[0].emit(),
-            _ => panic!("expected Compute"),
-        };
-        assert_eq!(legacy_body, typed);
-    }
-
-    #[test]
-    fn tk20_residual_add_atom_byte_identical_to_legacy_format_body() {
-        use crate::subtile_ir::BufId;
-        use crate::tk_lower::AddOp;
-        let op = AddOp {
-            a: BufId(0),
-            b: BufId(1),
-            out: BufId(2),
-            hidden: 2048,
-            m: 1,
-            act_elem: 2,
-        };
-        let typed = Tk20Call::ResidualAddConsumerBody {
-            a_id: 2,
-            b_id: 3,
-            total: op.hidden as u64 * op.m as u64,
-        }
-        .emit();
-        let mut p = TkProgram::new();
-        p.compute(
-            WarpRole::AllConsumers,
-            crate::tk_lower::residual_add_compute_body_for_test(&op, 2, 3),
-        );
-        let legacy_body = match &p.instrs[0] {
-            TkInstr::Compute { calls, .. } => calls[0].emit(),
-            _ => panic!("expected Compute"),
-        };
-        assert_eq!(legacy_body, typed);
-    }
+    // RoPE + ResidualAdd byte-identity tests deleted in Phase 5
+    // cutover (legacy body fns gone).
 
     #[test]
     fn tk20_call_raw_string_bridge_passes_legacy_body_unchanged() {

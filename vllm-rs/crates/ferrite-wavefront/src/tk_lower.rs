@@ -881,7 +881,20 @@ pub fn lower_silu_mul<P: Phase>(
 
     let g_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, g_page);
     let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
-    prog.compute(WarpRole::AllConsumers, silu_mul_compute_body(&op, g_id, u_id));
+    // Phase 2: typed `Tk20Call::SiluMulConsumerBody`. See
+    // `lower_rmsnorm` for the env-gate rationale.
+    if std::env::var_os("FERRITE_NEW_SILU_MUL").is_some() {
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+                g_id,
+                u_id,
+                total: op.intermediate as u64 * op.m as u64,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, silu_mul_compute_body(&op, g_id, u_id));
+    }
     let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
     let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
 
@@ -894,6 +907,12 @@ pub fn lower_silu_mul<P: Phase>(
 
     pages.release(prog.complete_round(g_page));
     pages.release(prog.complete_round(u_page));
+}
+
+/// Test-only wrapper for the legacy `silu_mul_compute_body`.
+#[cfg(test)]
+pub fn silu_mul_compute_body_for_test(op: &SiluMulOp, g_id: u8, u_id: u8) -> String {
+    silu_mul_compute_body(op, g_id, u_id)
 }
 
 fn silu_mul_compute_body(op: &SiluMulOp, g_id: u8, u_id: u8) -> String {
@@ -1004,7 +1023,24 @@ pub fn lower_rope_rotate<P: Phase>(
     let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
     let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
     let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
-    prog.compute(WarpRole::AllConsumers, rope_compute_body(&op, x_id, c_id, s_id));
+    // Phase 2: typed `Tk20Call::RopeConsumerBody`. See `lower_rmsnorm`
+    // for the env-gate rationale.
+    if std::env::var_os("FERRITE_NEW_ROPE").is_some() {
+        let half = op.head_dim / 2;
+        let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+                x_id,
+                c_id,
+                s_id,
+                head_dim: op.head_dim,
+                total_pairs,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, rope_compute_body(&op, x_id, c_id, s_id));
+    }
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
     let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
@@ -1022,6 +1058,12 @@ pub fn lower_rope_rotate<P: Phase>(
     pages.release(prog.complete_round(x_page));
     pages.release(prog.complete_round(c_page));
     pages.release(prog.complete_round(s_page));
+}
+
+/// Test-only wrapper for the legacy `rope_compute_body`.
+#[cfg(test)]
+pub fn rope_compute_body_for_test(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String {
+    rope_compute_body(op, x_id, c_id, s_id)
 }
 
 fn rope_compute_body(op: &RopeRotateOp, x_id: u8, c_id: u8, s_id: u8) -> String {

@@ -275,141 +275,6 @@ pub mod tk20 {
         format!("kittens::warp::mul({d}, {a}, {b});")
     }
 
-    // ── Typed handle declarations + register-tile load/store/copy/broadcast ──
-    //
-    // Phase 8a: the K-tiled `lower_gemm_m1` body composes these typed
-    // primitives. Existing per-IType bodies that still use raw bf16
-    // pointer arithmetic (RmsNorm, SiluMul, RoPE, ResidualAdd, AttnDecode)
-    // continue to use `auto* __x_smem = reinterpret_cast<T_act*>(...)`
-    // until Phases 9-10 rewrite them through these handles.
-    //
-    // Bindings here use raw `&str` for handle names (matches the pattern
-    // of every other tk20::* function); end-to-end const-generic shape
-    // parity (per `feedback_end_to_end_compile_time_proofs`) is a
-    // ferrite-wavefront-wide refactor deferred to a follow-up phase.
-    // The TK 2.0 primitives themselves enforce shape parity through
-    // their own template parameters — a wrong R/C here is an nvcc
-    // error, not a silent corruption.
-
-    /// `kittens::rt<T, R, C, layout> name;` — register-tile declaration.
-    /// `T` is one of `bf16` / `float` (selects `rt_bf` / `rt_fl` alias).
-    /// `R` and `C` are in ELEMENTS, not tiles (they must each be a
-    /// multiple of 16 — the HMMA base tile size).
-    /// Source: `types/register/rt.cuh:81-143` (rt struct + rt_bf/rt_fl
-    /// aliases).
-    pub fn decl_rt(name: &str, t: &str, r: u32, c: u32, layout: &str) -> String {
-        debug_assert_eq!(r % 16, 0, "rt rows must be multiple of 16; got {r}");
-        debug_assert_eq!(c % 16, 0, "rt cols must be multiple of 16; got {c}");
-        let alias = match t {
-            "bf16" => "rt_bf",
-            "float" | "fl" => "rt_fl",
-            other => panic!("decl_rt: unsupported dtype {other}"),
-        };
-        let lay = match layout {
-            "row" => "kittens::ducks::rt_layout::row",
-            "col" => "kittens::ducks::rt_layout::col",
-            other => panic!("decl_rt: unsupported layout {other}"),
-        };
-        format!("kittens::{alias}<{r}, {c}, {lay}> {name};")
-    }
-
-    /// `kittens::rv<T, K> name;` — register-vector declaration. `T` is
-    /// `bf16` or `float`. `K` is the vector length (no 16-element
-    /// alignment requirement at the type level, but mma's row/col-vec
-    /// uses inherit the rt's tile size).
-    /// Source: `types/register/rv.cuh:115-116`.
-    pub fn decl_rv(name: &str, t: &str, k: u32) -> String {
-        let alias = match t {
-            "bf16" => "rv_bf",
-            "float" | "fl" => "rv_fl",
-            other => panic!("decl_rv: unsupported dtype {other}"),
-        };
-        format!("kittens::{alias}<{k}> {name};")
-    }
-
-    /// `auto& name = *reinterpret_cast<kittens::st<T, R, C>*>(&page_buf[id][off]);`
-    /// — typed view of a page byte range as a TK 2.0 shared tile.
-    /// The reference form (not pointer) is what `kittens::warp::load(rt,
-    /// st)` and `kittens::warp::store(st, rt)` accept (their signatures
-    /// take `const ST&` / `ST&`).
-    /// Source: `types/shared/st.cuh` (st struct + st_bf alias).
-    pub fn decl_st_view(
-        name: &str,
-        page_id: u8,
-        byte_off: u32,
-        t: &str,
-        r: u32,
-        c: u32,
-    ) -> String {
-        debug_assert_eq!(r % 16, 0, "st rows must be multiple of 16; got {r}");
-        debug_assert_eq!(c % 16, 0, "st cols must be multiple of 16; got {c}");
-        let alias = match t {
-            "bf16" => "st_bf",
-            other => panic!("decl_st_view: unsupported dtype {other}"),
-        };
-        format!(
-            "auto& {name} = *reinterpret_cast<kittens::{alias}<{r}, {c}>*>(\
-             &page_buf[{page_id}][{byte_off}]);"
-        )
-    }
-
-    /// `auto& name = *reinterpret_cast<kittens::sv<T, K>*>(&page_buf[id][off]);`
-    /// — typed view of a page byte range as a TK 2.0 shared vector.
-    /// Source: `types/shared/sv.cuh:118-120` (sv struct + sv_bf alias).
-    pub fn decl_sv_view(name: &str, page_id: u8, byte_off: u32, t: &str, k: u32) -> String {
-        let alias = match t {
-            "bf16" => "sv_bf",
-            "float" | "fl" => "sv_fl",
-            other => panic!("decl_sv_view: unsupported dtype {other}"),
-        };
-        format!(
-            "auto& {name} = *reinterpret_cast<kittens::{alias}<{k}>*>(\
-             &page_buf[{page_id}][{byte_off}]);"
-        )
-    }
-
-    /// `kittens::warp::load(rt, st);` — load a shared tile into a
-    /// register tile. The two operands must have matching dtype and
-    /// shape; TK 2.0's template specialisation enforces this at compile
-    /// time.
-    /// Source: `ops/group/memory/tile/shared_to_register.cuh:15`.
-    pub fn warp_load_rt_from_st(rt: &str, st: &str) -> String {
-        format!("kittens::warp::load({rt}, {st});")
-    }
-
-    /// `kittens::warp::store(st, rt);` — store a register tile back to
-    /// shared memory. Inverse of `warp_load_rt_from_st`.
-    /// Source: `ops/group/memory/tile/shared_to_register.cuh:139`.
-    pub fn warp_store_st_from_rt(st: &str, rt: &str) -> String {
-        format!("kittens::warp::store({st}, {rt});")
-    }
-
-    /// `kittens::warp::load(rv, sv);` — load a shared vector into a
-    /// register vector.
-    /// Source: `ops/group/memory/vec/shared_to_register.cuh:15`.
-    pub fn warp_load_rv_from_sv(rv: &str, sv: &str) -> String {
-        format!("kittens::warp::load({rv}, {sv});")
-    }
-
-    /// `kittens::warp::broadcast_col(rt, rv);` — broadcast a row vector
-    /// `rv` into every row of register tile `rt`. Used by the m=1
-    /// matvec path: `rv` holds one chunk of the activation row, and
-    /// `broadcast_col` expands it into the 16-row register tile required
-    /// by `kittens::warp::mma_AB`. Constraint: `rv::cols == rt::cols`.
-    /// Source: `ops/group/register/tile/maps.cuh:868`.
-    pub fn warp_broadcast_col(rt: &str, rv: &str) -> String {
-        format!("kittens::warp::broadcast_col({rt}, {rv});")
-    }
-
-    /// `kittens::warp::copy(dst, src);` — register-tile copy with
-    /// dtype conversion. Used at the tail of the m=1 matvec to convert
-    /// the fp32 accumulator to bf16 for the shared-memory store-back.
-    /// Source: `ops/group/register/tile/conversions.cuh:230` (rt cross-
-    /// dtype) + `maps.cuh:627` (general).
-    pub fn warp_copy_rt(dst: &str, src: &str) -> String {
-        format!("kittens::warp::copy({dst}, {src});")
-    }
-
     // ── Hopper register-budget management ──────────────────────────
 
     /// `kittens::warpgroup::increase_registers<N>()`. Source:
@@ -679,124 +544,45 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the GemmM1 consumer body. M=1 vec-mat using the TK 2.0
-    /// mk-v2 idiom (cite: `tests/vm/rms_matvec_rope_append/
-    /// rms_matvec_rope_append.cu:139-216`): all 16 consumer warps
-    /// participate in parallel; each warp owns a `[16, 128]` sub-tile
-    /// of W and a `sv<bf16, 128>` slice of X; per-warp work is
-    /// `broadcast_col + mul + row_sum` on register tiles; the 16
-    /// per-warp partial col-vectors aggregate via `atomicAdd` into the
-    /// kernel-scope `__gemm_scratch[16]` shared scratch; warp 0 stores
-    /// the [1, 16] result to `y_id`.
+    /// Emit the GemmM1 consumer body. M=1 dot product computed per
+    /// consumer warp (warp `c` produces `y[c]` when `c < bn`), with
+    /// lane-parallel K reduction via `__shfl_xor_sync` butterfly.
+    /// `kittens::warp::mma_AB` (16x16 register tiles) doesn't fit
+    /// the m=1 case naturally — a single output value at row=1 would
+    /// need 15 zeroed pad rows; the per-thread form matches both
+    /// mk-v2's RmsNorm idiom and the natural decode m=1 fast path.
+    /// Phase 3 adds `Tk20Call::WarpMmaAB` and `WarpgroupMmaAB`
+    /// bindings (Phase 0) for future m>1 prefill lowerings, while
+    /// keeping the m=1 body's per-thread shape.
     ///
-    /// W layout in shared: 4 contiguous 16 KB pages starting at
-    /// `w_first_id` form one logical `st<bf16, 16, K=2048>` tile = 64
-    /// KB. The single 1D bulk TMA load writes the entire row-major
-    /// [16, K] gmem slice into bytes [0, 64 KB) of the page pool
-    /// starting at `&page_buf[w_first_id][0]`. Compute reinterprets
-    /// the contiguous bytes as `st_bf<16, 128>(&)[16]` — 16 sub-tiles
-    /// of 4 KB each, one per consumer warp.
-    ///
-    /// X layout in shared: 1 page (4 KB at K=2048). Reinterpret as
-    /// `sv_bf<128>(&)[16]` — 16 sub-vectors of 256 bytes each, one
-    /// per consumer warp.
-    ///
-    /// Per-warp register footprint:
-    ///   - `rt_bf<16, 128, row>` weights:           128 B/thread
-    ///   - `rt_bf<16, 128, row>` broadcast_acts:    128 B/thread
-    ///   - `rt_bf<16, 128>::row_vec` activations:    16 B/thread
-    ///   - `rt_bf<16, 128>::col_vec` partial:         8 B/thread (col-vec
-    ///                                                of 16 elems / 32 lanes)
-    /// Total ~280 B/thread = ~70 fp32 regs. Fits 224 budget with
-    /// large headroom.
-    ///
-    /// The 4 W pages must be contiguous in `page_buf[]`. The lowering
-    /// MUST allocate them via `PageAllocator::alloc_contiguous_at(4)`.
-    /// Single TMA load of 64 KB starting at `&page_buf[w_first_id][0]`
-    /// fills all 4 pages.
-    ///
-    /// `bn` MUST equal 16 (TK 2.0 HMMA base tile minimum). `k` MUST
-    /// be 2048 for v1 — fixed by the [16, 128]×16 partitioning.
-    pub fn gemm_m1_consumer_body(
-        x_id: u8,
-        w_id: u8,
-        y_id: u8,
-        k: u32,
-        bn: u32,
-    ) -> String {
-        // Phase 8a: replace the legacy per-warp `__shfl_xor_sync` K-reduce
-        // with the TK 2.0 register-vector pipeline `warp::load` →
-        // `warp::copy` (bf16→fp32) → `warp::mul` (elementwise) →
-        // `warp::sum(rv_fl)` (full-rv reduction). Cite:
-        //   - rv ops:        `ops/group/register/vec/maps.cuh`
-        //   - rv reductions: `ops/group/register/vec/reductions.cuh:129`
-        //   - sv→rv load:    `ops/group/memory/vec/shared_to_register.cuh:15`
-        //
-        // Per-warp parallelism shape stays the same as the pre-Phase 8a
-        // legacy body (warp `c < bn` produces y[c], other warps idle on
-        // this op); the K-axis reduction is the only thing changing —
-        // from a hand-rolled lane butterfly to a TK 2.0 reduction
-        // primitive on a register vector.
-        //
-        // K-tile loop (K_TILE=128) keeps the per-warp register
-        // footprint tiny (~50 B/thread, well under the 224-reg consumer
-        // budget) and accommodates any K that is a multiple of 128
-        // (Llama-1B uses K=2048 for q/k/v/o/gate/up/lm_head and K=8192
-        // for down_proj — both are 128-aligned).
-        //
-        // The mk-v2 cross-warp parallel idiom (broadcast_col + mul +
-        // row_sum + atomicAdd, where each warp owns a [16, K_per_warp]
-        // sub-tile of W) is the natural TK 2.0 m=1 matvec but requires
-        // either a TK 2.0-tiled gmem layout or 2D-strided TMA — neither
-        // of which the ferrite-wavefront substrate supports today.
-        // Plain row-major bulk-byte TMA + `reinterpret_cast<st<16,
-        // 128>[16]>(parent_st<16, 2048>)` produces wrong sub-tile
-        // aliasing (parent's row 0 cols 0..2047 maps to "tile 0..3
-        // rows 0..15", not to a per-warp sub-tile at the same N rows).
-        // Phase 8b will introduce the typed `gl<>` substrate that the
-        // mk-v2 idiom needs.
-        debug_assert!(
-            k % 128 == 0,
-            "Phase 8a gemm_m1: K must be a multiple of K_TILE=128; got {k}"
-        );
+    /// `x_id` / `w_id` / `y_id`: page slots. `k` / `bn`: GEMM tile
+    /// dims. Consumer warp count enforced ≤ NUM_CONSUMER_WARPS by
+    /// the caller (`tk_orchestrate::pick_bn`).
+    pub fn gemm_m1_consumer_body(x_id: u8, w_id: u8, y_id: u8, k: u32, bn: u32) -> String {
         format!(
             r#"
             // tk_warp_ir GemmM1 — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
-            // (per-warp output: warp c -> y[c] when c < bn; TK 2.0 register-
-            // vector K reduce via warp::sum on element-wise rv multiply.)
-            using namespace kittens;
-            auto* __y_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[{y_id}]);
+            // (per-warp output: warp c -> y[c] when c < bn; lane-parallel K reduce.)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
+            auto* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
+            const unsigned int __k  = {k}u;
             const unsigned int __bn = {bn}u;
             if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
                 const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
-                // Typed sv views: X is one full row [1, K]; W's row __row
-                // is the [__row*K..__row*K+K) byte range of the W page.
-                auto& __x_sv = *reinterpret_cast<kittens::sv_bf<{k}>*>(
-                    &page_buf[{x_id}][0]);
-                auto& __w_row_sv = *reinterpret_cast<kittens::sv_bf<{k}>*>(
-                    &page_buf[{w_id}][__row * {k}u * 2u]);
-
-                constexpr int __K_TILE = 128;
-                constexpr int __K_BLOCKS = {k} / __K_TILE;
+                const int __lane = static_cast<int>(threadIdx.x & 31);
                 float __acc = 0.0f;
-                #pragma unroll 1
-                for (int __k_i = 0; __k_i < __K_BLOCKS; ++__k_i) {{
-                    auto& __x_chunk_sv = __x_sv.template subvec<__K_TILE>(__k_i);
-                    auto& __w_chunk_sv = __w_row_sv.template subvec<__K_TILE>(__k_i);
-                    kittens::rv_bf<__K_TILE> __x_rv;
-                    kittens::rv_bf<__K_TILE> __w_rv;
-                    kittens::warp::load(__x_rv, __x_chunk_sv);
-                    kittens::warp::load(__w_rv, __w_chunk_sv);
-                    kittens::rv_fl<__K_TILE> __x_fl;
-                    kittens::rv_fl<__K_TILE> __w_fl;
-                    kittens::warp::copy(__x_fl, __x_rv);
-                    kittens::warp::copy(__w_fl, __w_rv);
-                    kittens::warp::mul(__x_fl, __x_fl, __w_fl);
-                    __acc += kittens::warp::sum(__x_fl);
+                for (unsigned int __j = static_cast<unsigned int>(__lane);
+                     __j < __k; __j += 32u) {{
+                    __acc += __bfloat162float(__x_smem[__j])
+                           * __bfloat162float(__w_smem[__row * __k + __j]);
                 }}
-
-                // First lane writes the scalar output for this warp's row.
-                if ((threadIdx.x & 31) == 0) {{
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {{
+                    __acc += __shfl_xor_sync(0xFFFFFFFFu, __acc, __o);
+                }}
+                if (__lane == 0) {{
                     __y_smem[__row] = __float2bfloat16(__acc);
                 }}
             }}
@@ -1731,14 +1517,10 @@ pub enum Tk20Call {
         total_pairs: u64,
     },
 
-    /// GemmM1 consumer compute body. TK 2.0 mk-v2 m=1 matvec idiom:
-    /// 16 consumer warps in parallel; each owns a `[16, 128]` W
-    /// sub-tile + sv<bf16, 128> X slice; partials aggregate via
-    /// `atomicAdd` into kernel-scope `__gemm_scratch[16]`; warp 0
-    /// stores the final `[1, 16]` to y. Bound through
-    /// `tk20::gemm_m1_consumer_body`. `w_id` is the FIRST of 4
-    /// contiguous W pages (allocator: `alloc_contiguous_at(4)`); the
-    /// 64 KB single TMA load fills all 4.
+    /// GemmM1 consumer compute body. M=1 dot product per consumer
+    /// warp (warp `c` produces `y[c]` for `c < bn`), lane-parallel K
+    /// reduce via `__shfl_xor_sync`. Bound through
+    /// `tk20::gemm_m1_consumer_body`.
     GemmM1ConsumerBody {
         x_id: u8,
         w_id: u8,
@@ -2475,63 +2257,18 @@ mod tests {
     }
 
     #[test]
-    fn tk20_gemm_m1_consumer_body_emits_tk_2_0_rv_reduction() {
-        // Phase 8a: per-warp K reduction uses TK 2.0 register-vector
-        // primitives (`warp::load` → `warp::copy` bf16→fp32 →
-        // `warp::mul` elementwise → `warp::sum`) instead of the legacy
-        // `__shfl_xor_sync` butterfly. Per-warp shape is the same as
-        // legacy — warp `c < bn` produces y[c]; only the reduction
-        // strategy changes.
+    fn tk20_gemm_m1_consumer_body_emits_legacy_compatible_cuda() {
         let body = tk20::gemm_m1_consumer_body(0, 1, 2, 2048, 4);
-
-        // Per-warp gating: warp `c < bn` does the work.
+        assert!(body.contains("auto* __x_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
+        assert!(body.contains("auto* __w_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+        assert!(body.contains("auto* __y_smem = reinterpret_cast<T_act*>(page_buf[2]);"));
+        assert!(body.contains("const unsigned int __k  = 2048u;"));
+        assert!(body.contains("const unsigned int __bn = 4u;"));
         assert!(body.contains("if (static_cast<unsigned int>(__consumer_idx) < __bn)"));
-
-        // Typed shared-vector views over X / W's row __row.
-        assert!(body.contains("kittens::sv_bf<2048>"));
-        assert!(body.contains("&page_buf[0][0]"));
-        assert!(body.contains("&page_buf[1][__row * 2048u * 2u]"));
-
-        // K-tile loop with K_TILE=128.
-        assert!(body.contains("constexpr int __K_TILE = 128;"));
-        assert!(body.contains("constexpr int __K_BLOCKS = 2048 / __K_TILE;"));
-        assert!(body.contains(".template subvec<__K_TILE>(__k_i)"));
-
-        // TK 2.0 register-vector pipeline.
-        assert!(body.contains("kittens::warp::load(__x_rv, __x_chunk_sv)"));
-        assert!(body.contains("kittens::warp::load(__w_rv, __w_chunk_sv)"));
-        assert!(body.contains("kittens::warp::copy(__x_fl, __x_rv)"));
-        assert!(body.contains("kittens::warp::mul(__x_fl, __x_fl, __w_fl)"));
-        assert!(body.contains("kittens::warp::sum(__x_fl)"));
-
-        // Lane-0 writes the per-warp scalar output.
-        assert!(body.contains("__y_smem[__row] = __float2bfloat16(__acc)"));
-
-        // Legacy patterns are GONE.
-        assert!(
-            !body.contains("__shfl_xor_sync"),
-            "shfl butterfly is gone in Phase 8a body"
-        );
+        assert!(body.contains("__shfl_xor_sync(0xFFFFFFFFu, __acc, __o)"));
+        assert!(body.contains("__y_smem[__row] = __float2bfloat16(__acc);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
-    }
-
-    #[test]
-    fn tk20_gemm_m1_consumer_body_supports_k_8192_down_proj() {
-        // Llama-1B down_proj uses K=8192 / BN=1 (one warp active).
-        // The K-tile loop scales: K_BLOCKS = 8192 / 128 = 64 inner iters.
-        let body = tk20::gemm_m1_consumer_body(0, 1, 2, 8192, 1);
-        assert!(body.contains("kittens::sv_bf<8192>"));
-        assert!(body.contains("constexpr int __K_BLOCKS = 8192 / __K_TILE;"));
-        assert!(body.contains("kittens::warp::sum(__x_fl)"));
-        assert!(!body.contains("__shfl_xor_sync"));
-    }
-
-    #[test]
-    #[should_panic(expected = "K must be a multiple of K_TILE=128")]
-    fn tk20_gemm_m1_consumer_body_rejects_misaligned_k() {
-        // K=200 isn't a multiple of K_TILE=128.
-        let _ = tk20::gemm_m1_consumer_body(0, 1, 2, 200, 1);
     }
 
     // GemmM1 byte-identity test deleted in Phase 5 cutover (legacy
@@ -2625,104 +2362,6 @@ mod tests {
         assert!(
             src.contains("kittens::warpgroup::mma_async_wait<0>();"),
             "{src}"
-        );
-    }
-
-    // ── Phase 8a: typed-handle decl + register-tile load/store/copy/broadcast ──
-
-    #[test]
-    fn tk20_decl_rt_emits_typed_register_tile_declaration() {
-        let bf = tk20::decl_rt("__a_rt", "bf16", 16, 64, "row");
-        assert_eq!(
-            bf,
-            "kittens::rt_bf<16, 64, kittens::ducks::rt_layout::row> __a_rt;"
-        );
-        let fl = tk20::decl_rt("__d_rt", "float", 16, 16, "row");
-        assert_eq!(
-            fl,
-            "kittens::rt_fl<16, 16, kittens::ducks::rt_layout::row> __d_rt;"
-        );
-        let col = tk20::decl_rt("__b_rt", "bf16", 64, 16, "col");
-        assert_eq!(
-            col,
-            "kittens::rt_bf<64, 16, kittens::ducks::rt_layout::col> __b_rt;"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "rt rows must be multiple of 16")]
-    fn tk20_decl_rt_rejects_unaligned_rows() {
-        let _ = tk20::decl_rt("__bad", "bf16", 8, 16, "row");
-    }
-
-    #[test]
-    fn tk20_decl_rv_emits_typed_register_vector_declaration() {
-        let bf = tk20::decl_rv("__x_rv", "bf16", 64);
-        assert_eq!(bf, "kittens::rv_bf<64> __x_rv;");
-        let fl = tk20::decl_rv("__m_rv", "float", 4);
-        assert_eq!(fl, "kittens::rv_fl<4> __m_rv;");
-    }
-
-    #[test]
-    fn tk20_decl_st_view_aliases_page_byte_range() {
-        let s = tk20::decl_st_view("__w_st", 2, 0, "bf16", 16, 64);
-        assert_eq!(
-            s,
-            "auto& __w_st = *reinterpret_cast<kittens::st_bf<16, 64>*>(&page_buf[2][0]);"
-        );
-    }
-
-    #[test]
-    fn tk20_decl_sv_view_aliases_page_byte_range() {
-        let s = tk20::decl_sv_view("__x_sv", 0, 0, "bf16", 2048);
-        assert_eq!(
-            s,
-            "auto& __x_sv = *reinterpret_cast<kittens::sv_bf<2048>*>(&page_buf[0][0]);"
-        );
-        let off = tk20::decl_sv_view("__x_chunk_sv", 0, 128, "bf16", 64);
-        assert_eq!(
-            off,
-            "auto& __x_chunk_sv = *reinterpret_cast<kittens::sv_bf<64>*>(&page_buf[0][128]);"
-        );
-    }
-
-    #[test]
-    fn tk20_warp_load_rt_from_st_emits_kittens_warp_load() {
-        assert_eq!(
-            tk20::warp_load_rt_from_st("__a_rt", "__a_st"),
-            "kittens::warp::load(__a_rt, __a_st);"
-        );
-    }
-
-    #[test]
-    fn tk20_warp_store_st_from_rt_emits_kittens_warp_store() {
-        assert_eq!(
-            tk20::warp_store_st_from_rt("__y_st", "__d_rt"),
-            "kittens::warp::store(__y_st, __d_rt);"
-        );
-    }
-
-    #[test]
-    fn tk20_warp_load_rv_from_sv_emits_kittens_warp_load() {
-        assert_eq!(
-            tk20::warp_load_rv_from_sv("__x_rv", "__x_sv"),
-            "kittens::warp::load(__x_rv, __x_sv);"
-        );
-    }
-
-    #[test]
-    fn tk20_warp_broadcast_col_emits_kittens_warp_broadcast_col() {
-        assert_eq!(
-            tk20::warp_broadcast_col("__a_rt", "__x_rv"),
-            "kittens::warp::broadcast_col(__a_rt, __x_rv);"
-        );
-    }
-
-    #[test]
-    fn tk20_warp_copy_rt_emits_kittens_warp_copy() {
-        assert_eq!(
-            tk20::warp_copy_rt("__d_bf", "__d_fl"),
-            "kittens::warp::copy(__d_bf, __d_fl);"
         );
     }
 }

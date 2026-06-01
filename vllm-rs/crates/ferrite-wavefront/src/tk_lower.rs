@@ -109,69 +109,6 @@ impl PageAllocator {
         self.in_use[page.id() as usize] = false;
         self.phase_bit[page.id() as usize] = page.phase();
     }
-
-    /// True iff there exists a run of `count` consecutive free slots at
-    /// parity `P::VALUE`. Used by the orchestrator to choose Phase0 vs
-    /// Phase1 for ops that need a multi-page contiguous alloc — the
-    /// `count_at` total isn't sufficient when parity bits are
-    /// fragmented across pages.
-    pub fn has_contiguous_run_at<P: Phase>(&self, count: usize) -> bool {
-        if count == 0 || count > NUM_PAGES as usize {
-            return count == 0;
-        }
-        (0..=(NUM_PAGES as usize - count)).any(|start| {
-            (0..count).all(|i| !self.in_use[start + i] && self.phase_bit[start + i] == P::VALUE)
-        })
-    }
-
-    /// Reserve `count` consecutive page slots at parity `P`, returning
-    /// the FIRST slot's typed handle. The remaining `count - 1` slots
-    /// are marked `in_use` (so no other op claims them) but not exposed
-    /// to the caller. Used for multi-page TMA loads where the bytes
-    /// span multiple pages contiguously — the dynamic-shared layout
-    /// `page_buf[NUM_PAGES][PAGE_SIZE]` guarantees `&page_buf[id][0]`
-    /// is followed in memory by `&page_buf[id+1][0]`, so a single 1D
-    /// bulk TMA of `count * PAGE_SIZE` bytes starting at
-    /// `&page_buf[first][0]` writes into all `count` pages.
-    ///
-    /// Phase 8a: GemmM1 uses `count = 4` (64 KB W tile = `[16, K=2048]`).
-    /// Only the first page's mbarriers are referenced by the lowering;
-    /// the other 3 pages' mbarriers stay at their init parity throughout
-    /// (no waits or arrives target them). Their `phase_bit` is mirrored
-    /// to the first page's at `release_contiguous` so subsequent
-    /// allocations see consistent state.
-    ///
-    /// Returns `None` if no `count`-long run of free same-parity slots
-    /// exists — caller may probe the OTHER parity, or fall back to a
-    /// non-multi-page lowering.
-    pub fn alloc_contiguous_at<P: Phase>(&mut self, count: usize) -> Option<PageHandle<P>> {
-        if count == 0 || count > NUM_PAGES as usize {
-            return None;
-        }
-        let first = (0..=(NUM_PAGES as usize - count)).find(|&start| {
-            (0..count).all(|i| !self.in_use[start + i] && self.phase_bit[start + i] == P::VALUE)
-        })?;
-        for i in 0..count {
-            self.in_use[first + i] = true;
-        }
-        Some(P::fresh_handle(first as u8))
-    }
-
-    /// Release a contiguous multi-page allocation. Mirrors all `count`
-    /// slots' `phase_bit` to the handle's runtime phase so the next
-    /// allocator decision sees consistent state across the group.
-    pub fn release_contiguous<P: crate::tk_warp_ir::Phase>(
-        &mut self,
-        page: PageHandle<P>,
-        count: usize,
-    ) {
-        let first = page.id() as usize;
-        let phase = page.phase();
-        for i in 0..count {
-            self.in_use[first + i] = false;
-            self.phase_bit[first + i] = phase;
-        }
-    }
 }
 
 // ── RmsNorm — the vertical slice ───────────────────────────────────
@@ -1640,10 +1577,7 @@ mod tests {
     }
 
     /// Codegen on GemmM1 emits the runtime parity `(__n_i & 1)` inside
-    /// the loop and the runtime W/Y byte-offsets. Phase 8a: the K
-    /// reduction inside the consumer body uses TK 2.0 `warp::sum`
-    /// over an element-wise `rv_fl` multiply, replacing the legacy
-    /// `__shfl_xor_sync` butterfly.
+    /// the loop and the runtime W byte-offset `(__n_i * <step>u)`.
     #[test]
     fn gemm_m1_codegen_emits_for_loop_runtime_offsets() {
         let mut pages = PageAllocator::new();
@@ -1671,18 +1605,9 @@ mod tests {
             src.contains("(__n_i * 8u)"),
             "Y TMA store uses runtime byte-offset\n{src}"
         );
-        // Phase 8a: TK 2.0 register-vector reduction replaces shfl.
         assert!(
-            src.contains("kittens::warp::sum(__x_fl)"),
-            "TK 2.0 warp::sum reduction present\n{src}"
-        );
-        assert!(
-            src.contains("kittens::warp::mul(__x_fl, __x_fl, __w_fl)"),
-            "TK 2.0 element-wise rv_fl multiply present\n{src}"
-        );
-        assert!(
-            !src.contains("__shfl_xor_sync"),
-            "shfl butterfly is gone in Phase 8a body\n{src}"
+            src.contains("__shfl_xor_sync"),
+            "lane butterfly reduction in compute body\n{src}"
         );
     }
 

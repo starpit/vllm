@@ -310,25 +310,28 @@ pub fn lower_attn_decode<P: Phase>(
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
 ) {
-    // GQA shape preconditions — the multi-head lowering distributes
-    // q-heads across the 8 consumer warps (one kv-head per warp).
-    // `num_q_heads` must be a multiple of NUM_CONSUMER_WARPS, and
-    // `num_kv_heads` must equal NUM_CONSUMER_WARPS so every warp
-    // owns exactly one kv-head. Llama-3.2-1B (32 q, 8 kv) satisfies
-    // both. Llama-3.2-3B (24 q, 8 kv) and other ratios will need a
-    // looser distribution; surface the constraint explicitly here
-    // rather than silently producing wrong output.
+    // Phase 7 GQA shape preconditions:
+    // - `num_kv_heads <= NUM_CONSUMER_WARPS` (each kv-head owned by
+    //   one consumer warp; warps with `__consumer_idx >= num_kv_heads`
+    //   skip AttnDecode compute but still arrive on barriers).
+    // - `num_q_heads % num_kv_heads == 0` (GQA grouping; per-kv
+    //   q-heads identical per warp).
+    //
+    // Llama-3.2-1B (32 q, 8 kv) at NUM_CONSUMER_WARPS=16: warps 0..7
+    // each take one kv-head + 4 q-heads; warps 8..15 idle on AttnDecode
+    // (they still do barrier arrives). Phase 9 (register-tile online
+    // softmax) revisits this sharding to use all 16 warps.
     debug_assert!(
-        op.num_q_heads % (NUM_CONSUMER_WARPS as u32) == 0,
-        "lower_attn_decode: num_q_heads ({}) must be divisible by NUM_CONSUMER_WARPS ({})",
-        op.num_q_heads,
+        op.num_kv_heads <= NUM_CONSUMER_WARPS as u32,
+        "lower_attn_decode: num_kv_heads ({}) must be <= NUM_CONSUMER_WARPS ({})",
+        op.num_kv_heads,
         NUM_CONSUMER_WARPS,
     );
     debug_assert!(
-        op.num_kv_heads == NUM_CONSUMER_WARPS as u32,
-        "lower_attn_decode: num_kv_heads ({}) must equal NUM_CONSUMER_WARPS ({}) for the per-warp kv-head sharding",
+        op.num_q_heads % op.num_kv_heads == 0,
+        "lower_attn_decode: num_q_heads ({}) must be divisible by num_kv_heads ({}) for GQA",
+        op.num_q_heads,
         op.num_kv_heads,
-        NUM_CONSUMER_WARPS,
     );
 
     // Allocate all three page slots up front so the function-scope
@@ -525,9 +528,13 @@ fn populate_attn_decode_prelude(
     k_id: u8,
     v_id: u8,
 ) {
-    // 8 consumer warps; each owns N_q / 8 q-heads.
-    let q_heads_per_warp = op.num_q_heads / (NUM_CONSUMER_WARPS as u32);
+    // Phase 7: each ACTIVE consumer warp (`__consumer_idx <
+    // num_kv_heads`) owns one kv-head + `q_per_kv` q-heads. Idle
+    // warps (`__consumer_idx >= num_kv_heads`) skip the body. With
+    // NUM_CONSUMER_WARPS=16 and Llama-1B (8 kv, 32 q), 8 active
+    // warps × 4 q-heads each.
     let q_per_kv = op.num_q_heads / op.num_kv_heads;
+    let q_heads_per_warp = q_per_kv;
     let prelude = crate::tk_codegen::tk20::attn_decode_prelude(
         q_id,
         k_id,

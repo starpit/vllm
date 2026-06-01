@@ -55,8 +55,21 @@ pub const PAGE_SIZE: u32 = 16384;
 /// Bytes of CTA-level scratch outside the page pool.
 pub const SCRATCH_BYTES: u32 = 1024;
 
-/// Number of consumer warps in the persistent CTA.
-pub const NUM_CONSUMER_WARPS: u8 = 8;
+/// Number of consumer warps in the persistent CTA. Phase 7: 8 → 16
+/// (4 warpgroups × 4 warps each — wgmma-aligned for Hopper).
+pub const NUM_CONSUMER_WARPS: u8 = 16;
+
+/// Number of service warps in the persistent CTA. Phase 7: 2 → 4
+/// (1 loader + 1 storer + 1 launcher + 1 controller, forming one
+/// complete kittens warpgroup so `kittens::warpgroup::decrease_registers`
+/// has its 4-warp alignment requirement satisfied). Today the launcher
+/// and controller are stubs (no instruction stream + no fused ITypes
+/// until Phase 12 lands); they just decrease_registers and idle.
+pub const NUM_SERVICE_WARPS: u8 = 4;
+
+/// Total warps in the persistent CTA. 20 warps × 32 threads = 640
+/// threads. `__launch_bounds__(640)` and `<<<1, 640, ...>>>` follow.
+pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
 
 // ── Phase as a type ─────────────────────────────────────────────────
 

@@ -426,7 +426,10 @@ pub mod tk20 {
         format!(
             r#"
             // tk_warp_ir AttnDecode #{u} — init per-warp softmax state
-            {{
+            // Phase 7: gate to active warps (`__consumer_idx <
+            // num_kv_heads`); idle warps skip but still arrive on
+            // barriers via the role-routed `arrive(Done)` outside.
+            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
                     __m_max_a{u}[__h] = -INFINITY;
@@ -451,7 +454,9 @@ pub mod tk20 {
         format!(
             r#"
             // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
-            {{
+            // Phase 7: gate to active warps (`__consumer_idx <
+            // num_kv_heads`).
+            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
                 const unsigned int __q_head_base =
@@ -494,7 +499,8 @@ pub mod tk20 {
         format!(
             r#"
             // tk_warp_ir AttnDecode #{u} — softmax(P) @ V
-            {{
+            // Phase 7: gate to active warps.
+            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
                 const unsigned int __v_off = __kv_head * __head_dim_a{u};
@@ -519,7 +525,8 @@ pub mod tk20 {
         format!(
             r#"
             // tk_warp_ir AttnDecode #{u} — finalise: O = O_accum / l_sum
-            {{
+            // Phase 7: gate to active warps.
+            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __q_head_base =
                     static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
@@ -601,8 +608,8 @@ pub mod tk20 {
             auto* __u_smem = reinterpret_cast<T_act*>(page_buf[{u_id}]);
             const unsigned int __total = {total}u;
             const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
+                static_cast<int>(threadIdx.x) - 4 * 32;
+            const int __consumer_threads = 16 * 32;
             for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
                  __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
                 const float __g = __bfloat162float(__g_smem[__i]);
@@ -643,8 +650,8 @@ pub mod tk20 {
             const unsigned int __half     = {half}u;
             const unsigned int __pairs    = {total_pairs}u;
             const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
+                static_cast<int>(threadIdx.x) - 4 * 32;
+            const int __consumer_threads = 16 * 32;
             for (unsigned int __p = static_cast<unsigned int>(__tid_in_consumers);
                  __p < __pairs; __p += static_cast<unsigned int>(__consumer_threads)) {{
                 // Decompose pair index → (row * head, lane in head_dim/2).
@@ -678,8 +685,8 @@ pub mod tk20 {
             auto* __b_smem = reinterpret_cast<T_act*>(page_buf[{b_id}]);
             const unsigned int __total = {total}u;
             const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 2 * 32;
-            const int __consumer_threads = 8 * 32;
+                static_cast<int>(threadIdx.x) - 4 * 32;
+            const int __consumer_threads = 16 * 32;
             for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
                  __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
                 const float __a = __bfloat162float(__a_smem[__i]);
@@ -709,8 +716,9 @@ fn role_guard(role: WarpRole) -> Option<String> {
 /// the role's warp count. Used by Wait / Sync emit, where every thread
 /// in the group is a participant.
 fn role_group_width(role: WarpRole) -> u32 {
+    use crate::tk_warp_ir::NUM_WARPS;
     match role {
-        WarpRole::All => NUM_CONSUMER_WARPS as u32 + 2, // 8 consumers + loader + storer (illustrative)
+        WarpRole::All => NUM_WARPS as u32, // Phase 7: 20 warps total.
         WarpRole::Loader | WarpRole::Storer | WarpRole::Consumer(_) => 1,
         WarpRole::AllConsumers => NUM_CONSUMER_WARPS as u32,
     }
@@ -1072,9 +1080,9 @@ pub fn emit_kernel_with_opts(
     prog: &TkProgram,
     opts: &EmitOpts,
 ) -> String {
-    use crate::tk_warp_ir::{NUM_CONSUMER_WARPS, NUM_PAGES};
+    use crate::tk_warp_ir::{NUM_CONSUMER_WARPS, NUM_PAGES, NUM_SERVICE_WARPS, NUM_WARPS};
 
-    let total_warps = NUM_CONSUMER_WARPS as u32 + 2; // 1 loader + 1 storer + N consumers
+    let total_warps = NUM_WARPS as u32; // Phase 7: 4 service + 16 consumers = 20 warps.
     let total_threads = total_warps * 32;
 
     let mut out = String::new();
@@ -1091,9 +1099,15 @@ pub fn emit_kernel_with_opts(
     out.push_str("\n");
 
     // Role constants. Matches the WarpRole emit in role_guard().
-    out.push_str("#define ROLE_LOADER   0\n");
-    out.push_str("#define ROLE_STORER   1\n");
-    out.push_str("#define ROLE_CONSUMER 2\n");
+    // Phase 7: 4 service warps + 16 consumer warps. Launcher and
+    // controller are stub roles today (decrease_registers + idle);
+    // they get real bodies at Phase 11/12 when cross-IType mbarrier
+    // table + fused ITypes need them.
+    out.push_str("#define ROLE_LOADER     0\n");
+    out.push_str("#define ROLE_STORER     1\n");
+    out.push_str("#define ROLE_LAUNCHER   2\n");
+    out.push_str("#define ROLE_CONTROLLER 3\n");
+    out.push_str("#define ROLE_CONSUMER   4\n");
     out.push_str("\n");
 
     // Kernel signature.
@@ -1126,14 +1140,38 @@ pub fn emit_kernel_with_opts(
     }
     out.push_str("\n");
 
-    // Role dispatch.
+    // Role dispatch. Phase 7 layout: warps 0-3 = service warpgroup
+    // (loader, storer, launcher, controller); warps 4-19 = 4 consumer
+    // warpgroups (16 consumer warps).
     out.push_str("    const int __warpid = threadIdx.x / 32;\n");
     out.push_str("    int __role;\n");
     out.push_str("    if      (__warpid == 0) __role = ROLE_LOADER;\n");
     out.push_str("    else if (__warpid == 1) __role = ROLE_STORER;\n");
+    out.push_str("    else if (__warpid == 2) __role = ROLE_LAUNCHER;\n");
+    out.push_str(&format!(
+        "    else if (__warpid == 3) __role = ROLE_CONTROLLER;\n"
+    ));
     out.push_str("    else                    __role = ROLE_CONSUMER;\n");
-    out.push_str("    const int __consumer_idx = __warpid - 2;\n");
+    out.push_str(&format!(
+        "    const int __consumer_idx = __warpid - {};\n",
+        NUM_SERVICE_WARPS
+    ));
     out.push_str("    (void)__consumer_idx;\n");
+    out.push_str("\n");
+
+    // Hopper register-budget plumbing. The service warpgroup (warps
+    // 0-3) hands its register share to the 4 consumer warpgroups so
+    // wgmma operations can fit `rt_<bf16, 16, K>` chunks. The
+    // `kittens::warpgroup::increase_registers<N>` /
+    // `decrease_registers<N>` calls REQUIRE warpgroup-aligned
+    // execution (4 warps in lockstep) — that's why Phase 7 adds the
+    // launcher + controller stubs to fill the service warpgroup to 4.
+    // Source: `ops/group/group.cuh:52` (increase) and `:56` (decrease).
+    out.push_str("    if (__warpid < 4) {\n");
+    out.push_str("        kittens::warpgroup::decrease_registers<56>();\n");
+    out.push_str("    } else {\n");
+    out.push_str("        kittens::warpgroup::increase_registers<224>();\n");
+    out.push_str("    }\n");
     out.push_str("\n");
 
     // Page pool + mbarriers. The page byte-buffer is allocated as
@@ -1731,7 +1769,8 @@ mod tests {
         let src = emit_kernel("tk_kernel_smoke", &args, &p);
 
         // Sanity: kernel signature references all args.
-        assert!(src.contains("__global__ __launch_bounds__(320) void tk_kernel_smoke("), "{src}");
+        // Phase 7: 20 warps × 32 = 640 threads.
+        assert!(src.contains("__global__ __launch_bounds__(640) void tk_kernel_smoke("), "{src}");
         assert!(src.contains("const __nv_bfloat16* __restrict__ x"), "{src}");
         assert!(src.contains("__nv_bfloat16* __restrict__ out"), "{src}");
         assert!(src.contains("const uint32_t __num_kv_pages"), "{src}");
@@ -1791,7 +1830,7 @@ mod tests {
             "smem attr lifted\n{src}"
         );
         assert!(
-            src.contains("tk_kernel_smoke<<<1, 320, DYN_SMEM, stream>>>("),
+            src.contains("tk_kernel_smoke<<<1, 640, DYN_SMEM, stream>>>("),
             "triple-chevron launch\n{src}"
         );
         assert!(
@@ -1850,12 +1889,14 @@ mod tests {
         let src = emit_kernel("tk_rmsnorm_decode_h2048", &args, &prog);
 
         // Sanity: the body's six-step handshake is inside the kernel.
+        // Phase 7: AllConsumers waits use group<16>; loader/storer
+        // are still group<1>; page_done init expected count is now 16.
         assert!(src.contains("kittens::group<1>::wait(page_consumed[0], 0)"), "{src}");
-        assert!(src.contains("kittens::group<8>::wait(page_ready[0], 0)"), "{src}");
+        assert!(src.contains("kittens::group<16>::wait(page_ready[0], 0)"), "{src}");
         assert!(src.contains("kittens::group<1>::wait(page_done[0], 0)"), "{src}");
         // Mbarrier init.
         assert!(src.contains("kittens::init_semaphore(page_ready[__i], 0, 1);"));
-        assert!(src.contains("kittens::init_semaphore(page_done[__i], 0, 8);"));
+        assert!(src.contains("kittens::init_semaphore(page_done[__i], 0, 16);"));
         // Compute body.
         assert!(src.contains("rsqrtf"));
     }
@@ -1974,8 +2015,8 @@ mod tests {
         p.sync(WarpRole::AllConsumers);
         p.sync(WarpRole::Loader);
         let src = emit_body(&p);
-        // 8 consumers → group<8>; loader is one warp → group<1>.
-        assert!(src.contains("kittens::group<8>::sync();"), "{src}");
+        // Phase 7: 16 consumers → group<16>; loader is one warp → group<1>.
+        assert!(src.contains("kittens::group<16>::sync();"), "{src}");
         assert!(src.contains("kittens::group<1>::sync();"), "{src}");
     }
 
@@ -2147,7 +2188,7 @@ mod tests {
         assert!(body.contains("const unsigned int __total = 2048u;"));
         // All-consumer parallelism: each consumer thread processes a
         // strided slice of the row.
-        assert!(body.contains("const int __consumer_threads = 8 * 32;"));
+        assert!(body.contains("const int __consumer_threads = 16 * 32;"));
         assert!(body.contains("__float2bfloat16(__a + __b)"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));

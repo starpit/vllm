@@ -358,6 +358,185 @@ pub mod tk20 {
         )
     }
 
+    // ── AttnDecode body atoms (Phase 4) ────────────────────────────
+    //
+    // AttnDecode's compute spans FIVE separate bodies: a function-
+    // scope prelude (typed page views + persistent compute
+    // accumulators that span the whole KV sweep), an init-softmax
+    // body, the QK^T+softmax-online step (inside the KV-sweep loop),
+    // the softmax(P)@V step (also inside the loop), and the final
+    // O = O_accum / l_sum normalize. Each is wrapped in a typed
+    // `Tk20Call` variant for the Phase 5 cutover.
+    //
+    // The bodies share function-scope state — `__m_max_a<u>`,
+    // `__l_sum_a<u>`, `__o_accum_a<u>[][HEAD_DIM]` etc. — declared in
+    // the prelude. The `<u>` suffix is the op's `unique_id` so two
+    // AttnDecode instances in the same TkProgram (e.g. one per
+    // transformer layer in a multi-layer Llama forward) don't collide
+    // on the same C++ identifiers.
+
+    /// Emit the AttnDecode prelude — typed page views + persistent
+    /// compute accumulators. Written into `TkProgram::prelude` (not
+    /// inside an instruction's role guard) so all warps see the
+    /// declarations and the consumers can reference per-warp state
+    /// across instruction boundaries inside the KV-sweep loop.
+    pub fn attn_decode_prelude(
+        q_id: u8,
+        k_id: u8,
+        v_id: u8,
+        head_dim: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        q_heads_per_warp: u32,
+        q_per_kv: u32,
+        scale: f32,
+        unique_id: u32,
+    ) -> String {
+        let u = unique_id;
+        format!(
+            r#"    // ── AttnDecode #{u} prelude (multi-head GQA; one kv-head per consumer warp) ──
+    using T_act = __nv_bfloat16;
+    auto* __q_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    auto* __k_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{k_id}]);
+    auto* __v_smem_a{u}   = reinterpret_cast<T_act*>(page_buf[{v_id}]);
+    auto* __out_smem_a{u} = reinterpret_cast<T_act*>(page_buf[{q_id}]);
+    const unsigned int __head_dim_a{u} = {head_dim}u;
+    const unsigned int __num_q_heads_a{u} = {num_q_heads}u;
+    const unsigned int __num_kv_heads_a{u} = {num_kv_heads}u;
+    const unsigned int __q_heads_per_warp_a{u} = {q_heads_per_warp}u;
+    const unsigned int __q_per_kv_a{u} = {q_per_kv}u;
+    const float __scale_a{u} = {scale:?}f;
+    // Per-warp per-q-head softmax state. With Llama-3.2-1B
+    // (N_q=32, 8 warps, qpw=4): each consumer warp keeps 4
+    // independent softmax + accumulator states.
+    float __m_max_a{u}[{q_heads_per_warp}];
+    float __l_sum_a{u}[{q_heads_per_warp}];
+    float __renorm_a{u}[{q_heads_per_warp}];
+    float __p_a{u}[{q_heads_per_warp}];
+    float __o_accum_a{u}[{q_heads_per_warp}][{head_dim}];
+"#
+        )
+    }
+
+    /// Emit the AttnDecode init-softmax body. Sets `__m_max = -INF`,
+    /// `__l_sum = 0`, zeroes `__o_accum`. Run once before the
+    /// KV-sweep loop on the consumer warps.
+    pub fn attn_decode_init_softmax_body(unique_id: u32) -> String {
+        let u = unique_id;
+        format!(
+            r#"
+            // tk_warp_ir AttnDecode #{u} — init per-warp softmax state
+            {{
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    __m_max_a{u}[__h] = -INFINITY;
+                    __l_sum_a{u}[__h] = 0.0f;
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] = 0.0f;
+                    }}
+                }}
+            }}
+"#
+        )
+    }
+
+    /// Emit the AttnDecode Q@K^T + online-softmax step body. Runs
+    /// inside the KV-sweep loop, once per K page. Computes the
+    /// per-q-head scaled dot-product, applies the online-softmax
+    /// renormalisation `__renorm = exp(m_old - m_new)`, updates
+    /// `__l_sum`, and rescales `__o_accum` by `__renorm`.
+    pub fn attn_decode_qkt_softmax_step_body(unique_id: u32) -> String {
+        let u = unique_id;
+        format!(
+            r#"
+            // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
+            {{
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
+                const unsigned int __q_head_base =
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
+                const unsigned int __k_off = __kv_head * __head_dim_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim_a{u};
+                    float __s = 0.0f;
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __s += __bfloat162float(__q_smem_a{u}[__q_off + __j])
+                             * __bfloat162float(__k_smem_a{u}[__k_off + __j]);
+                    }}
+                    #pragma unroll
+                    for (int __o = 16; __o > 0; __o >>= 1) {{
+                        __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
+                    }}
+                    __s *= __scale_a{u};
+                    const float __m_new = fmaxf(__m_max_a{u}[__h], __s);
+                    __renorm_a{u}[__h] = expf(__m_max_a{u}[__h] - __m_new);
+                    __p_a{u}[__h]      = expf(__s              - __m_new);
+                    __l_sum_a{u}[__h]  = __renorm_a{u}[__h] * __l_sum_a{u}[__h] + __p_a{u}[__h];
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] *= __renorm_a{u}[__h];
+                    }}
+                    __m_max_a{u}[__h] = __m_new;
+                }}
+            }}
+"#
+        )
+    }
+
+    /// Emit the AttnDecode softmax(P)@V accumulation step body.
+    /// Runs inside the KV-sweep loop, once per V page (paired with a
+    /// preceding `qkt_softmax_step` against the same iteration's K).
+    /// Adds `__p[h] * v[__j]` to each `__o_accum[h][__j]`.
+    pub fn attn_decode_sv_accum_step_body(unique_id: u32) -> String {
+        let u = unique_id;
+        format!(
+            r#"
+            // tk_warp_ir AttnDecode #{u} — softmax(P) @ V
+            {{
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
+                const unsigned int __v_off = __kv_head * __head_dim_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __o_accum_a{u}[__h][__j] += __p_a{u}[__h]
+                            * __bfloat162float(__v_smem_a{u}[__v_off + __j]);
+                    }}
+                }}
+            }}
+"#
+        )
+    }
+
+    /// Emit the AttnDecode finalise body. Divides `__o_accum` by
+    /// `__l_sum` and writes the result to `__out_smem` (which aliases
+    /// the Q page slot — output is in place on Q's page so the
+    /// storer drains it as a single round on the Q+O slot).
+    pub fn attn_decode_finalise_softmax_norm_body(unique_id: u32) -> String {
+        let u = unique_id;
+        format!(
+            r#"
+            // tk_warp_ir AttnDecode #{u} — finalise: O = O_accum / l_sum
+            {{
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                const unsigned int __q_head_base =
+                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
+                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
+                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim_a{u};
+                    const float __inv_l = 1.0f / __l_sum_a{u}[__h];
+                    for (unsigned int __j = static_cast<unsigned int>(__lane);
+                         __j < __head_dim_a{u}; __j += 32u) {{
+                        __out_smem_a{u}[__out_off + __j] =
+                            __float2bfloat16(__o_accum_a{u}[__h][__j] * __inv_l);
+                    }}
+                }}
+            }}
+"#
+        )
+    }
+
     /// Emit the GemmM1 consumer body. M=1 dot product computed per
     /// consumer warp (warp `c` produces `y[c]` when `c < bn`), with
     /// lane-parallel K reduction via `__shfl_xor_sync` butterfly.
@@ -1311,6 +1490,22 @@ pub enum Tk20Call {
         k: u32,
         bn: u32,
     },
+
+    /// AttnDecode init-softmax body. Bound through
+    /// `tk20::attn_decode_init_softmax_body`.
+    AttnDecodeInitSoftmaxBody { unique_id: u32 },
+
+    /// AttnDecode Q@K^T + online-softmax step (inside KV-sweep loop).
+    /// Bound through `tk20::attn_decode_qkt_softmax_step_body`.
+    AttnDecodeQktSoftmaxStepBody { unique_id: u32 },
+
+    /// AttnDecode softmax(P)@V accumulation step (inside KV-sweep
+    /// loop). Bound through `tk20::attn_decode_sv_accum_step_body`.
+    AttnDecodeSvAccumStepBody { unique_id: u32 },
+
+    /// AttnDecode finalise (O = O_accum / l_sum). Bound through
+    /// `tk20::attn_decode_finalise_softmax_norm_body`.
+    AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
 }
 
 impl Tk20Call {
@@ -1385,6 +1580,19 @@ impl Tk20Call {
                 k,
                 bn,
             } => tk20::gemm_m1_consumer_body(*x_id, *w_id, *y_id, *k, *bn),
+
+            Tk20Call::AttnDecodeInitSoftmaxBody { unique_id } => {
+                tk20::attn_decode_init_softmax_body(*unique_id)
+            }
+            Tk20Call::AttnDecodeQktSoftmaxStepBody { unique_id } => {
+                tk20::attn_decode_qkt_softmax_step_body(*unique_id)
+            }
+            Tk20Call::AttnDecodeSvAccumStepBody { unique_id } => {
+                tk20::attn_decode_sv_accum_step_body(*unique_id)
+            }
+            Tk20Call::AttnDecodeFinaliseSoftmaxNormBody { unique_id } => {
+                tk20::attn_decode_finalise_softmax_norm_body(*unique_id)
+            }
         }
     }
 }
@@ -2087,6 +2295,90 @@ mod tests {
             _ => panic!("expected Compute"),
         };
         assert_eq!(legacy_body, typed);
+    }
+
+    #[test]
+    fn tk20_attn_decode_prelude_emits_legacy_compatible_cuda() {
+        let prelude = tk20::attn_decode_prelude(0, 1, 2, 64, 32, 8, 4, 4, 0.125_f32, 7);
+        // Spot-check the load-bearing fragments — uniqueness suffix
+        // `_a7` keeps multi-AttnDecode forwards collision-free.
+        assert!(prelude.contains("AttnDecode #7 prelude"));
+        assert!(prelude.contains("auto* __q_smem_a7   = reinterpret_cast<T_act*>(page_buf[0]);"));
+        assert!(prelude.contains("auto* __k_smem_a7   = reinterpret_cast<T_act*>(page_buf[1]);"));
+        assert!(prelude.contains("auto* __v_smem_a7   = reinterpret_cast<T_act*>(page_buf[2]);"));
+        assert!(prelude.contains("const unsigned int __head_dim_a7 = 64u;"));
+        assert!(prelude.contains("const unsigned int __num_q_heads_a7 = 32u;"));
+        assert!(prelude.contains("const unsigned int __num_kv_heads_a7 = 8u;"));
+        assert!(prelude.contains("const unsigned int __q_heads_per_warp_a7 = 4u;"));
+        assert!(prelude.contains("float __o_accum_a7[4][64];"));
+        assert!(!prelude.contains("kittens::tma::"));
+        assert!(!prelude.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn tk20_attn_decode_compute_bodies_emit_legacy_compatible_cuda() {
+        let init = tk20::attn_decode_init_softmax_body(7);
+        assert!(init.contains("AttnDecode #7 — init per-warp softmax state"));
+        assert!(init.contains("__m_max_a7[__h] = -INFINITY;"));
+        assert!(init.contains("__l_sum_a7[__h] = 0.0f;"));
+        assert!(!init.contains("kittens::tma::"));
+
+        let qkt = tk20::attn_decode_qkt_softmax_step_body(7);
+        assert!(qkt.contains("AttnDecode #7 — Q@K^T + online softmax"));
+        assert!(qkt.contains("__shfl_xor_sync(0xFFFFFFFFu, __s, __o)"));
+        assert!(qkt.contains("__renorm_a7[__h] = expf(__m_max_a7[__h] - __m_new);"));
+        assert!(!qkt.contains("kittens::warp::mma_AB"));
+
+        let sv = tk20::attn_decode_sv_accum_step_body(7);
+        assert!(sv.contains("AttnDecode #7 — softmax(P) @ V"));
+        assert!(sv.contains("__o_accum_a7[__h][__j] += __p_a7[__h]"));
+
+        let fin = tk20::attn_decode_finalise_softmax_norm_body(7);
+        assert!(fin.contains("AttnDecode #7 — finalise: O = O_accum / l_sum"));
+        assert!(fin.contains("__float2bfloat16(__o_accum_a7[__h][__j] * __inv_l)"));
+    }
+
+    #[test]
+    fn tk20_attn_decode_atoms_byte_identical_to_legacy_format_bodies() {
+        use crate::subtile_ir::BufId;
+        use crate::tk_lower::AttnDecodeOp;
+        let op = AttnDecodeOp {
+            q: BufId(0),
+            k_cache: BufId(1),
+            v_cache: BufId(2),
+            out: BufId(3),
+            head_dim: 64,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            act_elem: 2,
+            softmax_scale: 0.125_f32,
+            num_kv_pages_arg: "__num_kv_pages",
+            unique_id: 7,
+        };
+
+        // Compare typed-atom emit against legacy fn output for each
+        // of the four AttnDecode compute bodies.
+        let atoms = [
+            (
+                Tk20Call::AttnDecodeInitSoftmaxBody { unique_id: 7 }.emit(),
+                crate::tk_lower::init_softmax_accum_body_for_test(&op),
+            ),
+            (
+                Tk20Call::AttnDecodeQktSoftmaxStepBody { unique_id: 7 }.emit(),
+                crate::tk_lower::qkt_softmax_step_body_for_test(&op),
+            ),
+            (
+                Tk20Call::AttnDecodeSvAccumStepBody { unique_id: 7 }.emit(),
+                crate::tk_lower::sv_accum_step_body_for_test(&op),
+            ),
+            (
+                Tk20Call::AttnDecodeFinaliseSoftmaxNormBody { unique_id: 7 }.emit(),
+                crate::tk_lower::finalise_softmax_norm_body_for_test(&op),
+            ),
+        ];
+        for (typed, legacy) in atoms.iter() {
+            assert_eq!(typed, legacy);
+        }
     }
 
     #[test]

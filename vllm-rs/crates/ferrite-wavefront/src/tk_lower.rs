@@ -432,7 +432,18 @@ pub fn lower_attn_decode<P: Phase>(
     // No `arrive(Ready)` — `tma::load_async` signals page_ready itself.
 
     let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
-    prog.compute(WarpRole::AllConsumers, init_softmax_accum_body(&op));
+    // Phase 4: typed `Tk20Call::AttnDecodeInitSoftmaxBody`. See
+    // `lower_rmsnorm` for the env-gate rationale.
+    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
+                unique_id: op.unique_id,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, init_softmax_accum_body(&op));
+    }
     // No `arrive(Done)` here — the Q+O slot is ONE round: loader fills
     // (TMA load_async signals page_ready), the consumer holds the page
     // through the KV loop, writes O into the same page slot at the
@@ -483,7 +494,17 @@ pub fn lower_attn_decode<P: Phase>(
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
-            body.compute(WarpRole::AllConsumers, qkt_softmax_step_body(&op));
+            // Phase 4: typed Tk20Call::AttnDecodeQktSoftmaxStepBody.
+            if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
+                body.compute_calls(
+                    WarpRole::AllConsumers,
+                    vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
+                        unique_id: op.unique_id,
+                    }],
+                );
+            } else {
+                body.compute(WarpRole::AllConsumers, qkt_softmax_step_body(&op));
+            }
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
 
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);
@@ -500,7 +521,17 @@ pub fn lower_attn_decode<P: Phase>(
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
-            body.compute(WarpRole::AllConsumers, sv_accum_step_body(&op));
+            // Phase 4: typed Tk20Call::AttnDecodeSvAccumStepBody.
+            if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
+                body.compute_calls(
+                    WarpRole::AllConsumers,
+                    vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
+                        unique_id: op.unique_id,
+                    }],
+                );
+            } else {
+                body.compute(WarpRole::AllConsumers, sv_accum_step_body(&op));
+            }
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
 
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var, start);
@@ -537,7 +568,17 @@ pub fn lower_attn_decode<P: Phase>(
     // page slot since the Q-load Ready handshake; the page is already
     // owned. Going straight to compute + arrive(Done) closes the slot's
     // single round (loader Ready → consumer Done → storer Consumed).
-    prog.compute(WarpRole::AllConsumers, finalise_softmax_norm_body(&op));
+    // Phase 4: typed Tk20Call::AttnDecodeFinaliseSoftmaxNormBody.
+    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
+                unique_id: op.unique_id,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, finalise_softmax_norm_body(&op));
+    }
     let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
 
     let o_page = prog.wait(WarpRole::Storer, PageBarrier::Done, o_page);
@@ -583,6 +624,28 @@ fn populate_attn_decode_prelude(
     let q_per_kv = num_q_heads / num_kv_heads;
     let scale = op.softmax_scale;
     let u = op.unique_id;
+
+    // Phase 4: route the prelude through the typed `tk20::*` API when
+    // FERRITE_NEW_ATTN_DECODE is set. Both paths produce byte-identical
+    // text (the typed binding's body IS the legacy `format!()` body
+    // moved into `tk20::attn_decode_prelude`).
+    if std::env::var_os("FERRITE_NEW_ATTN_DECODE").is_some() {
+        let prelude = crate::tk_codegen::tk20::attn_decode_prelude(
+            q_id,
+            k_id,
+            v_id,
+            head_dim,
+            num_q_heads,
+            num_kv_heads,
+            q_heads_per_warp,
+            q_per_kv,
+            scale,
+            u,
+        );
+        prog.add_prelude(prelude);
+        return;
+    }
+
     let prelude = format!(
         r#"    // ── AttnDecode #{u} prelude (multi-head GQA; one kv-head per consumer warp) ──
     using T_act = __nv_bfloat16;
@@ -607,6 +670,26 @@ fn populate_attn_decode_prelude(
 "#
     );
     prog.add_prelude(prelude);
+}
+
+/// Test-only wrappers exposing the legacy AttnDecode body fns so the
+/// byte-identity tests in `tk_codegen` can compare typed-atom output
+/// against legacy `format!()` output.
+#[cfg(test)]
+pub fn init_softmax_accum_body_for_test(op: &AttnDecodeOp) -> String {
+    init_softmax_accum_body(op)
+}
+#[cfg(test)]
+pub fn qkt_softmax_step_body_for_test(op: &AttnDecodeOp) -> String {
+    qkt_softmax_step_body(op)
+}
+#[cfg(test)]
+pub fn sv_accum_step_body_for_test(op: &AttnDecodeOp) -> String {
+    sv_accum_step_body(op)
+}
+#[cfg(test)]
+pub fn finalise_softmax_norm_body_for_test(op: &AttnDecodeOp) -> String {
+    finalise_softmax_norm_body(op)
 }
 
 fn init_softmax_accum_body(op: &AttnDecodeOp) -> String {

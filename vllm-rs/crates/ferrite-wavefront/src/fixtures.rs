@@ -151,6 +151,98 @@ pub fn rmsnorm_only_input() -> LoweringInput {
     }
 }
 
+/// Phase 6 single-op fixture: `out = a + b` element-wise. Buffer
+/// count: 2 sources + 1 op output = 3. Used by `bin/tk_emit_add` and
+/// the `add_kernel_matches_cpu_golden` test.
+pub fn add_only_input() -> LoweringInput {
+    let h = 2048u32;
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: h }, // 0  a
+            SourceShape { rows: 1, cols: h }, // 1  b
+        ],
+        ops: vec![OpDesc {
+            op: LoweredOp::Add,
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    }
+}
+
+/// Phase 6 single-op fixture: `out = silu(gate) * up`. Buffer count:
+/// 2 sources + 1 op output = 3. Used by `bin/tk_emit_silu_mul` and
+/// the `silu_mul_kernel_matches_cpu_golden` test. Llama-1B
+/// intermediate dim = 8192.
+pub fn silu_mul_only_input() -> LoweringInput {
+    let intermediate = 8192u32;
+    LoweringInput {
+        sources: vec![
+            SourceShape {
+                rows: 1,
+                cols: intermediate,
+            }, // 0  gate
+            SourceShape {
+                rows: 1,
+                cols: intermediate,
+            }, // 1  up
+        ],
+        ops: vec![OpDesc {
+            op: LoweredOp::SiluMul,
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    }
+}
+
+/// Phase 6 single-op fixture: NeoX RoPE rotate on a single Q row of
+/// `[1, num_heads * head_dim]`. Llama-1B Q-side: 32 heads × 64 head_dim
+/// = 2048 cols. Buffer count: 3 sources (x, cos, sin) + 1 op output = 4.
+pub fn rope_rotate_only_input() -> LoweringInput {
+    let head_dim = 64u32;
+    let num_heads = 32u32;
+    let cols = num_heads * head_dim;
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols },                  // 0  x
+            SourceShape { rows: 1, cols: head_dim },        // 1  cos
+            SourceShape { rows: 1, cols: head_dim },        // 2  sin
+        ],
+        ops: vec![OpDesc {
+            op: LoweredOp::RopeRotate { head_dim },
+            m: 1,
+            inputs: vec![
+                InputRef::Ext(0),
+                InputRef::Ext(1),
+                InputRef::Ext(2),
+            ],
+        }],
+        result: 0,
+    }
+}
+
+/// Phase 6 single-op fixture: M=1 GEMM `y = x @ w^T`, x is `[1, k]`,
+/// w is `[n, k]`, y is `[1, n]`. Llama-1B q_proj-shape: k=2048,
+/// n=2048 (32 q-heads × 64 head_dim). Buffer count: 2 sources + 1 op
+/// output = 3.
+pub fn gemm_m1_only_input() -> LoweringInput {
+    let k = 2048u32;
+    let n = 2048u32;
+    LoweringInput {
+        sources: vec![
+            SourceShape { rows: 1, cols: k }, // 0  x
+            SourceShape { rows: n, cols: k }, // 1  w
+        ],
+        ops: vec![OpDesc {
+            op: LoweredOp::Gemm { n, k },
+            m: 1,
+            inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+        }],
+        result: 0,
+    }
+}
+
 /// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
 /// [`LoweringInput`], in `BufId` order: sources first, then per-op
 /// output staging buffers. Mirrors the shape inference in

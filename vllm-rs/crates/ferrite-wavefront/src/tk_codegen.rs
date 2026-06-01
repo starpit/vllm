@@ -291,6 +291,99 @@ pub mod tk20 {
         debug_assert_eq!(n % 8, 0, "TK 2.0 setmaxnreg requires n % 8 == 0; got {n}");
         format!("kittens::warpgroup::decrease_registers<{n}>();")
     }
+
+    // ── RMSNorm consumer body (typed atom; emits raw CUDA inline) ──
+    //
+    // RmsNorm under TK 2.0 idiom: per-thread bf16 squared-sum +
+    // `__shfl_xor_sync` butterfly across the 32 warp lanes + per-thread
+    // normalize. This matches `~/git/Megakernels` `mk-v2` (TK 2.0,
+    // sm_90a) `csrc/itypes/rmsnorm.cuh` lines 130-180: the production
+    // TK 2.0 RmsNorm pattern uses `kittens::sv_bf<N>` ONLY as a typed
+    // page-pointer alias, not as the operand to `kittens::group<N>::
+    // sum/mul/etc.`. The reduction stays per-thread + warp shfl
+    // because (a) `kittens::warp::row_*` reductions operate on
+    // 16x16-aligned register tiles, not on m=1 rows, and (b) using
+    // sv_bf-scope ops would require an extra scratch sv (mul
+    // destroys input → can't recompute the original for the
+    // normalize step) — substrate-level page-allocator change beyond
+    // Phase 1's scope. Future optimisation: vectorize via uint64_t
+    // 4-lane unpack like mk-v2's `unpack_x4`/`pack_x4`.
+    //
+    // The typed atom replaces `Compute { body: format!(rmsnorm_body) }`
+    // with `Compute { calls: vec![RmsNormConsumerBody { ... }] }` —
+    // routes the body emit through Tk20Call::emit() so every CUDA
+    // fragment in the final .cu is traceable to a typed Rust atom
+    // (per feedback_dogfood_tk20_rust). The emit string is byte-
+    // identical to the legacy `rmsnorm_compute_body` so the existing
+    // `rmsnorm_kernel_matches_cpu_golden` test passes unchanged.
+
+    /// Emit the RmsNorm consumer compute body. Per-thread bf16
+    /// squared-sum + warp-wide `__shfl_xor_sync` reduce + per-thread
+    /// normalize. Gated to `__consumer_idx == 0` (single-warp scope —
+    /// other consumer warps fall through to `arrive(Done)`).
+    ///
+    /// `x_id` / `w_id`: page slot indices for the activation row and
+    /// gain weight row. `hidden`: row width. `eps`: rms epsilon
+    /// literal.
+    pub fn rmsnorm_consumer_body(x_id: u8, w_id: u8, hidden: u32, eps: f32) -> String {
+        format!(
+            r#"
+            // tk_warp_ir RmsNorm — RMS reduce + scale + apply weight (consumer warp 0)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
+            if (__consumer_idx == 0) {{
+                const unsigned int __hidden = {hidden}u;
+                const float __eps = {eps:?}f;
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                float __sumsq = 0.0f;
+                for (unsigned int __i = static_cast<unsigned int>(__lane);
+                     __i < __hidden; __i += 32u) {{
+                    const float __v = __bfloat162float(__x_smem[__i]);
+                    __sumsq += __v * __v;
+                }}
+                #pragma unroll
+                for (int __o = 16; __o > 0; __o >>= 1) {{
+                    __sumsq += __shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o);
+                }}
+                const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
+                for (unsigned int __i = static_cast<unsigned int>(__lane);
+                     __i < __hidden; __i += 32u) {{
+                    const float __v = __bfloat162float(__x_smem[__i]);
+                    const float __g = __bfloat162float(__w_smem[__i]);
+                    __x_smem[__i] = __float2bfloat16(__v * __scale * __g);
+                }}
+            }}
+"#
+        )
+    }
+
+    /// Emit the residual-Add consumer body. Element-wise A+B in place
+    /// on A's page, parallelised across all 8 consumer warps × 32
+    /// lanes (256 threads). All consumers participate (no
+    /// `__consumer_idx == 0` gate).
+    ///
+    /// `a_id` / `b_id`: page slots. `total`: `m * hidden` element count.
+    pub fn residual_add_consumer_body(a_id: u8, b_id: u8, total: u64) -> String {
+        format!(
+            r#"
+            // tk_warp_ir Residual Add — A+B in place on A's page (all consumer warps)
+            using T_act = __nv_bfloat16;
+            auto* __a_smem = reinterpret_cast<T_act*>(page_buf[{a_id}]);
+            auto* __b_smem = reinterpret_cast<T_act*>(page_buf[{b_id}]);
+            const unsigned int __total = {total}u;
+            const int __tid_in_consumers =
+                static_cast<int>(threadIdx.x) - 2 * 32;
+            const int __consumer_threads = 8 * 32;
+            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
+                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
+                const float __a = __bfloat162float(__a_smem[__i]);
+                const float __b = __bfloat162float(__b_smem[__i]);
+                __a_smem[__i] = __float2bfloat16(__a + __b);
+            }}
+"#
+        )
+    }
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1039,6 +1132,30 @@ pub enum Tk20Call {
     /// non-consumer warpgroups (loader/storer) to release registers
     /// for the consumers.
     WarpgroupDecreaseRegisters { n: u32 },
+
+    // ── Per-IType consumer body atoms (Phase 1+) ───────────────────
+    //
+    // Each variant emits the full consumer-warp compute body for one
+    // fused op, replacing the legacy `Compute { body: format!(...) }`
+    // route. Per `feedback_dogfood_tk20_rust`: every `kittens::*` text
+    // reaches the emitted .cu via a typed `Tk20Call` variant. These
+    // body atoms inline raw bf16 + `__shfl_xor_sync` CUDA where
+    // TK 2.0 doesn't expose a higher-level primitive (e.g. m=1
+    // RmsNorm row reduction — no register-tile match). The `mk-v2`
+    // (`~/git/Megakernels` `origin/mk-v2`, TK 2.0 sm_90a) production
+    // RmsNorm at `csrc/itypes/rmsnorm.cuh:130-180` does exactly the
+    // same: per-thread squared-sum + warp shfl + per-thread normalize,
+    // with `kittens::sv_bf<N>` only as a typed page alias.
+
+    /// RmsNorm consumer compute body. Per-thread bf16 squared-sum +
+    /// warp shfl-reduce + per-thread normalize. Bound through
+    /// `tk20::rmsnorm_consumer_body`.
+    RmsNormConsumerBody { x_id: u8, w_id: u8, hidden: u32, eps: f32 },
+
+    /// Residual-Add consumer compute body. All-consumer-warp
+    /// element-wise A+B in place on A's page. Bound through
+    /// `tk20::residual_add_consumer_body`.
+    ResidualAddConsumerBody { a_id: u8, b_id: u8, total: u64 },
 }
 
 impl Tk20Call {
@@ -1081,6 +1198,17 @@ impl Tk20Call {
             }
             Tk20Call::WarpgroupDecreaseRegisters { n } => {
                 tk20::warpgroup_decrease_registers(*n)
+            }
+
+            Tk20Call::RmsNormConsumerBody {
+                x_id,
+                w_id,
+                hidden,
+                eps,
+            } => tk20::rmsnorm_consumer_body(*x_id, *w_id, *hidden, *eps),
+
+            Tk20Call::ResidualAddConsumerBody { a_id, b_id, total } => {
+                tk20::residual_add_consumer_body(*a_id, *b_id, *total)
             }
         }
     }
@@ -1604,6 +1732,140 @@ mod tests {
         assert_eq!(emitted[1], "kittens::warpgroup::mma_AB(d, a, b);");
         assert_eq!(emitted[2], "kittens::warpgroup::mma_commit_group();");
         assert_eq!(emitted[3], "kittens::warpgroup::mma_async_wait<0>();");
+    }
+
+    #[test]
+    fn tk20_rmsnorm_consumer_body_emits_legacy_compatible_cuda() {
+        // Phase 1 typed atom — emit must be byte-identical to the
+        // legacy `tk_lower::rmsnorm_compute_body` so the existing
+        // `rmsnorm_kernel_matches_cpu_golden` test passes unchanged
+        // when FERRITE_NEW_RMSNORM is set.
+        let body = tk20::rmsnorm_consumer_body(0, 1, 2048, 1.0e-5);
+        // Spot-check the load-bearing CUDA fragments.
+        assert!(body.contains("auto* __x_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
+        assert!(body.contains("auto* __w_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+        assert!(body.contains("const unsigned int __hidden = 2048u;"));
+        assert!(body.contains("if (__consumer_idx == 0) {"));
+        assert!(body.contains("__shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o)"));
+        assert!(body.contains("rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps)"));
+        assert!(body.contains("__float2bfloat16(__v * __scale * __g)"));
+        // No TK 1.0 idioms — no per-warp wgmma in the body, no
+        // thread-scope tma calls (the body uses only raw bf16 +
+        // shfl_xor; TMA is the loader/storer's job, not the consumer's).
+        assert!(!body.contains("kittens::tma::"));
+        assert!(!body.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn tk20_residual_add_consumer_body_emits_legacy_compatible_cuda() {
+        let body = tk20::residual_add_consumer_body(2, 3, 2048);
+        assert!(body.contains("auto* __a_smem = reinterpret_cast<T_act*>(page_buf[2]);"));
+        assert!(body.contains("auto* __b_smem = reinterpret_cast<T_act*>(page_buf[3]);"));
+        assert!(body.contains("const unsigned int __total = 2048u;"));
+        // All-consumer parallelism: each consumer thread processes a
+        // strided slice of the row.
+        assert!(body.contains("const int __consumer_threads = 8 * 32;"));
+        assert!(body.contains("__float2bfloat16(__a + __b)"));
+        assert!(!body.contains("kittens::tma::"));
+        assert!(!body.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn tk20_call_rmsnorm_atom_round_trip_matches_binding() {
+        // Tk20Call::RmsNormConsumerBody.emit() must byte-equal the
+        // direct binding call (delegation contract).
+        let direct = tk20::rmsnorm_consumer_body(0, 1, 2048, 1.0e-5);
+        let via_atom = Tk20Call::RmsNormConsumerBody {
+            x_id: 0,
+            w_id: 1,
+            hidden: 2048,
+            eps: 1.0e-5,
+        }
+        .emit();
+        assert_eq!(direct, via_atom);
+    }
+
+    #[test]
+    fn tk20_call_residual_add_atom_round_trip_matches_binding() {
+        let direct = tk20::residual_add_consumer_body(2, 3, 2048);
+        let via_atom = Tk20Call::ResidualAddConsumerBody {
+            a_id: 2,
+            b_id: 3,
+            total: 2048,
+        }
+        .emit();
+        assert_eq!(direct, via_atom);
+    }
+
+    #[test]
+    fn tk20_rmsnorm_atom_byte_identical_to_legacy_format_body() {
+        // Phase 1 contract: the typed atom emits byte-identical CUDA
+        // to the legacy `tk_lower::rmsnorm_compute_body`. This ensures
+        // the existing `rmsnorm_kernel_matches_cpu_golden` golden test
+        // passes when FERRITE_NEW_RMSNORM is set without any tolerance
+        // change.
+        use crate::lower::LoweredOp;
+        use crate::subtile_ir::BufId;
+        use crate::tk_lower::RmsNormOp;
+        let op = RmsNormOp {
+            x: BufId(0),
+            weight: BufId(1),
+            out: BufId(2),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+            eps: 1.0e-5,
+            init: false,
+        };
+        let _ = LoweredOp::RmsNorm { eps: op.eps }; // type-check the op exists
+        let typed = Tk20Call::RmsNormConsumerBody {
+            x_id: 0,
+            w_id: 1,
+            hidden: 2048,
+            eps: 1.0e-5,
+        }
+        .emit();
+        // Build the legacy body via the existing public path (the
+        // `prog.compute(role, body)` setter exposes it). We can't
+        // call the private `rmsnorm_compute_body` directly, so reach
+        // through the lowering's emit:
+        let mut p = TkProgram::new();
+        p.compute(WarpRole::AllConsumers, crate::tk_lower::rmsnorm_compute_body_for_test(&op, 0, 1));
+        let legacy_body = match &p.instrs[0] {
+            TkInstr::Compute { calls, .. } => calls[0].emit(),
+            _ => panic!("expected Compute"),
+        };
+        assert_eq!(legacy_body, typed);
+    }
+
+    #[test]
+    fn tk20_residual_add_atom_byte_identical_to_legacy_format_body() {
+        use crate::subtile_ir::BufId;
+        use crate::tk_lower::AddOp;
+        let op = AddOp {
+            a: BufId(0),
+            b: BufId(1),
+            out: BufId(2),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+        };
+        let typed = Tk20Call::ResidualAddConsumerBody {
+            a_id: 2,
+            b_id: 3,
+            total: op.hidden as u64 * op.m as u64,
+        }
+        .emit();
+        let mut p = TkProgram::new();
+        p.compute(
+            WarpRole::AllConsumers,
+            crate::tk_lower::residual_add_compute_body_for_test(&op, 2, 3),
+        );
+        let legacy_body = match &p.instrs[0] {
+            TkInstr::Compute { calls, .. } => calls[0].emit(),
+            _ => panic!("expected Compute"),
+        };
+        assert_eq!(legacy_body, typed);
     }
 
     #[test]

@@ -208,7 +208,25 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
     //    arrive Done on both. ──
     let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
     let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
-    prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op, x_id, w_id));
+    // Phase 1: route the compute body through a typed `Tk20Call`
+    // atom. `FERRITE_NEW_RMSNORM=1` opts in to the typed path; the
+    // emit is byte-identical to the legacy `format!()` body (the
+    // typed atom delegates to `tk20::rmsnorm_consumer_body`, which
+    // emits the same CUDA) — the gate is a safety net for the
+    // cutover phase per the plan, not a behavior change.
+    if std::env::var_os("FERRITE_NEW_RMSNORM").is_some() {
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
+                x_id,
+                w_id,
+                hidden: op.hidden,
+                eps: op.eps,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, rmsnorm_compute_body(&op, x_id, w_id));
+    }
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
 
@@ -243,6 +261,15 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
 /// reductions but the slice doesn't need them yet, and using bare
 /// CUDA primitives keeps the emit independent of TK 2.0's typed-tile
 /// machinery for now.
+/// Test-only wrapper exposing the legacy `rmsnorm_compute_body` so
+/// the byte-identity test in `tk_codegen` can compare typed-atom
+/// output against the legacy `format!()` output without making the
+/// private fn `pub`.
+#[cfg(test)]
+pub fn rmsnorm_compute_body_for_test(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
+    rmsnorm_compute_body(op, x_id, w_id)
+}
+
 fn rmsnorm_compute_body(op: &RmsNormOp, x_id: u8, w_id: u8) -> String {
     let RmsNormOp { hidden, eps, .. } = *op;
     format!(
@@ -747,7 +774,20 @@ pub fn lower_residual_add<P: Phase>(
     //    arrives Done on both. ──
     let a_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, a_page);
     let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
-    prog.compute(WarpRole::AllConsumers, residual_add_compute_body(&op, a_id, b_id));
+    // Phase 1: typed `Tk20Call::ResidualAddConsumerBody`. See
+    // `lower_rmsnorm` for the env-gate rationale.
+    if std::env::var_os("FERRITE_NEW_ADD").is_some() {
+        prog.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+                a_id,
+                b_id,
+                total: op.hidden as u64 * op.m as u64,
+            }],
+        );
+    } else {
+        prog.compute(WarpRole::AllConsumers, residual_add_compute_body(&op, a_id, b_id));
+    }
     let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
     let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
 
@@ -761,6 +801,13 @@ pub fn lower_residual_add<P: Phase>(
 
     pages.release(prog.complete_round(a_page));
     pages.release(prog.complete_round(b_page));
+}
+
+/// Test-only wrapper for the legacy `residual_add_compute_body`. See
+/// `rmsnorm_compute_body_for_test`.
+#[cfg(test)]
+pub fn residual_add_compute_body_for_test(op: &AddOp, a_id: u8, b_id: u8) -> String {
+    residual_add_compute_body(op, a_id, b_id)
 }
 
 fn residual_add_compute_body(op: &AddOp, a_id: u8, b_id: u8) -> String {

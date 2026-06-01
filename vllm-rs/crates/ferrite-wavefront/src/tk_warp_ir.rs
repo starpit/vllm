@@ -259,12 +259,22 @@ pub enum TkInstr {
         dyn_byte_off: Option<String>,
     },
 
-    /// Inline compute fragment in a consumer warp. Used for ops
-    /// without a TK 2.0 primitive (RMS reduction, residual add). The
-    /// `body` text has been pre-resolved by the per-op atom — codegen
-    /// pastes it into the role-routed arm verbatim. (Equivalent of
-    /// today's atom_lib `emit_*_body` but shorter, single-warp scope.)
-    Compute { role: WarpRole, body: String },
+    /// Inline compute fragment in a consumer (or other) warp role.
+    ///
+    /// The body is a `Vec<Tk20Call>`: each entry is one TK 2.0
+    /// primitive call (or, during transition, a `RawString` carrying a
+    /// pre-resolved CUDA fragment from a legacy `format!()` body).
+    /// Codegen walks `calls` in order, emitting one CUDA statement per
+    /// element via the typed `tk20::*` Rust API.
+    ///
+    /// This replaces a previous `Compute { body: String }` shape; the
+    /// `RawString` `Tk20Call` variant is the bridge — it forwards the
+    /// String verbatim — and gets sunset when every `lower_*` has been
+    /// migrated to typed primitives (per `feedback_dogfood_tk20_rust`).
+    Compute {
+        role: WarpRole,
+        calls: Vec<crate::tk_codegen::Tk20Call>,
+    },
 
     /// Group sync (`kittens::group<NUM_CONSUMER_WARPS>::sync()`).
     Sync { role: WarpRole },
@@ -522,11 +532,22 @@ impl TkProgram {
         });
     }
 
+    /// Append a `Compute { calls: vec![Tk20Call::RawString(body)] }`.
+    /// Bridge for legacy `format!()` lowerings; sunset when every
+    /// `lower_*` migrates to the typed `tk20::*` API.
     pub fn compute(&mut self, role: WarpRole, body: impl Into<String>) {
         self.instrs.push(TkInstr::Compute {
             role,
-            body: body.into(),
+            calls: vec![crate::tk_codegen::Tk20Call::RawString(body.into())],
         });
+    }
+
+    /// Append a `Compute` whose body is a typed `tk20::*` call list.
+    /// New per-op lowerings (Phase 1+) build a `Vec<Tk20Call>` of
+    /// typed primitive variants and call this. The `RawString` variant
+    /// is forbidden in lowerings landed via this entry point.
+    pub fn compute_calls(&mut self, role: WarpRole, calls: Vec<crate::tk_codegen::Tk20Call>) {
+        self.instrs.push(TkInstr::Compute { role, calls });
     }
 
     pub fn sync(&mut self, role: WarpRole) {

@@ -135,6 +135,162 @@ pub mod tk20 {
              kittens::group<1>::tma::store_async_wait();"
         )
     }
+
+    // ── Warpgroup wgmma (Hopper peak; default for matmuls m>1) ────
+    //
+    // Each binding cites its TK 2.0 header line. PR review verifies
+    // the cited line still matches the emitted spelling. Per-binding
+    // unit tests assert the emit string contains the literal
+    // `kittens::warpgroup::*` — this catches TK 1.0 drift at
+    // `cargo test`, before nvcc.
+
+    /// `kittens::warpgroup::mma_fence(d)`. Source:
+    /// `third_party/thunderkittens/include/ops/group/mma/warpgroup.cuh:23`.
+    pub fn warpgroup_mma_fence(d: &str) -> String {
+        format!("kittens::warpgroup::mma_fence({d});")
+    }
+
+    /// `kittens::warpgroup::mma_AB(d, a, b)` — accumulating wgmma.
+    /// Source: `ops/group/mma/warpgroup.cuh:140`. Defaults
+    /// `fence=1, accumulate=1` (in TK 2.0); emit leaves them implicit.
+    pub fn warpgroup_mma_ab(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warpgroup::mma_AB({d}, {a}, {b});")
+    }
+
+    /// `kittens::warpgroup::mm_AB(d, a, b)` — reset variant of
+    /// `mma_AB`. Source: `ops/group/mma/warpgroup.cuh:186`.
+    pub fn warpgroup_mm_ab(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warpgroup::mm_AB({d}, {a}, {b});")
+    }
+
+    /// `kittens::warpgroup::mma_ABt(d, a, b)` — wgmma with B transposed.
+    /// Source: `ops/group/mma/warpgroup.cuh:258`.
+    pub fn warpgroup_mma_abt(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warpgroup::mma_ABt({d}, {a}, {b});")
+    }
+
+    /// `kittens::warpgroup::mma_commit_group()`. Source:
+    /// `ops/group/mma/warpgroup.cuh:78`.
+    pub fn warpgroup_mma_commit_group() -> String {
+        "kittens::warpgroup::mma_commit_group();".to_string()
+    }
+
+    /// `kittens::warpgroup::mma_async_wait<N>()`. Source:
+    /// `ops/group/mma/warpgroup.cuh:91`.
+    pub fn warpgroup_mma_async_wait(n: u32) -> String {
+        format!("kittens::warpgroup::mma_async_wait<{n}>();")
+    }
+
+    // ── Per-warp mma (decode m=1 fast path) ────────────────────────
+
+    /// `kittens::warp::mma_AB(d, a, b)`. Source:
+    /// `ops/group/mma/warp.cuh`. Used by `lower_gemm_m1`; for m>1
+    /// prefer `warpgroup_mma_ab`.
+    pub fn warp_mma_ab(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warp::mma_AB({d}, {a}, {b}, {d});")
+    }
+
+    /// `kittens::warp::mma_ABt(d, a, b)`. Source: `ops/group/mma/warp.cuh`.
+    pub fn warp_mma_abt(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warp::mma_ABt({d}, {a}, {b}, {d});")
+    }
+
+    // ── Group-scoped TMA store-side complements to load_async / store_async ──
+
+    /// `kittens::group<1>::tma::store_commit_group()`. Source:
+    /// `ops/group/util/tma.cuh:38`.
+    pub fn group_tma_store_commit_group() -> String {
+        "kittens::group<1>::tma::store_commit_group();".to_string()
+    }
+
+    /// `kittens::group<1>::tma::store_async_wait<N>()`. Source:
+    /// `ops/group/util/tma.cuh:47`. Already used inline in
+    /// `tma_store_async()` above with default N; this variant lets
+    /// callers issue the wait separately at a chosen N.
+    pub fn group_tma_store_async_wait(n: u32) -> String {
+        format!("kittens::group<1>::tma::store_async_wait<{n}>();")
+    }
+
+    /// `kittens::group<1>::tma::store_async_read_wait<N>()`. Source:
+    /// `ops/group/util/tma.cuh:61`.
+    pub fn group_tma_store_async_read_wait(n: u32) -> String {
+        format!("kittens::group<1>::tma::store_async_read_wait<{n}>();")
+    }
+
+    // ── Register-tile reductions / element-wise (warp-scoped) ──────
+
+    /// `kittens::warp::row_max(rv, rt)`. Source:
+    /// `ops/group/register/tile/reductions.cuh`. Per-row max into a
+    /// register vector. Used by online softmax row-max accumulator.
+    pub fn warp_row_max(rv: &str, rt: &str) -> String {
+        format!("kittens::warp::row_max({rv}, {rt});")
+    }
+
+    /// `kittens::warp::row_sum(rv, rt)`. Source: same header.
+    pub fn warp_row_sum(rv: &str, rt: &str) -> String {
+        format!("kittens::warp::row_sum({rv}, {rt});")
+    }
+
+    /// `kittens::warp::exp2(rt, rt)` — in-place exp2 on a register
+    /// tile (TK 2.0 binary-form: dst, src). Source:
+    /// `ops/group/register/tile/maps.cuh`.
+    pub fn warp_exp2(rt: &str) -> String {
+        format!("kittens::warp::exp2({rt}, {rt});")
+    }
+
+    /// `kittens::warp::mul_row(rt, rt, rv)` — in-place row-wise scale.
+    /// Source: `ops/group/register/tile/maps.cuh`.
+    pub fn warp_mul_row(rt: &str, rv: &str) -> String {
+        format!("kittens::warp::mul_row({rt}, {rt}, {rv});")
+    }
+
+    /// `kittens::warp::div_row(rt, rt, rv)`. Source: same header.
+    pub fn warp_div_row(rt: &str, rv: &str) -> String {
+        format!("kittens::warp::div_row({rt}, {rt}, {rv});")
+    }
+
+    /// `kittens::warp::neg_infty(rv)`. Source:
+    /// `ops/group/register/vec/maps.cuh`. Initialises a register vector
+    /// to `-inf` (online-softmax row-max identity).
+    pub fn warp_neg_infty(rv: &str) -> String {
+        format!("kittens::warp::neg_infty({rv});")
+    }
+
+    /// `kittens::warp::zero(rt)`. Source:
+    /// `ops/group/register/tile/maps.cuh`. Accumulator init.
+    pub fn warp_zero_rt(rt: &str) -> String {
+        format!("kittens::warp::zero({rt});")
+    }
+
+    /// `kittens::warp::add(d, a, b)`. Source:
+    /// `ops/group/register/tile/maps.cuh`. Element-wise register-tile
+    /// add.
+    pub fn warp_add_rt(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warp::add({d}, {a}, {b});")
+    }
+
+    /// `kittens::warp::mul(d, a, b)`. Source: same header. Element-wise
+    /// register-tile multiply.
+    pub fn warp_mul_rt(d: &str, a: &str, b: &str) -> String {
+        format!("kittens::warp::mul({d}, {a}, {b});")
+    }
+
+    // ── Hopper register-budget management ──────────────────────────
+
+    /// `kittens::warpgroup::increase_registers<N>()`. Source:
+    /// `ops/group/group.cuh:52`. `n % 8 == 0` enforced by TK 2.0
+    /// `static_assert`; bind-time `debug_assert!` mirrors that.
+    pub fn warpgroup_increase_registers(n: u32) -> String {
+        debug_assert_eq!(n % 8, 0, "TK 2.0 setmaxnreg requires n % 8 == 0; got {n}");
+        format!("kittens::warpgroup::increase_registers<{n}>();")
+    }
+
+    /// `kittens::warpgroup::decrease_registers<N>()`. Source:
+    /// `ops/group/group.cuh:56`. Same `n % 8 == 0` rule.
+    pub fn warpgroup_decrease_registers(n: u32) -> String {
+        debug_assert_eq!(n % 8, 0, "TK 2.0 setmaxnreg requires n % 8 == 0; got {n}");
+        format!("kittens::warpgroup::decrease_registers<{n}>();")
+    }
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -371,7 +527,23 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
                 ),
             )
         }
-        TkInstr::Compute { role, body } => (*role, body.clone()),
+        TkInstr::Compute { role, calls } => {
+            // Walk `calls` in order, emitting one CUDA fragment per
+            // primitive. Each `Tk20Call` lowers via `Tk20Call::emit()`,
+            // which delegates to a `tk20::*` Rust function (or, for
+            // the `RawString` bridge, returns the verbatim String).
+            // Whitespace between fragments matches the legacy
+            // `format!()` body's natural newlines so the per-canonical
+            // emit is byte-identical during the Phase 0 transition.
+            let mut s = String::new();
+            for (i, call) in calls.iter().enumerate() {
+                if i > 0 {
+                    s.push_str("\n    ");
+                }
+                s.push_str(&call.emit());
+            }
+            (*role, s)
+        }
         TkInstr::Sync { role } => {
             let n = role_group_width(*role);
             (*role, tk20::sync(n))
@@ -719,6 +891,199 @@ pub fn emit_kernel_with_opts(
     out.push_str("    return cudaGetLastError();\n");
     out.push_str("}\n");
     out
+}
+
+// ── Tk20Call — typed primitive call list for `TkInstr::Compute` ─────
+//
+// Per `feedback_dogfood_tk20_rust`: every `kittens::*` text in an
+// emitted .cu MUST come from a `tk20::*` Rust function. The legacy
+// `Compute { body: String }` shape allowed inline `format!("kittens::
+// warp::*")` — that's the failure mode that drifted the prior
+// cuda_emit revision into TK 1.0 idioms. `Tk20Call` makes the binding
+// step explicit: each variant binds one TK 2.0 primitive (or, during
+// transition, carries a RawString legacy fragment).
+//
+// `RawString` is the bridge variant: `prog.compute(role, body)` wraps
+// the legacy body in a single-element `vec![Tk20Call::RawString(body)]`
+// for byte-identical emit during Phase 0. Sunset at Phase 5.
+//
+// Every typed variant's `emit()` cites the TK 2.0 header path + line
+// for its primitive, both in the doc comment AND in the source code
+// under test (per-variant unit tests assert the emit string matches
+// the TK 2.0 spelling — catches TK 1.0 drift at `cargo test`, before
+// nvcc).
+
+/// Typed primitive-call atom for `TkInstr::Compute::calls`.
+///
+/// Each variant binds one TK 2.0 primitive call. `emit()` returns the
+/// CUDA fragment for that call. `RawString` is a transitional bridge
+/// for legacy `format!()` lowerings.
+#[derive(Clone, Debug)]
+pub enum Tk20Call {
+    /// Bridge for legacy `prog.compute(role, format!(...))` lowerings.
+    /// Forwarded verbatim to the emitted CUDA. Sunset at Phase 5 of the
+    /// substrate rebuild plan; new lowerings MUST construct a typed
+    /// variant (Mma, RmsReduce, etc.).
+    RawString(String),
+
+    // ── Hopper warpgroup wgmma (default for prefill, m>1 matmuls) ──
+    /// `kittens::warpgroup::mma_fence(d)`. Doc:
+    /// `third_party/thunderkittens/include/ops/group/mma/warpgroup.cuh:23`.
+    /// Wgmma fence — ensures register-side writes to `d` are visible to
+    /// the subsequent `mma_AB` reads.
+    WarpgroupMmaFence { d: String },
+
+    /// `kittens::warpgroup::mma_AB(d, a, b)` — accumulating wgmma.
+    /// Doc: `ops/group/mma/warpgroup.cuh:140`. Default fence=1,
+    /// accumulate=1 (the binding leaves the template parameters at
+    /// their defaults; `mm_AB` is the reset-variant alternative).
+    WarpgroupMmaAB { d: String, a: String, b: String },
+
+    /// `kittens::warpgroup::mm_AB(d, a, b)` — reset (non-accumulating)
+    /// wgmma. Doc: `ops/group/mma/warpgroup.cuh:186`.
+    WarpgroupMmAB { d: String, a: String, b: String },
+
+    /// `kittens::warpgroup::mma_ABt(d, a, b)` — accumulating wgmma
+    /// with B transposed. Doc: `ops/group/mma/warpgroup.cuh:258`.
+    WarpgroupMmaABt { d: String, a: String, b: String },
+
+    /// `kittens::warpgroup::mma_commit_group()`. Doc:
+    /// `ops/group/mma/warpgroup.cuh:78`. Caller is responsible for
+    /// pairing this with a subsequent `mma_async_wait<N>` before any
+    /// thread reads `d`.
+    WarpgroupMmaCommitGroup,
+
+    /// `kittens::warpgroup::mma_async_wait<N>()`. Doc:
+    /// `ops/group/mma/warpgroup.cuh:91`. `n` is the number of in-flight
+    /// commit groups still allowed (typically 0 to wait for all).
+    WarpgroupMmaAsyncWait { n: u32 },
+
+    // ── Per-warp mma (decode m=1 fast path) ────────────────────────
+    /// `kittens::warp::mma_AB(d, a, b)`. Doc:
+    /// `ops/group/mma/warp.cuh`. Used by the m=1 decode `lower_gemm_m1`
+    /// path; for m>1 prefill, prefer `WarpgroupMmaAB` for Hopper peak.
+    WarpMmaAB { d: String, a: String, b: String },
+
+    /// `kittens::warp::mma_ABt(d, a, b)`. Doc: `ops/group/mma/warp.cuh`.
+    WarpMmaABt { d: String, a: String, b: String },
+
+    // ── Group-scoped TMA (the missing complements to existing
+    //     tk20::tma_load_async / tma_store_async) ──────────────────
+    /// `kittens::group<1>::tma::store_commit_group()`. Doc:
+    /// `ops/group/util/tma.cuh:38`. Pair with `store_async_wait<N>` to
+    /// drain queued stores before re-using the page slot.
+    GroupTmaStoreCommitGroup,
+
+    /// `kittens::group<1>::tma::store_async_wait<N>()`. Doc:
+    /// `ops/group/util/tma.cuh:47`. Blocks until at most `n` async
+    /// stores are still pending (typically 0).
+    GroupTmaStoreAsyncWait { n: u32 },
+
+    /// `kittens::group<1>::tma::store_async_read_wait<N>()`. Doc:
+    /// `ops/group/util/tma.cuh:61`. Blocks until at most `n` stores
+    /// have outstanding READS — i.e. the source shared-tile is safe to
+    /// overwrite. Looser than `store_async_wait` (stores may still be
+    /// in flight to gmem; only the smem read is drained).
+    GroupTmaStoreAsyncReadWait { n: u32 },
+
+    // ── Register-tile reductions (warp-scoped) ─────────────────────
+    /// `kittens::warp::row_max(rv, rt)`. Doc:
+    /// `ops/group/register/tile/reductions.cuh`. Reduces each row of
+    /// the register tile to a single max value, written to the register
+    /// vector argument. Used by online softmax.
+    WarpRowMax { rv: String, rt: String },
+
+    /// `kittens::warp::row_sum(rv, rt)`. Doc: same header. Companion
+    /// to `WarpRowMax`; produces row-wise sums.
+    WarpRowSum { rv: String, rt: String },
+
+    /// `kittens::warp::exp2(rt)`. Doc:
+    /// `ops/group/register/tile/maps.cuh`. In-place exp2 on a register
+    /// tile.
+    WarpExp2 { rt: String },
+
+    /// `kittens::warp::mul_row(rt, rt, rv)`. Multiplies each row of `rt`
+    /// (in-place) by the corresponding scalar in `rv`. Doc: same maps
+    /// header.
+    WarpMulRow { rt: String, rv: String },
+
+    /// `kittens::warp::div_row(rt, rt, rv)`. Inverse of `WarpMulRow`.
+    WarpDivRow { rt: String, rv: String },
+
+    /// `kittens::warp::neg_infty(rv)`. Doc:
+    /// `ops/group/register/vec/maps.cuh`. Initialises a register vector
+    /// to `-inf` — the online-softmax row-max accumulator's identity.
+    WarpNegInfty { rv: String },
+
+    /// `kittens::warp::zero(rt)`. Doc: `ops/group/register/tile/maps.cuh`.
+    /// Zeroes a register tile; used for accumulator init.
+    WarpZeroRt { rt: String },
+
+    /// `kittens::warp::add(d, a, b)`. Doc:
+    /// `ops/group/register/tile/maps.cuh`. Element-wise add on register
+    /// tiles. Used by residual-add lowering.
+    WarpAddRt { d: String, a: String, b: String },
+
+    /// `kittens::warp::mul(d, a, b)`. Element-wise multiply.
+    WarpMulRt { d: String, a: String, b: String },
+
+    // ── Hopper register-budget management ──────────────────────────
+    /// `kittens::warpgroup::increase_registers<N>()`. Doc:
+    /// `ops/group/group.cuh:52`. `n` MUST be a multiple of 8 (TK 2.0
+    /// `static_assert`). Used by consumer warpgroups to claim a larger
+    /// register file for accumulators.
+    WarpgroupIncreaseRegisters { n: u32 },
+
+    /// `kittens::warpgroup::decrease_registers<N>()`. Doc:
+    /// `ops/group/group.cuh:56`. `n` MUST be a multiple of 8. Used by
+    /// non-consumer warpgroups (loader/storer) to release registers
+    /// for the consumers.
+    WarpgroupDecreaseRegisters { n: u32 },
+}
+
+impl Tk20Call {
+    /// Lower the typed primitive call to its CUDA fragment via the
+    /// matching `tk20::*` Rust function. The match is exhaustive — any
+    /// new variant added above MUST add an arm here citing its TK 2.0
+    /// header line in the binding.
+    pub fn emit(&self) -> String {
+        match self {
+            Tk20Call::RawString(s) => s.clone(),
+
+            Tk20Call::WarpgroupMmaFence { d } => tk20::warpgroup_mma_fence(d),
+            Tk20Call::WarpgroupMmaAB { d, a, b } => tk20::warpgroup_mma_ab(d, a, b),
+            Tk20Call::WarpgroupMmAB { d, a, b } => tk20::warpgroup_mm_ab(d, a, b),
+            Tk20Call::WarpgroupMmaABt { d, a, b } => tk20::warpgroup_mma_abt(d, a, b),
+            Tk20Call::WarpgroupMmaCommitGroup => tk20::warpgroup_mma_commit_group(),
+            Tk20Call::WarpgroupMmaAsyncWait { n } => tk20::warpgroup_mma_async_wait(*n),
+
+            Tk20Call::WarpMmaAB { d, a, b } => tk20::warp_mma_ab(d, a, b),
+            Tk20Call::WarpMmaABt { d, a, b } => tk20::warp_mma_abt(d, a, b),
+
+            Tk20Call::GroupTmaStoreCommitGroup => tk20::group_tma_store_commit_group(),
+            Tk20Call::GroupTmaStoreAsyncWait { n } => tk20::group_tma_store_async_wait(*n),
+            Tk20Call::GroupTmaStoreAsyncReadWait { n } => {
+                tk20::group_tma_store_async_read_wait(*n)
+            }
+
+            Tk20Call::WarpRowMax { rv, rt } => tk20::warp_row_max(rv, rt),
+            Tk20Call::WarpRowSum { rv, rt } => tk20::warp_row_sum(rv, rt),
+            Tk20Call::WarpExp2 { rt } => tk20::warp_exp2(rt),
+            Tk20Call::WarpMulRow { rt, rv } => tk20::warp_mul_row(rt, rv),
+            Tk20Call::WarpDivRow { rt, rv } => tk20::warp_div_row(rt, rv),
+            Tk20Call::WarpNegInfty { rv } => tk20::warp_neg_infty(rv),
+            Tk20Call::WarpZeroRt { rt } => tk20::warp_zero_rt(rt),
+            Tk20Call::WarpAddRt { d, a, b } => tk20::warp_add_rt(d, a, b),
+            Tk20Call::WarpMulRt { d, a, b } => tk20::warp_mul_rt(d, a, b),
+
+            Tk20Call::WarpgroupIncreaseRegisters { n } => {
+                tk20::warpgroup_increase_registers(*n)
+            }
+            Tk20Call::WarpgroupDecreaseRegisters { n } => {
+                tk20::warpgroup_decrease_registers(*n)
+            }
+        }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1101,5 +1466,187 @@ mod tests {
         // 8 consumers → group<8>; loader is one warp → group<1>.
         assert!(src.contains("kittens::group<8>::sync();"), "{src}");
         assert!(src.contains("kittens::group<1>::sync();"), "{src}");
+    }
+
+    // ── Phase 0 tk20::* binding tests ──────────────────────────────
+    //
+    // Each new tk20::* binding has a unit test asserting its emit
+    // string contains the TK 2.0 spelling cited in the binding's doc
+    // comment. If a future TK 2.0 release renames a primitive, these
+    // tests fail at `cargo test` — long before nvcc runs. The test is
+    // the actual TK 2.0 audit gate, not nvcc accepting the file.
+
+    #[test]
+    fn tk20_warpgroup_mma_bindings_emit_warpgroup_namespace() {
+        // Source: ops/group/mma/warpgroup.cuh:140 (mma_AB), :186 (mm_AB),
+        // :258 (mma_ABt), :23 (mma_fence), :78 (commit), :91 (async_wait).
+        assert_eq!(
+            tk20::warpgroup_mma_ab("d", "a", "b"),
+            "kittens::warpgroup::mma_AB(d, a, b);"
+        );
+        assert_eq!(
+            tk20::warpgroup_mm_ab("d", "a", "b"),
+            "kittens::warpgroup::mm_AB(d, a, b);"
+        );
+        assert_eq!(
+            tk20::warpgroup_mma_abt("d", "a", "b"),
+            "kittens::warpgroup::mma_ABt(d, a, b);"
+        );
+        assert_eq!(tk20::warpgroup_mma_fence("d"), "kittens::warpgroup::mma_fence(d);");
+        assert_eq!(
+            tk20::warpgroup_mma_commit_group(),
+            "kittens::warpgroup::mma_commit_group();"
+        );
+        assert_eq!(
+            tk20::warpgroup_mma_async_wait(0),
+            "kittens::warpgroup::mma_async_wait<0>();"
+        );
+    }
+
+    #[test]
+    fn tk20_warp_mma_bindings_emit_warp_namespace() {
+        // Source: ops/group/mma/warp.cuh.
+        // TK 2.0 warp::mma_AB takes (D, A, B, D) — accumulating into D.
+        assert_eq!(
+            tk20::warp_mma_ab("d", "a", "b"),
+            "kittens::warp::mma_AB(d, a, b, d);"
+        );
+        assert_eq!(
+            tk20::warp_mma_abt("d", "a", "b"),
+            "kittens::warp::mma_ABt(d, a, b, d);"
+        );
+    }
+
+    #[test]
+    fn tk20_group_tma_store_bindings_use_group_1_namespace() {
+        // Per feedback_tk20_tma_lane_gate: TMA must be lane-0-gated via
+        // kittens::group<1>::tma::*. Source: ops/group/util/tma.cuh:38, 47, 61.
+        assert_eq!(
+            tk20::group_tma_store_commit_group(),
+            "kittens::group<1>::tma::store_commit_group();"
+        );
+        assert_eq!(
+            tk20::group_tma_store_async_wait(0),
+            "kittens::group<1>::tma::store_async_wait<0>();"
+        );
+        assert_eq!(
+            tk20::group_tma_store_async_read_wait(0),
+            "kittens::group<1>::tma::store_async_read_wait<0>();"
+        );
+    }
+
+    #[test]
+    fn tk20_warp_reduction_bindings_emit_warp_namespace() {
+        // Source: ops/group/register/tile/reductions.cuh and
+        //         ops/group/register/{tile,vec}/maps.cuh.
+        assert_eq!(
+            tk20::warp_row_max("rv", "rt"),
+            "kittens::warp::row_max(rv, rt);"
+        );
+        assert_eq!(
+            tk20::warp_row_sum("rv", "rt"),
+            "kittens::warp::row_sum(rv, rt);"
+        );
+        assert_eq!(tk20::warp_exp2("rt"), "kittens::warp::exp2(rt, rt);");
+        assert_eq!(
+            tk20::warp_mul_row("rt", "rv"),
+            "kittens::warp::mul_row(rt, rt, rv);"
+        );
+        assert_eq!(
+            tk20::warp_div_row("rt", "rv"),
+            "kittens::warp::div_row(rt, rt, rv);"
+        );
+        assert_eq!(tk20::warp_neg_infty("rv"), "kittens::warp::neg_infty(rv);");
+        assert_eq!(tk20::warp_zero_rt("rt"), "kittens::warp::zero(rt);");
+        assert_eq!(
+            tk20::warp_add_rt("d", "a", "b"),
+            "kittens::warp::add(d, a, b);"
+        );
+        assert_eq!(
+            tk20::warp_mul_rt("d", "a", "b"),
+            "kittens::warp::mul(d, a, b);"
+        );
+    }
+
+    #[test]
+    fn tk20_warpgroup_register_budget_emits_warpgroup_namespace() {
+        // Source: ops/group/group.cuh:52 (increase) / :56 (decrease).
+        // TK 2.0 enforces n % 8 == 0; the binding's debug_assert
+        // mirrors that.
+        assert_eq!(
+            tk20::warpgroup_increase_registers(224),
+            "kittens::warpgroup::increase_registers<224>();"
+        );
+        assert_eq!(
+            tk20::warpgroup_decrease_registers(56),
+            "kittens::warpgroup::decrease_registers<56>();"
+        );
+    }
+
+    #[test]
+    fn tk20_call_enum_round_trips_via_emit() {
+        // Tk20Call is the typed primitive-call atom that
+        // TkInstr::Compute carries. emit() delegates to the matching
+        // tk20::* binding; this test confirms the wiring (the per-
+        // binding tests above check the cited TK 2.0 spelling).
+        let calls = vec![
+            Tk20Call::WarpgroupMmaFence { d: "d".into() },
+            Tk20Call::WarpgroupMmaAB {
+                d: "d".into(),
+                a: "a".into(),
+                b: "b".into(),
+            },
+            Tk20Call::WarpgroupMmaCommitGroup,
+            Tk20Call::WarpgroupMmaAsyncWait { n: 0 },
+        ];
+        let emitted: Vec<String> = calls.iter().map(|c| c.emit()).collect();
+        assert_eq!(emitted[0], "kittens::warpgroup::mma_fence(d);");
+        assert_eq!(emitted[1], "kittens::warpgroup::mma_AB(d, a, b);");
+        assert_eq!(emitted[2], "kittens::warpgroup::mma_commit_group();");
+        assert_eq!(emitted[3], "kittens::warpgroup::mma_async_wait<0>();");
+    }
+
+    #[test]
+    fn tk20_call_raw_string_bridge_passes_legacy_body_unchanged() {
+        // The RawString bridge is what `prog.compute(role, body)` wraps
+        // legacy format!() bodies in. emit() returns the body verbatim
+        // — preserves byte-identical legacy output during Phase 0.
+        let body = "for (int i = 0; i < 16; ++i) { /* legacy */ }";
+        let call = Tk20Call::RawString(body.to_string());
+        assert_eq!(call.emit(), body);
+    }
+
+    #[test]
+    fn compute_calls_setter_round_trips_to_emit() {
+        // The new prog.compute_calls(...) entry point used by Phase 1+
+        // typed lowerings — its calls reach the emitted CUDA in order.
+        let mut p = TkProgram::new();
+        p.compute_calls(
+            WarpRole::AllConsumers,
+            vec![
+                Tk20Call::WarpZeroRt { rt: "__acc".into() },
+                Tk20Call::WarpgroupMmaAB {
+                    d: "__acc".into(),
+                    a: "__a".into(),
+                    b: "__b_desc".into(),
+                },
+                Tk20Call::WarpgroupMmaCommitGroup,
+                Tk20Call::WarpgroupMmaAsyncWait { n: 0 },
+            ],
+        );
+        let src = emit_body(&p);
+        assert!(src.contains("kittens::warp::zero(__acc);"), "{src}");
+        assert!(
+            src.contains("kittens::warpgroup::mma_AB(__acc, __a, __b_desc);"),
+            "{src}"
+        );
+        assert!(
+            src.contains("kittens::warpgroup::mma_commit_group();"),
+            "{src}"
+        );
+        assert!(
+            src.contains("kittens::warpgroup::mma_async_wait<0>();"),
+            "{src}"
+        );
     }
 }

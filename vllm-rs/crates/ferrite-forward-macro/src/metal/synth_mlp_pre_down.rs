@@ -108,7 +108,12 @@ impl Implementation for MetalSynthMlpPreDownImpl {
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        WorkloadConstraint::Any
+        // Restrict to single-token decode. At M>=2 the per-row
+        // megakernel runs one TG per (m_row, tile), filling SMs with
+        // serial sequential gate-qmv→up-qmv→silu_mul work inside
+        // each TG with no inter-kernel overlap the unfused chain
+        // gets from GPU pipelining successive dispatches.
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {

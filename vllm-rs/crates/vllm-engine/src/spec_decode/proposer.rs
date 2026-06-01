@@ -236,6 +236,7 @@ impl DraftModelProposer {
                 max_seqlen_k: seed.max_seqlen_k,
                 num_tokens: seed.num_tokens,
                 has_spec_tokens: false,
+                last_token_indices: None,
             };
             if backend
                 .forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &prefill_req)
@@ -375,6 +376,7 @@ impl DraftModelProposer {
                 max_seqlen_k: iter0_max_k,
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
+                last_token_indices: None,
             };
             match backend.forward_chain_k(DRAFT_MODEL, DRAFT_KV, &iter0_req, seed.block_size, k) {
                 Ok(per_iter) => {
@@ -436,6 +438,7 @@ impl DraftModelProposer {
                 max_seqlen_k: step_max_k,
                 num_tokens: num_reqs,
                 has_spec_tokens: false,
+                last_token_indices: None,
             };
             let step_argmax =
                 match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {
@@ -580,6 +583,7 @@ impl Proposer for DraftModelProposer {
             // on num_seqs > 1), populating every row including each
             // req's bonus row. has_spec_tokens=false is safe for both.
             has_spec_tokens: false,
+            last_token_indices: None,
         };
         let first_argmaxes =
             match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &first_req) {
@@ -652,6 +656,7 @@ impl Proposer for DraftModelProposer {
                 num_tokens: num_reqs,
                 // Each K-step is M=1 per req — slice gate is fine.
                 has_spec_tokens: false,
+                last_token_indices: None,
             };
             let step_argmax =
                 match backend.forward_argmax_blocking(DRAFT_MODEL, DRAFT_KV, &step_req) {

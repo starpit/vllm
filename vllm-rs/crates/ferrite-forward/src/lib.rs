@@ -447,7 +447,6 @@ mod ctx {
         /// sample row) or when not built by the worker. Consumed by
         /// `Instruction::CutlassFusedAddRmsNormGemm` (and any future
         /// lm_head op) — see ferrite_worker.rs:650 for context.
-        #[cfg(feature = "cuda")]
         pub last_token_indices: Option<TensorView<'a>>,
         // The TP communicator the `Instruction::AllReduce` arm calls
         // into. `None` at tp=1 (the lowering pass emits no AllReduce

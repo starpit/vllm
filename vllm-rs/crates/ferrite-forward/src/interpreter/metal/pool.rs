@@ -1346,6 +1346,22 @@ fn write_runtime_inputs(
         let ptr = runtime.num_tokens_u32.contents().as_ptr() as *mut u32;
         std::ptr::write(ptr, inputs.num_tokens);
     }
+    // Plumb the lm_head sample-row index list. When the caller
+    // supplies `last_token_indices` (the common case: every forward
+    // that produces a sampled token) the slice trio uses these as
+    // the gather sources and scatter destinations; otherwise the
+    // count is 0 and the slice is a no-op for this step.
+    let num_sample_rows = inputs
+        .last_token_indices
+        .map(|s| s.len() as u32)
+        .unwrap_or(0);
+    unsafe {
+        let ptr = runtime.num_sample_rows_u32.contents().as_ptr() as *mut u32;
+        std::ptr::write(ptr, num_sample_rows);
+    }
+    if let Some(s) = inputs.last_token_indices {
+        write_slice("last_token_indices", &runtime.sample_indices, s)?;
+    }
     Ok(())
 }
 
@@ -1510,6 +1526,8 @@ mod tests {
             kv_cache_k: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             kv_cache_v: (0..num_layers).map(|_| alloc(device, 16)).collect(),
             num_tokens_u32: alloc(device, 4),
+            num_sample_rows_u32: alloc(device, 4),
+            sample_indices: alloc(device, 16),
         }
     }
 
@@ -1802,6 +1820,8 @@ mod tests {
             kv_cache_k: vec![alloc(d, 16)],
             kv_cache_v: vec![alloc(d, 16)],
             num_tokens_u32: alloc(d, 4),
+            num_sample_rows_u32: alloc(d, 4),
+            sample_indices: alloc(d, max_m_bytes),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

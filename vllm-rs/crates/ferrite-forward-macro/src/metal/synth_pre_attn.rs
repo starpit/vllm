@@ -116,7 +116,11 @@ impl Implementation for MetalSynthPreAttnImpl {
     }
 
     fn workload_constraint(&self) -> WorkloadConstraint {
-        WorkloadConstraint::Any
+        // Restrict to single-token decode (mirrors SynthMlpPreDown).
+        // At M>=2 per-row megakernel pays the same within-TG serial
+        // cost without launch-overhead-saving benefit; unfused chain
+        // wins via GPU-pipelined kernel overlap.
+        WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {

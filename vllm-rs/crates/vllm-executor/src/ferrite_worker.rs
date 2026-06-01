@@ -7744,6 +7744,12 @@ fn metal_chain_dispatch(
     };
 
     // ── 6. ForwardCtx ───────────────────────────────────────────
+    // Draft K-step chain: every forward step decodes 1 token per seq
+    // (num_tokens == num_reqs), so `last_token_indices = [0, 1, …,
+    // num_reqs-1]` would just be an identity gather. Skip it — the
+    // gather/scatter early-out when src == dst makes the slice a
+    // no-op anyway, and a non-zero indices buffer would cost only
+    // memcpy. None here keeps the chain dispatch lean.
     let ctx = ferrite_forward::ForwardCtx {
         input_ids: view_input_ids,
         positions: view_positions,
@@ -7755,6 +7761,7 @@ fn metal_chain_dispatch(
         max_seqlen_k: req.max_seqlen_k,
         kv_cache: kv_cache_ref,
         has_spec_tokens: false,
+        last_token_indices: None,
     };
 
     // SAFETY: kernel refs survive the synchronous call below.
@@ -7928,6 +7935,13 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
         let buf_cu_seqlens = Self::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
         let buf_seqused_k = Self::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
         let buf_block_table = Self::alloc_shared_u32_buf(&mtl_device, req.block_table);
+        // Stage the sample-row indices for the lm_head slice. The
+        // closure inside macro-generated `forward` reads these via
+        // `ctx.last_token_indices.as_raw()` and converts to a `&[u32]`
+        // that drives the index-driven gather/scatter kernels.
+        let buf_last_token_indices = req
+            .last_token_indices
+            .map(|s| Self::alloc_shared_u32_buf(&mtl_device, s));
         let alloc_us = t_alloc.elapsed().as_micros();
 
         // ── 2. Wrap MTLBuffers in TensorViews. Dtype is purely
@@ -7977,6 +7991,15 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 dtype_u32,
             ))
         };
+        // last_token_indices is optional — chunked-prefill intermediate
+        // chunks pass None, every other workload provides it.
+        let view_last_token_indices = req.last_token_indices.map(|s| unsafe {
+            TensorView::from_raw(GpuTensor::new(
+                buf_last_token_indices.as_ref().unwrap().contents().as_ptr() as *mut u8,
+                &[s.len().max(1)],
+                dtype_u32,
+            ))
+        });
 
         // ── 3. Build ForwardCtx + run forward ────────────────────────────
         // Disjoint borrows: `model_ref`/`kv_cache_ref`/`argmax_kernels`
@@ -8025,6 +8048,7 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
             max_seqlen_k: req.max_seqlen_k,
             kv_cache: kv_cache_ref,
             has_spec_tokens: req.has_spec_tokens,
+            last_token_indices: view_last_token_indices,
         };
 
         // ── 4. Fused argmax via forward_with_metal_followup. ─────────────
@@ -9057,6 +9081,11 @@ impl Worker for FerriteWorker {
                 max_seqlen_k,
                 num_tokens,
                 has_spec_tokens,
+                last_token_indices: if sample_indices.is_empty() {
+                    None
+                } else {
+                    Some(&sample_indices)
+                },
             };
             // Phase 9 gating: enable the worker-side speculative
             // K-step chain (runs in the lockstep thread, overlapped
@@ -9220,6 +9249,7 @@ impl Worker for FerriteWorker {
                             max_seqlen_k: lock_max_k,
                             kv_cache: dkv,
                             has_spec_tokens: false,
+                            last_token_indices: None,
                         };
                         let logits = unsafe {
                             dm.forward(&ctx, &mut shadow_device, lock_num_tokens as u64)
@@ -9332,6 +9362,7 @@ impl Worker for FerriteWorker {
                                     max_seqlen_k: chain_pos + 1,
                                     num_tokens: 1,
                                     has_spec_tokens: false,
+                                    last_token_indices: None,
                                 };
                             metal_chain_dispatch(
                                 dm,

@@ -136,6 +136,15 @@ pub struct ForwardArgmaxRequest<'a> {
     /// `false` for non-spec prefill/decode and for draft-model
     /// lockstep prefill / K-step chain forwards.
     pub has_spec_tokens: bool,
+    /// `[num_sample_rows]` u32 — per-sample-row source index into the
+    /// `[num_tokens, hidden]` activation produced by the forward.
+    /// Mirrors Python vLLM's `logits_indices = query_start_loc[1:] - 1`
+    /// and the CUDA path's `ForwardCtx.last_token_indices`. Backends
+    /// thread it into their lm_head fast path so the GEMM runs at
+    /// `M = num_sample_rows` instead of `M = num_tokens`. `None`
+    /// signals "no sampled tokens this step" (chunked-prefill
+    /// intermediate chunks) — backends fall back to the full GEMM.
+    pub last_token_indices: Option<&'a [u32]>,
 }
 
 /// Primitive the backend exposes for spec decode.

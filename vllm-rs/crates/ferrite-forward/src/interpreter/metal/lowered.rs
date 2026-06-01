@@ -396,19 +396,17 @@ pub struct MScaling {
 /// commands that aren't gated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeGate {
-    /// Run only when `num_seqs == 1` AND `!has_spec_tokens`. Used by
-    /// the lm_head slice trio (gather/qmv/scatter) — the slice writes
-    /// only the LAST row of logits, which is correct for single-seq
-    /// prefill/decode (the only row that matters) but wrong for spec
-    /// verify (1 seq, K+1 sample positions, every row matters).
-    OnlyIfSingleSeqNoSpec,
-    /// Run when `num_seqs > 1` OR `has_spec_tokens`. Used by the full
-    /// `M=bucket_m` lm_head fallback so:
-    ///   * multi-seq batches get correct per-seq logits (slice's per-
-    ///     seq-incorrect output gets overwritten by the full GEMM)
-    ///   * single-seq spec verify gets every row of logits populated
-    ///     for greedy rejection sampling
-    OnlyIfMultiSeqOrSpec,
+    /// Run only when `!has_spec_tokens`. Used by the lm_head slice
+    /// trio (gather/qmv/scatter) — the slice writes exactly the
+    /// `num_sample_rows` rows pointed at by `last_token_indices`,
+    /// which is correct for single-seq + multi-seq prefill and for
+    /// decode (num_sample_rows == num_seqs), but wrong for spec
+    /// verify where rejection sampling needs every row of logits.
+    OnlyIfNoSpec,
+    /// Run only when `has_spec_tokens`. Used by the full
+    /// `M=bucket_m` lm_head fallback that populates every row of
+    /// logits for greedy rejection sampling at spec-decode verify.
+    OnlyIfSpec,
 }
 
 impl DispatchShape {
@@ -686,6 +684,18 @@ pub enum RuntimeBindingKind {
     /// source row index `num_tokens - 1` at runtime without needing
     /// a function constant (M varies per call).
     NumTokensU32,
+    /// `[1]` u32 — actual `num_seqs` of the in-flight forward
+    /// (= `cu_seqlens_q.len() - 1`). Mirrors `NumTokensU32` but for
+    /// the per-seq-sample-row count the lm_head slice trio uses to
+    /// gate its inner loop (gather copies `num_seqs` rows, qmm runs
+    /// at M = num_seqs, scatter writes back `num_seqs` rows).
+    NumSeqsU32,
+    /// `[num_seqs]` u32 — per-sequence sample-row index
+    /// (`cu_seqlens_q[i+1] - 1` for seq `i`). Mirrors Python vLLM's
+    /// `logits_indices` and the CUDA path's `ForwardCtx.last_token_indices`.
+    /// Read by the index-driven `gather_last_token`/`scatter_first_to_last_row`
+    /// kernels — one row per sequence, in cu_seqlens_q order.
+    SampleIndices,
 }
 
 /// One ICB command: kernel + dispatch shape + bindings.

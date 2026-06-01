@@ -62,13 +62,21 @@ pub struct ForwardInputs<'a> {
     /// `RopeAppend` references the paged pool.
     pub block_table: Option<&'a [u32]>,
     /// `true` when this forward is a spec-decode verify batch (one
-    /// or more reqs carries `spec_token_ids`). Threaded into the
-    /// dispatch loop's `gate_matches` so the lm_head slice trio (gated
-    /// `OnlyIfSingleSeqNoSpec`) skips and the full-`M=bucket_m`
-    /// fallback (gated `OnlyIfMultiSeqOrSpec`) fires instead — the
-    /// slice writes only the LAST row of logits, which is wrong when
-    /// rejection sampling needs every row.
+    /// or more reqs carries `spec_token_ids`). Currently informational —
+    /// the lm_head slice trio reads `last_token_indices` for its row
+    /// list whether or not spec-decode is active, so this flag has no
+    /// effect on slice dispatch today. Retained for callers that pass
+    /// it; may be wired to additional gates in the future.
     pub has_spec_tokens: bool,
+    /// `[num_sample_rows]` u32 — per-sample-row source index into the
+    /// `[num_tokens, hidden]` lm_head input. Mirrors Python vLLM's
+    /// `logits_indices = query_start_loc[1:] - 1` and the CUDA path's
+    /// `ForwardCtx.last_token_indices`. When `Some`, the lm_head slice
+    /// trio gathers these rows, runs the GEMM at `M = len`, scatters
+    /// back. `None` falls back to the full `M = bucket_m` lm_head
+    /// GEMM (used by chunked-prefill intermediate chunks that produce
+    /// no sampled tokens).
+    pub last_token_indices: Option<&'a [u32]>,
 }
 
 /// Errors produced by [`super::pool::MetalWorkerPool::forward`] before

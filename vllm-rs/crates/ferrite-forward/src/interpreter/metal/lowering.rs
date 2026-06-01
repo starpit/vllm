@@ -216,45 +216,41 @@ pub fn lower_pair<W: CanonicalParams>(
 
     use crate::interpreter::metal::lowered::RuntimeGate;
     if let Some(info) = slice_info {
-        // Single-seq fast path: gather + qmv-M=1 + scatter, gated to
-        // run only when `num_seqs == 1`. The gather pulls row
-        // `num_tokens-1` (the lone seq's last token) into row 0 so
-        // qmv computes one row of logits which the scatter writes
-        // back to row `num_tokens-1` for the worker's downstream
-        // `embedding_gather` to find.
-        commands.push(gather_last_token_command::<W>(info.in_slot, info.k));
+        // Non-spec path: index-driven gather → qmv-M=num_sample_rows
+        // → index-driven scatter. Works for any num_seqs (single-seq
+        // prefill / multi-seq prefill / decode) because the gather
+        // kernel reads the per-seq sample row from `last_token_indices`
+        // and the qmv runs at M = num_sample_rows (worker overrides
+        // TG.X via seq_axis). Scatter writes back so the worker's
+        // downstream argmax reads from the original sample positions.
+        commands.push(gather_last_token_command::<W>(
+            info.in_slot,
+            info.k,
+            bucket_m,
+        ));
         barrier_before.push(true);
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
-        // lm_head at M=1 via qmv (matvec) — BW-bound on the 197 MB
-        // packed weight read on Llama-3.2-3B. ~1.6 ms vs ~12 ms for a
-        // qmm_t Standard 1-tile (which does BM=32 wasted m-rows).
-        commands.push(lm_head_qmv_command::<W>(&info, profile));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfNoSpec));
+        commands.push(lm_head_qmv_command::<W>(&info, profile, bucket_m));
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
-        // Post-GEMM scatter: row num_tokens-1 of output := row 0.
+        runtime_gate.push(Some(RuntimeGate::OnlyIfNoSpec));
         commands.push(scatter_first_to_last_row_command::<W>(
             info.out_slot,
             info.n,
+            bucket_m,
         ));
         barrier_before.push(true);
-        runtime_gate.push(Some(RuntimeGate::OnlyIfSingleSeqNoSpec));
+        runtime_gate.push(Some(RuntimeGate::OnlyIfNoSpec));
 
-        // Multi-seq fallback: emit the original lm_head GEMM (the
-        // full `M = bucket_m × N = vocab` qmm) gated to fire only
-        // when `num_seqs > 1`. The slice's gather/scatter only
-        // handle the lone last-token row; for batched decode every
-        // seq's sample row is at a different position
-        // (`cu_seqlens_q[i] + q_lens[i] - 1`) and the slice's qmv
-        // produces stale logits for every seq except the last one
-        // packed. The full GEMM writes correct logits to every row
-        // of `out`, so the worker's downstream
-        // `argmax(logits[sample_indices[i]])` reads valid data
-        // regardless of which path fired. Worker skips dispatches
-        // whose gate doesn't match the live `num_seqs`.
+        // Spec-decode verify fallback: rejection sampling needs every
+        // query row's logits, not just the per-seq sample rows. The
+        // full `M = bucket_m` qmm populates the entire logits buffer.
+        // CUDA's path doesn't need this because cuMemGetAllocationGran
+        // forces 2 MiB tiles anyway — but on metal the slice is
+        // strictly smaller, so we keep the fallback gated for spec.
         for (i, cmd) in lh.commands.into_iter().enumerate() {
             commands.push(cmd);
             barrier_before.push(*lh.barrier_before.get(i).unwrap_or(&true));
-            runtime_gate.push(Some(RuntimeGate::OnlyIfMultiSeqOrSpec));
+            runtime_gate.push(Some(RuntimeGate::OnlyIfSpec));
         }
     } else {
         // No slice — slice precondition (single AffineQmm lm_head,
@@ -297,13 +293,23 @@ struct LmHeadSliceInfo {
     bits: u32,
 }
 
-/// Lower the lm_head AffineQmm at M=1 through a qmv matvec kernel
-/// instead of the BM=32 qmm_t tile. Saves ~10 ms TTFT on Llama-3.2-3B
-/// lm_head (qmm_t-1-tile = 32 wasted m-rows × 4008 n-tiles, qmv at
-/// M=1 is single-pass BW-bound on the 197 MB packed weight read).
+/// Lower the lm_head AffineQmm through a qmv matvec kernel
+/// dispatched at `M = num_sample_rows` (= 1 for single-seq, num_seqs
+/// for multi-seq, K+1 for spec-decode verify). The qmv kernel
+/// natively supports M>1 via its X-axis threadgroup grid — one TG
+/// per row, all reading the same 197 MB packed weight tile per
+/// (BN, BK) sub-tile. Worker sets `threadgroups.X = num_sample_rows`
+/// at dispatch time via the `seq_axis` MScaling override.
+///
+/// vs the qmm_t-1-tile BM=32 fallback this avoids the
+/// `ceil(bucket_m/32) × 4008` tile sweep (32+ wasted m-rows per
+/// tile at multi-seq prefill); the gathered inputs at rows
+/// 0..num_sample_rows-1 mean the qmv reads exactly the rows it
+/// needs.
 fn lm_head_qmv_command<W: CanonicalParams>(
     info: &LmHeadSliceInfo,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
+    _bucket_m: u32,
 ) -> LoweredCommand {
     let dtype = dequant_dtype_for::<W>();
     let scale_dtype = scale_dtype_for::<W>();
@@ -323,6 +329,8 @@ fn lm_head_qmv_command<W: CanonicalParams>(
         ),
         None => pick_qmv_kernel(n_v, k_v, bits_v),
     };
+    // Bake X=1 baseline. Worker overrides X to live `num_seqs` at
+    // dispatch via `seq_axis = Some(X)` — qmv runs at M=num_seqs.
     let (tg, tpg) = qmv_dispatch_shape(kernel, /* M = */ 1, n_v, /* B = */ 1);
     let kernel_id = match kernel {
         QmvKernel::Quad { .. } => KernelId::AffineQmvQuad,
@@ -342,8 +350,13 @@ fn lm_head_qmv_command<W: CanonicalParams>(
         dispatch: DispatchShape {
             threadgroups: tg,
             threads_per_threadgroup: tpg,
-            // Fixed M=1 — no scaling.
-            m_scaling: None,
+            // Baseline X=1. seq_axis=Some(X) SETS X to live num_seqs
+            // at dispatch — qmv runs at M = num_seqs (one TG per row).
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                axis: super::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(1),
+                seq_axis: Some(super::lowered::MScaleAxis::X),
+            }),
         },
         bindings: affine_qmm_bindings(
             info.in_slot,
@@ -355,10 +368,15 @@ fn lm_head_qmv_command<W: CanonicalParams>(
     }
 }
 
-fn gather_last_token_command<W: CanonicalParams>(slot: u32, hidden_size: u32) -> LoweredCommand {
+fn gather_last_token_command<W: CanonicalParams>(
+    slot: u32,
+    hidden_size: u32,
+    bucket_m: u32,
+) -> LoweredCommand {
     sample_slice_command::<W>(
         slot,
         hidden_size,
+        bucket_m,
         KernelId::GatherLastToken,
         "gather_last_token_f16_specialized",
         "gather_last_token_bf16_specialized",
@@ -368,10 +386,12 @@ fn gather_last_token_command<W: CanonicalParams>(slot: u32, hidden_size: u32) ->
 fn scatter_first_to_last_row_command<W: CanonicalParams>(
     slot: u32,
     vocab_size: u32,
+    bucket_m: u32,
 ) -> LoweredCommand {
     sample_slice_command::<W>(
         slot,
         vocab_size,
+        bucket_m,
         KernelId::ScatterFirstToLastRow,
         "scatter_first_to_last_row_f16_specialized",
         "scatter_first_to_last_row_bf16_specialized",
@@ -381,10 +401,15 @@ fn scatter_first_to_last_row_command<W: CanonicalParams>(
 fn sample_slice_command<W: CanonicalParams>(
     slot: u32,
     row_stride: u32,
+    bucket_m: u32,
     kernel: KernelId,
     f16_symbol: &'static str,
     bf16_symbol: &'static str,
 ) -> LoweredCommand {
+    // 2D dispatch: tg.x covers the row-stride dim (one thread per
+    // element), tg.y covers the sample-row dim (one TG row per seq).
+    // The Y dim is baked to bucket_m worst-case; threads with
+    // `tid.y >= num_seqs` early-out so the actual work is N rows.
     const THREADS_PER_TG: u32 = 256;
     LoweredCommand {
         kernel,
@@ -395,9 +420,17 @@ fn sample_slice_command<W: CanonicalParams>(
         }
         .into(),
         dispatch: DispatchShape {
-            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), 1, 1),
+            threadgroups: (row_stride.div_ceil(THREADS_PER_TG), bucket_m, 1),
             threads_per_threadgroup: (THREADS_PER_TG, 1, 1),
-            m_scaling: None,
+            // seq_axis=Y SETS tg.y = num_seqs at dispatch — only N TGs
+            // along the sample-row dim instead of the bucket_m baseline.
+            // axis here is a no-op (bucket_m=1 → X*num_tokens/1, but X
+            // is the row-stride dim which doesn't scale with M).
+            m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                axis: super::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(1),
+                seq_axis: Some(super::lowered::MScaleAxis::Y),
+            }),
         },
         bindings: vec![
             Binding::ArenaSlot {
@@ -405,8 +438,12 @@ fn sample_slice_command<W: CanonicalParams>(
                 binding_index: 0,
             },
             Binding::Runtime {
-                kind: RuntimeBindingKind::NumTokensU32,
+                kind: RuntimeBindingKind::CuSeqlensQ,
                 binding_index: 1,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::NumSeqsU32,
+                binding_index: 2,
             },
         ],
         gemm_dims: None,

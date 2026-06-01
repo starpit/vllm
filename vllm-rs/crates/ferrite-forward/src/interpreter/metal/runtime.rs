@@ -45,10 +45,23 @@ pub struct RuntimeBindings {
     /// `[1]` u32 — actual `num_tokens` of the in-flight forward.
     /// The pool writes the current call's `num_tokens` into this
     /// 4-byte buffer at the start of every `forward()` so kernels
-    /// that need M at runtime (currently only
-    /// `KernelId::GatherLastToken`) can read it without a function
+    /// that need M at runtime can read it without a function
     /// constant (M varies per call).
     pub num_tokens_u32: Buffer,
+    /// `[1]` u32 — number of sample rows the lm_head slice trio
+    /// gathers / GEMMs / scatters this forward. Equals the length
+    /// of the in-flight `last_token_indices` slice (= `num_seqs` for
+    /// non-spec prefill/decode, `K+1` for spec-decode verify, `0`
+    /// when the caller doesn't pass indices). Read by the
+    /// `gather_last_token`/`scatter_first_to_last_row` kernels.
+    pub num_sample_rows_u32: Buffer,
+    /// `[num_sample_rows]` u32 — per-sample-row source/destination
+    /// index into the lm_head input/output tensor. Mirrors Python
+    /// vLLM's `logits_indices` and the CUDA path's
+    /// `ForwardCtx.last_token_indices`. Sized at construction for
+    /// the worker's largest bucket's `bucket_m`; the pool writes
+    /// the in-flight slice's content at the start of every forward.
+    pub sample_indices: Buffer,
 }
 
 impl RuntimeBindings {
@@ -67,6 +80,8 @@ impl RuntimeBindings {
             RuntimeBindingKind::KvCacheK { layer } => &self.kv_cache_k[layer.get() as usize],
             RuntimeBindingKind::KvCacheV { layer } => &self.kv_cache_v[layer.get() as usize],
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
+            RuntimeBindingKind::NumSeqsU32 => &self.num_sample_rows_u32,
+            RuntimeBindingKind::SampleIndices => &self.sample_indices,
         }
     }
 }

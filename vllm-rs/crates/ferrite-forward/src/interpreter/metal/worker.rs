@@ -555,7 +555,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(step.m_scaling.iter())
                 .zip(step.runtime_gate.iter())
             {
-                if !gate_matches(*gate, num_seqs, has_spec_tokens) {
+                if !gate_matches(*gate, num_tokens, num_seqs, has_spec_tokens) {
                     // Skipped: the lm_head slice's gather/qmv/scatter
                     // (gated single-seq) doesn't fire for batched
                     // batches; the M=bucket_m fallback (gated
@@ -1473,15 +1473,24 @@ fn resolve_bindings<W: CanonicalParams>(
 /// correct multi-row GEMM result.
 fn gate_matches(
     gate: Option<super::lowered::RuntimeGate>,
+    num_tokens: u32,
     num_seqs: u32,
     has_spec_tokens: bool,
 ) -> bool {
+    // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
+    // tokens to drop (prefill / chunked-prefill / mixed batches);
+    // steady-state decode has `num_tokens == num_seqs` and slicing
+    // would just add 2 kernel launches with no GEMM-work savings
+    // (qmv at M=num_seqs == qmm at M=num_seqs). Verified: gating
+    // unconditionally on multi-seq regressed c=4 TPOT by +5% on
+    // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
+    // win without hurting decode.
     match gate {
         None => true,
-        Some(super::lowered::RuntimeGate::OnlyIfSingleSeqNoSpec) => {
-            num_seqs <= 1 && !has_spec_tokens
+        Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
+            !has_spec_tokens && num_tokens > num_seqs
         }
-        Some(super::lowered::RuntimeGate::OnlyIfMultiSeqOrSpec) => num_seqs > 1 || has_spec_tokens,
+        Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
     }
 }
 
@@ -1672,6 +1681,8 @@ mod tests {
             kv_cache_k: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             kv_cache_v: (0..num_layers).map(|_| alloc_buffer(device, 16)).collect(),
             num_tokens_u32: alloc_buffer(device, 4),
+            num_sample_rows_u32: alloc_buffer(device, 4),
+            sample_indices: alloc_buffer(device, 16),
         }
     }
 

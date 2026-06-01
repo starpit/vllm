@@ -6951,9 +6951,17 @@ pub fn emit_model(
                             kv_cache_v: kv_v.clone(),
                             // 4 bytes — worker writes the current
                             // forward()'s `num_tokens` here before
-                            // dispatch so KernelId::GatherLastToken
-                            // can compute the source row.
+                            // dispatch so per-call kernels see M.
                             num_tokens_u32: alloc(4),
+                            // 4 bytes — worker writes `num_sample_rows`
+                            // here (= last_token_indices.len()) before
+                            // dispatch so the lm_head slice's gather /
+                            // scatter / qmv know how many rows to act on.
+                            num_sample_rows_u32: alloc(4),
+                            // [max_m] u32 — worker writes the lm_head
+                            // sample-row source indices here before
+                            // dispatch.
+                            sample_indices: alloc(max_m * 4),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7019,6 +7027,18 @@ pub fn emit_model(
                 ::std::option::Option::None
             };
 
+            // Plumb the lm_head sample-row index list from ForwardCtx.
+            // `last_token_indices` is `Option<TensorView>` — present
+            // when the worker built `logits_indices = query_start_loc[1:] - 1`
+            // (any prefill/decode that produces a sampled token), absent
+            // for chunked-prefill intermediate chunks. The metal slice
+            // gathers exactly these rows then runs the lm_head qmv at
+            // M = indices.len().
+            let last_token_indices = ctx.last_token_indices.as_ref().map(|view| {
+                let raw = view.as_raw();
+                ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
+            });
+
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7028,6 +7048,7 @@ pub fn emit_model(
                 seq_used_k,
                 block_table,
                 has_spec_tokens: ctx.has_spec_tokens,
+                last_token_indices,
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -7168,6 +7189,8 @@ pub fn emit_model(
                             kv_cache_k: kv_k.clone(),
                             kv_cache_v: kv_v.clone(),
                             num_tokens_u32: alloc(4),
+                            num_sample_rows_u32: alloc(4),
+                            sample_indices: alloc(max_m * 4),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7228,6 +7251,18 @@ pub fn emit_model(
                 ::std::option::Option::None
             };
 
+            // Plumb the lm_head sample-row index list from ForwardCtx.
+            // `last_token_indices` is `Option<TensorView>` — present
+            // when the worker built `logits_indices = query_start_loc[1:] - 1`
+            // (any prefill/decode that produces a sampled token), absent
+            // for chunked-prefill intermediate chunks. The metal slice
+            // gathers exactly these rows then runs the lm_head qmv at
+            // M = indices.len().
+            let last_token_indices = ctx.last_token_indices.as_ref().map(|view| {
+                let raw = view.as_raw();
+                ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
+            });
+
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7237,6 +7272,7 @@ pub fn emit_model(
                 seq_used_k,
                 block_table,
                 has_spec_tokens: ctx.has_spec_tokens,
+                last_token_indices,
             };
 
             // Pre-pick the bucket from iter-0 num_tokens. The chain

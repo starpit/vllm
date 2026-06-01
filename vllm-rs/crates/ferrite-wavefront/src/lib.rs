@@ -23,7 +23,6 @@ pub mod dispatch;
 pub mod launcher;
 pub mod lower;
 pub mod mega;
-pub mod mk;
 pub mod partition;
 pub mod region;
 pub mod region_schedule;

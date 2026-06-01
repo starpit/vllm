@@ -570,23 +570,12 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     };
 
     let tk_include = "../../third_party/thunderkittens/include";
-    // ferrite-owned MK substrate headers: scaffold.cuh, instruction.cuh,
-    // globals.cuh, and per-IType .cuh files. Per-canonical .cu files
-    // emitted by `ferrite-forward-macro` `#include "scaffold.cuh"` etc.;
-    // this `-I` resolves them. The watch list folds the .cuh contents
-    // into cudaforge's args_hash, so header edits invalidate every .o
-    // (transitive #include hashing — required so a scaffold.cuh edit
-    // doesn't cache-hit against a stale .cu .o per CLAUDE.md memory).
-    let ferrite_mk_csrc = "../../crates/ferrite-wavefront/csrc";
-    let ferrite_mk_watch: Vec<String> = walk_cuh(ferrite_mk_csrc);
 
     let mut mk_builder = cudaforge::KernelBuilder::new();
     mk_builder = mk_builder
         .out_dir(cache_dir)
         .source_files(megakernel_cus.clone())
-        .watch(ferrite_mk_watch.iter().map(|s| s.to_string()))
-        .include_path(tk_include)
-        .include_path(ferrite_mk_csrc);
+        .include_path(tk_include);
     mk_builder
         .arg(std_flag)
         .arg("-O3")
@@ -620,30 +609,6 @@ fn build_megakernels(cache_dir: &str, rerun_files: &mut Vec<String>) {
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=rt");
     println!("cargo:rustc-link-lib=dylib=pthread");
-}
-
-/// Recursively walk a directory and return every `.cuh` file path as
-/// a relative-to-build.rs string. Used to feed the ferrite MK
-/// substrate header tree into cudaforge's `.watch()` list so a header
-/// edit invalidates every dependent kernel.o.
-#[cfg(feature = "cuda")]
-fn walk_cuh(root: &str) -> Vec<String> {
-    fn visit(dir: &std::path::Path, out: &mut Vec<String>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    visit(&path, out);
-                } else if path.extension().is_some_and(|e| e == "cuh") {
-                    out.push(path.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    let mut out = Vec::new();
-    visit(std::path::Path::new(root), &mut out);
-    out.sort();
-    out
 }
 
 #[cfg(feature = "cuda")]

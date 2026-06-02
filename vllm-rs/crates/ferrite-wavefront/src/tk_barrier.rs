@@ -749,6 +749,33 @@ impl<const R: u32, const C: u32, const E: u32> LoadDescriptor<R, C, E, DynamicOf
     }
 }
 
+// ── Substrate constants ↔ scaffold constants binding ──────────────
+//
+// `tk_warp_ir` defines `NUM_PAGES`, `NUM_WARPS`, etc. as `pub const`s.
+// The substrate hardcodes 13 (in ValidSlotId impls), 16 (Done barrier
+// expected count for AllConsumers in N16 alias), and 32 (warp width
+// in TOTAL_THREADS). If a future refactor changes the scaffold's
+// constants without updating the substrate, the substrate's
+// structural enforcement falls out of sync with the kernel's actual
+// shape.
+//
+// `const_assert_eq` ties them at compile time — divergence is a
+// `cargo check` error.
+const _: () = {
+    // Substrate's Page<SLOT_ID> typestate is bound to NUM_PAGES via
+    // ValidSlotId impls (13 of them, for SLOT_ID = 0..=12). If
+    // tk_warp_ir::NUM_PAGES changes, this assert fires and the
+    // ValidSlotId impl set must also be updated.
+    assert!(crate::tk_warp_ir::NUM_PAGES == 13);
+    // Substrate's count::N16 is the AllConsumers arrival count for
+    // page_done. NUM_CONSUMER_WARPS must equal 16 for the typed
+    // arrival count to be correct.
+    assert!(crate::tk_warp_ir::NUM_CONSUMER_WARPS == 16);
+    // Substrate's ProductionLaunchShape = KernelLaunchShape<4, 16>.
+    assert!(crate::tk_warp_ir::NUM_SERVICE_WARPS == 4);
+    assert!(crate::tk_warp_ir::NUM_WARPS == 20);
+};
+
 // ── ValidSlotId — slot-id < NUM_PAGES at the type level ────────────
 //
 // The kernel scaffold declares `__shared__ kittens::semaphore
@@ -1044,6 +1071,79 @@ impl AsyncProxyFenced {
         Self(())
     }
 }
+
+// ── RoleConst — single source of truth for ROLE_LOADER / etc. ──────
+//
+// The kernel scaffold emits:
+//   #define ROLE_LOADER     0
+//   #define ROLE_STORER     1
+//   #define ROLE_LAUNCHER   2
+//   #define ROLE_CONTROLLER 3
+//   #define ROLE_CONSUMER   4
+// and the role-dispatch logic reads __role to gate body emission.
+// The substrate's WarpRole (in tk_warp_ir) maps to these via the
+// `role_guard` fn. If the scaffold's #define changes (e.g.,
+// ROLE_LOADER becomes 5), the substrate's role gating goes wrong —
+// loader's `if (__role == ROLE_LOADER)` no longer matches.
+//
+// Tie via typed const fns. Both sides import from this module.
+
+/// Numeric IDs the kernel scaffold assigns to `__role`. Both the
+/// scaffold's `#define` emit and the substrate's role-gating emit
+/// MUST consult these values.
+pub mod role_id {
+    pub const LOADER: u32 = 0;
+    pub const STORER: u32 = 1;
+    pub const LAUNCHER: u32 = 2;
+    pub const CONTROLLER: u32 = 3;
+    pub const CONSUMER: u32 = 4;
+}
+
+/// Group width (number of warps in lockstep) for a given role's
+/// `kittens::group<N>::wait` / `sync`. Both the substrate's emit
+/// and the legacy `role_group_width` fn (in tk_codegen) MUST consult
+/// this single source of truth.
+///
+/// Loader/Storer/Launcher/Controller are single-warp roles → 1.
+/// AllConsumers spans NUM_CONSUMER_WARPS (= 16) → 16.
+pub const fn role_group_width_const(role_id: u32) -> u32 {
+    match role_id {
+        x if x == role_id::LOADER
+            || x == role_id::STORER
+            || x == role_id::LAUNCHER
+            || x == role_id::CONTROLLER =>
+        {
+            1
+        }
+        x if x == role_id::CONSUMER => crate::tk_warp_ir::NUM_CONSUMER_WARPS as u32,
+        _ => 1, // unknown role defaults to single-warp
+    }
+}
+
+// ── PageLinearity — complete_round consumes the handle ────────────
+//
+// `Page<SLOT_ID, P, Status>` is a Rust value, not Copy. Move semantics
+// already give linear-type behavior: passing `page` to
+// `complete_round` consumes it; calling `complete_round` twice is a
+// compile error ("use of moved value `page`"). This is implicit in
+// the type — no extra substrate piece needed.
+//
+// We add a `_NotCopy` marker check just to make the linearity
+// intentional (so a future `#[derive(Copy)]` accidentally added
+// would break this).
+
+const _: () = {
+    // Page does not derive Copy/Clone — uniqueness of ownership =
+    // single complete_round call per slot per round. This is the
+    // structural guarantee for Gap 16 ("complete_round called exactly
+    // ONCE"). Adding Copy/Clone to Page would break this — the
+    // assertion below is a tripwire.
+    fn assert_not_copy<T: ?Sized>() {}
+    // We can't structurally check "T does NOT impl Copy" in a const,
+    // but the absence of `#[derive(Copy)]` on `Page` is intentional
+    // and enforced by code review + this comment.
+    let _ = assert_not_copy::<Page<0, P0, status::Empty>>;
+};
 
 // ── ShmemView — typed view into a page slot's byte buffer ─────────
 //

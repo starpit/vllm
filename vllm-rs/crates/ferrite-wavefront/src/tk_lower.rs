@@ -171,6 +171,35 @@ pub struct CarriedHandle {
     pub phase: u32,
 }
 
+/// Phase 12: routing hints threaded by the orchestrator into a per-op
+/// lowering. `inputs[i] = Some(carried)` means the op's i-th input
+/// slot is provided as a carry-forward handle (loader skips TMA load,
+/// emits a bare `arrive(Ready)` instead — the producer's storer's
+/// `arrive Consumed` already advanced the slot's parity, and the page
+/// already contains the producer's data). `inputs[i] = None` means
+/// the op allocates a fresh page and TMA-loads from gmem (existing
+/// path).
+///
+/// `output_internal = true` means the op's output is consumed only
+/// by another op in this same kernel; the storer skips TMA store
+/// (the consuming op reads directly from this op's smem page) and
+/// the lowering returns a `CarriedHandle` for the orchestrator to
+/// thread to the consuming op's `inputs` list. `false` means the
+/// existing storer-drain-to-gmem path.
+#[derive(Clone, Debug, Default)]
+pub struct RoutingHints {
+    pub inputs: Vec<Option<CarriedHandle>>,
+    pub output_internal: bool,
+}
+
+/// Phase 12: result returned by a routing-aware lowering. When
+/// `output_internal` was `true` in the hints, the lowering populates
+/// `output_carried` with the slot it kept reserved for the consumer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RoutingResult {
+    pub output_carried: Option<CarriedHandle>,
+}
+
 // ── RmsNorm — the vertical slice ───────────────────────────────────
 
 /// Inputs to lower one decode RmsNorm into a `TkProgram` fragment.
@@ -704,6 +733,121 @@ pub fn lower_residual_add<P: Phase>(
 
 // Phase 5 cutover: legacy `residual_add_compute_body` deleted.
 // Canonical emit at `tk_codegen::tk20::residual_add_consumer_body`.
+
+/// Phase 12: routing-aware variant of `lower_residual_add`. Same
+/// compute body, same intra-IType barrier protocol, but:
+///
+/// - For each input slot whose `hints.inputs[i] = Some(carried)`,
+///   the lowering uses `pages.consume_carried::<P>(carried)` instead
+///   of `alloc_at::<P>()`, and the loader emits a bare
+///   `arrive(Ready[id])` instead of `tma::load_async`. The page
+///   already holds the producer's data; the producer's storer's
+///   `arrive Consumed` already flipped the slot's parity to `P`, so
+///   the consumer's standard `wait Consumed[id]@P` passes through
+///   without re-loading.
+///
+/// - When `hints.output_internal = true`, the storer skips
+///   `tma::store_async` (the consuming op reads from this op's smem
+///   page directly) and the lowering returns a `CarriedHandle` so
+///   the orchestrator can thread it to the consuming op's `inputs`.
+///
+/// The non-routing path (no carry-forward inputs, no internal
+/// output) is byte-identical to `lower_residual_add` — same instr
+/// count, same emit, same page allocator state.
+pub fn lower_residual_add_routed<P: Phase>(
+    op: AddOp,
+    hints: &RoutingHints,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> RoutingResult {
+    debug_assert!(
+        hints.inputs.is_empty() || hints.inputs.len() == 2,
+        "lower_residual_add_routed: hints.inputs must be empty or len 2"
+    );
+    let in_a_carried = hints.inputs.first().and_then(|x| x.as_ref());
+    let in_b_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
+
+    // ── Allocate or consume A ──
+    let a_page: PageHandle<P> = match in_a_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("residual add: A page"),
+    };
+    let b_page: PageHandle<P> = match in_b_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("residual add: B page"),
+    };
+    let a_id = a_page.id();
+    let b_id = b_page.id();
+
+    let region = |buf, rows, hidden| RegionRef::rows_cols(buf, rows, 0, hidden);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Loader fills A (or skips for carry-forward) ──
+    let a_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, a_page);
+    if in_a_carried.is_some() {
+        // Page already holds producer's data; loader just flips the
+        // Ready barrier so the consumer's wait Ready passes.
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, a_page);
+    } else {
+        prog.load_async(a_id, op.a, region(op.a, op.m, op.hidden), tile);
+    }
+
+    // ── Loader fills B (or skips for carry-forward) ──
+    let b_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, b_page);
+    if in_b_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, b_page);
+    } else {
+        prog.load_async(b_id, op.b, region(op.b, op.m, op.hidden), tile);
+    }
+
+    // ── Consumer reads + computes (compute body is unchanged). ──
+    let a_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, a_page);
+    let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+            a_id,
+            b_id,
+            total: op.hidden as u64 * op.m as u64,
+        }],
+    );
+    let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
+    let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
+
+    // ── Storer drains A → out (or skips for internal output). ──
+    let a_page = prog.wait(WarpRole::Storer, PageBarrier::Done, a_page);
+    if !hints.output_internal {
+        prog.store_async(a_id, op.out, region(op.out, op.m, op.hidden), tile);
+    }
+    let a_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, a_page);
+
+    let b_page = prog.wait(WarpRole::Storer, PageBarrier::Done, b_page);
+    let b_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, b_page);
+
+    let a_advanced = prog.complete_round(a_page);
+    let b_advanced = prog.complete_round(b_page);
+
+    // ── Output: carry-forward A if internal, else release. ──
+    let result = if hints.output_internal {
+        let carried = pages.carry_forward(a_advanced);
+        // B is read-only; always release (B's data isn't the
+        // op's output).
+        pages.release(b_advanced);
+        RoutingResult {
+            output_carried: Some(carried),
+        }
+    } else {
+        pages.release(a_advanced);
+        pages.release(b_advanced);
+        RoutingResult::default()
+    };
+
+    result
+}
 
 // ── SiluMul — fused SwiGLU element-wise ────────────────────────────
 
@@ -1738,5 +1882,138 @@ mod tests {
             "Y TMA store removed (direct gmem write)\n{src}"
         );
         assert!(src.contains("__y_gmem[__n_i * __bn + __row]"), "{src}");
+    }
+
+    fn add_op_for_routing_test() -> AddOp {
+        AddOp {
+            a: BufId(20),
+            b: BufId(21),
+            out: BufId(22),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    /// Default hints (no carry-forward, no internal output) emit the
+    /// SAME instruction sequence as the legacy `lower_residual_add`.
+    /// Both load A from gmem, both load B from gmem, storer drains A
+    /// to gmem.
+    #[test]
+    fn lower_residual_add_routed_default_hints_match_legacy_emit() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let _result = lower_residual_add_routed::<Phase0>(
+            add_op_for_routing_test(),
+            &RoutingHints::default(),
+            &mut pages,
+            &mut prog,
+        );
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_residual_add::<Phase0>(add_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(
+            src_routed, src_legacy,
+            "default hints must emit byte-identical CUDA to legacy"
+        );
+    }
+
+    /// Carry-forward A: skip A's TMA load (loader emits bare arrive
+    /// Ready) but keep B's TMA load. Storer's TMA store-A stays
+    /// (output is external in this case). The carry-forward source
+    /// is a synthetic upstream slot we set up by allocating all
+    /// slots at Phase0, advancing them all to Phase1, releasing
+    /// every slot except id=5 (which we carry-forward).
+    #[test]
+    fn lower_residual_add_routed_carry_forward_input_a_skips_load() {
+        let mut pages = PageAllocator::new();
+        // Allocate every slot at Phase0.
+        let mut held: Vec<_> = (0..crate::tk_warp_ir::NUM_PAGES)
+            .map(|_| pages.alloc_at::<Phase0>().expect("alloc"))
+            .collect();
+        // Pull out id=5 to carry-forward; advance + release the rest
+        // at Phase1 so they're free for the lowering's alloc_at::<Phase1>().
+        held.sort_by_key(|p| p.id());
+        let target = held.remove(5);
+        assert_eq!(target.id(), 5);
+        for p in held {
+            pages.release(p.advance());
+        }
+        let carried = pages.carry_forward(target.advance());
+
+        let mut prog = TkProgram::new();
+        let result = lower_residual_add_routed::<Phase1>(
+            add_op_for_routing_test(),
+            &RoutingHints {
+                inputs: vec![Some(carried), None],
+                output_internal: false,
+            },
+            &mut pages,
+            &mut prog,
+        );
+        // No output carry-forward.
+        assert!(result.output_carried.is_none());
+
+        let src = emit_body(&prog);
+        // The bare arrive Ready[5] from the loader is present (this
+        // replaces the TMA load).
+        assert!(
+            src.contains("kittens::group<1>::arrive(page_ready[5])"),
+            "loader emits bare arrive Ready[5] for carry-forward A\n{src}"
+        );
+        // A's TMA load_async is GONE — page 5 (the carried slot) is
+        // never touched by tma::load_async.
+        assert!(
+            !src.contains("tma::load_async(page_ready[5]"),
+            "no TMA load on carry-forward slot 5\n{src}"
+        );
+        // B's load_async is still there. (B's slot id is dynamic;
+        // just check that some load_async exists.)
+        assert!(
+            src.contains("tma::load_async("),
+            "B's TMA load is still present\n{src}"
+        );
+        // Storer's TMA store-A is still there (output_internal=false).
+        assert!(
+            src.contains("tma::store_async"),
+            "storer drains A to gmem when output_internal=false\n{src}"
+        );
+    }
+
+    /// `output_internal = true`: storer skips TMA store and the
+    /// lowering returns a `CarriedHandle` for the orchestrator to
+    /// thread to the consuming op.
+    #[test]
+    fn lower_residual_add_routed_internal_output_skips_store_and_carries() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let result = lower_residual_add_routed::<Phase0>(
+            add_op_for_routing_test(),
+            &RoutingHints {
+                inputs: vec![None, None],
+                output_internal: true,
+            },
+            &mut pages,
+            &mut prog,
+        );
+        let carried = result.output_carried.expect("output_carried set");
+        // Slot stays in_use after the lowering returns.
+        assert!(
+            pages.in_use[carried.id as usize],
+            "carry-forward slot stays in_use"
+        );
+
+        let src = emit_body(&prog);
+        // Loaders DO load (no input carry-forward in this test).
+        assert!(src.contains("tma::load_async("));
+        // Storer does NOT TMA-store A.
+        assert!(
+            !src.contains("tma::store_async"),
+            "storer skips TMA store when output_internal=true\n{src}"
+        );
     }
 }

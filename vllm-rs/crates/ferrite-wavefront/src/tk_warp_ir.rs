@@ -567,21 +567,123 @@ impl TkProgram {
         self.instrs.push(TkInstr::Sync { role });
     }
 
-    /// Build a `ForLoop` body in a sub-program. The closure receives a
-    /// fresh [`TkProgram`] to populate; on return its `instrs` become
-    /// the loop body. This keeps lowering code shaped like ordinary
-    /// straight-line tape — no manual `Vec<TkInstr>` plumbing.
+    /// Build a `ForLoop` body in a sub-program. The closure receives
+    /// a [`LoopBody`] wrapper (not a raw [`TkProgram`]) — this enforces
+    /// at compile time that every emit inside the body is loop-safe.
+    ///
+    /// **Specifically**: `LoopBody` does NOT expose static-offset
+    /// [`TkProgram::load_async`] / [`TkProgram::store_async`] /
+    /// [`TkProgram::wait`] / [`TkProgram::arrive`]. Inside a loop body,
+    /// every load / store MUST take a dynamic byte-offset
+    /// expression (or the SAME static expression won't be correct
+    /// for every iteration). Every wait/arrive must use
+    /// [`TkProgram::wait_loop_parity`] / [`TkProgram::arrive_loop`]
+    /// for the runtime per-iter parity. The legacy
+    /// `lower_attn_decode` K/V load bug — `body.load_async(...,
+    /// RegionRef::rows_cols(..., 0, ...), ...)` — fails to compile
+    /// because `LoopBody` has no `load_async` method.
     pub fn for_loop<F>(&mut self, var: impl Into<String>, count: LoopBound, build: F)
     where
-        F: FnOnce(&mut TkProgram),
+        F: FnOnce(&mut LoopBody<'_>),
     {
-        let mut body = TkProgram::new();
+        let mut body_prog = TkProgram::new();
+        let mut body = LoopBody { inner: &mut body_prog };
         build(&mut body);
         self.instrs.push(TkInstr::ForLoop {
             var: var.into(),
             count,
-            body: body.instrs,
+            body: body_prog.instrs,
         });
+    }
+}
+
+// ── LoopBody — restricted view of TkProgram for use inside for_loop ─
+//
+// Inside a `for_loop` body, every barrier interaction must use the
+// runtime per-iter parity (`wait_loop_parity` / `arrive_loop`), and
+// every TMA must use a dynamic byte-offset (`load_async_dyn` /
+// `store_async_dyn`). LoopBody enforces this at the type level by
+// exposing ONLY those methods. The static-offset `load_async` and
+// the static-phase `wait` are not reachable through `LoopBody`.
+//
+// This catches the legacy `lower_attn_decode` K/V load bug at
+// compile time:
+//
+//     body.load_async(k_id, op.k_cache,
+//         RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols), k_tile);
+//
+// Now produces "no method named `load_async` found for struct
+// `&mut LoopBody`" — the call site must be rewritten to
+// `body.load_async_dyn(...)` with a real per-iter offset
+// expression.
+
+/// Restricted view of [`TkProgram`] for emitting instructions inside
+/// a `for_loop` body. Wraps a `&mut TkProgram` and exposes only the
+/// loop-safe methods.
+pub struct LoopBody<'a> {
+    inner: &'a mut TkProgram,
+}
+
+impl<'a> LoopBody<'a> {
+    /// Wait with the runtime per-iter parity expression. Forwards to
+    /// [`TkProgram::wait_loop_parity`].
+    pub fn wait_loop_parity(
+        &mut self,
+        role: WarpRole,
+        kind: PageBarrier,
+        page_id: u8,
+        loop_var: &str,
+        start_phase: u32,
+    ) {
+        self.inner.wait_loop_parity(role, kind, page_id, loop_var, start_phase);
+    }
+
+    /// Arrive inside a loop body. Forwards to
+    /// [`TkProgram::arrive_loop`].
+    pub fn arrive_loop(&mut self, role: WarpRole, kind: PageBarrier, page_id: u8) {
+        self.inner.arrive_loop(role, kind, page_id);
+    }
+
+    /// TMA load with a runtime byte-offset expression. Forwards to
+    /// [`TkProgram::load_async_dyn`]. **There is intentionally no
+    /// static-offset `load_async` on `LoopBody`** — every load
+    /// inside a for_loop must specify a dynamic offset, otherwise
+    /// every iteration reads the same bytes (the legacy
+    /// `lower_attn_decode` K/V cache bug).
+    pub fn load_async_dyn(
+        &mut self,
+        page_id: u8,
+        src: BufId,
+        src_region: RegionRef,
+        tile: TileShape,
+        dyn_byte_off: impl Into<String>,
+    ) {
+        self.inner.load_async_dyn(page_id, src, src_region, tile, dyn_byte_off);
+    }
+
+    /// TMA store with a runtime byte-offset expression. Forwards to
+    /// [`TkProgram::store_async_dyn`]. Same rationale as
+    /// [`LoopBody::load_async_dyn`].
+    pub fn store_async_dyn(
+        &mut self,
+        page_id: u8,
+        dst: BufId,
+        dst_region: RegionRef,
+        tile: TileShape,
+        dyn_byte_off: impl Into<String>,
+    ) {
+        self.inner.store_async_dyn(page_id, dst, dst_region, tile, dyn_byte_off);
+    }
+
+    /// Compute body inside a loop. Forwards to
+    /// [`TkProgram::compute_calls`].
+    pub fn compute_calls(&mut self, role: WarpRole, calls: Vec<crate::tk_codegen::Tk20Call>) {
+        self.inner.compute_calls(role, calls);
+    }
+
+    /// CTA-wide sync inside a loop. Forwards to [`TkProgram::sync`].
+    pub fn sync(&mut self, role: WarpRole) {
+        self.inner.sync(role);
     }
 }
 

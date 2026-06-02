@@ -512,31 +512,65 @@ pub mod tk20 {
     /// per-q-head scaled dot-product, applies the online-softmax
     /// renormalisation `__renorm = exp(m_old - m_new)`, updates
     /// `__l_sum`, and rescales `__o_accum` by `__renorm`.
-    pub fn attn_decode_qkt_softmax_step_body(unique_id: u32) -> String {
+    ///
+    /// Phase 9: replace the `__shfl_xor_sync` butterfly K-reduce with
+    /// TK 2.0 register-vector primitives (`warp::load → warp::copy →
+    /// warp::mul → warp::sum`), matching the Phase 8 `gemm_m1` pattern.
+    /// `head_dim` is now a body-emit parameter (was prelude-scope-only)
+    /// so `kittens::sv_bf<head_dim>` reaches the emit as a literal.
+    /// Per-q-head softmax math (m_max/l_sum/renorm/p scalars) stays on
+    /// per-thread float arrays declared in the prelude — those are
+    /// scalars not vectors. The full register-tile online-softmax with
+    /// `mma_AB`/`mma_ABt` waits on the typed `gl<>` substrate-deep phase
+    /// (same precondition as Phase 8: m=1 1×head_dim shapes don't fit
+    /// TK 2.0 register tiles which require ≥16×16).
+    pub fn attn_decode_qkt_softmax_step_body(unique_id: u32, head_dim: u32) -> String {
         let u = unique_id;
+        let q_sv_decl = decl_sv_view_bf(
+            "__q_row_sv",
+            &format!("(reinterpret_cast<__nv_bfloat16*>(__q_smem_a{u}) + __q_off)"),
+            head_dim,
+        );
+        let k_sv_decl = decl_sv_view_bf(
+            "__k_row_sv",
+            &format!("(reinterpret_cast<__nv_bfloat16*>(__k_smem_a{u}) + __k_off)"),
+            head_dim,
+        );
+        let q_rv_bf_decl = decl_rv_bf("__q_rv_bf", head_dim);
+        let k_rv_bf_decl = decl_rv_bf("__k_rv_bf", head_dim);
+        let q_rv_fl_decl = decl_rv_fl("__q_rv_fl", head_dim);
+        let k_rv_fl_decl = decl_rv_fl("__k_rv_fl", head_dim);
+        let load_q = warp_load_rv_from_sv("__q_rv_bf", "__q_row_sv");
+        let load_k = warp_load_rv_from_sv("__k_rv_bf", "__k_row_sv");
+        let copy_q = warp_copy_rv("__q_rv_fl", "__q_rv_bf");
+        let copy_k = warp_copy_rv("__k_rv_fl", "__k_rv_bf");
+        let mul_qk = warp_mul_rv("__q_rv_fl", "__q_rv_fl", "__k_rv_fl");
+        let sum_expr = warp_sum_rv("__q_rv_fl");
         format!(
             r#"
             // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
-            // Phase 7: gate to active warps (`__consumer_idx <
-            // num_kv_heads`).
+            // Phase 7: gate to active warps. Phase 9: K-axis reduce via
+            // TK 2.0 register-vector primitives.
             if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
                 const unsigned int __q_head_base =
                     static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
                 const unsigned int __k_off = __kv_head * __head_dim_a{u};
+                {k_sv_decl}
                 for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
                     const unsigned int __q_off = (__q_head_base + __h) * __head_dim_a{u};
-                    float __s = 0.0f;
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __s += __bfloat162float(__q_smem_a{u}[__q_off + __j])
-                             * __bfloat162float(__k_smem_a{u}[__k_off + __j]);
-                    }}
-                    #pragma unroll
-                    for (int __o = 16; __o > 0; __o >>= 1) {{
-                        __s += __shfl_xor_sync(0xFFFFFFFFu, __s, __o);
-                    }}
+                    {q_sv_decl}
+                    {q_rv_bf_decl}
+                    {k_rv_bf_decl}
+                    {q_rv_fl_decl}
+                    {k_rv_fl_decl}
+                    {load_q}
+                    {load_k}
+                    {copy_q}
+                    {copy_k}
+                    {mul_qk}
+                    float __s = {sum_expr};
                     __s *= __scale_a{u};
                     const float __m_new = fmaxf(__m_max_a{u}[__h], __s);
                     __renorm_a{u}[__h] = expf(__m_max_a{u}[__h] - __m_new);
@@ -1662,7 +1696,10 @@ pub enum Tk20Call {
 
     /// AttnDecode Q@K^T + online-softmax step (inside KV-sweep loop).
     /// Bound through `tk20::attn_decode_qkt_softmax_step_body`.
-    AttnDecodeQktSoftmaxStepBody { unique_id: u32 },
+    /// `head_dim` carried so the body emit declares
+    /// `kittens::sv_bf<head_dim>` / `kittens::rv_bf<head_dim>` views
+    /// with a literal compile-time length (Phase 9).
+    AttnDecodeQktSoftmaxStepBody { unique_id: u32, head_dim: u32 },
 
     /// AttnDecode softmax(P)@V accumulation step (inside KV-sweep
     /// loop). Bound through `tk20::attn_decode_sv_accum_step_body`.
@@ -1749,9 +1786,10 @@ impl Tk20Call {
             Tk20Call::AttnDecodeInitSoftmaxBody { unique_id } => {
                 tk20::attn_decode_init_softmax_body(*unique_id)
             }
-            Tk20Call::AttnDecodeQktSoftmaxStepBody { unique_id } => {
-                tk20::attn_decode_qkt_softmax_step_body(*unique_id)
-            }
+            Tk20Call::AttnDecodeQktSoftmaxStepBody {
+                unique_id,
+                head_dim,
+            } => tk20::attn_decode_qkt_softmax_step_body(*unique_id, *head_dim),
             Tk20Call::AttnDecodeSvAccumStepBody { unique_id } => {
                 tk20::attn_decode_sv_accum_step_body(*unique_id)
             }
@@ -2491,11 +2529,28 @@ mod tests {
         assert!(init.contains("__l_sum_a7[__h] = 0.0f;"));
         assert!(!init.contains("kittens::tma::"));
 
-        let qkt = tk20::attn_decode_qkt_softmax_step_body(7);
+        // Phase 9: K-axis reduce via TK 2.0 register-vector primitives;
+        // shfl butterfly removed.
+        let qkt = tk20::attn_decode_qkt_softmax_step_body(7, 64);
         assert!(qkt.contains("AttnDecode #7 — Q@K^T + online softmax"));
-        assert!(qkt.contains("__shfl_xor_sync(0xFFFFFFFFu, __s, __o)"));
+        assert!(qkt.contains("kittens::sv_bf<64>& __k_row_sv ="));
+        assert!(qkt.contains("kittens::sv_bf<64>& __q_row_sv ="));
+        assert!(qkt.contains("kittens::rv_bf<64> __q_rv_bf;"));
+        assert!(qkt.contains("kittens::rv_bf<64> __k_rv_bf;"));
+        assert!(qkt.contains("kittens::rv_fl<64> __q_rv_fl;"));
+        assert!(qkt.contains("kittens::rv_fl<64> __k_rv_fl;"));
+        assert!(qkt.contains("kittens::warp::load(__q_rv_bf, __q_row_sv);"));
+        assert!(qkt.contains("kittens::warp::load(__k_rv_bf, __k_row_sv);"));
+        assert!(qkt.contains("kittens::warp::copy(__q_rv_fl, __q_rv_bf);"));
+        assert!(qkt.contains("kittens::warp::copy(__k_rv_fl, __k_rv_bf);"));
+        assert!(qkt.contains("kittens::warp::mul(__q_rv_fl, __q_rv_fl, __k_rv_fl);"));
+        assert!(qkt.contains("float __s = kittens::warp::sum(__q_rv_fl);"));
         assert!(qkt.contains("__renorm_a7[__h] = expf(__m_max_a7[__h] - __m_new);"));
+        assert!(!qkt.contains("__shfl_xor_sync"));
+        assert!(!qkt.contains("__bfloat162float(__q_smem"));
+        assert!(!qkt.contains("__bfloat162float(__k_smem"));
         assert!(!qkt.contains("kittens::warp::mma_AB"));
+        assert!(!qkt.contains("kittens::warpgroup::mma_AB"));
 
         let sv = tk20::attn_decode_sv_accum_step_body(7);
         assert!(sv.contains("AttnDecode #7 — softmax(P) @ V"));

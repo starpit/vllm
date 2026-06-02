@@ -425,6 +425,7 @@ pub fn lower_attn_decode<P: Phase>(
                 WarpRole::AllConsumers,
                 vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
                     unique_id: op.unique_id,
+                    head_dim: op.head_dim,
                 }],
             );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);

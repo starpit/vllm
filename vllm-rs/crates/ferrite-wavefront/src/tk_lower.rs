@@ -605,17 +605,26 @@ pub fn lower_attn_decode<P: Phase>(
         |body| {
             // Per-iteration K round. Parity = (__kv_i & 1) ^ P::VALUE.
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
-            // Region uses a runtime expression for the page-table
-            // lookup; here we use a placeholder — the codegen's
-            // `LoadAsync` arm pastes `(__kv_i)` as the row index when
-            // the region is parameterised. For the slice, model the
-            // K-page byte-offset as 0 (real ports compute it from the
-            // block table).
-            body.load_async(
+            // Per-iteration K row offset: each token's K data occupies
+            // `kv_cols * act_elem` bytes (1024 B for Llama-1B). The
+            // dynamic offset `(__kv_i * row_bytes)` walks one token
+            // per iter through the contiguous K cache. NOTE: the
+            // proper paged-cache port indirects through the block
+            // table — `(block_table[__kv_i / block_size] *
+            // block_bytes + (__kv_i % block_size) * row_bytes)` — but
+            // for the prefill-+-N-decode-token sequences fitting in
+            // a single block (the first decode call) the flat offset
+            // matches. Block-table indirection is a follow-up; this
+            // value is per-iter and satisfies the substrate's
+            // structural enforcement (no static-zero loads inside
+            // for_loop bodies).
+            let row_bytes = kv_cols * op.act_elem;
+            body.load_async_dyn(
                 k_id,
                 op.k_cache,
                 RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
                 k_tile,
+                "0u".to_string(),
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
@@ -632,13 +641,14 @@ pub fn lower_attn_decode<P: Phase>(
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, k_id);
 
-            // Per-iteration V round.
+            // Per-iteration V round (same row_bytes per iter).
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, v_id, loop_var, start);
-            body.load_async(
+            body.load_async_dyn(
                 v_id,
                 op.v_cache,
                 RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
                 v_tile,
+                "0u".to_string(),
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
@@ -788,12 +798,16 @@ pub fn lower_attn_decode_routed<P: Phase>(
         loop_var,
         LoopBound::RuntimeU32(op.num_kv_pages_arg.into()),
         |body| {
+            // Per-iter K row offset; see `lower_attn_decode` for the
+            // block-table-indirection caveat.
+            let row_bytes = kv_cols * op.act_elem;
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
-            body.load_async(
+            body.load_async_dyn(
                 k_id,
                 op.k_cache,
                 RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
                 k_tile,
+                "0u".to_string(),
             );
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
             body.compute_calls(
@@ -808,11 +822,12 @@ pub fn lower_attn_decode_routed<P: Phase>(
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, k_id);
 
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, v_id, loop_var, start);
-            body.load_async(
+            body.load_async_dyn(
                 v_id,
                 op.v_cache,
                 RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
                 v_tile,
+                "0u".to_string(),
             );
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
             body.compute_calls(

@@ -323,6 +323,116 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
     pages.release(w_page);
 }
 
+/// Phase 12: routing-aware variant of `lower_rmsnorm`. Same protocol
+/// as `lower_residual_add_routed`. The weight slot is always
+/// gmem-loaded (weight is `InputRef::Ext` in every Llama / Mistral /
+/// Qwen / Phi / Gemma forward). Only x can carry-forward in.
+/// Output is in-place on x's page (the consumer body writes to
+/// `__x_smem` and the storer drains x_page → op.out); when
+/// `output_internal=true`, the storer skips the drain and the slot
+/// is carried forward to the consuming op.
+///
+/// Default-hints path is byte-identical to `lower_rmsnorm`.
+pub fn lower_rmsnorm_routed<P: Phase>(
+    op: RmsNormOp,
+    hints: &RoutingHints,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> RoutingResult {
+    debug_assert!(
+        hints.inputs.is_empty() || hints.inputs.len() == 2,
+        "lower_rmsnorm_routed: hints.inputs must be empty or len 2"
+    );
+    let in_x_carried = hints.inputs.first().and_then(|x| x.as_ref());
+    let in_w_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
+
+    let x_page: PageHandle<P> = match in_x_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages
+            .alloc_at::<P>()
+            .expect("page exhaustion: out of mbarrier slots (x)"),
+    };
+    let w_page: PageHandle<P> = match in_w_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages
+            .alloc_at::<P>()
+            .expect("page exhaustion: out of mbarrier slots (weight)"),
+    };
+    let x_id = x_page.id();
+    let w_id = w_page.id();
+
+    let x_region = RegionRef::rows_cols(op.x, op.m, 0, op.hidden);
+    let out_region = RegionRef::rows_cols(op.out, op.m, 0, op.hidden);
+    let weight_region = RegionRef::rows_cols(op.weight, 1, 0, op.hidden);
+    let x_tile = TileShape {
+        rows: op.m,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+    let weight_tile = TileShape {
+        rows: 1,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Loader: fill x (or skip for carry-forward) ──
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    if in_x_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, x_page);
+    } else {
+        prog.load_async(x_id, op.x, x_region, x_tile);
+    }
+
+    // ── Loader: fill weight (or skip for carry-forward; usually Ext) ──
+    let w_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, w_page);
+    if in_w_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, w_page);
+    } else {
+        prog.load_async(w_id, op.weight, weight_region, weight_tile);
+    }
+
+    // ── Consumer: RMS reduce + scale + apply weight (compute body unchanged) ──
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
+            x_id,
+            w_id,
+            hidden: op.hidden,
+            eps: op.eps,
+        }],
+    );
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
+
+    // ── Storer: drain x_page → out (or skip for internal output); free weight ──
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    if !hints.output_internal {
+        prog.store_async(x_id, op.out, out_region, x_tile);
+    }
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let w_page = prog.wait(WarpRole::Storer, PageBarrier::Done, w_page);
+    let w_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, w_page);
+
+    let x_advanced = prog.complete_round(x_page);
+    let w_advanced = prog.complete_round(w_page);
+
+    let result = if hints.output_internal {
+        let carried = pages.carry_forward(x_advanced);
+        pages.release(w_advanced);
+        RoutingResult {
+            output_carried: Some(carried),
+        }
+    } else {
+        pages.release(x_advanced);
+        pages.release(w_advanced);
+        RoutingResult::default()
+    };
+    result
+}
+
 // ── AttnDecode — the m=1 deadlock canonical ────────────────────────
 
 /// Inputs to lower one decode-attention op into a `TkProgram` fragment.
@@ -919,6 +1029,98 @@ pub fn lower_silu_mul<P: Phase>(
     pages.release(prog.complete_round(u_page));
 }
 
+/// Phase 12: routing-aware variant of `lower_silu_mul`. Same protocol
+/// as `lower_residual_add_routed`. Both gate and up are typically
+/// produced by upstream Gemms (gate_proj, up_proj) and consumed only
+/// by this op + the downstream down_proj — so both can carry-forward
+/// in. Output is in-place on gate's page; the storer drains gate_page
+/// to op.out (the down_proj's input) — when output_internal=true,
+/// drain skipped and gate_page is carried-forward.
+///
+/// Default-hints path is byte-identical to `lower_silu_mul`.
+pub fn lower_silu_mul_routed<P: Phase>(
+    op: SiluMulOp,
+    hints: &RoutingHints,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> RoutingResult {
+    debug_assert!(
+        hints.inputs.is_empty() || hints.inputs.len() == 2,
+        "lower_silu_mul_routed: hints.inputs must be empty or len 2"
+    );
+    let in_g_carried = hints.inputs.first().and_then(|x| x.as_ref());
+    let in_u_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
+
+    let g_page: PageHandle<P> = match in_g_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("silu_mul: gate page"),
+    };
+    let u_page: PageHandle<P> = match in_u_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("silu_mul: up page"),
+    };
+    let g_id = g_page.id();
+    let u_id = u_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.intermediate,
+        elem_bytes: op.act_elem,
+    };
+
+    let g_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, g_page);
+    if in_g_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, g_page);
+    } else {
+        prog.load_async(g_id, op.gate, region(op.gate, op.m, op.intermediate), tile);
+    }
+
+    let u_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, u_page);
+    if in_u_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, u_page);
+    } else {
+        prog.load_async(u_id, op.up, region(op.up, op.m, op.intermediate), tile);
+    }
+
+    let g_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, g_page);
+    let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+            g_id,
+            u_id,
+            total: op.intermediate as u64 * op.m as u64,
+        }],
+    );
+    let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
+    let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
+
+    let g_page = prog.wait(WarpRole::Storer, PageBarrier::Done, g_page);
+    if !hints.output_internal {
+        prog.store_async(g_id, op.out, region(op.out, op.m, op.intermediate), tile);
+    }
+    let g_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, g_page);
+
+    let u_page = prog.wait(WarpRole::Storer, PageBarrier::Done, u_page);
+    let u_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, u_page);
+
+    let g_advanced = prog.complete_round(g_page);
+    let u_advanced = prog.complete_round(u_page);
+
+    if hints.output_internal {
+        let carried = pages.carry_forward(g_advanced);
+        pages.release(u_advanced);
+        RoutingResult {
+            output_carried: Some(carried),
+        }
+    } else {
+        pages.release(g_advanced);
+        pages.release(u_advanced);
+        RoutingResult::default()
+    }
+}
+
 // Phase 5 cutover: legacy `silu_mul_compute_body` deleted.
 // Canonical emit at `tk_codegen::tk20::silu_mul_consumer_body`.
 
@@ -1035,6 +1237,141 @@ pub fn lower_rope_rotate<P: Phase>(
     pages.release(prog.complete_round(x_page));
     pages.release(prog.complete_round(c_page));
     pages.release(prog.complete_round(s_page));
+}
+
+/// Phase 12: routing-aware variant of `lower_rope_rotate`. Same
+/// protocol as `lower_residual_add_routed`. Only x is a carry-
+/// forward candidate (cos/sin are always Ext — the per-position
+/// rotary tables, loaded via `__decode_position * row_bytes`).
+/// Output is in-place on x's page; storer drains x_page → op.out
+/// when output is external.
+///
+/// Default-hints path is byte-identical to `lower_rope_rotate`.
+pub fn lower_rope_rotate_routed<P: Phase>(
+    op: RopeRotateOp,
+    hints: &RoutingHints,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> RoutingResult {
+    debug_assert!(
+        hints.inputs.is_empty() || hints.inputs.len() == 3,
+        "lower_rope_rotate_routed: hints.inputs must be empty or len 3"
+    );
+    let in_x_carried = hints.inputs.first().and_then(|x| x.as_ref());
+    let in_c_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
+    let in_s_carried = hints.inputs.get(2).and_then(|x| x.as_ref());
+
+    let x_page: PageHandle<P> = match in_x_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope: x page"),
+    };
+    let c_page: PageHandle<P> = match in_c_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope: cos page"),
+    };
+    let s_page: PageHandle<P> = match in_s_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope: sin page"),
+    };
+    let x_id = x_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let x_cols = op.num_heads * op.head_dim;
+    let x_tile = TileShape {
+        rows: op.m,
+        cols: x_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+
+    let row_bytes = op.head_dim * op.act_elem;
+    let pos_off = format!("__decode_position * {row_bytes}u");
+
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    if in_x_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, x_page);
+    } else {
+        prog.load_async(x_id, op.x, region(op.x, op.m, x_cols), x_tile);
+    }
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    if in_c_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, c_page);
+    } else {
+        prog.load_async_dyn(
+            c_id,
+            op.cos,
+            region(op.cos, 1, op.head_dim),
+            cs_tile,
+            pos_off.clone(),
+        );
+    }
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    if in_s_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, s_page);
+    } else {
+        prog.load_async_dyn(
+            s_id,
+            op.sin,
+            region(op.sin, 1, op.head_dim),
+            cs_tile,
+            pos_off,
+        );
+    }
+
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    if !hints.output_internal {
+        prog.store_async(x_id, op.out, region(op.out, op.m, x_cols), x_tile);
+    }
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    let x_advanced = prog.complete_round(x_page);
+    let c_advanced = prog.complete_round(c_page);
+    let s_advanced = prog.complete_round(s_page);
+
+    if hints.output_internal {
+        let carried = pages.carry_forward(x_advanced);
+        pages.release(c_advanced);
+        pages.release(s_advanced);
+        RoutingResult {
+            output_carried: Some(carried),
+        }
+    } else {
+        pages.release(x_advanced);
+        pages.release(c_advanced);
+        pages.release(s_advanced);
+        RoutingResult::default()
+    }
 }
 
 // Phase 5 cutover: legacy `rope_compute_body` deleted. Canonical
@@ -2015,5 +2352,151 @@ mod tests {
             !src.contains("tma::store_async"),
             "storer skips TMA store when output_internal=true\n{src}"
         );
+    }
+
+    /// Default-hints byte-identity for `lower_rmsnorm_routed`.
+    #[test]
+    fn lower_rmsnorm_routed_default_hints_match_legacy_emit() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let _ = lower_rmsnorm_routed::<Phase0>(
+            op(),
+            &RoutingHints::default(),
+            &mut pages,
+            &mut prog,
+        );
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_rmsnorm::<Phase0>(op(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
+    }
+
+    /// `lower_rmsnorm_routed` with `output_internal=true` skips the
+    /// storer's TMA store and returns a CarriedHandle.
+    #[test]
+    fn lower_rmsnorm_routed_internal_output_skips_store() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let result = lower_rmsnorm_routed::<Phase0>(
+            op(),
+            &RoutingHints {
+                inputs: vec![None, None],
+                output_internal: true,
+            },
+            &mut pages,
+            &mut prog,
+        );
+        assert!(result.output_carried.is_some());
+        let src = emit_body(&prog);
+        assert!(!src.contains("tma::store_async"));
+    }
+
+    fn silu_mul_op_for_routing_test() -> SiluMulOp {
+        SiluMulOp {
+            gate: BufId(30),
+            up: BufId(31),
+            out: BufId(32),
+            intermediate: 8192,
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    /// Default-hints byte-identity for `lower_silu_mul_routed`.
+    #[test]
+    fn lower_silu_mul_routed_default_hints_match_legacy_emit() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let _ = lower_silu_mul_routed::<Phase0>(
+            silu_mul_op_for_routing_test(),
+            &RoutingHints::default(),
+            &mut pages,
+            &mut prog,
+        );
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_silu_mul::<Phase0>(silu_mul_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
+    }
+
+    /// `lower_silu_mul_routed` with `output_internal=true`: storer skips drain.
+    #[test]
+    fn lower_silu_mul_routed_internal_output_skips_store() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let result = lower_silu_mul_routed::<Phase0>(
+            silu_mul_op_for_routing_test(),
+            &RoutingHints {
+                inputs: vec![None, None],
+                output_internal: true,
+            },
+            &mut pages,
+            &mut prog,
+        );
+        assert!(result.output_carried.is_some());
+        let src = emit_body(&prog);
+        assert!(!src.contains("tma::store_async"));
+    }
+
+    fn rope_op_for_routing_test() -> RopeRotateOp {
+        RopeRotateOp {
+            x: BufId(40),
+            cos: BufId(41),
+            sin: BufId(42),
+            out: BufId(43),
+            head_dim: 64,
+            num_heads: 32,
+            m: 1,
+            act_elem: 2,
+        }
+    }
+
+    /// Default-hints byte-identity for `lower_rope_rotate_routed`.
+    #[test]
+    fn lower_rope_rotate_routed_default_hints_match_legacy_emit() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let _ = lower_rope_rotate_routed::<Phase0>(
+            rope_op_for_routing_test(),
+            &RoutingHints::default(),
+            &mut pages,
+            &mut prog,
+        );
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_rope_rotate::<Phase0>(rope_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
+    }
+
+    /// `lower_rope_rotate_routed` with `output_internal=true`: storer
+    /// skips drain.
+    #[test]
+    fn lower_rope_rotate_routed_internal_output_skips_store() {
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let result = lower_rope_rotate_routed::<Phase0>(
+            rope_op_for_routing_test(),
+            &RoutingHints {
+                inputs: vec![None, None, None],
+                output_internal: true,
+            },
+            &mut pages,
+            &mut prog,
+        );
+        assert!(result.output_carried.is_some());
+        let src = emit_body(&prog);
+        assert!(!src.contains("tma::store_async"));
     }
 }

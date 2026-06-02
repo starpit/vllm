@@ -109,6 +109,66 @@ impl PageAllocator {
         self.in_use[page.id() as usize] = false;
         self.phase_bit[page.id() as usize] = page.phase();
     }
+
+    /// Phase 12: carry a page slot across an op boundary without
+    /// releasing it. The producer lowering uses this in place of
+    /// `release` for an internal output whose smem page is reused
+    /// directly by the next consumer (no gmem round-trip).
+    /// `phase_bit[id]` is updated to the post-round parity (so a
+    /// future allocator probe sees the right value if for some
+    /// reason the carry is dropped); `in_use[id]` stays `true` so
+    /// no other op can claim the slot before the consumer takes it.
+    pub fn carry_forward<P: crate::tk_warp_ir::Phase>(
+        &mut self,
+        page: PageHandle<P>,
+    ) -> CarriedHandle {
+        // Slot stays in_use=true; only the parity is recorded.
+        self.phase_bit[page.id() as usize] = page.phase();
+        CarriedHandle {
+            id: page.id(),
+            phase: page.phase(),
+        }
+    }
+
+    /// Phase 12: consume a carried-forward handle. The consuming op's
+    /// lowering uses this in place of `alloc_at::<P>()` for the input
+    /// slot whose data was produced by the upstream op's smem page.
+    /// Returns a typed `PageHandle<P>` at the carried-forward parity;
+    /// callers MUST then `release` (or carry-forward again) the page
+    /// at end-of-round, same as for an `alloc_at` allocation.
+    ///
+    /// The caller specifies the parity-typed handle they want; the
+    /// underlying `phase_bit` must match `P::VALUE`. Mismatch is a
+    /// caller error (the orchestrator chooses the consumer's lowering
+    /// generic to align with the carried parity).
+    pub fn consume_carried<P: crate::tk_warp_ir::Phase>(
+        &mut self,
+        carried: CarriedHandle,
+    ) -> PageHandle<P> {
+        debug_assert_eq!(
+            carried.phase, P::VALUE,
+            "consume_carried: carried phase {} != P::VALUE {}",
+            carried.phase, P::VALUE,
+        );
+        debug_assert!(
+            self.in_use[carried.id as usize],
+            "consume_carried: slot {} is not in_use (carry-forward dropped?)",
+            carried.id,
+        );
+        P::fresh_handle(carried.id)
+    }
+}
+
+/// Phase 12: handle for a page slot carried across an op boundary
+/// without a `release`/`alloc_at` round-trip. Produced by
+/// `PageAllocator::carry_forward(page)` and consumed by
+/// `PageAllocator::consume_carried::<P>(carried)`. Encodes the slot
+/// id + the post-producer-round parity bit so the consumer can pick
+/// the matching `lower_*<P>` generic.
+#[derive(Clone, Copy, Debug)]
+pub struct CarriedHandle {
+    pub id: u8,
+    pub phase: u32,
 }
 
 // ── RmsNorm — the vertical slice ───────────────────────────────────
@@ -1066,6 +1126,67 @@ mod tests {
             vec!["0", "0", "0", "0", "0", "0"],
             "round 0: every wait reads 0"
         );
+    }
+
+    /// Phase 12: carry-forward keeps the slot in_use so a follow-up
+    /// op can claim it via `consume_carried` without going through
+    /// alloc_at's free-slot probe. The `phase_bit` is recorded at
+    /// the carrier's parity so the next consumer's parity-typed
+    /// dispatch (`lower_X::<Phase0>` vs `<Phase1>`) sees the right
+    /// value.
+    #[test]
+    fn carry_forward_keeps_slot_in_use_and_records_parity() {
+        let mut pages = PageAllocator::new();
+        // Allocate at Phase0, advance through one round to Phase1,
+        // carry-forward instead of releasing.
+        let p = pages.alloc_at::<Phase0>().expect("alloc");
+        assert!(pages.in_use[p.id() as usize]);
+        let p_advanced = p.advance(); // Phase0 → Phase1 typed advance
+        let carried = pages.carry_forward(p_advanced);
+        assert!(
+            pages.in_use[carried.id as usize],
+            "carry_forward keeps slot in_use"
+        );
+        assert_eq!(carried.phase, 1, "carried at Phase1");
+        assert_eq!(
+            pages.phase_bit[carried.id as usize], 1,
+            "phase_bit recorded at carried parity"
+        );
+        // Consume — get a typed handle back at Phase1.
+        let p2: PageHandle<crate::tk_warp_ir::Phase1> = pages.consume_carried(carried);
+        assert_eq!(p2.id(), carried.id);
+        assert_eq!(p2.phase(), 1);
+        // Slot is still in_use after consume_carried (the consuming
+        // op's lowering is now responsible for end-of-round release).
+        assert!(pages.in_use[carried.id as usize]);
+        // Standard release at end of consumer's round.
+        pages.release(p2);
+        assert!(!pages.in_use[carried.id as usize]);
+    }
+
+    /// Carry-forward + consume_carried preserves the slot id (no
+    /// re-probe of the free pool happens between producer and
+    /// consumer). Two carry-forwards in flight occupy two distinct
+    /// slot ids.
+    #[test]
+    fn carry_forward_pins_slot_id() {
+        let mut pages = PageAllocator::new();
+        let p_a = pages.alloc_at::<Phase0>().expect("alloc a");
+        let p_b = pages.alloc_at::<Phase0>().expect("alloc b");
+        let id_a = p_a.id();
+        let id_b = p_b.id();
+        assert_ne!(id_a, id_b);
+        let carried_a = pages.carry_forward(p_a.advance());
+        let carried_b = pages.carry_forward(p_b.advance());
+        assert_eq!(carried_a.id, id_a);
+        assert_eq!(carried_b.id, id_b);
+        // A fresh alloc_at probe must NOT return either pinned id.
+        let p_c = pages.alloc_at::<Phase0>().expect("alloc c");
+        assert_ne!(p_c.id(), id_a);
+        assert_ne!(p_c.id(), id_b);
+        // Cleanup.
+        let _: PageHandle<crate::tk_warp_ir::Phase1> = pages.consume_carried(carried_a);
+        let _: PageHandle<crate::tk_warp_ir::Phase1> = pages.consume_carried(carried_b);
     }
 
     /// The page is released back to the allocator at the right parity:

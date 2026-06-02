@@ -355,51 +355,6 @@ pub mod tk20 {
         format!("kittens::warpgroup::decrease_registers<{n}>();")
     }
 
-    // ── Cross-IType mbarrier table (Phase 11) ──────────────────────
-    //
-    // Cross-IType waits go through `kittens::semaphore` via
-    // `tk20::wait` / `tk20::arrive` (the same mbarrier primitives used
-    // for intra-IType Ready/Done/Consumed handshakes). Per `(layer,
-    // opcode_id)` pair, one mbarrier slot is allocated in the per-
-    // canonical kernel scaffold's `cross_op[num_layers][num_opcodes]`
-    // semaphore table. Producer IType arrives the slot at end-of-
-    // instruction; consumer IType waits the slot at start-of-
-    // instruction.
-    //
-    // The legacy intra-IType `Ready/Done/Consumed` mbarriers
-    // (`page_ready[i]`/`page_done[i]`/`page_consumed[i]`) stay — they
-    // guard within-op handoff (loader → consumer → storer); the
-    // cross-IType `cross_op[layer][opcode]` table is a new orthogonal
-    // layer.
-    //
-    // Phase 11 ships the bindings + scaffold infrastructure. No IType
-    // emits cross_op_arrive / cross_op_wait yet — Phase 12 (fused
-    // ITypes) is the first consumer. Slot init counts come from the
-    // scheduler's per-(layer, opcode) producer/consumer count; absent
-    // a scheduler integration, the scaffold inits each slot to 1
-    // arrive (single-producer single-consumer, the simplest case).
-
-    /// `kittens::group<1>::arrive(cross_op[layer][opcode])`. Producer
-    /// IType arrives the cross-op slot at end-of-instruction. Source:
-    /// `ops/group/util/sync.cuh:69`. Lane-0 gated (the wrapper enforces
-    /// arrive-once semantics across the producing warp's lanes).
-    pub fn cross_op_arrive(layer: u32, opcode: u32) -> String {
-        format!(
-            "if ((threadIdx.x & 31) == 0) {{ kittens::group<1>::arrive(cross_op[{layer}][{opcode}]); }}"
-        )
-    }
-
-    /// `kittens::group<1>::wait(cross_op[layer][opcode], phase)`.
-    /// Consumer IType waits the cross-op slot at start-of-instruction.
-    /// Source: `ops/group/util/sync.cuh:112` (Hopper try_wait.parity).
-    /// `phase` is the parity bit (0 or 1) that round N expects, where
-    /// N = round count for this (layer, opcode) pair so far.
-    pub fn cross_op_wait(layer: u32, opcode: u32, phase_expr: &str) -> String {
-        format!(
-            "kittens::group<1>::wait(cross_op[{layer}][{opcode}], {phase_expr});"
-        )
-    }
-
     // ── RMSNorm consumer body (typed atom; emits raw CUDA inline) ──
     //
     // RmsNorm under TK 2.0 idiom: per-thread bf16 squared-sum +
@@ -995,16 +950,6 @@ pub struct EmitOpts {
     /// first wait in the round protocol that blocks without a matching
     /// arrive trace; off by default so production kernels stay quiet.
     pub debug_handshake: bool,
-    /// Phase 11: shape of the cross-IType `cross_op[num_layers][num_opcodes]`
-    /// `kittens::semaphore` table declared in shared memory by the
-    /// kernel scaffold. `None` = no cross-op table emitted (Phase 7-10
-    /// behaviour; per-op rounds use only the legacy intra-IType
-    /// `page_ready[i]` / `page_done[i]` / `page_consumed[i]` arrays).
-    /// `Some((layers, opcodes))` declares a 2D semaphore array sized
-    /// to `layers * opcodes`, all init to arrive-count 1 (single-
-    /// producer single-consumer; scheduler-driven multi-producer
-    /// counts wait on Phase 12 fusion-aware codegen).
-    pub cross_op_table: Option<(u32, u32)>,
 }
 
 /// Render a single lane-0-gated `printf` line. Always wraps in
@@ -1432,17 +1377,6 @@ pub fn emit_kernel_with_opts(
         "    __shared__ kittens::semaphore page_consumed[{}];\n",
         NUM_PAGES
     ));
-    // Phase 11: optional cross-IType mbarrier table. Producer ITypes
-    // emit `tk20::cross_op_arrive(layer, opcode)` at end-of-instruction;
-    // consumer ITypes emit `tk20::cross_op_wait(layer, opcode_dep, phase)`
-    // at start-of-instruction. Slot init counts default to 1 here
-    // (single-producer single-consumer); scheduler-driven multi-producer
-    // counts wait on Phase 12 fusion-aware codegen.
-    if let Some((layers, opcodes)) = opts.cross_op_table {
-        out.push_str(&format!(
-            "    __shared__ kittens::semaphore cross_op[{layers}][{opcodes}];\n"
-        ));
-    }
     // Dynamic shared memory: TK 2.0 production pattern. The launcher must
     // set `cudaFuncAttributeMaxDynamicSharedMemorySize` to at least
     // `NUM_PAGES * PAGE_SIZE` so the pool fits. nvcc itself only requires
@@ -1480,17 +1414,6 @@ pub fn emit_kernel_with_opts(
     out.push_str("            kittens::init_semaphore(page_consumed[__i], 0, 1);\n");
     out.push_str("            kittens::arrive(page_consumed[__i]);\n");
     out.push_str("        }\n");
-    if let Some((layers, opcodes)) = opts.cross_op_table {
-        out.push_str(&format!(
-            "        for (int __l = 0; __l < {layers}; ++__l) {{\n"
-        ));
-        out.push_str(&format!(
-            "            for (int __o = 0; __o < {opcodes}; ++__o) {{\n"
-        ));
-        out.push_str("                kittens::init_semaphore(cross_op[__l][__o], 0, 1);\n");
-        out.push_str("            }\n");
-        out.push_str("        }\n");
-    }
     out.push_str("    }\n");
     // Async-proxy fence: `mbarrier.init` and `mbarrier.arrive` write
     // through the ASYNC proxy of shared memory; without an explicit
@@ -2199,7 +2122,6 @@ mod tests {
 
         let opts = EmitOpts {
             debug_handshake: true,
-            ..Default::default()
         };
         let src = emit_body_with_opts(&p, &opts);
 
@@ -2255,7 +2177,6 @@ mod tests {
         };
         let opts = EmitOpts {
             debug_handshake: true,
-            ..Default::default()
         };
         let src = emit_kernel_with_opts("tk_dbg_smoke", &args, &p, &opts);
         assert!(src.contains("#include <cstdio>"), "cstdio pulled in\n{src}");
@@ -2617,65 +2538,6 @@ mod tests {
         let s = tk20::warp_sum_rv("__rv");
         // Expression — no trailing semicolon — composes inside `acc += ...;`.
         assert_eq!(s, "kittens::warp::sum(__rv)");
-    }
-
-    #[test]
-    fn tk20_cross_op_arrive_cites_kittens_group1_arrive() {
-        let s = tk20::cross_op_arrive(3, 5);
-        assert_eq!(
-            s,
-            "if ((threadIdx.x & 31) == 0) { kittens::group<1>::arrive(cross_op[3][5]); }"
-        );
-    }
-
-    #[test]
-    fn tk20_cross_op_wait_cites_kittens_group1_wait() {
-        let s = tk20::cross_op_wait(3, 5, "(__round_n & 1)");
-        assert_eq!(
-            s,
-            "kittens::group<1>::wait(cross_op[3][5], (__round_n & 1));"
-        );
-    }
-
-    #[test]
-    fn emit_kernel_cross_op_table_declared_and_initialized_when_set() {
-        // Phase 11: when EmitOpts::cross_op_table is set, the scaffold
-        // declares a 2D `kittens::semaphore` table sized to
-        // `[num_layers][num_opcodes]` and inits every slot to arrive-
-        // count 1. Default emit (None) omits the table entirely —
-        // Phases 7-10 byte-identity preserved.
-        let args = KernelArgs {
-            bufs: vec![KernelArg {
-                ty: "__nv_bfloat16* __restrict__".into(),
-                name: "out".into(),
-            }],
-            u32_args: vec![],
-        };
-        let prog = TkProgram::new();
-        let off = emit_kernel_with_opts(
-            "k",
-            &args,
-            &prog,
-            &EmitOpts {
-                debug_handshake: false,
-                cross_op_table: None,
-            },
-        );
-        assert!(!off.contains("cross_op["), "default emit has no cross_op table");
-
-        let on = emit_kernel_with_opts(
-            "k",
-            &args,
-            &prog,
-            &EmitOpts {
-                debug_handshake: false,
-                cross_op_table: Some((16, 8)),
-            },
-        );
-        assert!(on.contains("__shared__ kittens::semaphore cross_op[16][8];"));
-        assert!(on.contains("for (int __l = 0; __l < 16; ++__l)"));
-        assert!(on.contains("for (int __o = 0; __o < 8; ++__o)"));
-        assert!(on.contains("kittens::init_semaphore(cross_op[__l][__o], 0, 1);"));
     }
 
     // GemmM1 byte-identity test deleted in Phase 5 cutover (legacy

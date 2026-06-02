@@ -341,6 +341,10 @@ impl SpecializedPipelineCache {
                     "vision_rope_2d",
                     crate::embedded_metallib!("vision_rope_2d"),
                 ),
+                (
+                    "vision_varlen_attn",
+                    crate::embedded_metallib!("vision_varlen_attn"),
+                ),
             ],
         )?;
         // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at

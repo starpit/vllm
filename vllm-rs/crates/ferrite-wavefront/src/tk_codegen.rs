@@ -20,6 +20,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 use crate::tk_warp_ir::{
     LoopBound, PageBarrier, TileShape, TkInstr, TkProgram, WarpRole, NUM_CONSUMER_WARPS,
 };
@@ -132,6 +134,31 @@ pub mod tk20 {
              reinterpret_cast<void*>(reinterpret_cast<char*>(buf{dst_buf}) + {off_expr}), \
              reinterpret_cast<void*>(page_buf[{page_id}]), \
              {bytes}); \
+             kittens::group<1>::tma::store_async_wait();"
+        )
+    }
+
+    /// Step C.3 — descriptor (typed `gl<>`) TMA store for opted-in
+    /// buffers. Pair: typed `store_async<cache_policy::NORMAL>(dst, src,
+    /// {b,d,r,c})` + `store_commit_group()` + `store_async_wait()`.
+    /// `tile_type` is the CUDA tile type spelling (e.g.
+    /// `"kittens::sv_bf<2048>"` for vector form). Coords are
+    /// tile-frame `{0,0,0,0}` for the C.3 initial scope (rmsnorm output
+    /// store, no dynamic offset, single-tile shape).
+    ///
+    /// Sources:
+    ///   - `include/ops/group/memory/vec/tma.cuh` (vector `store_async`).
+    ///   - `include/ops/group/util/tma.cuh:38` (`store_commit_group`).
+    ///   - `include/ops/group/util/tma.cuh:47` (`store_async_wait<N=0>`).
+    /// Same TK 2.0 spelling as the C.2 PoC smoke kernel
+    /// (`tk_emit_rmsnorm_tensor_smoke.rs`).
+    pub fn tma_store_async_typed(page_id: u8, dst_buf: u32, tile_type: &str) -> String {
+        format!(
+            "kittens::group<1>::tma::store_async<kittens::cache_policy::NORMAL>(\
+             arg{dst_buf}, \
+             *reinterpret_cast<{tile_type}*>(page_buf[{page_id}]), \
+             {{0, 0, 0, 0}}); \
+             kittens::group<1>::tma::store_commit_group(); \
              kittens::group<1>::tma::store_async_wait();"
         )
     }
@@ -1027,10 +1054,38 @@ fn arrive_group_width(_role: WarpRole) -> u32 {
 
 // ── Emit options ───────────────────────────────────────────────────
 
+/// Layout for a typed `kittens::gl<>` buffer arg (Step C.3).
+///
+/// One of these per buffer index that opts in to descriptor-TMA. The
+/// emit composes
+/// `using ARG{i}_T = kittens::gl<bf16, batch, depth, rows, cols, tile_type>;`
+/// before the kernel and switches the kernel signature arg to
+/// `const __grid_constant__ ARG{i}_T arg{i}`. The host launcher
+/// constructs an `ARG{i}_T` instance from the runtime pointer and
+/// passes it to the kernel — `cuTensorMapEncodeTiled` runs inside
+/// TK 2.0's `gl<>` host ctor (`include/types/global/gl.cuh:153-160`),
+/// per `feedback_dogfood_tk20_rust`.
+///
+/// Compile-time-fixed dims (b, d, r, c not -1) are baked into the
+/// template; the host ctor takes `nullptr` for each runtime-dim slot.
+/// Llama-1B vector-form RmsNorm output uses
+/// `{batch:1, depth:1, rows:1, cols:hidden, tile_type:"kittens::sv_bf<HIDDEN>"}`.
+#[derive(Clone, Debug)]
+pub struct GlLayout {
+    pub batch: i32,
+    pub depth: i32,
+    pub rows: i32,
+    pub cols: i32,
+    /// CUDA type spelling for the `TMA_Types... = ...` template arg —
+    /// e.g. `"kittens::sv_bf<2048>"` (vector form, `UTMASTG.4D`) or
+    /// `"kittens::st_bf<16, 64>"` (tile form, `UTMASTG.5D`).
+    pub tile_type: String,
+}
+
 /// Per-emit knobs. Defaults give the production CUDA source; setting
 /// flags here turns on debug instrumentation that's safe to ship in a
 /// `.cu` file but adds a printf line per handshake.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EmitOpts {
     /// When true, every emitted `Wait` / `Arrive` / `LoadAsync` /
     /// `StoreAsync` is wrapped in lane-0-gated `printf`s tagged with
@@ -1039,6 +1094,15 @@ pub struct EmitOpts {
     /// first wait in the round protocol that blocks without a matching
     /// arrive trace; off by default so production kernels stay quiet.
     pub debug_handshake: bool,
+
+    /// Step C.3 — per-buffer descriptor-TMA opt-in. Map from buffer
+    /// index → typed `gl<>` layout. Buffers in this map become
+    /// `const __grid_constant__ ARG{i}_T arg{i}` parameters; their
+    /// TMA loads/stores emit the typed (descriptor) form
+    /// (`kittens::group<1>::tma::store_async<cache_policy::NORMAL>(arg, smem, {0,0,0,0})`).
+    /// Buffers absent from the map keep raw-bulk emit byte-identical
+    /// to the legacy path. Empty default → no behaviour change.
+    pub descriptor_layouts: BTreeMap<u32, GlLayout>,
 }
 
 /// Render a single lane-0-gated `printf` line. Always wraps in
@@ -1197,9 +1261,21 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
                 elem_bytes,
             } = *tile;
             let byte_off = (dst_region.region.cols.start as u64) * (elem_bytes as u64);
-            (
-                WarpRole::Storer,
-                tk20::tma_store_async(
+            // Step C.3 — when `dst` opted in to descriptor TMA via
+            // `EmitOpts::descriptor_layouts`, emit the typed `gl<>`
+            // store. Initial scope (rmsnorm output, vector form) is the
+            // single-tile {0,0,0,0} case: byte_off==0 and no dynamic
+            // offset. Anything else falls back to the raw-bulk path —
+            // defensive fallback so a stray opt-in for a wrong shape
+            // can't break correctness silently.
+            let typed_body: Option<String> = opts
+                .descriptor_layouts
+                .get(&dst.0)
+                .filter(|_| byte_off == 0 && dyn_byte_off.is_none())
+                .map(|layout| tk20::tma_store_async_typed(*page_id, dst.0, &layout.tile_type));
+            let body = match typed_body {
+                Some(s) => s,
+                None => tk20::tma_store_async(
                     *page_id,
                     dst.0,
                     byte_off,
@@ -1208,7 +1284,8 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
                     elem_bytes,
                     dyn_byte_off.as_deref(),
                 ),
-            )
+            };
+            (WarpRole::Storer, body)
         }
         TkInstr::Compute { role, calls } => {
             // Walk `calls` in order, emitting one CUDA fragment per
@@ -1387,17 +1464,44 @@ pub fn emit_kernel_with_opts(
     out.push_str("#define ROLE_CONSUMER   4\n");
     out.push_str("\n");
 
+    // Step C.3 — typed `kittens::gl<>` typedefs for descriptor-TMA
+    // opt-in buffers. One `using ARG{i}_T = kittens::gl<...>;` per
+    // entry in `opts.descriptor_layouts`. Empty default → none emitted,
+    // legacy raw-bulk path is byte-identical.
+    if !opts.descriptor_layouts.is_empty() {
+        for (i, layout) in &opts.descriptor_layouts {
+            out.push_str(&format!(
+                "using ARG{i}_T = kittens::gl<__nv_bfloat16, {b}, {d}, {r}, {c}, {tt}>;\n",
+                i = i,
+                b = layout.batch,
+                d = layout.depth,
+                r = layout.rows,
+                c = layout.cols,
+                tt = layout.tile_type,
+            ));
+        }
+        out.push_str("\n");
+    }
+
     // Kernel signature.
     out.push_str(&format!(
         "__global__ __launch_bounds__({total_threads}) void {name}(\n"
     ));
     let mut first = true;
-    for arg in &args.bufs {
+    for (i, arg) in args.bufs.iter().enumerate() {
         if !first {
             out.push_str(",\n");
         }
         first = false;
-        out.push_str(&format!("    {} {}", arg.ty, arg.name));
+        if opts.descriptor_layouts.contains_key(&(i as u32)) {
+            // Descriptor-TMA path: kernel takes the gl<> instance by
+            // value via `__grid_constant__` (TK 2.0 idiom — see C.2 PoC
+            // smoke kernel). Body keeps using `buf{i}` via the
+            // `auto* {name} = arg{i}.raw_ptr` alias below.
+            out.push_str(&format!("    const __grid_constant__ ARG{i}_T arg{i}"));
+        } else {
+            out.push_str(&format!("    {} {}", arg.ty, arg.name));
+        }
     }
     for u32_name in &args.u32_args {
         if !first {
@@ -1412,7 +1516,22 @@ pub fn emit_kernel_with_opts(
 
     // `buf{i}` aliases so the body's `buf3 /* +256 */` substitutions
     // resolve to the right named arg.
+    //
+    // For descriptor-TMA opt-in buffers, the kernel signature param is
+    // `arg{i}` (the gl<> instance), not the raw pointer. Bind a local
+    // `auto* {name} = arg{i}.raw_ptr;` first so the existing alias line
+    // (`auto& buf{i} = {name};`) keeps working — body code that uses
+    // `buf{i}` as a `bf16*` (e.g. for non-descriptor accesses) is
+    // unchanged. Descriptor TMA loads/stores against this buffer also
+    // have access to `arg{i}` directly via the IR-driven emit branch.
     for (i, arg) in args.bufs.iter().enumerate() {
+        if opts.descriptor_layouts.contains_key(&(i as u32)) {
+            out.push_str(&format!(
+                "    auto* {name} = arg{i}.raw_ptr;\n",
+                name = arg.name,
+                i = i,
+            ));
+        }
         out.push_str(&format!("    auto& buf{i} = {};\n", arg.name));
     }
     out.push_str("\n");
@@ -1584,6 +1703,24 @@ pub fn emit_kernel_with_opts(
             (int)DYN_SMEM);\n    \
             if (__err != cudaSuccess) return __err;\n"
     ));
+    // Step C.3 — for descriptor-TMA opt-in buffers, build a
+    // `kittens::gl<>` host instance from the runtime pointer. The gl<>
+    // ctor invokes `cuTensorMapEncodeTiled` internally per
+    // `include/types/global/gl.cuh:153-160`; per
+    // `feedback_dogfood_tk20_rust` the driver TMA API is never called
+    // from Rust. All-`nullptr` runtime-dim args because every dim is
+    // baked into the template (`make_arg_t<dim>` SFINAE accepts
+    // `nullptr` when the template dim is non-runtime).
+    if !opts.descriptor_layouts.is_empty() {
+        for i in opts.descriptor_layouts.keys() {
+            out.push_str(&format!(
+                "    ARG{i}_T arg{i}_inst(\n        \
+                     reinterpret_cast<__nv_bfloat16*>(bufs[{i}]),\n        \
+                     nullptr, nullptr, nullptr, nullptr);\n",
+                i = i,
+            ));
+        }
+    }
     out.push_str(&format!("    {name}<<<1, {total_threads}, DYN_SMEM, stream>>>(\n"));
     let mut first = true;
     for (i, arg) in args.bufs.iter().enumerate() {
@@ -1591,7 +1728,11 @@ pub fn emit_kernel_with_opts(
             out.push_str(",\n");
         }
         first = false;
-        out.push_str(&format!("        ({})bufs[{i}]", arg.ty));
+        if opts.descriptor_layouts.contains_key(&(i as u32)) {
+            out.push_str(&format!("        arg{i}_inst"));
+        } else {
+            out.push_str(&format!("        ({})bufs[{i}]", arg.ty));
+        }
     }
     for (j, _u32_name) in args.u32_args.iter().enumerate() {
         if !first {
@@ -2233,6 +2374,7 @@ mod tests {
 
         let opts = EmitOpts {
             debug_handshake: true,
+            ..Default::default()
         };
         let src = emit_body_with_opts(&p, &opts);
 
@@ -2288,6 +2430,7 @@ mod tests {
         };
         let opts = EmitOpts {
             debug_handshake: true,
+            ..Default::default()
         };
         let src = emit_kernel_with_opts("tk_dbg_smoke", &args, &p, &opts);
         assert!(src.contains("#include <cstdio>"), "cstdio pulled in\n{src}");
@@ -2759,6 +2902,216 @@ mod tests {
         assert!(
             src.contains("kittens::warpgroup::mma_async_wait<0>();"),
             "{src}"
+        );
+    }
+
+    // ── Step C.3 — descriptor-TMA opt-in tests ────────────────────
+
+    /// Default `EmitOpts` (empty `descriptor_layouts`) is byte-identical
+    /// to `emit_kernel` — guards the C.3 changes from regressing the
+    /// production canonical's raw-bulk emit.
+    #[test]
+    fn descriptor_layouts_empty_is_byte_identical_to_default() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let _page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        let args = KernelArgs {
+            bufs: vec![KernelArg {
+                ty: "__nv_bfloat16* __restrict__".into(),
+                name: "buf".into(),
+            }],
+            u32_args: vec![],
+        };
+        let plain = emit_kernel("tk_default_off", &args, &p);
+        let opts = EmitOpts::default();
+        let with_opts = emit_kernel_with_opts("tk_default_off", &args, &p, &opts);
+        assert_eq!(plain, with_opts, "default opts must match emit_kernel");
+    }
+
+    /// With one descriptor layout, the emit gains:
+    ///   - `using ARG{i}_T = kittens::gl<__nv_bfloat16, ...>;` typedef.
+    ///   - `const __grid_constant__ ARG{i}_T arg{i}` kernel sig param.
+    ///   - `auto* {name} = arg{i}.raw_ptr;` body alias (so existing
+    ///     `buf{i}` paths still resolve to a `bf16*`).
+    ///   - `ARG{i}_T arg{i}_inst(...)` host wrapper instance.
+    /// A non-typed buf in the same kernel keeps its raw pointer arg.
+    #[test]
+    fn descriptor_layout_emits_typed_arg_and_host_instance() {
+        let mut p = TkProgram::new();
+        let page: PageHandle<Phase0> = PageHandle::fresh(0);
+        let _page = p.wait(WarpRole::Loader, PageBarrier::Consumed, page);
+        let args = KernelArgs {
+            bufs: vec![
+                KernelArg {
+                    ty: "const __nv_bfloat16* __restrict__".into(),
+                    name: "x".into(),
+                },
+                KernelArg {
+                    ty: "__nv_bfloat16* __restrict__".into(),
+                    name: "op0_out".into(),
+                },
+            ],
+            u32_args: vec![],
+        };
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            1,
+            GlLayout {
+                batch: 1,
+                depth: 1,
+                rows: 1,
+                cols: 2048,
+                tile_type: "kittens::sv_bf<2048>".into(),
+            },
+        );
+        let opts = EmitOpts {
+            descriptor_layouts: layouts,
+            ..Default::default()
+        };
+        let src = emit_kernel_with_opts("tk_typed_smoke", &args, &p, &opts);
+
+        assert!(
+            src.contains(
+                "using ARG1_T = kittens::gl<__nv_bfloat16, 1, 1, 1, 2048, kittens::sv_bf<2048>>;"
+            ),
+            "typedef\n{src}"
+        );
+        assert!(
+            src.contains("const __grid_constant__ ARG1_T arg1"),
+            "kernel sig swaps to grid_constant typed arg\n{src}"
+        );
+        assert!(
+            src.contains("auto* op0_out = arg1.raw_ptr;"),
+            "body alias keeps bf16* available\n{src}"
+        );
+        // Untyped buf 0 keeps its raw signature.
+        assert!(
+            src.contains("const __nv_bfloat16* __restrict__ x"),
+            "untyped buf unaffected\n{src}"
+        );
+        // Host wrapper builds the gl<> instance from the runtime
+        // pointer (all-nullptr runtime-dim args because every dim is
+        // baked into the template).
+        assert!(
+            src.contains("ARG1_T arg1_inst(\n        reinterpret_cast<__nv_bfloat16*>(bufs[1])"),
+            "host wrapper builds gl<> instance\n{src}"
+        );
+        // Kernel call passes the instance for buf 1, raw cast for buf 0.
+        assert!(src.contains("arg1_inst"), "kernel call uses instance\n{src}");
+        assert!(
+            src.contains("(const __nv_bfloat16* __restrict__)bufs[0]"),
+            "kernel call casts non-typed buf\n{src}"
+        );
+    }
+
+    /// A `StoreAsync` to a typed buffer emits the descriptor-TMA store
+    /// (vector form, `cache_policy::NORMAL`, `{0,0,0,0}` coords). A
+    /// `StoreAsync` to a non-typed buffer keeps the raw-bulk emit.
+    #[test]
+    fn store_async_to_typed_buf_emits_descriptor_tma() {
+        let mut p = TkProgram::new();
+        // m=1 hidden=2048 store at column 0 → byte_off=0, eligible.
+        p.store_async(
+            7,
+            BufId(1),
+            rr(1, 0, 2048),
+            TileShape {
+                rows: 1,
+                cols: 2048,
+                elem_bytes: 2,
+            },
+        );
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            1,
+            GlLayout {
+                batch: 1,
+                depth: 1,
+                rows: 1,
+                cols: 2048,
+                tile_type: "kittens::sv_bf<2048>".into(),
+            },
+        );
+        let opts = EmitOpts {
+            descriptor_layouts: layouts,
+            ..Default::default()
+        };
+        let src = emit_body_with_opts(&p, &opts);
+
+        // Typed store form references arg1, the page_buf cast to the
+        // declared tile type, and the {0,0,0,0} tile-frame coord.
+        assert!(
+            src.contains("kittens::group<1>::tma::store_async<kittens::cache_policy::NORMAL>("),
+            "typed store_async\n{src}"
+        );
+        assert!(src.contains("arg1"), "typed store references arg1\n{src}");
+        assert!(
+            src.contains("*reinterpret_cast<kittens::sv_bf<2048>*>(page_buf[7])"),
+            "smem cast to tile_type\n{src}"
+        );
+        assert!(
+            src.contains("{0, 0, 0, 0}"),
+            "single-tile frame coord\n{src}"
+        );
+        assert!(
+            src.contains("kittens::group<1>::tma::store_commit_group();"),
+            "commit\n{src}"
+        );
+        assert!(
+            src.contains("kittens::group<1>::tma::store_async_wait();"),
+            "drain\n{src}"
+        );
+        // No raw-bulk store_async form for the typed buffer.
+        assert!(
+            !src.contains("reinterpret_cast<char*>(buf1)"),
+            "raw-bulk emit must not appear for typed buf\n{src}"
+        );
+    }
+
+    /// `StoreAsync` to a typed buffer with non-zero byte offset (not in
+    /// the C.3 initial scope) falls back to raw-bulk emit defensively —
+    /// the typed `{0,0,0,0}` coord path can't represent a sub-buffer
+    /// region. This keeps an over-eager opt-in from miscompiling.
+    #[test]
+    fn store_async_typed_falls_back_when_byte_off_nonzero() {
+        let mut p = TkProgram::new();
+        // c0=128 → byte_off=256 != 0 → must fall back.
+        p.store_async(
+            7,
+            BufId(1),
+            rr(1, 128, 64),
+            TileShape {
+                rows: 1,
+                cols: 64,
+                elem_bytes: 2,
+            },
+        );
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            1,
+            GlLayout {
+                batch: 1,
+                depth: 1,
+                rows: 1,
+                cols: 2048,
+                tile_type: "kittens::sv_bf<2048>".into(),
+            },
+        );
+        let opts = EmitOpts {
+            descriptor_layouts: layouts,
+            ..Default::default()
+        };
+        let src = emit_body_with_opts(&p, &opts);
+        // Raw-bulk path emits the legacy store_async with the byte
+        // offset.
+        assert!(
+            src.contains("reinterpret_cast<char*>(buf1) + 256"),
+            "fallback raw-bulk byte offset\n{src}"
+        );
+        // No typed cache_policy form.
+        assert!(
+            !src.contains("kittens::cache_policy::NORMAL"),
+            "fallback path must not emit typed store\n{src}"
         );
     }
 }

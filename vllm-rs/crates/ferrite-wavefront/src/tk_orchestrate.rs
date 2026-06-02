@@ -23,11 +23,14 @@
 //! pair falls outside that envelope, making the page-fit constraint a
 //! structural property of the IR.
 
+use std::collections::BTreeMap;
+
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
 use crate::routing::{
     classify_inputs, classify_outputs, coalesce_carry_forwards, InputRouting, OutputRouting,
 };
 use crate::subtile_ir::BufId;
+use crate::tk_codegen::GlLayout;
 use crate::tk_lower::{
     lower_attn_decode, lower_attn_decode_routed, lower_gemm_m1, lower_gemm_m1_routed,
     lower_residual_add, lower_residual_add_routed, lower_rmsnorm, lower_rmsnorm_routed,
@@ -437,6 +440,110 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
     (prog, n_bufs)
 }
 
+/// Step C.3 — opt-in descriptor-TMA layouts for the orchestrator's
+/// rmsnorm output buffers.
+///
+/// Walks `input.ops` in topo order (matching `lower_to_tk`'s shape
+/// inference), and for every `LoweredOp::RmsNorm` produces an entry
+/// keyed by the op's output `BufId` mapping to a vector-form
+/// `kittens::sv_bf<HIDDEN>` `gl<>` layout. Returns an empty map when
+/// `FERRITE_NEW_TMA_TENSOR` is unset — the canonical raw-bulk path
+/// stays byte-identical in default builds.
+///
+/// Scope rationale (per the C.3 handoff):
+///   - rmsnorm output stores have a fixed offset (region.cols.start =
+///     0) and no dynamic byte offset — the typed `tma::store_async`
+///     `{0,0,0,0}` coord is exact.
+///   - m=1 decode → 1×hidden activation row, fits `sv_bf<K>` (vector
+///     form, `UTMASTG.4D`); tile form `st_bf<R, C>` would require
+///     R % 16 == 0 and isn't viable for m=1.
+///   - Per-buffer opt-in (mixed kernel sig) keeps param-mem usage
+///     bounded — each `gl<>` instance is ~152B and the sm_90 kernel
+///     param-mem cap is 32KB.
+pub fn descriptor_layouts(input: &LoweringInput) -> BTreeMap<u32, GlLayout> {
+    if std::env::var_os("FERRITE_NEW_TMA_TENSOR").is_none() {
+        return BTreeMap::new();
+    }
+    descriptor_layouts_for_rmsnorm_outputs(input)
+}
+
+/// Pure helper: walks `input` and produces the same descriptor-TMA
+/// layout map the env-gated [`descriptor_layouts`] returns when
+/// enabled. Exposed for unit tests so they don't need to mutate
+/// process-wide env state.
+pub fn descriptor_layouts_for_rmsnorm_outputs(input: &LoweringInput) -> BTreeMap<u32, GlLayout> {
+    let mut out = BTreeMap::new();
+    let n_sources = input.sources.len() as u32;
+    let mut op_out_shape: Vec<(u32, u32)> = Vec::with_capacity(input.ops.len());
+
+    let shape_for = |r: InputRef,
+                     op_out_shape: &[(u32, u32)],
+                     sources: &[crate::subtile::SourceShape]|
+     -> (u32, u32) {
+        match r {
+            InputRef::Ext(e) => (sources[e].rows, sources[e].cols),
+            InputRef::Op(j) => op_out_shape[j],
+        }
+    };
+
+    // Same per-op shape inference as `lower_to_tk` — walk ops in
+    // order, push each op's (m, cols) so downstream `InputRef::Op(j)`
+    // resolutions land on the right shape.
+    for (op_idx, desc) in input.ops.iter().enumerate() {
+        let buf_id = n_sources + op_idx as u32;
+        match desc.op {
+            LoweredOp::RmsNorm { .. } => {
+                let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                op_out_shape.push((desc.m, hidden));
+                out.insert(
+                    buf_id,
+                    GlLayout {
+                        batch: 1,
+                        depth: 1,
+                        rows: 1,
+                        cols: hidden as i32,
+                        tile_type: format!("kittens::sv_bf<{hidden}>"),
+                    },
+                );
+            }
+            LoweredOp::Gemm { n, .. } => {
+                op_out_shape.push((desc.m, n));
+            }
+            LoweredOp::SiluMul => {
+                let intermediate = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                op_out_shape.push((desc.m, intermediate));
+            }
+            LoweredOp::Add => {
+                let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                op_out_shape.push((desc.m, hidden));
+            }
+            LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. } => {
+                let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                op_out_shape.push((desc.m, cols));
+            }
+            LoweredOp::AttnDecode {
+                num_q_heads,
+                head_dim,
+                ..
+            } => {
+                op_out_shape.push((desc.m, num_q_heads * head_dim));
+            }
+            LoweredOp::Silu | LoweredOp::Mul => {
+                // Standalone Silu/Mul is fused into SiluMul before
+                // orchestration; if one slips through, the orchestrator
+                // panics — match its error surface here so this helper
+                // doesn't paper over the bug with a stale shape entry.
+                panic!(
+                    "descriptor_layouts: standalone {:?} reached the helper; \
+                     fuse_silu_mul must run before lower_to_tk.",
+                    desc.op
+                );
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +559,122 @@ mod tests {
         // bn is always at least 1 even if k * ACT_ELEM > PAGE_SIZE
         // (caller is responsible for ensuring page fit).
         assert_eq!(pick_bn(16384), 1);
+    }
+
+    /// Step C.3 — full one-layer canonical emit with descriptor TMA on
+    /// rmsnorm outputs gives:
+    ///   - one `using ARG{i}_T = kittens::gl<...>;` typedef per rmsnorm
+    ///     output buffer.
+    ///   - one `const __grid_constant__ ARG{i}_T arg{i}` kernel param
+    ///     per typed buffer.
+    ///   - typed `tma::store_async<cache_policy::NORMAL>(arg{i}, ...,
+    ///     {0,0,0,0})` for each rmsnorm output store, in place of the
+    ///     raw-bulk `store_async(reinterpret_cast<char*>(buf{i}), ...)`.
+    ///   - one `ARG{i}_T arg{i}_inst(...)` host wrapper instance per
+    ///     typed buf, passed to the `<<<...>>>` launch.
+    /// This is the full integration that `vllm-executor`'s ferrite_worker
+    /// hits when `FERRITE_NEW_TMA_TENSOR=1`.
+    #[test]
+    fn full_one_layer_emit_with_descriptor_layouts_wires_typed_stores() {
+        use crate::fixtures::orchestrator_kernel_args;
+        use crate::tk_codegen::{emit_kernel_with_opts, EmitOpts};
+
+        let input = one_layer_input();
+        let (prog, n_bufs) = lower_to_tk(&input);
+        let args = orchestrator_kernel_args(&input, n_bufs);
+        let layouts = descriptor_layouts_for_rmsnorm_outputs(&input);
+        assert!(!layouts.is_empty(), "fixture has rmsnorms");
+
+        let opts = EmitOpts {
+            descriptor_layouts: layouts.clone(),
+            ..Default::default()
+        };
+        let src = emit_kernel_with_opts("tk_decode_one_layer_typed", &args, &prog, &opts);
+
+        // Every typed buf gets a typedef + a __grid_constant__ kernel
+        // sig param + a host instance.
+        for buf_id in layouts.keys() {
+            assert!(
+                src.contains(&format!("using ARG{buf_id}_T = kittens::gl<")),
+                "typedef for buf {buf_id}\n--- src ---\n{src}"
+            );
+            assert!(
+                src.contains(&format!(
+                    "const __grid_constant__ ARG{buf_id}_T arg{buf_id}"
+                )),
+                "grid_constant arg for buf {buf_id}\n--- src ---\n{src}"
+            );
+            assert!(
+                src.contains(&format!("ARG{buf_id}_T arg{buf_id}_inst(")),
+                "host wrapper instance for buf {buf_id}\n--- src ---\n{src}"
+            );
+        }
+
+        // At least one typed store_async lands in the body — exactly
+        // the rmsnorm output drains.
+        assert!(
+            src.contains("kittens::group<1>::tma::store_async<kittens::cache_policy::NORMAL>("),
+            "at least one typed store_async\n--- src ---\n{src}"
+        );
+
+        // Default-off control: no descriptor layouts → emit must keep
+        // the legacy raw-bulk store form for those same rmsnorm outputs.
+        let plain = emit_kernel_with_opts(
+            "tk_decode_one_layer_typed",
+            &args,
+            &prog,
+            &EmitOpts::default(),
+        );
+        assert!(
+            !plain.contains("kittens::cache_policy::NORMAL"),
+            "default emit must not contain typed store form\n{plain}"
+        );
+        assert!(
+            plain.contains("kittens::group<1>::tma::store_async("),
+            "default emit keeps raw-bulk store_async\n{plain}"
+        );
+    }
+
+    /// Step C.3 — `descriptor_layouts_for_rmsnorm_outputs` keys exactly
+    /// on the rmsnorm output BufIds (one per RmsNorm op), and each
+    /// entry carries the rmsnorm's hidden-axis size as a `sv_bf<HIDDEN>`
+    /// vector layout. Pure helper — no env mutation.
+    #[test]
+    fn descriptor_layouts_keys_each_rmsnorm_output() {
+        let input = one_layer_input();
+        let layouts = descriptor_layouts_for_rmsnorm_outputs(&input);
+        let n_sources = input.sources.len() as u32;
+
+        // Collect expected keys by scanning ops for RmsNorm ops.
+        let mut expected: Vec<u32> = input
+            .ops
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| match d.op {
+                LoweredOp::RmsNorm { .. } => Some(n_sources + i as u32),
+                _ => None,
+            })
+            .collect();
+        expected.sort();
+        let mut got: Vec<u32> = layouts.keys().copied().collect();
+        got.sort();
+        assert_eq!(got, expected, "keys must match RmsNorm output BufIds");
+        assert!(
+            !layouts.is_empty(),
+            "one_layer_input has rmsnorms; helper must produce entries"
+        );
+
+        for (buf_id, layout) in &layouts {
+            assert_eq!(layout.batch, 1);
+            assert_eq!(layout.depth, 1);
+            assert_eq!(layout.rows, 1);
+            assert!(layout.cols > 0, "rmsnorm hidden must be positive");
+            assert_eq!(
+                layout.tile_type,
+                format!("kittens::sv_bf<{}>", layout.cols),
+                "tile_type must match cols for buf {buf_id}"
+            );
+        }
     }
 
     /// One-layer forward lowers to a TkProgram with no panics, and the

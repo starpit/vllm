@@ -487,10 +487,19 @@ impl CudaModel {
                     tp_group: m.tp_group.as_ref(),
                 };
                 // PD-wavefront cuda megakernel dispatch (gated on
-                // `FERRITE_WAVEFRONT_GPU=1`). Returns `Some(_)` for
+                // `FERRITE_WAVEFRONT_GPU=1`). Decode-only (m=1, single
+                // 640-thread CTA): prefill (`num_tokens > 1`) falls
+                // through to the per-op `forward_backbone` path,
+                // because the orchestrator-emitted megakernel's tile
+                // shapes / page allocator / barrier-arrival counts are
+                // baked for num_tokens=1. Without this gate the
+                // dummy-forward memory-profile pass (1024 tokens)
+                // would launch the decode kernel with prefill-shaped
+                // buffers and hang the GPU. Returns `Some(_)` for
                 // canonicals with a wired-up megakernel; `None` falls
                 // back to the per-op trait `forward_backbone` path.
-                if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
+                if num_tokens == 1
+                    && std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
                     && let Some(out) = m
                         .weights
                         .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens)
@@ -708,10 +717,13 @@ impl CudaModel {
                     tp_group: m.tp_group.as_ref(),
                 };
                 // PD-wavefront cuda megakernel dispatch (gated on
-                // `FERRITE_WAVEFRONT_GPU=1`). Returns `Some(_)` for
-                // canonicals with a wired-up megakernel; `None` falls
-                // back to the per-op trait `forward` path.
-                let logits = if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
+                // `FERRITE_WAVEFRONT_GPU=1`). Decode-only (m=1) — see
+                // the matching gate in the backbone arm above for the
+                // explanation. Returns `Some(_)` for canonicals with a
+                // wired-up megakernel; `None` falls back to per-op
+                // trait `forward`.
+                let logits = if num_tokens == 1
+                    && std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some()
                     && let Some(out) = m
                         .weights
                         .wavefront_megakernel_dispatch_cuda(&ctx, device, num_tokens)
@@ -6704,6 +6716,16 @@ impl Worker for FerriteWorker {
         if self.kv_cache_is_fp8 {
             info!(
                 "FerriteWorker: FP8 KV cache — skipping CUDA graph capture (variable scratch buffer sizes)"
+            );
+            return Ok(());
+        }
+
+        if std::env::var_os("FERRITE_WAVEFRONT_GPU").is_some() {
+            info!(
+                "FerriteWorker: FERRITE_WAVEFRONT_GPU=1 — skipping CUDA graph \
+                 capture (megakernel launcher calls host-only \
+                 cudaFuncSetAttribute / cuTensorMapEncodeTiled, neither \
+                 of which can be recorded inside a graph capture region)"
             );
             return Ok(());
         }

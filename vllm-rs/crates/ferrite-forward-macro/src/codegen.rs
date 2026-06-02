@@ -6100,8 +6100,20 @@ fn dump_wavefront_mega(
                     stem.replace('-', "_").replace('.', "_")
                 );
                 let args = ferrite_wavefront::fixtures::orchestrator_kernel_args(&fused, n_bufs);
-                let src = ferrite_wavefront::tk_codegen::emit_kernel(
-                    &kernel_name, &args, &prog,
+                // Step C.3 — descriptor-TMA opt-in. Default off
+                // (env var unset) returns an empty map and the emit is
+                // byte-identical to the legacy raw-bulk path. With
+                // `FERRITE_NEW_TMA_TENSOR=1` set, the orchestrator
+                // selects rmsnorm output buffers for typed `kittens::gl<>`
+                // descriptor TMA → SASS `UTMASTG.4D`.
+                let descriptor_layouts =
+                    ferrite_wavefront::tk_orchestrate::descriptor_layouts(&fused);
+                let opts = ferrite_wavefront::tk_codegen::EmitOpts {
+                    descriptor_layouts,
+                    ..Default::default()
+                };
+                let src = ferrite_wavefront::tk_codegen::emit_kernel_with_opts(
+                    &kernel_name, &args, &prog, &opts,
                 );
                 let cache_dir = std::path::PathBuf::from(
                     std::env::var("HOME").unwrap_or_else(|_| ".".into()),
@@ -6686,7 +6698,26 @@ fn emit_wavefront_mega(prog: &ferrite_wavefront::mega::MegaProgram) -> TokenStre
 /// [`ferrite_forward::wavefront_cuda::DispatchSpec`] and delegates to
 /// [`ferrite_forward::wavefront_cuda::dispatch_cuda`].
 fn emit_wavefront_dispatch_cuda(d: &CudaDispatchData) -> TokenStream {
-    let kernel_ident = format_ident!("{}", d.kernel_name);
+    // The .cu (`tk_codegen.rs::emit_kernel_with_opts`) emits two
+    // symbols per canonical:
+    //   * `__global__ void {kernel_name}(...)` — C++-mangled (the
+    //     kernel itself; can't be called directly from Rust).
+    //   * `extern "C" cudaError_t launch_{kernel_name}(bufs, u32_args,
+    //     stream)` — the C-linkage host wrapper, the only symbol Rust
+    //     can FFI to.
+    // The Rust `LaunchFn` typedef in `wavefront_cuda.rs` matches the
+    // launcher's signature (`(bufs, u32_args, stream) -> i32`), not
+    // the kernel's own signature. So the FFI must bind the launcher.
+    //
+    // Earlier builds bound the bare kernel name; rust-lld accepted it
+    // via demangled-name fallback against the C++ kernel symbol, then
+    // calls into that symbol with launcher-shaped args invoked the
+    // CUDA-runtime trampoline with garbage and dispatch_cuda silently
+    // returned non-zero — the worker hook fell back to per-op forward.
+    // Once the kernel signature contains `kittens::gl<>` types
+    // (descriptor-TMA opt-in), the fallback no longer matches and the
+    // link errors out. Either way, the correct binding is the launcher.
+    let kernel_ident = format_ident!("launch_{}", d.kernel_name);
     let recipe_entries: Vec<TokenStream> = d
         .source_recipe
         .iter()

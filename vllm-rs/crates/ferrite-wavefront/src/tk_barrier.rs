@@ -792,6 +792,243 @@ mod slot_id_witness {
 
 pub use slot_id_witness::{Const as SlotIdConst, ValidSlotId};
 
+// ── SlotLease — round-completion-before-reuse witness ──────────────
+//
+// The legacy `PageAllocator` hands out a slot at typed phase P;
+// `release()` marks it free; the next `alloc_at::<P>()` call hands
+// it back. Between release and re-alloc, there's NO compile-time
+// proof the round actually closed — a lowering could release a slot
+// mid-round (e.g., after arrive(Done) but before storer's
+// arrive(Consumed)) and the next op would acquire a slot whose
+// barriers are NOT at the expected parity → wait blocks forever.
+//
+// The substrate's `Page::complete_round` requires `Page<_, _,
+// status::Consumed>` (full round closed) and produces
+// `Page<_, P::Flip, status::Empty>` (slot ready for reuse at flipped
+// parity). This is the structural guarantee — but it's only enforced
+// for code that uses the typed `Page` session type. Legacy code that
+// constructs PageHandle<P> directly bypasses it.
+//
+// `SlotLease<SLOT_ID, P>` is the bridge: a typed handle the
+// allocator hands out at acquire, consumed at release. The token's
+// `P` parameter must match the post-round phase; mismatch = compile
+// error. Migrating PageAllocator to issue SlotLease tokens makes the
+// "release mid-round" bug impossible at the type level.
+//
+// This commit adds the witness type. Wiring the legacy
+// PageAllocator to issue them is a follow-up migration.
+
+/// Typed lease handle for a page slot. Acquired by the allocator at
+/// typed phase `P`, must be returned at typed phase `P::Flip` (one
+/// full round completed) — type mismatch on release = compile error.
+///
+/// The `_phantom_lifetime` field carries a `&()` so the lease can't
+/// outlive the allocator scope; release is consumption.
+pub struct SlotLease<'lease, const SLOT_ID: u8, P: PhaseTag> {
+    _slot: SlotIdConst<SLOT_ID>,
+    _phase: PhantomData<P>,
+    _phantom_lifetime: PhantomData<&'lease ()>,
+}
+
+impl<'lease, const SLOT_ID: u8, P: PhaseTag> SlotLease<'lease, SLOT_ID, P>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
+    /// Construct a fresh lease — sealed; only the substrate's
+    /// `PageAllocator` migration can call this.
+    pub(crate) fn issue() -> Self {
+        Self {
+            _slot: SlotIdConst,
+            _phase: PhantomData,
+            _phantom_lifetime: PhantomData,
+        }
+    }
+
+    /// Consume the lease at the post-round flipped phase. Returns a
+    /// fresh lease at the new phase, ready for the next round's
+    /// holder.
+    pub fn complete_round(self) -> SlotLease<'lease, SLOT_ID, P::Flip> {
+        SlotLease::issue()
+    }
+}
+
+// ── KernelArgManifest — single SoT for kernel sig + dispatch ──────
+//
+// The kernel's `<<<>>>` argument list is emitted on TWO sides:
+//   1. The .cu kernel signature (in `tk_codegen::emit_kernel_with_opts`).
+//   2. The Rust dispatcher's `bufs[]` + `u32_args[]` push order
+//      (in `ferrite_forward::wavefront_cuda::dispatch_cuda`).
+//
+// The kernel reads `bufs[i]` at position i; `u32_args[j]` at position
+// j. If the two sides disagree on order, the kernel binds wrong
+// pointers / wrong scalar values to its parameters → undefined
+// behavior, OFTEN silent — wrong output OR a CUDA fault that LOOKS
+// like a kernel hang.
+//
+// Today both sides are derived from `KernelArgs` / `SourceRecipe`
+// independently. They happen to agree because the macro wires them
+// from the same orchestrator-time data, but there's no shared `const`
+// the two sides import. A future refactor that adds an arg in one
+// place but not the other would silently corrupt dispatch.
+//
+// Encode the binding: a single typed `KernelArgManifest` const fn is
+// the source of truth. The .cu emit and the Rust dispatch both
+// import it — divergence is a workspace compile error.
+
+/// Order tag for kernel arguments. The kernel's `<<<>>>` signature
+/// is `(bufs[0..N_SOURCES], op_outputs[0..N_OPS], u32_args[0..K])`
+/// — this enum names the slots so emit and dispatch can't drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelArgSlot {
+    Source(u32),
+    OpOutput(u32),
+    U32Arg(KernelU32Arg),
+}
+
+/// Names of the runtime u32 args. Order is fixed (and matches what
+/// `dispatch_cuda` pushes): `NumKvPages` first if present, then
+/// `DecodePosition` if present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelU32Arg {
+    /// `__num_kv_pages` — present iff the canonical contains
+    /// any AttnDecode op.
+    NumKvPages,
+    /// `__decode_position` — present iff the canonical contains
+    /// any RoPE op.
+    DecodePosition,
+}
+
+/// Per-canonical kernel argument manifest — the one source of truth
+/// the .cu emit AND the Rust dispatcher both consult.
+///
+/// `n_sources` source pointers come first, then `n_op_outputs` op
+/// output pointers, then `u32_args` runtime u32 scalars. Both sides
+/// (emit and dispatch) read the manifest in the same way, so
+/// reordering either side without updating this struct is impossible
+/// — the kernel sig and the dispatcher are derived from the same
+/// data.
+pub struct KernelArgManifest {
+    pub n_sources: u32,
+    pub n_op_outputs: u32,
+    pub u32_args: &'static [KernelU32Arg],
+}
+
+impl KernelArgManifest {
+    /// Total kernel-arg count (for assertion against the actual
+    /// kernel sig length).
+    pub const fn total_arg_count(&self) -> u32 {
+        self.n_sources + self.n_op_outputs + self.u32_args.len() as u32
+    }
+}
+
+// ── ActiveWarpsConst — single source of truth for divergent gates ──
+//
+// The legacy AttnDecode prelude emits
+//   `const unsigned int __num_kv_heads_a{u} = {num_kv_heads}u;`
+// and the compute body emits the divergent gate
+//   `if (__consumer_idx < __num_kv_heads_a{u}) { ... }`
+// while the typed-arrive emit uses
+//   `RoleGuardWidth<N8>` → `if (__consumer_idx < 8u)`.
+//
+// All three derive from `op.num_kv_heads` (= 8 for Llama-1B). If a
+// future refactor changes one without updating the others, the
+// kernel's compute body would gate on a different active-warp count
+// than the arrive's RoleGuardWidth → arrival count mismatch →
+// deadlock.
+//
+// Encode the binding via a single typed witness: `ActiveWarpsConst<N>`
+// is constructed once per op (from `op.num_kv_heads`) and passed to
+// BOTH the prelude emit AND the divergent-gate emit AND the
+// RoleGuardWidth construction. All three use the SAME N, so a
+// mismatch is impossible by construction.
+//
+// This piece is a substrate add — wiring it into the legacy
+// attn_decode_prelude / attn_decode_qkt_softmax_step_body / the
+// arrive's RoleGuardWidth requires migrating those emit fns to
+// take `ActiveWarpsConst<N>` instead of a runtime u32. That's
+// a follow-up. The witness itself is what's added here.
+
+/// Single source of truth for the active-warp count in a divergent
+/// consumer body. Constructed once per op (typically from
+/// `op.num_kv_heads` or similar); consumed by:
+///   * `prelude` emit (for the `__num_kv_heads_aN` constant);
+///   * compute-body emit (for the `if (__consumer_idx < N)` gate);
+///   * `RoleGuardWidth<NaCount>` construction for the arrive emit.
+/// All three derive from this one value — divergence impossible.
+pub struct ActiveWarpsConst<const N: u32>;
+
+impl<const N: u32> ActiveWarpsConst<N> {
+    pub const VAL: u32 = N;
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl<const N: u32> Default for ActiveWarpsConst<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── OpIdx — newtype-wrapped op-index witness ───────────────────────
+//
+// Each op in the orchestrator gets a `unique_id` used as a suffix on
+// per-op smem-prelude state arrays (`__m_max_a{u}`, `__l_sum_a{u}`,
+// etc.). If two ops share a unique_id, their state collides → wrong
+// data → potentially wrong output OR crash if the smem arrays
+// overlap.
+//
+// The orchestrator already assigns `op.unique_id = op_idx as u32` —
+// distinct by construction. But there's no compile-time witness that
+// downstream code respects this. `OpIdx<const I: u32>` is a sealed
+// newtype: lowering authors and emit fns take typed `OpIdx<I>`
+// arguments; constructing one without going through the orchestrator
+// is impossible (sealed constructor).
+//
+// This is a defensive substrate piece — if a future refactor
+// accidentally reuses unique_ids, downstream emit code that takes
+// `OpIdx<const I: u32>` would still TYPECHECK with the same I, but
+// the orchestrator's `mint` would fail to typecheck if it reused an
+// I. To make REUSE caught at compile time we'd need a
+// list-of-already-minted-ids type-level constraint — out of scope
+// for this commit. Even the type-newtype barrier alone is a
+// strengthening.
+
+/// Sealed witness for an op's unique_id. Construct via the
+/// orchestrator's `OpIdx::mint::<I>()`; the sealed constructor
+/// prevents external code from forging an OpIdx.
+pub struct OpIdx<const I: u32> {
+    _sealed: opidx_sealed::Sealed,
+}
+
+impl<const I: u32> OpIdx<I> {
+    /// Mint a fresh OpIdx. Called by the orchestrator at op-emit time;
+    /// `op_idx as u32` becomes the const generic I. The sealed
+    /// constructor here is the only way to get an OpIdx — external
+    /// code can never forge one with a const-generic value it didn't
+    /// receive from the orchestrator's emit path.
+    pub fn mint() -> Self {
+        Self {
+            _sealed: opidx_sealed::Sealed::new(),
+        }
+    }
+
+    /// The const u32 value for this op-idx.
+    pub const VAL: u32 = I;
+}
+
+mod opidx_sealed {
+    /// Crate-private constructor token. External code can name
+    /// `OpIdx<const I>` but can't construct one without going through
+    /// `OpIdx::mint`, which calls `Sealed::new` (only callable here).
+    pub struct Sealed(());
+    impl Sealed {
+        pub(super) fn new() -> Self {
+            Self(())
+        }
+    }
+}
+
 // ── Page session type ───────────────────────────────────────────────
 //
 // A page slot walks a lifecycle:

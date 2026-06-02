@@ -37,7 +37,7 @@ fn main() {
     let debug_handshake = std::env::var("TK_EMIT_DEBUG_HANDSHAKE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    let opts = EmitOpts { debug_handshake };
+    let opts = EmitOpts { debug_handshake, ..Default::default() };
     let src = emit_kernel_with_opts(KERNEL_NAME, &args, &prog, &opts);
 
     let path = out_dir.join(format!("{KERNEL_NAME}.cu"));

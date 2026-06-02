@@ -380,6 +380,9 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    gdn_state: None,
+                    gdn_state_indices: None,
+                    gdn_is_fresh: None,
                     mm_embeds,
                     embed_patches,
                     vision_rope_cos: None,
@@ -462,6 +465,9 @@ impl CudaModel {
                     max_seqlen_q,
                     max_seqlen_k,
                     kv_cache,
+                    gdn_state: None,
+                    gdn_state_indices: None,
+                    gdn_is_fresh: None,
                     mm_embeds,
                     embed_patches,
                     vision_rope_cos: None,
@@ -4051,6 +4057,19 @@ impl Worker for FerriteWorker {
                 std::slice::from_raw_parts(bt_data.as_ptr() as *const u8, num_blocks_needed * 4)
             });
 
+        // Single dummy seq → last_token_indices = [prefill_tokens - 1]. Without
+        // this the lm_head gather (commit 14e043524a) is bypassed and lm_head
+        // runs at full M=prefill_tokens, allocating an [M, vocab] output which
+        // for vocab=152064, prefill_tokens=65536 (bench-latency bs=32 il=2048
+        // setting `max_num_batched_tokens = bs*il`) is 19 GiB and OOMs the
+        // profile pass before any KV-cache budget is computed. The runtime
+        // path always sets `last_token_indices` at prefill, so the profile
+        // peak measured here matches the runtime peak.
+        let lti_data: Vec<u32> = vec![prefill_tokens as u32 - 1];
+        let dummy_lti = device.alloc_gpu_tensor_from_host(&[1], GpuDType::U32, unsafe {
+            std::slice::from_raw_parts(lti_data.as_ptr() as *const u8, 4)
+        });
+
         // Create a KV cache large enough for the profiling tokens.
         let dummy_kv = unsafe {
             vllm_cuda::KvCachePool::new(
@@ -4085,7 +4104,7 @@ impl Worker for FerriteWorker {
                 prefill_tokens,
                 &dummy_kv,
                 device,
-                None,
+                Some(TensorView::from_raw(dummy_lti)),
                 None,
             );
             if let Err(e) = driver::stream_synchronize(device.compute_stream) {

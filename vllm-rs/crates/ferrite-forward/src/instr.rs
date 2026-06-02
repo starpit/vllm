@@ -1643,10 +1643,52 @@ impl Instruction {
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.linear_at(bucket, op_idx, 0, layer);
                 assert_weight_shape("Gemm", w.dense_weight(), n, k, tp_active(ctx));
+                // Last-token-per-seq narrow before lm_head — same gate as
+                // `CutlassFusedAddRmsNormGemm` (instr.rs above), but covers
+                // the case where the cost solver picks plain cuBLAS Gemm
+                // for the lm_head shape (e.g. Qwen2.5-7B M=65536 N=152064:
+                // unfused full-M Gemm allocates 19.93 GiB output, OOMing
+                // on first prefill at bench-latency bs=32 il=2048). Detected
+                // via `n == vocab_size`. `LMHEAD_NARROW=0` disables for
+                // debug A/B.
+                let narrow_disabled = matches!(
+                    std::env::var("LMHEAD_NARROW").as_deref(),
+                    Ok("0") | Ok("off") | Ok("false")
+                );
+                // lm_head is the unique Gemm with `k == HIDDEN_SIZE && n
+                // > INTERMEDIATE_SIZE` — every other linear in the block
+                // either has `k == INTERMEDIATE_SIZE` (down_proj) or
+                // `n <= INTERMEDIATE_SIZE` (q/k/v/o/gate/up). VOCAB ≫
+                // INTERMEDIATE on every modern arch.
+                let is_lm_head = (k as usize) == W::HIDDEN_SIZE
+                    && (n as usize) > W::INTERMEDIATE_SIZE;
+                let gathered_owned: Option<OwnedTensor>;
+                let gemm_input = match ctx.fwd.last_token_indices {
+                    Some(idx)
+                        if !narrow_disabled
+                            && is_lm_head
+                            && idx.dim(0) < (*v).dim(0) =>
+                    {
+                        let owned = kernels::embedding_gather(
+                            *v,
+                            *idx,
+                            &mut ctx.device.caching,
+                            ctx.device.compute_stream,
+                        );
+                        let view = owned.as_gpu_tensor();
+                        gathered_owned = Some(owned);
+                        view
+                    }
+                    _ => {
+                        gathered_owned = None;
+                        *v
+                    }
+                };
                 let out = ctx
                     .device
                     .cublas
-                    .gemm(*v, w.dense_weight(), &mut ctx.device.caching);
+                    .gemm(gemm_input, w.dense_weight(), &mut ctx.device.caching);
+                drop(gathered_owned);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
             Instruction::FusedCublasGemmAdd(in_slot, residual_slot, layer, n, k) => unsafe {
@@ -4023,7 +4065,7 @@ unsafe fn gated_delta_net_eval<W: CanonicalParams>(
             // Prefill: per-sequence, seeding the ring from zero (worker-zeroed
             // on fresh). Slice the token axis via cu_seqlens_q.
             let cu = gdn_dtoh_i32(ctx.fwd.cu_seqlens_q, num_seqs + 1, stream);
-            let slots = gdn_dtoh_i32(*state_indices, num_seqs, stream);
+            let slots = gdn_dtoh_i32(state_indices, num_seqs, stream);
             let f32_sz = DType::F32.size_bytes();
             for s in 0..num_seqs {
                 let seq_start = cu[s] as usize;

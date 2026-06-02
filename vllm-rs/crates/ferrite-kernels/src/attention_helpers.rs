@@ -869,7 +869,7 @@ pub fn sk_bucket_for(max_seqlen_k: usize) -> u32 {
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn flashinfer_attention(
     q: TensorView<'_>,
-    _cu_seqlens_q: TensorView<'_>,
+    cu_seqlens_q: TensorView<'_>,
     _seqused_k: TensorView<'_>,
     block_table: TensorView<'_>,
     max_seqlen_q: usize,
@@ -884,6 +884,16 @@ pub unsafe fn flashinfer_attention(
     alloc: &mut CachingAllocator,
     stream: CUstream,
 ) -> Option<OwnedTensor> {
+    // The shim is single-sequence-only (see doc precondition above). Without
+    // this guard, multi-seq callers — chunked-prefill chunk 2+ and any mixed
+    // batch where max_q > 1 — feed a flattened (seq_len, max_seqlen_k) into
+    // the FI planner that misrepresents the shape and produces corrupted
+    // scheduling. The planner can return rc=0 with garbage state and a later
+    // unrelated kernel faults with ILLEGAL_ADDRESS (cf. the rc!=0 branch
+    // below — same poison pattern).
+    if cu_seqlens_q.dim(0) != 2 {
+        return None;
+    }
     debug_assert_eq!(
         q.ndim(),
         3,

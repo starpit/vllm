@@ -34,7 +34,7 @@ nccl = []
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal", "dep:ferrite-fusion-synth"]
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal", "dep:ferrite-fusion-synth", "dep:ferrite-vision", "ferrite-vision/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the

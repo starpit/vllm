@@ -843,7 +843,7 @@ mod dispatcher {
     /// `MultimodalData` (`vllm-common::ImageData`) is the boundary
     /// type the engine plumbs in, this is the interior shape the
     /// vision encoder consumes.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     #[derive(Debug)]
     pub struct PixelInput<'a> {
         /// Flat normalized pixels in CHW layout, length =
@@ -874,7 +874,7 @@ mod dispatcher {
     /// that never call `vision_forward` leave them at zero —
     /// `length == grid_t * grid_h_merged * grid_w_merged` is the
     /// post-merger invariant for filled patches.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     #[derive(Debug, Clone, Default)]
     pub struct EmbedPatch {
         /// Position in the input-id sequence where this image's
@@ -905,7 +905,7 @@ mod dispatcher {
     /// Phase D of the multimodal plan lands the first impl
     /// (qwen2 vision encoder). Until then this trait has zero
     /// callers and `try_load_mm` always returns `Ok(None)`.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub trait MultimodalForward: Send + Sync {
         /// Encode one or more pixel batches and project into the
         /// language model's hidden space.
@@ -963,7 +963,7 @@ mod dispatcher {
     /// `Ok(None)` when the arch claims the HF arch string but the
     /// live checkpoint has no vision tensors (text-only checkpoint
     /// loaded through an MM-capable arch entry — falls through).
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub type MmTryLoadFn = fn(
         &mut GpuWeights,
         CUstream,
@@ -986,7 +986,7 @@ mod dispatcher {
     /// arch-specific knob (placeholder token id key, size policy,
     /// tokens-per-image policy, preprocess fn) is data on this row,
     /// not a switch in ferrite or the macro.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub struct FerriteMmRegistration {
         pub arch_name: &'static str,
         pub hf_arches: &'static [&'static str],
@@ -996,7 +996,7 @@ mod dispatcher {
         pub mm_metadata: ferrite_vision::MmMetadata,
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     inventory::collect!(FerriteMmRegistration);
 
     /// Walk the [`FerriteMmRegistration`] inventory and return the
@@ -1009,7 +1009,7 @@ mod dispatcher {
     /// MM metadata is identical across the tp variants of an arch
     /// (preprocessing is host-side and replicated), so the first
     /// hit is sufficient.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn resolve_mm_metadata(hf_arches: &[String]) -> Option<&'static FerriteMmRegistration> {
         inventory::iter::<FerriteMmRegistration>().find(|reg| {
             hf_arches
@@ -1071,7 +1071,7 @@ mod dispatcher {
     /// expected case for text-only checkpoints, where ferrite_worker
     /// proceeds with `embed_patches: &[]`. Phase D of the
     /// multimodal plan lands the first row.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     pub fn try_load_mm(
         gw: &mut GpuWeights,
         stream: CUstream,
@@ -1105,7 +1105,7 @@ pub mod metal_followup_reexports {
 }
 // Multimodal sibling surface — text-side only crates (every metal
 // arch today) skip; cuda owns the vision pipeline.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use dispatcher::{
     EmbedPatch, FerriteMmRegistration, MmTryLoadFn, MultimodalForward, PixelInput,
     resolve_mm_metadata, try_load_mm,

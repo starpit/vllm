@@ -1956,9 +1956,9 @@ fn emit_arch_dispatcher(
         pub unsafe fn forward_backbone(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             match w {
                 #(#forward_backbone_arms)*
             }
@@ -1973,7 +1973,7 @@ fn emit_arch_dispatcher(
         pub unsafe fn forward_piecewise_capture(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
         ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
             match w {

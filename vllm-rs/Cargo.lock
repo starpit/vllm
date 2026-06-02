@@ -2385,6 +2385,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-model-qwen3-5-vl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-forward-macro",
+ "ferrite-kernels",
+ "ferrite-vision",
+ "half",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-model-qwen3-moe"
 version = "0.1.0"
 dependencies = [

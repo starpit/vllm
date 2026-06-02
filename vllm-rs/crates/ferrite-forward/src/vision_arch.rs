@@ -21,8 +21,11 @@
 //! free fn in `ferrite-vision`).
 
 use ferrite_cuda_core::DType;
-use ferrite_cuda_core::alloc::OwnedTensor;
-use ferrite_cuda_core::device::GpuDevice;
+// Top-level re-exports (backend-polymorphic) — the `alloc` / `device`
+// submodules are cuda-only; `OwnedTensor` / `GpuDevice` resolve to the
+// per-backend type on both cuda and metal.
+use ferrite_cuda_core::GpuDevice;
+use ferrite_cuda_core::OwnedTensor;
 use ferrite_cuda_core::tensor::GpuTensor;
 use ferrite_kernels::kv_cache::KvCachePool;
 use ferrite_vision::{
@@ -307,6 +310,16 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_reverse_indices: reverse_indices_view,
             vision_position_ids: position_ids_view,
             last_token_indices: None,
+            // Metal-only ForwardCtx fields — the vision tape is text-/GDN-free,
+            // so the decoder-specific slots are inert.
+            #[cfg(feature = "metal")]
+            has_spec_tokens: false,
+            #[cfg(feature = "metal")]
+            gdn_state: None,
+            #[cfg(feature = "metal")]
+            gdn_state_indices: None,
+            #[cfg(feature = "metal")]
+            gdn_is_fresh: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

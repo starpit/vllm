@@ -2180,6 +2180,24 @@ pub fn starter_library() -> ImplementationLibrary {
         // peer is available. Standalone Gelu / Mul tiles also fall
         // out of the claim when a fusion isn't applicable.
         lib.push(Box::new(FusedGateUpGeluMulImpl));
+
+        // Vision-tower op singletons (Qwen2-VL / Qwen2.5-VL / Qwen3.5-VL /
+        // Gemma3-MM `#[vision_forward]` bodies). All target-agnostic
+        // (`target_compatible ≡ true`, `single_tile_match`) — they emit
+        // `Instruction::{VarlenAttention,VisionRope,Gelu,...}` which the
+        // metal interpreter lowering maps to the vision kernels
+        // (`vision_varlen_attn` / `vision_rope_2d` / `gelu_tanh`). These
+        // mirror the identical registrations in the cuda block below;
+        // without them the metal solve fails ("no Impl matched ... Sub" —
+        // a misleading first-uncovered-singleton report when the global
+        // cover is infeasible because the vision ops have no metal Impl).
+        lib.push(Box::new(VarlenAttentionImpl));
+        lib.push(Box::new(VisionRopeImpl));
+        lib.push(Box::new(QuickGeluImpl));
+        lib.push(Box::new(GeluErfImpl));
+        lib.push(Box::new(GeluImpl));
+        lib.push(Box::new(PosEmbedRefImpl));
+        lib.push(Box::new(LoadPixelsImpl));
     }
     #[cfg(feature = "cuda")]
     {

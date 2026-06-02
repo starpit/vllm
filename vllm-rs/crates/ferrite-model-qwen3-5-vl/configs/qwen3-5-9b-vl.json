@@ -1,0 +1,27 @@
+{
+  "architectures": [
+    "Qwen3_5ForConditionalGeneration"
+  ],
+  "model_type": "qwen3_5_vl_vision",
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16",
+
+  "d_model": 4096,
+
+  "vision_embed_dim": 1152,
+  "vision_depth": 27,
+  "vision_num_heads": 16,
+  "vision_head_dim": 72,
+  "vision_mlp_hidden": 4304,
+  "vision_spatial_merge_size": 2,
+  "vision_in_chans": 3,
+  "vision_temporal_patch_size": 2,
+  "vision_patch_size": 16,
+  "vision_in_features": 1536,
+  "vision_rope_half_dim": 36,
+  "vision_merge_factor": 4,
+  "vision_merge_hidden": 4608,
+  "vision_num_position_embeddings": 2304,
+
+  "vision_norm_eps": 1e-6
+}

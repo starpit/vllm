@@ -55,7 +55,7 @@ pub mod piecewise;
 pub mod loaders;
 #[cfg(feature = "cuda")]
 pub mod tile_table;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod vision_arch;
 
 // Metal interpreter: lowering pass + worker pool. Phase 5.A lands the
@@ -109,7 +109,7 @@ pub use loaders::{
 };
 #[cfg(feature = "cuda")]
 pub use tile_table::{TileEntry, take_owned, tile_ref, view};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use vision_arch::{VisionArchWeights, VisionWrapper};
 
 /// One row in a per-canonical forward dispatch table. Replaces the
@@ -306,7 +306,7 @@ mod ctx {
     use ferrite_kernels::gdn_state::GdnStatePool;
     use ferrite_kernels::kv_cache::KvCachePool;
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     use super::EmbedPatch;
 
     /// Ambient runtime args the emitted forward fn needs. The
@@ -374,9 +374,9 @@ mod ctx {
         /// text-only batch, no splice — byte-identical to pre-MM
         /// behavior. `mm_embeds = None` is only valid when
         /// `embed_patches` is empty.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub mm_embeds: Option<TensorView<'a>>,
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub embed_patches: &'a [EmbedPatch],
         /// Vision-tower 2D RoPE cos table, shape `[total_L, head_dim/2]`,
         /// bf16. Built host-side from `grid_thw` per vision-encoder call;
@@ -385,11 +385,11 @@ mod ctx {
         /// forward calls — the `Instruction::VisionRope` arm panics on
         /// `expect` if reached without these set, mirroring the
         /// `tp_group` contract for `Instruction::AllReduce` at tp>1.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_rope_cos: Option<TensorView<'a>>,
         /// Vision-tower 2D RoPE sin table. Same shape / population /
         /// invariants as [`Self::vision_rope_cos`].
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_rope_sin: Option<TensorView<'a>>,
         /// Vision-tower input patches buffer, shape `[num_tokens,
         /// vision_in_features]`, bf16. The vision encoder's
@@ -409,7 +409,7 @@ mod ctx {
         /// counterpart copies this view into a tile-table OwnedTensor
         /// the rest of the encoder consumes. See
         /// [`crate::Instruction::LoadPixels`] for the eval body.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub pixels: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
         /// segmentation. Populated by the vision wrapper for arches
@@ -417,34 +417,34 @@ mod ctx {
         /// max_seqlen_full)` at fullatt-layer indices; `None` for
         /// every text-side call and for vision arches that use a
         /// single `cu_seqlens_q` (Qwen2-VL).
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_cu_seqlens_full: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-window segmentation.
         /// Populated by the vision wrapper for windowed-attention
         /// layers; same `None` semantics as
         /// [`Self::vision_cu_seqlens_full`].
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_cu_seqlens_window: Option<TensorView<'a>>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_full`]. `None` when not in use.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_max_seqlen_full: Option<usize>,
         /// Qwen2.5-VL: max segment length under
         /// [`Self::vision_cu_seqlens_window`]. `None` when not in use.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_max_seqlen_window: Option<usize>,
         /// Qwen2.5-VL: per-merged-cell natural→window-grouped
         /// permutation `[L / spatial_merge_size²]` u32. Drives the
         /// entry-side `embedding_gather(x, window_index)` (and the
         /// matching `embedding_gather(cos/sin, window_index)`) so
         /// every windowed-attention layer reads contiguous segments.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_window_index: Option<TensorView<'a>>,
         /// Qwen2.5-VL: inverse of [`Self::vision_window_index`] —
         /// per-merged-cell window-grouped→natural permutation that
         /// undoes the entry permute on the merger output before
         /// splice into the language-model embedding stream.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_reverse_indices: Option<TensorView<'a>>,
         /// SigLIP-style learned positional embedding indices, shape
         /// `[num_tokens]` u32. Built host-side as `[0..num_pos,
@@ -454,7 +454,7 @@ mod ctx {
         /// text-side forward calls and for vision arches that don't
         /// need a positional embedding (Qwen2-VL / Qwen2.5-VL use
         /// 2D RoPE via `vision_rope` instead).
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_position_ids: Option<TensorView<'a>>,
         /// Per-sequence final-token row indices, shape `[num_seqs]` u32.
         /// At prefill, lm_head only needs the last token of each sequence

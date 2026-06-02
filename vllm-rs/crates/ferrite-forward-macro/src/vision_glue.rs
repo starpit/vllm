@@ -240,9 +240,9 @@ pub fn emit_per_variant(
             unsafe fn vision_forward(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx<'_>,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
         }

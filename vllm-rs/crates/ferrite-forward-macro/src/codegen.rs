@@ -7796,9 +7796,9 @@ pub fn emit_model(
             pub unsafe fn forward_backbone(
                 wm: &Weights,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 let e = ::ferrite_forward::find_bucket(
                     FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
                 );
@@ -7816,9 +7816,9 @@ pub fn emit_model(
             pub unsafe fn forward_backbone(
                 wm: &Weights,
                 ctx: &::ferrite_forward::ForwardCtx,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward(wm, ctx, device, num_tokens) }
             }
         },
@@ -7846,9 +7846,9 @@ pub fn emit_model(
         pub unsafe fn forward(
             wm: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             let e = ::ferrite_forward::find_bucket(
                 FORWARD_TABLE, num_tokens, ctx.max_seqlen_k as u64,
             );
@@ -7867,7 +7867,7 @@ pub fn emit_model(
         pub unsafe fn forward_piecewise_capture(
             wm: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
         ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
             let e = ::ferrite_forward::find_bucket(

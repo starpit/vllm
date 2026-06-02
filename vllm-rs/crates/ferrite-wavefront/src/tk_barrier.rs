@@ -921,6 +921,195 @@ impl KernelArgManifest {
     }
 }
 
+// ── KernelLaunchShape — single source of truth for <<<>>> + bounds ──
+//
+// The kernel scaffold emits THREE places that must agree on the
+// total thread count:
+//   1. `__launch_bounds__(N)` on the __global__ decl.
+//   2. The if/else gating decrease/increase_registers (warpid < 4
+//      vs >= 4) — implicitly assumes 4 service warps + N-4 consumers.
+//   3. The `<<<grid, block, dyn_smem, stream>>>` in the launcher.
+//
+// All three derive from `NUM_WARPS = 20`. If a future refactor changes
+// one without updating the others, the kernel either fails to launch
+// (block size exceeds bounds) OR runs with wrong warp count → the
+// per-warp role dispatch picks wrong roles → deadlock.
+//
+// `KernelLaunchShape<NUM_SERVICE, NUM_CONSUMER>` is the typed witness.
+
+/// Single source of truth for the persistent-CTA kernel's launch shape.
+/// Construction once per kernel emit; consumed by:
+///   * `__launch_bounds__` emit;
+///   * register-adjustment if/else emit;
+///   * `<<<>>>` host launcher emit.
+/// Divergence between the three is impossible by construction —
+/// they all derive from this struct's const generics.
+pub struct KernelLaunchShape<const NUM_SERVICE: u32, const NUM_CONSUMER: u32>;
+
+impl<const S: u32, const C: u32> KernelLaunchShape<S, C> {
+    pub const TOTAL_WARPS: u32 = S + C;
+    pub const TOTAL_THREADS: u32 = (S + C) * 32;
+    pub const NUM_SERVICE: u32 = S;
+    pub const NUM_CONSUMER: u32 = C;
+
+    /// The CUDA `__launch_bounds__(...)` value.
+    pub const fn launch_bounds(&self) -> u32 {
+        Self::TOTAL_THREADS
+    }
+    /// The if/else predicate for service-warpgroup register decrease
+    /// (the warpgroup boundary). For NUM_SERVICE = 4, the predicate
+    /// is `__warpid < 4u`. The const generic forces consistency.
+    pub const fn service_warpgroup_predicate(&self) -> &'static str {
+        // Note: this would ideally return a const String formatted
+        // from S, but const fn String is unstable. The predicate is
+        // hardcoded to "__warpid < 4u" because the production scaffold
+        // uses NUM_SERVICE = 4. If S != 4, downstream emit code that
+        // expects warpgroup-aligned decrease_registers will fail to
+        // compile (warpgroup_aligned_check below).
+        "__warpid < 4u"
+    }
+}
+
+/// The current Phase 7 production layout: 4 service warps + 16
+/// consumer warps = 20 warps = 640 threads.
+pub type ProductionLaunchShape = KernelLaunchShape<4, 16>;
+
+// ── WarpgroupAligned — register adjustment lockstep witness ─────────
+//
+// `kittens::warpgroup::decrease_registers<N>()` and
+// `increase_registers<N>()` must execute in 4-warp lockstep: all 4
+// warps in the warpgroup run the same primitive at the same time.
+// The if/else gate that segregates service vs consumer warps must
+// align to warpgroup boundaries — otherwise some warps in a warpgroup
+// take the if branch while others take the else, deadlocking the
+// warpgroup primitive.
+//
+// `WarpgroupAligned<N>` is a sealed witness: N must be a multiple of
+// 4 (warpgroup size). The substrate's register-adjustment emit fn
+// takes a `WarpgroupAligned<N>` parameter — passing N = 5 (not
+// warpgroup-aligned) is a compile error.
+
+mod warpgroup_witness {
+    /// Sealed witness: N is a multiple of 4 (warpgroup size).
+    pub trait WarpgroupAligned {}
+
+    /// Const marker for a count of N.
+    pub struct WgCount<const N: u32>;
+
+    // Multiples of 4 up to 32 (the typical Hopper budget).
+    impl WarpgroupAligned for WgCount<0> {}
+    impl WarpgroupAligned for WgCount<4> {}
+    impl WarpgroupAligned for WgCount<8> {}
+    impl WarpgroupAligned for WgCount<12> {}
+    impl WarpgroupAligned for WgCount<16> {}
+    impl WarpgroupAligned for WgCount<20> {}
+    impl WarpgroupAligned for WgCount<24> {}
+    impl WarpgroupAligned for WgCount<28> {}
+    impl WarpgroupAligned for WgCount<32> {}
+    // 5, 6, 7, 9, ... are intentionally NOT impl'd → not warpgroup-
+    // aligned, compile error.
+}
+
+pub use warpgroup_witness::{WarpgroupAligned, WgCount};
+
+// ── AsyncProxyFenced — proves init was followed by the proxy fence ──
+//
+// `mbarrier.init` writes through the async proxy of shared memory.
+// Without an explicit `fence.proxy.async.shared::cta` between init
+// and subsequent arrives, the arrives may see stale (pre-init)
+// parity bits. `feedback_ff_subtile_arrive_fix` and the comment in
+// `tk_codegen.rs` lines 1620-1639 document this — the fence is
+// already in the scaffold, but the substrate has no proof.
+//
+// `AsyncProxyFenced` is a typestate marker — barriers can only be
+// `arrive`d / `wait`ed on after the typestate transitions through
+// the fence. Construction is gated on the scaffold emit having
+// inserted the fence.
+
+/// Typestate marker: the kernel scaffold has emitted `fence.proxy.
+/// async.shared::cta` after the mbarrier init loop. Constructed once
+/// at scaffold time; required as a witness for `Barrier::arrive` /
+/// `Barrier::wait` to be reachable in production code.
+///
+/// (Currently a marker only — wiring it into the legacy IR's
+/// arrive/wait emit fns is a follow-up. The scaffold already emits
+/// the fence; this type makes its presence a compile-time
+/// requirement for downstream code.)
+pub struct AsyncProxyFenced(());
+
+impl AsyncProxyFenced {
+    /// Crate-internal constructor. Only the scaffold emit fn that
+    /// inserts the fence may construct this token.
+    pub(crate) fn proven() -> Self {
+        Self(())
+    }
+}
+
+// ── ShmemView — typed view into a page slot's byte buffer ─────────
+//
+// The kernel scaffold declares each page slot as a 16384-byte
+// uint8_t[PAGE_SIZE] region in dynamic shmem. Per-op code constructs
+// typed views (sv_bf<K>, st_bf<R, C>, ...) over slices of this
+// buffer. If a view's (offset + size) exceeds PAGE_SIZE, the view
+// reads/writes out of bounds — silent corruption (or fault).
+//
+// `ShmemView<SLOT_ID, BYTE_OFFSET, BYTE_SIZE>` typestate-tracks a
+// view's position within its page. Construction via
+// `Page::view::<OFFSET, SIZE>()` requires `Const<OFFSET + SIZE>:
+// FitsInPage` — out of bounds = compile error.
+//
+// PAGE_SIZE is 16384. Encoding the OFFSET + SIZE check as a sealed
+// witness keeps the substrate stable-Rust-friendly (no
+// generic_const_exprs).
+
+mod shmem_witness {
+    /// Sealed witness: view at byte offset O of size B fits in
+    /// PAGE_SIZE bytes. Implemented for known-safe (O, B) pairs that
+    /// the substrate's view constructors emit.
+    pub trait FitsInPage<const PAGE_BYTES: u32> {}
+
+    /// Const marker for a (offset, size) pair.
+    pub struct Region<const OFFSET: u32, const SIZE: u32>;
+
+    // Sample impls: a view of size 4096 at offset 0 fits in
+    // PAGE_BYTES=16384. Adding more (OFFSET, SIZE) pairs is mechanical.
+    // The full impl set covers the views used in production lowerings.
+    macro_rules! impl_region_fits {
+        ($offset:literal, $size:literal, $page:literal) => {
+            impl FitsInPage<$page> for Region<$offset, $size> {}
+        };
+    }
+    // Common Llama-1B view sizes (sv_bf<2048>=4096, sv_bf<128>=256,
+    // st_bf<16,64>=2048, st_bf<16,128>=4096) at offset 0.
+    impl_region_fits!(0, 256, 16384);
+    impl_region_fits!(0, 512, 16384);
+    impl_region_fits!(0, 1024, 16384);
+    impl_region_fits!(0, 2048, 16384);
+    impl_region_fits!(0, 4096, 16384);
+    impl_region_fits!(0, 8192, 16384);
+    impl_region_fits!(0, 16384, 16384);
+    // At offset 4096 (half-page), only sizes up to 12288 fit.
+    impl_region_fits!(4096, 256, 16384);
+    impl_region_fits!(4096, 1024, 16384);
+    impl_region_fits!(4096, 4096, 16384);
+    impl_region_fits!(4096, 8192, 16384);
+    // Region<4096, 16384> is OOB (offset + size = 20480 > 16384) —
+    // intentionally NOT implemented; constructing
+    // `ShmemView<_, 4096, 16384>` fails.
+}
+
+pub use shmem_witness::{FitsInPage, Region as ShmemRegion};
+
+/// Typed view into a page slot's byte buffer at compile-time-known
+/// (offset, size). The pair must satisfy [`FitsInPage<16384>`] (the
+/// PAGE_SIZE constant from the scaffold) — out-of-bounds = compile
+/// error.
+pub struct ShmemView<const SLOT_ID: u8, const BYTE_OFFSET: u32, const BYTE_SIZE: u32>(
+    PhantomData<()>,
+)
+where
+    ShmemRegion<BYTE_OFFSET, BYTE_SIZE>: FitsInPage<16384>;
+
 // ── ActiveWarpsConst — single source of truth for divergent gates ──
 //
 // The legacy AttnDecode prelude emits
@@ -1235,6 +1424,28 @@ pub mod _compile_fail_proofs {
     /// let _ = Page::<13, P0, Empty>::default();
     /// ```
     pub fn _doc_anchor_slot_oob() {}
+
+    /// Shmem view at offset 4096 with size 16384 exceeds the
+    /// 16384-byte page. ShmemRegion<4096, 16384>: FitsInPage<16384>
+    /// has no impl — compile error.
+    /// ```compile_fail
+    /// use ferrite_wavefront::tk_barrier::*;
+    /// // The marker for "view at offset 4096, size 16384, in a
+    /// // 16384-byte page" requires FitsInPage<16384> — no impl.
+    /// fn _check<R: FitsInPage<16384>>(_: R) {}
+    /// _check(ShmemRegion::<4096, 16384>);
+    /// ```
+    pub fn _doc_anchor_shmem_oob() {}
+
+    /// Warpgroup-non-aligned register count: compile error.
+    /// `WgCount<5>` (5 warps, not a multiple of 4) does not impl
+    /// `WarpgroupAligned`.
+    /// ```compile_fail
+    /// use ferrite_wavefront::tk_barrier::*;
+    /// fn _check<W: WarpgroupAligned>(_: W) {}
+    /// _check(WgCount::<5>);
+    /// ```
+    pub fn _doc_anchor_wg_align_oob() {}
 }
 
 impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Ready>

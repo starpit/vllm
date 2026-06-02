@@ -345,6 +345,10 @@ impl SpecializedPipelineCache {
                     "vision_varlen_attn",
                     crate::embedded_metallib!("vision_varlen_attn"),
                 ),
+                (
+                    "vision_layernorm",
+                    crate::embedded_metallib!("vision_layernorm"),
+                ),
             ],
         )?;
         // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at

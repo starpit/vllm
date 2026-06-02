@@ -92,6 +92,22 @@ unsafe extern "C" {
         u32_args: *const u32,
         stream: *mut c_void,
     ) -> i32;
+
+    /// Step C.2 PoC: descriptor-TMA over a real RmsNorm op
+    /// (emitted by `bin/tk_emit_rmsnorm_tensor_smoke`). Vector-form
+    /// `kittens::tma::load_async<cache_policy::NORMAL>` on `sv_bf<K>`
+    /// for the m=1 activation row + weight load + output store —
+    /// the m=1 1×hidden shape doesn't fit `st_bf<R, C>`'s 16-row
+    /// minimum, so vector TMA is the natural fit. Compute body is
+    /// the same K_TILE=128 register-vector reduce that production
+    /// `tk20::rmsnorm_consumer_body` (Phase 10) uses. `bufs[0]` =
+    /// input bf16 [hidden=2048], `bufs[1]` = weight bf16 [2048],
+    /// `bufs[2]` = output bf16 [2048]. No u32 args.
+    pub fn launch_tk_rmsnorm_tensor_smoke(
+        bufs: *const *mut c_void,
+        u32_args: *const u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Safe wrapper around [`launch_tk_decode_one_layer`].
@@ -1059,5 +1075,76 @@ mod tests {
                 out_bytes[i], in_bytes[i]
             );
         }
+    }
+
+    /// Step C.2 PoC — descriptor-TMA on a real op (RmsNorm). Vector-
+    /// form `tma::load_async<cache_policy::NORMAL>` on `sv_bf<K=2048>`
+    /// for the m=1 activation row. Compute body matches the
+    /// production `tk20::rmsnorm_consumer_body` (Phase 10 register-
+    /// vector reduce). Verifies numerical correctness vs
+    /// `cpu_golden::rmsnorm` within the same 1.5e-2 max-abs tolerance
+    /// the existing `rmsnorm_kernel_matches_cpu_golden` test uses.
+    #[test]
+    #[ignore]
+    fn rmsnorm_tensor_smoke_kernel_matches_cpu_golden() {
+        use cudarc::driver::{CudaContext, DevicePtr};
+        use ferrite_forward::cpu_golden;
+        const HIDDEN: usize = 2048;
+        const BYTES: usize = HIDDEN * 2;
+
+        let x_f32 = prng_f32_seeded(0xa1a1_b2b2, HIDDEN, 0.5, 0.0);
+        let w_f32 = prng_f32_seeded(0xc3c3_d4d4, HIDDEN, 1.0, 0.0);
+        let (_, x_lossy, x_bytes) = f32_to_bf16_bytes(&x_f32);
+        let (_, w_lossy, w_bytes) = f32_to_bf16_bytes(&w_f32);
+        assert_eq!(x_bytes.len(), BYTES);
+        assert_eq!(w_bytes.len(), BYTES);
+
+        let ctx = CudaContext::new(0).expect("cuda init");
+        let stream = ctx.new_stream().expect("stream create");
+        let pad_floor = 1usize << 20;
+        let alloc_size = pad_floor.max(BYTES).div_ceil(128) * 128;
+        let buf_x: cudarc::driver::CudaSlice<u8> =
+            stream.alloc_zeros::<u8>(alloc_size).expect("alloc x");
+        let buf_w: cudarc::driver::CudaSlice<u8> =
+            stream.alloc_zeros::<u8>(alloc_size).expect("alloc w");
+        let buf_out: cudarc::driver::CudaSlice<u8> =
+            stream.alloc_zeros::<u8>(alloc_size).expect("alloc out");
+
+        let mut buf_x_mut = buf_x;
+        let mut buf_w_mut = buf_w;
+        stream.memcpy_htod(&x_bytes, &mut buf_x_mut).expect("h2d x");
+        stream.memcpy_htod(&w_bytes, &mut buf_w_mut).expect("h2d w");
+
+        let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(3);
+        let mut _records: Vec<cudarc::driver::SyncOnDrop<'_>> = Vec::with_capacity(3);
+        for buf in [&buf_x_mut, &buf_w_mut, &buf_out] {
+            let (dptr, rec) = DevicePtr::device_ptr(buf, &stream);
+            ptrs.push(dptr as *mut c_void);
+            _records.push(rec);
+        }
+        stream.synchronize().expect("pre-launch sync");
+
+        let u32_args: [u32; 0] = [];
+        let err = unsafe {
+            launch_tk_rmsnorm_tensor_smoke(
+                ptrs.as_ptr(),
+                u32_args.as_ptr(),
+                stream.cu_stream() as *mut c_void,
+            )
+        };
+        assert_eq!(err, 0, "launch_tk_rmsnorm_tensor_smoke cudaError {err}");
+        stream.synchronize().expect("post-launch sync");
+
+        let mut out_bytes = vec![0u8; alloc_size];
+        stream
+            .memcpy_dtoh(&buf_out, &mut out_bytes)
+            .expect("d2h out");
+        stream.synchronize().expect("post-d2h sync");
+
+        let got = bytes_to_f32_prefix(&out_bytes, HIDDEN);
+        let mut want = vec![0.0_f32; HIDDEN];
+        cpu_golden::rmsnorm(&x_lossy, &w_lossy, &mut want, 1e-5);
+        round_through_bf16_inplace(&mut want);
+        assert_max_abs(&got, &want, 1.5e-2, "rmsnorm_tensor");
     }
 }

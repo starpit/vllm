@@ -62,10 +62,28 @@ impl MetalSynthGateUpSiluMulImpl {
 /// across cached HF snapshots) while Llama-3.x / Qwen2.5 / SmolLM
 /// ship F16 — drives the synth Impl's `applies_to` gate.
 pub(crate) fn is_qwen3_arch(model: &crate::config::ModelParams) -> bool {
-    model
-        .architectures
-        .iter()
-        .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"))
+    // Match the WHOLE Qwen3.x family (Qwen3, Qwen3-MoE, Qwen3.5/3.6 incl.
+    // the VL-wrapped `Qwen3_5ForConditionalGeneration` /
+    // `Qwen3_5MoeForConditionalGeneration`) — all ship BF16 scales/biases.
+    // MUST stay consistent with codegen's `is_qwen3` (`starts_with("Qwen3")`,
+    // which drives `SCALE_DTYPE`): if the synth scale-tag gate disagrees,
+    // the synth requests a `_half`-scale kernel for a bf16-scale model →
+    // metallib mismatch panic (`no library synth_mlp_pre_down_bfloat_half_gs64`).
+    model.architectures.iter().any(|a| a.starts_with("Qwen3"))
+}
+
+/// True for `mlx_lm.convert` affine-quantized checkpoints. The M=1
+/// decode synth megakernels (`SynthMlpPreDown` / `SynthPreAttn`) are
+/// NOT correct on these (the fused rmsnorm double-counts the
+/// pre-applied zero-centered offset → degenerate output on
+/// `Qwen3.5-MLX-4bit`), so those gate off here and route to the
+/// proven-correct unfused chain. The prefill `SynthGateUpSiluMul`
+/// (M>=8) is unaffected.
+pub(crate) fn is_mlx_affine(model: &crate::config::ModelParams) -> bool {
+    matches!(
+        model.quantization.as_ref().map(|qc| &qc.method),
+        Some(crate::quantization::QuantMethod::Affine { .. })
+    )
 }
 
 impl Implementation for MetalSynthGateUpSiluMulImpl {

@@ -1362,6 +1362,16 @@ fn write_runtime_inputs(
     if let Some(s) = inputs.last_token_indices {
         write_slice("last_token_indices", &runtime.sample_indices, s)?;
     }
+    // GDN per-forward indices (hybrid arches only). i32 slot ids + u32
+    // fresh flags, one per batched sequence in cu_seqlens order.
+    if let Some(idx) = inputs.gdn_state_indices {
+        // i32 and u32 share the 4-byte layout the kernels read as int.
+        let as_u32 = unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u32, idx.len()) };
+        write_slice("gdn_state_indices", &runtime.gdn_state_indices, as_u32)?;
+    }
+    if let Some(fresh) = inputs.gdn_is_fresh {
+        write_slice("gdn_is_fresh", &runtime.gdn_is_fresh, fresh)?;
+    }
     Ok(())
 }
 
@@ -1528,6 +1538,10 @@ mod tests {
             num_tokens_u32: alloc(device, 4),
             num_sample_rows_u32: alloc(device, 4),
             sample_indices: alloc(device, 16),
+            gdn_state_conv: ::std::vec::Vec::new(),
+            gdn_state_ssm: ::std::vec::Vec::new(),
+            gdn_state_indices: alloc(device, 16),
+            gdn_is_fresh: alloc(device, 16),
         }
     }
 
@@ -1822,6 +1836,10 @@ mod tests {
             num_tokens_u32: alloc(d, 4),
             num_sample_rows_u32: alloc(d, 4),
             sample_indices: alloc(d, max_m_bytes),
+            gdn_state_conv: ::std::vec::Vec::new(),
+            gdn_state_ssm: ::std::vec::Vec::new(),
+            gdn_state_indices: alloc(d, 16),
+            gdn_is_fresh: alloc(d, 16),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

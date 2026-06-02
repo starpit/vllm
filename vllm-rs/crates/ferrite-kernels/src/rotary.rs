@@ -370,7 +370,37 @@ impl RotaryCache {
         llama3_scaling: Option<&Llama3RopeScaling>,
         dtype: DType,
     ) -> Result<Self> {
-        let rotary_dim = head_dim;
+        // Full rotary is the `rotary_dim == head_dim` special case.
+        Self::new_partial_from_gpuweights(
+            weights,
+            head_dim,
+            head_dim,
+            max_pos,
+            rope_theta,
+            llama3_scaling,
+            dtype,
+        )
+    }
+
+    /// Partial-rotary (and full, when `rotary_dim == head_dim`) cos/sin
+    /// cache, built on CPU and uploaded via [`GpuWeights`] — the
+    /// backend-neutral, stream-free counterpart to
+    /// [`Self::new_partial_from_stream`]. Builds a `[max_pos, rotary_dim]`
+    /// cache where `rotary_dim = partial_rotary_factor * head_dim` (e.g.
+    /// Qwen3.5: `0.25 * 256 = 64`). The cuda + metal rope kernels read it
+    /// with `ROT_DIM = rotary_dim` and pass the trailing
+    /// `head_dim - rotary_dim` channels through unrotated. Covers
+    /// no-scaling and Llama3 scaling; LongRoPE / YaRN stay cuda-only
+    /// (their `*_from_stream` host-math helpers aren't lifted yet).
+    pub fn new_partial_from_gpuweights(
+        weights: &mut GpuWeights,
+        head_dim: usize,
+        rotary_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        llama3_scaling: Option<&Llama3RopeScaling>,
+        dtype: DType,
+    ) -> Result<Self> {
         let half = rotary_dim / 2;
 
         let inv_freqs: Vec<f64> = (0..half)

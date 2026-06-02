@@ -883,6 +883,9 @@ pub enum WeightKind {
     DeepSeekMoeGgml,
     FusedMoe,
     SharedFusedMoe,
+    /// Gated-DeltaNet per-layer weight bundle — resolves to
+    /// `WeightAccessors::gated_delta_net_at`.
+    GatedDeltaNet,
     CosSin,
     /// Metal-only: MLX-affine int4 quantized embedding. Resolves to
     /// `WeightAccessors::affine_quant_embedding_at`.
@@ -2160,6 +2163,9 @@ pub fn starter_library() -> ImplementationLibrary {
         // / `MlaAttention` / `Moe` for the metal interpreter to handle.
         lib.push(Box::new(MlaSplitRefImpl));
         lib.push(Box::new(MlaAttentionImpl));
+        lib.push(Box::new(GatedDeltaNetImpl));
+        lib.push(Box::new(GateSplitImpl));
+        lib.push(Box::new(GateApplyImpl));
         lib.push(Box::new(DeepSeekMoeRefImpl));
         lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
@@ -2515,6 +2521,9 @@ pub fn starter_library() -> ImplementationLibrary {
         // sequence, and DeepSeekV2MoE (routed + shared expert).
         lib.push(Box::new(MlaSplitRefImpl));
         lib.push(Box::new(MlaAttentionImpl));
+        lib.push(Box::new(GatedDeltaNetImpl));
+        lib.push(Box::new(GateSplitImpl));
+        lib.push(Box::new(GateApplyImpl));
         lib.push(Box::new(DeepSeekMoeRefImpl));
         lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
@@ -2639,8 +2648,13 @@ impl Implementation for FusedGemmBiasImpl {
         "fused_gemm_bias"
     }
 
-    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
-        true
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // cuBLAS `gemm_bias` epilog — CUDA only. The Metal interpreter
+        // (Phase 5.A) has no `FusedGemmBias` lowering arm, so on Metal the
+        // `(Gemm, BiasAdd)` chain must stay split (Gemm + `MetalBiasAdd`,
+        // both of which `lower_one` handles). Without this gate the cost
+        // solver picks the fused variant at M=1 and pool-init panics.
+        profile.backend != crate::target::Backend::Metal
     }
 
     fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
@@ -15314,6 +15328,300 @@ impl Implementation for DeepSeekMoeRefImpl {
             in_slot_idx,
             out_slot_idx,
             layer,
+        )])
+    }
+}
+
+// ── GatedDeltaNetImpl ────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GatedDeltaNet` (Qwen3.5 / Qwen3-Next linear
+// attention). Backend-agnostic host-callback op: the cuda eval
+// (`gated_delta_net_eval` in ferrite-forward/src/instr.rs) orchestrates the
+// surviving `gdn_*` kernels. No `applies_to` gate is needed — the
+// `gated_delta_net` DSL op (and thus this OpKind) is emitted only by GDN
+// arches, so there is no cross-Impl contention.
+//
+// DSL: core = gated_delta_net(qkv, z, a, b, linear_attn[layer])
+//   inputs 0..3 = tile activations (qkv, z, a, b); input 4 = linear_attn[layer]
+//   weight → GatedDeltaNetLayer. Layer index derived from the weight name.
+
+#[derive(Debug, Default)]
+pub struct GatedDeltaNetImpl;
+
+impl Implementation for GatedDeltaNetImpl {
+    fn name(&self) -> &'static str {
+        "gated_delta_net_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GatedDeltaNet)
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        true
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // The `linear_attn[layer]` DSL weight maps to a GatedDeltaNetLayer.
+        // Bypass `default_required_weights` which would assign GpuTensor type.
+        let tile = claimed_tiles[0];
+        let node = fuf.get(tile);
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for input in &node.inputs {
+            if let FufInput::Weight { id, index, .. } = input {
+                let name = weight_field_name(program, *id, *index);
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                out.push(WeightAccessor {
+                    name,
+                    rust_type: quote! {
+                        ::ferrite_kernels::layers::GatedDeltaNetLayer
+                    },
+                    source_weights: vec![(*id, *index)],
+                });
+            }
+        }
+        out
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GatedDeltaNet",
+            vec![
+                ("qkv_slot", syn::parse_quote!(u32)),
+                ("z_slot", syn::parse_quote!(u32)),
+                ("a_slot", syn::parse_quote!(u32)),
+                ("b_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => panic!("GatedDeltaNet: input {idx} must be a Tile (got {other:?})"),
+            }
+        };
+        let (qkv_id, qkv_in) = resolve(0);
+        let (z_id, z_in) = resolve(1);
+        let (a_id, a_in) = resolve(2);
+        let (b_id, b_in) = resolve(3);
+        let qkv_slot = slots.of(qkv_id, qkv_in);
+        let z_slot = slots.of(z_id, z_in);
+        let a_slot = slots.of(a_id, a_in);
+        let b_slot = slots.of(b_id, b_in);
+        let out_slot = slots.of(tile, 0);
+        // Layer index comes from the `linear_attn[layer]` weight accessor name.
+        let accessors = self.required_weights(&m.claimed_tiles, fuf, program);
+        let acc = accessors.first().expect(
+            "GatedDeltaNet: required_weights returned empty (no linear_attn[layer] weight)",
+        );
+        let (_base, layer) = split_base_layer(&acc.name.to_string());
+        let layer = layer.unwrap_or(0) as u32;
+        Some(vec![ferrite_forward::Instruction::GatedDeltaNet(
+            qkv_slot, z_slot, a_slot, b_slot, out_slot, layer,
+        )])
+    }
+}
+
+// ── GateSplitImpl ────────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GateSplit` — Qwen3.5 attention output-gate split.
+// Deinterleaves the doubled `q_proj` output into `query` + `gate`. Two Owned
+// outputs (both freshly allocated by the eval). Backend-agnostic host-callback.
+
+#[derive(Debug, Default)]
+pub struct GateSplitImpl;
+
+impl Implementation for GateSplitImpl {
+    fn name(&self) -> &'static str {
+        "gate_split_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GateSplit)
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GateSplit",
+            vec![
+                ("qg_slot", syn::parse_quote!(u32)),
+                ("q_slot", syn::parse_quote!(u32)),
+                ("gate_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("GateSplit: input 0 must be a Tile (got {other:?})"),
+        };
+        let qg_slot = slots.of(in_id, in_slot);
+        let q_slot = slots.of(tile, 0);
+        let gate_slot = slots.of(tile, 1);
+        Some(vec![ferrite_forward::Instruction::GateSplit(
+            qg_slot, q_slot, gate_slot,
+        )])
+    }
+}
+
+// ── GateApplyImpl ────────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GateApply` — Qwen3.5 attention output gate:
+// `out = attn * sigmoid(gate)`. Shape-preserving 2-input elementwise.
+
+#[derive(Debug, Default)]
+pub struct GateApplyImpl;
+
+impl Implementation for GateApplyImpl {
+    fn name(&self) -> &'static str {
+        "gate_apply_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GateApply)
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GateApply",
+            vec![
+                ("attn_slot", syn::parse_quote!(u32)),
+                ("gate_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => panic!("GateApply: input {idx} must be a Tile (got {other:?})"),
+            }
+        };
+        let (attn_id, attn_in) = resolve(0);
+        let (gate_id, gate_in) = resolve(1);
+        let attn_slot = slots.of(attn_id, attn_in);
+        let gate_slot = slots.of(gate_id, gate_in);
+        let out_slot = slots.of(tile, 0);
+        Some(vec![ferrite_forward::Instruction::GateApply(
+            attn_slot, gate_slot, out_slot,
         )])
     }
 }

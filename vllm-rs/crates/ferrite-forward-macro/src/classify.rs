@@ -229,40 +229,58 @@ impl Ctx {
         self.scope = pre_scope;
 
         // A name is "changed" in an arm if its top-of-stack LocalId
-        // differs from the pre-If top-of-stack. Both arms must
-        // change the same set of names.
+        // differs from the pre-If top-of-stack.
         let then_changed = diff_tops(&pre_tops, &post_then);
         let else_changed = diff_tops(&pre_tops, &post_else);
 
         let then_keys: BTreeSet<&String> = then_changed.keys().collect();
         let else_keys: BTreeSet<&String> = else_changed.keys().collect();
-        if then_keys != else_keys {
-            let only_in_then: Vec<_> = then_keys
-                .difference(&else_keys)
-                .map(|s| s.as_str())
-                .collect();
-            let only_in_else: Vec<_> = else_keys
-                .difference(&then_keys)
-                .map(|s| s.as_str())
-                .collect();
+
+        // Names changed in only ONE arm are allowed when they are *new*
+        // arm-local scratch (not bound before the `if`): e.g. a hybrid
+        // layer whose `then` arm is GDN (binds `qkv`/`z`/…) and `else` arm
+        // is attention (binds `q`/`gate`/…). Such names are dead after the
+        // branch — only the merged (intersection) names escape. But a name
+        // that existed *before* the `if` and is reassigned in only one arm
+        // is the dangerous silent-divergence case (a read after the `if`
+        // would see the pre-If value when the other arm ran), so that
+        // stays an error. Both arms reassigning the same pre-If name (e.g.
+        // the loop-carried output) is fine — it lands in the intersection.
+        let one_arm_only: Vec<&String> = then_keys
+            .symmetric_difference(&else_keys)
+            .copied()
+            .collect();
+        let dangerous: Vec<&str> = one_arm_only
+            .iter()
+            .filter(|n| pre_tops.get(**n).is_some_and(|b| b.is_some()))
+            .map(|s| s.as_str())
+            .collect();
+        if !dangerous.is_empty() {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
                 format!(
-                    "`if`/`else` arms must bind the same set of names; \
-                     only in `then`: {only_in_then:?}, only in `else`: {only_in_else:?}",
+                    "`if`/`else` arms reassign name(s) bound before the `if` in only one arm: \
+                     {dangerous:?}; both arms must reassign such names (a read after the `if` \
+                     would otherwise see the pre-`if` value when the other arm ran). \
+                     Arm-local scratch names (new in one arm, dead after) are allowed.",
                 ),
             ));
         }
 
+        // Merge over the INTERSECTION — names changed in BOTH arms escape
+        // with a value from whichever arm ran. Arm-unique new names stay
+        // arm-local (not re-bound after the `if`; a read after resolves
+        // to the pre-If scope, or errors as out-of-scope if never bound).
         let mut merge_carry = Vec::new();
-        for (name, then_final) in &then_changed {
-            let else_final = else_changed[name];
+        for name in then_keys.intersection(&else_keys) {
+            let then_final = then_changed[*name];
+            let else_final = else_changed[*name];
             // Synthesize a merge binding that shadows any pre-If
             // binding of this name. Use `bind` so reads after the
             // If resolve to this merge id.
             let ident = syn::Ident::new(name, proc_macro2::Span::call_site());
             let merge_id = self.bind(ident);
-            merge_carry.push((merge_id, *then_final, else_final));
+            merge_carry.push((merge_id, then_final, else_final));
         }
 
         Ok(Stmt::If {
@@ -863,17 +881,49 @@ mod tests {
     }
 
     #[test]
-    fn if_arms_binding_different_names_is_rejected() {
-        let err = classify_err(
+    fn if_arms_unique_new_scratch_names_allowed() {
+        // Hybrid-layer pattern: the two arms are structurally different
+        // token mixers that bind disjoint *new* scratch names (`a` only in
+        // `then`, `b` only in `else`). Both are dead after the branch, so
+        // this is allowed — only the intersection escapes (here empty).
+        let p = classify_src(
             "for layer in 0..4 { \
                 if layer % 2 == 0 { a = attention(q, k, v, kv_cache, block_table); } \
                 else { b = sliding_attention(q, k, v, kv_cache, block_table); } \
             }",
         );
+        match &p.statements[0] {
+            Stmt::For { body, .. } => match &body[0] {
+                Stmt::If { merge_carry, .. } => {
+                    // Disjoint new names → empty intersection → no merge.
+                    assert!(
+                        merge_carry.is_empty(),
+                        "arm-unique scratch names should not be merged"
+                    );
+                }
+                _ => panic!("expected If"),
+            },
+            _ => panic!("expected for-loop"),
+        }
+    }
+
+    #[test]
+    fn if_arm_reassigns_pre_if_name_in_one_arm_is_rejected() {
+        // `x` is bound *before* the `if` and reassigned in only the `then`
+        // arm — the dangerous silent-divergence case (a read after the `if`
+        // would see the pre-`if` value when the `else` arm ran). Rejected.
+        let err = classify_err(
+            "for layer in 0..4 { \
+                x = attention(q, k, v, kv_cache, block_table); \
+                if layer % 2 == 0 { x = sliding_attention(q, k, v, kv_cache, block_table); } \
+                else { y = attention(q, k, v, kv_cache, block_table); } \
+                hidden_states = add(x, x); \
+            }",
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("same set of names"),
-            "error mentions asymmetric arms: {msg}"
+            msg.contains("only one arm") || msg.contains("bound before"),
+            "error flags a pre-`if` name reassigned in one arm only: {msg}"
         );
     }
 

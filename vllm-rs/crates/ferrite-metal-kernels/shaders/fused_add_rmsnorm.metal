@@ -130,9 +130,11 @@ kernel void fused_add_rmsnorm_bf16(
 /// in via `[[function_constant(N)]]`. Index assignments must match
 /// `ferrite-forward::interpreter::metal::pipelines`:
 ///   0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
-constant uint  FUSED_ARN_M           [[function_constant(0)]];
-constant uint  FUSED_ARN_HIDDEN_SIZE [[function_constant(1)]];
-constant float FUSED_ARN_EPS         [[function_constant(2)]];
+constant uint  FUSED_ARN_M             [[function_constant(0)]];
+constant uint  FUSED_ARN_HIDDEN_SIZE   [[function_constant(1)]];
+constant float FUSED_ARN_EPS           [[function_constant(2)]];
+// Zero-centered (Gemma / Qwen3.5) RMSNorm: effective gain = weight + offset.
+constant float FUSED_ARN_WEIGHT_OFFSET [[function_constant(3)]];
 
 /// Specialized fused add+rmsnorm matching the CUDA `fused_add_rms_norm_inplace`
 /// semantics (`ferrite-kernels::kernels::fused_add_rms_norm_inplace`):
@@ -189,7 +191,7 @@ template <typename T_act, typename T_scale>
     // Pass 2: write `rmsnorm(residual, weight)` back into `delta`.
     for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
         float s = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
-        float w = float(weight[i]);
+        float w = float(weight[i]) + FUSED_ARN_WEIGHT_OFFSET;
         delta[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act((s / rms) * w);
     }
 }

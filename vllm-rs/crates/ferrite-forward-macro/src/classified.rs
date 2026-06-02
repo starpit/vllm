@@ -370,6 +370,30 @@ pub enum OpKind {
     /// keyed on the rust_type fingerprint of the `moe[layer]` weight
     /// accessor. Shape-preserving.
     Moe,
+    /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). One coarse op
+    /// orchestrating the surviving `gdn_*` kernels: causal conv1d(+SiLU) →
+    /// split q/k/v → input-dependent gating → recurrent delta-rule scan →
+    /// gated RMSNorm. DSL form:
+    /// `core = gated_delta_net(qkv, z, a, b, linear_attn[layer])` where
+    /// `qkv = in_proj_qkv` `[T, conv_dim]`, `z = in_proj_z` `[T, value_dim]`,
+    /// `a/b = in_proj_{a,b}` `[T, num_v_heads]`, and `linear_attn[layer]`
+    /// resolves to a `GatedDeltaNetLayer` (conv1d / A_log / dt_bias / norm).
+    /// The recurrent + conv state is the ambient `ForwardCtx::gdn_state`
+    /// (non-paged, one slot/seq) selected by `gdn_state_indices`, read at
+    /// the `layer` carried on the `Instruction`. Output: `[T, value_dim]`
+    /// (feeds `out_proj`). Used by Qwen3.5 / Qwen3-Next linear layers.
+    GatedDeltaNet,
+    /// Qwen3.5 attention output-gate split. Deinterleaves the DOUBLED
+    /// `q_proj` output `[T, num_heads*2*head_dim]` (viewed `[T, nh, 2, hd]`)
+    /// into `query` (`[:,:,0,:]`) and `gate` (`[:,:,1,:]`), each
+    /// `[T, num_heads*head_dim]`. Tuple-returning (`(q, gate) = gate_split(qg)`);
+    /// the 2-target binding is handled in `Stmt::AssignTuple` like `MlaSplit`.
+    /// Used only by Qwen3.5 full-attention layers (`attn_output_gate=True`).
+    GateSplit,
+    /// Qwen3.5 attention output gate application: `out = attn * sigmoid(gate)`.
+    /// Shape-preserving 2-input elementwise. A fused op because bare `*` and
+    /// `sigmoid` are not DSL-callable (`Silu`/`Mul` are synthesis-only).
+    GateApply,
     /// Vision-prelude pixels materialization. Synthesized by
     /// `vision_lowering::materialize_pixels` between `fuf::unroll`
     /// and the solver: takes zero FUF inputs and produces a single
@@ -475,6 +499,9 @@ impl OpKind {
             "mla_split" => Some(Self::MlaSplit),
             "mla_attention" => Some(Self::MlaAttention),
             "moe_block" => Some(Self::Moe),
+            "gated_delta_net" => Some(Self::GatedDeltaNet),
+            "gate_split" => Some(Self::GateSplit),
+            "gate_apply" => Some(Self::GateApply),
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
             "strip_cls" => Some(Self::StripCls),
@@ -508,6 +535,9 @@ impl OpKind {
             Self::MlaSplit => "mla_split",
             Self::MlaAttention => "mla_attention",
             Self::Moe => "moe_block",
+            Self::GatedDeltaNet => "gated_delta_net",
+            Self::GateSplit => "gate_split",
+            Self::GateApply => "gate_apply",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
             // user can't write `all_reduce(...)` in a `#[forward]`

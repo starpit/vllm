@@ -150,12 +150,38 @@ pub trait CanonicalParams: WeightAccessors {
     /// canonically use; per-canonical macro impls override.
     const RMS_NORM_EPS: f32 = 1e-5;
 
+    /// Zero-centered RMSNorm gain offset (Gemma / Qwen3.5): the effective
+    /// gain applied by the standard `RmsNorm` / `FusedAddRmsNorm` metal
+    /// kernels is `weight + NORM_WEIGHT_OFFSET`. `1.0` for `(1 + weight)`
+    /// arches whose norm gains are stored zero-centered (Gemma2/3,
+    /// Qwen3.5 — input/post/final layernorms + per-head q/k norm), `0.0`
+    /// for plain RMSNorm (Llama / Qwen2 / Qwen3). The GDN gated RMSNorm
+    /// (`gdn_rms_norm_gated`) is a separate kernel and is NOT affected —
+    /// its gain is stored as the true value. Per-canonical macro impls
+    /// override from the config's `norm_weight_offset` field.
+    const NORM_WEIGHT_OFFSET: f32 = 0.0;
+
     /// Paged-KV-cache block stride (the `block_size` function
     /// constant `attention_via_cache_*_specialized` and
     /// `rope_append_*_specialized` consume). Backend-fixed at 16
     /// (vLLM's default); per-canonical override only if a model
     /// chooses a different paging size.
     const BLOCK_SIZE: u32 = 16;
+
+    // ── Gated-DeltaNet (Qwen3.5 / Qwen3-Next linear attention) ──────
+    // Per-layer GDN dims the `Instruction::GatedDeltaNet` eval reads as
+    // `W::GDN_*`. All default 0 so non-hybrid arches need no override;
+    // the proc-macro emits overrides for GDN arches from the
+    // `linear_num_key_heads` / `linear_num_value_heads` /
+    // `linear_key_head_dim` / `linear_value_head_dim` /
+    // `linear_conv_kernel_dim` config keys. `GDN_CONV_DIM` =
+    // `2·(num_k_heads·head_k_dim) + num_v_heads·head_v_dim`.
+    const GDN_NUM_K_HEADS: u32 = 0;
+    const GDN_NUM_V_HEADS: u32 = 0;
+    const GDN_HEAD_K_DIM: u32 = 0;
+    const GDN_HEAD_V_DIM: u32 = 0;
+    const GDN_CONV_KERNEL: u32 = 0;
+    const GDN_CONV_DIM: usize = 0;
 
     /// Block-table row stride (in u32s), equal to
     /// `ceil(MAX_SEQ_LEN / BLOCK_SIZE)`. Baked into
@@ -376,6 +402,15 @@ pub trait WeightAccessors {
         _layer: u32,
     ) -> &::ferrite_kernels::layers_moe::DeepSeekV2MoELayer {
         unreachable!("deepseek_moe_at not implemented for this arch")
+    }
+    fn gated_delta_net_at(
+        &self,
+        _bucket: u32,
+        _op_idx: u32,
+        _slot: u32,
+        _layer: u32,
+    ) -> &::ferrite_kernels::layers::GatedDeltaNetLayer {
+        unreachable!("gated_delta_net_at not implemented for this arch")
     }
     fn deepseek_moe_fp8_at(
         &self,
@@ -769,6 +804,20 @@ pub enum Instruction {
     RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool),
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32),
+    /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). Args:
+    /// `(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer)`. Reads the
+    /// `linear_attn[layer]` weight bundle (`GatedDeltaNetLayer`) via
+    /// `gated_delta_net_at` and the ambient conv/ssm state from
+    /// `ForwardCtx::{gdn_state, gdn_state_indices}` at `layer`. Output
+    /// `[T, value_dim]`.
+    GatedDeltaNet(u32, u32, u32, u32, u32, u32),
+    /// Qwen3.5 attention output-gate split. Args `(qg_slot, q_slot, gate_slot)`.
+    /// Deinterleaves the doubled `q_proj` output (per head `[query | gate]`)
+    /// into two `[T, num_heads*head_dim]` owned tiles.
+    GateSplit(u32, u32, u32),
+    /// Qwen3.5 attention output gate. Args `(attn_slot, gate_slot, out_slot)`.
+    /// `out = attn * sigmoid(gate)`.
+    GateApply(u32, u32, u32),
     DeepSeekMoe(u32, u32, u32),
     DeepSeekMoeFp8Block(u32, u32, u32),
     DeepSeekMoeGgml(u32, u32, u32),
@@ -2618,6 +2667,48 @@ impl Instruction {
                 };
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             }
+            Instruction::GatedDeltaNet(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer) => {
+                let layer = ctx.layer_offset + layer;
+                let out = unsafe {
+                    gated_delta_net_eval(
+                        ctx, qkv_slot, z_slot, a_slot, b_slot, layer, bucket, op_idx,
+                    )
+                };
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            }
+            Instruction::GateApply(attn_slot, gate_slot, out_slot) => unsafe {
+                // out = attn * sigmoid(gate)  (Qwen3.5 attention output gate).
+                let attn_tv = tile_ref(ctx.tiles, attn_slot).as_view(ctx.tiles);
+                let gate_tv = tile_ref(ctx.tiles, gate_slot).as_view(ctx.tiles);
+                let nt = (*attn_tv).dim(0);
+                let ncols = (*attn_tv).dim(1);
+                let dt = (*attn_tv).dtype();
+                let out = ctx.device.caching.alloc_tensor(&[nt, ncols], dt);
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*out.view()).raw_ptr(),
+                    (*attn_tv).as_ptr::<u8>(),
+                    (*attn_tv).size_bytes(),
+                    ctx.device.compute_stream,
+                )
+                .expect("GateApply: copy attn");
+                kernels::sigmoid_mul_inplace(
+                    *out.view(),
+                    *gate_tv,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GateSplit(_qg_slot, _q_slot, _gate_slot) => {
+                // Per-head deinterleave qg[T, nh*2*hd] → q,gate [T, nh*hd].
+                // CUDA path deferred to the cuda-host phase (needs a strided
+                // deinterleave kernel / memcpy2d-per-head); Mac-first uses the
+                // metal deinterleave lowering. See project_qwen35_gdn_port.md.
+                unimplemented!(
+                    "GateSplit cuda eval not yet implemented — per-head deinterleave \
+                     of the doubled q_proj. Implement in the cuda-host verification phase."
+                );
+            }
             Instruction::DeepSeekMoe(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
@@ -3782,6 +3873,282 @@ unsafe fn mla_attention_eval<W: CanonicalParams>(
         );
         drop(attn);
         sliced
+    }
+}
+
+/// Cast a model-dtype `GpuTensor` to a fresh f32 `OwnedTensor` of the given
+/// shape (elementwise; `cast_bias_to_f32` handles F32/F16/BF16). The shape's
+/// element count must equal `src.numel()`.
+#[cfg(feature = "cuda")]
+unsafe fn gdn_cast_to_f32(
+    caching: &mut ferrite_cuda_core::alloc::CachingAllocator,
+    src: ferrite_cuda_core::tensor::GpuTensor,
+    shape: &[usize],
+    stream: ferrite_cuda_core::CUstream,
+) -> OwnedTensor {
+    let dst = caching.alloc_tensor(shape, ferrite_cuda_core::dtype::DType::F32);
+    unsafe { kernels::cast_bias_to_f32(src, *dst.view(), stream) };
+    dst
+}
+
+/// Read `count` i32s from a device tensor to host (blocking). Used by the GDN
+/// prefill path to slice per-sequence token ranges.
+#[cfg(feature = "cuda")]
+unsafe fn gdn_dtoh_i32(
+    t: ferrite_cuda_core::tensor::TensorView<'_>,
+    count: usize,
+    stream: ferrite_cuda_core::CUstream,
+) -> Vec<i32> {
+    let mut host = vec![0i32; count];
+    unsafe {
+        ferrite_cuda_core::driver::memcpy_dtoh_async(
+            host.as_mut_ptr() as *mut u8,
+            (*t).as_ptr::<u8>(),
+            count * 4,
+            stream,
+        )
+        .expect("gdn_dtoh_i32: D2H copy failed");
+        ferrite_cuda_core::driver::stream_synchronize(stream).expect("gdn_dtoh_i32: sync");
+    }
+    host
+}
+
+/// Gated-DeltaNet eval — orchestrates the surviving `gdn_*` kernels for one
+/// linear-attention layer. Validated op-by-op against the cpu_golden oracle
+/// (`cpu_golden::gdn_*`):
+///   1. cast qkv/z/a/b (model dtype) → f32
+///   2. causal conv1d(+SiLU): decode = batched `gdn_conv1d_update` over
+///      `state_indices`; prefill = per-sequence `gdn_conv1d_prefill`
+///   3. `gdn_conv_split` → q/k/v
+///   4. `gdn_gating` → g (= -exp(A_log)·softplus(a+dt_bias)), beta (= sigmoid(b))
+///   5. `gdn_recurrent_fwd` (delta-rule scan; **scale = 1/sqrt(head_k)** —
+///      the deleted Qwen3-Next path passed 1.0, which dropped the q-scale and
+///      was a source of its flakiness)
+///   6. `gdn_rms_norm_gated` (per value-head; **SiLU(z)** gate)
+///   7. cast f32 core → model dtype (the DSL `out_proj` gemm follows)
+///
+/// Reads the `linear_attn[layer]` weight bundle via `gated_delta_net_at` and
+/// the ambient conv/ssm state from `ForwardCtx::{gdn_state, gdn_state_indices}`.
+/// The worker zero-inits a sequence's slot on its first (fresh) forward, so the
+/// state read here is always valid (the "degeneration after N requests" guard).
+/// NOTE: multi-sequence prefill in one batch (chunked/batched prefill) is the
+/// P6 follow-up; bring-up exercises single-sequence prefill + batched decode.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gated_delta_net_eval<W: CanonicalParams>(
+    ctx: &mut InterpreterCtx<'_, W>,
+    qkv_slot: u32,
+    z_slot: u32,
+    a_slot: u32,
+    b_slot: u32,
+    layer: u32,
+    bucket: u32,
+    op_idx: u32,
+) -> OwnedTensor {
+    unsafe {
+        use ferrite_cuda_core::dtype::DType;
+        use ferrite_cuda_core::tensor::GpuTensor;
+
+        let stream = ctx.device.compute_stream;
+
+        // Dims from the per-arch CanonicalParams consts.
+        let nk = W::GDN_NUM_K_HEADS as usize;
+        let nv = W::GDN_NUM_V_HEADS as usize;
+        let hk = W::GDN_HEAD_K_DIM as usize;
+        let hv = W::GDN_HEAD_V_DIM as usize;
+        let kernel = W::GDN_CONV_KERNEL as usize;
+        let conv_dim = W::GDN_CONV_DIM;
+        let key_dim = nk * hk;
+        let value_dim = nv * hv;
+
+        // Input activation tiles (model dtype, from the in_proj_* gemms).
+        let qkv_tv = tile_ref(ctx.tiles, qkv_slot).as_view(ctx.tiles);
+        let z_tv = tile_ref(ctx.tiles, z_slot).as_view(ctx.tiles);
+        let a_tv = tile_ref(ctx.tiles, a_slot).as_view(ctx.tiles);
+        let b_tv = tile_ref(ctx.tiles, b_slot).as_view(ctx.tiles);
+        let nt = (*qkv_tv).dim(0);
+        let model_dt = (*qkv_tv).dtype();
+
+        // Weight bundle (copy the Copy GpuTensors out so the &wm borrow ends).
+        let (conv1d_w, a_log_w, dt_bias_w, norm_w) = {
+            let w = ctx.wm.gated_delta_net_at(bucket, op_idx, 0, layer);
+            (w.conv1d, w.a_log, w.dt_bias, w.norm)
+        };
+
+        // Ambient recurrent/conv state for this layer + the per-seq slot ids.
+        let gdn_state = ctx
+            .fwd
+            .gdn_state
+            .expect("GatedDeltaNet eval: ForwardCtx.gdn_state is None (worker did not build the GDN state pool)");
+        let state_indices = ctx
+            .fwd
+            .gdn_state_indices
+            .expect("GatedDeltaNet eval: ForwardCtx.gdn_state_indices is None");
+        let conv_state = gdn_state.conv_state(layer as usize);
+        let ssm_state = gdn_state.ssm_state(layer as usize);
+        let num_seqs = (*state_indices).dim(0);
+
+        // 1. Cast inputs + small weights to f32 (the gdn_* kernels are f32).
+        let mixed_qkv = gdn_cast_to_f32(&mut ctx.device.caching, *qkv_tv, &[nt, conv_dim], stream);
+        let z_f32 = gdn_cast_to_f32(&mut ctx.device.caching, *z_tv, &[nt, value_dim], stream);
+        let a_f32 = gdn_cast_to_f32(&mut ctx.device.caching, *a_tv, &[nt, nv], stream);
+        let b_f32 = gdn_cast_to_f32(&mut ctx.device.caching, *b_tv, &[nt, nv], stream);
+        // conv1d.weight on-disk is [conv_dim, 1, kernel]; view it as [conv_dim, kernel].
+        let conv_w_f32 = gdn_cast_to_f32(
+            &mut ctx.device.caching,
+            conv1d_w,
+            &[conv_dim, kernel],
+            stream,
+        );
+        let a_log_f32 = gdn_cast_to_f32(&mut ctx.device.caching, a_log_w, &[nv], stream);
+        let dt_bias_f32 = gdn_cast_to_f32(&mut ctx.device.caching, dt_bias_w, &[nv], stream);
+        let norm_w_f32 = gdn_cast_to_f32(&mut ctx.device.caching, norm_w, &[hv], stream);
+
+        // 2. Causal conv1d (+SiLU), writing into conv_out and updating the ring.
+        let conv_out = ctx.device.caching.alloc_tensor(&[nt, conv_dim], DType::F32);
+        if num_seqs == nt {
+            // Decode: one token per sequence — batched ring update.
+            kernels::gdn_conv1d_update(
+                *conv_state,
+                *mixed_qkv.view(),
+                *conv_w_f32.view(),
+                *conv_out.view(),
+                *state_indices,
+                conv_dim,
+                kernel,
+                num_seqs,
+                stream,
+            );
+        } else {
+            // Prefill: per-sequence, seeding the ring from zero (worker-zeroed
+            // on fresh). Slice the token axis via cu_seqlens_q.
+            let cu = gdn_dtoh_i32(ctx.fwd.cu_seqlens_q, num_seqs + 1, stream);
+            let slots = gdn_dtoh_i32(*state_indices, num_seqs, stream);
+            let f32_sz = DType::F32.size_bytes();
+            for s in 0..num_seqs {
+                let seq_start = cu[s] as usize;
+                let seq_len = cu[s + 1] as usize - seq_start;
+                if seq_len == 0 {
+                    continue;
+                }
+                let slot_idx = slots[s] as usize;
+                let byte_off = seq_start * conv_dim * f32_sz;
+                let x_view = GpuTensor::new(
+                    (*mixed_qkv.view()).raw_ptr().add(byte_off),
+                    &[seq_len, conv_dim],
+                    DType::F32,
+                );
+                let out_view = GpuTensor::new(
+                    (*conv_out.view()).raw_ptr().add(byte_off),
+                    &[seq_len, conv_dim],
+                    DType::F32,
+                );
+                kernels::gdn_conv1d_prefill(
+                    *conv_state,
+                    x_view,
+                    *conv_w_f32.view(),
+                    out_view,
+                    slot_idx,
+                    conv_dim,
+                    kernel,
+                    seq_len,
+                    stream,
+                );
+            }
+        }
+        drop(mixed_qkv);
+
+        // 3. Split conv output into q/k/v (f32).
+        let (q_owned, k_owned, v_owned) = kernels::gdn_conv_split(
+            *conv_out.view(),
+            nt,
+            nk,
+            nv,
+            hk,
+            hv,
+            key_dim,
+            value_dim,
+            conv_dim,
+            &mut ctx.device.caching,
+            stream,
+        );
+        drop(conv_out);
+
+        // 4. Input-dependent gating: g, beta.
+        let g = ctx.device.caching.alloc_tensor(&[nt, nv], DType::F32);
+        let beta = ctx.device.caching.alloc_tensor(&[nt, nv], DType::F32);
+        kernels::gdn_gating(
+            *g.view(),
+            *beta.view(),
+            *a_log_f32.view(),
+            *a_f32.view(),
+            *b_f32.view(),
+            *dt_bias_f32.view(),
+            nv,
+            nt,
+            stream,
+        );
+
+        // 5. Recurrent delta-rule scan. scale = 1/sqrt(head_k) (q-scale; the
+        // kernel applies it after L2-normalization — see gdn_recurrent_kernels.cu).
+        let o = ctx.device.caching.alloc_tensor(&[nt, nv, hv], DType::F32);
+        let scale = 1.0f32 / (hk as f32).sqrt();
+        kernels::gdn_recurrent_fwd(
+            *q_owned.view(),
+            *k_owned.view(),
+            *v_owned.view(),
+            *g.view(),
+            *beta.view(),
+            *o.view(),
+            *ssm_state,
+            *state_indices,
+            *ctx.fwd.cu_seqlens_q,
+            scale,
+            num_seqs,
+            nt,
+            nk,
+            nv,
+            hk,
+            hv,
+            stream,
+        );
+        drop(q_owned);
+        drop(k_owned);
+        drop(v_owned);
+        drop(g);
+        drop(beta);
+
+        // 6. Gated RMSNorm (per value-head over head_v; SiLU(z) gate).
+        let total_rows = nt * nv;
+        let o_flat = o.view().reshape(&[total_rows, hv]);
+        let z_flat = z_f32.view().reshape(&[total_rows, hv]);
+        let normed = ctx
+            .device
+            .caching
+            .alloc_tensor(&[total_rows, hv], DType::F32);
+        kernels::gdn_rms_norm_gated(
+            *o_flat,
+            *z_flat,
+            *norm_w_f32.view(),
+            *normed.view(),
+            W::RMS_NORM_EPS,
+            hv,
+            total_rows,
+            stream,
+        );
+        drop(o);
+
+        // 7. Cast core back to model dtype as [nt, value_dim] for the out_proj
+        // gemm the DSL applies next.
+        let normed_flat = normed.view().reshape(&[nt, value_dim]);
+        if model_dt == DType::F32 {
+            normed
+        } else {
+            let out =
+                kernels::cast_from_f32(*normed_flat, model_dt, &mut ctx.device.caching, stream);
+            drop(normed);
+            out
+        }
     }
 }
 

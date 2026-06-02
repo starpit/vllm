@@ -51,6 +51,11 @@ pub struct RmsNormConstants {
     pub bucket_m: BucketM,
     pub q_size: QSize,
     pub rms_norm_eps: RmsNormEps,
+    /// Zero-centered (Gemma / Qwen3.5) gain offset: effective gain =
+    /// `weight + weight_offset`. `1.0` for `(1 + weight)` arches, `0.0`
+    /// for plain RMSNorm. Function constant 3 in `rmsnorm.metal` /
+    /// `fused_add_rmsnorm.metal`.
+    pub weight_offset: f32,
 }
 
 impl From<RmsNormConstants> for Vec<ConstantValue> {
@@ -59,6 +64,7 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(0), c.bucket_m.get()),
             ConstantValue::uint(ConstSlot(1), c.q_size.get()),
             ConstantValue::float(ConstSlot(2), c.rms_norm_eps.get()),
+            ConstantValue::float(ConstSlot(3), c.weight_offset),
         ]
     }
 }
@@ -283,6 +289,32 @@ pub struct SiluMulConstants {
 impl From<SiluMulConstants> for Vec<ConstantValue> {
     fn from(c: SiluMulConstants) -> Self {
         vec![ConstantValue::uint(ConstSlot(0), c.n.get())]
+    }
+}
+
+// ── GateApply / GateSplit (Qwen3.5 attention output gate) ─────────
+
+/// `KernelId::GateApply` (`gate_apply.metal::gate_apply_<dtype>`).
+/// `n = M * num_heads * head_dim` — total output elements. Same single
+/// `n` constant as `SiluMulConstants`, kept distinct for clarity.
+pub type GateApplyConstants = SiluMulConstants;
+
+/// `KernelId::GateSplit` (`gate_split.metal::gate_split_<dtype>`).
+/// `n` = per-output element count (`M * num_heads * head_dim`);
+/// `head_dim` / `num_heads` drive the per-head interleaved source index.
+pub struct GateSplitConstants {
+    pub n: HiddenSize,
+    pub head_dim: u32,
+    pub num_heads: u32,
+}
+
+impl From<GateSplitConstants> for Vec<ConstantValue> {
+    fn from(c: GateSplitConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.n.get()),
+            ConstantValue::uint(ConstSlot(1), c.head_dim),
+            ConstantValue::uint(ConstSlot(2), c.num_heads),
+        ]
     }
 }
 

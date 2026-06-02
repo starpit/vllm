@@ -941,6 +941,13 @@ fn compile_common(
                 "deepseek_moe_ggml",
                 "fused_moe_ref",
                 "shared_fused_moe_ref",
+                // Qwen3.5 hybrid ops — host-callback dispatch wrappers whose
+                // internals (conv1d / recurrent scan / deinterleave / sigmoid
+                // gate) carry no matmul; the projections are separate DSL
+                // gemms. Same accounting class as the `*_ref` MoE siblings.
+                "gated_delta_net_ref",
+                "gate_split_ref",
+                "gate_apply_ref",
                 // Metal MoE Impls. Same "host-callback dispatch
                 // wrapper, internal compute steps already classified
                 // (Gemm via metal_gemm_, gather_qmv via
@@ -1360,12 +1367,24 @@ fn compile_common(
     // intent visible at the call site.
     let arch_dispatch_ts = if mode.emit_arch_dispatch {
         let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
+        // Hybrid (Gated-DeltaNet) arches: the per-arch
+        // `FerriteWeights::gdn_runtime_config` override the worker reads
+        // to size + allocate the GDN state pool. Empty for non-hybrid
+        // arches (they keep the trait default `None`). Read off a
+        // representative specialization's FUF — every workload bucket
+        // shares the same op graph and per-layer GDN/full-attn dispatch,
+        // so the `linear_layers` mask is identical across them.
+        let gdn_runtime_config_tokens = solved
+            .first()
+            .map(|sm| codegen::emit_gdn_runtime_config(&sm.fuf, sm.model))
+            .unwrap_or_default();
         emit_arch_dispatcher(
             &arch_ident,
             &hf_arches,
             &arch_dispatch_arms,
             &models_dir,
             carrier.sig.ident.span(),
+            gdn_runtime_config_tokens,
         )?
     } else {
         proc_macro2::TokenStream::new()
@@ -1461,6 +1480,7 @@ fn emit_arch_dispatcher(
     arms: &[DispatchArm],
     models_dir: &Path,
     error_span: Span,
+    gdn_runtime_config_tokens: proc_macro2::TokenStream,
 ) -> syn::Result<proc_macro2::TokenStream> {
     if arms.is_empty() {
         return Ok(quote! {});
@@ -1978,6 +1998,8 @@ fn emit_arch_dispatcher(
             fn num_key_value_heads(&self) -> u64 { self.num_key_value_heads() }
             fn head_dim(&self) -> u64 { self.head_dim() }
             fn vocab_size(&self) -> u64 { self.vocab_size() }
+
+            #gdn_runtime_config_tokens
 
             unsafe fn forward(
                 &self,

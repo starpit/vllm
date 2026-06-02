@@ -29,8 +29,8 @@
 
 use core::ffi::c_void;
 use ferrite_cuda_core::alloc::{CachingAllocator, OwnedTensor};
-use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::driver;
+use ferrite_cuda_core::dtype::DType;
 use ferrite_cuda_core::tensor::GpuTensor;
 
 type CUstream = cudarc::driver::sys::CUstream;
@@ -212,7 +212,12 @@ pub unsafe fn fa3_init_metadata() {
     // Race: if another thread won the CAS, we leak our local alloc.
     // In practice this is called once at worker init, no contention.
     if FA3_METADATA_PTR
-        .compare_exchange(std::ptr::null_mut(), ptr, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         // Lost the race — free our local allocation.
@@ -232,7 +237,12 @@ fn fa3_metadata_ptr() -> *mut i32 {
     // off `num_gpu_blocks`. Not a correctness issue.
     let ptr = unsafe { fa3_alloc_metadata_buffer() };
     if FA3_METADATA_PTR
-        .compare_exchange(std::ptr::null_mut(), ptr, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         unsafe {
@@ -398,10 +408,7 @@ pub unsafe fn flash_attn_3_paged_decode_bf16_hdim128(
     // margin when the profile is prefill-only, matching python).
     let metadata_ptr = fa3_metadata_ptr();
     let (oaccum_ptr, lseaccum_ptr, _oa_keep, _la_keep) = if num_splits > 1 {
-        let oa = alloc.alloc_tensor(
-            &[num_splits, num_q_heads, total_q, head_dim],
-            DType::F32,
-        );
+        let oa = alloc.alloc_tensor(&[num_splits, num_q_heads, total_q, head_dim], DType::F32);
         let la = alloc.alloc_tensor(&[num_splits, num_q_heads, total_q], DType::F32);
         let oa_ptr = oa.raw_ptr() as *mut c_void;
         let la_ptr = la.raw_ptr() as *mut c_void;

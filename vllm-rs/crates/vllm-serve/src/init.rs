@@ -342,6 +342,7 @@ fn create_worker(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: 0,
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             cuda_graph_mode: config
                 .cuda_graph_mode
@@ -421,6 +422,7 @@ fn create_worker(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id,
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             cuda_graph_mode: config
                 .cuda_graph_mode
@@ -917,6 +919,30 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
+/// Whether an architecture is recurrent / hybrid — it keeps a sequential
+/// conv/ssm (Mamba-style) or Gated-DeltaNet state that cannot be reconstructed
+/// from a cached KV prefix. Prefix caching must be disabled for these models
+/// (a prefix-cache hit would feed only the new tokens, leaving the recurrent
+/// state computed over the wrong span). Mirrors vLLM's hybrid/SSM handling.
+/// Detected by HF `architectures` string since the marker is per-layer.
+fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
+    architectures.iter().any(|a| {
+        let a = a.as_str();
+        // Gated-DeltaNet hybrids (Qwen3.5 / Qwen3.6 / Qwen3-Next).
+        a.contains("Qwen3_5")
+            || a.contains("Qwen3_6")
+            || a.contains("Qwen3Next")
+            // Mamba / SSM families.
+            || a.contains("Mamba")
+            || a.contains("Jamba")
+            || a.contains("FalconH")
+            || a.contains("RecurrentGemma")
+            || a.contains("Zamba")
+            || a.contains("Lfm2")
+            || a.contains("GraniteMoeHybrid")
+    })
+}
+
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
 ///
 /// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
@@ -1045,7 +1071,23 @@ fn initialize_core(
 
     let use_async_scheduling =
         !config.disable_async_scheduling && !spec_decode_requires_sync(config);
-    let enable_prefix_caching = config.enable_prefix_caching;
+    // Recurrent / hybrid arches (Mamba, Gated-DeltaNet — Qwen3.5/3.6/Next, …)
+    // carry a sequential conv/ssm state that CANNOT be reconstructed from a
+    // cached KV prefix: a prefix-cache hit would feed the sequence only its
+    // *new* tokens, leaving the recurrent state computed over the wrong span
+    // (garbage output). vLLM disables prefix caching for these models; do the
+    // same. (Per-layer linear-attention is the marker; detect by arch string.)
+    let enable_prefix_caching = {
+        let hybrid = is_recurrent_hybrid_arch(&hf_config.architectures);
+        if hybrid && config.enable_prefix_caching {
+            info!(
+                "Prefix caching disabled: {:?} is a recurrent/hybrid (Mamba/Gated-DeltaNet) \
+                 architecture — its conv/ssm state cannot be reconstructed from a cached KV prefix",
+                hf_config.architectures
+            );
+        }
+        config.enable_prefix_caching && !hybrid
+    };
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
@@ -1143,6 +1185,7 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
+                max_num_seqs: config.max_num_seqs,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -1611,6 +1654,7 @@ fn initialize_stack_multinode(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: 0,
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
             cuda_graph_sizes: config
@@ -1888,6 +1932,7 @@ pub fn initialize_and_run_follower(config: &VllmConfig) -> Result<()> {
         hf_token: config.hf_token.clone(),
         block_size: config.block_size,
         device_id: 0, // Each node has 1 GPU at device 0.
+        max_num_seqs: config.max_num_seqs,
         enforce_eager: config.enforce_eager,
         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
         cuda_graph_sizes: config
@@ -2049,6 +2094,7 @@ fn initialize_stack_tp_pp(
                         hf_token: config.hf_token.clone(),
                         block_size: config.block_size,
                         device_id: global_rank as i32,
+                        max_num_seqs: config.max_num_seqs,
                         enforce_eager: config.enforce_eager,
                         max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(1024),
                         cuda_graph_sizes: config
@@ -2416,6 +2462,7 @@ fn initialize_stack_tp(
                 hf_token: config.hf_token.clone(),
                 block_size: config.block_size,
                 device_id: rank as i32,
+                max_num_seqs: config.max_num_seqs,
                 enforce_eager: config.enforce_eager,
                 max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
                 cuda_graph_sizes: config
@@ -2840,6 +2887,7 @@ fn initialize_stack_external(
             hf_token: config.hf_token.clone(),
             block_size: config.block_size,
             device_id: local_rank as i32,
+            max_num_seqs: config.max_num_seqs,
             enforce_eager: config.enforce_eager,
             max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
             cuda_graph_sizes: config

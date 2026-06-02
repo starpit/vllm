@@ -34,6 +34,11 @@ pub mod kernels;
 // stay `cfg(feature = "cuda")` *inside* the unified type.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod kv_cache;
+// `gdn_state` is the non-paged recurrent-state sibling of `kv_cache`, for the
+// linear-attention (Gated-DeltaNet) layers of hybrid models. Same dual-mode
+// shape: backend-neutral layout/sizing/accessors, caller-supplied alloc closure.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod gdn_state;
 // `layers` and `layers_moe` are dual-mode: the struct *definitions* compile
 // without the `cuda` feature (they reference only `GpuTensor`, which lives in
 // the always-available `ferrite_cuda_core::tensor` module), so the
@@ -56,14 +61,16 @@ pub mod rotary;
 #[cfg(feature = "cuda")]
 pub use forward_output::ForwardOutput;
 #[cfg(any(feature = "cuda", feature = "metal"))]
+pub use gdn_state::GdnStatePool;
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub use kv_cache::KvCachePool;
 // Layer struct types compile without `cuda` (see comment above the module
 // declarations). Re-export them ungated so consumers (notably the
 // `Instruction<W>` enum in ferrite-forward) can name them without the cuda
 // feature.
 pub use layers::{
-    Bnb4bitLinear, ColumnParallelLinear, Embedding, GgmlLinear, Linear, LinearLayer, MarlinLinear,
-    RmsNorm, RowParallelLinear, VocabParallelEmbedding,
+    Bnb4bitLinear, ColumnParallelLinear, Embedding, GatedDeltaNetLayer, GgmlLinear, Linear,
+    LinearLayer, MarlinLinear, RmsNorm, RowParallelLinear, VocabParallelEmbedding,
 };
 pub use layers_moe::{DeepSeekV2MoELayer, MarlinFusedMoELayer, MarlinSharedFusedMoELayer};
 pub use rotary::{Llama3RopeScaling, LlamaConfig, LongRopeScaling, RotaryCache, YarnRopeScaling};

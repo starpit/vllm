@@ -316,6 +316,26 @@ impl SpecializedPipelineCache {
                     "moe_weighted_sum",
                     crate::embedded_metallib!("moe_weighted_sum"),
                 ),
+                // Qwen3.5 Gated-DeltaNet + attention-output-gate kernels.
+                // `lower_one` (gate_apply/gate_split) and the GDN op lowering
+                // reference these libraries by name; without registration the
+                // per-(library, function) lookup in `get_or_build` panics at
+                // first forward.
+                ("gate_apply", crate::embedded_metallib!("gate_apply")),
+                ("gate_split", crate::embedded_metallib!("gate_split")),
+                ("gdn_gating", crate::embedded_metallib!("gdn_gating")),
+                (
+                    "gdn_rms_norm_gated",
+                    crate::embedded_metallib!("gdn_rms_norm_gated"),
+                ),
+                (
+                    "gdn_conv1d_varlen",
+                    crate::embedded_metallib!("gdn_conv1d_varlen"),
+                ),
+                (
+                    "gdn_scan_varlen",
+                    crate::embedded_metallib!("gdn_scan_varlen"),
+                ),
             ],
         )?;
         // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at

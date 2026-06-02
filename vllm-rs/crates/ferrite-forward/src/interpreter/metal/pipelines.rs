@@ -335,6 +335,9 @@ mod tests {
                 | KernelId::Nvfp4QmmT
                 | KernelId::AffineEmbed
                 | KernelId::SiluMul
+                | KernelId::GateApply
+                | KernelId::GateSplit
+                | KernelId::GatedDeltaNet
                 | KernelId::SplitKReduceSum
                 | KernelId::FusedAffineQkvRopeCache
                 | KernelId::SynthPreAttn
@@ -381,7 +384,12 @@ mod tests {
             ],
             KernelId::Embed => vec![
                 ConstantValue::uint(0, bucket_m),
-                ConstantValue::uint(1, W::Q_SIZE as u32),
+                // Row stride of the embedding table is the residual-stream
+                // width = HIDDEN_SIZE, NOT Q_SIZE. They coincide only when
+                // head_dim == hidden/num_heads (Llama/Qwen2/Qwen3); Qwen3.5
+                // has head_dim=256 so Q_SIZE(2048) != HIDDEN_SIZE(1024) and
+                // using Q_SIZE reads the wrong (out-of-bounds) table rows.
+                ConstantValue::uint(1, W::HIDDEN_SIZE as u32),
             ],
             KernelId::RopeAppend => vec![
                 ConstantValue::uint(0, W::HEAD_DIM),
@@ -419,6 +427,9 @@ mod tests {
             | KernelId::Nvfp4QmmT
             | KernelId::AffineEmbed
             | KernelId::SiluMul
+            | KernelId::GateApply
+            | KernelId::GateSplit
+            | KernelId::GatedDeltaNet
             | KernelId::SplitKReduceSum
             | KernelId::FusedAffineQkvRopeCache
             | KernelId::SynthPreAttn

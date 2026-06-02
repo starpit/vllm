@@ -3190,6 +3190,57 @@ mod ggml_probe {
     }
 }
 
+/// Per-layer weight bundle for a Gated-DeltaNet (linear-attention) layer of a
+/// hybrid model (Qwen3.5 / Qwen3-Next). The four non-projection weights the
+/// `Instruction::GatedDeltaNet` eval consumes; the in/out projections are plain
+/// `gemm`s in the DSL (so quantization applies to them normally) and are NOT
+/// part of this bundle.
+///
+/// Tensors are kept in their on-disk dtype here; the cuda eval casts them to
+/// f32 at use (the `gdn_*` kernels are f32). This mirrors the
+/// `DeepSeekV2MoELayer` typed-bundle pattern: one DSL weight accessor
+/// (`linear_attn[layer]`) resolves to one of these via `required_weights`.
+pub struct GatedDeltaNetLayer {
+    /// Causal depthwise conv1d weight. HF on-disk shape `[conv_dim, 1, kernel]`
+    /// (the singleton dim is dropped at use → `[conv_dim, kernel]`).
+    pub conv1d: GpuTensor,
+    /// Per-value-head log-decay base `A_log`, shape `[num_v_heads]`.
+    pub a_log: GpuTensor,
+    /// Per-value-head softplus bias `dt_bias`, shape `[num_v_heads]`.
+    pub dt_bias: GpuTensor,
+    /// Gated-RMSNorm weight, shape `[head_v_dim]` (norm is per value-head).
+    pub norm: GpuTensor,
+}
+
+impl GatedDeltaNetLayer {
+    pub fn new(conv1d: GpuTensor, a_log: GpuTensor, dt_bias: GpuTensor, norm: GpuTensor) -> Self {
+        Self {
+            conv1d,
+            a_log,
+            dt_bias,
+            norm,
+        }
+    }
+
+    /// Load from `GpuWeights`. `prefix` is the linear-attn prefix for this
+    /// layer (e.g. `model.language_model.layers.0.linear_attn`). Tensors are
+    /// taken in their on-disk dtype (`take_keep_dtype`) — `A_log`/`dt_bias` are
+    /// commonly fp32 in mamba-family checkpoints and the cuda eval casts the
+    /// rest to f32 at use.
+    pub fn load(weights: &mut GpuWeights, prefix: &str) -> Result<Self> {
+        let conv1d = weights.take_keep_dtype(&format!("{prefix}.conv1d.weight"))?;
+        let a_log = weights.take_keep_dtype(&format!("{prefix}.A_log"))?;
+        let dt_bias = weights.take_keep_dtype(&format!("{prefix}.dt_bias"))?;
+        // `gdn_rms_norm_gated` binds `norm.weight` as `const device float*`
+        // (F32). The official Qwen3.5 checkpoint ships it F32, but the
+        // `mlx-community/*-MLX-4bit` repack ships it BF16 — reading 2-byte
+        // BF16 as 4-byte F32 yields garbage → NaN. Upcast to F32 here
+        // (lossless no-op for the F32-on-disk official path).
+        let norm = weights.take_as_f32(&format!("{prefix}.norm.weight"))?;
+        Ok(Self::new(conv1d, a_log, dt_bias, norm))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

@@ -90,6 +90,14 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         //     produce correct output.
         // Gate it off on M1 entirely until either the unsafe atom
         // path is identified or the M1-specific divergence is fixed.
+        // FERRITE_NO_SYNTH=1 disables the M=1 fused synth megakernels so
+        // ALL M route through the unfused chain — makes decode
+        // batch-invariant (M=1 == M>1) and sidesteps quant-synth metallib
+        // gaps (e.g. the bf16-scale `synth_mlp_pre_down_*` library that
+        // isn't registered for quantized Qwen3.5). See `workload_constraint`.
+        if std::env::var_os("FERRITE_NO_SYNTH").is_some() {
+            return false;
+        }
         if profile.backend != Backend::Metal {
             return false;
         }
@@ -100,6 +108,12 @@ impl Implementation for MetalSynthMlpPreDownImpl {
     }
 
     fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
+        // mlx-affine checkpoints: the M=1 synth megakernel's fused rmsnorm
+        // double-counts the pre-applied zero-centered offset → degenerate
+        // output. Route to the (correct) unfused chain.
+        if crate::metal::synth_gate_up_silu_mul::is_mlx_affine(ctx.model) {
+            return false;
+        }
         let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
         matches!(
             (is_qwen3, self.scale_tag),
@@ -113,6 +127,27 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         // serial sequential gate-qmv→up-qmv→silu_mul work inside
         // each TG with no inter-kernel overlap the unfused chain
         // gets from GPU pipelining successive dispatches.
+        //
+        // KNOWN CONSEQUENCE — BATCH NON-INVARIANCE (diagnosed 2026-06-02,
+        // accepted/documented, not a bug): because this fused megakernel
+        // fires ONLY at M==1 while M>=2 routes through the unfused chain
+        // (FusedAddRmsNorm + AffineQmm gate + AffineQmm up + SiluMul), the
+        // two paths keep different intermediate precision (fused holds f32
+        // across the chain; unfused round-trips bf16 between dispatches).
+        // So a token's decode logits are NOT bit-identical across batch
+        // sizes M. For an UNCERTAIN greedy token this can flip the argmax,
+        // so batched decode of identical prompts may produce a different
+        // (still coherent) token than single-seq, and — combined with the
+        // engine's non-lockstep scheduling (a seq lands at varying M each
+        // run) — vary run-to-run / row-to-row. NOT a race: lockstep rows
+        // (same M, same position) are byte-identical; survives all GPU
+        // barriers. Attention (`attention_via_cache_v2` vs
+        // `attention_prefill_sdpa_v2_paged`) is bit-identical; lm_head is
+        // per-row qmv. The ONLY M-dependence is this synth-vs-unfused gate
+        // (here + `synth_pre_attn.rs`). To make batched decode bit-exact
+        // to single-seq, the fused and unfused paths must agree
+        // numerically (e.g. route M>1 through the fused path — at the TPOT
+        // cost this gate exists to avoid, see commit c7411077b).
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 

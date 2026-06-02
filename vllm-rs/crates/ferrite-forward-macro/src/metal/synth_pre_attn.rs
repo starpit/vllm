@@ -104,10 +104,23 @@ impl Implementation for MetalSynthPreAttnImpl {
     }
 
     fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // FERRITE_NO_SYNTH=1 disables the M=1 fused synth megakernels so
+        // ALL M route through the unfused chain — makes decode
+        // batch-invariant (M=1 == M>1) and sidesteps quant-synth metallib
+        // gaps. See `synth_mlp_pre_down.rs::workload_constraint`.
+        if std::env::var_os("FERRITE_NO_SYNTH").is_some() {
+            return false;
+        }
         profile.backend == Backend::Metal
     }
 
     fn applies_to(&self, ctx: &crate::impl_lib::MatchContext) -> bool {
+        // mlx-affine checkpoints: the M=1 synth megakernel's fused rmsnorm
+        // double-counts the pre-applied zero-centered offset → degenerate
+        // output. Route to the (correct) unfused chain.
+        if crate::metal::synth_gate_up_silu_mul::is_mlx_affine(ctx.model) {
+            return false;
+        }
         let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
         matches!(
             (is_qwen3, self.scale_tag),
@@ -120,6 +133,13 @@ impl Implementation for MetalSynthPreAttnImpl {
         // At M>=2 per-row megakernel pays the same within-TG serial
         // cost without launch-overhead-saving benefit; unfused chain
         // wins via GPU-pipelined kernel overlap.
+        //
+        // This M==1 gate (with SynthMlpPreDown's) is the source of the
+        // documented BATCH NON-INVARIANCE: M==1 fused vs M>=2 unfused keep
+        // different intermediate precision, so batched decode of identical
+        // prompts is not bit-exact to single-seq and can flip uncertain
+        // greedy tokens. Full write-up at the matching gate in
+        // `synth_mlp_pre_down.rs::workload_constraint`.
         WorkloadConstraint::NumTokensRange { min: 1, max: 1 }
     }
 

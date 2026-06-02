@@ -419,6 +419,27 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let e = lit_u32(e);
             quote! { MlaAttention(#a, #b, #c, #d, #e) }
         }
+        I::GatedDeltaNet(a, b, c, d, e, f) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { GatedDeltaNet(#a, #b, #c, #d, #e, #f) }
+        }
+        I::GateSplit(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GateSplit(#a, #b, #c) }
+        }
+        I::GateApply(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GateApply(#a, #b, #c) }
+        }
         I::DeepSeekMoe(a, b, c) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -865,6 +886,9 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::RopeAppend(..) => "RopeAppend",
         I::MlaSplit(..) => "MlaSplit",
         I::MlaAttention(..) => "MlaAttention",
+        I::GatedDeltaNet(..) => "GatedDeltaNet",
+        I::GateSplit(..) => "GateSplit",
+        I::GateApply(..) => "GateApply",
         I::DeepSeekMoe(..) => "DeepSeekMoe",
         I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
         I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
@@ -1230,6 +1254,21 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             3 => u(d),
             4 => u(e),
+            _ => None,
+        },
+        I::GatedDeltaNet(a, b, c, d, e, f) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            _ => None,
+        },
+        I::GateSplit(a, b, c) | I::GateApply(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
             _ => None,
         },
         I::DeepSeekMoe(a, b, c) => match idx {
@@ -1909,6 +1948,27 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             3 => I::MlaAttention(a, b, c, n, e),
             4 => I::MlaAttention(a, b, c, d, n),
             _ => panic!("MlaAttention: bad idx {idx}"),
+        },
+        I::GatedDeltaNet(a, b, c, d, e, f) => match idx {
+            0 => I::GatedDeltaNet(n, b, c, d, e, f),
+            1 => I::GatedDeltaNet(a, n, c, d, e, f),
+            2 => I::GatedDeltaNet(a, b, n, d, e, f),
+            3 => I::GatedDeltaNet(a, b, c, n, e, f),
+            4 => I::GatedDeltaNet(a, b, c, d, n, f),
+            5 => I::GatedDeltaNet(a, b, c, d, e, n),
+            _ => panic!("GatedDeltaNet: bad idx {idx}"),
+        },
+        I::GateSplit(a, b, c) => match idx {
+            0 => I::GateSplit(n, b, c),
+            1 => I::GateSplit(a, n, c),
+            2 => I::GateSplit(a, b, n),
+            _ => panic!("GateSplit: bad idx {idx}"),
+        },
+        I::GateApply(a, b, c) => match idx {
+            0 => I::GateApply(n, b, c),
+            1 => I::GateApply(a, n, c),
+            2 => I::GateApply(a, b, n),
+            _ => panic!("GateApply: bad idx {idx}"),
         },
         I::DeepSeekMoe(a, b, c) => match idx {
             0 => I::DeepSeekMoe(n, b, c),
@@ -3505,6 +3565,8 @@ pub fn weight_accessors_to_slots(accessors: &[crate::impl_lib::WeightAccessor]) 
                 WeightKind::SharedFusedMoe
             } else if ts_str.ends_with("FusedMoELayer") {
                 WeightKind::FusedMoe
+            } else if ts_str.ends_with("GatedDeltaNetLayer") {
+                WeightKind::GatedDeltaNet
             } else if ts_str.ends_with("GpuTensor") {
                 WeightKind::CosSin
             } else {
@@ -3671,6 +3733,10 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         I::FusedMoe(..) | I::MetalFusedMoe(..) => 1,
         I::SharedFusedMoe(..) | I::MetalSharedFusedMoe(..) => 1,
         I::DeepSeekMoe(..) | I::DeepSeekMoeFp8Block(..) | I::DeepSeekMoeGgml(..) => 1,
+        // GatedDeltaNet consumes one `linear_attn[layer]` weight bundle
+        // (GatedDeltaNetLayer). The ambient conv/ssm state is read from
+        // `ForwardCtx`, not a codegen-time weight.
+        I::GatedDeltaNet(..) => 1,
         // Everything else: no codegen-time weight, or weight resolved
         // via a different path (MetalBiasAdd through the upstream
         // Linear's `AffineLinearBias` field, attention reads through

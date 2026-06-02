@@ -24,6 +24,8 @@ pub mod attack_surface;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod backend_compat;
 pub mod cpu_golden;
+pub mod gdn_slot_allocator;
+pub mod gdn_state_layout;
 pub mod paged_kv_layout;
 // `info` is the non-generic, hashable backbone view used by
 // `vllm ferrite info`. The whole pipeline (BackboneDumpRegistration
@@ -301,6 +303,7 @@ pub fn hash_json_value(v: &serde_json::Value) -> u64 {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 mod ctx {
     use ferrite_cuda_core::tensor::TensorView;
+    use ferrite_kernels::gdn_state::GdnStatePool;
     use ferrite_kernels::kv_cache::KvCachePool;
 
     #[cfg(feature = "cuda")]
@@ -334,6 +337,23 @@ mod ctx {
         pub max_seqlen_q: usize,
         pub max_seqlen_k: usize,
         pub kv_cache: &'a KvCachePool,
+        /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
+        /// Qwen3-Next). The non-paged sibling of `kv_cache`: the
+        /// `Instruction::GatedDeltaNet` eval arm reads/writes per-linear-layer
+        /// `conv_state`/`ssm_state` here, indexed by the slot ids in
+        /// [`Self::gdn_state_indices`]. `None` for non-hybrid arches (their
+        /// codegen never emits a `GatedDeltaNet` op, so the field is never
+        /// read) — same optional-resource contract as `tp_group`.
+        pub gdn_state: Option<&'a GdnStatePool>,
+        /// Per-sequence GDN state-slot ids, shape `[num_seqs]` i32 — one slot
+        /// per batched sequence in `cu_seqlens_q` order. Built each step by the
+        /// worker from its `GdnSlotAllocator`. `None` for non-hybrid arches.
+        pub gdn_state_indices: Option<TensorView<'a>>,
+        /// Per-sequence GDN fresh flags, shape `[num_seqs]` u32 — 1 when the
+        /// sequence is on its first (fresh) forward, so the GDN conv1d/scan
+        /// kernels treat the slot's recurrent state as zero (the
+        /// "degeneration after N requests" guard). `None` for non-hybrid arches.
+        pub gdn_is_fresh: Option<TensorView<'a>>,
         /// `true` when at least one req in this forward carries
         /// `spec_token_ids` (= it's a spec-decode verify batch).
         /// Threaded through to `gate_matches` so the lm_head slice
@@ -501,6 +521,16 @@ mod dispatcher {
         fn num_key_value_heads(&self) -> u64;
         fn head_dim(&self) -> u64;
         fn vocab_size(&self) -> u64;
+
+        /// Gated-DeltaNet (linear-attention) runtime config for hybrid arches
+        /// (Qwen3.5 / Qwen3-Next). Drives the worker's `GdnStatePool` sizing +
+        /// allocation. The proc-macro emits a per-arch override returning
+        /// `Some(_)` for arches whose forward body contains a `gated_delta_net`
+        /// op; the default (non-hybrid arches) returns `None`, so no GDN state
+        /// pool is allocated and the `gdn_state` ForwardCtx field stays `None`.
+        fn gdn_runtime_config(&self) -> Option<crate::gdn_state_layout::GdnRuntimeConfig> {
+            None
+        }
 
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`

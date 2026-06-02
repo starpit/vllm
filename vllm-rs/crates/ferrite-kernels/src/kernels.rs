@@ -9308,7 +9308,9 @@ pub unsafe fn gdn_recurrent_fwd(
     );
 }
 
-/// RMS norm with sigmoid gating: `out = rms_norm(x) * weight * sigmoid(z)`.
+/// RMS norm with SiLU gating: `out = rms_norm(x) * weight * silu(z)` where
+/// `silu(z) = z * sigmoid(z)` (norm_before_gate; matches Python `RMSNormGated`
+/// and the cpu_golden oracle — NOT plain sigmoid).
 pub unsafe fn gdn_rms_norm_gated(
     x: GpuTensor,
     z: GpuTensor,
@@ -9645,7 +9647,8 @@ mod tests_gdn {
         }
     }
 
-    /// Test RMS norm gated: out = rms_norm(x) * weight * sigmoid(z).
+    /// Test RMS norm gated: out = rms_norm(x) * weight * silu(z),
+    /// silu(z) = z * sigmoid(z).
     #[test]
     #[ignore]
     fn test_cuda_gdn_rms_norm_gated() {
@@ -9657,8 +9660,8 @@ mod tests_gdn {
             // x = [1, 1, 1, 1, 2, 2, 2, 2]
             let x_data: Vec<f32> = (0..rows).flat_map(|r| vec![(r + 1) as f32; dim]).collect();
             let x = upload_f32(&x_data, stream);
-            // z = [0, 0, ...] => sigmoid(0) = 0.5
-            let z = upload_f32(&vec![0.0; rows * dim], stream);
+            // z = [1, 1, ...] => silu(1) = 1 * sigmoid(1) = 0.7310586
+            let z = upload_f32(&vec![1.0; rows * dim], stream);
             // weight = [1, 1, 1, 1]
             let weight = upload_f32(&vec![1.0; dim], stream);
             let out = alloc_f32(rows * dim, stream);
@@ -9666,15 +9669,19 @@ mod tests_gdn {
             gdn_rms_norm_gated(x, z, weight, out, 1e-6, dim, rows, stream);
 
             let result = download_f32(out, stream);
-            // Row 0: x=[1,1,1,1], rms = sqrt(4/4) = 1, normed = 1/1 = 1, * 0.5 = 0.5
+            let silu1 = 1.0f32 / (1.0 + (-1.0f32).exp()); // silu(1) = 1*sigmoid(1)
+            // Row 0: x=[1,1,1,1], rms = 1, normed = 1, * weight 1, * silu(1).
             for (i, &val) in result[..dim].iter().enumerate() {
-                assert!((val - 0.5).abs() < 0.01, "row0[{i}]={val}, expected 0.5",);
+                assert!(
+                    (val - silu1).abs() < 0.01,
+                    "row0[{i}]={val}, expected {silu1}",
+                );
             }
-            // Row 1: x=[2,2,2,2], rms = sqrt(16/4) = 2, normed = 2/2 = 1, * 0.5 = 0.5
+            // Row 1: x=[2,2,2,2], rms = 1/2, normed = 2*0.5 = 1, * weight 1, * silu(1).
             for (i, &val) in result[dim..2 * dim].iter().enumerate() {
                 assert!(
-                    (val - 0.5).abs() < 0.01,
-                    "row1[{}]={val}, expected 0.5",
+                    (val - silu1).abs() < 0.01,
+                    "row1[{}]={val}, expected {silu1}",
                     i + dim
                 );
             }

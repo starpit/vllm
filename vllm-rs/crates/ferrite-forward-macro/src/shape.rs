@@ -439,6 +439,9 @@ pub fn apply_signature(
         OpKind::MlaSplit => sig_mla_split(solver, inputs),
         OpKind::MlaAttention => sig_mla_attention(solver, inputs),
         OpKind::Moe => sig_moe(solver, inputs),
+        OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
+        OpKind::GateSplit => sig_gate_split(solver, inputs),
+        OpKind::GateApply => sig_gate_apply(solver, inputs),
         // MmEmbedSplice: identity-shape one-input in-place. Same
         // signature as AllReduce — the splice mutates the embed
         // output buffer, shape unchanged. Never inserted by the DSL;
@@ -798,6 +801,70 @@ fn sig_mla_attention(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Sh
     })
 }
 
+/// `gated_delta_net(qkv, z, a, b, linear_attn[layer])`
+/// → `[T, linear_num_value_heads * linear_value_head_dim]`.
+/// Inputs: `qkv` `[T, conv_dim]`, `z` `[T, value_dim]`, `a`/`b` `[T, nv]`,
+/// and the `linear_attn[layer]` weight (a `GatedDeltaNetLayer` struct — like
+/// `moe[layer]`, so no tensor-rank assertion). The output token dim is taken
+/// from `qkv`'s row dim; the column dim is the GDN value dim.
+fn sig_gated_delta_net(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GatedDeltaNet, inputs, 5)?;
+    let qkv = &inputs[0];
+    if qkv.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GatedDeltaNet,
+            reason: "qkv must have rank >= 1".into(),
+        });
+    }
+    let value_dim = Dim::Mul(vec![
+        Dim::Bound("linear_num_value_heads".into()),
+        Dim::Bound("linear_value_head_dim".into()),
+    ]);
+    Ok(OpSig {
+        output: vec![qkv[0].clone(), value_dim],
+    })
+}
+
+/// `gate_split(qg: [T, num_attention_heads*2*head_dim])` → (single-output sig
+/// for `apply_signature` validation; the real 2-tuple `(q, gate)` binding is in
+/// `Stmt::AssignTuple`). Returns `q` shape `[T, attn_q_dim]`
+/// (`= num_attention_heads*head_dim`).
+fn sig_gate_split(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GateSplit, inputs, 1)?;
+    let qg = &inputs[0];
+    if qg.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GateSplit,
+            reason: "qg must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig {
+        output: vec![
+            qg[0].clone(),
+            Dim::Mul(vec![
+                Dim::Bound("num_attention_heads".into()),
+                Dim::Bound("head_dim".into()),
+            ]),
+        ],
+    })
+}
+
+/// `gate_apply(attn, gate)` → `[T, attn_q_dim]` (= attn shape). Shape-preserving
+/// elementwise (`attn * sigmoid(gate)`).
+fn sig_gate_apply(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GateApply, inputs, 2)?;
+    let attn = &inputs[0];
+    if attn.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GateApply,
+            reason: "attn must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig {
+        output: attn.clone(),
+    })
+}
+
 /// `moe_block(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
 /// the second arg is a MoE layer struct (`FusedMoELayer` /
 /// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` or their quant
@@ -907,6 +974,12 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // Moe's moe[layer] is a struct (not a tensor) at arg 1;
         // weight_arg_ranks governs shape-rank assertion only, so we skip it.
         OpKind::Moe => &[],
+        // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
+        // (not a tensor); like Moe, skip the tensor-rank assertion.
+        OpKind::GatedDeltaNet => &[],
+        // GateSplit/GateApply take only activation inputs; no tensor weight args.
+        OpKind::GateSplit => &[],
+        OpKind::GateApply => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
         // LoadPixels has zero FUF inputs (the tile is materialized
@@ -1752,13 +1825,42 @@ impl InferCtx {
                         vec![t_dim, Dim::Bound("qk_rope_head_dim".into())],
                     );
                     Ok(())
+                } else if let Expr::Call { op, args } = value
+                    && matches!(op, OpKind::GateSplit)
+                {
+                    // `(q, gate) = gate_split(qg)`
+                    // qg:   [T, num_attention_heads * 2 * head_dim]
+                    // q:    [T, attn_q_dim]  (= num_attention_heads * head_dim)
+                    // gate: [T, attn_q_dim]
+                    let qg_shape = self.expr_shape(&args[0])?;
+                    if targets.len() != 2 {
+                        return Err(ShapeError::BadArgs {
+                            op: *op,
+                            reason: format!(
+                                "gate_split returns 2 values, got {} targets",
+                                targets.len()
+                            ),
+                        });
+                    }
+                    let t_dim = qg_shape
+                        .first()
+                        .cloned()
+                        .unwrap_or(Dim::Bound("num_tokens".into()));
+                    let qd = Dim::Mul(vec![
+                        Dim::Bound("num_attention_heads".into()),
+                        Dim::Bound("head_dim".into()),
+                    ]);
+                    self.locals
+                        .insert(targets[0], vec![t_dim.clone(), qd.clone()]);
+                    self.locals.insert(targets[1], vec![t_dim, qd]);
+                    Ok(())
                 } else {
                     Err(ShapeError::BadArgs {
                         op: match value {
                             Expr::Call { op, .. } => *op,
                             _ => OpKind::Add, // placeholder
                         },
-                        reason: "only rope_append, rope_append_interleaved, vision_rope, and mla_split return a tuple".into(),
+                        reason: "only rope_append, rope_append_interleaved, vision_rope, mla_split, and gate_split return a tuple".into(),
                     })
                 }
             }

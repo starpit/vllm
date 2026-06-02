@@ -120,8 +120,27 @@ fn safetensors_prefix(
         (None, _) => format!("model.{joined}"),
     };
     match decoder_safetensors_prefix {
-        Some(prefix) => format!("{prefix}.{key}"),
         None => key,
+        Some(prefix) => {
+            // Tolerate a trailing dot in the config value.
+            let prefix = prefix.trim_end_matches('.');
+            match key.strip_prefix("model") {
+                // Replace-the-`model`-root form: the prefix already names
+                // the `model` root (e.g. Qwen3.5-VL `model.language_model`),
+                // so the decoder's keys sit DIRECTLY under it —
+                // `model.language_model.embed_tokens`,
+                // `model.language_model.layers.N.*`, `model.language_model.norm`
+                // — NOT nested as `<prefix>.model.<key>`. Splice the prefix
+                // in for the leading `model` segment. (`lm_head` has no
+                // `model` root, so it falls through to the wrapper arm;
+                // tied-embedding arches like Qwen3.5 never look it up.)
+                Some(rest) if prefix.starts_with("model") => format!("{prefix}{rest}"),
+                // Namespace-wrapper form (Gemma3-MM `language_model`): the
+                // whole standard `model.<key>` / `lm_head` namespace nests
+                // under the prefix → `language_model.model.<key>`.
+                _ => format!("{prefix}.{key}"),
+            }
+        }
     }
 }
 
@@ -166,6 +185,11 @@ enum FieldLoad {
     /// optional `<prefix>.bias`. Used by `MeanSubRmsNormBiasAddImpl`
     /// (encoder models like ModernBERT, vision towers like Qwen2-VL).
     LayerNorm(String, f32),
+    /// `GatedDeltaNetLayer::load(gw, prefix)` — pulls the 4 GDN
+    /// per-layer weights `<prefix>.{conv1d.weight, A_log, dt_bias,
+    /// norm.weight}`. `prefix` is the `linear_attn` prefix for the layer.
+    /// Used by `GatedDeltaNetImpl` (Qwen3.5 / Qwen3-Next linear layers).
+    GatedDeltaNet(String),
     /// `LinearLayer::load_dense(gw, prefix)`.
     LinearDense(String),
     /// `LinearLayer::load_dense_concat(gw, &[prefix0, prefix1, ...], stream)`.
@@ -524,6 +548,9 @@ fn plan_field_load(
     let is_deepseek_v2_ggml_moe = ty.ends_with("::DeepSeekV2GgmlMoELayer")
         || ty == "DeepSeekV2GgmlMoELayer"
         || ty.ends_with("layers_moe::DeepSeekV2GgmlMoELayer");
+    let is_gated_delta_net = ty.ends_with("::GatedDeltaNetLayer")
+        || ty == "GatedDeltaNetLayer"
+        || ty.ends_with("layers::GatedDeltaNetLayer");
     let is_embedding =
         ty.ends_with("::Embedding") || ty == "Embedding" || ty.ends_with("layers::Embedding");
     // P6: MLX-affine int4 quantized embedding. Distinct type from
@@ -1062,6 +1089,17 @@ fn plan_field_load(
         };
     }
 
+    if is_gated_delta_net {
+        assert_eq!(
+            prefixes.len(),
+            1,
+            "GatedDeltaNetLayer accessor `{}` with {} sources (expected 1 per layer)",
+            accessor.name,
+            prefixes.len(),
+        );
+        return FieldLoad::GatedDeltaNet(prefixes.into_iter().next().unwrap());
+    }
+
     if is_embedding || is_affine_quant_embedding {
         assert_eq!(
             prefixes.len(),
@@ -1303,6 +1341,45 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
         .unwrap_or(fallback)
 }
 
+/// Runtime RMSNorm gain offset for zero-centered (Gemma-style) norms.
+/// When the config sets `"rms_norm_zero_centered": true` (Gemma2/3,
+/// Qwen3.5/3.6/Next — input/post/final layernorms + per-head q/k norm
+/// store gains zero-centered, effective gain `1 + weight`), the standard
+/// `RmsNorm` / `FusedAddRmsNorm` metal kernels fold `weight + 1.0`. The
+/// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
+/// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
+/// un-bakes a converter's pre-applied constant). Default 0.0.
+fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
+    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
+        return 0.0;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+        return 0.0;
+    };
+    if v.get("rms_norm_zero_centered")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+    {
+        // The standard kernels fold `weight + 1.0`, assuming the
+        // checkpoint stores the gain ZERO-CENTERED (`weight = gain - 1`,
+        // the HF convention). But `mlx_lm.convert` "sanitizes" these
+        // norms by pre-adding 1.0 (storing the full gain `1 + weight`),
+        // so for MLX-affine checkpoints folding another +1.0 double-
+        // counts the offset → gain ≈1.7× too large → garbage. Verified
+        // on `mlx-community/Qwen3.5-0.8B-MLX-4bit` (input_layernorm.weight
+        // is exactly +1.0 vs the official bf16). Use 0.0 there so the
+        // kernel reads the pre-offset gain as-is. (GDN gated norm uses a
+        // separate kernel with no offset and is unaffected either way.)
+        let is_mlx_affine = matches!(
+            model.quantization.as_ref().map(|qc| &qc.method),
+            Some(crate::quantization::QuantMethod::Affine { .. })
+        );
+        if is_mlx_affine { 0.0 } else { 1.0 }
+    } else {
+        0.0
+    }
+}
+
 fn tie_word_embeddings(model: &ModelParams) -> bool {
     // `ModelParams::tie_word_embeddings` is populated by the config
     // loader from the HF JSON; read directly rather than re-parsing
@@ -1462,13 +1539,26 @@ fn emit_fingerprint_check(
     };
 
     let last_layer = num_hidden_layers.saturating_sub(1);
-    // Per-arch decoder root for fingerprint-tensor names: `model` for
-    // text-only and Qwen-style VL, `<prefix>.model` for arches whose
-    // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
-    // text decoder weights under `language_model.<...>`).
+    // Per-arch decoder root for fingerprint-tensor names. MUST agree
+    // with [`safetensors_prefix`]'s prefix handling (replace-vs-prepend)
+    // — the fingerprint looks up `{dec_root}.embed_tokens.weight` /
+    // `{dec_root}.layers.N.q_proj.weight`, and if that name doesn't
+    // match what the loader actually reads, every variant rejects and
+    // `try_load` returns `Ok(None)` → `ArchNotSupported`.
     let dec_root: String = match model.decoder_safetensors_prefix.as_deref() {
-        Some(prefix) => format!("{prefix}.model"),
         None => "model".to_string(),
+        Some(prefix) => {
+            let prefix = prefix.trim_end_matches('.');
+            if prefix.starts_with("model") {
+                // Replace-the-`model`-root form (Qwen3.5-VL
+                // `model.language_model`): decoder root IS the prefix.
+                prefix.to_string()
+            } else {
+                // Namespace-wrapper form (Gemma3-MM `language_model`):
+                // `language_model.model`.
+                format!("{prefix}.model")
+            }
+        }
     };
     // Pick a layered tensor that ACTUALLY EXISTS ON DISK to use as the
     // fingerprint sniff. Packed parents come first (Phi-3 ships
@@ -1502,6 +1592,15 @@ fn emit_fingerprint_check(
     };
     let fp_leaf: &str = fp_leaf_owned.as_str();
     let last_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.{suffix}");
+    // MLX-affine `.scales` sibling of `last_tensor`. The affine group-size
+    // gate must probe a layer that ACTUALLY HAS `fp_leaf` (= `self_attn.q_proj`).
+    // It MUST NOT hardcode `layers.0`: hybrid arches (Qwen3.5 Gated-DeltaNet,
+    // Mamba/Jamba) make layer 0 a linear-attention layer with NO `self_attn.q_proj`,
+    // so `layers.0.self_attn.q_proj.scales` is absent there and the gate would
+    // reject every variant → `ArchNotSupported`. `last_layer` is the same layer
+    // the present-check (`last_tensor`) already requires, so its `.scales`
+    // sibling is guaranteed present for the affine checkpoint.
+    let last_scales_tensor = format!("{dec_root}.layers.{last_layer}.{fp_leaf}.scales");
     let one_past_tensor = format!("{dec_root}.layers.{num_hidden_layers}.{fp_leaf}.{suffix}");
     let opposite_tensor = format!("{dec_root}.layers.0.{fp_leaf}.{opposite_suffix}");
     // BNB4 checkpoints ship the U8-packed nibbles at `.weight`
@@ -1735,7 +1834,7 @@ fn emit_fingerprint_check(
             let scales_groups =
                 proc_macro2::Literal::usize_unsuffixed(hidden_size as usize / *group_size as usize);
             quote! {
-                match gw.tensor_info(#mlx_marker_tensor) {
+                match gw.tensor_info(#last_scales_tensor) {
                     Some((shape, _))
                         if shape.len() == 2 && shape[1] == #scales_groups => {}
                     _ => return false,
@@ -2924,7 +3023,11 @@ fn emit_weights_struct(
         // `max_model_len` is the function argument; the .min(...) caps
         // it at the model's hard limit so a misconfigured larger value
         // doesn't run past the rope shape.
-        match (partial, scaling) {
+        // rotary_dim = partial_rotary_factor * head_dim (e.g. Qwen3.5:
+        // 0.25 * 256 = 64); `None` ⇒ full rotary (rotary_dim == head_dim).
+        let rotary_dim_metal: Option<usize> =
+            partial.map(|f| (f * head_dim as f64).round() as usize);
+        match (rotary_dim_metal, scaling) {
             (None, None) => quote! {
                 let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
                 let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
@@ -2963,7 +3066,52 @@ fn emit_weights_struct(
                     )?;
                 }
             }
-            // LongRoPE / YaRN / partial-rotary scaling families: the
+            // Partial rotary, no scaling (Qwen3.5 / Qwen3-Next:
+            // partial_rotary_factor 0.25). Builds a `[max_pos, rotary_dim]`
+            // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
+            // trailing head_dim-rotary_dim channels pass through unrotated.
+            (Some(rotary_dim), None) => quote! {
+                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                let rotary = ::ferrite_kernels::rotary::RotaryCache::new_partial_from_gpuweights(
+                    gw,
+                    #head_dim,
+                    #rotary_dim,
+                    rope_max_pos,
+                    #rope_theta,
+                    None,
+                    ::ferrite_cuda_core::dtype::DType::BF16,
+                )?;
+            },
+            // Partial rotary + Llama3 scaling.
+            (
+                Some(rotary_dim),
+                Some(crate::config::RopeScaling::Llama3 {
+                    factor,
+                    low_freq_factor,
+                    high_freq_factor,
+                    original_max_position_embeddings,
+                }),
+            ) => {
+                let orig = original_max_position_embeddings as usize;
+                quote! {
+                    let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                    let rotary = ::ferrite_kernels::rotary::RotaryCache::new_partial_from_gpuweights(
+                        gw,
+                        #head_dim,
+                        #rotary_dim,
+                        rope_max_pos,
+                        #rope_theta,
+                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                            factor: #factor,
+                            low_freq_factor: #low_freq_factor,
+                            high_freq_factor: #high_freq_factor,
+                            original_max_position_embeddings: #orig,
+                        }),
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                    )?;
+                }
+            }
+            // LongRoPE / YaRN (with or without partial rotary): the
             // macro can't emit a working metal init yet (no
             // `*_from_gpuweights` counterpart in `ferrite-kernels::rotary`).
             // Stub to a runtime panic so the build remains green for the
@@ -3551,6 +3699,9 @@ fn emit_unindexed_let(name: &syn::Ident, plan: &FieldLoad, tp_world_size: u8) ->
         }
         FieldLoad::RmsNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::RmsNorm::load(gw, #prefix, #eps)?;
+        },
+        FieldLoad::GatedDeltaNet(prefix) => quote! {
+            let #name = ::ferrite_kernels::layers::GatedDeltaNetLayer::load(gw, #prefix)?;
         },
         FieldLoad::LayerNorm(prefix, eps) => quote! {
             let #name = ::ferrite_kernels::layers::LayerNorm::load(gw, #prefix, #eps)?;
@@ -4179,13 +4330,25 @@ fn emit_group_let(
             } else {
                 None
             };
-            // Decoder-side layered root: `model.layers` (text-only and
-            // Qwen-style VL) or `<prefix>.model.layers` for arches whose
-            // variant config sets `decoder_safetensors_prefix`
-            // (Gemma3-MM nests the text decoder under `language_model.<...>`).
+            // Decoder-side layered root: `model.layers` (text-only) or a
+            // `decoder_safetensors_prefix`-derived root. MUST agree with
+            // [`safetensors_prefix`]'s prefix handling (replace-vs-prepend),
+            // or the L=0 key the loader looks up won't match this root and
+            // the `layered_suffix` invariant fires.
             let decoder_root_owned: String = match model.decoder_safetensors_prefix.as_deref() {
-                Some(prefix) => format!("{prefix}.model.layers"),
                 None => "model.layers".to_string(),
+                Some(prefix) => {
+                    let prefix = prefix.trim_end_matches('.');
+                    if prefix.starts_with("model") {
+                        // Replace-the-`model`-root form (Qwen3.5-VL
+                        // `model.language_model`): `model.language_model.layers`.
+                        format!("{prefix}.layers")
+                    } else {
+                        // Namespace-wrapper form (Gemma3-MM `language_model`):
+                        // `language_model.model.layers`.
+                        format!("{prefix}.model.layers")
+                    }
+                }
             };
             let call = emit_layered_load_body(
                 plan,
@@ -4647,6 +4810,20 @@ fn emit_layered_load_body(
                     .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
             }
         }
+        FieldLoad::GatedDeltaNet(prefix) => {
+            let p = layer_templated_prefix_expr(
+                prefix,
+                vision_zero_prefix_ref,
+                decoder_zero_prefix_ref,
+            );
+            quote! {
+                (0u32..#n_lit)
+                    .map(|layer: u32| -> ::anyhow::Result<_> {
+                        ::ferrite_kernels::layers::GatedDeltaNetLayer::load(gw, &#p)
+                    })
+                    .collect::<::anyhow::Result<::std::vec::Vec<_>>>()?
+            }
+        }
         FieldLoad::DeepSeekV2Fp8BlockMoe {
             prefix,
             n_routed_experts,
@@ -5014,6 +5191,7 @@ fn emit_weight_accessors_impl(
                         WeightKind::DeepSeekMoe => "deepseek_moe_at",
                         WeightKind::DeepSeekMoeFp8 => "deepseek_moe_fp8_at",
                         WeightKind::DeepSeekMoeGgml => "deepseek_moe_ggml_at",
+                        WeightKind::GatedDeltaNet => "gated_delta_net_at",
                         WeightKind::FusedMoe => "fused_moe_at",
                         WeightKind::SharedFusedMoe => "shared_fused_moe_at",
                         WeightKind::CosSin => "cos_sin_at",
@@ -5253,6 +5431,10 @@ fn emit_weight_accessors_impl(
         "deepseek_moe_ggml_at",
         quote! { &::ferrite_kernels::layers_moe::DeepSeekV2GgmlMoELayer },
     );
+    let gated_delta_net = method_emit(
+        "gated_delta_net_at",
+        quote! { &::ferrite_kernels::layers::GatedDeltaNetLayer },
+    );
     let fused_moe = method_emit(
         "fused_moe_at",
         quote! { &::ferrite_kernels::layers_moe::FusedMoELayer },
@@ -5335,6 +5517,7 @@ fn emit_weight_accessors_impl(
             #dsmoe
             #dsmoe_fp8
             #dsmoe_ggml
+            #gated_delta_net
             #fused_moe
             #shared_moe
             #cos_sin
@@ -5668,10 +5851,11 @@ fn emit_synthesized_kernel_sources_override(
     // must match the corresponding `MetalSynth*Impl` instantiation
     // registered in `starter_library` (otherwise the solver's pick and
     // the runtime pipeline cache disagree on the library key).
-    let is_qwen3 = model
-        .architectures
-        .iter()
-        .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"));
+    // Whole Qwen3 family (Qwen3 / Qwen3Moe / Qwen3.5 / Qwen3.6 /
+    // Qwen3-Next, dense + MoE + the VL-wrapped `Qwen3_5ForConditional
+    // Generation` text decoders) ships BF16 scales+biases. Match by
+    // family prefix so new members are covered automatically.
+    let is_qwen3 = model.architectures.iter().any(|a| a.starts_with("Qwen3"));
     let t_scale = if is_qwen3 { "bfloat" } else { "half" };
 
     // Model dims baked as MSL `constant constexpr` literals at synth
@@ -5861,6 +6045,20 @@ fn emit_canonical_params_impl(
     let v_head_dim = *model.bounds.get("v_head_dim").unwrap_or(&0) as usize;
     let qk_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
+    // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) per-layer dims. Absent (→ 0,
+    // matching the trait defaults) for every non-hybrid arch. The metal
+    // `lower_one(GatedDeltaNet)` arm reads these as `W::GDN_*` to size
+    // the conv1d / gating / scan / gated-RMSNorm dispatch grids and the
+    // op-scratch layout; the cuda eval reads them too. Not divided by
+    // `tp` — GDN tensor-parallel partitioning is a separate concern and
+    // bring-up is TP=1 (where the division is a no-op anyway).
+    let gdn_num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
+    let gdn_num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
+    let gdn_head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
+    let gdn_head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let gdn_conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
+    let gdn_conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as usize;
+
     // Vision-tower constants. Set in `#[vision_forward]` configs via
     // `vision_num_heads` / `vision_head_dim` bounds; absent in text
     // configs so the defaults (0 / 0.0) match the trait defaults
@@ -5952,6 +6150,33 @@ fn emit_canonical_params_impl(
     let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
     let v_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(v_head_dim);
     let qk_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_head_dim);
+    let gdn_num_k_heads_lit = proc_macro2::Literal::u32_unsuffixed(gdn_num_k_heads);
+    let gdn_num_v_heads_lit = proc_macro2::Literal::u32_unsuffixed(gdn_num_v_heads);
+    let gdn_head_k_dim_lit = proc_macro2::Literal::u32_unsuffixed(gdn_head_k_dim);
+    let gdn_head_v_dim_lit = proc_macro2::Literal::u32_unsuffixed(gdn_head_v_dim);
+    let gdn_conv_kernel_lit = proc_macro2::Literal::u32_unsuffixed(gdn_conv_kernel);
+    let gdn_conv_dim_lit = proc_macro2::Literal::usize_unsuffixed(gdn_conv_dim);
+    let norm_weight_offset_lit =
+        proc_macro2::Literal::f32_suffixed(norm_weight_runtime_offset(model));
+    // RMSNorm eps from config (Qwen3.5: 1e-6). Without this the metal
+    // `RmsNorm`/`FusedAddRmsNorm`/`gdn_rms_norm_gated` kernels fall back to
+    // the trait default 1e-5, which visibly drifts on outlier-dominated
+    // (massive-activation) residual streams where mean(x^2) ~ eps.
+    let rms_norm_eps_lit = proc_macro2::Literal::f32_suffixed(rms_norm_eps(model));
+    // Rotary dim for the metal rope kernel's `ROT_DIM` fn-const. Mirrors
+    // the rope-cache builder (codegen.rs ~2758): `partial_rotary_factor
+    // * head_dim` for partial-rope arches (Qwen3.5: 0.25*256 = 64), else
+    // the full `head_dim`. Without this the impl falls back to the trait
+    // default `ROT_DIM = HEAD_DIM`, so the kernel rotates head_dim dims
+    // against a rotary_dim-wide cos/sin cache → partial-rope arches break.
+    let rot_dim_val: u32 = model
+        .scalars
+        .get("partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * head_dim as f64).round() as u32)
+        .unwrap_or(head_dim);
+    let rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
     let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
     let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
@@ -6017,10 +6242,11 @@ fn emit_canonical_params_impl(
     // `_s_bf16_` symbol arms. Match on the HF `architectures` strings
     // baked into `model.architectures`.
     let scale_dtype_override = {
-        let is_qwen3 = model
-            .architectures
-            .iter()
-            .any(|a| matches!(a.as_str(), "Qwen3ForCausalLM" | "Qwen3MoeForCausalLM"));
+        // Match the whole Qwen3 family by prefix (Qwen3 / Qwen3Moe /
+        // Qwen3.5 / Qwen3.6 / Qwen3-Next, incl. the VL-wrapped
+        // `Qwen3_5ForConditionalGeneration` text decoders). Must stay in
+        // sync with the synth-kernel `t_scale` gate above.
+        let is_qwen3 = model.architectures.iter().any(|a| a.starts_with("Qwen3"));
         // NVFP4 (NVIDIA ModelOpt) checkpoints ship BF16 RMSNorm gains
         // (and BF16 embed/lm_head), unlike the mlx-community 4bit Llama
         // convention of F16. `SCALE_DTYPE` selects the rmsnorm /
@@ -6071,6 +6297,15 @@ fn emit_canonical_params_impl(
             const FINAL_LOGIT_SOFTCAPPING: f32 = #final_logit_softcapping_lit;
             const QK_HEAD_DIM: usize = #qk_head_dim_lit;
             const MLA_ATTN_SCALE: f32 = #mla_attn_scale_lit;
+            const GDN_NUM_K_HEADS: u32 = #gdn_num_k_heads_lit;
+            const GDN_NUM_V_HEADS: u32 = #gdn_num_v_heads_lit;
+            const GDN_HEAD_K_DIM: u32 = #gdn_head_k_dim_lit;
+            const GDN_HEAD_V_DIM: u32 = #gdn_head_v_dim_lit;
+            const GDN_CONV_KERNEL: u32 = #gdn_conv_kernel_lit;
+            const GDN_CONV_DIM: usize = #gdn_conv_dim_lit;
+            const NORM_WEIGHT_OFFSET: f32 = #norm_weight_offset_lit;
+            const RMS_NORM_EPS: f32 = #rms_norm_eps_lit;
+            const ROT_DIM: u32 = #rot_dim_lit;
             const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
             const VISION_Q_SIZE: usize = #vision_q_size_lit;
@@ -6080,6 +6315,75 @@ fn emit_canonical_params_impl(
             #mrope_section_tokens
             #synth_sources_override
             #scale_dtype_override
+        }
+    }
+}
+
+/// Emit the per-arch `FerriteWeights::gdn_runtime_config()` override for
+/// hybrid (Gated-DeltaNet) arches (Qwen3.5 / Qwen3-Next).
+///
+/// The `linear_layers` mask is read straight off the unrolled FUF: every
+/// `OpKind::GatedDeltaNet` tile carries its `linear_attn[layer]` weight
+/// bundle as a `FufInput::Weight { index: Some(layer) }`, and that
+/// concrete unrolled index IS the global layer id. So the mask is exactly
+/// the per-layer GDN/full-attn dispatch the `#[forward]` `if` resolved at
+/// unroll time — taken from the IR, not re-derived from the predicate
+/// (faithful to "everything is driven by the IR").
+///
+/// Returns an empty token stream for non-hybrid arches (no GatedDeltaNet
+/// tile) so the `impl FerriteWeights` falls through to the trait default
+/// (`None`); the worker then allocates no GDN state pool and leaves the
+/// `gdn_state` ForwardCtx field `None`.
+pub fn emit_gdn_runtime_config(fuf: &Fuf, model: &ModelParams) -> proc_macro2::TokenStream {
+    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
+        Some(&n) => n as usize,
+        None => return proc_macro2::TokenStream::new(),
+    };
+    let mut linear = vec![false; num_hidden_layers];
+    let mut is_hybrid = false;
+    for node in &fuf.nodes {
+        if node.op != OpKind::GatedDeltaNet {
+            continue;
+        }
+        is_hybrid = true;
+        // The op's only weight input is the `linear_attn[layer]` bundle;
+        // its concrete unrolled index is the global layer id.
+        for inp in &node.inputs {
+            if let FufInput::Weight { index: Some(l), .. } = inp {
+                let l = *l as usize;
+                if l < num_hidden_layers {
+                    linear[l] = true;
+                }
+            }
+        }
+    }
+    if !is_hybrid {
+        return proc_macro2::TokenStream::new();
+    }
+
+    let conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as u32;
+    let conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
+    let num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
+    let num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
+    let head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
+    let head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let bits = linear.iter().copied();
+
+    quote! {
+        fn gdn_runtime_config(
+            &self,
+        ) -> ::core::option::Option<::ferrite_forward::gdn_state_layout::GdnRuntimeConfig> {
+            ::core::option::Option::Some(
+                ::ferrite_forward::gdn_state_layout::GdnRuntimeConfig {
+                    conv_dim: #conv_dim,
+                    conv_kernel: #conv_kernel,
+                    num_k_heads: #num_k_heads,
+                    num_v_heads: #num_v_heads,
+                    head_k_dim: #head_k_dim,
+                    head_v_dim: #head_v_dim,
+                    linear_layers: ::std::vec![ #(#bits),* ],
+                },
+            )
         }
     }
 }
@@ -6926,6 +7230,40 @@ pub fn emit_model(
                 let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
                     .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
                     .collect();
+                // GDN (Gated-DeltaNet) persistent state buffers, captured per
+                // (global) layer from `ctx.gdn_state` for hybrid arches; empty
+                // for non-hybrid. Non-linear layers reuse the first linear
+                // layer's buffer as a never-bound placeholder (the
+                // GatedDeltaNet lowering only emits GdnConvState/GdnSsmState on
+                // linear layers, so the placeholder is never read).
+                let (gdn_conv, gdn_ssm): (::std::vec::Vec<Buffer>, ::std::vec::Vec<Buffer>) =
+                    match ctx.gdn_state {
+                        ::core::option::Option::Some(gp) => {
+                            match (0..gp.num_layers).find(|&l| gp.is_linear(l)) {
+                                ::core::option::Option::Some(f0) => {
+                                    let fc = gp.conv_layer_mem(f0).buffer().clone();
+                                    let fs = gp.ssm_layer_mem(f0).buffer().clone();
+                                    let conv = (0..gp.num_layers)
+                                        .map(|l| if gp.is_linear(l) {
+                                            gp.conv_layer_mem(l).buffer().clone()
+                                        } else { fc.clone() })
+                                        .collect();
+                                    let ssm = (0..gp.num_layers)
+                                        .map(|l| if gp.is_linear(l) {
+                                            gp.ssm_layer_mem(l).buffer().clone()
+                                        } else { fs.clone() })
+                                        .collect();
+                                    (conv, ssm)
+                                }
+                                ::core::option::Option::None => {
+                                    (::std::vec::Vec::new(), ::std::vec::Vec::new())
+                                }
+                            }
+                        }
+                        ::core::option::Option::None => {
+                            (::std::vec::Vec::new(), ::std::vec::Vec::new())
+                        }
+                    };
                 let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
                     ::std::sync::Arc::new(move |dev| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
@@ -6962,6 +7300,14 @@ pub fn emit_model(
                             // sample-row source indices here before
                             // dispatch.
                             sample_indices: alloc(max_m * 4),
+                            // GDN persistent state (per-layer) + per-forward
+                            // indices/fresh flags (Shared, overwritten each
+                            // forward). Index buffers sized to the max bucket
+                            // (num_seqs <= num_tokens <= max_m).
+                            gdn_state_conv: gdn_conv.clone(),
+                            gdn_state_ssm: gdn_ssm.clone(),
+                            gdn_state_indices: alloc(max_m * 4),
+                            gdn_is_fresh: alloc(max_m * 4),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7039,6 +7385,27 @@ pub fn emit_model(
                 ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
             });
 
+            // GDN per-forward indices (hybrid arches): read from ctx's
+            // host-visible TensorViews (slot id per seq, fresh flag per seq).
+            // `None` for non-hybrid arches (ctx fields are None).
+            let gdn_state_indices = match ctx.gdn_state_indices {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const i32,
+                        tv.as_raw().numel(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let gdn_is_fresh = match ctx.gdn_is_fresh {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u32,
+                        tv.as_raw().numel(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7049,6 +7416,8 @@ pub fn emit_model(
                 block_table,
                 has_spec_tokens: ctx.has_spec_tokens,
                 last_token_indices,
+                gdn_state_indices,
+                gdn_is_fresh,
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -7165,6 +7534,40 @@ pub fn emit_model(
                 let kv_v: ::std::vec::Vec<Buffer> = (0..num_layers)
                     .map(|l| ctx.kv_cache.v_chunk_table_mem(l).buffer().clone())
                     .collect();
+                // GDN (Gated-DeltaNet) persistent state buffers, captured per
+                // (global) layer from `ctx.gdn_state` for hybrid arches; empty
+                // for non-hybrid. Non-linear layers reuse the first linear
+                // layer's buffer as a never-bound placeholder (the
+                // GatedDeltaNet lowering only emits GdnConvState/GdnSsmState on
+                // linear layers, so the placeholder is never read).
+                let (gdn_conv, gdn_ssm): (::std::vec::Vec<Buffer>, ::std::vec::Vec<Buffer>) =
+                    match ctx.gdn_state {
+                        ::core::option::Option::Some(gp) => {
+                            match (0..gp.num_layers).find(|&l| gp.is_linear(l)) {
+                                ::core::option::Option::Some(f0) => {
+                                    let fc = gp.conv_layer_mem(f0).buffer().clone();
+                                    let fs = gp.ssm_layer_mem(f0).buffer().clone();
+                                    let conv = (0..gp.num_layers)
+                                        .map(|l| if gp.is_linear(l) {
+                                            gp.conv_layer_mem(l).buffer().clone()
+                                        } else { fc.clone() })
+                                        .collect();
+                                    let ssm = (0..gp.num_layers)
+                                        .map(|l| if gp.is_linear(l) {
+                                            gp.ssm_layer_mem(l).buffer().clone()
+                                        } else { fs.clone() })
+                                        .collect();
+                                    (conv, ssm)
+                                }
+                                ::core::option::Option::None => {
+                                    (::std::vec::Vec::new(), ::std::vec::Vec::new())
+                                }
+                            }
+                        }
+                        ::core::option::Option::None => {
+                            (::std::vec::Vec::new(), ::std::vec::Vec::new())
+                        }
+                    };
                 let factory: ::ferrite_forward::interpreter::metal::RuntimeFactory =
                     ::std::sync::Arc::new(move |dev| {
                         let max_m = METAL_MAX_BUCKET_M as u64;
@@ -7191,6 +7594,14 @@ pub fn emit_model(
                             num_tokens_u32: alloc(4),
                             num_sample_rows_u32: alloc(4),
                             sample_indices: alloc(max_m * 4),
+                            // GDN persistent state (per-layer) + per-forward
+                            // indices/fresh flags (Shared, overwritten each
+                            // forward). Index buffers sized to the max bucket
+                            // (num_seqs <= num_tokens <= max_m).
+                            gdn_state_conv: gdn_conv.clone(),
+                            gdn_state_ssm: gdn_ssm.clone(),
+                            gdn_state_indices: alloc(max_m * 4),
+                            gdn_is_fresh: alloc(max_m * 4),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7263,6 +7674,27 @@ pub fn emit_model(
                 ::std::slice::from_raw_parts(raw.raw_ptr() as *const u32, raw.numel())
             });
 
+            // GDN per-forward indices (hybrid arches): read from ctx's
+            // host-visible TensorViews (slot id per seq, fresh flag per seq).
+            // `None` for non-hybrid arches (ctx fields are None).
+            let gdn_state_indices = match ctx.gdn_state_indices {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const i32,
+                        tv.as_raw().numel(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let gdn_is_fresh = match ctx.gdn_is_fresh {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u32,
+                        tv.as_raw().numel(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7273,6 +7705,8 @@ pub fn emit_model(
                 block_table,
                 has_spec_tokens: ctx.has_spec_tokens,
                 last_token_indices,
+                gdn_state_indices,
+                gdn_is_fresh,
             };
 
             // Pre-pick the bucket from iter-0 num_tokens. The chain

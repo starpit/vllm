@@ -33,6 +33,8 @@ use vllm_model::weight::HfModelConfig;
 // `KvCachePool` is `cfg(any(cuda, metal))` in `ferrite-kernels::kv_cache`,
 // and `DType` is unconditional in `ferrite-cuda-core::dtype`.
 use ferrite_cuda_core::dtype::DType as GpuDType;
+use ferrite_forward::gdn_slot_allocator::GdnSlotAllocator;
+use ferrite_kernels::gdn_state::GdnStatePool;
 use ferrite_kernels::kv_cache::KvCachePool;
 
 #[cfg(feature = "cuda")]
@@ -105,6 +107,11 @@ pub struct FerriteWorkerConfig {
     pub cuda_graph_mode: CudaGraphMode,
     /// Maximum tokens per scheduler iteration (controls arena pre-sizing).
     pub max_num_batched_tokens: usize,
+    /// Maximum concurrently-resident sequences (scheduler
+    /// `max_num_seqs`). Sizes the Gated-DeltaNet state pool — one
+    /// recurrent-state slot per resident sequence for hybrid arches
+    /// (Qwen3.5 / Qwen3-Next); unused by non-hybrid arches.
+    pub max_num_seqs: usize,
     /// Batch sizes to capture as CUDA graphs (sorted, deduplicated).
     pub cuda_graph_sizes: Vec<usize>,
     /// Run cublasLt algorithm benchmarking during warmup (--cublas-autotune).
@@ -1423,6 +1430,24 @@ pub struct FerriteWorker {
     // ---------------------------------------------------------------
     config: FerriteWorkerConfig,
     kv_cache: Option<KvCachePool>,
+    /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
+    /// Qwen3-Next). `Some(_)` only when the loaded model's
+    /// `gdn_runtime_config()` is `Some` (built in `initialize_cache`).
+    /// The non-paged sibling of `kv_cache`: the metal forward binds its
+    /// per-linear-layer conv/ssm buffers into the runtime through
+    /// `ForwardCtx::gdn_state`.
+    gdn_state: Option<GdnStatePool>,
+    /// Per-request GDN state-slot allocator (one slot per concurrently
+    /// resident sequence, recycled on finish — the "degeneration after
+    /// N requests" guard). `Some` iff the model is hybrid; drives the
+    /// per-step `gdn_state_indices` / `gdn_is_fresh` the forward reads.
+    gdn_slot_allocator: Option<GdnSlotAllocator>,
+    /// Per-step GDN scratch: the `(state_indices, is_fresh)` vectors
+    /// built in `execute_model` (one entry per batched sequence in
+    /// cu_seqlens order) and consumed by the metal
+    /// `forward_argmax_blocking` to populate `ForwardCtx::{gdn_state_indices,
+    /// gdn_is_fresh}`. `None` between steps / for non-hybrid arches.
+    gdn_pending: Option<(Vec<i32>, Vec<u32>)>,
     model_dir: Option<PathBuf>,
     hf_config: Option<HfModelConfig>,
     /// Draft model's resolved snapshot dir, populated when
@@ -1827,6 +1852,9 @@ impl FerriteWorker {
             device: None,
             model: None,
             kv_cache: None,
+            gdn_state: None,
+            gdn_slot_allocator: None,
+            gdn_pending: None,
             model_dir: None,
             hf_config: None,
             draft_model_dir: None,
@@ -3879,9 +3907,35 @@ impl Worker for FerriteWorker {
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
 
         self.kv_cache = Some(pool);
-        // Qwen3Next GDN state pool was allocated here when the hand-written
-        // `vllm_cuda::model::qwen3_next` lived. With ferrite-only forwards,
-        // recurrent state is owned by ferrite-forward's per-arch glue.
+
+        // GDN (Gated-DeltaNet) recurrent-state pool for hybrid arches
+        // (Qwen3.5 / Qwen3-Next). The state *infrastructure* is in place:
+        //   - `ferrite_kernels::gdn_state::GdnStatePool` (the f32 conv+ssm pool),
+        //   - `ferrite_forward::gdn_slot_allocator::GdnSlotAllocator` (slot
+        //     lifecycle + the `is_fresh` degeneration guard),
+        //   - `ForwardCtx::{gdn_state, gdn_state_indices}` (the eval reads these),
+        //   - `FerriteWeights::gdn_runtime_config()` (per-arch dims + linear mask).
+        //
+        // TODO(cuda-runtime, P1b finalize): wire the runtime here — only
+        // reachable/verifiable on a CUDA host (the gdn_* kernels are cuda-only):
+        //   1. if `model.gdn_runtime_config()` is Some(cfg): build a
+        //      `GdnStatePool::new(num_layers, &cfg.linear_layers, max_num_seqs,
+        //      cfg.conv_dim, cfg.conv_kernel, cfg.num_v_heads, cfg.head_v_dim,
+        //      cfg.head_k_dim, |bytes| RawGpuMem::new(driver::mem_alloc(bytes)?, bytes))`
+        //      into a `self.gdn_state: Option<GdnStatePool>` field; create a
+        //      `GdnSlotAllocator::new(max_num_seqs)` field.
+        //   2. `determine_available_memory`: route GDN arches down the
+        //      fixed-estimate path (the profiling dummy forward has no gdn_state
+        //      yet) and subtract `GdnStatePool::reserve_bytes(...)`.
+        //   3. `update_states`: `slot_for(req_id)` at the new-request admit loop,
+        //      `release(req_id)` at the finished-req loop (and on preempt).
+        //   4. Build a `[num_seqs]` i32 `gdn_state_indices` per step (slot id per
+        //      sequence, cu_seqlens_q order) via `Self::h2d_i32`, and thread a
+        //      `GdnForwardInputs { state: &GdnStatePool, indices: TensorView }`
+        //      (mirror `MmForwardInputs`) into `forward`/`hidden_states` so the
+        //      ctx at :366/:448 carries `gdn_state: Some(..), gdn_state_indices:
+        //      Some(..)` on the main prefill/decode path (None elsewhere).
+        // See memory project_qwen35_gdn_port.md "P1b/P2/P3 IMPLEMENTATION MAP".
 
         Ok(())
     }
@@ -7163,12 +7217,30 @@ mod tests {
 // FerriteWorker under metal. Step 3 fills those bodies in via the
 // per-arch `metal_pool()` factory + `MetalWorkerPool::forward`.
 
+/// Stable per-process u64 key for a request's GDN state slot.
+///
+/// `GdnSlotAllocator` keys on `u64`, but the engine identifies requests
+/// by `String`. A `DefaultHasher` (fixed SipHash keys `(0, 0)`) is
+/// deterministic across calls within a run, so the same `req_id` always
+/// maps to the same slot for its whole lifetime; collisions among the
+/// few hundred concurrently-live ids are astronomically unlikely.
+#[cfg(feature = "metal")]
+fn gdn_slot_key(req_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    req_id.hash(&mut h);
+    h.finish()
+}
+
 #[cfg(feature = "metal")]
 impl FerriteWorker {
     pub fn new(config: FerriteWorkerConfig) -> Self {
         Self {
             config,
             kv_cache: None,
+            gdn_state: None,
+            gdn_slot_allocator: None,
+            gdn_pending: None,
             model_dir: None,
             hf_config: None,
             // Metal forward currently produces f16 outputs; cuda's "auto"
@@ -7760,6 +7832,9 @@ fn metal_chain_dispatch(
         max_seqlen_q: req.max_seqlen_q,
         max_seqlen_k: req.max_seqlen_k,
         kv_cache: kv_cache_ref,
+        gdn_state: None,
+        gdn_state_indices: None,
+        gdn_is_fresh: None,
         has_spec_tokens: false,
         last_token_indices: None,
     };
@@ -7916,6 +7991,24 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 _ => return Err(BackendError::UnknownHandle("KvPoolHandle")),
             };
 
+        // GDN recurrent state for hybrid arches — TARGET model only (the
+        // speculative draft is a separate, non-GDN model). The pool's
+        // per-linear-layer conv/ssm buffers reach the metal runtime
+        // through `ForwardCtx::gdn_state`; the per-sequence slot ids /
+        // fresh flags were built this step in `execute_model` and parked
+        // in `self.gdn_pending` (consumed here). `None` for non-hybrid
+        // arches / the draft → unchanged behavior.
+        let gdn_state_ref = if matches!(model, ModelHandle::TARGET) {
+            self.gdn_state.as_ref()
+        } else {
+            None
+        };
+        let gdn_pending = if gdn_state_ref.is_some() {
+            self.gdn_pending.take()
+        } else {
+            None
+        };
+
         let device_buf = self
             .gpu_device
             .as_ref()
@@ -8037,6 +8130,45 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?
         };
 
+        // Upload the per-step GDN slot ids / fresh flags into shared
+        // (host-readable) buffers. The macro-emitted metal forward reads
+        // them back off `ctx.gdn_state_indices` / `gdn_is_fresh` as host
+        // slices for `ForwardInputs`, then `write_runtime_inputs` copies
+        // them into the runtime buffers the kernels bind. i32 and u32
+        // share the 4-byte layout `alloc_shared_u32_buf` writes. The
+        // `buf_*` locals must outlive the forward call below — the views
+        // hold raw pointers into their `contents()`.
+        let gdn_pending_views = gdn_pending.as_ref().filter(|_| gdn_state_ref.is_some());
+        let buf_gdn_indices = gdn_pending_views.map(|(idx, _)| {
+            let idx_u32: &[u32] =
+                unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u32, idx.len()) };
+            FerriteWorker::alloc_shared_u32_buf(&mtl_device, idx_u32)
+        });
+        let buf_gdn_is_fresh = gdn_pending_views
+            .map(|(_, fresh)| FerriteWorker::alloc_shared_u32_buf(&mtl_device, fresh));
+        let view_gdn_indices =
+            buf_gdn_indices
+                .as_ref()
+                .zip(gdn_pending_views)
+                .map(|(b, (idx, _))| unsafe {
+                    TensorView::from_raw(GpuTensor::new(
+                        b.contents().as_ptr() as *mut u8,
+                        &[idx.len().max(1)],
+                        ferrite_cuda_core::dtype::DType::I32,
+                    ))
+                });
+        let view_gdn_is_fresh =
+            buf_gdn_is_fresh
+                .as_ref()
+                .zip(gdn_pending_views)
+                .map(|(b, (_, fresh))| unsafe {
+                    TensorView::from_raw(GpuTensor::new(
+                        b.contents().as_ptr() as *mut u8,
+                        &[fresh.len().max(1)],
+                        ferrite_cuda_core::dtype::DType::U32,
+                    ))
+                });
+
         let ctx = ferrite_forward::ForwardCtx {
             input_ids: view_input_ids,
             positions: view_positions,
@@ -8047,6 +8179,9 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
             max_seqlen_q: req.max_seqlen_q,
             max_seqlen_k: req.max_seqlen_k,
             kv_cache: kv_cache_ref,
+            gdn_state: gdn_state_ref,
+            gdn_state_indices: view_gdn_indices,
+            gdn_is_fresh: view_gdn_is_fresh,
             has_spec_tokens: req.has_spec_tokens,
             last_token_indices: view_last_token_indices,
         };
@@ -8718,6 +8853,56 @@ impl Worker for FerriteWorker {
         );
         self.kv_cache = Some(pool);
 
+        // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) recurrent-state pool —
+        // the non-paged sibling of the KV cache. Only hybrid arches
+        // report a `gdn_runtime_config` (macro-emitted from the unrolled
+        // IR's per-layer GDN dispatch); every other arch leaves
+        // `self.gdn_state` / `self.gdn_slot_allocator` `None`. One
+        // recurrent-state slot per concurrently-resident sequence
+        // (`max_num_seqs`), matching the scheduler's `max_num_running_reqs`
+        // so the slot allocator never exhausts.
+        if let Some(gdn_cfg) = model.gdn_runtime_config() {
+            let num_slots = self.config.max_num_seqs.max(1);
+            let num_layers = model.num_hidden_layers() as usize;
+            let t_gdn = std::time::Instant::now();
+            let gdn_pool = unsafe {
+                ferrite_kernels::gdn_state::GdnStatePool::new(
+                    num_layers,
+                    &gdn_cfg.linear_layers,
+                    num_slots,
+                    gdn_cfg.conv_dim as usize,
+                    gdn_cfg.conv_kernel as usize,
+                    gdn_cfg.num_v_heads as usize,
+                    gdn_cfg.head_v_dim as usize,
+                    gdn_cfg.head_k_dim as usize,
+                    |bytes| {
+                        // f32 conv/ssm state, GPU-resident across forwards
+                        // (no CPU touches) → StorageModePrivate + pin into
+                        // the same shared residency set as the KV pool, so
+                        // the lazy pager can't drop it mid-attention.
+                        let buffer = mtl_device
+                            .newBufferWithLength_options(
+                                bytes,
+                                ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                            )
+                            .expect("GDN state buffer alloc returned nil");
+                        residency.insert(&buffer);
+                        Ok(RawGpuMem::from_buffer(buffer))
+                    },
+                )
+            }
+            .map_err(|e| ExecutorError::WorkerInit(format!("GdnStatePool: {e}")))?;
+            info!(
+                "FerriteWorker(metal): GDN state pool — {} linear / {} layers × {} slots in {:?}",
+                gdn_cfg.num_linear_layers(),
+                num_layers,
+                num_slots,
+                t_gdn.elapsed(),
+            );
+            self.gdn_state = Some(gdn_pool);
+            self.gdn_slot_allocator = Some(GdnSlotAllocator::new(num_slots));
+        }
+
         // Phase 3 of DRAFT_SPEC_DECODE_PLAN.md: allocate the draft model's
         // KV pool alongside the target's, sized to fit inside the same
         // shared `recommendedMaxWorkingSetSize` budget.
@@ -8751,7 +8936,33 @@ impl Worker for FerriteWorker {
             .as_ref()
             .ok_or_else(|| ExecutorError::WorkerInit("metal device not initialized".into()))?;
         let total = metal_device.device.recommendedMaxWorkingSetSize() as usize;
-        let weights_and_overhead = metal_device.device.currentAllocatedSize();
+        // Reserve room for the Gated-DeltaNet recurrent-state pool. It is
+        // built in `initialize_cache` (which runs AFTER this), so it is
+        // NOT yet in `currentAllocatedSize`; fold it into the non-KV
+        // overhead here so the engine doesn't hand back KV blocks that
+        // leave no room for it. Persistent f32 state, one slot per
+        // resident seq — sized identically to the pool built later. Zero
+        // for non-hybrid arches.
+        let gdn_reserve = self
+            .model
+            .as_ref()
+            .and_then(|m| m.gdn_runtime_config())
+            .map(|cfg| {
+                ferrite_kernels::gdn_state::GdnStatePool::reserve_bytes(
+                    cfg.num_linear_layers(),
+                    self.config.max_num_seqs.max(1),
+                    cfg.conv_dim as usize,
+                    cfg.conv_kernel as usize,
+                    cfg.num_v_heads as usize,
+                    cfg.head_v_dim as usize,
+                    cfg.head_k_dim as usize,
+                )
+            })
+            .unwrap_or(0);
+        let weights_and_overhead = metal_device
+            .device
+            .currentAllocatedSize()
+            .saturating_add(gdn_reserve);
         let arena_peak = self
             .model
             .as_ref()
@@ -8820,6 +9031,13 @@ impl Worker for FerriteWorker {
             self.mm_data_buffers.remove(req_id);
             self.sampling_params_map.remove(req_id);
             self.seeded_rngs.remove(req_id);
+            // Recycle the request's GDN recurrent-state slot (hybrid
+            // arches only). The slot's state is now stale; the next
+            // request to claim it is flagged fresh so it zero-inits
+            // rather than continuing from a finished sequence's state.
+            if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+                alloc.release(gdn_slot_key(req_id));
+            }
         }
         self.input_batch
             .remove_finished(&scheduler_output.finished_req_ids);
@@ -9027,6 +9245,38 @@ impl Worker for FerriteWorker {
         let sample_indices: Vec<u32> = attn.sample_indices();
         let req_ids_in_order: Vec<String> = attn.req_ids.clone();
         let q_lens: Vec<usize> = attn.q_lens.clone();
+
+        // GDN per-step state-slot indices (hybrid arches only). One i32
+        // slot id + u32 fresh flag per batched sequence, in the SAME
+        // order as `cu_seqlens_q` / `req_ids_in_order`. The metal
+        // `forward_argmax_blocking` uploads these into
+        // `ForwardCtx::{gdn_state_indices, gdn_is_fresh}`. `slot_for`
+        // returns `is_fresh=true` on a request's FIRST forward (including
+        // a recycled slot's new owner) so the GDN conv1d/scan kernels
+        // zero-init the slot's conv/ssm state instead of continuing from
+        // a finished sequence's stale data (the degeneration guard).
+        self.gdn_pending = if let Some(alloc) = self.gdn_slot_allocator.as_mut() {
+            let mut indices = Vec::with_capacity(req_ids_in_order.len());
+            let mut fresh = Vec::with_capacity(req_ids_in_order.len());
+            for req_id in &req_ids_in_order {
+                match alloc.slot_for(gdn_slot_key(req_id)) {
+                    Some((slot, is_fresh)) => {
+                        indices.push(slot as i32);
+                        fresh.push(u32::from(is_fresh));
+                    }
+                    None => {
+                        return Err(ExecutorError::WorkerExecution(format!(
+                            "GDN state-slot pool exhausted (capacity {}): scheduler \
+                             admitted more concurrent sequences than max_num_seqs",
+                            alloc.capacity(),
+                        )));
+                    }
+                }
+            }
+            Some((indices, fresh))
+        } else {
+            None
+        };
 
         let input_ids_u32 = std::mem::take(&mut prepared.flat_token_ids);
         let positions_u32 = std::mem::take(&mut prepared.flat_positions);
@@ -9248,6 +9498,9 @@ impl Worker for FerriteWorker {
                             max_seqlen_q: lock_max_q,
                             max_seqlen_k: lock_max_k,
                             kv_cache: dkv,
+                            gdn_state: None,
+                            gdn_state_indices: None,
+                            gdn_is_fresh: None,
                             has_spec_tokens: false,
                             last_token_indices: None,
                         };

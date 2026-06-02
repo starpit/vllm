@@ -133,7 +133,9 @@ __global__ void fused_recurrent_gdn_fwd_kernel(
     }
 }
 
-// RMSNormGated: out = rms_norm(x) * weight * sigmoid(z)
+// RMSNormGated: out = rms_norm(x) * weight * silu(z)   (norm_before_gate)
+// The gate is SiLU(z) = z * sigmoid(z), NOT plain sigmoid — matches Python
+// vLLM `RMSNormGated` / the cpu_golden `gdn_rms_norm_gated` oracle.
 // x, z: [total_rows, head_v_dim] where total_rows = num_tokens * num_v_heads
 // One block per row.
 __global__ void rms_norm_gated_kernel(
@@ -184,8 +186,9 @@ __global__ void rms_norm_gated_kernel(
     for (int i = threadIdx.x; i < head_v_dim; i += blockDim.x) {
         float normed = x_row[i] * rms * weight[i];
         float z_val = z_row[i];
-        float sig = 1.0f / (1.0f + expf(-z_val));
-        o_row[i] = normed * sig;
+        // SiLU gate: silu(z) = z * sigmoid(z) (NOT plain sigmoid).
+        float silu = z_val / (1.0f + expf(-z_val));
+        o_row[i] = normed * silu;
     }
 }
 

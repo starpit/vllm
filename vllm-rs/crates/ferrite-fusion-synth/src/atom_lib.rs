@@ -378,7 +378,16 @@ impl Atom for AffineQmvAtom {
         const device uint8_t*  __ws_iter = __ws;
         const device {t_scale}* __sc_iter = __sc;
         const device {t_scale}* __bi_iter = __bi;
-        for (int __k = 0; __k < (int)__hidden; __k += __block_size) {{
+        // Full blocks only. When __hidden is NOT a multiple of
+        // __block_size (e.g. Qwen2.5-0.5B hidden=896, block=512) the
+        // unconditional `__k < __hidden` loop over-reads the final
+        // partial block: for the last output row that read runs past the
+        // weight/scale buffers entirely (undefined memory → NaN, and
+        // 0*NaN = NaN poisons the row). Mirror MLX's qmv: iterate full
+        // blocks, then a bounded safe tail. `__k_full == __hidden` when
+        // aligned, so the tail below is a no-op for 3B / Qwen3.5 / Llama.
+        const int __k_full = (int)__hidden - ((int)__hidden % __block_size);
+        for (int __k = 0; __k < __k_full; __k += __block_size) {{
             float __sum = mk_load_vector<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread);
             for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
                 const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
@@ -390,6 +399,22 @@ impl Atom for AffineQmvAtom {
             __sc_iter += __block_size / {gs};
             __bi_iter += __block_size / {gs};
             __x_tg    += __block_size;
+        }}
+        // Bounded remainder tail (each lane dots only its valid K range,
+        // so no read runs past the weight / scale / x buffers).
+        {{
+            const int __remaining = clamp(
+                (int)__hidden - __k_full - (int)__simd_lid * __values_per_thread,
+                0, __values_per_thread);
+            if (__remaining > 0) {{
+                float __sum = mk_load_vector_safe<{t_act}, float, __values_per_thread, __bits>(__x_tg, __x_thread, __remaining);
+                for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
+                    const device uint8_t*  __wl = __ws_iter + __row * __in_vec_size_w;
+                    float __s = float(__sc_iter[__row * __in_vec_size_g]);
+                    float __b = float(__bi_iter[__row * __in_vec_size_g]);
+                    __result[__row] += mk_qdot_safe<float, __values_per_thread, __bits>(__wl, __x_thread, __s, __b, __sum, __remaining);
+                }}
+            }}
         }}
         for (int __row = 0; __row < MK_ROWS_PER_SIMDGROUP; __row++) {{
             __result[__row] = simd_sum(__result[__row]);

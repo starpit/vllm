@@ -62,6 +62,20 @@ pub struct RuntimeBindings {
     /// the worker's largest bucket's `bucket_m`; the pool writes
     /// the in-flight slice's content at the start of every forward.
     pub sample_indices: Buffer,
+    /// Per-layer GDN conv-state ring buffers (persistent f32 pool),
+    /// GLOBAL-layer-indexed like `gdn_state_ssm`. Non-linear (full-attn)
+    /// layers hold a dummy buffer that is never bound (the
+    /// `GatedDeltaNet` lowering only emits `GdnConvState` on linear
+    /// layers). Empty for non-hybrid arches.
+    pub gdn_state_conv: Vec<Buffer>,
+    /// Per-layer GDN recurrent (ssm) state buffers. Same indexing /
+    /// dummy / emptiness contract as [`Self::gdn_state_conv`].
+    pub gdn_state_ssm: Vec<Buffer>,
+    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence.
+    /// Shared storage; the pool overwrites `contents()` each forward.
+    pub gdn_state_indices: Buffer,
+    /// `[num_seqs]` u32 — per-sequence fresh flag. Shared storage.
+    pub gdn_is_fresh: Buffer,
 }
 
 impl RuntimeBindings {
@@ -82,6 +96,12 @@ impl RuntimeBindings {
             RuntimeBindingKind::NumTokensU32 => &self.num_tokens_u32,
             RuntimeBindingKind::NumSeqsU32 => &self.num_sample_rows_u32,
             RuntimeBindingKind::SampleIndices => &self.sample_indices,
+            RuntimeBindingKind::GdnConvState { layer } => {
+                &self.gdn_state_conv[layer.get() as usize]
+            }
+            RuntimeBindingKind::GdnSsmState { layer } => &self.gdn_state_ssm[layer.get() as usize],
+            RuntimeBindingKind::GdnStateIndices => &self.gdn_state_indices,
+            RuntimeBindingKind::GdnIsFresh => &self.gdn_is_fresh,
         }
     }
 }

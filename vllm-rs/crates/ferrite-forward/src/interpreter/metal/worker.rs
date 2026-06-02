@@ -415,6 +415,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
             r.insert(&runtime.cu_seqlens_q);
             r.insert(&runtime.seq_used_k);
             r.insert(&runtime.block_table);
+            // Gated-DeltaNet per-forward index buffers (hybrid arches:
+            // Qwen3.5 / Qwen3-Next). Same contract as the inputs above —
+            // the GDN conv1d/scan kernels bind them by baked gpuAddress in
+            // the ICB, never via an encoder `setBuffer`, so without an
+            // explicit residency entry Apple's lazy pager hands the GPU
+            // stale (zeroed) pages: the kernels then read `state_indices`
+            // as all-zero, routing EVERY sequence's recurrent state to
+            // slot 0 (so only the first sequence in a batch keeps its GDN
+            // state; the rest read/write slot 0 and inherit seq-0's
+            // answer). The factory allocates these unconditionally (a
+            // 16 KiB Shared buffer even for non-hybrid arches), so the
+            // insert is a harmless pin when no GDN command binds them.
+            r.insert(&runtime.gdn_state_indices);
+            r.insert(&runtime.gdn_is_fresh);
             r.commit();
         }
 
@@ -1174,12 +1188,30 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                     | WeightTensor::MoeSharedDownW
                     | WeightTensor::MoeSharedDownS
                     | WeightTensor::MoeSharedDownB
-                    | WeightTensor::MoeSharedExpertGate,
+                    | WeightTensor::MoeSharedExpertGate
+                    | WeightTensor::GdnConv1d
+                    | WeightTensor::GdnALog
+                    | WeightTensor::GdnDtBias
+                    | WeightTensor::GdnNorm,
                     _,
                 ) => {
                     return Err(WorkerError::WeightLookupFailed {
-                        reason: "Moe* WeightTensor variant requested against LinearLayer bundle — \
-                                 expected FusedMoe or SharedFusedMoe bundle",
+                        reason: "Moe*/Gdn* WeightTensor variant requested against LinearLayer bundle — \
+                                 expected FusedMoe / SharedFusedMoe / GatedDeltaNet bundle",
+                    });
+                }
+            }
+        }
+        WeightBundleKind::GatedDeltaNet => {
+            let l = weights.gated_delta_net_at(bucket, op_idx, slot, layer);
+            match which {
+                WeightTensor::GdnConv1d => l.conv1d,
+                WeightTensor::GdnALog => l.a_log,
+                WeightTensor::GdnDtBias => l.dt_bias,
+                WeightTensor::GdnNorm => l.norm,
+                _ => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "non-Gdn* WeightTensor requested against GatedDeltaNet bundle",
                     });
                 }
             }
@@ -1193,6 +1225,14 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
         WeightBundleKind::AffineQuantEmbedding => {
             let e = weights.affine_quant_embedding_at(bucket, op_idx, slot, layer);
             match which {
+                WeightTensor::GdnConv1d
+                | WeightTensor::GdnALog
+                | WeightTensor::GdnDtBias
+                | WeightTensor::GdnNorm => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "Gdn* WeightTensor requested against AffineQuantEmbedding bundle",
+                    });
+                }
                 WeightTensor::Weight => e.weight,
                 WeightTensor::AffineScales => e.scales,
                 WeightTensor::AffineBiases => e.affine_biases,
@@ -1281,7 +1321,11 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 | WeightTensor::AffineScales
                 | WeightTensor::AffineBiases
                 | WeightTensor::AffineLinearBias
-                | WeightTensor::Nvfp4Scales => {
+                | WeightTensor::Nvfp4Scales
+                | WeightTensor::GdnConv1d
+                | WeightTensor::GdnALog
+                | WeightTensor::GdnDtBias
+                | WeightTensor::GdnNorm => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "non-Moe WeightTensor variant requested against FusedMoe bundle",
                     });
@@ -1334,7 +1378,11 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 | WeightTensor::AffineScales
                 | WeightTensor::AffineBiases
                 | WeightTensor::AffineLinearBias
-                | WeightTensor::Nvfp4Scales => {
+                | WeightTensor::Nvfp4Scales
+                | WeightTensor::GdnConv1d
+                | WeightTensor::GdnALog
+                | WeightTensor::GdnDtBias
+                | WeightTensor::GdnNorm => {
                     return Err(WorkerError::WeightLookupFailed {
                         reason: "non-Moe WeightTensor variant requested against SharedFusedMoe \
                                  bundle",
@@ -1683,6 +1731,10 @@ mod tests {
             num_tokens_u32: alloc_buffer(device, 4),
             num_sample_rows_u32: alloc_buffer(device, 4),
             sample_indices: alloc_buffer(device, 16),
+            gdn_state_conv: ::std::vec::Vec::new(),
+            gdn_state_ssm: ::std::vec::Vec::new(),
+            gdn_state_indices: alloc_buffer(device, 16),
+            gdn_is_fresh: alloc_buffer(device, 16),
         }
     }
 

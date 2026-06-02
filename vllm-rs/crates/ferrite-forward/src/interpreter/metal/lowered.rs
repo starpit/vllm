@@ -159,6 +159,16 @@ pub enum KernelId {
     /// gate/up Linears are MLX-affine quantized (plan P12 branch
     /// (i)). Maps to `silu_mul_<dtype>` in `silu_mul.metallib`.
     SiluMul,
+    /// Qwen3.5 attention output gate `out = attn * sigmoid(gate)`. Maps
+    /// to `gate_apply_<dtype>` in `gate_apply.metallib`.
+    GateApply,
+    /// Qwen3.5 attention output-gate split: per-head deinterleave of the
+    /// doubled `q_proj` output into `query` + `gate`. Maps to
+    /// `gate_split_<dtype>` in `gate_split.metallib`.
+    GateSplit,
+    /// Qwen3.5 / Qwen3-Next Gated-DeltaNet linear-attention core. Maps to
+    /// the `gated_delta_*` kernels in `gated_delta.metallib`.
+    GatedDeltaNet,
     /// Sum-along-axis-0 reduce for the `[split_k, M, N]` intermediate
     /// `AffineQmmTSplitK` produces. Maps to
     /// `splitk_reduce_sum_<dtype>` in `quantized_splitk_reduce.metallib`.
@@ -560,6 +570,11 @@ pub enum WeightBundleKind {
     /// the lowering arm skips the shared-expert tail.
     #[cfg(feature = "metal")]
     SharedFusedMoe,
+    /// Qwen3.5 / Qwen3-Next Gated-DeltaNet per-layer weight bundle.
+    /// Resolves through `WeightAccessors::gated_delta_net_at(...)` to a
+    /// `&GatedDeltaNetLayer` (conv1d / A_log / dt_bias / norm); the
+    /// `WeightTensor::Gdn*` variants select which sub-tensor.
+    GatedDeltaNet,
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
@@ -647,6 +662,19 @@ pub enum WeightTensor {
     /// expert output. Stored as a `Linear` (not quantized) in MLX
     /// safetensors.
     MoeSharedExpertGate,
+    // ── Gated-DeltaNet bundle tensors ───────────────────────────────
+    //
+    // Valid only against `WeightBundleKind::GatedDeltaNet`. The worker
+    // resolves these against the `GatedDeltaNetLayer` struct returned by
+    // `WeightAccessors::gated_delta_net_at`.
+    /// Causal depthwise conv1d weight `[conv_dim, 1, kernel]` (on-disk dtype).
+    GdnConv1d,
+    /// Per-value-head log-decay base `A_log` `[num_v_heads]`.
+    GdnALog,
+    /// Per-value-head softplus bias `dt_bias` `[num_v_heads]`.
+    GdnDtBias,
+    /// Gated-RMSNorm weight `[head_v_dim]`.
+    GdnNorm,
 }
 
 /// Categories of buffers the worker rebinds per forward call.
@@ -696,6 +724,26 @@ pub enum RuntimeBindingKind {
     /// Read by the index-driven `gather_last_token`/`scatter_first_to_last_row`
     /// kernels — one row per sequence, in cu_seqlens_q order.
     SampleIndices,
+    /// Gated-DeltaNet conv-state ring for a linear-attention layer
+    /// (persistent f32 pool, mutated in place across forwards — the
+    /// non-paged sibling of `KvCacheK/V`). Resolved to the per-layer
+    /// `GdnStatePool` conv buffer.
+    GdnConvState {
+        layer: LayerId,
+    },
+    /// Gated-DeltaNet recurrent (ssm) state for a linear-attention layer
+    /// (persistent f32 pool, mutated in place across forwards).
+    GdnSsmState {
+        layer: LayerId,
+    },
+    /// `[num_seqs]` i32 — GDN state-pool slot id per batched sequence
+    /// (cu_seqlens order). Written per forward by the worker.
+    GdnStateIndices,
+    /// `[num_seqs]` u32 — 1 when the sequence is on its first (fresh)
+    /// forward; the GDN conv1d/scan kernels then treat the slot's state
+    /// as zero instead of reading stale recurrent state (the
+    /// "degeneration after N requests" guard). Written per forward.
+    GdnIsFresh,
 }
 
 /// One ICB command: kernel + dispatch shape + bindings.

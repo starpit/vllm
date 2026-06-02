@@ -587,6 +587,25 @@ impl Instruction {
                     F::RopeCosSin,
                 ],
             ),
+            Instruction::GatedDeltaNet(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer) => (
+                "GatedDeltaNet",
+                vec![
+                    F::Slot(qkv_slot),
+                    F::Slot(z_slot),
+                    F::Slot(a_slot),
+                    F::Slot(b_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                ],
+            ),
+            Instruction::GateSplit(qg_slot, q_slot, gate_slot) => (
+                "GateSplit",
+                vec![F::Slot(qg_slot), F::Slot(q_slot), F::Slot(gate_slot)],
+            ),
+            Instruction::GateApply(attn_slot, gate_slot, out_slot) => (
+                "GateApply",
+                vec![F::Slot(attn_slot), F::Slot(gate_slot), F::Slot(out_slot)],
+            ),
             Instruction::DeepSeekMoe(in_slot, out_slot, layer) => (
                 "DeepSeekMoe",
                 vec![

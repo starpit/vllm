@@ -625,7 +625,10 @@ fn lower_one<W: CanonicalParams>(
             ),
             constants: super::kernel_constants::EmbedConstants {
                 bucket_m: super::ids::BucketM(bucket_m),
-                q_size: super::ids::QSize(W::Q_SIZE as u32),
+                // Embedding-table row stride = residual-stream width =
+                // HIDDEN_SIZE (NOT Q_SIZE — they differ when head_dim !=
+                // hidden/num_heads, e.g. Qwen3.5 head_dim=256).
+                q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
             }
             .into(),
             // 1D dispatch over the `bucket_m` tokens; one thread per
@@ -693,6 +696,7 @@ fn lower_one<W: CanonicalParams>(
                 // per-head q_norm/k_norm (Qwen3) it's `W::HEAD_DIM`.
                 q_size: super::ids::QSize(*hidden_size),
                 rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                weight_offset: W::NORM_WEIGHT_OFFSET,
             }
             .into(),
             // Dispatch: `bucket_m * m_multiplier` threadgroups at
@@ -749,6 +753,7 @@ fn lower_one<W: CanonicalParams>(
                     // we plumb it through the field for uniformity.
                     q_size: super::ids::QSize(*hidden_size),
                     rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: W::NORM_WEIGHT_OFFSET,
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -1383,6 +1388,90 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Qwen3.5 attention output gate: out = attn * sigmoid(gate) ──
+        I::GateApply(attn_slot, gate_slot, out_slot) => {
+            let dtype = dequant_dtype_for::<W>();
+            // out is [M, num_heads * head_dim]; one thread per element,
+            // m_scaling rescales the X axis to the runtime token count.
+            let n = bucket_m * (W::NUM_Q_HEADS * W::HEAD_DIM);
+            LoweredCommand {
+                kernel: KernelId::GateApply,
+                library: "gate_apply",
+                function: gate_apply_static_name(dtype),
+                constants: super::kernel_constants::SiluMulConstants {
+                    n: super::ids::HiddenSize(n),
+                }
+                .into(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *attn_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *gate_slot,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Qwen3.5 attention output-gate split (per-head deinterleave) ──
+        I::GateSplit(qg_slot, q_slot, gate_slot) => {
+            let dtype = dequant_dtype_for::<W>();
+            // Each output is [M, num_heads * head_dim]; one thread per
+            // output element writes both the query and gate halves.
+            let n = bucket_m * (W::NUM_Q_HEADS * W::HEAD_DIM);
+            LoweredCommand {
+                kernel: KernelId::GateSplit,
+                library: "gate_split",
+                function: gate_split_static_name(dtype),
+                constants: super::kernel_constants::GateSplitConstants {
+                    n: super::ids::HiddenSize(n),
+                    head_dim: W::HEAD_DIM,
+                    num_heads: W::NUM_Q_HEADS,
+                }
+                .into(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *q_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *gate_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *qg_slot,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── MLX-affine int4 quantized embedding (P6) ─────────────
         //
         // `Instruction::AffineEmbed` replaces `Instruction::Embed`
@@ -1562,14 +1651,18 @@ fn lower_one<W: CanonicalParams>(
                 super::kernel_constants::FusedGateUpSiluMulDecodeConstants {
                     bucket_m: super::ids::BucketM(bucket_m),
                     intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
-                    q_size: super::ids::QSize(W::Q_SIZE as u32),
+                    // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
+                    // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
+                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
                 }
                 .into()
             } else {
                 super::kernel_constants::FusedGateUpSiluMulPrefillConstants {
                     bucket_m: super::ids::BucketM(bucket_m),
                     intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
-                    q_size: super::ids::QSize(W::Q_SIZE as u32),
+                    // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
+                    // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
+                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
                 }
                 .into()
             };
@@ -2742,6 +2835,232 @@ fn lower_one<W: CanonicalParams>(
             return Ok(cmds);
         }
 
+        // ── Qwen3.5 Gated-DeltaNet: conv1d → gating → scan → gated-RMSNorm ──
+        //
+        // One coarse op lowers to FOUR compute commands that pass f32
+        // intermediates through the bucket's `moe_scratch` (reused as
+        // generic op-scratch). The final `core` lands in the model-dtype
+        // arena `out_slot` (read by the out_proj gemm). Persistent
+        // conv/ssm state binds from `GdnStatePool` via Runtime bindings
+        // (the KV-cache pattern); per-forward slot indices + is_fresh
+        // come from the worker. `lower` supplies barrier_before=true for
+        // commands 1.. (intra-instruction RAW on conv_out/g/beta/o +
+        // the in-place state rings), so each stage sees the prior one's
+        // writes. Math is the golden-tested cpu_golden recurrence.
+        I::GatedDeltaNet(qkv_slot, z_slot, a_slot, b_slot, out_slot, layer) => {
+            use super::ids::{BucketM, LayerId};
+            use super::lowered::{MScaleAxis, MScaling};
+            let global_layer = *layer + layer_offset;
+            let layer_id = LayerId(global_layer);
+            let dtype = dequant_dtype_for::<W>();
+            let nk = W::GDN_NUM_K_HEADS;
+            let nv = W::GDN_NUM_V_HEADS;
+            let hk = W::GDN_HEAD_K_DIM;
+            let hv = W::GDN_HEAD_V_DIM;
+            let kernel = W::GDN_CONV_KERNEL;
+            let conv_dim = W::GDN_CONV_DIM as u32;
+            let value_dim = nv * hv;
+            let scale = (hk as f32).powf(-0.5);
+
+            let layout = GdnScratchLayout::compute(bucket_m, conv_dim, nv, value_dim);
+            *moe_scratch_bytes = (*moe_scratch_bytes).max(layout.total);
+
+            // The locator is identical for every weight in the bundle;
+            // `which` picks the sub-tensor.
+            let locator = WeightLocator {
+                bucket: tape_index,
+                op_idx: index as u32,
+                slot: 0,
+            };
+            let weight = |which: WeightTensor, binding_index: u8| Binding::Weight {
+                kind: WeightBundleKind::GatedDeltaNet,
+                which,
+                layer: layer_id,
+                locator,
+                binding_index,
+            };
+            let runtime = |kind: RuntimeBindingKind, binding_index: u8| Binding::Runtime {
+                kind,
+                binding_index,
+            };
+
+            let mut cmds = Vec::with_capacity(4);
+
+            // 1. Causal depthwise conv1d (+SiLU), varlen + stateful.
+            //    grid (num_seqs[set via seq_axis=X], ceil(conv_dim/tg_y), 1).
+            cmds.push(LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_conv1d_varlen",
+                function: gdn_conv1d_varlen_static_name(dtype),
+                constants: vec![
+                    ConstantValue::uint(0, conv_dim),
+                    ConstantValue::uint(1, kernel),
+                ],
+                dispatch: {
+                    let tg_y = conv_dim.clamp(1, THREADS_PER_GROUP);
+                    DispatchShape {
+                        threadgroups: (1, conv_dim.div_ceil(tg_y), 1),
+                        threads_per_threadgroup: (1, tg_y, 1),
+                        // bucket_m=1 no-ops the token scale; seq_axis SETS X = num_seqs.
+                        m_scaling: Some(MScaling {
+                            axis: MScaleAxis::X,
+                            bucket_m: BucketM(1),
+                            seq_axis: Some(MScaleAxis::X),
+                        }),
+                    }
+                },
+                bindings: vec![
+                    Binding::MoeScratch {
+                        binding_index: 0,
+                        byte_offset: layout.conv_out,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *qkv_slot,
+                        binding_index: 1,
+                    },
+                    weight(WeightTensor::GdnConv1d, 2),
+                    runtime(RuntimeBindingKind::GdnConvState { layer: layer_id }, 3),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 4),
+                    runtime(RuntimeBindingKind::GdnStateIndices, 5),
+                    runtime(RuntimeBindingKind::GdnIsFresh, 6),
+                ],
+                gemm_dims: None,
+            });
+
+            // 2. Input-dependent gating → g, beta (f32 scratch).
+            //    1D over [num_tokens · nv]; scales X with num_tokens.
+            cmds.push(LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_gating",
+                function: gdn_gating_static_name(dtype),
+                constants: vec![
+                    ConstantValue::uint(0, bucket_m * nv),
+                    ConstantValue::uint(1, nv),
+                ],
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(bucket_m * nv, THREADS_PER_GROUP);
+                    d.m_scaling = Some(MScaling {
+                        axis: MScaleAxis::X,
+                        bucket_m: BucketM(bucket_m),
+                        seq_axis: None,
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::MoeScratch {
+                        binding_index: 0,
+                        byte_offset: layout.g,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.beta,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *a_slot,
+                        binding_index: 2,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *b_slot,
+                        binding_index: 3,
+                    },
+                    weight(WeightTensor::GdnALog, 4),
+                    weight(WeightTensor::GdnDtBias, 5),
+                ],
+                gemm_dims: None,
+            });
+
+            // 3. Recurrent gated delta-rule scan → o (f32 scratch).
+            //    grid (ceil(hv/tgx), nv, num_seqs[set via seq_axis=Z]).
+            //    Always the _f32 instantiation (all I/O is f32 scratch).
+            cmds.push(LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_scan_varlen",
+                function: "gdn_scan_varlen_f32",
+                constants: vec![
+                    ConstantValue::uint(0, nk),
+                    ConstantValue::uint(1, nv),
+                    ConstantValue::uint(2, hk),
+                    ConstantValue::uint(3, hv),
+                    ConstantValue::float(4, scale),
+                ],
+                dispatch: {
+                    let tgx = hv.clamp(1, THREADS_PER_GROUP);
+                    DispatchShape {
+                        threadgroups: (hv.div_ceil(tgx), nv, 1),
+                        threads_per_threadgroup: (tgx, 1, 1),
+                        m_scaling: Some(MScaling {
+                            axis: MScaleAxis::Z,
+                            bucket_m: BucketM(1),
+                            seq_axis: Some(MScaleAxis::Z),
+                        }),
+                    }
+                },
+                bindings: vec![
+                    Binding::MoeScratch {
+                        binding_index: 0,
+                        byte_offset: layout.o,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.conv_out,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 2,
+                        byte_offset: layout.g,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 3,
+                        byte_offset: layout.beta,
+                    },
+                    runtime(RuntimeBindingKind::GdnSsmState { layer: layer_id }, 4),
+                    runtime(RuntimeBindingKind::CuSeqlensQ, 5),
+                    runtime(RuntimeBindingKind::GdnStateIndices, 6),
+                    runtime(RuntimeBindingKind::GdnIsFresh, 7),
+                ],
+                gemm_dims: None,
+            });
+
+            // 4. Gated RMSNorm → core (model-dtype arena out_slot).
+            //    One threadgroup per row [num_tokens · nv]; scales X.
+            cmds.push(LoweredCommand {
+                kernel: KernelId::GatedDeltaNet,
+                library: "gdn_rms_norm_gated",
+                function: gdn_rms_norm_gated_static_name(dtype),
+                constants: vec![
+                    ConstantValue::uint(0, hv),
+                    ConstantValue::uint(1, bucket_m * nv),
+                    ConstantValue::float(2, W::RMS_NORM_EPS),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m * nv, 1, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(MScaling {
+                        axis: MScaleAxis::X,
+                        bucket_m: BucketM(bucket_m),
+                        seq_axis: None,
+                    }),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::MoeScratch {
+                        binding_index: 1,
+                        byte_offset: layout.o,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *z_slot,
+                        binding_index: 2,
+                    },
+                    weight(WeightTensor::GdnNorm, 3),
+                ],
+                gemm_dims: None,
+            });
+
+            return Ok(cmds);
+        }
+
         // ── Metadata-only: no Metal dispatch ───────────────────────
         I::Reshape(_, _, _, _, _, _) | I::Alias(_, _) | I::Free(_) => {
             // These rebind / drop slots in the dispatcher's logical
@@ -2822,6 +3141,47 @@ fn silu_mul_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "silu_mul_f16",
         DequantDtype::Bf16 => "silu_mul_bf16",
+    }
+}
+
+fn gate_apply_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gate_apply_f16",
+        DequantDtype::Bf16 => "gate_apply_bf16",
+    }
+}
+
+fn gate_split_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gate_split_f16",
+        DequantDtype::Bf16 => "gate_split_bf16",
+    }
+}
+
+// ── Gated-DeltaNet kernel symbol pickers ──────────────────────────
+// The conv1d / gating / gated-RMSNorm kernels read model-dtype inputs
+// (`x`/`a`/`b`/`z`/weights) and write f32 scratch (or, for the final
+// RMSNorm, the model-dtype arena `out_slot`). The scan reads ALL-f32
+// scratch (conv_out/g/beta/ssm/o), so it is always the `_f32`
+// instantiation regardless of the model dtype.
+fn gdn_conv1d_varlen_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_conv1d_varlen_f16",
+        DequantDtype::Bf16 => "gdn_conv1d_varlen_bf16",
+    }
+}
+
+fn gdn_gating_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_gating_f16",
+        DequantDtype::Bf16 => "gdn_gating_bf16",
+    }
+}
+
+fn gdn_rms_norm_gated_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gdn_rms_norm_gated_f16",
+        DequantDtype::Bf16 => "gdn_rms_norm_gated_bf16",
     }
 }
 
@@ -3168,6 +3528,45 @@ struct MoeScratchLayout {
 
 fn align_256(n: u32) -> u32 {
     (n + 255) & !255
+}
+
+/// Per-bucket Gated-DeltaNet scratch layout. The four GDN sub-commands
+/// pass f32 intermediates between each other through the bucket's
+/// shared `moe_scratch` buffer (reused as generic op-scratch — a GDN
+/// layer and a MoE layer never run concurrently in the serialized
+/// tape, so the single buffer, sized to the max of both layouts, is
+/// safe). conv_out / g / beta / o are all f32; the final `core` lands
+/// in the model-dtype arena `out_slot`, not here. Regions are
+/// 256-byte aligned (Apple Silicon `MTLBuffer.offset` alignment).
+#[derive(Clone, Copy, Debug)]
+struct GdnScratchLayout {
+    conv_out: u32, // [bucket_m, conv_dim] f32  (conv1d out → scan in)
+    g: u32,        // [bucket_m, nv]       f32  (gating out → scan in)
+    beta: u32,     // [bucket_m, nv]       f32  (gating out → scan in)
+    o: u32,        // [bucket_m, value_dim] f32 (scan out → rms in)
+    total: u32,
+}
+
+impl GdnScratchLayout {
+    fn compute(bucket_m: u32, conv_dim: u32, nv: u32, value_dim: u32) -> Self {
+        const F32: u32 = 4;
+        let mut off = 0u32;
+        let conv_out = off;
+        off = align_256(off + bucket_m * conv_dim * F32);
+        let g = off;
+        off = align_256(off + bucket_m * nv * F32);
+        let beta = off;
+        off = align_256(off + bucket_m * nv * F32);
+        let o = off;
+        off = align_256(off + bucket_m * value_dim * F32);
+        Self {
+            conv_out,
+            g,
+            beta,
+            o,
+            total: off,
+        }
+    }
 }
 
 impl MoeScratchLayout {

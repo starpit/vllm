@@ -223,6 +223,47 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
         );
     }
 
+    // VL-wrapper prefix aliasing. MLX-community repacks store the text
+    // decoder under `language_model.model.<key>`, while the official VL
+    // checkpoints use `model.language_model.<key>` — the same logical
+    // tensor in a swapped on-disk ordering. A compiled ferrite variant
+    // bakes ONE ordering (from its `decoder_safetensors_prefix`), so
+    // without this a checkpoint in the other ordering fails to load
+    // (`weight not found: model.language_model.embed_tokens.weight`).
+    // Insert an alias under the swapped ordering so a single variant
+    // loads either layout. Cheap (clones an mmap-backed ref: Arc + a
+    // small shape Vec) and collision-free (no checkpoint ships both
+    // orderings of the same tensor; we skip if the target already exists).
+    let alias_pairs: Vec<(String, CpuTensorRef)> = tensors
+        .iter()
+        .filter_map(|(name, t)| {
+            let alt = name
+                .strip_prefix("language_model.model.")
+                .map(|rest| format!("model.language_model.{rest}"))
+                .or_else(|| {
+                    name.strip_prefix("model.language_model.")
+                        .map(|rest| format!("language_model.model.{rest}"))
+                })?;
+            if tensors.contains_key(&alt) {
+                return None;
+            }
+            Some((
+                alt,
+                CpuTensorRef {
+                    mmap: t.mmap.clone(),
+                    data_offset: t.data_offset,
+                    size_bytes: t.size_bytes,
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                    owned: t.owned.clone(),
+                },
+            ))
+        })
+        .collect();
+    for (alt, t) in alias_pairs {
+        tensors.insert(alt, t);
+    }
+
     tracing::info!(
         "Parsed shard {}: {} tensors in {:?} (open+mmap {:?}, madvise {:?}, deserialize {:?}, iterate {:?})",
         path.display(),
@@ -1204,6 +1245,28 @@ impl GpuWeights {
         Ok(unsafe { GpuTensor::new(gpu_ptr, shape, dtype) })
     }
 
+    /// Take a tensor and upload it to GPU as **F32**, upcasting F16/BF16
+    /// on the CPU first. Use for kernel bindings that are typed
+    /// `const device float*` but whose on-disk dtype varies across
+    /// checkpoint conventions — e.g. the Gated-DeltaNet gated-RMSNorm
+    /// `linear_attn.norm.weight`, which the official Qwen3.5 checkpoint
+    /// ships as F32 but the `mlx-community/*-MLX-4bit` repack ships as
+    /// BF16. Without the upcast the kernel reads 2-byte BF16 as 4-byte
+    /// F32 → garbage → NaN. Upcast is lossless, so the F32-on-disk path
+    /// is byte-identical to before.
+    pub fn take_as_f32(&mut self, name: &str) -> Result<GpuTensor> {
+        let shape = self
+            .tensors
+            .get(name)
+            .map(|r| r.shape.clone())
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+        let f32_data = self.take_to_cpu_f32(name)?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+        };
+        self.alloc_packed_from_host(bytes, &shape, DType::F32)
+    }
+
     /// Try to take a pre-cast entry for the given tensor name. CUDA-only.
     #[cfg(feature = "cuda")]
     fn take_precast(&self, name: &str) -> Option<PrecastEntry> {
@@ -1232,17 +1295,21 @@ impl GpuWeights {
                     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elems) };
                 result.extend_from_slice(src);
             }
+            // Unaligned byte reads: mmap'd safetensors tensors are NOT
+            // guaranteed 2-byte aligned (a tensor can start at an odd
+            // offset after an odd-sized neighbor), so reinterpreting the
+            // raw pointer as `*const f16/bf16` trips the debug-build
+            // alignment precondition → abort. `from_le_bytes` over a
+            // stack-copied `[u8; 2]` is alignment-free.
             DType::F16 => {
-                let src = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const half::f16, num_elems)
-                };
-                result.extend(src.iter().map(|v| v.to_f32()));
+                for chunk in data[..num_elems * 2].chunks_exact(2) {
+                    result.push(half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+                }
             }
             DType::BF16 => {
-                let src = unsafe {
-                    std::slice::from_raw_parts(data.as_ptr() as *const half::bf16, num_elems)
-                };
-                result.extend(src.iter().map(|v| v.to_f32()));
+                for chunk in data[..num_elems * 2].chunks_exact(2) {
+                    result.push(half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32());
+                }
             }
             other => anyhow::bail!("take_to_cpu_f32: unsupported dtype {other}"),
         }

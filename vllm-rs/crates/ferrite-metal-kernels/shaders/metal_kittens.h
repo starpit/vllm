@@ -97,6 +97,36 @@ inline U mk_qdot(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// mk_qdot_safe — quantized.h qdot_safe (bits==4/8). Bounded variant of
+// mk_qdot: dots only the first `N` (of values_per_thread) weight values,
+// so the partial tail block of an unaligned `in_vec_size` never reads
+// past the weight buffer. `x_thread[N..]` must already be zeroed by
+// mk_load_vector_safe — the loop simply stops at `N`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename U, int values_per_thread, int bits>
+inline U mk_qdot_safe(
+    const device uint8_t* w,
+    const thread U* x_thread,
+    U scale, U bias, U sum, int N)
+{
+    U accum = 0;
+    if (bits == 4) {
+        const device uint16_t* ws = (const device uint16_t*)w;
+        for (int i = 0; i < (N / 4); i++) {
+            accum += (x_thread[4*i]   * (ws[i] & 0x000f) +
+                      x_thread[4*i+1] * (ws[i] & 0x00f0) +
+                      x_thread[4*i+2] * (ws[i] & 0x0f00) +
+                      x_thread[4*i+3] * (ws[i] & 0xf000));
+        }
+    } else if (bits == 8) {
+        for (int i = 0; i < N; i++)
+            accum += x_thread[i] * w[i];
+    }
+    return scale * accum + sum * bias;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // mk_qmv_fast
 //
 // Core of qmv_fast_impl (quantized.h:749-814). Computes MK_ROWS_PER_SIMDGROUP
@@ -238,6 +268,37 @@ inline U mk_load_vector(const threadgroup T* x, thread U* x_thread) {
             sum += x[i];
             x_thread[i] = x[i];
         }
+    }
+    return sum;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mk_load_vector_safe — threadgroup-source, bounded (quantized.h
+// load_vector_safe). Reads only the first `N` activation values and
+// zeros `x_thread[N..values_per_thread]`, so a partial tail block of an
+// unaligned `in_vec_size` never reads past the staged `x` row (and the
+// zeroed lanes make mk_qdot_safe's omitted weight reads a true no-op).
+// ─────────────────────────────────────────────────────────────────────────────
+
+template <typename T, typename U, int values_per_thread, int bits>
+inline U mk_load_vector_safe(const threadgroup T* x, thread U* x_thread, int N) {
+    U sum = 0;
+    if (bits == 4) {
+        for (int i = 0; i < N; i += 4) {
+            sum += x[i] + x[i+1] + x[i+2] + x[i+3];
+            x_thread[i]   = x[i];
+            x_thread[i+1] = x[i+1] / 16.0f;
+            x_thread[i+2] = x[i+2] / 256.0f;
+            x_thread[i+3] = x[i+3] / 4096.0f;
+        }
+    } else if (bits == 8) {
+        for (int i = 0; i < N; i++) {
+            sum += x[i];
+            x_thread[i] = x[i];
+        }
+    }
+    for (int i = N; i < values_per_thread; i++) {
+        x_thread[i] = 0;
     }
     return sum;
 }

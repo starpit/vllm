@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: Apache-2.0
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
+//! Qwen3.5 / Qwen3.6 (`Qwen3_5ForConditionalGeneration` text decoder) — a
+//! hybrid of Gated-DeltaNet linear-attention layers and periodic full-attention
+//! layers (`full_attention_interval = 4`; full layers at index `l % 4 == 3`).
+//! Dense SwiGLU MLP for the 0.8B bring-up (`mlp_only_layers = []`, no MoE).
+//!
+//! Transcribed 1:1 from `transformers` `modeling_qwen3_5.py`:
+//!   * **Linear-attention layer** (`Qwen3_5GatedDeltaNet`): four separate input
+//!     projections (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`) feed
+//!     the coarse `gated_delta_net` op (causal conv1d+SiLU → split q/k/v →
+//!     gating → recurrent delta-rule scan → gated RMSNorm), then `out_proj`.
+//!     The op reads the non-paged conv/ssm state from `ForwardCtx::gdn_state`.
+//!   * **Full-attention layer** (`Qwen3_5Attention`): `attn_output_gate=True`,
+//!     so `q_proj` is DOUBLED. `gate_split` deinterleaves the per-head
+//!     `[query | gate]` blocks; `q`/`k` get per-head RMSNorm; partial RoPE
+//!     (`partial_rotary_factor = 0.25`); standard GQA attention; the output is
+//!     gated by `* sigmoid(gate)` before `o_proj`.
+//!
+//! On-disk text weights live under `model.language_model.*` (set via
+//! `decoder_safetensors_prefix` in the config); `tie_word_embeddings=True` so
+//! `lm_head` shares `embed_tokens` (the loader handles the tie). Vision
+//! (`model.visual.*`) and MTP (`mtp.*`) weights are ignored — text-only path.
+//!
+//! Qwen3.5 ≡ Qwen3.6 (identical config shapes); the MoE flagship
+//! (35B-A3B) is a follow-up that swaps the dense MLP for `moe_block`.
+
+use ferrite_forward_macro::forward;
+
+#[forward(
+    workloads = [1, 8, 64, 512, 4096],
+)]
+fn qwen3_5() {
+    hidden_states = embed(input_ids, embed_tokens);
+    for layer in 0..num_hidden_layers {
+        normed = rmsnorm(hidden_states, input_layernorm[layer]);
+
+        // Token mixer: GDN linear attention for `l % interval != 3`,
+        // full attention (with output gate) for the periodic `l % interval == 3`.
+        if layer % full_attention_interval != 3 {
+            // ── Gated-DeltaNet linear attention ─────────────────────
+            qkv = gemm(normed, linear_attn.in_proj_qkv[layer]);
+            z = gemm(normed, linear_attn.in_proj_z[layer]);
+            a = gemm(normed, linear_attn.in_proj_a[layer]);
+            b = gemm(normed, linear_attn.in_proj_b[layer]);
+            core = gated_delta_net(qkv, z, a, b, linear_attn[layer]);
+            mixer_out = gemm(core, linear_attn.out_proj[layer]);
+        } else {
+            // ── Full attention with sigmoid output gate ─────────────
+            // q_proj is doubled; gate_split deinterleaves per-head
+            // [query | gate]. q/k get per-head RMSNorm; partial RoPE.
+            qg = gemm(normed, self_attn.q_proj[layer]);
+            (q, gate) = gate_split(qg);
+            q = rmsnorm(q, self_attn.q_norm[layer]);
+            k = gemm(normed, self_attn.k_proj[layer]);
+            k = rmsnorm(k, self_attn.k_norm[layer]);
+            v = gemm(normed, self_attn.v_proj[layer]);
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            attn = attention(q, k, v, kv_cache[layer], block_table);
+            // Sigmoid output gate: attn * sigmoid(gate), fused (bare `*` /
+            // `sigmoid` aren't DSL-callable — Silu/Mul are synthesis-only).
+            attn = gate_apply(attn, gate);
+            mixer_out = gemm(attn, self_attn.o_proj[layer]);
+        }
+        hidden_states = add(mixer_out, hidden_states);
+
+        // Dense SwiGLU MLP.
+        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+        mlp_out = gemm(
+            silu(gemm(normed2, mlp.gate_proj[layer])) * gemm(normed2, mlp.up_proj[layer]),
+            mlp.down_proj[layer],
+        );
+        hidden_states = add(mlp_out, hidden_states);
+    }
+    normed = rmsnorm(hidden_states, norm);
+    logits = gemm(normed, lm_head);
+}

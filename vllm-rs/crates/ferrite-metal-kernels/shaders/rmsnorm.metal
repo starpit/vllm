@@ -56,9 +56,12 @@ kernel void rmsnorm_f16(
 /// in via `[[function_constant(N)]]`, no runtime constants buffer.
 /// Index assignments must match `ferrite-forward::interpreter::metal::pipelines`:
 ///   0 = M (uint), 1 = N/HIDDEN_SIZE (uint), 2 = EPS (float).
-constant uint  RMSNORM_M           [[function_constant(0)]];
-constant uint  RMSNORM_HIDDEN_SIZE [[function_constant(1)]];
-constant float RMSNORM_EPS         [[function_constant(2)]];
+constant uint  RMSNORM_M             [[function_constant(0)]];
+constant uint  RMSNORM_HIDDEN_SIZE   [[function_constant(1)]];
+constant float RMSNORM_EPS           [[function_constant(2)]];
+// Zero-centered (Gemma / Qwen3.5) RMSNorm: effective gain = weight + offset.
+// `offset` = 1.0 for `(1 + weight)` arches, 0.0 for plain RMSNorm.
+constant float RMSNORM_WEIGHT_OFFSET [[function_constant(3)]];
 
 // Template form (`<T_act, T_scale>`): same in-register cast pattern as
 // the affine quant kernels (`shaders/quantized_*.metal`). The kernel
@@ -106,7 +109,7 @@ template <typename T_act, typename T_scale>
 
     for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
         float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
-        float w   = float(weight[i]);
+        float w   = float(weight[i]) + RMSNORM_WEIGHT_OFFSET;
         output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act((val / rms) * w);
     }
 }

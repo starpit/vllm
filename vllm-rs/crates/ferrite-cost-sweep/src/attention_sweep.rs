@@ -504,13 +504,9 @@ fn bench_cell(
 
         // oaccum / lseaccum sized for FA3_NUM_SPLITS x h x m x hdim
         // (matches the shim's per-call alloc shape).
-        let oaccum_bytes = FA3_NUM_SPLITS as usize
-            * num_qo_heads as usize
-            * m as usize
-            * head_dim as usize
-            * 4;
-        let lseaccum_bytes =
-            FA3_NUM_SPLITS as usize * num_qo_heads as usize * m as usize * 4;
+        let oaccum_bytes =
+            FA3_NUM_SPLITS as usize * num_qo_heads as usize * m as usize * head_dim as usize * 4;
+        let lseaccum_bytes = FA3_NUM_SPLITS as usize * num_qo_heads as usize * m as usize * 4;
         let oaccum = gpu_alloc_zeros(oaccum_bytes);
         let lseaccum = gpu_alloc_zeros(lseaccum_bytes);
 

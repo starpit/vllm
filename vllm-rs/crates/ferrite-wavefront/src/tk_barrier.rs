@@ -292,8 +292,23 @@ pub struct Barrier<Kind, Expected, Phase, Arrived>(
     PhantomData<(fn() -> Kind, fn() -> Expected, fn() -> Phase, fn() -> Arrived)>,
 );
 
-impl<K, E, P, A> Default for Barrier<K, E, P, A> {
-    fn default() -> Self {
+impl<K, E, P, A> Barrier<K, E, P, A> {
+    /// Crate-internal constructor for typestate transitions (`arrive`,
+    /// `wait`). Only callable from inside this module — external code
+    /// must go through [`Barrier::init`] to obtain the round-0 handle,
+    /// which enforces init-once-per-(kind, slot) at the type level
+    /// (init returns `Barrier<K, E, P0, Z>` only — any subsequent
+    /// state must be reached by transitioning the existing handle).
+    pub(crate) fn fresh_internal() -> Self {
+        Self(PhantomData)
+    }
+
+    /// Test-only constructor for building partial-state handles in
+    /// substrate self-tests. Production code MUST use [`Barrier::init`]
+    /// — `Default` is intentionally not implemented to enforce
+    /// init-once-per-(kind, slot).
+    #[cfg(test)]
+    pub fn fresh_for_test() -> Self {
         Self(PhantomData)
     }
 }
@@ -341,7 +356,7 @@ impl<K: BarrierKind, E: count::Nat> Barrier<K, E, P0, count::Z> {
                 page_id = page_id,
                 expected = E::VAL,
             ),
-            handle: Self::default(),
+            handle: Self::fresh_internal(),
         }
     }
 }
@@ -377,7 +392,7 @@ where
                 field = K::FIELD,
                 page_id = page_id,
             ),
-            handle: Barrier::default(),
+            handle: Barrier::fresh_internal(),
         }
     }
 }
@@ -572,7 +587,7 @@ where
                 field = K::FIELD,
                 page_id = page_id,
             ),
-            handle: Barrier::default(),
+            handle: Barrier::fresh_internal(),
         }
     }
 }
@@ -646,7 +661,7 @@ where
                 page_id = page_id,
                 phase = P::VAL,
             ),
-            handle: Barrier::default(),
+            handle: Barrier::fresh_internal(),
         }
     }
 }
@@ -734,6 +749,49 @@ impl<const R: u32, const C: u32, const E: u32> LoadDescriptor<R, C, E, DynamicOf
     }
 }
 
+// ── ValidSlotId — slot-id < NUM_PAGES at the type level ────────────
+//
+// The kernel scaffold declares `__shared__ kittens::semaphore
+// page_ready[NUM_PAGES]` etc. (NUM_PAGES = 13 in the current Phase 7
+// scaffold). A slot id ≥ NUM_PAGES would index out of bounds — the
+// emit would compile in nvcc as "valid C++" but the kernel would
+// access uninitialized smem (or fault).
+//
+// `ValidSlotId<N>` is a sealed witness implemented only for `N ∈
+// 0..NUM_PAGES`. `Page<SLOT_ID>` and the typed barrier methods that
+// take a `page_id` const generic require `Const<SLOT_ID>:
+// ValidSlotId<NUM_PAGES>` — out-of-bounds is a compile error.
+//
+// NUM_PAGES is currently 13 per `tk_warp_ir::NUM_PAGES`. If that
+// constant changes, the impls below must also change (mechanical —
+// the build will fail if we forget).
+
+mod slot_id_witness {
+    /// Sealed witness: `Const<S>` is a valid slot id.
+    pub trait ValidSlotId {}
+    /// Const-marker struct so we can name `Const<S>: ValidSlotId`.
+    pub struct Const<const S: u8>;
+
+    // 13 impls — one per valid slot. NUM_PAGES = 13 today; if
+    // tk_warp_ir::NUM_PAGES grows, add more impls here.
+    impl ValidSlotId for Const<0> {}
+    impl ValidSlotId for Const<1> {}
+    impl ValidSlotId for Const<2> {}
+    impl ValidSlotId for Const<3> {}
+    impl ValidSlotId for Const<4> {}
+    impl ValidSlotId for Const<5> {}
+    impl ValidSlotId for Const<6> {}
+    impl ValidSlotId for Const<7> {}
+    impl ValidSlotId for Const<8> {}
+    impl ValidSlotId for Const<9> {}
+    impl ValidSlotId for Const<10> {}
+    impl ValidSlotId for Const<11> {}
+    impl ValidSlotId for Const<12> {}
+    // SLOT_ID = 13 has no impl → Const<13>: ValidSlotId is unsatisfiable.
+}
+
+pub use slot_id_witness::{Const as SlotIdConst, ValidSlotId};
+
 // ── Page session type ───────────────────────────────────────────────
 //
 // A page slot walks a lifecycle:
@@ -786,13 +844,19 @@ pub mod status {
 /// next state is returned. The handle is zero-sized.
 pub struct Page<const SLOT_ID: u8, Phase, Status>(PhantomData<(Phase, Status)>);
 
-impl<const SLOT_ID: u8, P: PhaseTag, S> Default for Page<SLOT_ID, P, S> {
+impl<const SLOT_ID: u8, P: PhaseTag, S> Default for Page<SLOT_ID, P, S>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     fn default() -> Self {
         Self(PhantomData)
     }
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Empty> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Empty>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Loader acquires the slot for round R: waits on `Consumed`
     /// barrier (1 expected arrive, the previous round's storer).
     /// Returns the slot in `Loading` state and the flipped Consumed
@@ -833,7 +897,10 @@ impl OffsetKindAllowedIn<P1> for DynamicOffset {}
 impl<Start: PhaseTag> OffsetKindAllowedIn<LoopPhase<Start>> for DynamicOffset {}
 impl OffsetKindAllowedIn<RuntimePhase> for DynamicOffset {}
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Loading> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Loading>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Loader issues TMA `expect_bytes` + `load_async` from a typed
     /// [`LoadDescriptor`]. The barrier auto-arrives via
     /// `mbarrier::complete_tx::bytes`. State advances to `Ready`.
@@ -920,9 +987,23 @@ pub mod _compile_fail_proofs {
     /// // is the compile_fail above.)
     /// ```
     pub fn _doc_anchor() {}
+
+    /// Slot id 13 is out of bounds (NUM_PAGES = 13, valid IDs 0..12):
+    /// compile error.
+    /// ```compile_fail
+    /// use ferrite_wavefront::tk_barrier::*;
+    /// use ferrite_wavefront::tk_barrier::status::*;
+    /// // Const<13>: ValidSlotId has no impl — `Page<13, _, _>` cannot
+    /// // be constructed.
+    /// let _ = Page::<13, P0, Empty>::default();
+    /// ```
+    pub fn _doc_anchor_slot_oob() {}
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Ready> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Ready>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Consumer waits on Ready (1 expected arrive, from TMA). State
     /// advances to `Computing` and the Ready barrier flips parity.
     pub fn consumer_acquire(
@@ -937,7 +1018,10 @@ impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Ready> {
     }
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Computing> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Computing>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Consumer's compute body has issued the right number of arrives
     /// on the Done barrier — the typed `Barrier<Done, _, P, N>`
     /// parameter proves it (Arrived ≡ Expected). State advances to
@@ -960,7 +1044,10 @@ impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Computing> {
     }
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Done> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Done>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Storer issued `tma::store_async` + commit + wait. State
     /// advances to `Storing`. (No emit — the caller's store is
     /// already in the IR.)
@@ -969,7 +1056,10 @@ impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Done> {
     }
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Storing> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Storing>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Storer arrives on Consumed. State advances to `Consumed`.
     pub fn storer_done(
         self,
@@ -983,7 +1073,10 @@ impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Storing> {
     }
 }
 
-impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Consumed> {
+impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Consumed>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Round complete. Slot is reusable at the next phase.
     /// Returning a `Page<_, P::Flip, Empty>` means the next
     /// `loader_acquire` must wait on a Consumed barrier at `P::Flip`
@@ -1035,7 +1128,7 @@ where
                 page_id = page_id,
                 parity = parity_expr,
             ),
-            handle: Barrier::default(),
+            handle: Barrier::fresh_internal(),
         }
     }
 }
@@ -1094,7 +1187,10 @@ where
 
 // ── Static → Loop phase entry ───────────────────────────────────────
 
-impl<const SLOT_ID: u8, P: PhaseTag, S> Page<SLOT_ID, P, S> {
+impl<const SLOT_ID: u8, P: PhaseTag, S> Page<SLOT_ID, P, S>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Enter a loop body: convert the slot's static phase `P` to
     /// `LoopPhase<P>`. The slot's status is unchanged. After the
     /// loop ([`Page::exit_loop_runtime`]), the phase becomes
@@ -1104,7 +1200,10 @@ impl<const SLOT_ID: u8, P: PhaseTag, S> Page<SLOT_ID, P, S> {
     }
 }
 
-impl<const SLOT_ID: u8, Start: PhaseTag, S> Page<SLOT_ID, LoopPhase<Start>, S> {
+impl<const SLOT_ID: u8, Start: PhaseTag, S> Page<SLOT_ID, LoopPhase<Start>, S>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
     /// Exit a loop body: the slot's actual phase is now `Start ^ (N
     /// & 1)` for the runtime `N` iterations. The substrate marks it
     /// [`RuntimePhase`] — the next op must use runtime-parity waits.
@@ -1342,7 +1441,7 @@ mod tests {
         // but for test simplicity, we construct it directly here at
         // the slot's CURRENT parity (P0 — the page is still in round
         // 0; complete_round flips parity at the very end).
-        let consumed_for_storer = Barrier::<Consumed, N1, P0, Z>::default();
+        let consumed_for_storer = Barrier::<Consumed, N1, P0, Z>::fresh_for_test();
         let (page, _consumed_after_arrive) = page.storer_done(consumed_for_storer);
 
         // Round complete; slot returns to Empty at P::Flip = P1.
@@ -1378,14 +1477,14 @@ mod tests {
         // LoopPhase<P0> with E=N1 (1 storer arrive expected).
         // Init: Arrived=N1 (loader's wait succeeds because the
         // previous iter's storer arrive bumped Arrived to N1).
-        let consumed_in: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::default();
+        let consumed_in: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::fresh_for_test();
 
         // Loader waits Consumed in the loop. Emits runtime parity.
         let _consumed_after_wait = consumed_in.wait_in_loop(K_SLOT, 1, "__kv_i");
 
         // For substrate correctness: the per-iter Done barrier with
         // E=N16, A=N16 is the proof that all 16 consumers arrived.
-        let done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::default();
+        let done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::fresh_for_test();
         let _done_after_wait = done_armed.wait_in_loop(K_SLOT, 16, "__kv_i");
 
         // Exit the loop: LoopPhase<P0> → RuntimePhase. The next op
@@ -1440,13 +1539,13 @@ mod tests {
         // load_async (TMA arrives Ready). Page advances Empty →
         // Loading → Ready.
         let q_page = Page::<Q_SLOT, P0, status::Empty>::default();
-        let q_consumed_pre: Barrier<Consumed, N1, P0, N1> = Barrier::default();
+        let q_consumed_pre: Barrier<Consumed, N1, P0, N1> = Barrier::fresh_for_test();
         let (q_page, _q_consumed_after_wait) = q_page.loader_acquire(q_consumed_pre);
         let q_page = q_page.loader_done();
 
         // Consumer: wait Ready (TMA-armed). Init softmax compute (no
         // arrive Done — Q's Done waits until end of op).
-        let q_ready_armed: Barrier<Ready, N1, P0, N1> = Barrier::default();
+        let q_ready_armed: Barrier<Ready, N1, P0, N1> = Barrier::fresh_for_test();
         let (q_page, _q_ready_after_wait) = q_page.consumer_acquire(q_ready_armed);
         // Page is in Computing state; the KV loop runs while we hold
         // it. (The substrate doesn't model this "consumer holds Q
@@ -1463,21 +1562,21 @@ mod tests {
         let v_page_loop = Page::<V_SLOT, P0, status::Empty>::default().enter_loop();
 
         // K-iter loader: wait Consumed (in loop), load (TMA arrives).
-        let k_consumed_armed: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::default();
+        let k_consumed_armed: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::fresh_for_test();
         let _ = k_consumed_armed.wait_in_loop(K_SLOT, 1, "__kv_i");
         // K-iter consumer: wait Ready, compute (qkt softmax step),
         // arrive Done × 16.
-        let k_ready_armed: Barrier<Ready, N1, LoopPhase<P0>, N1> = Barrier::default();
+        let k_ready_armed: Barrier<Ready, N1, LoopPhase<P0>, N1> = Barrier::fresh_for_test();
         let _ = k_ready_armed.wait_in_loop(K_SLOT, 1, "__kv_i");
-        let k_done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::default();
+        let k_done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::fresh_for_test();
         let _ = k_done_armed.wait_in_loop(K_SLOT, 16, "__kv_i");
         // K-iter storer: wait Done (already done above), arrive Consumed.
         // V-iter same shape.
-        let v_consumed_armed: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::default();
+        let v_consumed_armed: Barrier<Consumed, N1, LoopPhase<P0>, N1> = Barrier::fresh_for_test();
         let _ = v_consumed_armed.wait_in_loop(V_SLOT, 1, "__kv_i");
-        let v_ready_armed: Barrier<Ready, N1, LoopPhase<P0>, N1> = Barrier::default();
+        let v_ready_armed: Barrier<Ready, N1, LoopPhase<P0>, N1> = Barrier::fresh_for_test();
         let _ = v_ready_armed.wait_in_loop(V_SLOT, 1, "__kv_i");
-        let v_done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::default();
+        let v_done_armed: Barrier<Done, N16, LoopPhase<P0>, N16> = Barrier::fresh_for_test();
         let _ = v_done_armed.wait_in_loop(V_SLOT, 16, "__kv_i");
 
         // After the loop: K and V slots in RuntimePhase.

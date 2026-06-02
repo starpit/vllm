@@ -26,6 +26,7 @@ pub mod mega;
 pub mod partition;
 pub mod region;
 pub mod region_schedule;
+pub mod routing;
 pub mod scheduler;
 pub mod subtile;
 pub mod subtile_ir;

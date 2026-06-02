@@ -389,25 +389,58 @@ pub mod tk20 {
     /// gain weight row. `hidden`: row width. `eps`: rms epsilon
     /// literal.
     pub fn rmsnorm_consumer_body(x_id: u8, w_id: u8, hidden: u32, eps: f32) -> String {
+        // Phase 10: replace the per-warp `__shfl_xor_sync` butterfly
+        // squared-sum with the Phase-8-style TK 2.0 register-vector
+        // reduction (`warp::load → warp::copy → warp::mul →
+        // warp::sum`) over K_TILE=128 chunks. Hidden=2048 → 16 inner
+        // iters; per-warp register footprint stays well under the
+        // 224-reg consumer budget.
+        //
+        // The second pass (apply `scale * w` and write back to
+        // `__x_smem` in-place) stays per-thread — no shfl involved
+        // there; the lane-strided writeback maps naturally to the
+        // in-place x_smem store and avoids the rv→bf→sv store dance
+        // that would require a scratch sv (no rv→sv-with-conversion
+        // primitive in TK 2.0; would need rv_fl → rv_bf via copy
+        // then `kittens::warp::store(sv, rv)`).
+        const K_TILE: u32 = 128;
+        debug_assert_eq!(
+            hidden % K_TILE,
+            0,
+            "rmsnorm_consumer_body: hidden={hidden} must be a multiple of K_TILE={K_TILE}"
+        );
+        let k_blocks = hidden / K_TILE;
+
+        let x_sv_decl = decl_sv_view_bf("__x_sv", &format!("page_buf[{x_id}]"), hidden);
+        let x_rv_bf_decl = decl_rv_bf("__x_rv_bf", K_TILE);
+        let x_rv_fl_decl = decl_rv_fl("__x_rv_fl", K_TILE);
+        let load_x = warp_load_rv_from_sv(
+            "__x_rv_bf",
+            "__x_sv.template subvec<128>(__k_i)",
+        );
+        let copy_x = warp_copy_rv("__x_rv_fl", "__x_rv_bf");
+        let mul_xx = warp_mul_rv("__x_rv_fl", "__x_rv_fl", "__x_rv_fl");
+        let sum_expr = warp_sum_rv("__x_rv_fl");
+
         format!(
             r#"
             // tk_warp_ir RmsNorm — RMS reduce + scale + apply weight (consumer warp 0)
             using T_act = __nv_bfloat16;
             auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
             auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
+            {x_sv_decl}
             if (__consumer_idx == 0) {{
                 const unsigned int __hidden = {hidden}u;
                 const float __eps = {eps:?}f;
                 const int __lane = static_cast<int>(threadIdx.x & 31);
                 float __sumsq = 0.0f;
-                for (unsigned int __i = static_cast<unsigned int>(__lane);
-                     __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__x_smem[__i]);
-                    __sumsq += __v * __v;
-                }}
-                #pragma unroll
-                for (int __o = 16; __o > 0; __o >>= 1) {{
-                    __sumsq += __shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o);
+                for (int __k_i = 0; __k_i < {k_blocks}; ++__k_i) {{
+                    {x_rv_bf_decl}
+                    {x_rv_fl_decl}
+                    {load_x}
+                    {copy_x}
+                    {mul_xx}
+                    __sumsq += {sum_expr};
                 }}
                 const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
                 for (unsigned int __i = static_cast<unsigned int>(__lane);
@@ -2324,25 +2357,32 @@ mod tests {
     }
 
     #[test]
-    fn tk20_rmsnorm_consumer_body_emits_legacy_compatible_cuda() {
-        // Phase 1 typed atom — emit must be byte-identical to the
-        // legacy `tk_lower::rmsnorm_compute_body` so the existing
-        // `rmsnorm_kernel_matches_cpu_golden` test passes unchanged
-        // when FERRITE_NEW_RMSNORM is set.
+    fn tk20_rmsnorm_consumer_body_emits_tk20_register_vector_reduce() {
+        // Phase 10: replace the per-warp shfl butterfly with TK 2.0
+        // register-vector reduction over K_TILE=128 chunks.
         let body = tk20::rmsnorm_consumer_body(0, 1, 2048, 1.0e-5);
-        // Spot-check the load-bearing CUDA fragments.
         assert!(body.contains("auto* __x_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
         assert!(body.contains("auto* __w_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+        assert!(body
+            .contains("kittens::sv_bf<2048>& __x_sv = *reinterpret_cast<kittens::sv_bf<2048>*>(page_buf[0]);"));
         assert!(body.contains("const unsigned int __hidden = 2048u;"));
         assert!(body.contains("if (__consumer_idx == 0) {"));
-        assert!(body.contains("__shfl_xor_sync(0xFFFFFFFFu, __sumsq, __o)"));
+        assert!(body.contains("for (int __k_i = 0; __k_i < 16; ++__k_i)"));
+        assert!(body.contains("kittens::rv_bf<128> __x_rv_bf;"));
+        assert!(body.contains("kittens::rv_fl<128> __x_rv_fl;"));
+        assert!(body.contains("kittens::warp::load(__x_rv_bf, __x_sv.template subvec<128>(__k_i));"));
+        assert!(body.contains("kittens::warp::copy(__x_rv_fl, __x_rv_bf);"));
+        assert!(body.contains("kittens::warp::mul(__x_rv_fl, __x_rv_fl, __x_rv_fl);"));
+        assert!(body.contains("__sumsq += kittens::warp::sum(__x_rv_fl);"));
         assert!(body.contains("rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps)"));
         assert!(body.contains("__float2bfloat16(__v * __scale * __g)"));
-        // No TK 1.0 idioms — no per-warp wgmma in the body, no
-        // thread-scope tma calls (the body uses only raw bf16 +
-        // shfl_xor; TMA is the loader/storer's job, not the consumer's).
+        // Legacy shfl + per-thread squared-sum loop gone.
+        assert!(!body.contains("__shfl_xor_sync"));
+        assert!(!body.contains("__sumsq += __v * __v"));
+        // Strictly TK 2.0 (no warpgroup wgmma in consumer body).
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
+        assert!(!body.contains("kittens::warpgroup::mma_AB"));
     }
 
     #[test]

@@ -898,20 +898,18 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         op.bn * op.k * op.act_elem,
         PAGE_SIZE,
     );
-    debug_assert!(
-        op.bn.saturating_mul(op.act_elem) <= PAGE_SIZE,
-        "lower_gemm_m1: Y tile [1,{}] ({} bytes) exceeds PAGE_SIZE={}",
-        op.bn,
-        op.bn * op.act_elem,
-        PAGE_SIZE,
-    );
 
+    // Phase 8: drop the Y staging page. The per-iter Y store was
+    // `bn * act_elem` = 8 bytes for Llama-1B (bn=4, bf16), which
+    // violates `cp.async.bulk`'s 16-byte minimum and silently dropped
+    // the output. Consumer body now writes directly to gmem
+    // (`buf{op.out}[__n_i * bn + row]`) from lane 0 of the producing
+    // warp; storer no longer touches Y. Eliminates one page allocation
+    // and the per-iter Y wait/store/arrive triplet.
     let x_page = pages.alloc_at::<P>().expect("gemm_m1: x page");
     let w_page = pages.alloc_at::<P>().expect("gemm_m1: w page");
-    let y_page = pages.alloc_at::<P>().expect("gemm_m1: y page");
     let x_id = x_page.id();
     let w_id = w_page.id();
-    let y_id = y_page.id();
 
     let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
     let x_tile = TileShape {
@@ -924,11 +922,6 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         cols: op.k,
         elem_bytes: op.act_elem,
     };
-    let y_tile = TileShape {
-        rows: 1,
-        cols: op.bn,
-        elem_bytes: op.act_elem,
-    };
 
     // ── Load X once before the N-block loop ──
     let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
@@ -938,7 +931,6 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
     // ── N-block loop ──
     let n_blocks = op.n.div_ceil(op.bn);
     let w_byte_step = (op.bn as u64) * (op.k as u64) * (op.act_elem as u64);
-    let y_byte_step = (op.bn as u64) * (op.act_elem as u64);
     let loop_var = "__n_i";
 
     // Capture the page's static phase at loop entry — fed to every
@@ -959,39 +951,28 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
             format!("(__n_i * {w_byte_step}u)"),
         );
 
-        // Consumer: wait y free, wait W ready, compute, signal both done.
-        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Consumed, y_id, loop_var, start);
+        // Consumer: wait W ready, compute (writes directly to gmem
+        // `buf{op.out}[__n_i * bn + row]`), signal W done.
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
         body.compute_calls(
             WarpRole::AllConsumers,
             vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
                 x_id,
                 w_id,
-                y_id,
+                out_buf: op.out.0,
                 k: op.k,
                 bn: op.bn,
             }],
         );
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
-        body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, y_id);
 
-        // Storer: free W slot (read-only — no actual store), drain Y.
+        // Storer: free W slot (read-only — no actual store).
         body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, w_id, loop_var, start);
         body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, w_id);
-
-        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, y_id, loop_var, start);
-        body.store_async_dyn(
-            y_id,
-            op.out,
-            region(op.out, 1, op.bn),
-            y_tile,
-            format!("(__n_i * {y_byte_step}u)"),
-        );
-        body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, y_id);
     });
 
-    // After the loop the W and Y page slots have been ping-ponged
-    // exactly `n_blocks` times. Each iteration flips each barrier
+    // After the loop the W page slot has been ping-ponged exactly
+    // `n_blocks` times. Each iteration flips each barrier
     // (consumed/ready/done) once, so the post-loop runtime parity
     // is `start_parity XOR (n_blocks & 1)`:
     //   - odd  n_blocks → parity flipped from start ⇒ advance type by 1
@@ -1007,12 +988,9 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
     //                     This was the op5/Add hang post-op4/Gemm.
     if n_blocks % 2 == 1 {
         let w_page = prog.complete_round(w_page);
-        let y_page = prog.complete_round(y_page);
         pages.release(w_page);
-        pages.release(y_page);
     } else {
         pages.release(w_page);
-        pages.release(y_page);
     }
 
     // Close X's single round. X was loaded once (loader Ready), held by
@@ -1518,9 +1496,9 @@ mod tests {
     }
 
     /// GemmM1 lowers to: X-load (outside) + ForLoop over n_blocks +
-    /// X-close (outside). The loop body has 10 instrs:
-    /// loader (wait+load) + consumer (wait+wait+compute+arrive+arrive)
-    /// + storer-w (wait+arrive) + storer-y (wait+store+arrive).
+    /// X-close (outside). Phase 8: Y staging page dropped — consumer
+    /// writes directly to `buf{op.out}` from gmem; storer no longer
+    /// touches Y.
     #[test]
     fn gemm_m1_lowers_to_xload_plus_loop_plus_xclose() {
         let mut pages = PageAllocator::new();
@@ -1536,18 +1514,18 @@ mod tests {
             })
             .collect();
         assert_eq!(loops.len(), 1, "one N-block loop");
-        // Loop body: 12 instrs.
+        // Loop body: 7 instrs (Phase 8 — Y staging removed).
         //  loader  (2): wait Consumed[w], LoadAsync[w]
-        //  consumer(5): wait Consumed[y], wait Ready[w], Compute,
-        //               arrive Done[w], arrive Done[y]
-        //  storer-w(2): wait Done[w], arrive Consumed[w]   (W is read-only)
-        //  storer-y(3): wait Done[y], StoreAsync[y], arrive Consumed[y]
-        assert_eq!(loops[0].len(), 12, "loop body has 12 instrs (see comment)");
+        //  consumer(3): wait Ready[w], Compute (direct gmem write),
+        //               arrive Done[w]
+        //  storer  (2): wait Done[w], arrive Consumed[w]   (W is read-only)
+        assert_eq!(loops[0].len(), 7, "loop body has 7 instrs (see comment)");
     }
 
-    /// GemmM1 uses three distinct page slots (x, w, y) — none alias.
+    /// GemmM1 uses two distinct page slots (x, w) — none alias.
+    /// Phase 8: Y page dropped.
     #[test]
-    fn gemm_m1_uses_three_distinct_pages() {
+    fn gemm_m1_uses_two_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
         lower_gemm_m1::<Phase0>(gemm_qkv_op(), &mut pages, &mut prog);
@@ -1573,11 +1551,13 @@ mod tests {
         }
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 3, "three distinct page slots: {ids:?}");
+        assert_eq!(ids.len(), 2, "two distinct page slots: {ids:?}");
     }
 
     /// Codegen on GemmM1 emits the runtime parity `(__n_i & 1)` inside
     /// the loop and the runtime W byte-offset `(__n_i * <step>u)`.
+    /// The Y store is gone — consumer body writes
+    /// `__y_gmem[__n_i * __bn + __row]` directly.
     #[test]
     fn gemm_m1_codegen_emits_for_loop_runtime_offsets() {
         let mut pages = PageAllocator::new();
@@ -1600,14 +1580,23 @@ mod tests {
             src.contains("(__n_i * 16384u)"),
             "W TMA load uses runtime byte-offset\n{src}"
         );
-        // Y byte step = bn * act_elem = 4 * 2 = 8.
+        // Phase 8: no Y TMA store.
         assert!(
-            src.contains("(__n_i * 8u)"),
-            "Y TMA store uses runtime byte-offset\n{src}"
+            !src.contains("(__n_i * 8u)"),
+            "Y TMA store removed (direct gmem write)\n{src}"
         );
         assert!(
-            src.contains("__shfl_xor_sync"),
-            "lane butterfly reduction in compute body\n{src}"
+            src.contains("__y_gmem[__n_i * __bn + __row]"),
+            "consumer writes directly to gmem\n{src}"
+        );
+        // Phase 8: TK 2.0 register-vector K-reduce replaces shfl butterfly.
+        assert!(
+            src.contains("kittens::warp::sum(__x_rv_fl)"),
+            "TK 2.0 register-vector sum reduction in compute body\n{src}"
+        );
+        assert!(
+            !src.contains("__shfl_xor_sync"),
+            "legacy shfl K-reduce removed\n{src}"
         );
     }
 
@@ -1621,7 +1610,11 @@ mod tests {
         let src = emit_body(&prog);
         // W byte step = 1 * 8192 * 2 = 16384.
         assert!(src.contains("(__n_i * 16384u)"), "{src}");
-        // Y byte step = 1 * 2 = 2.
-        assert!(src.contains("(__n_i * 2u)"), "{src}");
+        // Phase 8: Y store removed.
+        assert!(
+            !src.contains("(__n_i * 2u)"),
+            "Y TMA store removed (direct gmem write)\n{src}"
+        );
+        assert!(src.contains("__y_gmem[__n_i * __bn + __row]"), "{src}");
     }
 }

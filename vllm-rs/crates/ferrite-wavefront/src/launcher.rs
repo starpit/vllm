@@ -77,6 +77,21 @@ unsafe extern "C" {
         u32_args: *const u32,
         stream: *mut c_void,
     ) -> i32;
+
+    /// Step C.1 descriptor-TMA proof-of-concept (emitted by
+    /// `bin/tk_emit_tma_tensor_smoke`). Roundtrips a 64×128 bf16 tile
+    /// through smem using TK 2.0's typed `gl<>` + `tma::load_async<>`
+    /// / `store_async<>` (descriptor form, `cp.async.bulk.tensor`
+    /// PTX). The .cu's host wrapper constructs `gl<>` instances
+    /// via TK 2.0's host ctor (which internally calls
+    /// `cuTensorMapEncodeTiled`); Rust never touches the driver TMA
+    /// API. `bufs[0]` = input bf16 [64*128], `bufs[1]` = output bf16
+    /// [64*128]. No u32 args.
+    pub fn launch_tk_tma_tensor_smoke(
+        bufs: *const *mut c_void,
+        u32_args: *const u32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// Safe wrapper around [`launch_tk_decode_one_layer`].
@@ -962,5 +977,87 @@ mod tests {
         // worst-case bf16 storage error on the [-0.1, 0.1) input
         // range output.
         assert_max_abs(&got, &want, 5e-2, "gemm_m1");
+    }
+
+    /// Step C.1 descriptor-TMA proof-of-concept. Roundtrips a 64×128
+    /// bf16 tile through smem using TK 2.0's typed `gl<>` +
+    /// `tma::load_async<dim::ROW>` / `store_async<dim::ROW>`
+    /// (descriptor form, `cp.async.bulk.tensor` PTX, NOT raw bulk).
+    /// The .cu's host wrapper constructs `gl<>` instances via TK 2.0's
+    /// `__host__ inline gl(T*, ...)` ctor; that ctor calls
+    /// `cuTensorMapEncodeTiled` internally — Rust never touches the
+    /// driver TMA API.
+    ///
+    /// Verifies bit-exact roundtrip: `out == in` after the kernel
+    /// completes (tile is loaded into smem, then stored back to gmem
+    /// without modification).
+    #[test]
+    #[ignore]
+    fn tma_tensor_smoke_kernel_roundtrips_64x128_bf16() {
+        use cudarc::driver::{CudaContext, DevicePtr};
+        const ROWS: usize = 64;
+        const COLS: usize = 128;
+        const N: usize = ROWS * COLS;
+        const BYTES: usize = N * 2; // bf16
+
+        let in_f32 = prng_f32_seeded(0xc1c1_c1c1, N, 1.0, 0.0);
+        let (_, _in_lossy, in_bytes) = f32_to_bf16_bytes(&in_f32);
+        assert_eq!(in_bytes.len(), BYTES);
+
+        let ctx = CudaContext::new(0).expect("cuda init");
+        let stream = ctx.new_stream().expect("stream create");
+        // TMA descriptors require 128-byte alignment for the gmem
+        // base address per CUDA programming guide. cudarc allocations
+        // are 128-byte-aligned by default; pad allocation up to
+        // 1 MB to match the other launcher goldens (defensive).
+        let pad_floor = 1usize << 20;
+        let alloc_size = pad_floor.max(BYTES).div_ceil(128) * 128;
+        let buf_in: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros::<u8>(alloc_size)
+            .expect("alloc in");
+        let buf_out: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros::<u8>(alloc_size)
+            .expect("alloc out");
+
+        let mut buf_in_mut = buf_in;
+        stream
+            .memcpy_htod(&in_bytes, &mut buf_in_mut)
+            .expect("h2d in");
+
+        let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(2);
+        let mut _records: Vec<cudarc::driver::SyncOnDrop<'_>> = Vec::with_capacity(2);
+        for buf in [&buf_in_mut, &buf_out] {
+            let (dptr, rec) = DevicePtr::device_ptr(buf, &stream);
+            ptrs.push(dptr as *mut c_void);
+            _records.push(rec);
+        }
+        stream.synchronize().expect("pre-launch sync");
+
+        let u32_args: [u32; 0] = [];
+        let err = unsafe {
+            launch_tk_tma_tensor_smoke(
+                ptrs.as_ptr(),
+                u32_args.as_ptr(),
+                stream.cu_stream() as *mut c_void,
+            )
+        };
+        assert_eq!(err, 0, "launch_tk_tma_tensor_smoke cudaError {err}");
+        stream.synchronize().expect("post-launch sync");
+
+        let mut out_bytes = vec![0u8; alloc_size];
+        stream
+            .memcpy_dtoh(&buf_out, &mut out_bytes)
+            .expect("d2h out");
+        stream.synchronize().expect("post-d2h sync");
+
+        // Bit-exact roundtrip: TMA load + TMA store should preserve
+        // every byte of the input tile (no math).
+        for i in 0..BYTES {
+            assert_eq!(
+                out_bytes[i], in_bytes[i],
+                "byte mismatch at offset {i}: got {} want {}",
+                out_bytes[i], in_bytes[i]
+            );
+        }
     }
 }

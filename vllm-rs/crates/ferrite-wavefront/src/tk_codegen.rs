@@ -778,6 +778,95 @@ pub mod tk20 {
         )
     }
 
+    /// Phase 12 internal-output variant of [`gemm_m1_consumer_body`].
+    /// Same TK 2.0 register-vector K-reduce; lane 0 of warp c writes
+    /// `page_buf[y_id][__n_i * bn + row]` (smem) instead of
+    /// `buf{out_buf}[...]` (gmem). Used by `lower_gemm_m1_routed`
+    /// when the gemm's output is consumed only by a downstream op in
+    /// this same kernel — the storer skips TMA store and the Y page
+    /// is carried-forward to the consumer.
+    ///
+    /// Phase 8's cp.async.bulk-min issue (8-byte TMA store dropped)
+    /// does NOT apply here because we don't TMA-store at all. The Y
+    /// page stays in smem; the producer's writes flow through
+    /// Done→Consumed→Ready barrier ordering when the consumer reads
+    /// from this same slot.
+    ///
+    /// `y_id`: the smem page slot holding the full
+    /// `[1, n]` output across all N-block iterations. Consumer warps
+    /// each write their own row at the per-iter offset.
+    pub fn gemm_m1_consumer_body_internal(
+        x_id: u8,
+        w_id: u8,
+        y_id: u8,
+        k: u32,
+        bn: u32,
+    ) -> String {
+        const K_TILE: u32 = 128;
+        debug_assert_eq!(
+            k % K_TILE,
+            0,
+            "gemm_m1_consumer_body_internal: K={k} must be multiple of K_TILE={K_TILE}"
+        );
+        let k_blocks = k / K_TILE;
+
+        let x_sv_decl = decl_sv_view_bf("__x_sv", &format!("page_buf[{x_id}]"), k);
+        let w_row_sv_decl = decl_sv_view_bf(
+            "__w_row_sv",
+            &format!("(reinterpret_cast<__nv_bfloat16*>(page_buf[{w_id}]) + __row * {k}u)"),
+            k,
+        );
+        let x_rv_bf_decl = decl_rv_bf("__x_rv_bf", K_TILE);
+        let w_rv_bf_decl = decl_rv_bf("__w_rv_bf", K_TILE);
+        let x_rv_fl_decl = decl_rv_fl("__x_rv_fl", K_TILE);
+        let w_rv_fl_decl = decl_rv_fl("__w_rv_fl", K_TILE);
+        let load_x = warp_load_rv_from_sv(
+            "__x_rv_bf",
+            "__x_sv.template subvec<128>(__k_i)",
+        );
+        let load_w = warp_load_rv_from_sv(
+            "__w_rv_bf",
+            "__w_row_sv.template subvec<128>(__k_i)",
+        );
+        let copy_x = warp_copy_rv("__x_rv_fl", "__x_rv_bf");
+        let copy_w = warp_copy_rv("__w_rv_fl", "__w_rv_bf");
+        let mul_xw = warp_mul_rv("__x_rv_fl", "__x_rv_fl", "__w_rv_fl");
+        let sum_expr = warp_sum_rv("__x_rv_fl");
+
+        format!(
+            r#"
+            // tk_warp_ir GemmM1 (internal) — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
+            // TK 2.0 register-vector K-reduce; lane 0 of warp c writes
+            // page_buf[{y_id}][__n_i * bn + row] (smem; carry-forward).
+            using T_act = __nv_bfloat16;
+            T_act* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
+            const unsigned int __bn = {bn}u;
+            {x_sv_decl}
+            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
+                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
+                const int __lane = static_cast<int>(threadIdx.x & 31);
+                {w_row_sv_decl}
+                float __acc = 0.0f;
+                for (int __k_i = 0; __k_i < {k_blocks}; ++__k_i) {{
+                    {x_rv_bf_decl}
+                    {w_rv_bf_decl}
+                    {x_rv_fl_decl}
+                    {w_rv_fl_decl}
+                    {load_x}
+                    {load_w}
+                    {copy_x}
+                    {copy_w}
+                    {mul_xw}
+                    __acc += {sum_expr};
+                }}
+                if (__lane == 0) {{
+                    __y_smem[__n_i * __bn + __row] = __float2bfloat16(__acc);
+                }}
+            }}
+"#
+        )
+    }
+
     /// Emit the SiluMul consumer body. Fused `silu(gate) * up` in
     /// place on gate's page, all-consumer-warp parallel. Same per-
     /// thread bf16 + sigmoid-via-`expf` pattern as the legacy fused
@@ -1723,6 +1812,20 @@ pub enum Tk20Call {
         bn: u32,
     },
 
+    /// GemmM1 consumer compute body — internal-output variant
+    /// (Phase 12 routing). Same K-reduce as `GemmM1ConsumerBody` but
+    /// writes to `page_buf[y_id]` (smem) instead of `buf{out_buf}`
+    /// (gmem). Used when the gemm's output is consumed only by a
+    /// downstream op in this same kernel; the producer's storer
+    /// skips TMA store and the Y smem page is carried-forward.
+    GemmM1ConsumerBodyInternal {
+        x_id: u8,
+        w_id: u8,
+        y_id: u8,
+        k: u32,
+        bn: u32,
+    },
+
     /// AttnDecode init-softmax body. Bound through
     /// `tk20::attn_decode_init_softmax_body`.
     AttnDecodeInitSoftmaxBody { unique_id: u32 },
@@ -1815,6 +1918,14 @@ impl Tk20Call {
                 k,
                 bn,
             } => tk20::gemm_m1_consumer_body(*x_id, *w_id, *out_buf, *k, *bn),
+
+            Tk20Call::GemmM1ConsumerBodyInternal {
+                x_id,
+                w_id,
+                y_id,
+                k,
+                bn,
+            } => tk20::gemm_m1_consumer_body_internal(*x_id, *w_id, *y_id, *k, *bn),
 
             Tk20Call::AttnDecodeInitSoftmaxBody { unique_id } => {
                 tk20::attn_decode_init_softmax_body(*unique_id)

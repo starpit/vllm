@@ -19,11 +19,8 @@ use std::path::PathBuf;
 use ferrite_wavefront::fixtures::{one_layer_input, orchestrator_kernel_args};
 use ferrite_wavefront::subtile_ir::BufId;
 use ferrite_wavefront::tk_codegen::{emit_kernel, KernelArg, KernelArgs};
-use ferrite_wavefront::tk_gmem::{
-    emit_fence_after_op, ArenaSlot, CrossOpInput, Ext, GmemHandle,
-};
 use ferrite_wavefront::tk_lower::{
-    lower_attn_decode, lower_rmsnorm, AttnDecodeOp, PageAllocator, RmsNormOp,
+    lower_attn_decode, lower_rmsnorm, AttnDecodeOp, PageAllocator, RmsNormOp, RoutingHints,
 };
 use ferrite_wavefront::tk_orchestrate::lower_to_tk;
 use ferrite_wavefront::tk_warp_ir::{Phase0, TkProgram};
@@ -38,25 +35,21 @@ fn main() {
     // ── Slice: RmsNorm ──
     let mut pages = PageAllocator::new();
     let mut prog = TkProgram::new();
-    let rms_op = RmsNormOp {
-        x: BufId(0),
-        weight: BufId(1),
-        out: BufId(2),
-        hidden: 2048,
-        m: 1,
-        act_elem: 2,
-        eps: 1e-5,
-        init: true,
-    };
-    let rms_x = CrossOpInput::Fenced(emit_fence_after_op(
+    let _ = lower_rmsnorm::<Phase0>(
+        RmsNormOp {
+            x: BufId(0),
+            weight: BufId(1),
+            out: BufId(2),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+            eps: 1e-5,
+            init: true,
+        },
+        &RoutingHints::default(),
+        &mut pages,
         &mut prog,
-        GmemHandle::<ArenaSlot>::new_initial(rms_op.x),
-    ));
-    let rms_w = CrossOpInput::Fenced(emit_fence_after_op(
-        &mut prog,
-        GmemHandle::<Ext>::new_initial(rms_op.weight),
-    ));
-    let _ = lower_rmsnorm::<Phase0>(rms_op, rms_x, rms_w, false, &mut pages, &mut prog);
+    );
     let args = KernelArgs {
         bufs: vec![
             KernelArg {
@@ -103,13 +96,7 @@ fn main() {
     );
     let kf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, k);
     let vf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, v);
-    let q_in = CrossOpInput::Fenced(emit_fence_after_op(
-        &mut prog2,
-        GmemHandle::<ArenaSlot>::new_initial(attn_op.q),
-    ));
-    let _ = lower_attn_decode::<Phase0>(
-        attn_op, q_in, kf, vf, false, &mut pages2, &mut prog2,
-    );
+    let _ = lower_attn_decode::<Phase0>(attn_op, kf, vf, &RoutingHints::default(), &mut pages2, &mut prog2);
     let args2 = KernelArgs {
         bufs: vec![
             KernelArg {

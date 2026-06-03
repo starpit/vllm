@@ -235,10 +235,6 @@ pub struct RmsNormOp {
 
 /// Lower one RmsNorm op into a `TkProgram` fragment.
 ///
-/// Step F.1.2: legacy `lower_rmsnorm` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_rmsnorm_routed`).
-///
 /// Tape shape for one round (TK 2.0 mbarrier semantics — every wait in
 /// the round reads the *same* parity `R & 1`; only `complete_round`
 /// flips the typed parity for the next round):
@@ -254,17 +250,90 @@ pub struct RmsNormOp {
 /// each `wait` sees the right parity is that the IR consumed a typed
 /// `PageHandle<P>` whose phase came from the round boundary. Codegen
 /// emits the captured `P::VALUE`; phase drift is unrepresentable.
+pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &mut TkProgram) {
+    let x_page = pages
+        .alloc_at::<P>()
+        .expect("page exhaustion: out of mbarrier slots (x)");
+    let w_page = pages
+        .alloc_at::<P>()
+        .expect("page exhaustion: out of mbarrier slots (weight)");
+    let x_id = x_page.id();
+    let w_id = w_page.id();
+
+    // x's region for the TMA: full hidden columns, m rows.
+    let x_region = RegionRef::rows_cols(op.x, op.m, 0, op.hidden);
+    let out_region = RegionRef::rows_cols(op.out, op.m, 0, op.hidden);
+    let weight_region = RegionRef::rows_cols(op.weight, 1, 0, op.hidden);
+    let x_tile = TileShape {
+        rows: op.m,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+    let weight_tile = TileShape {
+        rows: 1,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Loader: fill x and weight pages ──
+    // Round 0: wait on `Consumed` at Phase0. (Persistent-CTA scaffold
+    // pre-arrives `page_consumed` at init so its first wait reads 1 —
+    // and our typed parity for a fresh page slot starts at Phase0,
+    // so `wait(consumed, 0)` returns immediately because the barrier's
+    // observed phase is 1, != expected 0.)
+    //
+    // No explicit `arrive(Ready)` — `tma::load_async` ITSELF signals
+    // the page_ready barrier when the load completes. Emitting an
+    // arrive in addition to the load would over-count arrivals and
+    // shift the barrier's phase off the round parity, breaking the
+    // consumer's `wait(ready, 0)`.
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, x_region, x_tile);
+
+    let w_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, w_page);
+    prog.load_async(w_id, op.weight, weight_region, weight_tile);
+
+    // ── Consumer: wait both Ready, RMS reduce + scale + multiply weight,
+    //    arrive Done on both. ──
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
+            x_id,
+            w_id,
+            hidden: op.hidden,
+            eps: op.eps,
+        }],
+    );
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
+
+    // ── Storer: drain x_page → out, free weight slot. ──
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    prog.store_async(x_id, op.out, out_region, x_tile);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let w_page = prog.wait(WarpRole::Storer, PageBarrier::Done, w_page);
+    let w_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, w_page);
+
+    let x_page = prog.complete_round(x_page);
+    let w_page = prog.complete_round(w_page);
+    pages.release(x_page);
+    pages.release(w_page);
+}
+
+/// Phase 12: routing-aware variant of `lower_rmsnorm`. Same protocol
+/// as `lower_residual_add_routed`. The weight slot is always
+/// gmem-loaded (weight is `InputRef::Ext` in every Llama / Mistral /
+/// Qwen / Phi / Gemma forward). Only x can carry-forward in.
+/// Output is in-place on x's page (the consumer body writes to
+/// `__x_smem` and the storer drains x_page → op.out); when
+/// `output_internal=true`, the storer skips the drain and the slot
+/// is carried forward to the consuming op.
 ///
-/// The weight slot is always gmem-loaded (weight is `InputRef::Ext`
-/// in every Llama / Mistral / Qwen / Phi / Gemma forward). Only x
-/// can carry-forward in. Output is in-place on x's page (the consumer
-/// body writes to `__x_smem` and the storer drains x_page → op.out);
-/// when `output_internal=true`, the storer skips the drain and the
-/// slot is carried forward to the consuming op.
-///
-/// Default-hints path is byte-identical to the legacy `lower_rmsnorm`
-/// deleted in Step F.1.2.
-pub fn lower_rmsnorm<P: Phase>(
+/// Default-hints path is byte-identical to `lower_rmsnorm`.
+pub fn lower_rmsnorm_routed<P: Phase>(
     op: RmsNormOp,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
@@ -272,7 +341,7 @@ pub fn lower_rmsnorm<P: Phase>(
 ) -> RoutingResult {
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 2,
-        "lower_rmsnorm: hints.inputs must be empty or len 2"
+        "lower_rmsnorm_routed: hints.inputs must be empty or len 2"
     );
     let in_x_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_w_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -423,10 +492,6 @@ pub struct AttnDecodeOp {
 
 /// Lower one decode-attention op into a `TkProgram` fragment.
 ///
-/// Step F.1.2: legacy `lower_attn_decode` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_attn_decode_routed`).
-///
 /// Tape shape:
 ///   1. Q-load (one round on the Q page; outside the loop). Loader
 ///      TMA-loads Q, consumer waits on Ready, the consumer body
@@ -439,6 +504,238 @@ pub struct AttnDecodeOp {
 ///      the parity to the loop variable directly.
 ///   3. Final softmax-normalise + O-store. Consumer divides the
 ///      accumulator by `l_sum`, storer TMA-stores the result.
+pub fn lower_attn_decode<P: Phase>(
+    op: AttnDecodeOp,
+    k_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>>,
+    v_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>>,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    // E.13: typed fenced handles confirm that
+    // `tk_gmem::emit_fence_after_op` was emitted between the producing
+    // op (RopeAppend) and this read. The handles' buf_ids must match
+    // op.k_cache / op.v_cache — debug_assert at runtime, but the
+    // fence emit is guaranteed by Rust types.
+    let k_cache = k_cache.into_inner();
+    let v_cache = v_cache.into_inner();
+    debug_assert_eq!(op.k_cache, k_cache.buf_id());
+    debug_assert_eq!(op.v_cache, v_cache.buf_id());
+    let _ = (k_cache, v_cache);
+    // Phase 7 GQA shape preconditions:
+    // - `num_kv_heads <= NUM_CONSUMER_WARPS` (each kv-head owned by
+    //   one consumer warp; warps with `__consumer_idx >= num_kv_heads`
+    //   skip AttnDecode compute but still arrive on barriers).
+    // - `num_q_heads % num_kv_heads == 0` (GQA grouping; per-kv
+    //   q-heads identical per warp).
+    //
+    // Llama-3.2-1B (32 q, 8 kv) at NUM_CONSUMER_WARPS=16: warps 0..7
+    // each take one kv-head + 4 q-heads; warps 8..15 idle on AttnDecode
+    // (they still do barrier arrives). Phase 9 (register-tile online
+    // softmax) revisits this sharding to use all 16 warps.
+    debug_assert!(
+        op.num_kv_heads <= NUM_CONSUMER_WARPS as u32,
+        "lower_attn_decode: num_kv_heads ({}) must be <= NUM_CONSUMER_WARPS ({})",
+        op.num_kv_heads,
+        NUM_CONSUMER_WARPS,
+    );
+    debug_assert!(
+        op.num_q_heads % op.num_kv_heads == 0,
+        "lower_attn_decode: num_q_heads ({}) must be divisible by num_kv_heads ({}) for GQA",
+        op.num_q_heads,
+        op.num_kv_heads,
+    );
+
+    // Allocate all three page slots up front so the function-scope
+    // prelude (typed page views, persistent compute accumulators) can
+    // bind to known ids before any handshake instruction is emitted.
+    let q_page = pages.alloc_at::<P>().expect("Q page");
+    let k_page = pages.alloc_at::<P>().expect("K page");
+    let v_page = pages.alloc_at::<P>().expect("V page");
+    let q_id = q_page.id();
+    let k_id = k_page.id();
+    let v_id = v_page.id();
+    populate_attn_decode_prelude(prog, &op, q_id, k_id, v_id);
+
+    // Tile shapes:
+    //   Q  : `[1, num_q_heads * head_dim]`  — full row, all heads.
+    //   K,V: `[1, num_kv_heads * head_dim]` — one row per KV iter, all kv-heads.
+    //   O  : same as Q.
+    let q_cols = op.num_q_heads * op.head_dim;
+    let kv_cols = op.num_kv_heads * op.head_dim;
+
+    // ── Q page (one-shot) ──
+    let q_region = RegionRef::rows_cols(op.q, 1, 0, q_cols);
+    let q_tile = TileShape {
+        rows: 1,
+        cols: q_cols,
+        elem_bytes: op.act_elem,
+    };
+
+    let q_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, q_page);
+    prog.load_async(q_id, op.q, q_region, q_tile);
+    // No `arrive(Ready)` — `tma::load_async` signals page_ready itself.
+
+    let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
+            unique_id: op.unique_id,
+        }],
+    );
+    // No `arrive(Done)` here — the Q+O slot is ONE round: loader fills
+    // (TMA load_async signals page_ready), the consumer holds the page
+    // through the KV loop, writes O into the same page slot at the
+    // finalise step, then signals page_done; the storer waits on done,
+    // drains O, signals page_consumed. Two consumer arrives on
+    // page_done would flip the barrier twice, breaking the round
+    // invariant (storer's wait would hang on the wrong parity).
+
+    // ── KV sweep ──
+    // K and V tiles carry ALL kv-heads of the current iteration's
+    // token (not a single head): each consumer warp reads its own
+    // kv-head's slice from the tile via `__kv_head * __head_dim`
+    // offsetting in the compute body. The per-page byte budget at
+    // Llama-3.2-1B is 8 * 64 * 2 = 1024 B per K (and V) tile —
+    // far below PAGE_SIZE.
+    let k_tile = TileShape {
+        rows: 1,
+        cols: kv_cols,
+        elem_bytes: op.act_elem,
+    };
+    let v_tile = k_tile;
+
+    let loop_var = "__kv_i";
+    // Capture K and V pages' static phase at loop entry. See the
+    // `wait_loop_parity` doc on `tk_warp_ir.rs` for why iter-0 must
+    // read the page's static phase, not a hardcoded 0 — same root
+    // cause as the op4/Gemm deadlock when slot reuse straddled an
+    // odd number of prior cycles.
+    let start = P::VALUE;
+    // Per-iteration K/V row stride. Each token's K (or V) row
+    // occupies `kv_cols * act_elem` bytes (Llama-1B: 8 kv_heads *
+    // 64 head_dim * 2 = 1024 B). `body.iter_offset` constructs the
+    // typed [`LoopOffset`] = `(__kv_i * stride)` — the only
+    // expression load_async_dyn accepts inside a for_loop body.
+    // NOTE: proper paged-cache port indirects through block_table —
+    // `block_table[__kv_i / block_size] * block_bytes + (__kv_i %
+    // block_size) * row_bytes`. Single-block sequences match the
+    // flat stride; multi-block needs block-table indirection.
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    // Structural enforcement (Gap 17): for_loop_runtime is the ONLY
+    // path that constructs `LoopBound::RuntimeU32` (the constructor
+    // is sealed). Plain `prog.for_loop(_, LoopBound::RuntimeU32(...))`
+    // is now a Rust compile error — verifying that the substrate
+    // catches the legacy buggy form structurally.
+    let post_pages = prog.for_loop_runtime(
+        loop_var,
+        op.num_kv_pages_arg,
+        vec![k_page, v_page],
+        |body| {
+            // Per-iteration K round. Parity = (__kv_i & 1) ^ P::VALUE.
+            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
+            body.load_async_dyn(
+                k_id,
+                op.k_cache,
+                RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
+                k_tile,
+                body.iter_offset(kv_row_bytes),
+            );
+            // No `arrive(Ready)` — `tma::load_async` signals page_ready.
+
+            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
+            body.compute_calls(
+                WarpRole::AllConsumers,
+                vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
+                    unique_id: op.unique_id,
+                    head_dim: op.head_dim,
+                }],
+            );
+            body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
+
+            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);
+            body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, k_id);
+
+            // Per-iteration V round (same row_bytes per iter).
+            body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, v_id, loop_var, start);
+            body.load_async_dyn(
+                v_id,
+                op.v_cache,
+                RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
+                v_tile,
+                body.iter_offset(kv_row_bytes),
+            );
+            // No `arrive(Ready)` — `tma::load_async` signals page_ready.
+
+            body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
+            body.compute_calls(
+                WarpRole::AllConsumers,
+                vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
+                    unique_id: op.unique_id,
+                }],
+            );
+            body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
+
+            body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var, start);
+            body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, v_id);
+        },
+    );
+
+    // After the loop the K/V pages have been ping-ponged a RUNTIME
+    // number of times (`__num_kv_pages`). Each barrier flips ONCE
+    // per iter; for even N hardware doesn't net-flip, for odd N it
+    // does. The legacy `complete_round` blindly advances typed phase
+    // by 1 — for even N this corrupts state and the next op deadlocks.
+    //
+    // **Compile-time enforcement (Gap 17, fixes FERRITE_WAVEFRONT_GPU=1
+    // first-decode hang)**: wrap the K and V handles in
+    // `PageHandleAfterRuntimeLoop` and release ONLY through
+    // `complete_round_with_parity_correction`, which emits the
+    // runtime phantom round automatically. Calling plain
+    // `complete_round(k_page)` on `PageHandleAfterRuntimeLoop` would
+    // be a Rust compile error — there's no impl that accepts the
+    // post-loop handle without the parity correction.
+    // for_loop_runtime returned post-loop wrappers in the same order
+    // as input: [k_page_post, v_page_post]. The wrappers are the only
+    // type complete_round_with_parity_correction accepts — and that
+    // function emits the phantom round automatically.
+    let mut post_pages_iter = post_pages.into_iter();
+    let k_page_post = post_pages_iter.next().expect("k post-loop handle");
+    let v_page_post = post_pages_iter.next().expect("v post-loop handle");
+    let k_page = prog.complete_round_with_parity_correction(k_page_post, op.num_kv_pages_arg);
+    let v_page = prog.complete_round_with_parity_correction(v_page_post, op.num_kv_pages_arg);
+    pages.release(k_page);
+    pages.release(v_page);
+
+    // ── Final O-store ──
+    // Output is `[1, num_q_heads * head_dim]` (matches Q tile width).
+    let o_page = q_page; // reuse Q's page slot for O after the loop.
+    let o_region = RegionRef::rows_cols(op.out, 1, 0, q_cols);
+    let o_tile = TileShape {
+        rows: 1,
+        cols: q_cols,
+        elem_bytes: op.act_elem,
+    };
+    // No `wait(Consumed)` here — the consumer has been holding this
+    // page slot since the Q-load Ready handshake; the page is already
+    // owned. Going straight to compute + arrive(Done) closes the slot's
+    // single round (loader Ready → consumer Done → storer Consumed).
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
+            unique_id: op.unique_id,
+        }],
+    );
+    let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
+
+    let o_page = prog.wait(WarpRole::Storer, PageBarrier::Done, o_page);
+    prog.store_async(q_id, op.out, o_region, o_tile);
+    let o_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, o_page);
+
+    let o_page = prog.complete_round(o_page);
+    pages.release(o_page);
+}
+
+/// Phase 12: routing-aware variant of `lower_attn_decode`.
 ///
 /// Inputs (3 slots): `q`, `k_cache`, `v_cache`. Only `q` is a
 /// carry-forward candidate; `k_cache` / `v_cache` are the paged KV
@@ -449,9 +746,8 @@ pub struct AttnDecodeOp {
 /// storer skips `tma::store_async` and the Q+O slot is carried-
 /// forward to the consuming op (typically `out_proj`).
 ///
-/// Default-hints path is byte-identical to the legacy
-/// `lower_attn_decode` deleted in Step F.1.2.
-pub fn lower_attn_decode<P: Phase>(
+/// Default-hints path is byte-identical to `lower_attn_decode`.
+pub fn lower_attn_decode_routed<P: Phase>(
     op: AttnDecodeOp,
     k_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>>,
     v_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>>,
@@ -466,19 +762,19 @@ pub fn lower_attn_decode<P: Phase>(
     let _ = (k_cache, v_cache);
     debug_assert!(
         op.num_kv_heads <= NUM_CONSUMER_WARPS as u32,
-        "lower_attn_decode: num_kv_heads ({}) must be <= NUM_CONSUMER_WARPS ({})",
+        "lower_attn_decode_routed: num_kv_heads ({}) must be <= NUM_CONSUMER_WARPS ({})",
         op.num_kv_heads,
         NUM_CONSUMER_WARPS,
     );
     debug_assert!(
         op.num_q_heads % op.num_kv_heads == 0,
-        "lower_attn_decode: num_q_heads ({}) must be divisible by num_kv_heads ({}) for GQA",
+        "lower_attn_decode_routed: num_q_heads ({}) must be divisible by num_kv_heads ({}) for GQA",
         op.num_q_heads,
         op.num_kv_heads,
     );
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 3,
-        "lower_attn_decode: hints.inputs must be empty or len 3 (q, k_cache, v_cache)"
+        "lower_attn_decode_routed: hints.inputs must be empty or len 3 (q, k_cache, v_cache)"
     );
     let in_q_carried = hints.inputs.first().and_then(|x| x.as_ref());
     // K/V cache always Ext; ignore those hints if any.
@@ -710,12 +1006,63 @@ pub struct AddOp {
 ///   `Consumed` to release the slot. (Storer does NO TMA store on B —
 ///   B is read-only; we use the storer warp purely to flip the
 ///   `Consumed` barrier so the next op can reuse the slot.)
-///
-/// Step F.1.2: legacy `lower_residual_add` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_residual_add_routed`). Same
-/// compute body, same intra-IType barrier protocol as the legacy
-/// path, but:
+pub fn lower_residual_add<P: Phase>(
+    op: AddOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let a_page = pages.alloc_at::<P>().expect("residual add: A page");
+    let b_page = pages.alloc_at::<P>().expect("residual add: B page");
+    let a_id = a_page.id();
+    let b_id = b_page.id();
+
+    let region = |buf, rows, hidden| RegionRef::rows_cols(buf, rows, 0, hidden);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.hidden,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Loader fills A ──
+    let a_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, a_page);
+    prog.load_async(a_id, op.a, region(op.a, op.m, op.hidden), tile);
+
+    // ── Loader fills B ──
+    let b_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, b_page);
+    prog.load_async(b_id, op.b, region(op.b, op.m, op.hidden), tile);
+
+    // ── Consumer waits on Ready for both, computes A+B in place on A,
+    //    arrives Done on both. ──
+    let a_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, a_page);
+    let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+            a_id,
+            b_id,
+            total: op.hidden as u64 * op.m as u64,
+        }],
+    );
+    let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
+    let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
+
+    // ── Storer drains A → out, then frees both pages. ──
+    let a_page = prog.wait(WarpRole::Storer, PageBarrier::Done, a_page);
+    prog.store_async(a_id, op.out, region(op.out, op.m, op.hidden), tile);
+    let a_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, a_page);
+
+    let b_page = prog.wait(WarpRole::Storer, PageBarrier::Done, b_page);
+    let b_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, b_page);
+
+    pages.release(prog.complete_round(a_page));
+    pages.release(prog.complete_round(b_page));
+}
+
+// Phase 5 cutover: legacy `residual_add_compute_body` deleted.
+// Canonical emit at `tk_codegen::tk20::residual_add_consumer_body`.
+
+/// Phase 12: routing-aware variant of `lower_residual_add`. Same
+/// compute body, same intra-IType barrier protocol, but:
 ///
 /// - For each input slot whose `hints.inputs[i] = Some(carried)`,
 ///   the lowering uses `pages.consume_carried::<P>(carried)` instead
@@ -732,10 +1079,9 @@ pub struct AddOp {
 ///   the orchestrator can thread it to the consuming op's `inputs`.
 ///
 /// The non-routing path (no carry-forward inputs, no internal
-/// output) is byte-identical to the legacy `lower_residual_add`
-/// deleted in Step F.1.2 — same instr count, same emit, same page
-/// allocator state.
-pub fn lower_residual_add<P: Phase>(
+/// output) is byte-identical to `lower_residual_add` — same instr
+/// count, same emit, same page allocator state.
+pub fn lower_residual_add_routed<P: Phase>(
     op: AddOp,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
@@ -743,7 +1089,7 @@ pub fn lower_residual_add<P: Phase>(
 ) -> RoutingResult {
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 2,
-        "lower_residual_add: hints.inputs must be empty or len 2"
+        "lower_residual_add_routed: hints.inputs must be empty or len 2"
     );
     let in_a_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_b_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -850,24 +1196,66 @@ pub struct SiluMulOp {
 
 /// Lower one `silu(gate) * up` op into a `TkProgram` fragment.
 ///
-/// Step F.1.2: legacy `lower_silu_mul` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_silu_mul_routed`).
-///
 /// Two pages — gate page is overwritten in place with the result and
 /// drained to `out`; up page is read-only (storer arrives Consumed only).
 /// One round on both slots, parity 0.
-///
-/// Same protocol as `lower_residual_add`. Both gate and up are
-/// typically produced by upstream Gemms (gate_proj, up_proj) and
-/// consumed only by this op + the downstream down_proj — so both
-/// can carry-forward in. Output is in-place on gate's page; the
-/// storer drains gate_page to op.out (the down_proj's input) — when
-/// output_internal=true, drain skipped and gate_page is carried-forward.
-///
-/// Default-hints path is byte-identical to the legacy `lower_silu_mul`
-/// deleted in Step F.1.2.
 pub fn lower_silu_mul<P: Phase>(
+    op: SiluMulOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let g_page = pages.alloc_at::<P>().expect("silu_mul: gate page");
+    let u_page = pages.alloc_at::<P>().expect("silu_mul: up page");
+    let g_id = g_page.id();
+    let u_id = u_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let tile = TileShape {
+        rows: op.m,
+        cols: op.intermediate,
+        elem_bytes: op.act_elem,
+    };
+
+    let g_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, g_page);
+    prog.load_async(g_id, op.gate, region(op.gate, op.m, op.intermediate), tile);
+
+    let u_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, u_page);
+    prog.load_async(u_id, op.up, region(op.up, op.m, op.intermediate), tile);
+
+    let g_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, g_page);
+    let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+            g_id,
+            u_id,
+            total: op.intermediate as u64 * op.m as u64,
+        }],
+    );
+    let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
+    let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
+
+    let g_page = prog.wait(WarpRole::Storer, PageBarrier::Done, g_page);
+    prog.store_async(g_id, op.out, region(op.out, op.m, op.intermediate), tile);
+    let g_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, g_page);
+
+    let u_page = prog.wait(WarpRole::Storer, PageBarrier::Done, u_page);
+    let u_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, u_page);
+
+    pages.release(prog.complete_round(g_page));
+    pages.release(prog.complete_round(u_page));
+}
+
+/// Phase 12: routing-aware variant of `lower_silu_mul`. Same protocol
+/// as `lower_residual_add_routed`. Both gate and up are typically
+/// produced by upstream Gemms (gate_proj, up_proj) and consumed only
+/// by this op + the downstream down_proj — so both can carry-forward
+/// in. Output is in-place on gate's page; the storer drains gate_page
+/// to op.out (the down_proj's input) — when output_internal=true,
+/// drain skipped and gate_page is carried-forward.
+///
+/// Default-hints path is byte-identical to `lower_silu_mul`.
+pub fn lower_silu_mul_routed<P: Phase>(
     op: SiluMulOp,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
@@ -875,7 +1263,7 @@ pub fn lower_silu_mul<P: Phase>(
 ) -> RoutingResult {
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 2,
-        "lower_silu_mul: hints.inputs must be empty or len 2"
+        "lower_silu_mul_routed: hints.inputs must be empty or len 2"
     );
     let in_g_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_u_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -979,19 +1367,104 @@ pub struct RopeRotateOp {
 
 /// Lower one NeoX-RoPE rotate into a `TkProgram` fragment.
 ///
-/// Step F.1.2: legacy `lower_rope_rotate` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_rope_rotate_routed`).
-///
 /// Three pages — x (in-place + drained), cos (read-only), sin (read-only).
-/// Same protocol as `lower_residual_add`. Only x is a carry-forward
-/// candidate (cos/sin are always Ext — the per-position rotary tables,
-/// loaded via `__decode_position * row_bytes`). Output is in-place on
-/// x's page; storer drains x_page → op.out when output is external.
-///
-/// Default-hints path is byte-identical to the legacy `lower_rope_rotate`
-/// deleted in Step F.1.2.
 pub fn lower_rope_rotate<P: Phase>(
+    op: RopeRotateOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let x_page = pages.alloc_at::<P>().expect("rope: x page");
+    let c_page = pages.alloc_at::<P>().expect("rope: cos page");
+    let s_page = pages.alloc_at::<P>().expect("rope: sin page");
+    let x_id = x_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let x_cols = op.num_heads * op.head_dim;
+    let x_tile = TileShape {
+        rows: op.m,
+        cols: x_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+
+    // Loader fills all three pages. Cos/sin are runtime-positional:
+    // the dispatcher passes `cos_sin_cache.base` (cos) and
+    // `cos_sin_cache.base + half_offset` (sin); the kernel adds
+    // `__decode_position * row_bytes` so each decode token reads its
+    // own row. `row_bytes = head_dim * act_elem` (one full row of the
+    // packed `[max_pos, head_dim]` cache; the load deliberately fetches
+    // 128 B = full row even though the rotation only touches the first
+    // half_dim, since TMA loads benefit from row-aligned sizes).
+    let row_bytes = op.head_dim * op.act_elem;
+    let pos_off = format!("__decode_position * {row_bytes}u");
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, region(op.x, op.m, x_cols), x_tile);
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    prog.load_async_dyn(
+        c_id,
+        op.cos,
+        region(op.cos, 1, op.head_dim),
+        cs_tile,
+        pos_off.clone(),
+    );
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    prog.load_async_dyn(
+        s_id,
+        op.sin,
+        region(op.sin, 1, op.head_dim),
+        cs_tile,
+        pos_off,
+    );
+
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    prog.store_async(x_id, op.out, region(op.out, op.m, x_cols), x_tile);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    pages.release(prog.complete_round(x_page));
+    pages.release(prog.complete_round(c_page));
+    pages.release(prog.complete_round(s_page));
+}
+
+/// Phase 12: routing-aware variant of `lower_rope_rotate`. Same
+/// protocol as `lower_residual_add_routed`. Only x is a carry-
+/// forward candidate (cos/sin are always Ext — the per-position
+/// rotary tables, loaded via `__decode_position * row_bytes`).
+/// Output is in-place on x's page; storer drains x_page → op.out
+/// when output is external.
+///
+/// Default-hints path is byte-identical to `lower_rope_rotate`.
+pub fn lower_rope_rotate_routed<P: Phase>(
     op: RopeRotateOp,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
@@ -999,7 +1472,7 @@ pub fn lower_rope_rotate<P: Phase>(
 ) -> RoutingResult {
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 3,
-        "lower_rope_rotate: hints.inputs must be empty or len 3"
+        "lower_rope_rotate_routed: hints.inputs must be empty or len 3"
     );
     let in_x_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_c_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -1191,10 +1664,156 @@ pub struct RopeAppendOp {
 /// `row_bytes = num_kv_heads * head_dim * act_elem`. The dispatcher
 /// has already resolved block-table indirection into a flat slot
 /// index, so the kernel just multiplies.
-///
-/// Step F.1.2: legacy `lower_rope_append` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_rope_append_routed`).
+pub fn lower_rope_append<P: Phase>(
+    op: RopeAppendOp,
+    k_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    v_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> (
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
+) {
+    debug_assert_eq!(
+        op.k_cache,
+        k_cache_handle.buf_id(),
+        "lower_rope_append: op.k_cache != handle.buf_id"
+    );
+    debug_assert_eq!(
+        op.v_cache,
+        v_cache_handle.buf_id(),
+        "lower_rope_append: op.v_cache != handle.buf_id"
+    );
+    let k_page = pages.alloc_at::<P>().expect("rope_append: K page");
+    let c_page = pages.alloc_at::<P>().expect("rope_append: cos page");
+    let s_page = pages.alloc_at::<P>().expect("rope_append: sin page");
+    let v_page = pages.alloc_at::<P>().expect("rope_append: V page");
+    let k_id = k_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+    let v_id = v_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let kv_cols = op.num_kv_heads * op.head_dim;
+    let kv_tile = TileShape {
+        rows: op.m,
+        cols: kv_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+
+    // Per-token row stride for both the cos/sin cache and the paged
+    // K/V cache. `head_dim * act_elem` for cos/sin (1 head row) and
+    // `num_kv_heads * head_dim * act_elem` for K/V (full kv-row).
+    let cs_row_bytes = op.head_dim * op.act_elem;
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    let pos_off = format!("__decode_position * {cs_row_bytes}u");
+    let slot_off = format!("({} * {kv_row_bytes}u)", op.decode_slot_arg);
+
+    // ── Loader: fill K, cos, sin, V ──
+    let k_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, k_page);
+    prog.load_async(k_id, op.k, region(op.k, op.m, kv_cols), kv_tile);
+
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    prog.load_async_dyn(
+        c_id,
+        op.cos,
+        region(op.cos, 1, op.head_dim),
+        cs_tile,
+        pos_off.clone(),
+    );
+
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    prog.load_async_dyn(
+        s_id,
+        op.sin,
+        region(op.sin, 1, op.head_dim),
+        cs_tile,
+        pos_off,
+    );
+
+    let v_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, v_page);
+    prog.load_async(v_id, op.v, region(op.v, op.m, kv_cols), kv_tile);
+
+    // ── Consumer: rotate K in place; V held read-only ──
+    let k_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, k_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    let v_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, v_page);
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_kv_heads as u64) * (half as u64);
+    // Reuse the standard RopeConsumerBody — it acts on a single page
+    // (`x_id` slot) using cos/sin slots; we point it at K. V is not
+    // touched.
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id: k_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
+    let _ = half; // silence unused-binding warning if linter complains
+    let k_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, k_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+    let v_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, v_page);
+
+    // ── Storer: drain rotated K → op.out + K_cache; drain V → V_cache ──
+    let k_page = prog.wait(WarpRole::Storer, PageBarrier::Done, k_page);
+    // Existing arena edge — keeps the dataflow validator + any future
+    // arena-reading consumer happy.
+    prog.store_async(k_id, op.out, region(op.out, op.m, kv_cols), kv_tile);
+    // NEW: paged K cache write at __decode_slot.
+    prog.store_async_dyn(
+        k_id,
+        op.k_cache,
+        region(op.k_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off.clone(),
+    );
+    let k_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, k_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    let v_page = prog.wait(WarpRole::Storer, PageBarrier::Done, v_page);
+    // NEW: paged V cache write at __decode_slot. (V is otherwise
+    // read-only inside the kernel — no arena drain.)
+    prog.store_async_dyn(
+        v_id,
+        op.v_cache,
+        region(op.v_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off,
+    );
+    let v_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, v_page);
+
+    pages.release(prog.complete_round(k_page));
+    pages.release(prog.complete_round(c_page));
+    pages.release(prog.complete_round(s_page));
+    pages.release(prog.complete_round(v_page));
+
+    // E.13: cross-op gmem ordering for the K/V cache writes is now
+    // emitted by the orchestrator via `tk_gmem::emit_fence_after_op`
+    // between this op and the next reader (typically AttnDecode).
+    // The CTA-wide `__syncthreads()` E.12.B emitted here is removed —
+    // the typed `Fenced<GmemHandle<...>>` substrate enforces fence
+    // emission structurally, so a single source of truth for the
+    // primitive sits in `tk_codegen::tk20::cross_op_gmem_fence_body`.
+    (k_cache_handle, v_cache_handle)
+}
+
+/// Phase 12: routing-aware variant of `lower_rope_append`.
 ///
 /// Inputs (4 carry-forward candidates: K, cos, sin, V — though
 /// cos/sin are always `InputRef::Ext` and never carry-forward in
@@ -1204,9 +1823,8 @@ pub struct RopeAppendOp {
 /// `op.out` arena drain stays as the carry-forward target when
 /// `output_internal=true`.
 ///
-/// Default-hints path is byte-identical to the legacy `lower_rope_append`
-/// deleted in Step F.1.2.
-pub fn lower_rope_append<P: Phase>(
+/// Default-hints path is byte-identical to `lower_rope_append`.
+pub fn lower_rope_append_routed<P: Phase>(
     op: RopeAppendOp,
     k_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
     v_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
@@ -1222,7 +1840,7 @@ pub fn lower_rope_append<P: Phase>(
     debug_assert_eq!(op.v_cache, v_cache_handle.buf_id());
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 4,
-        "lower_rope_append: hints.inputs must be empty or len 4"
+        "lower_rope_append_routed: hints.inputs must be empty or len 4"
     );
     let in_k_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_c_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -1443,10 +2061,125 @@ pub struct GemmM1Op {
 ///      - Storer drains `y_page` to `out[n_i*bn .. (n_i+1)*bn]`.
 ///   3. Close X's single round (consumer arrives Done, storer waits
 ///      Done + arrives Consumed without storing — X is read-only).
-///
-/// Step F.1.2: legacy `lower_gemm_m1` deleted. Routing is
-/// unconditional after Step F.1; this is the routing-aware
-/// implementation (formerly `lower_gemm_m1_routed`). Per-warp
+pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &mut TkProgram) {
+    debug_assert!(
+        op.bn.saturating_mul(op.k).saturating_mul(op.act_elem) <= PAGE_SIZE,
+        "lower_gemm_m1: W tile {}x{} ({} bytes) exceeds PAGE_SIZE={}",
+        op.bn,
+        op.k,
+        op.bn * op.k * op.act_elem,
+        PAGE_SIZE,
+    );
+
+    // Phase 8: drop the Y staging page. The per-iter Y store was
+    // `bn * act_elem` = 8 bytes for Llama-1B (bn=4, bf16), which
+    // violates `cp.async.bulk`'s 16-byte minimum and silently dropped
+    // the output. Consumer body now writes directly to gmem
+    // (`buf{op.out}[__n_i * bn + row]`) from lane 0 of the producing
+    // warp; storer no longer touches Y. Eliminates one page allocation
+    // and the per-iter Y wait/store/arrive triplet.
+    let x_page = pages.alloc_at::<P>().expect("gemm_m1: x page");
+    let w_page = pages.alloc_at::<P>().expect("gemm_m1: w page");
+    let x_id = x_page.id();
+    let w_id = w_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let x_tile = TileShape {
+        rows: 1,
+        cols: op.k,
+        elem_bytes: op.act_elem,
+    };
+    let w_tile = TileShape {
+        rows: op.bn,
+        cols: op.k,
+        elem_bytes: op.act_elem,
+    };
+
+    // ── Load X once before the N-block loop ──
+    let x_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, x_page);
+    prog.load_async(x_id, op.x, region(op.x, 1, op.k), x_tile);
+    let x_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, x_page);
+
+    // ── N-block loop ──
+    let n_blocks = op.n.div_ceil(op.bn);
+    let w_byte_step = (op.bn as u64) * (op.k as u64) * (op.act_elem as u64);
+    let loop_var = "__n_i";
+
+    // Capture the page's static phase at loop entry — fed to every
+    // `wait_loop_parity` so iter-0 reads the page's actual mbarrier
+    // parity (the page was just allocated at type P, which the
+    // allocator records as `phase_bit[id] = P::VALUE`; the underlying
+    // mbarrier parity matches when the prior user closed the slot
+    // cleanly via `complete_round + release`).
+    let start = P::VALUE;
+    prog.for_loop(loop_var, LoopBound::Const(n_blocks), |body| {
+        // Loader streams the next W tile.
+        body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, w_id, loop_var, start);
+        body.load_async_dyn(
+            w_id,
+            op.w,
+            region(op.w, op.bn, op.k),
+            w_tile,
+            body.iter_offset(w_byte_step),
+        );
+
+        // Consumer: wait W ready, compute (writes directly to gmem
+        // `buf{op.out}[__n_i * bn + row]`), signal W done.
+        body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
+        body.compute_calls(
+            WarpRole::AllConsumers,
+            vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
+                x_id,
+                w_id,
+                out_buf: op.out.0,
+                k: op.k,
+                bn: op.bn,
+            }],
+        );
+        body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
+
+        // Storer: free W slot (read-only — no actual store).
+        body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, w_id, loop_var, start);
+        body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, w_id);
+    });
+
+    // After the loop the W page slot has been ping-ponged exactly
+    // `n_blocks` times. Each iteration flips each barrier
+    // (consumed/ready/done) once, so the post-loop runtime parity
+    // is `start_parity XOR (n_blocks & 1)`:
+    //   - odd  n_blocks → parity flipped from start ⇒ advance type by 1
+    //                     (== `complete_round`).
+    //   - even n_blocks → parity back at start ⇒ DON'T advance the
+    //                     type, just release at the unchanged phase.
+    //                     `complete_round` here would record
+    //                     `phase_bit = !P::VALUE` while the actual
+    //                     mbarrier sits at `P::VALUE`, and the next
+    //                     op picking up the slot would emit waits
+    //                     with one parity while the barrier polls the
+    //                     other → deadlock at the op boundary.
+    //                     This was the op5/Add hang post-op4/Gemm.
+    if n_blocks % 2 == 1 {
+        let w_page = prog.complete_round(w_page);
+        pages.release(w_page);
+    } else {
+        pages.release(w_page);
+    }
+
+    // Close X's single round. X was loaded once (loader Ready), held by
+    // the consumer through every loop iteration, and is now released.
+    // No store — X is read-only — but the storer still flips Consumed
+    // so the slot is freed for the next op.
+    let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
+    let x_page = prog.wait(WarpRole::Storer, PageBarrier::Done, x_page);
+    let x_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, x_page);
+    let x_page = prog.complete_round(x_page);
+    pages.release(x_page);
+}
+
+// Phase 5 cutover: legacy `gemm_m1_compute_body` deleted. Canonical
+// emit at `tk_codegen::tk20::gemm_m1_consumer_body`.
+
+/// Phase 12: routing-aware variant of `lower_gemm_m1`. Same per-warp
 /// K-axis matvec; routing controls the input/output paths:
 ///
 /// - `hints.inputs[0] = Some(carried)` — X is carry-forward; loader
@@ -1466,8 +2199,8 @@ pub struct GemmM1Op {
 ///   store; lowering returns `RoutingResult { output_carried: Some(y) }`.
 ///
 /// Default-hints path (no carry-forward inputs, output external) is
-/// byte-identical to the legacy `lower_gemm_m1` deleted in Step F.1.2.
-pub fn lower_gemm_m1<P: Phase>(
+/// byte-identical to `lower_gemm_m1`.
+pub fn lower_gemm_m1_routed<P: Phase>(
     op: GemmM1Op,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
@@ -1475,7 +2208,7 @@ pub fn lower_gemm_m1<P: Phase>(
 ) -> RoutingResult {
     debug_assert!(
         op.bn.saturating_mul(op.k).saturating_mul(op.act_elem) <= PAGE_SIZE,
-        "lower_gemm_m1: W tile {}x{} ({} bytes) exceeds PAGE_SIZE={}",
+        "lower_gemm_m1_routed: W tile {}x{} ({} bytes) exceeds PAGE_SIZE={}",
         op.bn,
         op.k,
         op.bn * op.k * op.act_elem,
@@ -1488,7 +2221,7 @@ pub fn lower_gemm_m1<P: Phase>(
         // PAGE_SIZE=16384.
         debug_assert!(
             op.n.saturating_mul(op.act_elem) <= PAGE_SIZE,
-            "lower_gemm_m1: internal Y tile [1,{}] ({} bytes) exceeds PAGE_SIZE={}",
+            "lower_gemm_m1_routed: internal Y tile [1,{}] ({} bytes) exceeds PAGE_SIZE={}",
             op.n,
             op.n * op.act_elem,
             PAGE_SIZE,
@@ -1496,7 +2229,7 @@ pub fn lower_gemm_m1<P: Phase>(
     }
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 2,
-        "lower_gemm_m1: hints.inputs must be empty or len 2"
+        "lower_gemm_m1_routed: hints.inputs must be empty or len 2"
     );
     let in_x_carried = hints.inputs.first().and_then(|x| x.as_ref());
     let in_w_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
@@ -1598,20 +2331,7 @@ pub fn lower_gemm_m1<P: Phase>(
         body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, w_id);
     });
 
-    // Close W slot's parity. After the loop the W page slot has been
-    // ping-ponged exactly `n_blocks` times. Each iteration flips each
-    // barrier (consumed/ready/done) once, so the post-loop runtime
-    // parity is `start_parity XOR (n_blocks & 1)`:
-    //   - odd  n_blocks → parity flipped from start ⇒ advance type by 1
-    //                     (== `complete_round`).
-    //   - even n_blocks → parity back at start ⇒ DON'T advance the
-    //                     type, just release at the unchanged phase.
-    //                     `complete_round` here would record
-    //                     `phase_bit = !P::VALUE` while the actual
-    //                     mbarrier sits at `P::VALUE`, and the next
-    //                     op picking up the slot would emit waits
-    //                     with one parity while the barrier polls the
-    //                     other → deadlock at the op boundary.
+    // Close W slot's parity (same logic as legacy lower_gemm_m1).
     if n_blocks % 2 == 1 {
         let w_page = prog.complete_round(w_page);
         pages.release(w_page);
@@ -1684,7 +2404,7 @@ mod tests {
     fn rmsnorm_lowers_to_two_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
 
         assert_eq!(prog.instrs.len(), 14, "{prog:?}");
 
@@ -1773,7 +2493,7 @@ mod tests {
     fn page_released_at_correct_parity() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
         // Both x (slot 0) and weight (slot 1) live on Phase1 after one round.
         assert_eq!(pages.phase_bit[0], 1, "x slot on Phase1 after one round");
         assert_eq!(pages.phase_bit[1], 1, "weight slot on Phase1 after one round");
@@ -1788,7 +2508,7 @@ mod tests {
     fn rmsnorm_codegen_walks_match_arms() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         // Three role-routed arms.
@@ -1830,7 +2550,7 @@ mod tests {
     fn two_rmsnorms_use_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rmsnorm::<Phase0>(op(), &mut pages, &mut prog);
         // Pretend the first op's slot is still owned (skip the release).
         // Re-simulate by manually marking slot 0 as in_use:
         let mut pages2 = PageAllocator::new();
@@ -1873,7 +2593,7 @@ mod tests {
         let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
         let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
         let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
-        let _ = lower_attn_decode::<Phase0>(op, kf, vf, &RoutingHints::default(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         // Count ForLoops and their body lengths.
         let loops: Vec<&Vec<TkInstr>> = prog
@@ -1909,7 +2629,7 @@ mod tests {
         let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
         let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
         let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
-        let _ = lower_attn_decode::<Phase0>(op, kf, vf, &RoutingHints::default(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         let mut outer_phases = Vec::<WaitPhase>::new();
         let mut inner_phases = Vec::<WaitPhase>::new();
@@ -1953,7 +2673,7 @@ mod tests {
         let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
         let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
         let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
-        let _ = lower_attn_decode::<Phase0>(op, kf, vf, &RoutingHints::default(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         assert!(
@@ -1982,7 +2702,7 @@ mod tests {
         let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
         let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
         let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
-        let _ = lower_attn_decode::<Phase0>(op, kf, vf, &RoutingHints::default(), &mut pages, &mut prog);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         for instr in &prog.instrs {
@@ -2020,7 +2740,7 @@ mod tests {
     fn add_lowers_to_two_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_residual_add::<Phase0>(add_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         let mut store_pages = Vec::<u8>::new();
@@ -2047,7 +2767,7 @@ mod tests {
     fn add_codegen_emits_two_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_residual_add::<Phase0>(add_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         // Both pages get loader+consumer+storer arms.
@@ -2086,7 +2806,7 @@ mod tests {
     fn silu_mul_lowers_to_two_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_silu_mul::<Phase0>(silu_mul_op_(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_silu_mul::<Phase0>(silu_mul_op_(), &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         let mut store_pages = Vec::<u8>::new();
@@ -2109,7 +2829,7 @@ mod tests {
     fn silu_mul_codegen_emits_silu_and_mul() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_silu_mul::<Phase0>(silu_mul_op_(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_silu_mul::<Phase0>(silu_mul_op_(), &mut pages, &mut prog);
         let src = emit_body(&prog);
         // SiLU formula: g / (1 + exp(-g))
         assert!(src.contains("__silu_g"), "{src}");
@@ -2135,7 +2855,7 @@ mod tests {
     fn rope_lowers_to_three_page_handshake() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rope_rotate::<Phase0>(rope_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rope_rotate::<Phase0>(rope_op(), &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         let mut store_pages = Vec::<u8>::new();
@@ -2158,7 +2878,7 @@ mod tests {
     fn rope_codegen_emits_neox_rotation() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rope_rotate::<Phase0>(rope_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_rope_rotate::<Phase0>(rope_op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
         assert!(src.contains("__cos_smem"), "{src}");
         assert!(src.contains("__sin_smem"), "{src}");
@@ -2179,7 +2899,7 @@ mod tests {
     fn add_releases_both_pages_at_phase1() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_residual_add::<Phase0>(add_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_residual_add::<Phase0>(add_op(), &mut pages, &mut prog);
         assert_eq!(pages.phase_bit[0], 1, "A page on Phase1 after one round");
         assert_eq!(pages.phase_bit[1], 1, "B page on Phase1 after one round");
         assert!(!pages.in_use[0]);
@@ -2222,7 +2942,7 @@ mod tests {
     fn gemm_m1_lowers_to_xload_plus_loop_plus_xclose() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_gemm_m1::<Phase0>(gemm_qkv_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_gemm_m1::<Phase0>(gemm_qkv_op(), &mut pages, &mut prog);
 
         let loops: Vec<&Vec<TkInstr>> = prog
             .instrs
@@ -2247,7 +2967,7 @@ mod tests {
     fn gemm_m1_uses_two_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_gemm_m1::<Phase0>(gemm_qkv_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_gemm_m1::<Phase0>(gemm_qkv_op(), &mut pages, &mut prog);
 
         // Find every page id referenced in any TMA load/store.
         let mut ids = Vec::<u8>::new();
@@ -2282,7 +3002,7 @@ mod tests {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
         let op = gemm_qkv_op();
-        let _ = lower_gemm_m1::<Phase0>(op, &RoutingHints::default(), &mut pages, &mut prog);
+        lower_gemm_m1::<Phase0>(op, &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         let n_blocks = op.n.div_ceil(op.bn);
@@ -2325,7 +3045,7 @@ mod tests {
     fn gemm_m1_down_proj_shape_lowers() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_gemm_m1::<Phase0>(gemm_down_op(), &RoutingHints::default(), &mut pages, &mut prog);
+        lower_gemm_m1::<Phase0>(gemm_down_op(), &mut pages, &mut prog);
         let src = emit_body(&prog);
         // W byte step = 1 * 8192 * 2 = 16384.
         assert!(src.contains("(__n_i * 16384u)"), "{src}");
@@ -2348,30 +3068,30 @@ mod tests {
         }
     }
 
-    /// Step F.1.2: legacy `lower_residual_add` is gone (routing always
-    /// on). The default-hints path must still emit the unchanged
-    /// loader-fills-A + loader-fills-B + storer-drains-A instruction
-    /// shape — full TMA load and store, no smem routing. Sanity-check
-    /// that the renamed `lower_residual_add` (formerly `_routed`) takes
-    /// that path with `RoutingHints::default()`.
+    /// Default hints (no carry-forward, no internal output) emit the
+    /// SAME instruction sequence as the legacy `lower_residual_add`.
+    /// Both load A from gmem, both load B from gmem, storer drains A
+    /// to gmem.
     #[test]
-    fn lower_residual_add_default_hints_emits_full_tma_path() {
+    fn lower_residual_add_routed_default_hints_match_legacy_emit() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _result = lower_residual_add::<Phase0>(
+        let _result = lower_residual_add_routed::<Phase0>(
             add_op_for_routing_test(),
             &RoutingHints::default(),
             &mut pages,
             &mut prog,
         );
-        let src = emit_body(&prog);
-        // Both inputs load from gmem.
-        let n_loads = src.matches("tma::load_async").count();
-        assert_eq!(n_loads, 2, "two TMA loads (A + B)\n{src}");
-        // Storer drains A to gmem (output_internal=false).
-        assert!(
-            src.contains("tma::store_async"),
-            "storer drains A to gmem when output_internal=false\n{src}"
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_residual_add::<Phase0>(add_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(
+            src_routed, src_legacy,
+            "default hints must emit byte-identical CUDA to legacy"
         );
     }
 
@@ -2382,7 +3102,7 @@ mod tests {
     /// slots at Phase0, advancing them all to Phase1, releasing
     /// every slot except id=5 (which we carry-forward).
     #[test]
-    fn lower_residual_add_carry_forward_input_a_skips_load() {
+    fn lower_residual_add_routed_carry_forward_input_a_skips_load() {
         let mut pages = PageAllocator::new();
         // Allocate every slot at Phase0.
         let mut held: Vec<_> = (0..crate::tk_warp_ir::NUM_PAGES)
@@ -2399,7 +3119,7 @@ mod tests {
         let carried = pages.carry_forward(target.advance());
 
         let mut prog = TkProgram::new();
-        let result = lower_residual_add::<Phase1>(
+        let result = lower_residual_add_routed::<Phase1>(
             add_op_for_routing_test(),
             &RoutingHints {
                 inputs: vec![Some(carried), None],
@@ -2441,10 +3161,10 @@ mod tests {
     /// lowering returns a `CarriedHandle` for the orchestrator to
     /// thread to the consuming op.
     #[test]
-    fn lower_residual_add_internal_output_skips_store_and_carries() {
+    fn lower_residual_add_routed_internal_output_skips_store_and_carries() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let result = lower_residual_add::<Phase0>(
+        let result = lower_residual_add_routed::<Phase0>(
             add_op_for_routing_test(),
             &RoutingHints {
                 inputs: vec![None, None],
@@ -2470,32 +3190,34 @@ mod tests {
         );
     }
 
-    /// Step F.1.2: legacy `lower_rmsnorm` is gone (routing always on).
-    /// Default-hints path emits the unchanged X+W TMA load + X TMA
-    /// store shape.
+    /// Default-hints byte-identity for `lower_rmsnorm_routed`.
     #[test]
-    fn lower_rmsnorm_default_hints_emits_full_tma_path() {
+    fn lower_rmsnorm_routed_default_hints_match_legacy_emit() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(
+        let _ = lower_rmsnorm_routed::<Phase0>(
             op(),
             &RoutingHints::default(),
             &mut pages,
             &mut prog,
         );
-        let src = emit_body(&prog);
-        let n_loads = src.matches("tma::load_async").count();
-        assert_eq!(n_loads, 2, "two TMA loads (X + W)\n{src}");
-        assert!(src.contains("tma::store_async"), "X drained to gmem\n{src}");
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_rmsnorm::<Phase0>(op(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
     }
 
     /// `lower_rmsnorm_routed` with `output_internal=true` skips the
     /// storer's TMA store and returns a CarriedHandle.
     #[test]
-    fn lower_rmsnorm_internal_output_skips_store() {
+    fn lower_rmsnorm_routed_internal_output_skips_store() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let result = lower_rmsnorm::<Phase0>(
+        let result = lower_rmsnorm_routed::<Phase0>(
             op(),
             &RoutingHints {
                 inputs: vec![None, None],
@@ -2520,31 +3242,33 @@ mod tests {
         }
     }
 
-    /// Step F.1.2: legacy `lower_silu_mul` is gone (routing always on).
-    /// Default-hints path emits the unchanged gate+up TMA load + gate
-    /// TMA store shape.
+    /// Default-hints byte-identity for `lower_silu_mul_routed`.
     #[test]
-    fn lower_silu_mul_default_hints_emits_full_tma_path() {
+    fn lower_silu_mul_routed_default_hints_match_legacy_emit() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_silu_mul::<Phase0>(
+        let _ = lower_silu_mul_routed::<Phase0>(
             silu_mul_op_for_routing_test(),
             &RoutingHints::default(),
             &mut pages,
             &mut prog,
         );
-        let src = emit_body(&prog);
-        let n_loads = src.matches("tma::load_async").count();
-        assert_eq!(n_loads, 2, "two TMA loads (gate + up)\n{src}");
-        assert!(src.contains("tma::store_async"), "gate drained to gmem\n{src}");
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_silu_mul::<Phase0>(silu_mul_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
     }
 
     /// `lower_silu_mul_routed` with `output_internal=true`: storer skips drain.
     #[test]
-    fn lower_silu_mul_internal_output_skips_store() {
+    fn lower_silu_mul_routed_internal_output_skips_store() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let result = lower_silu_mul::<Phase0>(
+        let result = lower_silu_mul_routed::<Phase0>(
             silu_mul_op_for_routing_test(),
             &RoutingHints {
                 inputs: vec![None, None],
@@ -2571,32 +3295,34 @@ mod tests {
         }
     }
 
-    /// Step F.1.2: legacy `lower_rope_rotate` is gone (routing always
-    /// on). Default-hints path emits the unchanged x+cos+sin TMA load
-    /// + x TMA store shape.
+    /// Default-hints byte-identity for `lower_rope_rotate_routed`.
     #[test]
-    fn lower_rope_rotate_default_hints_emits_full_tma_path() {
+    fn lower_rope_rotate_routed_default_hints_match_legacy_emit() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rope_rotate::<Phase0>(
+        let _ = lower_rope_rotate_routed::<Phase0>(
             rope_op_for_routing_test(),
             &RoutingHints::default(),
             &mut pages,
             &mut prog,
         );
-        let src = emit_body(&prog);
-        let n_loads = src.matches("tma::load_async").count();
-        assert_eq!(n_loads, 3, "three TMA loads (x + cos + sin)\n{src}");
-        assert!(src.contains("tma::store_async"), "x drained to gmem\n{src}");
+        let src_routed = emit_body(&prog);
+
+        let mut pages2 = PageAllocator::new();
+        let mut prog2 = TkProgram::new();
+        lower_rope_rotate::<Phase0>(rope_op_for_routing_test(), &mut pages2, &mut prog2);
+        let src_legacy = emit_body(&prog2);
+
+        assert_eq!(src_routed, src_legacy);
     }
 
     /// `lower_rope_rotate_routed` with `output_internal=true`: storer
     /// skips drain.
     #[test]
-    fn lower_rope_rotate_internal_output_skips_store() {
+    fn lower_rope_rotate_routed_internal_output_skips_store() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let result = lower_rope_rotate::<Phase0>(
+        let result = lower_rope_rotate_routed::<Phase0>(
             rope_op_for_routing_test(),
             &RoutingHints {
                 inputs: vec![None, None, None],

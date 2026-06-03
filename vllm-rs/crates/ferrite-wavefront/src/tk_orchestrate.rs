@@ -32,8 +32,10 @@ use crate::routing::{
 use crate::subtile_ir::BufId;
 use crate::tk_codegen::GlLayout;
 use crate::tk_lower::{
-    lower_attn_decode, lower_gemm_m1, lower_residual_add, lower_rmsnorm, lower_rope_append,
-    lower_rope_rotate, lower_silu_mul, AddOp, AttnDecodeOp, CarriedHandle, GemmM1Op,
+    lower_attn_decode, lower_attn_decode_routed, lower_gemm_m1, lower_gemm_m1_routed,
+    lower_residual_add, lower_residual_add_routed, lower_rmsnorm, lower_rmsnorm_routed,
+    lower_rope_append, lower_rope_append_routed, lower_rope_rotate, lower_rope_rotate_routed,
+    lower_silu_mul, lower_silu_mul_routed, AddOp, AttnDecodeOp, CarriedHandle, GemmM1Op,
     PageAllocator, RmsNormOp, RopeAppendOp, RopeRotateOp, RoutingHints, SiluMulOp,
 };
 use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, WarpRole, PAGE_SIZE};
@@ -59,7 +61,7 @@ fn op_kind_name(op: &LoweredOp) -> &'static str {
     }
 }
 
-/// Step F.1.2 — build routing hints for op `op_idx` from the
+/// Phase 12 — build routing hints for op `op_idx` from the
 /// pre-computed analysis vectors and the running `carried_table`
 /// side table. For each input slot:
 ///   - `InputRouting::CarryForward { producer_op_idx }` →
@@ -133,7 +135,7 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
         // "at most one carry-forward per consumer" rule. They must
         // drain to gmem so the consumer can TMA-load safely.
         coalesce_carry_forwards(&mut outs, &ins);
-        (outs, ins)
+        (Some(outs), Some(ins))
     };
     let mut carried_table: Vec<Option<CarriedHandle>> = vec![None; input.ops.len()];
 
@@ -154,16 +156,30 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
 
     let mut op_out_shape: Vec<(u32, u32)> = Vec::with_capacity(input.ops.len());
 
-    /// Step F.1.2 — routed dispatch. Routing is unconditional after
-    /// Step F.1, so the only entry point is the routing-aware lowering
-    /// `lower_X` (formerly `lower_X_routed` before the suffix drop).
-    /// Picks `Phase0` vs `Phase1` from carry-forward inputs' parities
-    /// (all must agree); falls back to free-slot count when no
-    /// carry-forward inputs. Stores any returned `output_carried`
-    /// into `carried_table[op_idx]`.
+    /// Dispatch one `lower_X<P>` based on which parity has enough free
+    /// slots. Phase0 is preferred (fresh allocator state); Phase1 is
+    /// used for slot reuse after the first round of any slot. If neither
+    /// parity has `n_pages` free, falls back to whichever has more — the
+    /// inner `alloc_at::<P>()` will then panic with the offending op
+    /// name, which is the visible failure we want.
+    macro_rules! dispatch_phase {
+        ($n_pages:expr, $f:ident, $op:expr) => {{
+            let n: usize = $n_pages;
+            if pages.count_at(0) >= n {
+                $f::<Phase0>($op, &mut pages, &mut prog);
+            } else {
+                $f::<Phase1>($op, &mut pages, &mut prog);
+            }
+        }};
+    }
+
+    /// Phase 12 — routed dispatch. Returns `RoutingResult`. Picks
+    /// `Phase0` vs `Phase1` from carry-forward inputs' parities (all
+    /// must agree); falls back to free-slot count when no carry-
+    /// forward inputs.
+    #[allow(unused_macros)]
     macro_rules! dispatch_phase_routed {
-        ($op_idx:expr, $hints:expr, $carried:expr,
-         $n_pages:expr, $f:ident, $op:expr) => {{
+        ($n_pages:expr, $f:ident, $op:expr, $hints:expr) => {{
             let n: usize = $n_pages;
             let hints_ref: &RoutingHints = $hints;
             let parities: Vec<u32> = hints_ref
@@ -180,7 +196,7 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 );
             }
             let chosen = parities.first().copied();
-            let result = match chosen {
+            match chosen {
                 Some(0) => $f::<Phase0>($op, hints_ref, &mut pages, &mut prog),
                 Some(1) => $f::<Phase1>($op, hints_ref, &mut pages, &mut prog),
                 Some(other) => panic!(
@@ -195,8 +211,24 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         $f::<Phase1>($op, hints_ref, &mut pages, &mut prog)
                     }
                 }
-            };
-            $carried[$op_idx] = result.output_carried;
+            }
+        }};
+    }
+
+    /// Combined dispatch: routed when `hints_opt` is `Some`; legacy
+    /// otherwise. Stores any returned `output_carried` into
+    /// `carried_table[op_idx]`. Caller passes `op_idx`, `hints_opt`,
+    /// and `carried_table` explicitly so macro hygiene doesn't trip
+    /// on the captured for-loop variable.
+    macro_rules! dispatch_phase_maybe_routed {
+        ($op_idx:expr, $hints_opt:expr, $carried:expr,
+         $n_pages:expr, $f_legacy:ident, $f_routed:ident, $op:expr) => {{
+            if let Some(ref hints) = $hints_opt {
+                let result = dispatch_phase_routed!($n_pages, $f_routed, $op, hints);
+                $carried[$op_idx] = result.output_carried;
+            } else {
+                dispatch_phase!($n_pages, $f_legacy, $op);
+            }
         }};
     }
 
@@ -234,20 +266,25 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
             ),
         );
 
-        // Step F.1.2: build per-op routing hints from the analysis +
-        // running side table. Routing is unconditional after Step F.1.
-        let hints: RoutingHints =
-            build_routing_hints(op_idx, &input_routing, &output_routing, &carried_table);
+        // Phase 12: build per-op routing hints from the analysis +
+        // running side table. None when routing is off (legacy path).
+        let hints_opt: Option<RoutingHints> =
+            if let (Some(ir), Some(or_)) = (input_routing.as_ref(), output_routing.as_ref()) {
+                Some(build_routing_hints(op_idx, ir, or_, &carried_table))
+            } else {
+                None
+            };
 
         match desc.op {
             LoweredOp::RmsNorm { eps } => {
                 let x = buf_for(desc.inputs[0], &op_out_buf);
                 let weight = buf_for(desc.inputs[1], &op_out_buf);
                 let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
                     2,
                     lower_rmsnorm,
+                    lower_rmsnorm_routed,
                     RmsNormOp {
                         x,
                         weight,
@@ -266,10 +303,11 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let x = buf_for(desc.inputs[0], &op_out_buf);
                 let w = buf_for(desc.inputs[1], &op_out_buf);
                 let bn = pick_bn(k);
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
                     3,
                     lower_gemm_m1,
+                    lower_gemm_m1_routed,
                     GemmM1Op {
                         x,
                         w,
@@ -287,10 +325,11 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let gate = buf_for(desc.inputs[0], &op_out_buf);
                 let up = buf_for(desc.inputs[1], &op_out_buf);
                 let intermediate = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
                     2,
                     lower_silu_mul,
+                    lower_silu_mul_routed,
                     SiluMulOp {
                         gate,
                         up,
@@ -307,10 +346,11 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let a = buf_for(desc.inputs[0], &op_out_buf);
                 let b = buf_for(desc.inputs[1], &op_out_buf);
                 let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
                     2,
                     lower_residual_add,
+                    lower_residual_add_routed,
                     AddOp {
                         a,
                         b,
@@ -329,10 +369,11 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let sin = buf_for(desc.inputs[2], &op_out_buf);
                 let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
                 let num_heads = cols / head_dim;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
                     3,
                     lower_rope_rotate,
+                    lower_rope_rotate_routed,
                     RopeRotateOp {
                         x,
                         cos,
@@ -364,13 +405,10 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let v_cache = buf_for(desc.inputs[5], &op_out_buf);
                 let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
                 let num_kv_heads = cols / head_dim;
-                // Routed lowering only carries K/cos/sin/V (4 slots);
-                // K_cache and V_cache are always Ext (paged-cache pools)
-                // so their hints are dropped via `take(4)`.
-                let rope_hints = RoutingHints {
-                    inputs: hints.inputs.iter().take(4).cloned().collect(),
-                    output_internal: hints.output_internal,
-                };
+                let hints_opt = hints_opt.as_ref().map(|h| RoutingHints {
+                    inputs: h.inputs.iter().take(4).cloned().collect(),
+                    output_internal: h.output_internal,
+                });
                 let rope_append_op = RopeAppendOp {
                     k,
                     cos,
@@ -391,39 +429,54 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 let v_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(
                     v_cache,
                 );
-                // Step F.1.2: routing always on. Phase chosen from
-                // carry-forward parities; falls back to free-slot count
-                // when no carry-forward inputs.
-                let parities: Vec<u32> = rope_hints
-                    .inputs
-                    .iter()
-                    .filter_map(|h| h.as_ref().map(|c| c.phase))
-                    .collect();
-                let chosen = parities.first().copied();
-                let (result, k_out, v_out) = match chosen {
-                    Some(0) => lower_rope_append::<Phase0>(
-                        rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                    ),
-                    Some(1) => lower_rope_append::<Phase1>(
-                        rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                    ),
-                    Some(other) => panic!(
-                        "lower_to_tk: invalid carry-forward parity {} for lower_rope_append",
-                        other,
-                    ),
+                let (k_out, v_out) = match hints_opt.as_ref() {
+                    Some(hints) => {
+                        // Routed: phase from carry-forward parities.
+                        let parities: Vec<u32> = hints
+                            .inputs
+                            .iter()
+                            .filter_map(|h| h.as_ref().map(|c| c.phase))
+                            .collect();
+                        let chosen = parities.first().copied();
+                        let (result, k_out, v_out) = match chosen {
+                            Some(0) => lower_rope_append_routed::<Phase0>(
+                                rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                            ),
+                            Some(1) => lower_rope_append_routed::<Phase1>(
+                                rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                            ),
+                            Some(other) => panic!(
+                                "lower_to_tk: invalid carry-forward parity {} for lower_rope_append_routed",
+                                other,
+                            ),
+                            None => {
+                                if pages.count_at(0) >= 4 {
+                                    lower_rope_append_routed::<Phase0>(
+                                        rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                                    )
+                                } else {
+                                    lower_rope_append_routed::<Phase1>(
+                                        rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                                    )
+                                }
+                            }
+                        };
+                        carried_table[op_idx] = result.output_carried;
+                        (k_out, v_out)
+                    }
                     None => {
+                        // Legacy: phase from free-slot count.
                         if pages.count_at(0) >= 4 {
                             lower_rope_append::<Phase0>(
-                                rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
+                                rope_append_op, k_handle, v_handle, &mut pages, &mut prog,
                             )
                         } else {
                             lower_rope_append::<Phase1>(
-                                rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
+                                rope_append_op, k_handle, v_handle, &mut pages, &mut prog,
                             )
                         }
                     }
                 };
-                carried_table[op_idx] = result.output_carried;
                 pending_k_unfenced = Some(k_out);
                 pending_v_unfenced = Some(v_out);
                 op_out_shape.push((desc.m, cols));
@@ -447,10 +500,10 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 // — Q + paged-cache segment pairs (often >3). The
                 // routed lowering only consumes Q/k_cache/v_cache (3).
                 // Truncate hints to match.
-                let attn_hints = RoutingHints {
-                    inputs: hints.inputs.iter().take(3).cloned().collect(),
-                    output_internal: hints.output_internal,
-                };
+                let hints_opt = hints_opt.as_ref().map(|h| RoutingHints {
+                    inputs: h.inputs.iter().take(3).cloned().collect(),
+                    output_internal: h.output_internal,
+                });
                 let attn_decode_op = AttnDecodeOp {
                     q,
                     k_cache,
@@ -490,59 +543,79 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 );
                 let k_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, k_unfenced);
                 let v_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, v_unfenced);
-                // Step F.1.2: routing always on. Phase chosen from
-                // carry-forward parities; falls back to free-slot count
-                // when no carry-forward inputs.
-                let parities: Vec<u32> = attn_hints
-                    .inputs
-                    .iter()
-                    .filter_map(|h| h.as_ref().map(|c| c.phase))
-                    .collect();
-                let chosen = parities.first().copied();
-                let result = match chosen {
-                    Some(0) => lower_attn_decode::<Phase0>(
-                        attn_decode_op,
-                        k_fenced,
-                        v_fenced,
-                        &attn_hints,
-                        &mut pages,
-                        &mut prog,
-                    ),
-                    Some(1) => lower_attn_decode::<Phase1>(
-                        attn_decode_op,
-                        k_fenced,
-                        v_fenced,
-                        &attn_hints,
-                        &mut pages,
-                        &mut prog,
-                    ),
-                    Some(other) => panic!(
-                        "lower_to_tk: invalid carry-forward parity {} for lower_attn_decode",
-                        other,
-                    ),
+                match hints_opt.as_ref() {
+                    Some(hints) => {
+                        let parities: Vec<u32> = hints
+                            .inputs
+                            .iter()
+                            .filter_map(|h| h.as_ref().map(|c| c.phase))
+                            .collect();
+                        let chosen = parities.first().copied();
+                        let result = match chosen {
+                            Some(0) => lower_attn_decode_routed::<Phase0>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                hints,
+                                &mut pages,
+                                &mut prog,
+                            ),
+                            Some(1) => lower_attn_decode_routed::<Phase1>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                hints,
+                                &mut pages,
+                                &mut prog,
+                            ),
+                            Some(other) => panic!(
+                                "lower_to_tk: invalid carry-forward parity {} for lower_attn_decode_routed",
+                                other,
+                            ),
+                            None => {
+                                if pages.count_at(0) >= 3 {
+                                    lower_attn_decode_routed::<Phase0>(
+                                        attn_decode_op,
+                                        k_fenced,
+                                        v_fenced,
+                                        hints,
+                                        &mut pages,
+                                        &mut prog,
+                                    )
+                                } else {
+                                    lower_attn_decode_routed::<Phase1>(
+                                        attn_decode_op,
+                                        k_fenced,
+                                        v_fenced,
+                                        hints,
+                                        &mut pages,
+                                        &mut prog,
+                                    )
+                                }
+                            }
+                        };
+                        carried_table[op_idx] = result.output_carried;
+                    }
                     None => {
                         if pages.count_at(0) >= 3 {
                             lower_attn_decode::<Phase0>(
                                 attn_decode_op,
                                 k_fenced,
                                 v_fenced,
-                                &attn_hints,
                                 &mut pages,
                                 &mut prog,
-                            )
+                            );
                         } else {
                             lower_attn_decode::<Phase1>(
                                 attn_decode_op,
                                 k_fenced,
                                 v_fenced,
-                                &attn_hints,
                                 &mut pages,
                                 &mut prog,
-                            )
+                            );
                         }
                     }
-                };
-                carried_table[op_idx] = result.output_carried;
+                }
                 op_out_shape.push((desc.m, num_q_heads * head_dim));
             }
 

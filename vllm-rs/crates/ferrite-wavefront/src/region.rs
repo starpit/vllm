@@ -548,6 +548,11 @@ pub(crate) fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
             num_q_heads,
             head_dim,
             ..
+        }
+        | LoweredOp::AttnPrefill {
+            num_q_heads,
+            head_dim,
+            ..
         } => num_q_heads * head_dim,
         LoweredOp::RmsNorm { .. }
         | LoweredOp::Silu
@@ -555,7 +560,9 @@ pub(crate) fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
         | LoweredOp::SiluMul
         | LoweredOp::Add
         | LoweredOp::RopeRotate { .. }
-        | LoweredOp::RopeAppend { .. } => in0_cols,
+        | LoweredOp::RopeAppend { .. }
+        | LoweredOp::RopeMultiToken { .. }
+        | LoweredOp::ReshapeAndCacheMulti { .. } => in0_cols,
     }
 }
 
@@ -666,12 +673,22 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
                         num_kv_heads,
                         head_dim,
                         scale,
+                    }
+                    | LoweredOp::AttnPrefill {
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        scale,
                     } => SubOp::AttnDecode {
                         num_q_heads,
                         num_kv_heads,
                         head_dim,
                         scale,
                     },
+                    LoweredOp::RopeMultiToken { head_dim } => SubOp::RopeRotate { head_dim },
+                    LoweredOp::ReshapeAndCacheMulti { head_dim, layer } => {
+                        SubOp::RopeAppend { head_dim, layer }
+                    }
                     LoweredOp::Gemm { .. } => unreachable!("gemm handled above"),
                 };
                 // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the

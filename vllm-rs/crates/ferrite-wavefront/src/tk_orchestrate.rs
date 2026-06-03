@@ -59,6 +59,9 @@ fn op_kind_name(op: &LoweredOp) -> &'static str {
         LoweredOp::RopeRotate { .. } => "RopeRotate",
         LoweredOp::RopeAppend { .. } => "RopeAppend",
         LoweredOp::AttnDecode { .. } => "AttnDecode",
+        LoweredOp::AttnPrefill { .. } => "AttnPrefill",
+        LoweredOp::RopeMultiToken { .. } => "RopeMultiToken",
+        LoweredOp::ReshapeAndCacheMulti { .. } => "ReshapeAndCacheMulti",
     }
 }
 
@@ -633,6 +636,19 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     desc.op
                 );
             }
+
+            // Stage 4.A — prefill IR variants exist in the enum so
+            // the bridge can emit them, but the lowerings land in
+            // Stage 4.C. Until then, the orchestrator panics if a
+            // prefill canonical (num_tokens > 1) reaches it.
+            LoweredOp::AttnPrefill { .. }
+            | LoweredOp::RopeMultiToken { .. }
+            | LoweredOp::ReshapeAndCacheMulti { .. } => {
+                panic!(
+                    "lower_to_tk: prefill op {:?} not yet supported (Stage 4.C)",
+                    desc.op
+                );
+            }
         }
     }
 
@@ -739,6 +755,18 @@ pub fn descriptor_layouts_for_rmsnorm_outputs(input: &LoweringInput) -> BTreeMap
                     desc.op
                 );
             }
+            LoweredOp::AttnPrefill {
+                num_q_heads,
+                head_dim,
+                ..
+            } => {
+                op_out_shape.push((desc.m, num_q_heads * head_dim));
+            }
+            LoweredOp::RopeMultiToken { .. }
+            | LoweredOp::ReshapeAndCacheMulti { .. } => {
+                let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                op_out_shape.push((desc.m, cols));
+            }
         }
     }
     out
@@ -829,6 +857,44 @@ mod tests {
             .count();
         assert_eq!(ext, 3, "External count: result + multi-consumer + coalesce-demotion");
         assert_eq!(outs.len() - ext, 9, "Internal count");
+    }
+
+    /// Step F (Stage 4.A) — bridge is parameterized by `num_tokens`.
+    /// For `num_tokens > 1`, the bridge emits prefill IR variants
+    /// (`AttnPrefill`, `RopeMultiToken`, `ReshapeAndCacheMulti`) and
+    /// every `OpDesc.m == num_tokens`. Until Stage 4.C lands the
+    /// per-op lowerings, the orchestrator panics on prefill ops with
+    /// a known message — this test pins that contract so the next
+    /// stage knows where to wire the lowerings.
+    #[test]
+    fn stage_4a_prefill_fixture_propagates_num_tokens() {
+        use crate::fixtures::{buf_byte_sizes, one_layer_input, prefill_one_layer_input};
+        let n = 64u32;
+        let pf = prefill_one_layer_input(n);
+        // Every op carries the bucket size as `m`.
+        for od in &pf.ops {
+            assert_eq!(od.m, n, "OpDesc.m must equal num_tokens");
+        }
+        // Prefill IR variants (vs decode's RopeRotate/RopeAppend/AttnDecode):
+        let kinds: Vec<&'static str> = pf.ops.iter().map(|od| op_kind_name(&od.op)).collect();
+        assert!(kinds.contains(&"RopeMultiToken"), "kinds={:?}", kinds);
+        assert!(kinds.contains(&"AttnPrefill"), "kinds={:?}", kinds);
+        // Per-buffer byte sizes scale with num_tokens for activation
+        // sources (source 0 = `[m, hidden]`, m * 2048 * 2 bytes).
+        let dec_sizes = buf_byte_sizes(&one_layer_input());
+        let pf_sizes = buf_byte_sizes(&pf);
+        // Source 0 (input activation `x`): decode is `[1, 2048] = 4096 B`,
+        // prefill is `[n, 2048] = n * 4096 B`.
+        assert_eq!(dec_sizes[0], 1 * 2048 * 2);
+        assert_eq!(pf_sizes[0], n as usize * 2048 * 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "prefill op")]
+    fn stage_4a_orchestrator_panics_on_prefill_until_4c() {
+        use crate::fixtures::rope_multi_only_input;
+        let pf = rope_multi_only_input(64);
+        let _ = lower_to_tk(&pf);
     }
 
     /// Step C.3 — full one-layer canonical emit with descriptor TMA on

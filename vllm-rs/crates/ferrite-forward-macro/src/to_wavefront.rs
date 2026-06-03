@@ -338,8 +338,13 @@ impl<'a> Builder<'a> {
         if let Some(cs) = self.cos_sin {
             return cs;
         }
-        let cos = self.push_source(1, self.head_dim, SourceBinding::Cos);
-        let sin = self.push_source(1, self.head_dim, SourceBinding::Sin);
+        // For decode (m=1), cos/sin source is `[1, head_dim]` — one
+        // position. For prefill (m=num_tokens), the runtime gathers
+        // num_tokens cos/sin rows; the structural source shape is
+        // `[m, head_dim]`. The shape contract for the prefill rope
+        // lowerings (Stage 4.C) requires this row count.
+        let cos = self.push_source(self.m, self.head_dim, SourceBinding::Cos);
+        let sin = self.push_source(self.m, self.head_dim, SourceBinding::Sin);
         self.cos_sin = Some((cos, sin));
         (cos, sin)
     }
@@ -368,21 +373,33 @@ fn kv_cache_index(node: &FufNode) -> Option<u64> {
     })
 }
 
-/// Translate a solved decode FUF into a wavefront `LoweringInput`.
+/// Translate a solved FUF into a wavefront `LoweringInput`, parameterized
+/// by `num_tokens` (Stage 4.A of Step F).
 ///
-/// `asn` is the `num_tokens = 1` (decode) [`Assignment`]; `bounds` is the
+/// - `num_tokens == 1` is decode (per-token prefill / single-token forward).
+///   Emits `RopeRotate` / `RopeAppend` / `AttnDecode` exactly as before
+///   the rename.
+/// - `num_tokens > 1` is bucketed prefill. Emits `RopeMultiToken` /
+///   `ReshapeAndCacheMulti` / `AttnPrefill`. The per-op lowerings for
+///   these variants land in Stage 4.C; until then, the orchestrator
+///   panics on them so callers don't accidentally compile a prefill
+///   bucket before the lowerings exist.
+///
+/// `asn` is the [`Assignment`] solved for this bucket; `bounds` is the
 /// per-model integer bounds the solver used (tp-sharded if tp>1).
 /// `prefix_len` models the KV-cache prefix rows for the attention
 /// `Source` segments (structural only — the real length binds at run
 /// time).
-pub fn lower_decode_to_wavefront(
+pub fn lower_to_wavefront(
     fuf: &Fuf,
     asn: &Assignment,
     inferred: &Inferred,
     bounds: &BTreeMap<String, u64>,
     model: &ModelParams,
     prefix_len: u32,
+    num_tokens: u32,
 ) -> Result<LoweredDecode, BridgeError> {
+    assert!(num_tokens >= 1, "num_tokens must be >= 1");
     let eps = *model
         .scalars
         .get("rms_norm_eps")
@@ -391,8 +408,8 @@ pub fn lower_decode_to_wavefront(
         })? as f32;
     let scale = attention_scale_for(model);
     let mut b = bounds.clone();
-    b.insert("num_tokens".into(), 1);
-    let m = 1u32;
+    b.insert("num_tokens".into(), num_tokens as u64);
+    let m = num_tokens;
     let head_dim = b
         .get("head_dim")
         .copied()
@@ -572,12 +589,32 @@ pub fn lower_decode_to_wavefront(
                 // source indices via the cached `prefix_for(layer)`
                 // helper (same indices Attention will receive later).
                 let (pk, pv) = bx.prefix_for(layer as u64);
+                // Stage 4.A — bridge dispatches RopeAppend two ways:
+                //   - num_tokens == 1 (decode): RopeRotate (Q) +
+                //     RopeAppend (K + cache write).
+                //   - num_tokens > 1 (prefill): RopeMultiToken (Q) +
+                //     ReshapeAndCacheMulti (K + cache write across
+                //     num_tokens rows).
+                // The lowerings for the prefill variants land in
+                // Stage 4.C; until then the orchestrator panics on
+                // them. The IR variants exist so this bridge can emit.
+                let (q_op, k_op) = if num_tokens > 1 {
+                    (
+                        LoweredOp::RopeMultiToken { head_dim },
+                        LoweredOp::ReshapeAndCacheMulti { head_dim, layer },
+                    )
+                } else {
+                    (
+                        LoweredOp::RopeRotate { head_dim },
+                        LoweredOp::RopeAppend { head_dim, layer },
+                    )
+                };
                 let qi = bx.push_op(
-                    LoweredOp::RopeRotate { head_dim },
+                    q_op,
                     vec![q, InputRef::Ext(cos), InputRef::Ext(sin)],
                 );
                 let ki = bx.push_op(
-                    LoweredOp::RopeAppend { head_dim, layer },
+                    k_op,
                     vec![
                         k,
                         InputRef::Ext(cos),
@@ -610,13 +647,26 @@ pub fn lower_decode_to_wavefront(
                     detail: "attention missing kv_cache extern index",
                 })?;
                 let (pk, pv) = bx.prefix_for(layer);
-                let idx = bx.push_op(
+                // Stage 4.A — bridge picks AttnDecode (m=1) vs
+                // AttnPrefill (m>1). The Stage 4.C lowering for
+                // AttnPrefill is the FA-2-style consumer body.
+                let attn_op = if num_tokens > 1 {
+                    LoweredOp::AttnPrefill {
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        scale,
+                    }
+                } else {
                     LoweredOp::AttnDecode {
                         num_q_heads,
                         num_kv_heads,
                         head_dim,
                         scale,
-                    },
+                    }
+                };
+                let idx = bx.push_op(
+                    attn_op,
                     vec![q, InputRef::Ext(pk), InputRef::Ext(pv), k, v],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
@@ -939,6 +989,9 @@ pub fn stats(fuf: &Fuf, asn: &Assignment, lowered: &LoweredDecode) -> BridgeStat
             LoweredOp::RopeRotate { .. } => "RopeRotate",
             LoweredOp::RopeAppend { .. } => "RopeAppend",
             LoweredOp::AttnDecode { .. } => "AttnDecode",
+            LoweredOp::AttnPrefill { .. } => "AttnPrefill",
+            LoweredOp::RopeMultiToken { .. } => "RopeMultiToken",
+            LoweredOp::ReshapeAndCacheMulti { .. } => "ReshapeAndCacheMulti",
         };
         *hist.entry(name).or_default() += 1;
     }

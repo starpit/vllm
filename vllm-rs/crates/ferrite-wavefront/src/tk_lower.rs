@@ -599,9 +599,15 @@ pub fn lower_attn_decode<P: Phase>(
     // cause as the op4/Gemm deadlock when slot reuse straddled an
     // odd number of prior cycles.
     let start = P::VALUE;
-    prog.for_loop(
+    // Structural enforcement (Gap 17): for_loop_runtime is the ONLY
+    // path that constructs `LoopBound::RuntimeU32` (the constructor
+    // is sealed). Plain `prog.for_loop(_, LoopBound::RuntimeU32(...))`
+    // is now a Rust compile error — verifying that the substrate
+    // catches the legacy buggy form structurally.
+    let post_pages = prog.for_loop_runtime(
         loop_var,
-        LoopBound::RuntimeU32(op.num_kv_pages_arg.into()),
+        op.num_kv_pages_arg,
+        vec![k_page, v_page],
         |body| {
             // Per-iteration K round. Parity = (__kv_i & 1) ^ P::VALUE.
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
@@ -680,8 +686,13 @@ pub fn lower_attn_decode<P: Phase>(
     // `complete_round(k_page)` on `PageHandleAfterRuntimeLoop` would
     // be a Rust compile error — there's no impl that accepts the
     // post-loop handle without the parity correction.
-    let k_page_post = PageHandleAfterRuntimeLoop::from_handle(k_page);
-    let v_page_post = PageHandleAfterRuntimeLoop::from_handle(v_page);
+    // for_loop_runtime returned post-loop wrappers in the same order
+    // as input: [k_page_post, v_page_post]. The wrappers are the only
+    // type complete_round_with_parity_correction accepts — and that
+    // function emits the phantom round automatically.
+    let mut post_pages_iter = post_pages.into_iter();
+    let k_page_post = post_pages_iter.next().expect("k post-loop handle");
+    let v_page_post = post_pages_iter.next().expect("v post-loop handle");
     let k_page = prog.complete_round_with_parity_correction(k_page_post, op.num_kv_pages_arg);
     let v_page = prog.complete_round_with_parity_correction(v_page_post, op.num_kv_pages_arg);
     pages.release(k_page);
@@ -799,9 +810,11 @@ pub fn lower_attn_decode_routed<P: Phase>(
     let v_tile = k_tile;
     let loop_var = "__kv_i";
     let start = P::VALUE;
-    prog.for_loop(
+    // Structural enforcement (Gap 17) for the routed AttnDecode too.
+    let post_pages = prog.for_loop_runtime(
         loop_var,
-        LoopBound::RuntimeU32(op.num_kv_pages_arg.into()),
+        op.num_kv_pages_arg,
+        vec![k_page, v_page],
         |body| {
             // Per-iter K row offset; see `lower_attn_decode` for the
             // block-table-indirection caveat.
@@ -846,10 +859,11 @@ pub fn lower_attn_decode_routed<P: Phase>(
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, v_id);
         },
     );
-    // Compile-time-enforced parity correction (Gap 17). See
-    // `lower_attn_decode` for the rationale.
-    let k_page_post = PageHandleAfterRuntimeLoop::from_handle(k_page);
-    let v_page_post = PageHandleAfterRuntimeLoop::from_handle(v_page);
+    // for_loop_runtime returned post-loop wrappers; structurally
+    // forces complete_round_with_parity_correction (Gap 17).
+    let mut post_pages_iter = post_pages.into_iter();
+    let k_page_post = post_pages_iter.next().expect("k post-loop handle");
+    let v_page_post = post_pages_iter.next().expect("v post-loop handle");
     let k_page = prog.complete_round_with_parity_correction(k_page_post, op.num_kv_pages_arg);
     let v_page = prog.complete_round_with_parity_correction(v_page_post, op.num_kv_pages_arg);
     pages.release(k_page);

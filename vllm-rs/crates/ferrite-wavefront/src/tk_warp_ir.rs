@@ -151,20 +151,30 @@ impl Phase for Phase1 {
 /// hardware aligns with typed phase. Forgetting the correction is
 /// impossible: there's no `complete_round` method on this type.
 ///
-/// # Compile-fail proof
+/// # Compile-fail proofs (the structural Gap 17 enforcement)
 ///
-/// Calling `prog.complete_round` on a `PageHandleAfterRuntimeLoop` is
-/// a Rust compile error — `complete_round` only accepts `PageHandle<P>`,
-/// not the post-loop wrapper.
+/// 1. Calling `prog.complete_round` on a `PageHandleAfterRuntimeLoop`
+///    is a Rust compile error — `complete_round` only accepts
+///    `PageHandle<P>`, not the post-loop wrapper.
 /// ```compile_fail
 /// use ferrite_wavefront::tk_warp_ir::*;
 /// let mut prog = TkProgram::new();
 /// let page: PageHandle<Phase0> = PageHandle::fresh(0);
 /// let post = PageHandleAfterRuntimeLoop::from_handle(page);
-/// // The lowering author tries to release without the parity
-/// // correction. complete_round expects PageHandle<P>, not the
-/// // post-loop wrapper. Compile error.
+/// // Author tries to release without parity correction. Compile error.
 /// let _ = prog.complete_round(post);
+/// ```
+///
+/// 2. Constructing `LoopBound::RuntimeU32(...)` from a lowering is a
+///    Rust compile error — the constructor takes a sealed
+///    `SealedRuntime` token only `for_loop_runtime` can mint.
+///    Verifies that the legacy `prog.for_loop(_, LoopBound::RuntimeU32
+///    (...))` pattern (which would let the buggy
+///    `prog.complete_round(k_page)` compile) is no longer expressible.
+/// ```compile_fail
+/// use ferrite_wavefront::tk_warp_ir::*;
+/// let _ = LoopBound::RuntimeU32("__num_kv_pages".to_string());
+/// // error[E0061]: enum variant takes 2 arguments but 1 was supplied
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct PageHandleAfterRuntimeLoop<P: Phase> {
@@ -379,10 +389,36 @@ pub enum TkInstr {
 
 /// Loop trip count for [`TkInstr::ForLoop`]: either a const baked at
 /// codegen time or a named runtime u32 the kernel scaffold provides.
+///
+/// The `RuntimeU32` variant carries a sealed token (`SealedRuntime`)
+/// that only the substrate's [`TkProgram::for_loop_runtime`] can
+/// construct. Constructing `LoopBound::RuntimeU32(...)` from a
+/// lowering is a Rust compile error — guarantees runtime loops go
+/// through the typed parity-correction path (Gap 17, fixes the
+/// FERRITE_WAVEFRONT_GPU=1 first-decode hang structurally).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoopBound {
     Const(u32),
-    RuntimeU32(String),
+    /// Runtime u32 expression. **Construction sealed**: only
+    /// [`TkProgram::for_loop_runtime`] can produce this variant.
+    RuntimeU32(String, SealedRuntime),
+}
+
+/// Sealed token gating `LoopBound::RuntimeU32` construction.
+/// External code cannot instantiate this — only `tk_warp_ir`
+/// internals (specifically [`TkProgram::for_loop_runtime`]) call
+/// `SealedRuntime::new()` (which is `pub(crate)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedRuntime(());
+
+impl SealedRuntime {
+    /// Crate-private. Lowerings cannot call this — they MUST go
+    /// through `TkProgram::for_loop_runtime`, which threads page
+    /// handles through `PageHandleAfterRuntimeLoop` and forces the
+    /// parity-correction release.
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
 }
 
 /// The phase argument to [`TkInstr::Wait`].
@@ -416,7 +452,7 @@ impl LoopBound {
     pub fn cuda_expr(&self) -> String {
         match self {
             LoopBound::Const(n) => n.to_string(),
-            LoopBound::RuntimeU32(name) => name.clone(),
+            LoopBound::RuntimeU32(name, _) => name.clone(),
         }
     }
 }
@@ -697,6 +733,48 @@ impl TkProgram {
             _phase: PhantomData,
         }
         .advance()
+    }
+
+    /// **Structural enforcement of parity correction (Gap 17).** Build
+    /// a `ForLoop` body where the iter count is a runtime variable.
+    /// Pages threaded through the loop come in as `PageHandle<P>` and
+    /// come out as `PageHandleAfterRuntimeLoop<P>` — the only type
+    /// the safe `complete_round_with_parity_correction` accepts.
+    /// Calling plain `prog.complete_round` on the returned handles is
+    /// a Rust compile error (proven by the doctest on
+    /// [`PageHandleAfterRuntimeLoop`]).
+    ///
+    /// This is the structural fix for FERRITE_WAVEFRONT_GPU=1
+    /// first-decode hang — the legacy `for_loop + complete_round`
+    /// pattern is no longer expressible: handles you put through
+    /// `for_loop_runtime` can't be released without going through
+    /// `complete_round_with_parity_correction`.
+    pub fn for_loop_runtime<P, F>(
+        &mut self,
+        var: impl Into<String>,
+        count_var: impl Into<String>,
+        pages: Vec<PageHandle<P>>,
+        build: F,
+    ) -> Vec<PageHandleAfterRuntimeLoop<P>>
+    where
+        P: Phase,
+        F: FnOnce(&mut LoopBody<'_>),
+    {
+        let count_var_string = count_var.into();
+        let mut body_prog = TkProgram::new();
+        let mut body = LoopBody {
+            inner: &mut body_prog,
+        };
+        build(&mut body);
+        self.instrs.push(TkInstr::ForLoop {
+            var: var.into(),
+            count: LoopBound::RuntimeU32(count_var_string, SealedRuntime::new()),
+            body: body_prog.instrs,
+        });
+        pages
+            .into_iter()
+            .map(PageHandleAfterRuntimeLoop::from_handle)
+            .collect()
     }
 
     /// Build a `ForLoop` body in a sub-program. The closure receives

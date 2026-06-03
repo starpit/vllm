@@ -157,6 +157,140 @@ impl VisionConfig {
         debug_assert_eq!(cos.len(), total_l * half_rot);
         (cos, sin)
     }
+
+    /// Build the raw per-token 2D-RoPE angle table (`freqs`, f32),
+    /// shape `[total_l, half_rot]` row-major (theta_h's then theta_w's
+    /// per token). Identical position logic to
+    /// [`Self::build_rope_cos_sin_bf16`] but emits the raw angles
+    /// `theta = pos * inv_freq` instead of their cos/sin — the metal
+    /// `vision_rope_2d` kernel reads `freqs` and computes cos/sin
+    /// internally, whereas the cuda `vision_rope_apply` kernel consumes
+    /// the precomputed cos/sin from `build_rope_cos_sin_bf16`.
+    pub fn build_rope_freqs_f32(&self, grid_thw: &[(u32, u32, u32)], total_l: usize) -> Vec<f32> {
+        let head_dim = self.head_dim();
+        let half_rot = head_dim / 2;
+        let freq_axis_dim = half_rot / 2;
+        let s = self.spatial_merge_size as usize;
+
+        let inv_freq: Vec<f32> = (0..freq_axis_dim)
+            .map(|i| 1.0 / ROPE_THETA.powf((2 * i) as f32 / (half_rot as f32)))
+            .collect();
+
+        let mut freqs = Vec::<f32>::with_capacity(total_l * half_rot);
+        for &(t, h, w) in grid_thw {
+            let (h, w, t) = (h as usize, w as usize, t as usize);
+            debug_assert_eq!(h % s, 0, "h must be divisible by spatial_merge_size");
+            debug_assert_eq!(w % s, 0, "w must be divisible by spatial_merge_size");
+            let h_blocks = h / s;
+            let w_blocks = w / s;
+            let frame_len = h * w;
+            let mut hpos = vec![0u32; frame_len];
+            let mut wpos = vec![0u32; frame_len];
+            let mut idx = 0usize;
+            for hb in 0..h_blocks {
+                for wb in 0..w_blocks {
+                    for sh in 0..s {
+                        for sw in 0..s {
+                            hpos[idx] = (hb * s + sh) as u32;
+                            wpos[idx] = (wb * s + sw) as u32;
+                            idx += 1;
+                        }
+                    }
+                }
+            }
+            for _ in 0..t {
+                for token in 0..frame_len {
+                    let hp = hpos[token] as f32;
+                    let wp = wpos[token] as f32;
+                    for &f in inv_freq.iter() {
+                        freqs.push(hp * f);
+                    }
+                    for &f in inv_freq.iter() {
+                        freqs.push(wp * f);
+                    }
+                }
+            }
+        }
+        debug_assert_eq!(freqs.len(), total_l * half_rot);
+        freqs
+    }
+
+    /// Host-side `fast_pos_embed_interpolate` (Qwen3.5-VL). For every
+    /// output token — emitted directly in spatial-merge order so it
+    /// pairs elementwise with the patch packing — bilinearly
+    /// interpolates the learned positional table at the token's
+    /// `(row, col)` mapped onto a `num_grid_per_side × num_grid_per_side`
+    /// grid via `linspace(0, num_grid_per_side - 1, h|w)`. Mirror of
+    /// mlx-vlm `qwen3_vl/vision.py::fast_pos_embed_interpolate` (the
+    /// trailing spatial-merge `reshape/transpose` is fused into the
+    /// `(hb, wb, sh, sw)` loop, exactly as `build_rope_freqs_f32` does).
+    ///
+    /// `table` is the learned `pos_embed.weight`, f32
+    /// `[num_grid_per_side², embed_dim]`. Returns `[total_l, embed_dim]`
+    /// f32 in merge order; the caller converts to the model dtype and
+    /// uploads it as the `pos_embeds` runtime extern.
+    pub fn fast_pos_embed_interpolate(
+        &self,
+        grid_thw: &[(u32, u32, u32)],
+        num_grid_per_side: usize,
+        table: &[f32],
+        total_l: usize,
+    ) -> Vec<f32> {
+        let e = self.embed_dim as usize;
+        let s = self.spatial_merge_size as usize;
+        let ng = num_grid_per_side;
+        debug_assert_eq!(table.len(), ng * ng * e, "pos_embed table shape");
+        // linspace(0, ng-1, n)[i] = i*(ng-1)/(n-1); n==1 → 0 (np.linspace).
+        let lin = |i: usize, n: usize| -> f32 {
+            if n <= 1 {
+                0.0
+            } else {
+                (i as f32) * ((ng - 1) as f32) / ((n - 1) as f32)
+            }
+        };
+        let mut out = Vec::<f32>::with_capacity(total_l * e);
+        for &(t, h, w) in grid_thw {
+            let (h, w, t) = (h as usize, w as usize, t as usize);
+            let (h_blocks, w_blocks) = (h / s, w / s);
+            // One spatial frame in merge order; tiled `t` times below.
+            let mut frame = Vec::<f32>::with_capacity(h * w * e);
+            for hb in 0..h_blocks {
+                for wb in 0..w_blocks {
+                    for sh in 0..s {
+                        for sw in 0..s {
+                            let (row, col) = (hb * s + sh, wb * s + sw);
+                            let (hf, wf) = (lin(row, h), lin(col, w));
+                            let (h_floor, w_floor) = (hf as usize, wf as usize);
+                            let h_ceil = (h_floor + 1).min(ng - 1);
+                            let w_ceil = (w_floor + 1).min(ng - 1);
+                            let (dh, dw) = (hf - h_floor as f32, wf - w_floor as f32);
+                            let w00 = (1.0 - dh) * (1.0 - dw);
+                            let w01 = (1.0 - dh) * dw;
+                            let w10 = dh * (1.0 - dw);
+                            let w11 = dh * dw;
+                            let i00 = (h_floor * ng + w_floor) * e;
+                            let i01 = (h_floor * ng + w_ceil) * e;
+                            let i10 = (h_ceil * ng + w_floor) * e;
+                            let i11 = (h_ceil * ng + w_ceil) * e;
+                            for c in 0..e {
+                                frame.push(
+                                    w00 * table[i00 + c]
+                                        + w01 * table[i01 + c]
+                                        + w10 * table[i10 + c]
+                                        + w11 * table[i11 + c],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for _ in 0..t {
+                out.extend_from_slice(&frame);
+            }
+        }
+        debug_assert_eq!(out.len(), total_l * e);
+        out
+    }
 } // impl VisionConfig (rope)
 
 /// Build per-image varlen `cu_seqlens` (one segment per (T, H, W) frame —
@@ -418,6 +552,10 @@ pub fn i32_slice_as_bytes(s: &[i32]) -> &[u8] {
 }
 
 pub fn u32_slice_as_bytes(s: &[u32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+pub fn f32_slice_as_bytes(s: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 

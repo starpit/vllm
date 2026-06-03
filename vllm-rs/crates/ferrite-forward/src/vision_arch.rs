@@ -120,6 +120,15 @@ pub trait VisionArchWeights: Send + Sync + Sized + 'static {
 pub struct VisionWrapper<W: VisionArchWeights> {
     pub weights: W,
     kv_placeholder: KvCachePool,
+    /// Qwen3.5-VL learned positional-embedding table (the f32
+    /// `vision_tower.pos_embed.weight`, `[num_grid², embed_dim]`) plus
+    /// `num_grid_per_side`, captured host-side at load (the loader
+    /// doesn't expose it as a runtime weight since the DSL never
+    /// references it). When present, `vision_forward` runs
+    /// `fast_pos_embed_interpolate` over it per forward and uploads the
+    /// result as the `pos_embeds` extern. `None` for towers without a
+    /// learned pos-embed.
+    pos_embed_table: Option<(Vec<f32>, usize)>,
 }
 
 impl<W: VisionArchWeights> VisionWrapper<W> {
@@ -127,7 +136,16 @@ impl<W: VisionArchWeights> VisionWrapper<W> {
         Self {
             weights,
             kv_placeholder: KvCachePool::empty_for_vision(),
+            pos_embed_table: None,
         }
+    }
+
+    /// Attach the host-side learned positional-embedding table (see
+    /// [`Self::pos_embed_table`]). `num_grid_per_side` =
+    /// `sqrt(num_position_embeddings)`.
+    pub fn with_pos_embed_table(mut self, table: Vec<f32>, num_grid_per_side: usize) -> Self {
+        self.pos_embed_table = Some((table, num_grid_per_side));
+        self
     }
 }
 
@@ -224,6 +242,51 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             bf16_slice_as_bytes(sin_to_upload),
         );
 
+        // METAL: the raw f32 `freqs` angle table the `vision_rope_2d`
+        // kernel reads (it derives cos/sin internally). CUDA consumes
+        // the precomputed cos/sin above instead, so `freqs` is None
+        // there. NOTE: built in NATURAL token order — correct for
+        // non-windowed towers (Qwen3.5-VL); windowed arches (Qwen2.5-VL)
+        // would need the same block-grouped permute as cos/sin, but the
+        // metal varlen-attn arm only wires the non-windowed (kind 0)
+        // path today, so this is consistent.
+        #[cfg(feature = "metal")]
+        let freqs_buf: Option<GpuTensor> = Some(device.alloc_gpu_tensor_from_host(
+            &[total_l, half_rot],
+            DType::F32,
+            ferrite_vision::f32_slice_as_bytes(&cfg.build_rope_freqs_f32(&grid_thw, total_l)),
+        ));
+        #[cfg(not(feature = "metal"))]
+        let freqs_buf: Option<GpuTensor> = None;
+        let freqs_view = freqs_buf.as_ref().map(|t| unsafe { t.as_view() });
+
+        // ── Qwen3.5-VL learned positional embedding (host interp) ───
+        //
+        // `fast_pos_embed_interpolate` (4-corner bilinear over a 48×48
+        // grid) is far cheaper host-side than as a kernel, so the tower
+        // ships the *result* as the `pos_embeds` extern and the DSL just
+        // `add(pos_embeds, hidden_states)` after patch_embed. The learned
+        // `pos_embed.weight` table is captured host-side at load (the
+        // loader doesn't expose it as a runtime weight); when present we
+        // interpolate it per forward in spatial-merge token order and
+        // upload as bf16. `None` for towers without a learned pos-embed
+        // (the DSL then never emits `LoadPosEmbeds`). Validated bit-close
+        // to the mlx-vlm golden in the vl crate's green-gate test.
+        let pos_embeds_buf: Option<GpuTensor> = self.pos_embed_table.as_ref().map(|(table, ng)| {
+            let embed_dim = cfg.embed_dim as usize;
+            let pe_f32 = cfg.fast_pos_embed_interpolate(&grid_thw, *ng, table, total_l);
+            let pe_bits: Vec<u16> = pe_f32
+                .iter()
+                .map(|&x| ferrite_vision::f32_to_bf16(x))
+                .collect();
+            device.alloc_gpu_tensor_from_host(
+                &[total_l, embed_dim],
+                DType::BF16,
+                bf16_slice_as_bytes(&pe_bits),
+            )
+        });
+        let pos_embeds_view = pos_embeds_buf.as_ref().map(|t| unsafe { t.as_view() });
+
         // ── Learned positional embeddings (SigLIP / Gemma3-MM) ──────
         //
         // For arches that override `vision_num_positions()` to
@@ -295,7 +358,15 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             embed_patches: &[],
             vision_rope_cos: Some(cos_view),
             vision_rope_sin: Some(sin_view),
+            // METAL: the f32 `freqs` table for `vision_rope_2d` (None on
+            // cuda, which uses the cos/sin views above).
+            vision_rope_freqs: freqs_view,
             pixels: Some(pixels_view),
+            // Qwen3.5-VL host-interpolated learned positional embedding.
+            // Computed + uploaded just below for towers that carry a
+            // `pos_embed` table; `None` for towers without one (the DSL
+            // then never emits `LoadPosEmbeds`).
+            pos_embeds: pos_embeds_view,
             // Qwen2.5-VL: `cu_seqlens_full` is the same per-image
             // segmentation as `cu_seqlens_q` above (the window
             // permutation preserves per-image boundaries since
@@ -325,6 +396,29 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         };
 
         let projected = unsafe { self.weights.vision_forward(&ctx, device, total_l as u64) };
+
+        // METAL: the macro-emitted vision forward hands back the merger
+        // output with an uninformative shape (`[total_l, 0]`) — the green
+        // gate ignores it and reads raw_ptr with computed dims. The metal
+        // embed-splice, however, round-trips `mm_embeds` through a shared
+        // buffer sized by the view's element count, so a 0-width view
+        // copies nothing and every image token degenerates to a zero
+        // vector. Stamp the real `[n_merged, d_model]` shape here
+        // (metadata-only reshape; the raw_ptr / data are unchanged).
+        #[cfg(feature = "metal")]
+        let projected = {
+            let mut projected = projected;
+            let merge2 = (cfg.spatial_merge_size as usize).pow(2);
+            let n_merged = if merge2 == 0 {
+                total_l
+            } else {
+                total_l / merge2
+            };
+            unsafe {
+                projected.reshape(&[n_merged, cfg.d_model as usize], DType::BF16);
+            }
+            projected
+        };
 
         let sm = cfg.spatial_merge_size;
         debug_assert_eq!(placeholders.len(), grid_thw.len());

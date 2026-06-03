@@ -391,6 +391,16 @@ mod ctx {
         /// invariants as [`Self::vision_rope_cos`].
         #[cfg(any(feature = "cuda", feature = "metal"))]
         pub vision_rope_sin: Option<TensorView<'a>>,
+        /// Vision-tower 2D RoPE **angle** table (`freqs`, f32), shape
+        /// `[total_L, vision_head_dim/2]`. METAL-ONLY consumer: the
+        /// `vision_rope_2d` kernel reads raw `freqs` and computes
+        /// cos/sin internally (the CUDA `vision_rope_apply` kernel reads
+        /// the precomputed [`Self::vision_rope_cos`]/[`Self::vision_rope_sin`]
+        /// instead). Built host-side from `grid_thw`, uploaded and set by
+        /// the metal `vision_forward` wrapper before the interpreter runs.
+        /// `None` on the cuda path and for text-side forwards.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        pub vision_rope_freqs: Option<TensorView<'a>>,
         /// Vision-tower input patches buffer, shape `[num_tokens,
         /// vision_in_features]`, bf16. The vision encoder's
         /// `vision_forward` host wrapper packs per-image CHW pixels
@@ -411,6 +421,19 @@ mod ctx {
         /// [`crate::Instruction::LoadPixels`] for the eval body.
         #[cfg(any(feature = "cuda", feature = "metal"))]
         pub pixels: Option<TensorView<'a>>,
+        /// Qwen3.5-VL learned positional embedding, already interpolated
+        /// host-side via `fast_pos_embed_interpolate` (4-corner bilinear
+        /// over a 48×48 grid), shape `[num_tokens, vision_embed_dim]`,
+        /// model dtype. The vision wrapper computes, uploads, and sets it
+        /// before invoking the interpreter; the DSL adds it to the
+        /// patch-embed output (`add(pos_embeds, hidden_states)`). `None`
+        /// for text-side calls and towers without a learned positional
+        /// embedding — `Instruction::LoadPosEmbeds` panics on `expect` if
+        /// reached without it set, mirroring [`Self::pixels`]. Synthesized
+        /// into a tile by `vision_lowering::materialize_pos_embeds`; see
+        /// [`crate::Instruction::LoadPosEmbeds`] for the eval body.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        pub pos_embeds: Option<TensorView<'a>>,
         /// Qwen2.5-VL: cu_seqlens for the per-image **full-frame**
         /// segmentation. Populated by the vision wrapper for arches
         /// whose body calls `varlen_attention(..., cu_seqlens_full,

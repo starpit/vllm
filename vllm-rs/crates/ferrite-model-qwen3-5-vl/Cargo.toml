@@ -20,3 +20,12 @@ ferrite-vision = { path = "../ferrite-vision" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 half = { workspace = true }
+
+# macOS-only test dep for the metal vision green-gate (`src/lib.rs`
+# `green_gate` mod). Gated on `target_os = "macos"` so Linux CUDA test
+# builds (which never compile the `feature = "metal"` test mod) don't
+# pull the Apple-only `objc2-metal`. We only need
+# `MTLCreateSystemDefaultDevice` to stand up a `MetalAllocator` /
+# `GpuDevice` the way `MetalAllocator`'s own unit tests do.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3", features = ["MTLDevice"] }

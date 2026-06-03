@@ -2488,10 +2488,21 @@ fn emit_weights_struct(
         } else {
             "num_hidden_layers"
         };
-        let block_prefix_template = if is_vision {
-            "visual.blocks"
+        // The packed-split SOURCE key (`<root>.<l>.attn.qkv`) must use the
+        // SAME vision root the layered load reads back the carved q/k/v
+        // under (codegen.rs ~4321 `vision_root_owned`). Derive it from the
+        // per-arch `vision_safetensors_layout` (`vision_tower.blocks` for
+        // Qwen3.5-VL) rather than hardcoding `visual.blocks` — otherwise
+        // any non-`visual` Qwen-family tower carves qkv under a root the
+        // loader never queries and load() fails on the missing split.
+        let block_prefix_template: String = if is_vision {
+            let layout = model
+                .vision_layout
+                .clone()
+                .unwrap_or_else(crate::config::VisionSafetensorsLayout::qwen_default);
+            format!("{}.{}", layout.default_root, layout.layered_subpath)
         } else {
-            "model.layers"
+            "model.layers".to_string()
         };
         let num_hidden_layers = *model.bounds.get(layer_count_key).unwrap_or_else(|| {
             panic!(
@@ -5636,7 +5647,14 @@ fn last_non_splice_node(fuf: &Fuf) -> Option<&crate::fuf::FufNode> {
     fuf.nodes.iter().rev().find(|n| {
         !matches!(
             n.op,
-            crate::classified::OpKind::MmEmbedSplice | crate::classified::OpKind::LoadPixels
+            crate::classified::OpKind::MmEmbedSplice
+                | crate::classified::OpKind::LoadPixels
+                // `materialize_pos_embeds` appends LoadPosEmbeds at the
+                // FUF tail (after LoadPixels), so it must be skipped too
+                // — otherwise it would be mistaken for the encoder's
+                // terminal and the forward would return the pos_embeds
+                // tile instead of the merger output.
+                | crate::classified::OpKind::LoadPosEmbeds
         )
     })
 }
@@ -5665,9 +5683,9 @@ enum BackboneLayout {
 /// Classify the FUF's terminal as decoder vs encoder. A decoder
 /// terminal is `gemm(<tile>, <lm_head_weight>)`, optionally followed
 /// by an `AllGather` (inserted by tp>1 lowering on the vocab-parallel
-/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels`
-/// nodes via [`last_non_splice_node`] — those are appended by
-/// lowering passes but aren't the body's actual terminal.
+/// lm_head Gemm). Walks past trailing `MmEmbedSplice` / `LoadPixels` /
+/// `LoadPosEmbeds` nodes via [`last_non_splice_node`] — those are
+/// appended by lowering passes but aren't the body's actual terminal.
 fn backbone_layout(fuf: &Fuf, program: &Program) -> BackboneLayout {
     const LM_HEAD_PREFIX: &str = "lm_head";
 
@@ -6068,6 +6086,7 @@ fn emit_canonical_params_impl(
     let vision_num_heads = *model.bounds.get("vision_num_heads").unwrap_or(&0) as u32;
     let vision_head_dim = *model.bounds.get("vision_head_dim").unwrap_or(&0) as u32;
     let vision_q_size = (vision_num_heads as usize) * (vision_head_dim as usize);
+    let vision_in_features = *model.bounds.get("vision_in_features").unwrap_or(&0) as usize;
     let vision_attn_scale: f32 = if vision_head_dim > 0 {
         1.0_f32 / (vision_head_dim as f32).sqrt()
     } else {
@@ -6185,6 +6204,7 @@ fn emit_canonical_params_impl(
     let vision_num_heads_lit = proc_macro2::Literal::u32_unsuffixed(vision_num_heads);
     let vision_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(vision_head_dim);
     let vision_q_size_lit = proc_macro2::Literal::usize_unsuffixed(vision_q_size);
+    let vision_in_features_lit = proc_macro2::Literal::usize_unsuffixed(vision_in_features);
     let vision_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(vision_attn_scale);
     let vision_patch_grid_side_lit = proc_macro2::Literal::u32_unsuffixed(vision_patch_grid_side);
     let vision_pool_kernel_lit = proc_macro2::Literal::u32_unsuffixed(vision_pool_kernel);
@@ -6198,11 +6218,22 @@ fn emit_canonical_params_impl(
     // multimodal variant never compiles past this guard.
     let mrope_section_tokens = match model.mrope_section {
         Some([t, h, w]) => {
-            let pair_count = head_dim / 2;
+            // mrope bands cover the ROTARY half, not the full head_dim
+            // half — Qwen3.5 uses partial rotary (factor 0.25 → rotary_dim
+            // = 64, half = 32 = [11,11,10]); Qwen2-VL is full (factor
+            // absent → rotary_dim = head_dim).
+            let rotary_dim = model
+                .scalars
+                .get("partial_rotary_factor")
+                .copied()
+                .filter(|&f| (f - 1.0).abs() > 1e-9)
+                .map(|f| (f * head_dim as f64).round() as u32)
+                .unwrap_or(head_dim);
+            let pair_count = rotary_dim / 2;
             if t + h + w != pair_count {
                 let msg = format!(
                     "model `{}`: rope_scaling.mrope_section [{t}, {h}, {w}] sums to {} \
-                     but head_dim/2 = {pair_count}. Fix the config so the sum matches.",
+                     but rotary_dim/2 = {pair_count} (rotary_dim {rotary_dim}). Fix the config.",
                     model.source_stem,
                     t + h + w,
                 );
@@ -6309,6 +6340,7 @@ fn emit_canonical_params_impl(
             const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
             const VISION_Q_SIZE: usize = #vision_q_size_lit;
+            const VISION_IN_FEATURES: usize = #vision_in_features_lit;
             const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
@@ -7028,6 +7060,62 @@ pub fn emit_model(
         proc_macro2::Literal::u32_unsuffixed(max_m as u32)
     };
 
+    // Vision runtime-extern buffer sizes (bytes), baked from the largest
+    // bucket + vision geometry. Zero (→ alloc's 16-byte floor) on
+    // non-vision arches (the `vision_*` bounds are absent in text
+    // configs). `freqs` is f32 `[total_L, vision_head_dim/2]`; `pixels`
+    // is the model dtype (bf16) `[num_tokens, vision_in_features]`.
+    let (
+        vision_freqs_bytes_lit,
+        vision_pixels_bytes_lit,
+        vision_posemb_bytes_lit,
+        mm_embeds_bytes_lit,
+        mm_dst_rows_bytes_lit,
+        mrope_cos_sin_bytes_lit,
+    ) = {
+        let max_m = num_tokens_points.iter().copied().max().unwrap_or(0);
+        let vis_head_dim = model.bounds.get("vision_head_dim").copied().unwrap_or(0);
+        let vis_in_features = model.bounds.get("vision_in_features").copied().unwrap_or(0);
+        let vis_embed_dim = model.bounds.get("vision_embed_dim").copied().unwrap_or(0);
+        let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(0);
+        let freqs_bytes = max_m * (vis_head_dim / 2) * 4;
+        let pixels_bytes = max_m * vis_in_features * 2;
+        // pos_embeds: model-dtype (bf16) `[num_tokens, vision_embed_dim]`,
+        // host-interpolated and added to the patch-embed output.
+        let posemb_bytes = max_m * vis_embed_dim * 2;
+        // mm splice (text decoder): mm_embeds = bf16 `[max_m, hidden]`;
+        // mm_dst_rows = u32 `[max_m]`. Zero on non-MM arches.
+        let mm_embeds_bytes = max_m * hidden_size * 2;
+        let mm_dst_rows_bytes = max_m * 4;
+        // MRoPE cos/sin override (MRoPE text decoders only): model-dtype
+        // (f16/bf16 → 2 bytes) `[max_m, rot_dim]`. 0 on 1D-rope arches
+        // (the `resolve_bindings` swap never fires, so the buffer is
+        // never bound — `alloc`'s 16-byte floor covers the placeholder).
+        // `rot_dim = partial_rotary_factor * head_dim` (Qwen3.5: 0.25*256
+        // = 64), mirroring the rope-cache builder / `ROT_DIM` fn-const.
+        let mrope_cos_sin_bytes = if model.mrope_section.is_some() {
+            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let rot_dim = model
+                .scalars
+                .get("partial_rotary_factor")
+                .copied()
+                .filter(|&f| (f - 1.0).abs() > 1e-9)
+                .map(|f| (f * head_dim as f64).round() as u64)
+                .unwrap_or(head_dim);
+            max_m * rot_dim * 2
+        } else {
+            0
+        };
+        (
+            proc_macro2::Literal::u64_unsuffixed(freqs_bytes),
+            proc_macro2::Literal::u64_unsuffixed(pixels_bytes),
+            proc_macro2::Literal::u64_unsuffixed(posemb_bytes),
+            proc_macro2::Literal::u64_unsuffixed(mm_embeds_bytes),
+            proc_macro2::Literal::u64_unsuffixed(mm_dst_rows_bytes),
+            proc_macro2::Literal::u64_unsuffixed(mrope_cos_sin_bytes),
+        )
+    };
+
     // Vocab size — baked from `model.bounds["vocab_size"]` at
     // macro-expansion time. The metal forward body needs it to
     // shape the `OwnedTensor` it returns from the tape_index's
@@ -7087,6 +7175,75 @@ pub fn emit_model(
         proc_macro2::Literal::u64_unsuffixed(total)
     };
 
+    // Per-forward MRoPE cos/sin override builder, spliced into the metal
+    // `forward` / `forward_with_metal_followup` bodies just before
+    // `ForwardInputs`. Only MRoPE text decoders (config carries
+    // `rope_scaling.mrope_section`) build the per-token band-split table
+    // and switch the rope kernel to identity positions (option (b)):
+    // `positions[t] = t` indexes row `t` of the table, so the unmodified
+    // 1D rope kernel reads the right (T/H/W band-split) cos/sin without an
+    // in-kernel band-split. The worker's `resolve_bindings` redirects the
+    // baked `WeightBundleKind::CosSin` pointer to `runtime.mrope_cos_sin`
+    // under the same `W::MROPE_SECTION` gate. Every 1D-rope arch keeps
+    // `positions` untouched and passes `mrope_cos_sin: None`. The `[3, n]`
+    // vs broadcast `[n]` positions are disambiguated at runtime by
+    // `ctx.positions` numel (the worker uploads `[3, n]` only when image
+    // tokens are present).
+    let mrope_runtime_block: proc_macro2::TokenStream = match model.mrope_section {
+        Some([t, h, w]) => {
+            let head_dim = *model.bounds.get("head_dim").unwrap_or(&0);
+            let rot_dim_val = model
+                .scalars
+                .get("partial_rotary_factor")
+                .copied()
+                .filter(|&f| (f - 1.0).abs() > 1e-9)
+                .map(|f| (f * head_dim as f64).round() as u32)
+                .unwrap_or(head_dim as u32);
+            let rope_theta_val: f64 = model
+                .scalars
+                .get("rope_theta")
+                .copied()
+                .or_else(|| model.bounds.get("rope_theta").map(|&v| v as f64))
+                .unwrap_or(10000.0);
+            let rope_theta_lit = proc_macro2::Literal::f64_unsuffixed(rope_theta_val);
+            let t_lit = proc_macro2::Literal::u32_unsuffixed(t);
+            let h_lit = proc_macro2::Literal::u32_unsuffixed(h);
+            let w_lit = proc_macro2::Literal::u32_unsuffixed(w);
+            let rot_dim_lit2 = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
+            quote! {
+                let mut __mrope_table_vec: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
+                let mut __mrope_ident_vec: ::std::vec::Vec<u32> = ::std::vec::Vec::new();
+                let (positions, mrope_cos_sin): (&[u32], ::core::option::Option<&[u8]>) =
+                    if !ctx.positions.as_raw().raw_ptr().is_null() {
+                        let __pos_numel = ctx.positions.as_raw().numel();
+                        let __pos_all = ::std::slice::from_raw_parts(
+                            ctx.positions.as_raw().raw_ptr() as *const u32,
+                            __pos_numel,
+                        );
+                        __mrope_table_vec =
+                            ::ferrite_forward::interpreter::metal::build_mrope_cos_sin_override(
+                                __pos_all,
+                                n,
+                                #rot_dim_lit2 as usize,
+                                #rope_theta_lit,
+                                [#t_lit, #h_lit, #w_lit],
+                                <Weights as ::ferrite_forward::CanonicalParams>::METAL_DTYPE,
+                            );
+                        __mrope_ident_vec.extend(0..n as u32);
+                        (
+                            __mrope_ident_vec.as_slice(),
+                            ::core::option::Option::Some(__mrope_table_vec.as_slice()),
+                        )
+                    } else {
+                        (positions, ::core::option::Option::None)
+                    };
+            }
+        }
+        None => quote! {
+            let mrope_cos_sin: ::core::option::Option<&[u8]> = ::core::option::Option::None;
+        },
+    };
+
     let metal_emission = quote! {
         #(#metal_arena_bytes_statics)*
 
@@ -7107,6 +7264,38 @@ pub fn emit_model(
         /// `METAL_MAX_BUCKET_M * MAX_BLOCKS_PER_SEQ * sizeof(u32)`.
         #[cfg(feature = "metal")]
         pub const METAL_MAX_BUCKET_M: u32 = #max_bucket_m_lit;
+
+        /// Byte size of the vision 2D-RoPE `freqs` runtime buffer
+        /// (f32 `[max_bucket_m, vision_head_dim/2]`). 0 on non-vision
+        /// arches (`alloc` floors to 16 bytes).
+        #[cfg(feature = "metal")]
+        pub const METAL_VISION_FREQS_BYTES: u64 = #vision_freqs_bytes_lit;
+
+        /// Byte size of the vision `pixels` runtime buffer (model dtype
+        /// `[max_bucket_m, vision_in_features]`). 0 on non-vision arches.
+        #[cfg(feature = "metal")]
+        pub const METAL_VISION_PIXELS_BYTES: u64 = #vision_pixels_bytes_lit;
+
+        /// Byte size of the vision `pos_embeds` runtime buffer (model
+        /// dtype `[max_bucket_m, vision_embed_dim]`). 0 on non-vision
+        /// arches and on towers without a learned positional embedding.
+        #[cfg(feature = "metal")]
+        pub const METAL_VISION_POSEMB_BYTES: u64 = #vision_posemb_bytes_lit;
+
+        /// Byte size of the `mm_embeds` splice buffer (bf16
+        /// `[max_bucket_m, hidden]`) and the `mm_dst_rows` buffer (u32
+        /// `[max_bucket_m]`). 0 on arches without the multimodal splice.
+        #[cfg(feature = "metal")]
+        pub const METAL_MM_EMBEDS_BYTES: u64 = #mm_embeds_bytes_lit;
+        #[cfg(feature = "metal")]
+        pub const METAL_MM_DST_ROWS_BYTES: u64 = #mm_dst_rows_bytes_lit;
+
+        /// Byte size of the MRoPE cos/sin override buffer (model dtype
+        /// `[max_bucket_m, rot_dim]`). 0 on 1D-rope arches (the rope
+        /// kernel keeps the static cos/sin cache; `alloc` floors to 16
+        /// bytes and the buffer is never bound).
+        #[cfg(feature = "metal")]
+        pub const METAL_MROPE_COS_SIN_BYTES: u64 = #mrope_cos_sin_bytes_lit;
 
         /// Vocab size — baked from `model.bounds["vocab_size"]`. The
         /// metal forward shapes its returned `OwnedTensor` as
@@ -7308,6 +7497,16 @@ pub fn emit_model(
                             gdn_state_ssm: gdn_ssm.clone(),
                             gdn_state_indices: alloc(max_m * 4),
                             gdn_is_fresh: alloc(max_m * 4),
+                            // Vision externs: sized from the baked
+                            // METAL_VISION_*_BYTES consts (16-byte floor
+                            // on non-vision arches). Overwritten per
+                            // forward by `write_runtime_inputs`.
+                            vision_rope_freqs: alloc(METAL_VISION_FREQS_BYTES),
+                            pixels: alloc(METAL_VISION_PIXELS_BYTES),
+                            vision_pos_embeds: alloc(METAL_VISION_POSEMB_BYTES),
+                            mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
+                            mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
+                            mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7329,14 +7528,29 @@ pub fn emit_model(
             // shared buffer keeps backing the slice until the worker
             // memcopies through `write_runtime_inputs`.
             let n = num_tokens as usize;
-            let input_ids = ::std::slice::from_raw_parts(
-                ctx.input_ids.as_raw().raw_ptr() as *const u32,
-                n,
-            );
-            let positions = ::std::slice::from_raw_parts(
-                ctx.positions.as_raw().raw_ptr() as *const u32,
-                n,
-            );
+            // Vision towers carry no token ids / positions — the tape
+            // consumes pixels / freqs / cu_seqlens instead, so the macro's
+            // ctx leaves these as `null_view`. `from_raw_parts(null, n)` is
+            // UB even for an unused read (and `write_runtime_inputs` only
+            // copies `len` bytes), so hand the worker an empty slice when
+            // the pointer is null — same null-guard shape as the optional
+            // decoder inputs (slot_mapping / cu_seqlens_q / …) just below.
+            let input_ids: &[u32] = if ctx.input_ids.as_raw().raw_ptr().is_null() {
+                &[]
+            } else {
+                ::std::slice::from_raw_parts(
+                    ctx.input_ids.as_raw().raw_ptr() as *const u32,
+                    n,
+                )
+            };
+            let positions: &[u32] = if ctx.positions.as_raw().raw_ptr().is_null() {
+                &[]
+            } else {
+                ::std::slice::from_raw_parts(
+                    ctx.positions.as_raw().raw_ptr() as *const u32,
+                    n,
+                )
+            };
             let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
                 ::std::option::Option::Some(::std::slice::from_raw_parts(
                     ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
@@ -7406,6 +7620,70 @@ pub fn emit_model(
                 ),
                 ::core::option::Option::None => ::core::option::Option::None,
             };
+            // Vision externs (vision towers): read as raw bytes from the
+            // ctx TensorViews. `freqs` is f32, `pixels` is the model
+            // dtype; the worker copies bytes verbatim. `None` for text.
+            let vision_rope_freqs = match ctx.vision_rope_freqs {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let pixels = match ctx.pixels {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let pos_embeds = match ctx.pos_embeds {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            // Multimodal splice: vision embeddings (bytes) + a per-source-
+            // row destination map built from `embed_patches`. Text-only
+            // batches leave `embed_patches` empty → both `None` (no-op).
+            let mm_embeds = match ctx.mm_embeds {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            // ALWAYS materialized (all-`u32::MAX` for text-only batches):
+            // the splice command sits in every decoder tape, so the kernel
+            // must read `MAX` (= skip) for non-image rows — an unwritten
+            // placeholder buffer would scatter garbage into the residual.
+            let __mm_dst_rows_vec: ::std::vec::Vec<u32> = {
+                let mut __v = ::std::vec![u32::MAX; n];
+                let mut __src: usize = 0;
+                for __p in ctx.embed_patches {
+                    for __k in 0..(__p.length as usize) {
+                        if __src < __v.len() {
+                            __v[__src] = __p.token_offset + __k as u32;
+                        }
+                        __src += 1;
+                    }
+                }
+                __v
+            };
+            let mm_dst_rows = ::core::option::Option::Some(__mm_dst_rows_vec.as_slice());
+            // MRoPE (Qwen3.5-VL) only: build the per-token cos/sin override
+            // table + identity positions (shadows `positions`); a no-op
+            // `let mrope_cos_sin = None;` on 1D-rope arches.
+            #mrope_runtime_block
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7418,6 +7696,12 @@ pub fn emit_model(
                 last_token_indices,
                 gdn_state_indices,
                 gdn_is_fresh,
+                vision_rope_freqs,
+                pixels,
+                pos_embeds,
+                mm_embeds,
+                mm_dst_rows,
+                mrope_cos_sin,
             };
 
             // ── Run forward + copy logits out ─────────────────────
@@ -7602,6 +7886,16 @@ pub fn emit_model(
                             gdn_state_ssm: gdn_ssm.clone(),
                             gdn_state_indices: alloc(max_m * 4),
                             gdn_is_fresh: alloc(max_m * 4),
+                            // Vision externs: sized from the baked
+                            // METAL_VISION_*_BYTES consts (16-byte floor
+                            // on non-vision arches). Overwritten per
+                            // forward by `write_runtime_inputs`.
+                            vision_rope_freqs: alloc(METAL_VISION_FREQS_BYTES),
+                            pixels: alloc(METAL_VISION_PIXELS_BYTES),
+                            vision_pos_embeds: alloc(METAL_VISION_POSEMB_BYTES),
+                            mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
+                            mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
+                            mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -7618,14 +7912,29 @@ pub fn emit_model(
             // Read host-visible iter-0 input slices off ctx (same
             // pattern as `forward_with_metal_followup`).
             let n = num_tokens as usize;
-            let input_ids = ::std::slice::from_raw_parts(
-                ctx.input_ids.as_raw().raw_ptr() as *const u32,
-                n,
-            );
-            let positions = ::std::slice::from_raw_parts(
-                ctx.positions.as_raw().raw_ptr() as *const u32,
-                n,
-            );
+            // Vision towers carry no token ids / positions — the tape
+            // consumes pixels / freqs / cu_seqlens instead, so the macro's
+            // ctx leaves these as `null_view`. `from_raw_parts(null, n)` is
+            // UB even for an unused read (and `write_runtime_inputs` only
+            // copies `len` bytes), so hand the worker an empty slice when
+            // the pointer is null — same null-guard shape as the optional
+            // decoder inputs (slot_mapping / cu_seqlens_q / …) just below.
+            let input_ids: &[u32] = if ctx.input_ids.as_raw().raw_ptr().is_null() {
+                &[]
+            } else {
+                ::std::slice::from_raw_parts(
+                    ctx.input_ids.as_raw().raw_ptr() as *const u32,
+                    n,
+                )
+            };
+            let positions: &[u32] = if ctx.positions.as_raw().raw_ptr().is_null() {
+                &[]
+            } else {
+                ::std::slice::from_raw_parts(
+                    ctx.positions.as_raw().raw_ptr() as *const u32,
+                    n,
+                )
+            };
             let slot_mapping = if !ctx.slot_mapping.as_raw().raw_ptr().is_null() {
                 ::std::option::Option::Some(::std::slice::from_raw_parts(
                     ctx.slot_mapping.as_raw().raw_ptr() as *const u32,
@@ -7695,6 +8004,69 @@ pub fn emit_model(
                 ),
                 ::core::option::Option::None => ::core::option::Option::None,
             };
+            // Vision externs (vision towers): raw-byte reads from the
+            // ctx TensorViews. `None` for text arches.
+            let vision_rope_freqs = match ctx.vision_rope_freqs {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let pixels = match ctx.pixels {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            let pos_embeds = match ctx.pos_embeds {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            // Multimodal splice: vision embeddings (bytes) + a per-source-
+            // row destination map built from `embed_patches`. Text-only
+            // batches leave `embed_patches` empty → both `None` (no-op).
+            let mm_embeds = match ctx.mm_embeds {
+                ::core::option::Option::Some(tv) => ::core::option::Option::Some(
+                    ::std::slice::from_raw_parts(
+                        tv.as_raw().raw_ptr() as *const u8,
+                        tv.as_raw().size_bytes(),
+                    ),
+                ),
+                ::core::option::Option::None => ::core::option::Option::None,
+            };
+            // ALWAYS materialized (all-`u32::MAX` for text-only batches):
+            // the splice command sits in every decoder tape, so the kernel
+            // must read `MAX` (= skip) for non-image rows — an unwritten
+            // placeholder buffer would scatter garbage into the residual.
+            let __mm_dst_rows_vec: ::std::vec::Vec<u32> = {
+                let mut __v = ::std::vec![u32::MAX; n];
+                let mut __src: usize = 0;
+                for __p in ctx.embed_patches {
+                    for __k in 0..(__p.length as usize) {
+                        if __src < __v.len() {
+                            __v[__src] = __p.token_offset + __k as u32;
+                        }
+                        __src += 1;
+                    }
+                }
+                __v
+            };
+            let mm_dst_rows = ::core::option::Option::Some(__mm_dst_rows_vec.as_slice());
+            // MRoPE (Qwen3.5-VL) only: build the per-token cos/sin override
+            // table + identity positions (shadows `positions`); a no-op
+            // `let mrope_cos_sin = None;` on 1D-rope arches.
+            #mrope_runtime_block
             let inputs = ::ferrite_forward::interpreter::metal::ForwardInputs {
                 num_tokens: num_tokens as u32,
                 input_ids,
@@ -7707,6 +8079,12 @@ pub fn emit_model(
                 last_token_indices,
                 gdn_state_indices,
                 gdn_is_fresh,
+                vision_rope_freqs,
+                pixels,
+                pos_embeds,
+                mm_embeds,
+                mm_dst_rows,
+                mrope_cos_sin,
             };
 
             // Pre-pick the bucket from iter-0 num_tokens. The chain
@@ -8026,6 +8404,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         }
     }
 

@@ -155,8 +155,25 @@ impl ResolvedMmProcessor {
                     .and_then(|p| std::fs::read_to_string(&p).ok())
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                     .and_then(|v| {
-                        let mn = v.get("min_pixels").and_then(|x| x.as_u64())?;
-                        let mx = v.get("max_pixels").and_then(|x| x.as_u64())?;
+                        // Two schemas: Qwen2-VL / Qwen2.5-VL write top-level
+                        // `min_pixels` / `max_pixels`; Qwen3-VL / Qwen3.5-VL
+                        // moved them under `size.shortest_edge` /
+                        // `size.longest_edge` (matching transformers'
+                        // Qwen3VLImageProcessor + mlx-vlm). Prefer the
+                        // top-level keys, then fall back to the `size`
+                        // dict so the newer models smart-resize correctly
+                        // (e.g. a 224×224 image bumps up to the 256×256 /
+                        // 16×16-patch grid instead of staying 14×14).
+                        let mn = v.get("min_pixels").and_then(|x| x.as_u64()).or_else(|| {
+                            v.get("size")
+                                .and_then(|s| s.get("shortest_edge"))
+                                .and_then(|x| x.as_u64())
+                        })?;
+                        let mx = v.get("max_pixels").and_then(|x| x.as_u64()).or_else(|| {
+                            v.get("size")
+                                .and_then(|s| s.get("longest_edge"))
+                                .and_then(|x| x.as_u64())
+                        })?;
                         Some((mn as usize, mx as usize))
                     });
                 from_file.unwrap_or((default_min_pixels, default_max_pixels))
@@ -218,7 +235,7 @@ impl ResolvedMmProcessor {
 
 /// Top-level resolver. Returns `None` for text-only models, or when
 /// no MM arch in the inventory claims any of the HF arch strings.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn resolve<E: HfExtra + ?Sized>(
     hf_arches: &[String],
     hf_extra: &E,

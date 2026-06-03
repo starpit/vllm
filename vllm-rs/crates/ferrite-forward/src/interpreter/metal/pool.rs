@@ -1372,6 +1372,31 @@ fn write_runtime_inputs(
     if let Some(fresh) = inputs.gdn_is_fresh {
         write_slice("gdn_is_fresh", &runtime.gdn_is_fresh, fresh)?;
     }
+    // Vision externs (vision-tower arches only). Copied verbatim as
+    // bytes — `freqs` is f32, `pixels` is the model dtype (bf16); the
+    // runtime buffers are untyped and the kernels reinterpret.
+    if let Some(b) = inputs.vision_rope_freqs {
+        write_bytes("vision_rope_freqs", &runtime.vision_rope_freqs, b)?;
+    }
+    if let Some(b) = inputs.pixels {
+        write_bytes("pixels", &runtime.pixels, b)?;
+    }
+    if let Some(b) = inputs.pos_embeds {
+        write_bytes("pos_embeds", &runtime.vision_pos_embeds, b)?;
+    }
+    // Multimodal splice (MM-bearing batches only). mm_embeds = the
+    // projected vision output (bytes); mm_dst_rows = per-row dst (u32).
+    if let Some(b) = inputs.mm_embeds {
+        write_bytes("mm_embeds", &runtime.mm_embeds, b)?;
+    }
+    if let Some(d) = inputs.mm_dst_rows {
+        write_slice("mm_dst_rows", &runtime.mm_dst_rows, d)?;
+    }
+    // MRoPE cos/sin override (MRoPE text decoders only). Bytes in the
+    // rope kernel's element dtype; the worker binds it at the cos/sin slot.
+    if let Some(b) = inputs.mrope_cos_sin {
+        write_bytes("mrope_cos_sin", &runtime.mrope_cos_sin, b)?;
+    }
     Ok(())
 }
 
@@ -1445,6 +1470,32 @@ fn write_slice(kind: &'static str, buffer: &Buffer, src: &[u32]) -> Result<(), F
         if bytes_needed > 0 {
             copy_nonoverlapping(
                 src.as_ptr() as *const u8,
+                buffer.contents().as_ptr() as *mut u8,
+                bytes_needed,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Byte-accurate sibling of [`write_slice`] for runtime externs whose
+/// element type isn't `u32` (vision `freqs` = f32, `pixels` = bf16).
+/// Zero-fills the whole buffer then copies `src` verbatim into the head.
+fn write_bytes(kind: &'static str, buffer: &Buffer, src: &[u8]) -> Result<(), ForwardError> {
+    let bytes_needed = src.len();
+    let bytes_available = buffer.length();
+    if bytes_needed > bytes_available {
+        return Err(ForwardError::BufferTooSmall {
+            kind,
+            bytes_needed,
+            bytes_available,
+        });
+    }
+    unsafe {
+        std::ptr::write_bytes(buffer.contents().as_ptr() as *mut u8, 0u8, bytes_available);
+        if bytes_needed > 0 {
+            copy_nonoverlapping(
+                src.as_ptr(),
                 buffer.contents().as_ptr() as *mut u8,
                 bytes_needed,
             );
@@ -1542,6 +1593,12 @@ mod tests {
             gdn_state_ssm: ::std::vec::Vec::new(),
             gdn_state_indices: alloc(device, 16),
             gdn_is_fresh: alloc(device, 16),
+            vision_rope_freqs: alloc(device, 16),
+            pixels: alloc(device, 16),
+            vision_pos_embeds: alloc(device, 16),
+            mm_embeds: alloc(device, 16),
+            mm_dst_rows: alloc(device, 16),
+            mrope_cos_sin: alloc(device, 16),
         }
     }
 
@@ -1840,6 +1897,12 @@ mod tests {
             gdn_state_ssm: ::std::vec::Vec::new(),
             gdn_state_indices: alloc(d, 16),
             gdn_is_fresh: alloc(d, 16),
+            vision_rope_freqs: alloc(d, 16),
+            pixels: alloc(d, 16),
+            vision_pos_embeds: alloc(d, 16),
+            mm_embeds: alloc(d, 16),
+            mm_dst_rows: alloc(d, 16),
+            mrope_cos_sin: alloc(d, 16),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

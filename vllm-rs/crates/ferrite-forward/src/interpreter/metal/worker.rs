@@ -429,6 +429,20 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // insert is a harmless pin when no GDN command binds them.
             r.insert(&runtime.gdn_state_indices);
             r.insert(&runtime.gdn_is_fresh);
+            // Vision per-forward externs (vision towers: Qwen3.5-VL ViT).
+            // Same baked-gpuAddress / lazy-pager hazard as the GDN
+            // buffers above — the `vision_rope_2d` / `vision_varlen_attn`
+            // / `LoadPixels` kernels read `freqs` / `cu_seqlens` / `pixels`
+            // by ICB-baked address, so an un-pinned buffer is served stale
+            // zero pages (garbage rope angles / all-token-0 pixels). The
+            // factory allocates 16-byte placeholders on non-vision arches,
+            // so the pin is harmless when no vision command binds them.
+            r.insert(&runtime.vision_rope_freqs);
+            r.insert(&runtime.pixels);
+            r.insert(&runtime.vision_pos_embeds);
+            r.insert(&runtime.mm_embeds);
+            r.insert(&runtime.mm_dst_rows);
+            r.insert(&runtime.mrope_cos_sin);
             r.commit();
         }
 
@@ -1216,6 +1230,28 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
                 }
             }
         }
+        WeightBundleKind::LayerNorm => {
+            // Torch-style LayerNorm-with-bias bundle (vision towers).
+            // `which == Weight` → the gain, `which == Bias` → the
+            // (mandatory) bias. The `vision_layernorm` kernel binds both
+            // (buffer 2 = weight, buffer 3 = bias), so the lowering arm
+            // emits one `Weight{Weight}` + one `Weight{Bias}` against the
+            // same locator. An absent bias is a loader/DSL mismatch —
+            // surface it rather than dropping the bias term.
+            let l = weights.layer_norm_at(bucket, op_idx, slot, layer);
+            match which {
+                WeightTensor::Weight => l.weight,
+                WeightTensor::Bias => l.bias.ok_or(WorkerError::WeightLookupFailed {
+                    reason: "LayerNorm bundle has no .bias — vision LayerNorm \
+                             requires both .weight and .bias",
+                })?,
+                _ => {
+                    return Err(WorkerError::WeightLookupFailed {
+                        reason: "non-Weight/Bias WeightTensor requested against LayerNorm bundle",
+                    });
+                }
+            }
+        }
         WeightBundleKind::CosSin => weights.cos_sin_at(bucket, op_idx, slot, layer),
         // MLX-affine int4 quantized embedding (P6). The lowering's
         // `AffineEmbed` arm always uses `layer = 0` (embed_tokens is
@@ -1443,9 +1479,31 @@ fn resolve_bindings<W: CanonicalParams>(
                 locator,
                 binding_index,
             } => {
-                let (b, off) =
-                    resolve_weight(weights, allocator, kind, layer.get(), *which, *locator)?;
-                (b, off, *binding_index as u64)
+                // MRoPE text decoders (Qwen3.5-VL) override the static
+                // cos/sin RotaryCache with a per-forward, per-token
+                // band-split table built host-side (option (b)). The
+                // table lives in `runtime.mrope_cos_sin` and the rope
+                // kernel reads it with identity positions (`positions[t]
+                // = t`), so redirect the baked `WeightBundleKind::CosSin`
+                // pointer to that runtime buffer. Compile-time gated on
+                // `W::MROPE_SECTION` — folds away (zero cost, no behavior
+                // change) on every 1D-rope arch. Covers all cos/sin
+                // consumers at once (`RopeAppend`, `FusedQkvRopeCache`,
+                // the affine-fused QKV-rope path) since they all bind
+                // `CosSin` here.
+                if W::MROPE_SECTION.is_some() && matches!(kind, WeightBundleKind::CosSin) {
+                    (
+                        runtime
+                            .buffer_for(super::lowered::RuntimeBindingKind::MropeCosSin)
+                            .clone(),
+                        0u64,
+                        *binding_index as u64,
+                    )
+                } else {
+                    let (b, off) =
+                        resolve_weight(weights, allocator, kind, layer.get(), *which, *locator)?;
+                    (b, off, *binding_index as u64)
+                }
             }
             Binding::Runtime {
                 kind,
@@ -1735,6 +1793,12 @@ mod tests {
             gdn_state_ssm: ::std::vec::Vec::new(),
             gdn_state_indices: alloc_buffer(device, 16),
             gdn_is_fresh: alloc_buffer(device, 16),
+            vision_rope_freqs: alloc_buffer(device, 16),
+            pixels: alloc_buffer(device, 16),
+            vision_pos_embeds: alloc_buffer(device, 16),
+            mm_embeds: alloc_buffer(device, 16),
+            mm_dst_rows: alloc_buffer(device, 16),
+            mrope_cos_sin: alloc_buffer(device, 16),
         }
     }
 

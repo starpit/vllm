@@ -2395,6 +2395,7 @@ dependencies = [
  "ferrite-kernels",
  "ferrite-vision",
  "half",
+ "objc2-metal",
  "tracing",
 ]
 
@@ -2434,6 +2435,7 @@ dependencies = [
  "ferrite-model-qwen2-vl",
  "ferrite-model-qwen3",
  "ferrite-model-qwen3-5",
+ "ferrite-model-qwen3-5-vl",
  "ferrite-model-qwen3-moe",
 ]
 

@@ -18,7 +18,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use vllm_common::engine_io::EmbeddingData;
-#[cfg(all(feature = "multimodal", feature = "cuda"))]
+#[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
 use vllm_common::multimodal::{ImageData, MultimodalData};
 use vllm_common::sampling::GuidedGrammar;
 use vllm_common::{EngineCoreOutput, EngineCoreRequest, FinishReason, SamplingParams, StopReason};
@@ -246,7 +246,7 @@ pub struct AsyncEngine {
     /// runtime-resolved knobs (smart-resize bounds, image_size,
     /// patch_size). The engine dispatches generically through this
     /// handle — no arch names appear here.
-    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
     mm_processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
     /// Whether the engine is in pooling mode (embedding requests go through scheduler).
     is_pooling: bool,
@@ -285,7 +285,7 @@ impl AsyncEngine {
             default_chat_template_kwargs: None,
             async_scheduling: false,
             step_loop_alive: Arc::new(AtomicBool::new(false)),
-            #[cfg(all(feature = "multimodal", feature = "cuda"))]
+            #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
             mm_processor: None,
             is_pooling: false,
             no_progress_timeout: DEFAULT_NO_PROGRESS_TIMEOUT,
@@ -413,7 +413,7 @@ impl AsyncEngine {
     /// per-arch knobs (placeholder token id, image_size, smart-resize
     /// bounds, tokens-per-image, preprocess fn pointer) are carried by
     /// the resolved handle — the engine never names an arch.
-    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
     pub fn set_mm_processor(
         &mut self,
         processor: Option<std::sync::Arc<crate::multimodal::ResolvedMmProcessor>>,
@@ -2880,13 +2880,13 @@ impl AsyncEngine {
         };
 
         // Extract images from message content arrays and build multimodal data.
-        #[cfg(all(feature = "multimodal", feature = "cuda"))]
+        #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
         let mm_data = if self.mm_processor.is_some() {
             self.extract_images_from_messages(&request.messages, &mut token_ids)?
         } else {
             None
         };
-        #[cfg(not(all(feature = "multimodal", feature = "cuda")))]
+        #[cfg(not(all(feature = "multimodal", any(feature = "cuda", feature = "metal"))))]
         let mm_data = None;
 
         Ok(EngineCoreRequest {
@@ -2999,7 +2999,7 @@ impl AsyncEngine {
     /// images, expand image placeholder tokens, and build `MultimodalData`.
     ///
     /// Returns `None` if no images are present.
-    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
     fn extract_images_from_messages(
         &self,
         messages: &[protocol::ChatCompletionMessageParam],

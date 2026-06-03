@@ -5,6 +5,36 @@
 using namespace metal;
 
 // ============================================================================
+// CopyRows: out[i] = in[i]  (flat element-wise copy, bounds-guarded)
+//
+// Materializes the vision `pixels` runtime extern into an arena tile
+// (`Instruction::LoadPixels`). out @ buffer(0), in @ buffer(1), the
+// element count `n` @ buffer(2) as a runtime `constant uint&` (NOT a
+// function constant — bound via `setBytes` inline, like `gelu_tanh`),
+// so the m_scaling tail and any bucket-padding rows are no-ops.
+// ============================================================================
+
+kernel void copy_rows_f16(
+    device half* out [[buffer(0)]],
+    device const half* in [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = in[gid];
+}
+
+kernel void copy_rows_bf16(
+    device bfloat* out [[buffer(0)]],
+    device const bfloat* in [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    out[gid] = in[gid];
+}
+
+// ============================================================================
 // Add: out = a + b
 // ============================================================================
 
@@ -24,6 +54,72 @@ kernel void add_bf16(
     uint gid [[thread_position_in_grid]]
 ) {
     out[gid] = a[gid] + b[gid];
+}
+
+// ── In-place residual add: residual += delta ────────────────────────────────
+//
+// The `KernelId::Add` lowering arm (`Instruction::Add`, interpreter/metal/
+// lowering.rs) binds buffer(0) = residual (in/out) + buffer(1) = delta and
+// dispatches token-parallel over `eff_m * width` exact threads (no bounds
+// guard needed — same dispatchThreads convention as `bias_add_*_specialized`).
+// The `_specialized` suffix matches the elementwise naming family the
+// lowering's `pick_specialized_symbol` helper expects; this variant carries
+// no function constants. First exercised by the Qwen3.5-VL vision tower —
+// the text path fuses its residual into `FusedAddRmsNorm`, so the standalone
+// add never reached metal before.
+kernel void residual_add_f16_specialized(
+    device half* residual [[buffer(0)]],
+    device const half* delta [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    residual[gid] = residual[gid] + delta[gid];
+}
+
+kernel void residual_add_bf16_specialized(
+    device bfloat* residual [[buffer(0)]],
+    device const bfloat* delta [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    residual[gid] = residual[gid] + delta[gid];
+}
+
+// ── Multimodal embed splice: scatter vision embeddings into the text
+// embedding stream ───────────────────────────────────────────────────
+//
+// `Instruction::SpliceMmEmbeds` (interpreter/metal/lowering.rs). For each
+// source row `s` of `mm` (the projected vision output), copy it into text
+// embedding row `dst_rows[s]`; `dst_rows[s] == 0xFFFFFFFF` skips (text-only
+// batches and the padding tail past `total_mm` are all marked skip).
+// One thread per element; `embed` is in/out (buffer 0). Dispatched over
+// `num_tokens * hidden` (m_scaling shrinks from the baked `bucket_m *
+// hidden` to the live num_tokens), so `s < num_tokens` always indexes
+// `dst_rows`.
+kernel void mm_embed_splice_f16(
+    device half* embed [[buffer(0)]],
+    device const half* mm [[buffer(1)]],
+    device const uint* dst_rows [[buffer(2)]],
+    constant uint& hidden [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint s = gid / hidden;
+    uint c = gid % hidden;
+    uint dst = dst_rows[s];
+    if (dst == 0xFFFFFFFFu) return;
+    embed[dst * hidden + c] = mm[s * hidden + c];
+}
+
+kernel void mm_embed_splice_bf16(
+    device bfloat* embed [[buffer(0)]],
+    device const bfloat* mm [[buffer(1)]],
+    device const uint* dst_rows [[buffer(2)]],
+    constant uint& hidden [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint s = gid / hidden;
+    uint c = gid % hidden;
+    uint dst = dst_rows[s];
+    if (dst == 0xFFFFFFFFu) return;
+    embed[dst * hidden + c] = mm[s * hidden + c];
 }
 
 // ============================================================================

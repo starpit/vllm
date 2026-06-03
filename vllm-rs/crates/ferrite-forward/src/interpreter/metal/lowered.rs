@@ -282,6 +282,36 @@ pub enum KernelId {
     /// Symbol: `moe_weighted_sum_{float16,bfloat16}` in
     /// `moe_weighted_sum.metallib`.
     MoeWeightedSum,
+    /// Vision-tower LayerNorm-with-bias (Qwen3.5-VL ViT norm1/norm2/
+    /// merger.norm). Maps to `vision_layernorm_{f16,bf16}` in
+    /// `vision_layernorm.metallib`. Bindings: `(out @ 0, in @ 1,
+    /// weight @ 2, bias @ 3)`; function constants LN_M/LN_HIDDEN/LN_EPS.
+    VisionLayerNorm,
+    /// Vision-tower 2D NeoX RoPE (rotate_half), applied independently
+    /// to q and k. Maps to `vision_rope_2d_{f16,bf16}` in
+    /// `vision_rope_2d.metallib`. Bindings: `(out @ 0, x @ 1, freqs @ 2)`;
+    /// function constants VR_HEAD_DIM/VR_NUM_HEADS/VR_N_ELEMS.
+    VisionRope,
+    /// Vision-tower bidirectional varlen SDPA. Maps to
+    /// `vision_varlen_attn_{f16,bf16}` in `vision_varlen_attn.metallib`.
+    /// Bindings: `(out @ 0, q @ 1, k @ 2, v @ 3, cu_seqlens @ 4)`;
+    /// function constants VA_HEAD_DIM/VA_NUM_HEADS/VA_NUM_SEGS/
+    /// VA_N_TOKENS/VA_SCALE.
+    VisionVarlenAttn,
+    /// Standalone tanh-approx GELU (Qwen3.5-VL ViT MLP / merger MLP).
+    /// Maps to `gelu_tanh_{f16,bf16}` in `activation.metallib`. Bindings:
+    /// `(out @ 0, in @ 1, n inline @ 2)`.
+    VisionGelu,
+    /// Copy the vision `pixels` runtime extern into an arena slot
+    /// (materialized by `vision_lowering::materialize_pixels`). Maps to
+    /// `copy_rows_{f16,bf16}` in `elementwise.metallib`.
+    VisionLoadPixels,
+    /// Multimodal embed splice — scatter the projected vision embeddings
+    /// (`MmEmbeds`) into the text embedding stream at the placeholder
+    /// rows (`MmDstRows`). Maps to `mm_embed_splice_{f16,bf16}` in
+    /// `elementwise.metallib`. Bindings: `(embed @ 0 in/out, mm @ 1,
+    /// dst_rows @ 2, hidden inline @ 3)`.
+    MmEmbedSplice,
 }
 
 /// Element dtype the metal pipeline should pick. The shader source
@@ -575,6 +605,12 @@ pub enum WeightBundleKind {
     /// `&GatedDeltaNetLayer` (conv1d / A_log / dt_bias / norm); the
     /// `WeightTensor::Gdn*` variants select which sub-tensor.
     GatedDeltaNet,
+    /// Torch-style LayerNorm-with-bias bundle (vision towers:
+    /// Qwen3.5-VL norm1/norm2/merger.norm). Resolves through
+    /// `WeightAccessors::layer_norm_at(...)` to a `&LayerNorm`
+    /// (`.weight` + `.bias`); `WeightTensor::Weight` selects the gain
+    /// and `WeightTensor::Bias` the (mandatory) bias.
+    LayerNorm,
 }
 
 /// Which tensor inside a multi-tensor weight bundle this binding
@@ -744,6 +780,44 @@ pub enum RuntimeBindingKind {
     /// as zero instead of reading stale recurrent state (the
     /// "degeneration after N requests" guard). Written per forward.
     GdnIsFresh,
+    /// `[total_L, vision_head_dim/2]` f32 — the vision 2D-RoPE per-token
+    /// rotary angle table (`freqs`). The `vision_rope_2d` kernel reads
+    /// it at `buffer(2)` and computes cos/sin internally. Built host-side
+    /// from `grid_thw` and uploaded by the vision wrapper, written per
+    /// forward by the worker. Carried on `ForwardCtx::vision_rope_freqs`.
+    VisionRopeFreqs,
+    /// `[num_tokens, vision_in_features]` model-dtype — the vision patch
+    /// pixel rows. `Instruction::LoadPixels` copies it into an arena slot.
+    /// Carried on `ForwardCtx::pixels`, written per forward by the worker.
+    Pixels,
+    /// `[num_tokens, vision_embed_dim]` model-dtype — the Qwen3.5-VL
+    /// host-interpolated learned positional embedding.
+    /// `Instruction::LoadPosEmbeds` copies it into an arena slot.
+    /// Carried on `ForwardCtx::pos_embeds`, written per forward by the
+    /// worker.
+    VisionPosEmbeds,
+    /// `[num_tokens, hidden]` model-dtype — the projected vision-encoder
+    /// embeddings (`ForwardCtx::mm_embeds`), copied row-blockwise into
+    /// the text embedding stream at the image-placeholder rows by
+    /// `Instruction::SpliceMmEmbeds`. Only the first `total_mm` rows are
+    /// live; padding rows are never read (guarded by `MmDstRows`).
+    MmEmbeds,
+    /// `[num_tokens]` u32 — for each source `mm_embeds` row, the
+    /// destination row in the text embedding stream, or `u32::MAX` for
+    /// padding / text-only rows (the splice kernel skips those). Built
+    /// host-side from `ForwardCtx::embed_patches`.
+    MmDstRows,
+    /// `[num_tokens, ROT_DIM]` model-dtype — per-token RoPE cos/sin
+    /// override for MRoPE text decoders (Qwen3.5-VL). Each row `t` is the
+    /// band-split (`mrope_section` T/H/W) cos/sin for token `t`; combined
+    /// with identity positions (`positions[t] = t`) it lets the unmodified
+    /// 1D `rope_append_*`/fused-qkv-rope kernels read the correct row
+    /// without an in-kernel band-split (option (b)). The worker
+    /// `resolve_bindings` redirects the baked `WeightBundleKind::CosSin`
+    /// pointer to this buffer when `W::MROPE_SECTION.is_some()`; the macro
+    /// forward builds + writes it per forward via `ForwardInputs`. 16-byte
+    /// placeholder on 1D-rope arches (never bound).
+    MropeCosSin,
 }
 
 /// One ICB command: kernel + dispatch shape + bindings.

@@ -77,7 +77,7 @@ kernel void gelu_f16(
     constexpr half BETA = 0.7978845608h;  // sqrt(2/pi)
     constexpr half KAPPA = 0.044715h;
     half x_cube = x * x * x;
-    half inner = BETA * (x + KAPPA * x_cube);
+    half inner = clamp(BETA * (x + KAPPA * x_cube), -15.0h, 15.0h);
     output[gid] = 0.5h * x * (1.0h + tanh(inner));
 }
 
@@ -94,7 +94,14 @@ kernel void gelu_bf16(
     constexpr float BETA = 0.7978845608f;  // sqrt(2/pi)
     constexpr float KAPPA = 0.044715f;
     float x_cube = x * x * x;
-    float inner = BETA * (x + KAPPA * x_cube);
+    // Clamp the tanh argument: Metal's relaxed-math `tanh` evaluates via
+    // `exp(2*inner)`, which overflows to Inf (→ NaN) for large `inner`.
+    // `tanh` is already saturated to ±1 well before ±15, so this is
+    // bit-exact in f16/bf16/f32 while killing the overflow. (Qwen3.5-VL's
+    // ViT MLP drives fc1 activations to ~17 → inner ~189 — the first
+    // kernel to hit it; text MLPs stay well within range, so it's a no-op
+    // there.)
+    float inner = clamp(BETA * (x + KAPPA * x_cube), -15.0f, 15.0f);
     output[gid] = bfloat(0.5f * x * (1.0f + tanh(inner)));
 }
 
@@ -111,7 +118,14 @@ kernel void gelu_f32(
     constexpr float BETA = 0.7978845608f;  // sqrt(2/pi)
     constexpr float KAPPA = 0.044715f;
     float x_cube = x * x * x;
-    float inner = BETA * (x + KAPPA * x_cube);
+    // Clamp the tanh argument: Metal's relaxed-math `tanh` evaluates via
+    // `exp(2*inner)`, which overflows to Inf (→ NaN) for large `inner`.
+    // `tanh` is already saturated to ±1 well before ±15, so this is
+    // bit-exact in f16/bf16/f32 while killing the overflow. (Qwen3.5-VL's
+    // ViT MLP drives fc1 activations to ~17 → inner ~189 — the first
+    // kernel to hit it; text MLPs stay well within range, so it's a no-op
+    // there.)
+    float inner = clamp(BETA * (x + KAPPA * x_cube), -15.0f, 15.0f);
     output[gid] = 0.5f * x * (1.0f + tanh(inner));
 }
 
@@ -131,7 +145,7 @@ kernel void gelu_tanh_f16(
     constexpr half BETA = 0.7978845608h;
     constexpr half KAPPA = 0.044715h;
     half x_cube = x * x * x;
-    half inner = BETA * (x + KAPPA * x_cube);
+    half inner = clamp(BETA * (x + KAPPA * x_cube), -15.0h, 15.0h);
     output[gid] = 0.5h * x * (1.0h + tanh(inner));
 }
 
@@ -147,7 +161,14 @@ kernel void gelu_tanh_bf16(
     constexpr float BETA = 0.7978845608f;
     constexpr float KAPPA = 0.044715f;
     float x_cube = x * x * x;
-    float inner = BETA * (x + KAPPA * x_cube);
+    // Clamp the tanh argument: Metal's relaxed-math `tanh` evaluates via
+    // `exp(2*inner)`, which overflows to Inf (→ NaN) for large `inner`.
+    // `tanh` is already saturated to ±1 well before ±15, so this is
+    // bit-exact in f16/bf16/f32 while killing the overflow. (Qwen3.5-VL's
+    // ViT MLP drives fc1 activations to ~17 → inner ~189 — the first
+    // kernel to hit it; text MLPs stay well within range, so it's a no-op
+    // there.)
+    float inner = clamp(BETA * (x + KAPPA * x_cube), -15.0f, 15.0f);
     output[gid] = bfloat(0.5f * x * (1.0f + tanh(inner)));
 }
 
@@ -163,7 +184,14 @@ kernel void gelu_tanh_f32(
     constexpr float BETA = 0.7978845608f;
     constexpr float KAPPA = 0.044715f;
     float x_cube = x * x * x;
-    float inner = BETA * (x + KAPPA * x_cube);
+    // Clamp the tanh argument: Metal's relaxed-math `tanh` evaluates via
+    // `exp(2*inner)`, which overflows to Inf (→ NaN) for large `inner`.
+    // `tanh` is already saturated to ±1 well before ±15, so this is
+    // bit-exact in f16/bf16/f32 while killing the overflow. (Qwen3.5-VL's
+    // ViT MLP drives fc1 activations to ~17 → inner ~189 — the first
+    // kernel to hit it; text MLPs stay well within range, so it's a no-op
+    // there.)
+    float inner = clamp(BETA * (x + KAPPA * x_cube), -15.0f, 15.0f);
     output[gid] = 0.5f * x * (1.0f + tanh(inner));
 }
 

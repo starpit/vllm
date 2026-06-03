@@ -693,6 +693,16 @@ impl TkProgram {
         parity_var: &str,
     ) -> PageHandle<P::Next> {
         let id = page.id;
+        // Sync all warps before the phantom round. The for_loop body
+        // synchronizes warps via per-iter barriers; after the loop,
+        // warps may be at different positions. The phantom round
+        // assumes all 16 consumer warps will fire arrive_done, which
+        // requires them to be past the for_loop. __syncthreads()
+        // forces convergence before the phantom round runs.
+        self.compute(
+            WarpRole::All,
+            "__syncthreads();".to_string(),
+        );
         // Phantom round: 1 arrive Ready (loader), NUM_CONSUMER_WARPS
         // arrives Done (consumers, from each warp's lane 0), 1 arrive
         // Consumed (storer). Each gated on `(parity_var & 1u) == 0u`.
@@ -761,13 +771,15 @@ impl TkProgram {
         F: FnOnce(&mut LoopBody<'_>),
     {
         let count_var_string = count_var.into();
+        let var_string = var.into();
         let mut body_prog = TkProgram::new();
         let mut body = LoopBody {
             inner: &mut body_prog,
+            loop_var: var_string.clone(),
         };
         build(&mut body);
         self.instrs.push(TkInstr::ForLoop {
-            var: var.into(),
+            var: var_string,
             count: LoopBound::RuntimeU32(count_var_string, SealedRuntime::new()),
             body: body_prog.instrs,
         });
@@ -796,11 +808,15 @@ impl TkProgram {
     where
         F: FnOnce(&mut LoopBody<'_>),
     {
+        let var_string = var.into();
         let mut body_prog = TkProgram::new();
-        let mut body = LoopBody { inner: &mut body_prog };
+        let mut body = LoopBody {
+            inner: &mut body_prog,
+            loop_var: var_string.clone(),
+        };
         build(&mut body);
         self.instrs.push(TkInstr::ForLoop {
-            var: var.into(),
+            var: var_string,
             count,
             body: body_prog.instrs,
         });
@@ -832,9 +848,80 @@ impl TkProgram {
 /// loop-safe methods.
 pub struct LoopBody<'a> {
     inner: &'a mut TkProgram,
+    /// The CUDA name of the loop induction variable (e.g. `"__kv_i"`).
+    /// Captured by `for_loop` / `for_loop_runtime` so the body can
+    /// construct typed [`LoopOffset`] expressions tied to it.
+    loop_var: String,
+}
+
+/// Witness that a TMA byte-offset expression depends on the enclosing
+/// loop's induction variable. Constructible only via
+/// [`LoopBody::iter_offset`] / [`LoopBody::iter_offset_expr`] — there
+/// is no public constructor accepting a raw string. A static expression
+/// like `"0u"` cannot be wrapped, which makes the legacy
+/// `lower_attn_decode` K/V offset bug (every iter reads byte 0)
+/// structurally impossible inside a loop body.
+///
+/// # Compile-fail proof (Bug 3 — K cache offset)
+///
+/// `LoopOffset` cannot be constructed from a raw string outside the
+/// substrate. Verifies that the legacy `"0u".to_string()` pattern at
+/// the load_async_dyn call site is not expressible:
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_warp_ir::LoopOffset;
+/// // No public constructor — `expr` field is private.
+/// let bad = LoopOffset { expr: "0u".to_string() };
+/// ```
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_warp_ir::LoopOffset;
+/// // No public `From<&str>` impl either.
+/// let bad: LoopOffset = "0u".into();
+/// ```
+#[derive(Clone, Debug)]
+pub struct LoopOffset {
+    expr: String,
+}
+
+impl LoopOffset {
+    pub(crate) fn into_expr(self) -> String {
+        self.expr
+    }
 }
 
 impl<'a> LoopBody<'a> {
+    /// Construct a per-iter byte offset of the form
+    /// `(<loop_var> * <byte_stride>u)`. The result is a typed
+    /// [`LoopOffset`] tied to this body's loop variable; static-zero
+    /// or stride-less offsets cannot be expressed.
+    pub fn iter_offset(&self, byte_stride: u64) -> LoopOffset {
+        LoopOffset {
+            expr: format!("({} * {byte_stride}u)", self.loop_var),
+        }
+    }
+
+    /// Construct a per-iter byte offset from a caller-supplied
+    /// expression. The closure receives the loop variable's CUDA
+    /// name; the result wraps the produced expression as a
+    /// [`LoopOffset`]. Use this for non-linear strides (e.g.
+    /// `block_table[__kv_i / block_size] * block_bytes + ...`).
+    pub fn iter_offset_expr<F>(&self, build: F) -> LoopOffset
+    where
+        F: FnOnce(&str) -> String,
+    {
+        LoopOffset {
+            expr: build(&self.loop_var),
+        }
+    }
+
+    /// The CUDA name of the enclosing loop's induction variable.
+    /// Exposed so callers that need the bare identifier (rather than
+    /// a typed offset) — e.g. [`LoopBody::wait_loop_parity`] — can
+    /// keep using it without re-allocating.
+    pub fn loop_var(&self) -> &str {
+        &self.loop_var
+    }
     /// Wait with the runtime per-iter parity expression. Forwards to
     /// [`TkProgram::wait_loop_parity`].
     pub fn wait_loop_parity(
@@ -854,35 +941,42 @@ impl<'a> LoopBody<'a> {
         self.inner.arrive_loop(role, kind, page_id);
     }
 
-    /// TMA load with a runtime byte-offset expression. Forwards to
-    /// [`TkProgram::load_async_dyn`]. **There is intentionally no
-    /// static-offset `load_async` on `LoopBody`** — every load
-    /// inside a for_loop must specify a dynamic offset, otherwise
-    /// every iteration reads the same bytes (the legacy
-    /// `lower_attn_decode` K/V cache bug).
+    /// TMA load with a per-iter byte-offset expression. The offset is
+    /// a typed [`LoopOffset`] — a witness that the expression depends
+    /// on this body's loop variable. Forwards to
+    /// [`TkProgram::load_async_dyn`].
+    ///
+    /// **There is intentionally no static-offset `load_async` on
+    /// `LoopBody`, and no raw-string overload of `load_async_dyn`.**
+    /// Every load inside a for_loop must specify a dynamic offset
+    /// constructed via [`LoopBody::iter_offset`] or
+    /// [`LoopBody::iter_offset_expr`]. Bare strings — including the
+    /// legacy `"0u".to_string()` — are rejected by the type checker
+    /// (Bug 3: K cache offset wrong, every iter reading byte 0).
     pub fn load_async_dyn(
         &mut self,
         page_id: u8,
         src: BufId,
         src_region: RegionRef,
         tile: TileShape,
-        dyn_byte_off: impl Into<String>,
+        dyn_byte_off: LoopOffset,
     ) {
-        self.inner.load_async_dyn(page_id, src, src_region, tile, dyn_byte_off);
+        self.inner
+            .load_async_dyn(page_id, src, src_region, tile, dyn_byte_off.into_expr());
     }
 
-    /// TMA store with a runtime byte-offset expression. Forwards to
-    /// [`TkProgram::store_async_dyn`]. Same rationale as
-    /// [`LoopBody::load_async_dyn`].
+    /// TMA store with a per-iter byte-offset expression. Same
+    /// rationale as [`LoopBody::load_async_dyn`].
     pub fn store_async_dyn(
         &mut self,
         page_id: u8,
         dst: BufId,
         dst_region: RegionRef,
         tile: TileShape,
-        dyn_byte_off: impl Into<String>,
+        dyn_byte_off: LoopOffset,
     ) {
-        self.inner.store_async_dyn(page_id, dst, dst_region, tile, dyn_byte_off);
+        self.inner
+            .store_async_dyn(page_id, dst, dst_region, tile, dyn_byte_off.into_expr());
     }
 
     /// Compute body inside a loop. Forwards to

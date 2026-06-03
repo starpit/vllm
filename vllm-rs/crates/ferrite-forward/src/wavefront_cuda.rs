@@ -61,34 +61,56 @@ pub type LaunchFn = unsafe extern "C" fn(
 // Verification: revert dispatch_cuda to `u32_builder.push_num_kv_pages(
 // ctx.kv_cache.num_blocks as u32)` — the call fails to typecheck.
 
-/// Per-sequence count of KV cache blocks. Constructed only via
-/// `from_max_seqlen_k`, which derives the value from
-/// `(max_seqlen_k, block_size)` — never from the cache pool size.
-///
-/// # Compile-fail proof (Gap 18)
-///
-/// Passing a raw `u32` (e.g., `kv_cache.num_blocks`) to
-/// `push_num_kv_pages` is a Rust compile error.
-/// ```compile_fail
-/// use ferrite_forward::wavefront_cuda::*;
-/// let mut b = KernelU32ArgsBuilder::new();
-/// // The pool size is just a u32 — but push_num_kv_pages requires
-/// // SeqBlockCount. Compile error.
-/// let pool_size: u32 = 138868;
-/// b.push_num_kv_pages(pool_size);
-/// ```
+/// Per-sequence count of KV cache blocks (each block holds
+/// `block_size` tokens). Constructed only via `from_max_seqlen_k`.
+/// Distinct type from [`SeqTokenCount`] — neither is convertible to
+/// the other without explicit re-derivation.
 #[derive(Clone, Copy, Debug)]
 pub struct SeqBlockCount(u32);
 
 impl SeqBlockCount {
-    /// Construct from a sequence's `max_seqlen_k` (current K_LEN =
-    /// prompt + decode position) and the cache `block_size`.
     pub fn from_max_seqlen_k(max_seqlen_k: u32, block_size: u32) -> Self {
         Self(max_seqlen_k.div_ceil(block_size))
     }
 
-    /// Raw u32 for FFI. Crate-private — only the typed
-    /// `KernelU32ArgsBuilder` should access this.
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Per-sequence count of K/V tokens currently cached (= `max_seqlen_k`).
+/// Used for the megakernel's `__num_kv_pages` runtime arg. The
+/// kernel iterates ONE TOKEN per loop iteration (loads 1024 bytes =
+/// `kv_cols * elem_bytes` per iter), so the iter count must equal
+/// the token count, NOT the block count and NOT the cache pool size.
+///
+/// # Compile-fail proofs (Gap 18 + Bug 3)
+///
+/// Pool size (raw u32):
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::*;
+/// let mut b = KernelU32ArgsBuilder::new();
+/// let pool: u32 = 138868;
+/// b.push_num_kv_pages(pool);  // raw u32 rejected
+/// ```
+///
+/// `SeqBlockCount` (right type for "blocks", wrong for "tokens"):
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::*;
+/// let mut b = KernelU32ArgsBuilder::new();
+/// let blocks = SeqBlockCount::from_max_seqlen_k(128, 16); // 8 blocks
+/// b.push_num_kv_pages(blocks);  // expected SeqTokenCount, found SeqBlockCount
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SeqTokenCount(u32);
+
+impl SeqTokenCount {
+    /// Construct from `max_seqlen_k` (current K_LEN = prompt + decode
+    /// position). The kernel will iterate this many times.
+    pub fn from_max_seqlen_k(max_seqlen_k: u32) -> Self {
+        Self(max_seqlen_k)
+    }
+
     pub(crate) fn raw(self) -> u32 {
         self.0
     }
@@ -124,13 +146,15 @@ impl KernelU32ArgsBuilder {
         Self { args: Vec::new() }
     }
 
-    /// Push the per-sequence KV block count. **Compile-time
-    /// guarantee**: caller must produce a [`SeqBlockCount`]; the
-    /// pool size (raw `u32` from `kv_cache.num_blocks`) cannot be
-    /// passed without going through `SeqBlockCount::from_max_seqlen_k`,
-    /// which only derives the value from
-    /// `(max_seqlen_k, block_size)`.
-    pub fn push_num_kv_pages(&mut self, count: SeqBlockCount) {
+    /// Push the per-sequence KV TOKEN count (`__num_kv_pages` in the
+    /// kernel — name is legacy; semantically a token count since the
+    /// kernel iterates one token per loop iter).
+    ///
+    /// **Compile-time guarantee**: caller must produce a
+    /// [`SeqTokenCount`]; raw u32 (pool size, etc.) and
+    /// [`SeqBlockCount`] (block count) are both rejected by the type
+    /// checker. Construct via `SeqTokenCount::from_max_seqlen_k`.
+    pub fn push_num_kv_pages(&mut self, count: SeqTokenCount) {
         self.args.push(count.raw());
     }
 
@@ -401,10 +425,7 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     // private constructor only accepts (max_seqlen_k, block_size).
     let mut u32_builder = KernelU32ArgsBuilder::new();
     if spec.has_attn_decode {
-        let count = SeqBlockCount::from_max_seqlen_k(
-            ctx.max_seqlen_k as u32,
-            ctx.kv_cache.block_size as u32,
-        );
+        let count = SeqTokenCount::from_max_seqlen_k(ctx.max_seqlen_k as u32);
         u32_builder.push_num_kv_pages(count);
     }
     if spec.has_rope {

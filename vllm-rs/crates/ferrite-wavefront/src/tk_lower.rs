@@ -30,8 +30,8 @@
 
 use crate::subtile_ir::{BufId, RegionRef};
 use crate::tk_warp_ir::{
-    LoopBound, PageBarrier, PageHandle, PageHandleAfterRuntimeLoop, Phase, Phase0, Phase1,
-    TileShape, TkProgram, WarpRole, NUM_CONSUMER_WARPS, NUM_PAGES, PAGE_SIZE,
+    LoopBound, PageBarrier, PageHandle, Phase, Phase0, Phase1, TileShape, TkProgram, WarpRole,
+    NUM_CONSUMER_WARPS, NUM_PAGES, PAGE_SIZE,
 };
 
 // ── Allocators ──────────────────────────────────────────────────────
@@ -599,6 +599,16 @@ pub fn lower_attn_decode<P: Phase>(
     // cause as the op4/Gemm deadlock when slot reuse straddled an
     // odd number of prior cycles.
     let start = P::VALUE;
+    // Per-iteration K/V row stride. Each token's K (or V) row
+    // occupies `kv_cols * act_elem` bytes (Llama-1B: 8 kv_heads *
+    // 64 head_dim * 2 = 1024 B). `body.iter_offset` constructs the
+    // typed [`LoopOffset`] = `(__kv_i * stride)` — the only
+    // expression load_async_dyn accepts inside a for_loop body.
+    // NOTE: proper paged-cache port indirects through block_table —
+    // `block_table[__kv_i / block_size] * block_bytes + (__kv_i %
+    // block_size) * row_bytes`. Single-block sequences match the
+    // flat stride; multi-block needs block-table indirection.
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
     // Structural enforcement (Gap 17): for_loop_runtime is the ONLY
     // path that constructs `LoopBound::RuntimeU32` (the constructor
     // is sealed). Plain `prog.for_loop(_, LoopBound::RuntimeU32(...))`
@@ -611,26 +621,12 @@ pub fn lower_attn_decode<P: Phase>(
         |body| {
             // Per-iteration K round. Parity = (__kv_i & 1) ^ P::VALUE.
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
-            // Per-iteration K row offset: each token's K data occupies
-            // `kv_cols * act_elem` bytes (1024 B for Llama-1B). The
-            // dynamic offset `(__kv_i * row_bytes)` walks one token
-            // per iter through the contiguous K cache. NOTE: the
-            // proper paged-cache port indirects through the block
-            // table — `(block_table[__kv_i / block_size] *
-            // block_bytes + (__kv_i % block_size) * row_bytes)` — but
-            // for the prefill-+-N-decode-token sequences fitting in
-            // a single block (the first decode call) the flat offset
-            // matches. Block-table indirection is a follow-up; this
-            // value is per-iter and satisfies the substrate's
-            // structural enforcement (no static-zero loads inside
-            // for_loop bodies).
-            let row_bytes = kv_cols * op.act_elem;
             body.load_async_dyn(
                 k_id,
                 op.k_cache,
                 RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
                 k_tile,
-                "0u".to_string(),
+                body.iter_offset(kv_row_bytes),
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
@@ -654,7 +650,7 @@ pub fn lower_attn_decode<P: Phase>(
                 op.v_cache,
                 RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
                 v_tile,
-                "0u".to_string(),
+                body.iter_offset(kv_row_bytes),
             );
             // No `arrive(Ready)` — `tma::load_async` signals page_ready.
 
@@ -810,22 +806,22 @@ pub fn lower_attn_decode_routed<P: Phase>(
     let v_tile = k_tile;
     let loop_var = "__kv_i";
     let start = P::VALUE;
+    // Per-iter K/V row stride; see `lower_attn_decode` for the
+    // block-table-indirection caveat.
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
     // Structural enforcement (Gap 17) for the routed AttnDecode too.
     let post_pages = prog.for_loop_runtime(
         loop_var,
         op.num_kv_pages_arg,
         vec![k_page, v_page],
         |body| {
-            // Per-iter K row offset; see `lower_attn_decode` for the
-            // block-table-indirection caveat.
-            let row_bytes = kv_cols * op.act_elem;
             body.wait_loop_parity(WarpRole::Loader, PageBarrier::Consumed, k_id, loop_var, start);
             body.load_async_dyn(
                 k_id,
                 op.k_cache,
                 RegionRef::rows_cols(op.k_cache, 1, 0, kv_cols),
                 k_tile,
-                "0u".to_string(),
+                body.iter_offset(kv_row_bytes),
             );
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
             body.compute_calls(
@@ -845,7 +841,7 @@ pub fn lower_attn_decode_routed<P: Phase>(
                 op.v_cache,
                 RegionRef::rows_cols(op.v_cache, 1, 0, kv_cols),
                 v_tile,
-                "0u".to_string(),
+                body.iter_offset(kv_row_bytes),
             );
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
             body.compute_calls(
@@ -1692,7 +1688,7 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
             op.w,
             region(op.w, op.bn, op.k),
             w_tile,
-            format!("(__n_i * {w_byte_step}u)"),
+            body.iter_offset(w_byte_step),
         );
 
         // Consumer: wait W ready, compute (writes directly to gmem
@@ -1872,7 +1868,7 @@ pub fn lower_gemm_m1_routed<P: Phase>(
             op.w,
             region(op.w, op.bn, op.k),
             w_tile,
-            format!("(__n_i * {w_byte_step}u)"),
+            body.iter_offset(w_byte_step),
         );
 
         // Consumer compute body — switch between gmem and smem

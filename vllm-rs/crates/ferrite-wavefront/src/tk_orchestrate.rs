@@ -23,18 +23,21 @@
 //! pair falls outside that envelope, making the page-fit constraint a
 //! structural property of the IR.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
 use crate::routing::{
-    classify_inputs, classify_outputs, coalesce_carry_forwards, InputRouting, OutputRouting,
+    classify_inputs, classify_outputs, coalesce_carry_forwards, InputRouting,
 };
 use crate::subtile_ir::BufId;
 use crate::tk_codegen::GlLayout;
+use crate::tk_gmem::{
+    emit_fence_after_op, ArenaSlot, Carried, CarriedProof, CrossOpInput, Ext, GmemHandle, OpOutput,
+};
 use crate::tk_lower::{
     lower_attn_decode, lower_gemm_m1, lower_residual_add, lower_rmsnorm, lower_rope_append,
     lower_rope_rotate, lower_silu_mul, AddOp, AttnDecodeOp, CarriedHandle, GemmM1Op,
-    PageAllocator, RmsNormOp, RopeAppendOp, RopeRotateOp, RoutingHints, SiluMulOp,
+    PageAllocator, RmsNormOp, RopeAppendOp, RopeRotateOp, SiluMulOp,
 };
 use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, WarpRole, PAGE_SIZE};
 
@@ -59,33 +62,46 @@ fn op_kind_name(op: &LoweredOp) -> &'static str {
     }
 }
 
-/// Step F.1.2 — build routing hints for op `op_idx` from the
-/// pre-computed analysis vectors and the running `carried_table`
-/// side table. For each input slot:
-///   - `InputRouting::CarryForward { producer_op_idx }` →
-///     `Some(carried_table[producer_op_idx])` (the producer must
-///     have stored its `CarriedHandle` already; producers are visited
-///     before consumers in topo order).
-///   - `InputRouting::GmemLoad` → `None`.
-fn build_routing_hints(
-    op_idx: usize,
-    input_routing: &[Vec<InputRouting>],
-    output_routing: &[OutputRouting],
+/// Stage 2.B — build a typed [`CrossOpInput<ArenaSlot>`] for an
+/// arena-edge consumer slot. The producer's gmem-routed output
+/// landed in `gmem_handles[buf]`; we wrap it via
+/// [`emit_fence_after_op`] for the consumer's typed Fenced input.
+/// For carry-forward edges we wrap the producer's stashed
+/// `CarriedHandle` (from `carried_table`) into a sealed
+/// [`Carried<ArenaSlot>`].
+fn build_arena_input(
+    routing: &InputRouting,
+    buf: BufId,
+    gmem_handles: &HashMap<BufId, GmemHandle<ArenaSlot>>,
     carried_table: &[Option<CarriedHandle>],
-) -> RoutingHints {
-    let inputs: Vec<Option<CarriedHandle>> = input_routing[op_idx]
-        .iter()
-        .map(|ir| match ir {
-            InputRouting::CarryForward { producer_op_idx } => {
-                carried_table.get(*producer_op_idx).copied().flatten()
-            }
-            InputRouting::GmemLoad => None,
-        })
-        .collect();
-    RoutingHints {
-        inputs,
-        output_internal: output_routing[op_idx].is_internal(),
+    prog: &mut TkProgram,
+) -> CrossOpInput<ArenaSlot> {
+    match routing {
+        InputRouting::CarryForward { producer_op_idx } => {
+            let h = carried_table[*producer_op_idx]
+                .expect("Stage 2.B: producer's CarriedHandle must be stashed before consumer runs");
+            CrossOpInput::Carried(Carried::from_handle(h, CarriedProof::mint()))
+        }
+        InputRouting::GmemLoad => {
+            let h = *gmem_handles.get(&buf).unwrap_or_else(|| {
+                panic!(
+                    "Stage 2.B: arena gmem handle missing for buf {:?} (producer must have \
+                     stashed via OpOutput::Gmem before consumer dispatch)",
+                    buf
+                )
+            });
+            CrossOpInput::Fenced(emit_fence_after_op(prog, h))
+        }
     }
+}
+
+/// Stage 2.B — build a typed [`CrossOpInput<Ext>`] for an external-
+/// source consumer slot. External sources never carry-forward (they
+/// have no producer op); the orchestrator constructs a fresh
+/// `GmemHandle::<Ext>::new_initial` and fences it.
+fn build_ext_input(buf: BufId, prog: &mut TkProgram) -> CrossOpInput<Ext> {
+    let h = GmemHandle::<Ext>::new_initial(buf);
+    CrossOpInput::Fenced(emit_fence_after_op(prog, h))
 }
 
 /// Pick `bn` (W-tile rows per page load) for a given GEMM `k`.
@@ -154,51 +170,50 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
 
     let mut op_out_shape: Vec<(u32, u32)> = Vec::with_capacity(input.ops.len());
 
-    /// Step F.1.2 — routed dispatch. Routing is unconditional after
-    /// Step F.1, so the only entry point is the routing-aware lowering
-    /// `lower_X` (formerly `lower_X_routed` before the suffix drop).
-    /// Picks `Phase0` vs `Phase1` from carry-forward inputs' parities
-    /// (all must agree); falls back to free-slot count when no
-    /// carry-forward inputs. Stores any returned `output_carried`
-    /// into `carried_table[op_idx]`.
-    macro_rules! dispatch_phase_routed {
-        ($op_idx:expr, $hints:expr, $carried:expr,
-         $n_pages:expr, $f:ident, $op:expr) => {{
-            let n: usize = $n_pages;
-            let hints_ref: &RoutingHints = $hints;
-            let parities: Vec<u32> = hints_ref
-                .inputs
-                .iter()
-                .filter_map(|h| h.as_ref().map(|c| c.phase))
-                .collect();
-            if !parities.is_empty() {
-                debug_assert!(
-                    parities.iter().all(|&p| p == parities[0]),
-                    "lower_to_tk: carry-forward inputs have inconsistent parities for {}: {:?}",
-                    stringify!($f),
-                    parities,
-                );
-            }
-            let chosen = parities.first().copied();
-            let result = match chosen {
-                Some(0) => $f::<Phase0>($op, hints_ref, &mut pages, &mut prog),
-                Some(1) => $f::<Phase1>($op, hints_ref, &mut pages, &mut prog),
-                Some(other) => panic!(
-                    "lower_to_tk: invalid carry-forward parity {} for {}",
-                    other,
-                    stringify!($f),
-                ),
-                None => {
-                    if pages.count_at(0) >= n {
-                        $f::<Phase0>($op, hints_ref, &mut pages, &mut prog)
-                    } else {
-                        $f::<Phase1>($op, hints_ref, &mut pages, &mut prog)
-                    }
-                }
-            };
-            $carried[$op_idx] = result.output_carried;
-        }};
+    // Stage 2.B — phase-pick helper. Carry-forward inputs (if any) all
+    // share one parity (the producer's post-round parity) — that's the
+    // typed phase the consumer's lowering must run at. Without any
+    // carry-forward inputs, fall back to picking the parity with the
+    // most free slots so reuse keeps working across many ops.
+    fn pick_phase(carried_phases: &[u32], pages: &PageAllocator, n_pages: usize) -> u32 {
+        if let Some(first) = carried_phases.first().copied() {
+            debug_assert!(
+                carried_phases.iter().all(|&p| p == first),
+                "lower_to_tk: carry-forward inputs have inconsistent parities: {:?}",
+                carried_phases,
+            );
+            return first;
+        }
+        if pages.count_at(0) >= n_pages {
+            0
+        } else {
+            1
+        }
     }
+
+    /// Stage 2.B — collect the carried-input parities from the
+    /// per-op input routing for phase picking.
+    fn collect_carried_phases(
+        op_idx: usize,
+        input_routing: &[Vec<InputRouting>],
+        carried_table: &[Option<CarriedHandle>],
+    ) -> Vec<u32> {
+        input_routing[op_idx]
+            .iter()
+            .filter_map(|ir| match ir {
+                InputRouting::CarryForward { producer_op_idx } => {
+                    carried_table[*producer_op_idx].map(|c| c.phase)
+                }
+                InputRouting::GmemLoad => None,
+            })
+            .collect()
+    }
+
+    // Stage 2.B — typed gmem handle stash for arena-edge gmem-routed
+    // outputs. Producers populate this on `OpOutput::Gmem`; consumers
+    // look up by BufId and fence via `build_arena_input` to construct
+    // their typed `CrossOpInput::Fenced`.
+    let mut gmem_handles: HashMap<BufId, GmemHandle<ArenaSlot>> = HashMap::new();
 
     // E.13: typed gmem handle stash for the cross-op K/V cache edge.
     // RopeAppend (the producer) places handles here; the next
@@ -211,6 +226,31 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
         None;
     let mut pending_v_unfenced: Option<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>> =
         None;
+
+    /// Stage 2.B — stash the lowering's typed output for the next
+    /// consumer op. Gmem outputs go into `gmem_handles[buf]`; carry-
+    /// forward outputs go into `carried_table[op_idx]`.
+    fn stash_output(
+        out_buf: BufId,
+        op_idx: usize,
+        output: OpOutput<ArenaSlot>,
+        gmem_handles: &mut HashMap<BufId, GmemHandle<ArenaSlot>>,
+        carried_table: &mut [Option<CarriedHandle>],
+    ) {
+        match output {
+            OpOutput::Gmem(h) => {
+                debug_assert_eq!(
+                    h.buf_id(),
+                    out_buf,
+                    "Stage 2.B: lowering returned GmemHandle with mismatched BufId",
+                );
+                gmem_handles.insert(out_buf, h);
+            }
+            OpOutput::Carried(c) => {
+                carried_table[op_idx] = Some(c.into_handle());
+            }
+        }
+    }
 
     for (op_idx, desc) in input.ops.iter().enumerate() {
         let out_buf = BufId(n_sources + op_idx as u32);
@@ -234,116 +274,184 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
             ),
         );
 
-        // Step F.1.2: build per-op routing hints from the analysis +
-        // running side table. Routing is unconditional after Step F.1.
-        let hints: RoutingHints =
-            build_routing_hints(op_idx, &input_routing, &output_routing, &carried_table);
+        // Stage 2.B — routing analysis is consulted on a per-input
+        // basis below. `output_internal` is read once to drive the
+        // typed `bool` argument to each lowering.
+        let output_internal = output_routing[op_idx].is_internal();
+        let carried_phases = collect_carried_phases(op_idx, &input_routing, &carried_table);
 
+        // Helper closure to build an arena `CrossOpInput` for one
+        // `desc.inputs[i]` slot. Captures the routing classification
+        // for this op + the running gmem-handle / carried tables.
+        // Outer match below lifts these per-op.
         match desc.op {
             LoweredOp::RmsNorm { eps } => {
-                let x = buf_for(desc.inputs[0], &op_out_buf);
-                let weight = buf_for(desc.inputs[1], &op_out_buf);
+                let x_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let weight_buf = buf_for(desc.inputs[1], &op_out_buf);
                 let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
-                    2,
-                    lower_rmsnorm,
-                    RmsNormOp {
-                        x,
-                        weight,
-                        out: out_buf,
-                        hidden,
-                        m: desc.m,
-                        act_elem: ACT_ELEM,
-                        eps,
-                        init: false,
-                    }
+                let x_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    x_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
                 );
+                let weight_in = build_ext_input(weight_buf, &mut prog);
+                let phase = pick_phase(&carried_phases, &pages, 2);
+                let op = RmsNormOp {
+                    x: x_buf,
+                    weight: weight_buf,
+                    out: out_buf,
+                    hidden,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                    eps,
+                    init: false,
+                };
+                let output = if phase == 0 {
+                    lower_rmsnorm::<Phase0>(op, x_in, weight_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_rmsnorm::<Phase1>(op, x_in, weight_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, hidden));
             }
 
             LoweredOp::Gemm { n, k } => {
-                let x = buf_for(desc.inputs[0], &op_out_buf);
-                let w = buf_for(desc.inputs[1], &op_out_buf);
+                let x_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let w_buf = buf_for(desc.inputs[1], &op_out_buf);
                 let bn = pick_bn(k);
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
-                    3,
-                    lower_gemm_m1,
-                    GemmM1Op {
-                        x,
-                        w,
-                        out: out_buf,
-                        k,
-                        n,
-                        bn,
-                        act_elem: ACT_ELEM,
-                    }
+                let x_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    x_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
                 );
+                let w_in = build_ext_input(w_buf, &mut prog);
+                let phase = pick_phase(&carried_phases, &pages, 3);
+                let op = GemmM1Op {
+                    x: x_buf,
+                    w: w_buf,
+                    out: out_buf,
+                    k,
+                    n,
+                    bn,
+                    act_elem: ACT_ELEM,
+                };
+                let output = if phase == 0 {
+                    lower_gemm_m1::<Phase0>(op, x_in, w_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_gemm_m1::<Phase1>(op, x_in, w_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, n));
             }
 
             LoweredOp::SiluMul => {
-                let gate = buf_for(desc.inputs[0], &op_out_buf);
-                let up = buf_for(desc.inputs[1], &op_out_buf);
+                let gate_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let up_buf = buf_for(desc.inputs[1], &op_out_buf);
                 let intermediate = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
-                    2,
-                    lower_silu_mul,
-                    SiluMulOp {
-                        gate,
-                        up,
-                        out: out_buf,
-                        intermediate,
-                        m: desc.m,
-                        act_elem: ACT_ELEM,
-                    }
+                let gate_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    gate_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
                 );
+                let up_in = build_arena_input(
+                    &input_routing[op_idx][1],
+                    up_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                let phase = pick_phase(&carried_phases, &pages, 2);
+                let op = SiluMulOp {
+                    gate: gate_buf,
+                    up: up_buf,
+                    out: out_buf,
+                    intermediate,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                };
+                let output = if phase == 0 {
+                    lower_silu_mul::<Phase0>(op, gate_in, up_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_silu_mul::<Phase1>(op, gate_in, up_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, intermediate));
             }
 
             LoweredOp::Add => {
-                let a = buf_for(desc.inputs[0], &op_out_buf);
-                let b = buf_for(desc.inputs[1], &op_out_buf);
+                let a_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let b_buf = buf_for(desc.inputs[1], &op_out_buf);
                 let hidden = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
-                    2,
-                    lower_residual_add,
-                    AddOp {
-                        a,
-                        b,
-                        out: out_buf,
-                        hidden,
-                        m: desc.m,
-                        act_elem: ACT_ELEM,
-                    }
+                let a_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    a_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
                 );
+                let b_in = build_arena_input(
+                    &input_routing[op_idx][1],
+                    b_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                let phase = pick_phase(&carried_phases, &pages, 2);
+                let op = AddOp {
+                    a: a_buf,
+                    b: b_buf,
+                    out: out_buf,
+                    hidden,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                };
+                let output = if phase == 0 {
+                    lower_residual_add::<Phase0>(op, a_in, b_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_residual_add::<Phase1>(op, a_in, b_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, hidden));
             }
 
             LoweredOp::RopeRotate { head_dim } => {
-                let x = buf_for(desc.inputs[0], &op_out_buf);
-                let cos = buf_for(desc.inputs[1], &op_out_buf);
-                let sin = buf_for(desc.inputs[2], &op_out_buf);
+                let x_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let cos_buf = buf_for(desc.inputs[1], &op_out_buf);
+                let sin_buf = buf_for(desc.inputs[2], &op_out_buf);
                 let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
                 let num_heads = cols / head_dim;
-                dispatch_phase_routed!(
-                    op_idx, &hints, carried_table,
-                    3,
-                    lower_rope_rotate,
-                    RopeRotateOp {
-                        x,
-                        cos,
-                        sin,
-                        out: out_buf,
-                        head_dim,
-                        num_heads,
-                        m: desc.m,
-                        act_elem: ACT_ELEM,
-                    }
+                let x_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    x_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
                 );
+                let cos_in = build_ext_input(cos_buf, &mut prog);
+                let sin_in = build_ext_input(sin_buf, &mut prog);
+                let phase = pick_phase(&carried_phases, &pages, 3);
+                let op = RopeRotateOp {
+                    x: x_buf,
+                    cos: cos_buf,
+                    sin: sin_buf,
+                    out: out_buf,
+                    head_dim,
+                    num_heads,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                };
+                let output = if phase == 0 {
+                    lower_rope_rotate::<Phase0>(op, x_in, cos_in, sin_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_rope_rotate::<Phase1>(op, x_in, cos_in, sin_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, cols));
             }
 
@@ -351,31 +459,49 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
             // the paged KV cache pools (PrefixK / PrefixV per layer).
             // `desc.inputs` from the bridge is
             // `[K, cos, sin, V, K_cache, V_cache]` (6 entries, per
-            // E.12.A bridge widening). Routed lowering only carries
-            // the first 4 (K/cos/sin/V); K_cache and V_cache are
-            // always Ext (paged-cache pools) so their hints are
-            // dropped via `take(4)`.
+            // E.12.A bridge widening). The lowering takes K/cos/sin/V
+            // as typed `CrossOpInput` (4 slots); K_cache and V_cache
+            // are typed `GmemHandle` arguments (E.12.B).
             LoweredOp::RopeAppend { head_dim, layer: _ } => {
-                let k = buf_for(desc.inputs[0], &op_out_buf);
-                let cos = buf_for(desc.inputs[1], &op_out_buf);
-                let sin = buf_for(desc.inputs[2], &op_out_buf);
-                let v = buf_for(desc.inputs[3], &op_out_buf);
+                let k_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let cos_buf = buf_for(desc.inputs[1], &op_out_buf);
+                let sin_buf = buf_for(desc.inputs[2], &op_out_buf);
+                let v_buf = buf_for(desc.inputs[3], &op_out_buf);
                 let k_cache = buf_for(desc.inputs[4], &op_out_buf);
                 let v_cache = buf_for(desc.inputs[5], &op_out_buf);
                 let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
                 let num_kv_heads = cols / head_dim;
-                // Routed lowering only carries K/cos/sin/V (4 slots);
-                // K_cache and V_cache are always Ext (paged-cache pools)
-                // so their hints are dropped via `take(4)`.
-                let rope_hints = RoutingHints {
-                    inputs: hints.inputs.iter().take(4).cloned().collect(),
-                    output_internal: hints.output_internal,
-                };
+                let k_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    k_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                let cos_in = build_ext_input(cos_buf, &mut prog);
+                let sin_in = build_ext_input(sin_buf, &mut prog);
+                let v_in = build_arena_input(
+                    &input_routing[op_idx][3],
+                    v_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                // Carry-forward phases: only K + V (cos/sin are always Ext;
+                // KCache/VCache aren't CrossOpInput).
+                let mut ra_phases: Vec<u32> = Vec::new();
+                if let InputRouting::CarryForward { producer_op_idx } = input_routing[op_idx][0] {
+                    if let Some(c) = carried_table[producer_op_idx] { ra_phases.push(c.phase); }
+                }
+                if let InputRouting::CarryForward { producer_op_idx } = input_routing[op_idx][3] {
+                    if let Some(c) = carried_table[producer_op_idx] { ra_phases.push(c.phase); }
+                }
+                let phase = pick_phase(&ra_phases, &pages, 4);
                 let rope_append_op = RopeAppendOp {
-                    k,
-                    cos,
-                    sin,
-                    v,
+                    k: k_buf,
+                    cos: cos_buf,
+                    sin: sin_buf,
+                    v: v_buf,
                     out: out_buf,
                     k_cache,
                     v_cache,
@@ -385,45 +511,36 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     act_elem: ACT_ELEM,
                     decode_slot_arg: "__decode_slot",
                 };
-                let k_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(
-                    k_cache,
-                );
-                let v_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(
-                    v_cache,
-                );
-                // Step F.1.2: routing always on. Phase chosen from
-                // carry-forward parities; falls back to free-slot count
-                // when no carry-forward inputs.
-                let parities: Vec<u32> = rope_hints
-                    .inputs
-                    .iter()
-                    .filter_map(|h| h.as_ref().map(|c| c.phase))
-                    .collect();
-                let chosen = parities.first().copied();
-                let (result, k_out, v_out) = match chosen {
-                    Some(0) => lower_rope_append::<Phase0>(
-                        rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                    ),
-                    Some(1) => lower_rope_append::<Phase1>(
-                        rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                    ),
-                    Some(other) => panic!(
-                        "lower_to_tk: invalid carry-forward parity {} for lower_rope_append",
-                        other,
-                    ),
-                    None => {
-                        if pages.count_at(0) >= 4 {
-                            lower_rope_append::<Phase0>(
-                                rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                            )
-                        } else {
-                            lower_rope_append::<Phase1>(
-                                rope_append_op, k_handle, v_handle, &rope_hints, &mut pages, &mut prog,
-                            )
-                        }
-                    }
+                let k_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache);
+                let v_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache);
+                let (output, k_out, v_out) = if phase == 0 {
+                    lower_rope_append::<Phase0>(
+                        rope_append_op,
+                        k_in,
+                        cos_in,
+                        sin_in,
+                        v_in,
+                        k_handle,
+                        v_handle,
+                        output_internal,
+                        &mut pages,
+                        &mut prog,
+                    )
+                } else {
+                    lower_rope_append::<Phase1>(
+                        rope_append_op,
+                        k_in,
+                        cos_in,
+                        sin_in,
+                        v_in,
+                        k_handle,
+                        v_handle,
+                        output_internal,
+                        &mut pages,
+                        &mut prog,
+                    )
                 };
-                carried_table[op_idx] = result.output_carried;
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 pending_k_unfenced = Some(k_out);
                 pending_v_unfenced = Some(v_out);
                 op_out_shape.push((desc.m, cols));
@@ -435,24 +552,25 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 head_dim,
                 scale,
             } => {
-                // Multi-head GQA: q has `num_q_heads` heads of `head_dim`
-                // each (`[1, num_q_heads * head_dim]`); kv has
-                // `num_kv_heads` heads (`num_q_heads / num_kv_heads`
-                // q-heads share each kv-head). Output is per-head
-                // attention concatenated.
-                let q = buf_for(desc.inputs[0], &op_out_buf);
+                let q_buf = buf_for(desc.inputs[0], &op_out_buf);
                 let k_cache = buf_for(desc.inputs[1], &op_out_buf);
                 let v_cache = buf_for(desc.inputs[2], &op_out_buf);
-                // AttnDecode's `desc.inputs` is `[Q, (K_seg, V_seg)...]`
-                // — Q + paged-cache segment pairs (often >3). The
-                // routed lowering only consumes Q/k_cache/v_cache (3).
-                // Truncate hints to match.
-                let attn_hints = RoutingHints {
-                    inputs: hints.inputs.iter().take(3).cloned().collect(),
-                    output_internal: hints.output_internal,
-                };
+                let q_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    q_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                // Q is the only CrossOpInput; K_cache/V_cache stay
+                // typed Fenced<GmemHandle<...>>.
+                let mut ad_phases: Vec<u32> = Vec::new();
+                if let InputRouting::CarryForward { producer_op_idx } = input_routing[op_idx][0] {
+                    if let Some(c) = carried_table[producer_op_idx] { ad_phases.push(c.phase); }
+                }
+                let phase = pick_phase(&ad_phases, &pages, 3);
                 let attn_decode_op = AttnDecodeOp {
-                    q,
+                    q: q_buf,
                     k_cache,
                     v_cache,
                     out: out_buf,
@@ -467,82 +585,41 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 // E.13: take the unfenced handles from the prior
                 // RopeAppend (if any), emit the cross-op gmem fence,
                 // and pass the Fenced wrappers to the consumer. If no
-                // RopeAppend ran (test fixtures + future variants
-                // where the cache is pre-populated by per-op forward
-                // and read-only inside the megakernel), construct a
-                // fresh `new_initial` handle. Either path goes
-                // through `emit_fence_after_op` — AttnDecode's
-                // `Fenced<...>` requirement is satisfied uniformly.
+                // RopeAppend ran (test fixtures + future variants),
+                // construct a fresh `new_initial` handle. Either path
+                // goes through `emit_fence_after_op`.
                 let k_unfenced = pending_k_unfenced.take().unwrap_or_else(|| {
                     crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache)
                 });
                 let v_unfenced = pending_v_unfenced.take().unwrap_or_else(|| {
                     crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache)
                 });
-                debug_assert_eq!(
-                    k_unfenced.buf_id(),
-                    k_cache,
-                    "lower_to_tk: AttnDecode's k_cache buf doesn't match producer's K handle",
-                );
-                debug_assert_eq!(
-                    v_unfenced.buf_id(),
-                    v_cache,
-                );
+                debug_assert_eq!(k_unfenced.buf_id(), k_cache);
+                debug_assert_eq!(v_unfenced.buf_id(), v_cache);
                 let k_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, k_unfenced);
                 let v_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, v_unfenced);
-                // Step F.1.2: routing always on. Phase chosen from
-                // carry-forward parities; falls back to free-slot count
-                // when no carry-forward inputs.
-                let parities: Vec<u32> = attn_hints
-                    .inputs
-                    .iter()
-                    .filter_map(|h| h.as_ref().map(|c| c.phase))
-                    .collect();
-                let chosen = parities.first().copied();
-                let result = match chosen {
-                    Some(0) => lower_attn_decode::<Phase0>(
+                let output = if phase == 0 {
+                    lower_attn_decode::<Phase0>(
                         attn_decode_op,
+                        q_in,
                         k_fenced,
                         v_fenced,
-                        &attn_hints,
+                        output_internal,
                         &mut pages,
                         &mut prog,
-                    ),
-                    Some(1) => lower_attn_decode::<Phase1>(
+                    )
+                } else {
+                    lower_attn_decode::<Phase1>(
                         attn_decode_op,
+                        q_in,
                         k_fenced,
                         v_fenced,
-                        &attn_hints,
+                        output_internal,
                         &mut pages,
                         &mut prog,
-                    ),
-                    Some(other) => panic!(
-                        "lower_to_tk: invalid carry-forward parity {} for lower_attn_decode",
-                        other,
-                    ),
-                    None => {
-                        if pages.count_at(0) >= 3 {
-                            lower_attn_decode::<Phase0>(
-                                attn_decode_op,
-                                k_fenced,
-                                v_fenced,
-                                &attn_hints,
-                                &mut pages,
-                                &mut prog,
-                            )
-                        } else {
-                            lower_attn_decode::<Phase1>(
-                                attn_decode_op,
-                                k_fenced,
-                                v_fenced,
-                                &attn_hints,
-                                &mut pages,
-                                &mut prog,
-                            )
-                        }
-                    }
+                    )
                 };
-                carried_table[op_idx] = result.output_carried;
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
                 op_out_shape.push((desc.m, num_q_heads * head_dim));
             }
 

@@ -2362,26 +2362,31 @@ mod tests {
     /// rsync` it to the pod and feed nvcc.
     #[test]
     fn end_to_end_rmsnorm_kernel_snapshot() {
-        use crate::tk_lower::{lower_rmsnorm, PageAllocator, RmsNormOp, RoutingHints};
+        use crate::tk_gmem::{emit_fence_after_op, ArenaSlot, CrossOpInput, Ext, GmemHandle};
+        use crate::tk_lower::{lower_rmsnorm, PageAllocator, RmsNormOp};
         use crate::tk_warp_ir::Phase0;
 
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        let _ = lower_rmsnorm::<Phase0>(
-            RmsNormOp {
-                x: BufId(0),
-                weight: BufId(1),
-                out: BufId(2),
-                hidden: 2048,
-                m: 1,
-                act_elem: 2,
-                eps: 1e-5,
-                init: true,
-            },
-            &RoutingHints::default(),
-            &mut pages,
+        let op = RmsNormOp {
+            x: BufId(0),
+            weight: BufId(1),
+            out: BufId(2),
+            hidden: 2048,
+            m: 1,
+            act_elem: 2,
+            eps: 1e-5,
+            init: true,
+        };
+        let x_in = CrossOpInput::Fenced(emit_fence_after_op(
             &mut prog,
-        );
+            GmemHandle::<ArenaSlot>::new_initial(op.x),
+        ));
+        let weight_in = CrossOpInput::Fenced(emit_fence_after_op(
+            &mut prog,
+            GmemHandle::<Ext>::new_initial(op.weight),
+        ));
+        let _ = lower_rmsnorm::<Phase0>(op, x_in, weight_in, false, &mut pages, &mut prog);
 
         let args = KernelArgs {
             bufs: vec![

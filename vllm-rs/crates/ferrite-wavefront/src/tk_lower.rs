@@ -506,9 +506,21 @@ pub struct AttnDecodeOp {
 ///      accumulator by `l_sum`, storer TMA-stores the result.
 pub fn lower_attn_decode<P: Phase>(
     op: AttnDecodeOp,
+    k_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>>,
+    v_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>>,
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
 ) {
+    // E.13: typed fenced handles confirm that
+    // `tk_gmem::emit_fence_after_op` was emitted between the producing
+    // op (RopeAppend) and this read. The handles' buf_ids must match
+    // op.k_cache / op.v_cache — debug_assert at runtime, but the
+    // fence emit is guaranteed by Rust types.
+    let k_cache = k_cache.into_inner();
+    let v_cache = v_cache.into_inner();
+    debug_assert_eq!(op.k_cache, k_cache.buf_id());
+    debug_assert_eq!(op.v_cache, v_cache.buf_id());
+    let _ = (k_cache, v_cache);
     // Phase 7 GQA shape preconditions:
     // - `num_kv_heads <= NUM_CONSUMER_WARPS` (each kv-head owned by
     //   one consumer warp; warps with `__consumer_idx >= num_kv_heads`
@@ -737,10 +749,17 @@ pub fn lower_attn_decode<P: Phase>(
 /// Default-hints path is byte-identical to `lower_attn_decode`.
 pub fn lower_attn_decode_routed<P: Phase>(
     op: AttnDecodeOp,
+    k_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>>,
+    v_cache: crate::tk_gmem::Fenced<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>>,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
 ) -> RoutingResult {
+    let k_cache = k_cache.into_inner();
+    let v_cache = v_cache.into_inner();
+    debug_assert_eq!(op.k_cache, k_cache.buf_id());
+    debug_assert_eq!(op.v_cache, v_cache.buf_id());
+    let _ = (k_cache, v_cache);
     debug_assert!(
         op.num_kv_heads <= NUM_CONSUMER_WARPS as u32,
         "lower_attn_decode_routed: num_kv_heads ({}) must be <= NUM_CONSUMER_WARPS ({})",
@@ -1647,9 +1666,24 @@ pub struct RopeAppendOp {
 /// index, so the kernel just multiplies.
 pub fn lower_rope_append<P: Phase>(
     op: RopeAppendOp,
+    k_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    v_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
+) -> (
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
 ) {
+    debug_assert_eq!(
+        op.k_cache,
+        k_cache_handle.buf_id(),
+        "lower_rope_append: op.k_cache != handle.buf_id"
+    );
+    debug_assert_eq!(
+        op.v_cache,
+        v_cache_handle.buf_id(),
+        "lower_rope_append: op.v_cache != handle.buf_id"
+    );
     let k_page = pages.alloc_at::<P>().expect("rope_append: K page");
     let c_page = pages.alloc_at::<P>().expect("rope_append: cos page");
     let s_page = pages.alloc_at::<P>().expect("rope_append: sin page");
@@ -1769,15 +1803,14 @@ pub fn lower_rope_append<P: Phase>(
     pages.release(prog.complete_round(s_page));
     pages.release(prog.complete_round(v_page));
 
-    // CTA-wide barrier: force all warps to converge after the K/V
-    // cache writes complete. Without this, downstream AttnDecode's
-    // loader warp may issue its TMA load on the K_cache pool BEFORE
-    // RopeAppend's storer warp finishes its `tma::store_async_wait()`
-    // — the pool reads would see stale (or zero) bytes at the new
-    // decode token's slot. `__syncthreads()` flushes per-warp stores
-    // to the CTA-shared gmem view, and is the cheapest cross-warp
-    // ordering primitive available.
-    prog.compute(WarpRole::All, "__syncthreads();".to_string());
+    // E.13: cross-op gmem ordering for the K/V cache writes is now
+    // emitted by the orchestrator via `tk_gmem::emit_fence_after_op`
+    // between this op and the next reader (typically AttnDecode).
+    // The CTA-wide `__syncthreads()` E.12.B emitted here is removed —
+    // the typed `Fenced<GmemHandle<...>>` substrate enforces fence
+    // emission structurally, so a single source of truth for the
+    // primitive sits in `tk_codegen::tk20::cross_op_gmem_fence_body`.
+    (k_cache_handle, v_cache_handle)
 }
 
 /// Phase 12: routing-aware variant of `lower_rope_append`.
@@ -1793,10 +1826,18 @@ pub fn lower_rope_append<P: Phase>(
 /// Default-hints path is byte-identical to `lower_rope_append`.
 pub fn lower_rope_append_routed<P: Phase>(
     op: RopeAppendOp,
+    k_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    v_cache_handle: crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
     hints: &RoutingHints,
     pages: &mut PageAllocator,
     prog: &mut TkProgram,
-) -> RoutingResult {
+) -> (
+    RoutingResult,
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
+) {
+    debug_assert_eq!(op.k_cache, k_cache_handle.buf_id());
+    debug_assert_eq!(op.v_cache, v_cache_handle.buf_id());
     debug_assert!(
         hints.inputs.is_empty() || hints.inputs.len() == 4,
         "lower_rope_append_routed: hints.inputs must be empty or len 4"
@@ -1959,11 +2000,11 @@ pub fn lower_rope_append_routed<P: Phase>(
         RoutingResult::default()
     };
 
-    // CTA-wide barrier; see `lower_rope_append` for rationale (forces
-    // K/V cache stores to be visible to the next op's loader warp).
-    prog.compute(WarpRole::All, "__syncthreads();".to_string());
-
-    result
+    // E.13: cross-op gmem ordering for the K/V cache writes is
+    // emitted by the orchestrator via
+    // `tk_gmem::emit_fence_after_op`. The `__syncthreads()` E.12.B
+    // emitted here is removed.
+    (result, k_cache_handle, v_cache_handle)
 }
 
 // ── GemmM1 — M=1 vec-mat decode GEMM ───────────────────────────────
@@ -2547,7 +2588,12 @@ mod tests {
     fn attn_decode_lowers_to_typed_outer_plus_kv_loop() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
+        let op = attn_op();
+        let k = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(op.k_cache);
+        let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
+        let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
+        let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         // Count ForLoops and their body lengths.
         let loops: Vec<&Vec<TkInstr>> = prog
@@ -2578,7 +2624,12 @@ mod tests {
         use crate::tk_warp_ir::WaitPhase;
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
+        let op = attn_op();
+        let k = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(op.k_cache);
+        let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
+        let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
+        let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         let mut outer_phases = Vec::<WaitPhase>::new();
         let mut inner_phases = Vec::<WaitPhase>::new();
@@ -2617,7 +2668,12 @@ mod tests {
     fn attn_decode_codegen_emits_for_and_runtime_parity() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
+        let op = attn_op();
+        let k = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(op.k_cache);
+        let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
+        let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
+        let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
         let src = emit_body(&prog);
 
         assert!(
@@ -2641,7 +2697,12 @@ mod tests {
     fn attn_decode_uses_three_distinct_pages() {
         let mut pages = PageAllocator::new();
         let mut prog = TkProgram::new();
-        lower_attn_decode::<Phase0>(attn_op(), &mut pages, &mut prog);
+        let op = attn_op();
+        let k = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(op.k_cache);
+        let v = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(op.v_cache);
+        let kf = crate::tk_gmem::emit_fence_after_op(&mut prog, k);
+        let vf = crate::tk_gmem::emit_fence_after_op(&mut prog, v);
+        lower_attn_decode::<Phase0>(op, kf, vf, &mut pages, &mut prog);
 
         let mut load_pages = Vec::<u8>::new();
         for instr in &prog.instrs {

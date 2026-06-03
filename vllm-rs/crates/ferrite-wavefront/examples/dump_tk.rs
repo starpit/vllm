@@ -74,23 +74,28 @@ fn main() {
     // ── Slice: AttnDecode ──
     let mut pages2 = PageAllocator::new();
     let mut prog2 = TkProgram::new();
-    lower_attn_decode::<Phase0>(
-        AttnDecodeOp {
-            q: BufId(0),
-            k_cache: BufId(1),
-            v_cache: BufId(2),
-            out: BufId(3),
-            head_dim: 128,
-            num_q_heads: 8,
-            num_kv_heads: 8,
-            act_elem: 2,
-            softmax_scale: 0.088_388_35,
-            num_kv_pages_arg: "__num_kv_pages",
-            unique_id: 0,
-        },
-        &mut pages2,
-        &mut prog2,
+    let attn_op = AttnDecodeOp {
+        q: BufId(0),
+        k_cache: BufId(1),
+        v_cache: BufId(2),
+        out: BufId(3),
+        head_dim: 128,
+        num_q_heads: 8,
+        num_kv_heads: 8,
+        act_elem: 2,
+        softmax_scale: 0.088_388_35,
+        num_kv_pages_arg: "__num_kv_pages",
+        unique_id: 0,
+    };
+    let k = ferrite_wavefront::tk_gmem::GmemHandle::<ferrite_wavefront::tk_gmem::KCache>::new_initial(
+        attn_op.k_cache,
     );
+    let v = ferrite_wavefront::tk_gmem::GmemHandle::<ferrite_wavefront::tk_gmem::VCache>::new_initial(
+        attn_op.v_cache,
+    );
+    let kf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, k);
+    let vf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, v);
+    lower_attn_decode::<Phase0>(attn_op, kf, vf, &mut pages2, &mut prog2);
     let args2 = KernelArgs {
         bufs: vec![
             KernelArg {

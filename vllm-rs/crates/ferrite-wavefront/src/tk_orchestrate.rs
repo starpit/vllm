@@ -227,6 +227,18 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
         }};
     }
 
+    // E.13: typed gmem handle stash for the cross-op K/V cache edge.
+    // RopeAppend (the producer) places handles here; the next
+    // AttnDecode (the consumer) takes them, fences, and feeds the
+    // Fenced wrappers to its lowering. The orchestrator cannot
+    // bypass this — `lower_attn_decode` requires
+    // `Fenced<GmemHandle<...>>`, and the only way to construct one
+    // is `tk_gmem::emit_fence_after_op`.
+    let mut pending_k_unfenced: Option<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>> =
+        None;
+    let mut pending_v_unfenced: Option<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>> =
+        None;
+
     for (op_idx, desc) in input.ops.iter().enumerate() {
         let out_buf = BufId(n_sources + op_idx as u32);
         op_out_buf.push(out_buf);
@@ -392,26 +404,76 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     inputs: h.inputs.iter().take(4).cloned().collect(),
                     output_internal: h.output_internal,
                 });
-                dispatch_phase_maybe_routed!(
-                    op_idx, hints_opt, carried_table,
-                    4,
-                    lower_rope_append,
-                    lower_rope_append_routed,
-                    RopeAppendOp {
-                        k,
-                        cos,
-                        sin,
-                        v,
-                        out: out_buf,
-                        k_cache,
-                        v_cache,
-                        head_dim,
-                        num_kv_heads,
-                        m: desc.m,
-                        act_elem: ACT_ELEM,
-                        decode_slot_arg: "__decode_slot",
-                    }
+                let rope_append_op = RopeAppendOp {
+                    k,
+                    cos,
+                    sin,
+                    v,
+                    out: out_buf,
+                    k_cache,
+                    v_cache,
+                    head_dim,
+                    num_kv_heads,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                    decode_slot_arg: "__decode_slot",
+                };
+                let k_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(
+                    k_cache,
                 );
+                let v_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(
+                    v_cache,
+                );
+                let (k_out, v_out) = match hints_opt.as_ref() {
+                    Some(hints) => {
+                        // Routed: phase from carry-forward parities.
+                        let parities: Vec<u32> = hints
+                            .inputs
+                            .iter()
+                            .filter_map(|h| h.as_ref().map(|c| c.phase))
+                            .collect();
+                        let chosen = parities.first().copied();
+                        let (result, k_out, v_out) = match chosen {
+                            Some(0) => lower_rope_append_routed::<Phase0>(
+                                rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                            ),
+                            Some(1) => lower_rope_append_routed::<Phase1>(
+                                rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                            ),
+                            Some(other) => panic!(
+                                "lower_to_tk: invalid carry-forward parity {} for lower_rope_append_routed",
+                                other,
+                            ),
+                            None => {
+                                if pages.count_at(0) >= 4 {
+                                    lower_rope_append_routed::<Phase0>(
+                                        rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                                    )
+                                } else {
+                                    lower_rope_append_routed::<Phase1>(
+                                        rope_append_op, k_handle, v_handle, hints, &mut pages, &mut prog,
+                                    )
+                                }
+                            }
+                        };
+                        carried_table[op_idx] = result.output_carried;
+                        (k_out, v_out)
+                    }
+                    None => {
+                        // Legacy: phase from free-slot count.
+                        if pages.count_at(0) >= 4 {
+                            lower_rope_append::<Phase0>(
+                                rope_append_op, k_handle, v_handle, &mut pages, &mut prog,
+                            )
+                        } else {
+                            lower_rope_append::<Phase1>(
+                                rope_append_op, k_handle, v_handle, &mut pages, &mut prog,
+                            )
+                        }
+                    }
+                };
+                pending_k_unfenced = Some(k_out);
+                pending_v_unfenced = Some(v_out);
                 op_out_shape.push((desc.m, cols));
             }
 
@@ -437,25 +499,118 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     inputs: h.inputs.iter().take(3).cloned().collect(),
                     output_internal: h.output_internal,
                 });
-                dispatch_phase_maybe_routed!(
-                    op_idx, hints_opt, carried_table,
-                    3,
-                    lower_attn_decode,
-                    lower_attn_decode_routed,
-                    AttnDecodeOp {
-                        q,
-                        k_cache,
-                        v_cache,
-                        out: out_buf,
-                        head_dim,
-                        num_q_heads,
-                        num_kv_heads,
-                        act_elem: ACT_ELEM,
-                        softmax_scale: scale,
-                        num_kv_pages_arg: "__num_kv_pages",
-                        unique_id: op_idx as u32,
-                    }
+                let attn_decode_op = AttnDecodeOp {
+                    q,
+                    k_cache,
+                    v_cache,
+                    out: out_buf,
+                    head_dim,
+                    num_q_heads,
+                    num_kv_heads,
+                    act_elem: ACT_ELEM,
+                    softmax_scale: scale,
+                    num_kv_pages_arg: "__num_kv_pages",
+                    unique_id: op_idx as u32,
+                };
+                // E.13: take the unfenced handles from the prior
+                // RopeAppend (if any), emit the cross-op gmem fence,
+                // and pass the Fenced wrappers to the consumer. If no
+                // RopeAppend ran (test fixtures + future variants
+                // where the cache is pre-populated by per-op forward
+                // and read-only inside the megakernel), construct a
+                // fresh `new_initial` handle. Either path goes
+                // through `emit_fence_after_op` — AttnDecode's
+                // `Fenced<...>` requirement is satisfied uniformly.
+                let k_unfenced = pending_k_unfenced.take().unwrap_or_else(|| {
+                    crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache)
+                });
+                let v_unfenced = pending_v_unfenced.take().unwrap_or_else(|| {
+                    crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache)
+                });
+                debug_assert_eq!(
+                    k_unfenced.buf_id(),
+                    k_cache,
+                    "lower_to_tk: AttnDecode's k_cache buf doesn't match producer's K handle",
                 );
+                debug_assert_eq!(
+                    v_unfenced.buf_id(),
+                    v_cache,
+                );
+                let k_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, k_unfenced);
+                let v_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, v_unfenced);
+                match hints_opt.as_ref() {
+                    Some(hints) => {
+                        let parities: Vec<u32> = hints
+                            .inputs
+                            .iter()
+                            .filter_map(|h| h.as_ref().map(|c| c.phase))
+                            .collect();
+                        let chosen = parities.first().copied();
+                        let result = match chosen {
+                            Some(0) => lower_attn_decode_routed::<Phase0>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                hints,
+                                &mut pages,
+                                &mut prog,
+                            ),
+                            Some(1) => lower_attn_decode_routed::<Phase1>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                hints,
+                                &mut pages,
+                                &mut prog,
+                            ),
+                            Some(other) => panic!(
+                                "lower_to_tk: invalid carry-forward parity {} for lower_attn_decode_routed",
+                                other,
+                            ),
+                            None => {
+                                if pages.count_at(0) >= 3 {
+                                    lower_attn_decode_routed::<Phase0>(
+                                        attn_decode_op,
+                                        k_fenced,
+                                        v_fenced,
+                                        hints,
+                                        &mut pages,
+                                        &mut prog,
+                                    )
+                                } else {
+                                    lower_attn_decode_routed::<Phase1>(
+                                        attn_decode_op,
+                                        k_fenced,
+                                        v_fenced,
+                                        hints,
+                                        &mut pages,
+                                        &mut prog,
+                                    )
+                                }
+                            }
+                        };
+                        carried_table[op_idx] = result.output_carried;
+                    }
+                    None => {
+                        if pages.count_at(0) >= 3 {
+                            lower_attn_decode::<Phase0>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                &mut pages,
+                                &mut prog,
+                            );
+                        } else {
+                            lower_attn_decode::<Phase1>(
+                                attn_decode_op,
+                                k_fenced,
+                                v_fenced,
+                                &mut pages,
+                                &mut prog,
+                            );
+                        }
+                    }
+                }
                 op_out_shape.push((desc.m, num_q_heads * head_dim));
             }
 

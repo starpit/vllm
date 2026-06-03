@@ -385,6 +385,15 @@ pub enum TkInstr {
         count: LoopBound,
         body: Vec<TkInstr>,
     },
+
+    /// E.13: cross-op gmem-fence. Codegen lowers this to a CTA-wide
+    /// sequence (commit + wait for outstanding TMA stores +
+    /// threadfence + syncthreads) so a subsequent op's TMA loads on
+    /// the same gmem region observe the prior op's TMA stores. Emit
+    /// only via [`crate::tk_gmem::emit_fence_after_op`] — direct
+    /// construction is permitted by Rust visibility but the typed
+    /// `Fenced<H>` wrapper is the actual safety boundary.
+    CrossOpGmemFence,
 }
 
 /// Loop trip count for [`TkInstr::ForLoop`]: either a const baked at
@@ -658,6 +667,14 @@ impl TkProgram {
             role,
             calls: vec![crate::tk_codegen::Tk20Call::RawString(body.into())],
         });
+    }
+
+    /// E.13: append a [`TkInstr::CrossOpGmemFence`]. Use only via
+    /// [`crate::tk_gmem::emit_fence_after_op`] — that is the only
+    /// path that yields the [`crate::tk_gmem::Fenced`] witness
+    /// required by gmem-reading lowerings.
+    pub(crate) fn emit_cross_op_gmem_fence(&mut self) {
+        self.instrs.push(TkInstr::CrossOpGmemFence);
     }
 
     /// Append a `Compute` whose body is a typed `tk20::*` call list.

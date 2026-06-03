@@ -543,6 +543,27 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
         eprintln!("[wavefront-cuda] launch_tk_decode_full returned cudaError {err}");
         return None;
     }
+    // E.13: drain the persistent-CTA megakernel before returning.
+    // The kernel's `tma::store_async + store_commit_group +
+    // store_async_wait` per-store sequence covers same-warp
+    // ordering, and the substrate-emitted cross-op `Fenced<H>` fence
+    // covers intra-kernel cross-warp ordering. Neither, however, is
+    // sufficient for cross-kernel-launch ordering on Hopper:
+    // `cp.async.bulk` writes complete asynchronously w.r.t. the
+    // issuing thread, and the kernel's exit `__syncthreads()` does
+    // a CTA `bar.sync` but does not drain the async proxy. The next
+    // megakernel launch (next decode token) reads K_cache via
+    // `tma::load_async`; without an explicit stream sync between
+    // launches, the loads may observe pre-write gmem.
+    //
+    // `sync_compute()` (cuStreamSynchronize on the compute stream)
+    // is the host-side guarantee that the kernel has fully drained
+    // before the next call begins. Empirically: with this in place,
+    // `Paris -> " Paris. The Eiffel Tower is located in"` (coherent
+    // megakernel decode); without it, `" Paris!!!!!!!!!"`.
+    device
+        .sync_compute()
+        .expect("sync compute after wavefront megakernel");
 
     // ── 6. Pluck the result op output and reshape it in place from
     //     the U8 byte layout the kernel writes (the alloc is sized to

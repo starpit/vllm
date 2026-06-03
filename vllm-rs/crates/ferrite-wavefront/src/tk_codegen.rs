@@ -63,6 +63,46 @@ pub mod tk20 {
         format!("kittens::group<{n_warps}>::sync();")
     }
 
+    /// E.13: cross-op gmem-fence body. Emits a CTA-wide sync +
+    /// commits and waits for all outstanding TMA stores + a
+    /// CTA-scoped threadfence + a final converging sync. After this
+    /// sequence, gmem writes from any prior op's storer warp are
+    /// visible to any subsequent op's loader warp's TMA load on the
+    /// same address.
+    ///
+    /// The raw `cp.async.bulk.commit_group` / `cp.async.bulk.wait_group`
+    /// PTX intrinsics are used directly: TK 2.0's
+    /// `tma::store_async_wait` is per-warp-group and isn't
+    /// guaranteed to be observed by other warps without an explicit
+    /// commit + wait combo at fence time.
+    ///
+    /// Initial cut (Step E.13). If empirically insufficient on the
+    /// pod, iterate ON THIS BODY only; the substrate that gates this
+    /// emit ([`crate::tk_gmem::Fenced`] / `emit_fence_after_op`) is
+    /// unaffected.
+    pub fn cross_op_gmem_fence_body() -> String {
+        // Multi-line CUDA fragment. Each line is one statement; the
+        // codegen wraps the whole emit in the `if (__role == ...)`
+        // role guard upstream — except `WarpRole::All` which emits
+        // unguarded (every thread in the CTA executes these lines).
+        //
+        // `__threadfence()` is system-scope (vs `_block` which is
+        // CTA-scope only). Empirically the CTA-scope fence wasn't
+        // enough for the megakernel; system-scope ensures the TMA
+        // stores are visible across the entire device, which covers
+        // both the same-CTA-different-warp case AND the
+        // cross-kernel-launch case (stream-serialized but possibly
+        // L2-stale).
+        [
+            "__syncthreads();",
+            "asm volatile(\"cp.async.bulk.commit_group;\");",
+            "asm volatile(\"cp.async.bulk.wait_group 0;\");",
+            "__threadfence();",
+            "__syncthreads();",
+        ]
+        .join("\n        ")
+    }
+
     /// Total bytes a tile of `(rows, cols)` occupies given `elem_bytes`.
     fn tile_bytes(rows: u32, cols: u32, elem_bytes: u32) -> u32 {
         rows * cols * elem_bytes
@@ -129,11 +169,21 @@ pub mod tk20 {
             Some(e) => format!("({dst_byte_off}u + ({e}))"),
             None => format!("{dst_byte_off}"),
         };
+        // E.13: emit `store_commit_group` between `store_async` and
+        // `store_async_wait`. The typed (sv/st) store_async variant
+        // already does this (`tma_store_async_typed` at line ~191);
+        // the raw-bulk variant historically did not, so
+        // `store_async_wait`'s underlying
+        // `cp.async.bulk.wait_group N=0` had no group to wait on and
+        // returned immediately. The actual stores stayed in flight,
+        // and downstream readers (TMA loads in the next op, plus
+        // cross-launch reads) saw stale gmem.
         format!(
             "kittens::group<1>::tma::store_async(\
              reinterpret_cast<void*>(reinterpret_cast<char*>(buf{dst_buf}) + {off_expr}), \
              reinterpret_cast<void*>(page_buf[{page_id}]), \
              {bytes}); \
+             kittens::group<1>::tma::store_commit_group(); \
              kittens::group<1>::tma::store_async_wait();"
         )
     }
@@ -1308,6 +1358,7 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
             let n = role_group_width(*role);
             (*role, tk20::sync(n))
         }
+        TkInstr::CrossOpGmemFence => (WarpRole::All, tk20::cross_op_gmem_fence_body()),
         // Handled by the early return above. Reachable only if a
         // future refactor breaks that contract; an `unreachable!` is
         // the right tripwire.
@@ -1661,11 +1712,23 @@ pub fn emit_kernel_with_opts(
     out.push_str(&emit_body_with_opts(prog, opts));
     out.push_str("\n");
 
-    // Final sync: every warp waits for the others before retiring.
-    // CTA-wide sync. `kittens::group<N>::sync()` (barrier-less) is
-    // only legal for single-warp groups (asserts `GROUP_WARPS==1`); the
-    // multi-warp form takes a `bar.sync` barrier id. Easiest portable
-    // choice for "all 10 warps converge" is just `__syncthreads()`.
+    // E.13 kernel-end fence: any cp.async.bulk stores still in
+    // flight at this point would otherwise be observed as stale gmem
+    // by the NEXT kernel launch (CUDA stream serialization
+    // guarantees kernel-N-ends-before-kernel-N+1-starts at the
+    // queueing level, but cp.async.bulk acks complete asynchronously
+    // and aren't guaranteed visible without an explicit
+    // commit_group + wait_group N=0 emitted from the storing warp).
+    // The persistent-CTA megakernel's storer warp's per-store
+    // `tma::store_async_wait` covers same-warp ordering, but stores
+    // landing late (e.g. RopeAppend's cache writes near end of the
+    // tape) may still be in flight when the storer warp reaches
+    // here. Force a CTA-wide commit + wait + system fence so the
+    // kernel doesn't exit with pending bulk stores.
+    out.push_str("    __syncthreads();\n");
+    out.push_str("    asm volatile(\"cp.async.bulk.commit_group;\");\n");
+    out.push_str("    asm volatile(\"cp.async.bulk.wait_group 0;\");\n");
+    out.push_str("    __threadfence();\n");
     out.push_str("    __syncthreads();\n");
     out.push_str("}\n");
     out.push_str("\n");

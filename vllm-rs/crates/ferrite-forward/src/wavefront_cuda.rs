@@ -132,6 +132,50 @@ impl DecodePosition {
     }
 }
 
+/// Paged KV-cache slot index for the new decode token. D2H-copied
+/// from `ctx.slot_mapping[0]` (I64 → u32) once per dispatch — the
+/// scheduler has already resolved
+/// `block_table[seq][pos / block_size] * block_size + (pos %
+/// block_size)` into a single absolute slot index, so the megakernel
+/// just multiplies it by the per-token row stride.
+///
+/// Distinct type from [`SeqTokenCount`] / [`SeqBlockCount`] /
+/// [`DecodePosition`] — none of them is convertible to a
+/// `DecodeSlot` without explicit re-derivation. Sealed
+/// constructor [`DecodeSlot::from_slot_mapping`] is the only path.
+///
+/// # Compile-fail proof
+///
+/// Raw u32 / SeqTokenCount rejected by the typed pusher:
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::*;
+/// let mut b = KernelU32ArgsBuilder::new();
+/// let raw: u32 = 0;
+/// b.push_decode_slot(raw);  // expected DecodeSlot, found u32
+/// ```
+///
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::*;
+/// let mut b = KernelU32ArgsBuilder::new();
+/// let count = SeqTokenCount::from_max_seqlen_k(7);
+/// b.push_decode_slot(count);  // expected DecodeSlot, found SeqTokenCount
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeSlot(u32);
+
+impl DecodeSlot {
+    /// Construct from a `slot_mapping[token_i]` value (typically i64
+    /// from the runtime tensor; cast to u32 — paged-cache indices
+    /// for in-scope models fit in u32).
+    pub fn from_slot_mapping(slot: u32) -> Self {
+        Self(slot)
+    }
+
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+}
+
 /// Typed builder for kernel u32 args. Args are pushed in a fixed
 /// order matching `KernelArgs::u32_args` (set by
 /// `fixtures::orchestrator_kernel_args`): num_kv_pages first
@@ -161,6 +205,14 @@ impl KernelU32ArgsBuilder {
     /// Push the decode position.
     pub fn push_decode_position(&mut self, pos: DecodePosition) {
         self.args.push(pos.raw());
+    }
+
+    /// Push the paged-KV-cache slot index for the new decode token's
+    /// K/V (`__decode_slot` in the kernel — multiplied by per-token
+    /// row stride to compute the cache-write byte offset). Compile-
+    /// time safe: caller must produce a [`DecodeSlot`].
+    pub fn push_decode_slot(&mut self, slot: DecodeSlot) {
+        self.args.push(slot.raw());
     }
 
     pub fn finalize(self) -> Vec<u32> {
@@ -261,6 +313,14 @@ pub struct DispatchSpec {
     /// `ctx.positions[0]` and pushes it after `__num_kv_pages` so the
     /// rope TMA loads can index `cos_sin_cache + pos * row_bytes`.
     pub has_rope: bool,
+    /// True if any op is `RopeAppend`; gates the `__decode_slot` u32
+    /// arg the kernel uses to address the paged-KV-cache K/V write
+    /// destinations. The dispatcher D2H copies `ctx.slot_mapping[0]`
+    /// (I64 → u32) and pushes it after `__decode_position`. The new
+    /// token's K row writes to `K_cache + slot * row_bytes` and V to
+    /// `V_cache + slot * row_bytes` — `slot_mapping` already encodes
+    /// the paged block-table indirection, so the kernel just multiplies.
+    pub has_rope_append: bool,
     /// Op index whose output buffer is the final logits row. Within
     /// `op_output_bytes`. Reshaped on return to
     /// `[num_tokens, vocab_size]` bf16.
@@ -442,9 +502,32 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
         device.sync_d2h().expect("sync d2h decode position");
         u32_builder.push_decode_position(DecodePosition::from_raw(pos_host));
     }
+    if spec.has_rope_append {
+        // `slot_mapping` is a `[num_tokens]` I64 tensor — for
+        // num_tokens=1 decode, slot_mapping[0] is the absolute paged
+        // cache slot for the new token's K/V (the runtime has already
+        // resolved block-table indirection into a flat slot index).
+        let mut slot_host: i64 = 0;
+        unsafe {
+            device
+                .async_d2h(
+                    (&raw mut slot_host).cast::<u8>(),
+                    ctx.slot_mapping.raw_ptr().cast::<u8>(),
+                    std::mem::size_of::<i64>(),
+                )
+                .expect("d2h decode slot");
+        }
+        device.sync_d2h().expect("sync d2h decode slot");
+        debug_assert!(
+            slot_host >= 0 && slot_host <= u32::MAX as i64,
+            "decode slot {slot_host} out of u32 range",
+        );
+        u32_builder.push_decode_slot(DecodeSlot::from_slot_mapping(slot_host as u32));
+    }
 
     // Finalize u32 args from the typed builder. Order is fixed:
-    // num_kv_pages (if present), then decode_position (if present).
+    // num_kv_pages (if present), decode_position (if present),
+    // decode_slot (if present).
     let u32_args: Vec<u32> = u32_builder.finalize();
 
     // ── 5. Call the FFI wrapper. Pointer table + u32 table are kept

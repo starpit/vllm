@@ -5989,6 +5989,7 @@ struct CudaDispatchData {
     op_output_bytes: Vec<u64>,
     has_attn_decode: bool,
     has_rope: bool,
+    has_rope_append: bool,
     result_op_idx: u32,
     vocab_size: u64,
     embed_bucket: u32,
@@ -6551,6 +6552,10 @@ fn build_cuda_dispatch_data(
         .ops
         .iter()
         .any(|d| matches!(d.op, LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. }));
+    let has_rope_append = fused
+        .ops
+        .iter()
+        .any(|d| matches!(d.op, LoweredOp::RopeAppend { .. }));
 
     // The orchestrator's `BufId(n_sources + j)` for op j; the lowered
     // input's `result: usize` is the op index whose output is the
@@ -6568,6 +6573,7 @@ fn build_cuda_dispatch_data(
         op_output_bytes: raw_op_output_bytes,
         has_attn_decode,
         has_rope,
+        has_rope_append,
         result_op_idx,
         vocab_size,
         embed_bucket: bb_bucket_id,
@@ -6736,6 +6742,7 @@ fn emit_wavefront_dispatch_cuda(d: &CudaDispatchData) -> TokenStream {
         .map(|b| proc_macro2::Literal::u64_unsuffixed(*b));
     let has_attn_decode = d.has_attn_decode;
     let has_rope = d.has_rope;
+    let has_rope_append = d.has_rope_append;
     let result_op_idx = proc_macro2::Literal::u32_unsuffixed(d.result_op_idx);
     let vocab_size = proc_macro2::Literal::u64_unsuffixed(d.vocab_size);
     let embed_bucket = proc_macro2::Literal::u32_unsuffixed(d.embed_bucket);
@@ -6790,6 +6797,7 @@ fn emit_wavefront_dispatch_cuda(d: &CudaDispatchData) -> TokenStream {
                 op_output_bytes: WAVEFRONT_OP_OUTPUT_BYTES,
                 has_attn_decode: #has_attn_decode,
                 has_rope: #has_rope,
+                has_rope_append: #has_rope_append,
                 result_op_idx: #result_op_idx,
                 vocab_size: #vocab_size,
                 launch_fn: #kernel_ident,

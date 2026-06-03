@@ -913,7 +913,8 @@ pub fn validate(graph: &SubtileGraph) -> Result<usize, String> {
             SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
-            SubOp::RopeAppend { .. } => arity == 4, // K, cos, sin, V
+            // E.12: K, cos, sin, V, K_cache, V_cache.
+            SubOp::RopeAppend { .. } => arity == 6,
             // Q followed by one or more (K_seg, V_seg) pairs.
             SubOp::AttnDecode { .. } => arity >= 3 && arity % 2 == 1,
         };

@@ -567,13 +567,25 @@ pub fn lower_decode_to_wavefront(
                     detail: "rope_append missing kv_cache extern index",
                 })? as u32;
                 let (cos, sin) = bx.cos_sin();
+                // E.12 — RopeAppend writes rotated K and V into the
+                // paged KV cache. Pull the per-layer PrefixK / PrefixV
+                // source indices via the cached `prefix_for(layer)`
+                // helper (same indices Attention will receive later).
+                let (pk, pv) = bx.prefix_for(layer as u64);
                 let qi = bx.push_op(
                     LoweredOp::RopeRotate { head_dim },
                     vec![q, InputRef::Ext(cos), InputRef::Ext(sin)],
                 );
                 let ki = bx.push_op(
                     LoweredOp::RopeAppend { head_dim, layer },
-                    vec![k, InputRef::Ext(cos), InputRef::Ext(sin), v],
+                    vec![
+                        k,
+                        InputRef::Ext(cos),
+                        InputRef::Ext(sin),
+                        v,
+                        InputRef::Ext(pk),
+                        InputRef::Ext(pv),
+                    ],
                 );
                 bx.produced.insert((tile.0, 0), Producer::Op(qi));
                 bx.produced.insert((tile.0, 1), Producer::Op(ki));

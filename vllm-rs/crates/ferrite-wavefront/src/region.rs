@@ -447,7 +447,11 @@ pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
             SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
             SubOp::RopeRotate { .. } => arity == 3,
-            SubOp::RopeAppend { .. } => arity == 4,
+            // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
+            // — the K_cache / V_cache are per-layer PrefixK / PrefixV
+            // sources used as TMA-store destinations for the new
+            // decode token's K/V.
+            SubOp::RopeAppend { .. } => arity == 6,
             SubOp::AttnDecode { .. } => arity >= 3 && arity % 2 == 1,
         };
         if !arity_ok {

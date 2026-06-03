@@ -342,5 +342,17 @@ pub fn orchestrator_kernel_args(
     {
         u32_args.push("__decode_position".into());
     }
+    // Runtime decode slot — the new token's absolute paged-cache slot
+    // index for the K/V cache writes emitted by RopeAppend's storer.
+    // Source: `ctx.slot_mapping[0]` (D2H copy, I64 → u32). Registered
+    // whenever any op is RopeAppend; pure RopeRotate (Q-side, no
+    // cache write) doesn't need it.
+    if input
+        .ops
+        .iter()
+        .any(|d| matches!(d.op, LoweredOp::RopeAppend { .. }))
+    {
+        u32_args.push("__decode_slot".into());
+    }
     KernelArgs { bufs, u32_args }
 }

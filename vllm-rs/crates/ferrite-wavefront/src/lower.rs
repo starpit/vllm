@@ -71,42 +71,6 @@ pub enum LoweredOp {
         head_dim: u32,
         scale: f32,
     },
-
-    // ── Prefill variants (Step F.4 / Stage 4.A) ─────────────────
-    //
-    // Bridge emits these instead of `AttnDecode` / `RopeAppend` /
-    // (per-token) `RopeRotate` when the canonical's `num_tokens > 1`.
-    // The lowerings (`lower_attn_prefill`, `lower_rope_multi`,
-    // `lower_reshape_and_cache_multi`) and per-op `m`-axis tiling
-    // land in Stage 4.B-C; until then the orchestrator routes
-    // these variants to a `todo!()` panic so anything that hits
-    // them at compile time fails loudly.
-
-    /// FA-2-style causal attention over `m` query rows + paged
-    /// prefix cache. Inputs: `[Q, K_cache, V_cache, K_new, V_new]`
-    /// (the bridge mirrors `AttnDecode`'s widened input list).
-    /// Output: `[m, num_q_heads * head_dim]`. Spec:
-    /// `kernels::flash_attn_contiguous`.
-    AttnPrefill {
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        scale: f32,
-    },
-
-    /// Multi-row NeoX rotary over `[m, heads * head_dim]`. Inputs:
-    /// `[x, cos, sin]`. Cos/sin are the per-position rotary tables
-    /// indexed by `positions[0..m]`. Shape-preserving. Decode's
-    /// `RopeRotate` is the m=1 special case but kept separate so
-    /// the lowering doesn't have to test `op.m`.
-    RopeMultiToken { head_dim: u32 },
-
-    /// Multi-row K/V cache write: rotate K (NeoX) and write rotated
-    /// K + V to the paged cache at `slot_mapping[0..m]`. Inputs:
-    /// `[K, cos, sin, V, K_cache, V_cache]` (mirrors `RopeAppend`'s
-    /// widened input list per Step E.12.A). The decode `RopeAppend`
-    /// is the m=1 special case.
-    ReshapeAndCacheMulti { head_dim: u32, layer: u32 },
 }
 
 /// One op in the forward.
@@ -210,32 +174,6 @@ pub fn lower(input: &LoweringInput) -> SubtileGraph {
                 },
                 num_q_heads * head_dim,
             ),
-
-            // Stage 4.A: prefill variants reuse decode SubOps for
-            // host-eval / shape inference (same semantics; m differs).
-            // Orchestrator-side lowerings differentiate m=1 vs m>1.
-            LoweredOp::AttnPrefill {
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                scale,
-            } => (
-                SubOp::AttnDecode {
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    scale,
-                },
-                num_q_heads * head_dim,
-            ),
-            LoweredOp::RopeMultiToken { head_dim } => {
-                let cols = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
-                (SubOp::RopeRotate { head_dim }, cols)
-            }
-            LoweredOp::ReshapeAndCacheMulti { head_dim, layer } => {
-                let cols = input_shape(desc.inputs[0], &op_shape, &input.sources).1;
-                (SubOp::RopeAppend { head_dim, layer }, cols)
-            }
         };
         let id = SubtileId(nodes.len() as u32);
         nodes.push(SubtileNode {

@@ -6037,17 +6037,13 @@ fn dump_wavefront_mega(
 ) {
     use crate::to_wavefront;
     let stem = model.source_stem.as_str();
-    // Stage 4.A — bridge is `num_tokens`-parameterized; per-canonical
-    // bucketing (1, 16, 64, 256, 1024) lands in Stage 4.D. For now the
-    // wavefront megakernel is decode-only (num_tokens == 1).
-    let lowered = match to_wavefront::lower_to_wavefront(
+    let lowered = match to_wavefront::lower_decode_to_wavefront(
         fuf,
         decode_asn,
         inferred,
         decode_bounds,
         model,
         0,
-        1,
     ) {
         Ok(l) => l,
         Err(e) => {

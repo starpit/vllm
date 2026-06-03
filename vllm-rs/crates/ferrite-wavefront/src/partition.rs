@@ -298,12 +298,6 @@ pub fn lower_partitioned(
                 num_kv_heads,
                 head_dim: hd,
                 scale,
-            }
-            | LoweredOp::AttnPrefill {
-                num_q_heads,
-                num_kv_heads,
-                head_dim: hd,
-                scale,
             } => {
                 let gqa = num_q_heads / num_kv_heads.max(1);
                 let subop = SubOp::AttnDecode {
@@ -373,13 +367,7 @@ pub fn lower_partitioned(
                     LoweredOp::RopeAppend { head_dim, layer } => {
                         SubOp::RopeAppend { head_dim, layer }
                     }
-                    LoweredOp::RopeMultiToken { head_dim } => SubOp::RopeRotate { head_dim },
-                    LoweredOp::ReshapeAndCacheMulti { head_dim, layer } => {
-                        SubOp::RopeAppend { head_dim, layer }
-                    }
-                    LoweredOp::Gemm { .. }
-                    | LoweredOp::AttnDecode { .. }
-                    | LoweredOp::AttnPrefill { .. } => {
+                    LoweredOp::Gemm { .. } | LoweredOp::AttnDecode { .. } => {
                         unreachable!("handled above")
                     }
                 };
@@ -390,19 +378,15 @@ pub fn lower_partitioned(
                 }
                 let cat = match other {
                     LoweredOp::Silu | LoweredOp::Mul | LoweredOp::SiluMul => Cat::Elem,
-                    LoweredOp::RopeRotate { .. }
-                    | LoweredOp::RopeAppend { .. }
-                    | LoweredOp::RopeMultiToken { .. }
-                    | LoweredOp::ReshapeAndCacheMulti { .. } => Cat::Rope,
+                    LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. } => Cat::Rope,
                     // rmsnorm AND residual-add stay whole — the replicated
                     // backbone every worker recomputes (no broadcast wait).
                     _ => Cat::Whole,
                 };
                 let hd = match other {
-                    LoweredOp::RopeRotate { head_dim }
-                    | LoweredOp::RopeAppend { head_dim, .. }
-                    | LoweredOp::RopeMultiToken { head_dim }
-                    | LoweredOp::ReshapeAndCacheMulti { head_dim, .. } => head_dim,
+                    LoweredOp::RopeRotate { head_dim } | LoweredOp::RopeAppend { head_dim, .. } => {
+                        head_dim
+                    }
                     _ => chain_unit, // placeholder; only Cat::Rope reads it
                 };
                 match cat {

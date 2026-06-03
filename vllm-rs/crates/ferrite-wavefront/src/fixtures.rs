@@ -243,138 +243,6 @@ pub fn gemm_m1_only_input() -> LoweringInput {
     }
 }
 
-/// Stage 4.A — prefill counterpart of [`one_layer_input`]: same DAG
-/// shape as one transformer block, but every op's `m == num_tokens`
-/// and the rope/attention ops emit prefill IR variants
-/// (`RopeMultiToken` / `ReshapeAndCacheMulti` / `AttnPrefill`)
-/// instead of the decode `RopeRotate` / `RopeAppend` / `AttnDecode`
-/// triple.
-///
-/// This is the structural shape the bridge emits for `num_tokens > 1`
-/// (see `ferrite_forward_macro::to_wavefront::lower_to_wavefront`).
-/// The orchestrator panics on these variants until Stage 4.C lands
-/// the per-op lowerings; the test
-/// `prefill_one_layer_orchestrator_panics_until_stage_4c` in
-/// `tk_orchestrate` pins that contract.
-pub fn prefill_one_layer_input(num_tokens: u32) -> LoweringInput {
-    assert!(num_tokens >= 1);
-    let h = 2048u32;
-    let kv = 512u32;
-    let i = 8192u32;
-    let hd = 64u32;
-    let m = num_tokens;
-    LoweringInput {
-        sources: vec![
-            SourceShape { rows: m, cols: h },  // 0  x
-            SourceShape { rows: 1, cols: h },  // 1  rms_w0
-            SourceShape { rows: h, cols: h },  // 2  q_w
-            SourceShape { rows: kv, cols: h }, // 3  k_w
-            SourceShape { rows: kv, cols: h }, // 4  v_w
-            SourceShape { rows: m, cols: hd }, // 5  cos (per-token)
-            SourceShape { rows: m, cols: hd }, // 6  sin (per-token)
-            SourceShape { rows: 1, cols: h },  // 7  k_cache slice
-            SourceShape { rows: 1, cols: h },  // 8  v_cache slice
-            SourceShape { rows: h, cols: h },  // 9  o_w
-            SourceShape { rows: 1, cols: h },  // 10 rms_w1
-            SourceShape { rows: i, cols: h },  // 11 gate_w
-            SourceShape { rows: i, cols: h },  // 12 up_w
-            SourceShape { rows: h, cols: i },  // 13 down_w
-        ],
-        ops: vec![
-            OpDesc {
-                op: LoweredOp::RmsNorm { eps: 1e-5 },
-                m,
-                inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
-                m,
-                inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
-            },
-            OpDesc {
-                op: LoweredOp::RopeMultiToken { head_dim: hd },
-                m,
-                inputs: vec![InputRef::Op(1), InputRef::Ext(5), InputRef::Ext(6)],
-            },
-            OpDesc {
-                op: LoweredOp::AttnPrefill {
-                    num_q_heads: h / hd,
-                    num_kv_heads: kv / hd,
-                    head_dim: hd,
-                    scale: 0.125,
-                },
-                m,
-                inputs: vec![InputRef::Op(2), InputRef::Ext(7), InputRef::Ext(8)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
-                m,
-                inputs: vec![InputRef::Op(3), InputRef::Ext(9)],
-            },
-            OpDesc {
-                op: LoweredOp::Add,
-                m,
-                inputs: vec![InputRef::Ext(0), InputRef::Op(4)],
-            },
-            OpDesc {
-                op: LoweredOp::RmsNorm { eps: 1e-5 },
-                m,
-                inputs: vec![InputRef::Op(5), InputRef::Ext(10)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
-                m,
-                inputs: vec![InputRef::Op(6), InputRef::Ext(11)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
-                m,
-                inputs: vec![InputRef::Op(6), InputRef::Ext(12)],
-            },
-            OpDesc {
-                op: LoweredOp::SiluMul,
-                m,
-                inputs: vec![InputRef::Op(7), InputRef::Op(8)],
-            },
-            OpDesc {
-                op: LoweredOp::Gemm { n: h, k: i },
-                m,
-                inputs: vec![InputRef::Op(9), InputRef::Ext(13)],
-            },
-            OpDesc {
-                op: LoweredOp::Add,
-                m,
-                inputs: vec![InputRef::Ext(0), InputRef::Op(10)],
-            },
-        ],
-        result: 11,
-    }
-}
-
-/// Stage 4.A — minimal single-op `RopeMultiToken` fixture: rotate
-/// num_tokens Q rows. All inputs are external (no upstream ops), so
-/// the orchestrator reaches the prefill match arm directly without
-/// hitting the upstream-handle-missing path the multi-op fixture
-/// trips. Used by `stage_4a_orchestrator_panics_on_prefill_until_4c`.
-pub fn rope_multi_only_input(num_tokens: u32) -> LoweringInput {
-    let head_dim = 64u32;
-    let num_heads = 32u32;
-    let cols = num_heads * head_dim;
-    LoweringInput {
-        sources: vec![
-            SourceShape { rows: num_tokens, cols },           // 0  x
-            SourceShape { rows: num_tokens, cols: head_dim }, // 1  cos
-            SourceShape { rows: num_tokens, cols: head_dim }, // 2  sin
-        ],
-        ops: vec![OpDesc {
-            op: LoweredOp::RopeMultiToken { head_dim },
-            m: num_tokens,
-            inputs: vec![InputRef::Ext(0), InputRef::Ext(1), InputRef::Ext(2)],
-        }],
-        result: 0,
-    }
-}
-
 /// Per-buffer byte sizes (bf16 = 2 bytes / element) for a
 /// [`LoweringInput`], in `BufId` order: sources first, then per-op
 /// output staging buffers. Mirrors the shape inference in
@@ -408,17 +276,10 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
             | LoweredOp::SiluMul
             | LoweredOp::RopeRotate { .. }
             | LoweredOp::RopeAppend { .. }
-            | LoweredOp::RopeMultiToken { .. }
-            | LoweredOp::ReshapeAndCacheMulti { .. }
             | LoweredOp::Silu
             | LoweredOp::Mul => shape_for(desc.inputs[0], &op_shapes, &input.sources).1,
             LoweredOp::Gemm { n, .. } => n,
             LoweredOp::AttnDecode {
-                num_q_heads,
-                head_dim,
-                ..
-            }
-            | LoweredOp::AttnPrefill {
                 num_q_heads,
                 head_dim,
                 ..

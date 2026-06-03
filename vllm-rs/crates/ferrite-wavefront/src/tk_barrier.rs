@@ -1145,6 +1145,125 @@ const _: () = {
     let _ = assert_not_copy::<Page<0, P0, status::Empty>>;
 };
 
+// ── ForLoopIterParity — THE DEADLOCK FIX ───────────────────────────
+//
+// **This is the substrate for the actual decode-time hang** observed
+// under FERRITE_WAVEFRONT_GPU=1 in the production canonical (runtime
+// diagnosis 2026-06-03). Pod test confirmed:
+//   * SM 100%, mem 0% → kernel busy-waiting on a barrier, not making
+//     progress.
+//   * Wait sites in the canonical use `((__kv_i & 1) ^ 1)` for K/V
+//     loops, indicating start_phase=1 at AttnDecode entry.
+//   * GEMM_Q has n_blocks = 512 (EVEN) — its for_loop runs 512 iters,
+//     each flipping the slot's barrier ONCE. After 512 (even) iters,
+//     hardware barrier parity = original (no net flip). But the
+//     legacy `complete_round` blindly advances typed phase by 1.
+//   * Result: typed says "Phase1" but hardware is at original phase.
+//     AttnDecode acquires the slot, emits `wait(_, 1)`, but hardware
+//     is at phase 0 — the wait blocks forever.
+//
+// The substrate captures this by tying the for_loop's iter count to
+// the post-loop typed phase. Typed phase advances iff the iter count
+// is ODD. The check is COMPILE TIME for orchestrator-known iter
+// counts (e.g., n_blocks for GEMMs is computed from compile-time
+// `n` and `pick_bn(k)`).
+//
+// For RUNTIME iter counts (e.g., AttnDecode's `__num_kv_pages`), the
+// post-loop phase is RuntimePhase (already in the substrate). The
+// CALLER must use runtime-parity waits for any subsequent op on the
+// slot. This forces the orchestrator to either:
+//   (a) Re-allocate the slot at the OPPOSITE typed phase (using
+//       PageAllocator::alloc_at the right phase based on loop's
+//       static parity), OR
+//   (b) Use runtime-parity in the next op's wait.
+//
+// IsEven / IsOdd witnesses:
+
+mod parity_witness {
+    /// `U<N>` is even.
+    pub trait IsEven {}
+    /// `U<N>` is odd.
+    pub trait IsOdd {}
+    /// Const-marker struct for a u32 N.
+    pub struct U<const N: u32>;
+
+    // Hand impls for the iter counts the orchestrator actually uses
+    // for Llama-1B GEMMs and other ops:
+    //   GEMM_Q (k=2048, bn=4): n_blocks = ceil(2048/4) = 512 → EVEN
+    //   GEMM_K (k=2048, bn=4): n_blocks = 512 → EVEN
+    //   GEMM_V (k=2048, bn=4): n_blocks = 512 → EVEN
+    //   GEMM_O (k=2048, bn=4): n_blocks = 512 → EVEN (output proj)
+    //   GEMM_gate/up/down (k=8192, bn=1): n_blocks = 8192 → EVEN
+    //   GEMM_lm_head (k=2048, bn=4): n_blocks = ceil(vocab/bn) → varies
+    //
+    // A future refactor that picks `bn` such that `n_blocks` is ODD
+    // would need a new IsOdd impl. Add as needed.
+    impl IsEven for U<2> {}
+    impl IsEven for U<4> {}
+    impl IsEven for U<8> {}
+    impl IsEven for U<16> {}
+    impl IsEven for U<64> {}
+    impl IsEven for U<128> {}
+    impl IsEven for U<256> {}
+    impl IsEven for U<512> {}
+    impl IsEven for U<1024> {}
+    impl IsEven for U<2048> {}
+    impl IsEven for U<4096> {}
+    impl IsEven for U<8192> {}
+    impl IsEven for U<16384> {}
+
+    impl IsOdd for U<1> {}
+    impl IsOdd for U<3> {}
+    impl IsOdd for U<5> {}
+    impl IsOdd for U<7> {}
+    impl IsOdd for U<127> {}
+    impl IsOdd for U<255> {}
+    impl IsOdd for U<511> {}
+    impl IsOdd for U<1023> {}
+    // Add more as the orchestrator's pick_bn produces them.
+}
+
+pub use parity_witness::{IsEven, IsOdd, U as ParityCount};
+
+/// Static-iter-count for_loop completion: typed phase advances iff
+/// the iter count is ODD.
+///
+/// `complete_for_loop_even::<N>` requires `ParityCount<N>: IsEven` —
+/// returns the page at the SAME typed phase (no advance, since
+/// hardware didn't net-flip).
+///
+/// `complete_for_loop_odd::<N>` requires `ParityCount<N>: IsOdd` —
+/// returns the page at flipped typed phase (one net flip).
+///
+/// Calling `complete_for_loop_even::<512>` on a loop that actually
+/// ran an odd number of iters would be possible only if the user
+/// lied about N at the type level — the substrate trusts the const-
+/// generic. For runtime N (unknown at compile time), use
+/// `Page::exit_loop_runtime` to fall through to RuntimePhase.
+impl<const SLOT_ID: u8, P: PhaseTag, S> Page<SLOT_ID, P, S>
+where
+    SlotIdConst<SLOT_ID>: ValidSlotId,
+{
+    /// For-loop with EVEN static iter count: post-loop typed phase
+    /// equals pre-loop typed phase. The legacy `complete_round` would
+    /// over-advance and cause the deadlock the substrate now catches.
+    pub fn complete_for_loop_even<const N: u32>(self) -> Page<SLOT_ID, P, S>
+    where
+        ParityCount<N>: IsEven,
+    {
+        Page(PhantomData)
+    }
+
+    /// For-loop with ODD static iter count: post-loop typed phase
+    /// flipped (matches hardware's net flip).
+    pub fn complete_for_loop_odd<const N: u32>(self) -> Page<SLOT_ID, P::Flip, S>
+    where
+        ParityCount<N>: IsOdd,
+    {
+        Page(PhantomData)
+    }
+}
+
 // ── ShmemView — typed view into a page slot's byte buffer ─────────
 //
 // The kernel scaffold declares each page slot as a 16384-byte
@@ -1546,6 +1665,22 @@ pub mod _compile_fail_proofs {
     /// _check(WgCount::<5>);
     /// ```
     pub fn _doc_anchor_wg_align_oob() {}
+
+    /// THE deadlock the runtime diagnosis identified: a for_loop with
+    /// even static iter count followed by `complete_for_loop_odd`
+    /// would over-advance the typed phase (corresponds to the legacy
+    /// `prog.complete_round` after a 512-iter GEMM loop). Compile error.
+    /// ```compile_fail
+    /// use ferrite_wavefront::tk_barrier::*;
+    /// use ferrite_wavefront::tk_barrier::status::*;
+    /// // Page enters at static Phase0. After 512 (even) iters of a
+    /// // for_loop, hardware doesn't net-flip — typed phase must
+    /// // remain Phase0. Calling complete_for_loop_odd::<512> would
+    /// // claim odd-flip; ParityCount<512>: IsOdd has no impl.
+    /// let p = Page::<0, P0, Empty>::default();
+    /// let _: Page<0, P1, Empty> = p.complete_for_loop_odd::<512>();
+    /// ```
+    pub fn _doc_anchor_loop_parity() {}
 }
 
 impl<const SLOT_ID: u8, P: PhaseTag> Page<SLOT_ID, P, status::Ready>

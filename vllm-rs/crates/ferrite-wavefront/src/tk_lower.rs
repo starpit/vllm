@@ -30,8 +30,8 @@
 
 use crate::subtile_ir::{BufId, RegionRef};
 use crate::tk_warp_ir::{
-    LoopBound, PageBarrier, PageHandle, Phase, Phase0, Phase1, TileShape, TkProgram, WarpRole,
-    NUM_CONSUMER_WARPS, NUM_PAGES, PAGE_SIZE,
+    LoopBound, PageBarrier, PageHandle, PageHandleAfterRuntimeLoop, Phase, Phase0, Phase1,
+    TileShape, TkProgram, WarpRole, NUM_CONSUMER_WARPS, NUM_PAGES, PAGE_SIZE,
 };
 
 // ── Allocators ──────────────────────────────────────────────────────
@@ -666,19 +666,24 @@ pub fn lower_attn_decode<P: Phase>(
         },
     );
 
-    // After the loop the K/V pages have been ping-ponged some
-    // (runtime) number of times; we don't track parity statically
-    // anymore — but the loop body is a closed round-pair every
-    // iteration, so the slot's parity at the START of the next
-    // op's round is determined by the runtime parity. The allocator
-    // for the next op uses `wait_loop_parity` again, so this is fine.
-    // We *do* need to release the typed handle to the allocator;
-    // since we cannot statically know the post-loop parity, we
-    // call complete_round to advance and release at Phase1 (matches
-    // the typical even-N case; odd-N callers must arrange a half-
-    // iteration cleanup).
-    let k_page = prog.complete_round(k_page);
-    let v_page = prog.complete_round(v_page);
+    // After the loop the K/V pages have been ping-ponged a RUNTIME
+    // number of times (`__num_kv_pages`). Each barrier flips ONCE
+    // per iter; for even N hardware doesn't net-flip, for odd N it
+    // does. The legacy `complete_round` blindly advances typed phase
+    // by 1 — for even N this corrupts state and the next op deadlocks.
+    //
+    // **Compile-time enforcement (Gap 17, fixes FERRITE_WAVEFRONT_GPU=1
+    // first-decode hang)**: wrap the K and V handles in
+    // `PageHandleAfterRuntimeLoop` and release ONLY through
+    // `complete_round_with_parity_correction`, which emits the
+    // runtime phantom round automatically. Calling plain
+    // `complete_round(k_page)` on `PageHandleAfterRuntimeLoop` would
+    // be a Rust compile error — there's no impl that accepts the
+    // post-loop handle without the parity correction.
+    let k_page_post = PageHandleAfterRuntimeLoop::from_handle(k_page);
+    let v_page_post = PageHandleAfterRuntimeLoop::from_handle(v_page);
+    let k_page = prog.complete_round_with_parity_correction(k_page_post, op.num_kv_pages_arg);
+    let v_page = prog.complete_round_with_parity_correction(v_page_post, op.num_kv_pages_arg);
     pages.release(k_page);
     pages.release(v_page);
 
@@ -841,8 +846,12 @@ pub fn lower_attn_decode_routed<P: Phase>(
             body.arrive_loop(WarpRole::Storer, PageBarrier::Consumed, v_id);
         },
     );
-    let k_page = prog.complete_round(k_page);
-    let v_page = prog.complete_round(v_page);
+    // Compile-time-enforced parity correction (Gap 17). See
+    // `lower_attn_decode` for the rationale.
+    let k_page_post = PageHandleAfterRuntimeLoop::from_handle(k_page);
+    let v_page_post = PageHandleAfterRuntimeLoop::from_handle(v_page);
+    let k_page = prog.complete_round_with_parity_correction(k_page_post, op.num_kv_pages_arg);
+    let v_page = prog.complete_round_with_parity_correction(v_page_post, op.num_kv_pages_arg);
     pages.release(k_page);
     pages.release(v_page);
 

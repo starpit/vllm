@@ -6108,8 +6108,15 @@ fn dump_wavefront_mega(
                 // descriptor TMA → SASS `UTMASTG.4D`.
                 let descriptor_layouts =
                     ferrite_wavefront::tk_orchestrate::descriptor_layouts(&fused);
+                // Runtime diagnostic: TK_EMIT_DEBUG_HANDSHAKE=1 wraps
+                // every wait/arrive/load_async/store_async with lane-0-
+                // gated printfs tagged by warp+page+kind+phase. The
+                // last printed line before the hang is the wait that
+                // never completes — names the deadlock's barrier.
+                let debug_handshake = std::env::var_os("TK_EMIT_DEBUG_HANDSHAKE").is_some();
                 let opts = ferrite_wavefront::tk_codegen::EmitOpts {
                     descriptor_layouts,
+                    debug_handshake,
                     ..Default::default()
                 };
                 let src = ferrite_wavefront::tk_codegen::emit_kernel_with_opts(

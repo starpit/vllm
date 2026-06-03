@@ -112,6 +112,75 @@ impl Phase for Phase1 {
     }
 }
 
+// ── PageHandleAfterRuntimeLoop — typed handle post for_loop ────────
+//
+// A page slot that went through a `for_loop` body with RUNTIME iter
+// count (`LoopBound::RuntimeU32`) emerges with an UNKNOWN-parity
+// hardware barrier state — could be start parity (even iters) or
+// flipped (odd iters). The legacy `prog.complete_round` blindly
+// advances typed phase by 1, mismatching hardware for even iters.
+// The mismatch caused the FERRITE_WAVEFRONT_GPU=1 first-decode hang
+// (runtime diag 2026-06-03).
+//
+// `PageHandleAfterRuntimeLoop<P>` is a typed handle returned by the
+// loop-aware exit path. The ONLY way to release such a handle is
+// through `TkProgram::complete_round_with_parity_correction(
+// handle, parity_var)`, which:
+//   1. Emits a runtime conditional phantom round of arrives that
+//      flips hardware once more iff the runtime iter count is even.
+//   2. Advances typed phase by 1 (now consistent with hardware).
+//
+// A lowering that calls plain `prog.complete_round(handle)` on a
+// regular `PageHandle<P>` returned by `prog.for_loop` would not
+// compile — the for_loop now returns `PageHandleAfterRuntimeLoop<P>`
+// for runtime-bound loops, and complete_round only accepts
+// PageHandle<P>. The lowering MUST go through
+// `complete_round_with_parity_correction` — which structurally emits
+// the phantom round.
+//
+// This catches Gap 17 (the actual decode-time deadlock) at compile
+// time: omit the parity correction and your code doesn't typecheck.
+
+/// Typed page-slot handle AFTER a runtime-iter-count `for_loop` body.
+/// The hardware barrier parity is `start ^ (N & 1)` where `N` is the
+/// runtime iteration count. `P` is the typed phase the slot would
+/// be at if `complete_round` is called naively (matching odd-N case).
+///
+/// **Released only via [`TkProgram::complete_round_with_parity_correction`]**
+/// — that function emits a runtime conditional phantom round so
+/// hardware aligns with typed phase. Forgetting the correction is
+/// impossible: there's no `complete_round` method on this type.
+///
+/// # Compile-fail proof
+///
+/// Calling `prog.complete_round` on a `PageHandleAfterRuntimeLoop` is
+/// a Rust compile error — `complete_round` only accepts `PageHandle<P>`,
+/// not the post-loop wrapper.
+/// ```compile_fail
+/// use ferrite_wavefront::tk_warp_ir::*;
+/// let mut prog = TkProgram::new();
+/// let page: PageHandle<Phase0> = PageHandle::fresh(0);
+/// let post = PageHandleAfterRuntimeLoop::from_handle(page);
+/// // The lowering author tries to release without the parity
+/// // correction. complete_round expects PageHandle<P>, not the
+/// // post-loop wrapper. Compile error.
+/// let _ = prog.complete_round(post);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct PageHandleAfterRuntimeLoop<P: Phase> {
+    pub id: u8,
+    _phase: PhantomData<P>,
+}
+
+impl<P: Phase> PageHandleAfterRuntimeLoop<P> {
+    pub fn from_handle(h: PageHandle<P>) -> Self {
+        Self {
+            id: h.id,
+            _phase: PhantomData,
+        }
+    }
+}
+
 // ── Page + scratch handles ──────────────────────────────────────────
 
 /// One mbarrier page in the persistent CTA, carrying its CURRENT phase
@@ -565,6 +634,69 @@ impl TkProgram {
 
     pub fn sync(&mut self, role: WarpRole) {
         self.instrs.push(TkInstr::Sync { role });
+    }
+
+    /// Release a page handle after a RUNTIME-iter-count `for_loop`,
+    /// emitting a parity-correction phantom round so hardware aligns
+    /// with the typed phase advance. The phantom round fires one
+    /// extra arrive on each barrier of the slot, gated on
+    /// `(parity_var & 1u) == 0u` — for even iter counts this flips
+    /// hardware once more; for odd, no-op.
+    ///
+    /// **The ONLY way to release a `PageHandleAfterRuntimeLoop`.**
+    /// Forgetting the parity correction is structurally impossible.
+    /// The bug class this prevents: legacy `complete_round(handle)`
+    /// after a runtime for_loop assumed odd-N — for even-N (e.g.,
+    /// Llama-1B AttnDecode where `__num_kv_pages` = 138868), the typed
+    /// advance diverges from hardware → next op's wait blocks. The
+    /// FERRITE_WAVEFRONT_GPU=1 first-decode hang (runtime-diagnosed
+    /// 2026-06-03).
+    pub fn complete_round_with_parity_correction<P: Phase>(
+        &mut self,
+        page: PageHandleAfterRuntimeLoop<P>,
+        parity_var: &str,
+    ) -> PageHandle<P::Next> {
+        let id = page.id;
+        // Phantom round: 1 arrive Ready (loader), NUM_CONSUMER_WARPS
+        // arrives Done (consumers, from each warp's lane 0), 1 arrive
+        // Consumed (storer). Each gated on `(parity_var & 1u) == 0u`.
+        self.compute(
+            WarpRole::Loader,
+            format!(
+                "if (({pv} & 1u) == 0u) {{ \
+                 kittens::group<1>::arrive(page_ready[{id}]); \
+                 }}",
+                pv = parity_var,
+                id = id,
+            ),
+        );
+        self.compute(
+            WarpRole::AllConsumers,
+            format!(
+                "if (({pv} & 1u) == 0u) {{ \
+                 kittens::group<1>::arrive(page_done[{id}]); \
+                 }}",
+                pv = parity_var,
+                id = id,
+            ),
+        );
+        self.compute(
+            WarpRole::Storer,
+            format!(
+                "if (({pv} & 1u) == 0u) {{ \
+                 kittens::group<1>::arrive(page_consumed[{id}]); \
+                 }}",
+                pv = parity_var,
+                id = id,
+            ),
+        );
+        // Now hardware advanced once more; typed advance via
+        // PageHandle::advance is consistent.
+        PageHandle::<P> {
+            id,
+            _phase: PhantomData,
+        }
+        .advance()
     }
 
     /// Build a `ForLoop` body in a sub-program. The closure receives

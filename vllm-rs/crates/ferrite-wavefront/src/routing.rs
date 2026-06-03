@@ -35,6 +35,42 @@
 //! (Phase 12 follow-up — this file ships only the analysis, no
 //! emit-side wiring yet, so default behaviour is byte-identical to
 //! Phase 11).
+//!
+//! ## Step F (Stage 3) — External-edge categories
+//!
+//! After Step F.1 made carry-forward the default and Step F.3 typed
+//! the routing decision, the External outputs that remain are the
+//! ones the substrate's [`crate::tk_gmem::Fenced<GmemHandle<...>>`]
+//! is for. They fall into three categories on the synthetic
+//! `one_layer_input` fixture (`tk_orchestrate.rs::tests::stage_3_audit_*`):
+//!
+//! 1. **Result op output**. `input.result` is host-readable
+//!    post-kernel. Always External by definition.
+//!
+//! 2. **Multi-consumer producers**. An output read by ≥ 2
+//!    downstream ops can't be carry-forward under the simple
+//!    "producer skips drain, single consumer reuses the smem page"
+//!    protocol — only one of the consumers would see the smem
+//!    contents; the others would TMA-load stale gmem.
+//!    `classify_outputs` marks these External upfront. Multi-consumer
+//!    carry-forward (page-lifetime tracking across N rounds) is a
+//!    future extension.
+//!
+//! 3. **Coalesce demotions**. A single-consumer producer whose
+//!    consumer's "at most one CarryForward per consumer" rule gave
+//!    the carry to a different (earlier) input slot. Example:
+//!    SiluMul reads gate_proj + up_proj outputs; only gate_proj
+//!    carries; up_proj is demoted to External by
+//!    [`coalesce_carry_forwards`] so the consumer can TMA-load it
+//!    instead.
+//!
+//! On Llama-3.2-1B's per-layer fixture (12 ops): 3 External + 9
+//! Internal. Per-decode-token kernel: 16 layers ≈ 48 External
+//! edges + the final result + the per-layer K_cache/V_cache writes
+//! (typed separately as `Fenced<GmemHandle<KCache>>` since E.13).
+//! Each External edge lands a `tk_gmem::emit_fence_after_op` →
+//! `TkInstr::CrossOpGmemFence` → `cp.async.bulk.commit_group +
+//! wait_group + __threadfence + __syncthreads` in the codegen.
 
 use crate::lower::{InputRef, LoweringInput};
 

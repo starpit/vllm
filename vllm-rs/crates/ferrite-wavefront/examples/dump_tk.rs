@@ -20,7 +20,7 @@ use ferrite_wavefront::fixtures::{one_layer_input, orchestrator_kernel_args};
 use ferrite_wavefront::subtile_ir::BufId;
 use ferrite_wavefront::tk_codegen::{emit_kernel, KernelArg, KernelArgs};
 use ferrite_wavefront::tk_lower::{
-    lower_attn_decode, lower_rmsnorm, AttnDecodeOp, PageAllocator, RmsNormOp,
+    lower_attn_decode, lower_rmsnorm, AttnDecodeOp, PageAllocator, RmsNormOp, RoutingHints,
 };
 use ferrite_wavefront::tk_orchestrate::lower_to_tk;
 use ferrite_wavefront::tk_warp_ir::{Phase0, TkProgram};
@@ -35,7 +35,7 @@ fn main() {
     // ── Slice: RmsNorm ──
     let mut pages = PageAllocator::new();
     let mut prog = TkProgram::new();
-    lower_rmsnorm::<Phase0>(
+    let _ = lower_rmsnorm::<Phase0>(
         RmsNormOp {
             x: BufId(0),
             weight: BufId(1),
@@ -46,6 +46,7 @@ fn main() {
             eps: 1e-5,
             init: true,
         },
+        &RoutingHints::default(),
         &mut pages,
         &mut prog,
     );
@@ -95,7 +96,7 @@ fn main() {
     );
     let kf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, k);
     let vf = ferrite_wavefront::tk_gmem::emit_fence_after_op(&mut prog2, v);
-    lower_attn_decode::<Phase0>(attn_op, kf, vf, &mut pages2, &mut prog2);
+    let _ = lower_attn_decode::<Phase0>(attn_op, kf, vf, &RoutingHints::default(), &mut pages2, &mut prog2);
     let args2 = KernelArgs {
         bufs: vec![
             KernelArg {

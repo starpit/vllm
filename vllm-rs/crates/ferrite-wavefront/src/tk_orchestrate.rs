@@ -120,47 +120,6 @@ fn pick_bn(k: u32) -> u32 {
     max_bn.min(8).max(1)
 }
 
-/// Stage 4.B — pick `m_chunk` (rows per outer m-tile loop iteration)
-/// for a prefill op whose activation tile is `[m, cols] × ACT_ELEM`.
-///
-/// Constraint: `m_chunk * cols * ACT_ELEM <= PAGE_SIZE` so the chunk's
-/// activation tile fits one Phase-12-routed smem page (the producer
-/// fills one page per iteration; the consumer reads it via `Carried`
-/// or `Fenced` per the routing analysis exactly as in decode m=1).
-///
-/// This is the most conservative chunk size — it does NOT depend on
-/// `m`. If `cols * ACT_ELEM > PAGE_SIZE` we fall back to `m_chunk = 1`
-/// and the chunk is one row at a time (the down_proj output bottleneck
-/// for Llama-1B prefill: `cols = intermediate = 8192` → m_chunk = 1
-/// at PAGE_SIZE = 16384).
-///
-/// Stage 4.C wires this into the prefill lowerings (lower_gemm_mn /
-/// lower_attn_prefill / lower_rope_multi / lower_reshape_and_cache_multi)
-/// inside an outer `ForLoop` over `ceil(m / m_chunk)`.
-pub const fn pick_m_chunk(cols: u32) -> u32 {
-    let bytes_per_row = cols * ACT_ELEM;
-    if bytes_per_row >= PAGE_SIZE {
-        1
-    } else {
-        // floor(PAGE_SIZE / bytes_per_row) — biggest power-of-2-ish
-        // chunk that fits. No upper cap analogous to `pick_bn`'s 8 —
-        // the prefill consumer body iterates over rows in software,
-        // not warp-per-row. Stage 4.C may add a cap if wgmma's
-        // warpgroup-collective MMA shape (`[64, N, K]`) imposes one.
-        let chunk = PAGE_SIZE / bytes_per_row;
-        if chunk == 0 { 1 } else { chunk }
-    }
-}
-
-/// Stage 4.B — compile-time witness: `m_chunk * cols * ACT_ELEM`
-/// fits in one page. The prefill lowerings (Stage 4.C) bind this
-/// in their signatures so a miswire (m_chunk too big for the page)
-/// is a Rust compile error.
-pub const fn m_chunk_fits_page(m_chunk: u32, cols: u32) -> bool {
-    let bytes = (m_chunk as u64) * (cols as u64) * (ACT_ELEM as u64);
-    bytes <= PAGE_SIZE as u64
-}
-
 /// Lower an entire forward (a [`LoweringInput`]) to a single
 /// [`TkProgram`] — the persistent megakernel body.
 ///
@@ -818,74 +777,6 @@ mod tests {
     use super::*;
     use crate::fixtures::one_layer_input;
     use crate::tk_codegen::emit_body;
-
-    /// Step F (Stage 4.B) — per-op page-budget audit on the
-    /// `prefill_one_layer_input` fixture. Documents the m_chunk each
-    /// prefill op needs at the current `PAGE_SIZE = 16384`,
-    /// `NUM_PAGES = 13` (208 KB total). Stage 4.C lowerings will use
-    /// `pick_m_chunk` to size their outer m-axis loop.
-    ///
-    /// Llama-3.2-1B prefill op-output column widths:
-    ///   - hidden = 2048 (RmsNorm/Add/Q-out/O-out activations)
-    ///   - intermediate = 8192 (gate_proj/up_proj/SiluMul outputs)
-    ///   - kv_dim = 512 (K/V-out activations)
-    ///   - q_dim = 2048 (Q after Gemm)
-    ///   - down_proj output = hidden = 2048
-    ///
-    /// At PAGE_SIZE=16384, ACT_ELEM=2:
-    ///   - cols=2048: bytes_per_row = 4096, m_chunk = 4
-    ///   - cols=8192: bytes_per_row = 16384, m_chunk = 1 (BOTTLENECK)
-    ///   - cols=512:  bytes_per_row = 1024,  m_chunk = 16
-    ///   - cols=64 (head_dim): bytes_per_row = 128, m_chunk = 128
-    ///
-    /// For Llama-1B prefill the bottleneck is the intermediate=8192
-    /// SiluMul / down_proj input edge: m_chunk=1 means one row at a
-    /// time through that pipeline. To raise m_chunk for cols=8192 to
-    /// 2 would require PAGE_SIZE = 32768; total shmem 13*32768 = 416 KB
-    /// exceeds H100's 228 KB cap — so a retune to (NUM_PAGES, PAGE_SIZE)
-    /// = (8, 24576) (192 KB total, m_chunk for cols=8192 still =1)
-    /// or (7, 32768) (224 KB total, m_chunk for cols=8192 =2) is the
-    /// next decision in 4.C/4.E once we have measured page-allocator
-    /// concurrency demand.
-    #[test]
-    fn stage_4b_prefill_m_chunk_audit_llama_1b() {
-        // Activation column widths that appear in prefill_one_layer_input.
-        let cases: &[(u32, u32, &str)] = &[
-            (2048, 4, "hidden=2048 (RmsNorm/Add/Q-out/O-out)"),
-            (8192, 1, "intermediate=8192 (gate/up/SiluMul/down-input) BOTTLENECK"),
-            (512, 16, "kv_dim=512 (K/V-out)"),
-            (64, 128, "head_dim=64 (cos/sin)"),
-        ];
-        for &(cols, expect_m, label) in cases {
-            let got = pick_m_chunk(cols);
-            assert_eq!(
-                got, expect_m,
-                "pick_m_chunk({cols}) for {label}: got {got}, want {expect_m}"
-            );
-            // Witness: the chosen m_chunk fits one page.
-            assert!(
-                m_chunk_fits_page(got, cols),
-                "m_chunk={got} cols={cols} must fit PAGE_SIZE={PAGE_SIZE}"
-            );
-            // And one more row would NOT fit (when bytes_per_row < PAGE_SIZE).
-            if (cols * ACT_ELEM) < PAGE_SIZE {
-                let next = got + 1;
-                let fits = m_chunk_fits_page(next, cols);
-                assert!(
-                    !fits || (cols * ACT_ELEM * next) <= PAGE_SIZE,
-                    "m_chunk={next} cols={cols}: expected to NOT fit OR be ≤ page"
-                );
-            }
-        }
-
-        // Total page-pool size matches what tk_codegen emits as
-        // dynamic shmem (NUM_PAGES * PAGE_SIZE = 13 * 16384 = 208 KB).
-        let pool_bytes = (crate::tk_warp_ir::NUM_PAGES as u64) * (PAGE_SIZE as u64);
-        assert_eq!(pool_bytes, 13 * 16384);
-        // 208 KB < H100's 228 KB shmem cap — leaves ~20 KB for
-        // SCRATCH_BYTES (1 KB) + TK 2.0 page-metadata structures.
-        assert!(pool_bytes <= 228 * 1024);
-    }
 
     #[test]
     fn pick_bn_keeps_w_tile_inside_one_page() {

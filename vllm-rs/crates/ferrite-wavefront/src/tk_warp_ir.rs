@@ -45,19 +45,6 @@ use crate::subtile_ir::{BufId, RegionRef};
 
 // ── Substrate constants (TK 2.0 default; see header
 //    `include/kittens.cuh::page` and the persistent kernel scaffold) ──
-//
-// Stage 4.B audit (Llama-3.2-1B prefill, see
-// `tk_orchestrate::tests::stage_4b_prefill_m_chunk_audit_llama_1b`):
-//   PAGE_SIZE = 16384 → m_chunk for cols=8192 is 1 (the
-//   intermediate-dim down_proj input bottleneck). m_chunk for the
-//   hidden-dim (2048) edges is 4. Total page-pool bytes = NUM_PAGES *
-//   PAGE_SIZE = 208 KB, fitting H100's 228 KB shmem cap with ~20 KB
-//   slack for SCRATCH_BYTES + TK 2.0 page metadata.
-//
-// A retune to `(NUM_PAGES, PAGE_SIZE) = (7, 32768)` (224 KB) would
-// raise the cols=8192 m_chunk to 2 at the cost of 6 fewer pages of
-// double-buffering headroom. Decision deferred to Stage 4.C/4.E once
-// per-op concurrent page demand is measured.
 
 /// Number of mbarrier pages in the persistent CTA.
 pub const NUM_PAGES: u32 = 13;

@@ -34,9 +34,9 @@ use crate::tk_codegen::GlLayout;
 use crate::tk_lower::{
     lower_attn_decode, lower_attn_decode_routed, lower_gemm_m1, lower_gemm_m1_routed,
     lower_residual_add, lower_residual_add_routed, lower_rmsnorm, lower_rmsnorm_routed,
-    lower_rope_rotate, lower_rope_rotate_routed, lower_silu_mul, lower_silu_mul_routed, AddOp,
-    AttnDecodeOp, CarriedHandle, GemmM1Op, PageAllocator, RmsNormOp, RopeRotateOp, RoutingHints,
-    SiluMulOp,
+    lower_rope_append, lower_rope_append_routed, lower_rope_rotate, lower_rope_rotate_routed,
+    lower_silu_mul, lower_silu_mul_routed, AddOp, AttnDecodeOp, CarriedHandle, GemmM1Op,
+    PageAllocator, RmsNormOp, RopeAppendOp, RopeRotateOp, RoutingHints, SiluMulOp,
 };
 use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, WarpRole, PAGE_SIZE};
 
@@ -346,20 +346,12 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 op_out_shape.push((desc.m, hidden));
             }
 
-            LoweredOp::RopeRotate { head_dim }
-            | LoweredOp::RopeAppend { head_dim, layer: _ } => {
+            LoweredOp::RopeRotate { head_dim } => {
                 let x = buf_for(desc.inputs[0], &op_out_buf);
                 let cos = buf_for(desc.inputs[1], &op_out_buf);
                 let sin = buf_for(desc.inputs[2], &op_out_buf);
                 let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
                 let num_heads = cols / head_dim;
-                // RopeAppend's `desc.inputs` is `[K, cos, sin, V]`
-                // (4 entries) but the rotate lowering only consumes
-                // x/cos/sin. Truncate hints to match before dispatch.
-                let hints_opt = hints_opt.as_ref().map(|h| RoutingHints {
-                    inputs: h.inputs.iter().take(3).cloned().collect(),
-                    output_internal: h.output_internal,
-                });
                 dispatch_phase_maybe_routed!(
                     op_idx, hints_opt, carried_table,
                     3,
@@ -374,6 +366,50 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         num_heads,
                         m: desc.m,
                         act_elem: ACT_ELEM,
+                    }
+                );
+                op_out_shape.push((desc.m, cols));
+            }
+
+            // E.12: RopeAppend rotates K and writes rotated K + V to
+            // the paged KV cache pools (PrefixK / PrefixV per layer).
+            // `desc.inputs` from the bridge is
+            // `[K, cos, sin, V, K_cache, V_cache]` (6 entries, per
+            // E.12.A bridge widening). Routed lowering only carries
+            // the first 4 (K/cos/sin/V); K_cache and V_cache are
+            // always Ext (paged-cache pools) so their hints are
+            // dropped via `take(4)`.
+            LoweredOp::RopeAppend { head_dim, layer: _ } => {
+                let k = buf_for(desc.inputs[0], &op_out_buf);
+                let cos = buf_for(desc.inputs[1], &op_out_buf);
+                let sin = buf_for(desc.inputs[2], &op_out_buf);
+                let v = buf_for(desc.inputs[3], &op_out_buf);
+                let k_cache = buf_for(desc.inputs[4], &op_out_buf);
+                let v_cache = buf_for(desc.inputs[5], &op_out_buf);
+                let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                let num_kv_heads = cols / head_dim;
+                let hints_opt = hints_opt.as_ref().map(|h| RoutingHints {
+                    inputs: h.inputs.iter().take(4).cloned().collect(),
+                    output_internal: h.output_internal,
+                });
+                dispatch_phase_maybe_routed!(
+                    op_idx, hints_opt, carried_table,
+                    4,
+                    lower_rope_append,
+                    lower_rope_append_routed,
+                    RopeAppendOp {
+                        k,
+                        cos,
+                        sin,
+                        v,
+                        out: out_buf,
+                        k_cache,
+                        v_cache,
+                        head_dim,
+                        num_kv_heads,
+                        m: desc.m,
+                        act_elem: ACT_ELEM,
+                        decode_slot_arg: "__decode_slot",
                     }
                 );
                 op_out_shape.push((desc.m, cols));

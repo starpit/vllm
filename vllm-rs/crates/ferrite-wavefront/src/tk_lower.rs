@@ -1575,6 +1575,397 @@ pub fn lower_rope_rotate_routed<P: Phase>(
 // Phase 5 cutover: legacy `rope_compute_body` deleted. Canonical
 // emit at `tk_codegen::tk20::rope_consumer_body`.
 
+// ── RoPE append — rotate K + write K/V to paged KV cache ───────────
+
+/// Inputs to lower one decode `RopeAppend` op.
+///
+/// Mirrors `LoweredOp::RopeAppend { head_dim, layer }`. RopeAppend
+/// rotates K (NeoX) and **writes** rotated K + un-rotated V to the
+/// paged KV cache pools (`PrefixK` / `PrefixV` per layer) at the new
+/// decode token's slot. The slot is `__decode_slot` (a kernel runtime
+/// u32 arg, populated by `KernelU32ArgsBuilder::push_decode_slot`
+/// from `ctx.slot_mapping[0]`).
+///
+/// Without this op, AttnDecode reads only prompt-prefill K/V from
+/// the cache; new decode tokens never land in the cache and
+/// subsequent decode steps softmax against stale tail rows
+/// (the `Paris!!!!!!!!!` regression Step E.12 fixes).
+#[derive(Clone, Copy, Debug)]
+pub struct RopeAppendOp {
+    /// `[m, num_kv_heads * head_dim]` K activation (k_proj output).
+    pub k: BufId,
+    /// `[1, head_dim]` rotary cos for the current position
+    /// (TMA-loaded with `__decode_position * row_bytes` offset).
+    pub cos: BufId,
+    /// `[1, head_dim]` rotary sin (same TMA offset).
+    pub sin: BufId,
+    /// `[m, num_kv_heads * head_dim]` V activation (v_proj output) —
+    /// passed through to the cache un-rotated.
+    pub v: BufId,
+    /// Output buffer for rotated K (existing arena edge — kept so
+    /// the dataflow validator's downstream-of-RopeAppend edge
+    /// doesn't break, even though AttnDecode in the megakernel
+    /// reads from the cache, not this buffer).
+    pub out: BufId,
+    /// Paged K cache pool (`[num_blocks, block_size, num_kv_heads,
+    /// head_dim]` BF16 — same layout as `kernels::reshape_and_cache`).
+    /// Bridge-supplied via `PrefixK { layer }` source.
+    pub k_cache: BufId,
+    /// Paged V cache pool (same layout).
+    pub v_cache: BufId,
+    /// Per-head dim.
+    pub head_dim: u32,
+    /// Number of KV heads (the `num_heads` dim in the cache layout).
+    pub num_kv_heads: u32,
+    /// Decode rows. m=1 for standard decode.
+    pub m: u32,
+    pub act_elem: u32,
+    /// Name of the runtime u32 the persistent kernel scaffold provides
+    /// for the decode slot (`"__decode_slot"`). Multiplied by
+    /// `num_kv_heads * head_dim * act_elem` (per-token row stride) to
+    /// compute the cache write byte offset.
+    pub decode_slot_arg: &'static str,
+}
+
+/// Lower one RoPE-append into a `TkProgram` fragment.
+///
+/// Tape shape (4 page slots):
+///   1. Loader: TMA-loads K (no offset), cos/sin (with
+///      `__decode_position * row_bytes`), V (no offset).
+///   2. AllConsumers: rotates K in place using the standard
+///      `RopeConsumerBody` (V is held but untouched).
+///   3. Storer drains:
+///      - rotated K → `op.out` (existing arena edge).
+///      - rotated K → `op.k_cache + (__decode_slot * row_bytes)`
+///        (NEW cache write).
+///      - V → `op.v_cache + (__decode_slot * row_bytes)`
+///        (NEW cache write).
+///   4. Round boundary on all four pages.
+///
+/// `row_bytes = num_kv_heads * head_dim * act_elem`. The dispatcher
+/// has already resolved block-table indirection into a flat slot
+/// index, so the kernel just multiplies.
+pub fn lower_rope_append<P: Phase>(
+    op: RopeAppendOp,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) {
+    let k_page = pages.alloc_at::<P>().expect("rope_append: K page");
+    let c_page = pages.alloc_at::<P>().expect("rope_append: cos page");
+    let s_page = pages.alloc_at::<P>().expect("rope_append: sin page");
+    let v_page = pages.alloc_at::<P>().expect("rope_append: V page");
+    let k_id = k_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+    let v_id = v_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let kv_cols = op.num_kv_heads * op.head_dim;
+    let kv_tile = TileShape {
+        rows: op.m,
+        cols: kv_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+
+    // Per-token row stride for both the cos/sin cache and the paged
+    // K/V cache. `head_dim * act_elem` for cos/sin (1 head row) and
+    // `num_kv_heads * head_dim * act_elem` for K/V (full kv-row).
+    let cs_row_bytes = op.head_dim * op.act_elem;
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    let pos_off = format!("__decode_position * {cs_row_bytes}u");
+    let slot_off = format!("({} * {kv_row_bytes}u)", op.decode_slot_arg);
+
+    // ── Loader: fill K, cos, sin, V ──
+    let k_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, k_page);
+    prog.load_async(k_id, op.k, region(op.k, op.m, kv_cols), kv_tile);
+
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    prog.load_async_dyn(
+        c_id,
+        op.cos,
+        region(op.cos, 1, op.head_dim),
+        cs_tile,
+        pos_off.clone(),
+    );
+
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    prog.load_async_dyn(
+        s_id,
+        op.sin,
+        region(op.sin, 1, op.head_dim),
+        cs_tile,
+        pos_off,
+    );
+
+    let v_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, v_page);
+    prog.load_async(v_id, op.v, region(op.v, op.m, kv_cols), kv_tile);
+
+    // ── Consumer: rotate K in place; V held read-only ──
+    let k_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, k_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    let v_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, v_page);
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_kv_heads as u64) * (half as u64);
+    // Reuse the standard RopeConsumerBody — it acts on a single page
+    // (`x_id` slot) using cos/sin slots; we point it at K. V is not
+    // touched.
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id: k_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
+    let _ = half; // silence unused-binding warning if linter complains
+    let k_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, k_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+    let v_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, v_page);
+
+    // ── Storer: drain rotated K → op.out + K_cache; drain V → V_cache ──
+    let k_page = prog.wait(WarpRole::Storer, PageBarrier::Done, k_page);
+    // Existing arena edge — keeps the dataflow validator + any future
+    // arena-reading consumer happy.
+    prog.store_async(k_id, op.out, region(op.out, op.m, kv_cols), kv_tile);
+    // NEW: paged K cache write at __decode_slot.
+    prog.store_async_dyn(
+        k_id,
+        op.k_cache,
+        region(op.k_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off.clone(),
+    );
+    let k_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, k_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    let v_page = prog.wait(WarpRole::Storer, PageBarrier::Done, v_page);
+    // NEW: paged V cache write at __decode_slot. (V is otherwise
+    // read-only inside the kernel — no arena drain.)
+    prog.store_async_dyn(
+        v_id,
+        op.v_cache,
+        region(op.v_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off,
+    );
+    let v_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, v_page);
+
+    pages.release(prog.complete_round(k_page));
+    pages.release(prog.complete_round(c_page));
+    pages.release(prog.complete_round(s_page));
+    pages.release(prog.complete_round(v_page));
+
+    // CTA-wide barrier: force all warps to converge after the K/V
+    // cache writes complete. Without this, downstream AttnDecode's
+    // loader warp may issue its TMA load on the K_cache pool BEFORE
+    // RopeAppend's storer warp finishes its `tma::store_async_wait()`
+    // — the pool reads would see stale (or zero) bytes at the new
+    // decode token's slot. `__syncthreads()` flushes per-warp stores
+    // to the CTA-shared gmem view, and is the cheapest cross-warp
+    // ordering primitive available.
+    prog.compute(WarpRole::All, "__syncthreads();".to_string());
+}
+
+/// Phase 12: routing-aware variant of `lower_rope_append`.
+///
+/// Inputs (4 carry-forward candidates: K, cos, sin, V — though
+/// cos/sin are always `InputRef::Ext` and never carry-forward in
+/// practice). K_cache / V_cache are external sources by definition
+/// (per-layer paged cache pools), never carry-forward.
+/// Output (rotated K) is in-place on the K page slot's smem; the
+/// `op.out` arena drain stays as the carry-forward target when
+/// `output_internal=true`.
+///
+/// Default-hints path is byte-identical to `lower_rope_append`.
+pub fn lower_rope_append_routed<P: Phase>(
+    op: RopeAppendOp,
+    hints: &RoutingHints,
+    pages: &mut PageAllocator,
+    prog: &mut TkProgram,
+) -> RoutingResult {
+    debug_assert!(
+        hints.inputs.is_empty() || hints.inputs.len() == 4,
+        "lower_rope_append_routed: hints.inputs must be empty or len 4"
+    );
+    let in_k_carried = hints.inputs.first().and_then(|x| x.as_ref());
+    let in_c_carried = hints.inputs.get(1).and_then(|x| x.as_ref());
+    let in_s_carried = hints.inputs.get(2).and_then(|x| x.as_ref());
+    let in_v_carried = hints.inputs.get(3).and_then(|x| x.as_ref());
+
+    let k_page: PageHandle<P> = match in_k_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope_append: K page"),
+    };
+    let c_page: PageHandle<P> = match in_c_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope_append: cos page"),
+    };
+    let s_page: PageHandle<P> = match in_s_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope_append: sin page"),
+    };
+    let v_page: PageHandle<P> = match in_v_carried {
+        Some(c) => pages.consume_carried::<P>(*c),
+        None => pages.alloc_at::<P>().expect("rope_append: V page"),
+    };
+    let k_id = k_page.id();
+    let c_id = c_page.id();
+    let s_id = s_page.id();
+    let v_id = v_page.id();
+
+    let region = |buf, rows, cols| RegionRef::rows_cols(buf, rows, 0, cols);
+    let kv_cols = op.num_kv_heads * op.head_dim;
+    let kv_tile = TileShape {
+        rows: op.m,
+        cols: kv_cols,
+        elem_bytes: op.act_elem,
+    };
+    let cs_tile = TileShape {
+        rows: 1,
+        cols: op.head_dim,
+        elem_bytes: op.act_elem,
+    };
+    let cs_row_bytes = op.head_dim * op.act_elem;
+    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    let pos_off = format!("__decode_position * {cs_row_bytes}u");
+    let slot_off = format!("({} * {kv_row_bytes}u)", op.decode_slot_arg);
+
+    let k_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, k_page);
+    if in_k_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, k_page);
+    } else {
+        prog.load_async(k_id, op.k, region(op.k, op.m, kv_cols), kv_tile);
+    }
+
+    let c_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, c_page);
+    if in_c_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, c_page);
+    } else {
+        prog.load_async_dyn(
+            c_id,
+            op.cos,
+            region(op.cos, 1, op.head_dim),
+            cs_tile,
+            pos_off.clone(),
+        );
+    }
+
+    let s_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, s_page);
+    if in_s_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, s_page);
+    } else {
+        prog.load_async_dyn(
+            s_id,
+            op.sin,
+            region(op.sin, 1, op.head_dim),
+            cs_tile,
+            pos_off,
+        );
+    }
+
+    let v_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, v_page);
+    if in_v_carried.is_some() {
+        prog.arrive(WarpRole::Loader, PageBarrier::Ready, v_page);
+    } else {
+        prog.load_async(v_id, op.v, region(op.v, op.m, kv_cols), kv_tile);
+    }
+
+    let k_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, k_page);
+    let c_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, c_page);
+    let s_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, s_page);
+    let v_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, v_page);
+    let half = op.head_dim / 2;
+    let total_pairs = (op.m as u64) * (op.num_kv_heads as u64) * (half as u64);
+    prog.compute_calls(
+        WarpRole::AllConsumers,
+        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+            x_id: k_id,
+            c_id,
+            s_id,
+            head_dim: op.head_dim,
+            total_pairs,
+        }],
+    );
+    let _ = half;
+    let k_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, k_page);
+    let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
+    let s_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, s_page);
+    let v_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, v_page);
+
+    let k_page = prog.wait(WarpRole::Storer, PageBarrier::Done, k_page);
+    if !hints.output_internal {
+        prog.store_async(k_id, op.out, region(op.out, op.m, kv_cols), kv_tile);
+    }
+    // Cache writes ALWAYS happen (the cache is the load-bearing
+    // edge for downstream attention; arena drain is a separate
+    // bookkeeping store, gated by output_internal like other ops).
+    prog.store_async_dyn(
+        k_id,
+        op.k_cache,
+        region(op.k_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off.clone(),
+    );
+    let k_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, k_page);
+
+    let c_page = prog.wait(WarpRole::Storer, PageBarrier::Done, c_page);
+    let c_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, c_page);
+
+    let s_page = prog.wait(WarpRole::Storer, PageBarrier::Done, s_page);
+    let s_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, s_page);
+
+    let v_page = prog.wait(WarpRole::Storer, PageBarrier::Done, v_page);
+    prog.store_async_dyn(
+        v_id,
+        op.v_cache,
+        region(op.v_cache, op.m, kv_cols),
+        kv_tile,
+        slot_off,
+    );
+    let v_page = prog.arrive(WarpRole::Storer, PageBarrier::Consumed, v_page);
+
+    let k_advanced = prog.complete_round(k_page);
+    let c_advanced = prog.complete_round(c_page);
+    let s_advanced = prog.complete_round(s_page);
+    let v_advanced = prog.complete_round(v_page);
+
+    let result = if hints.output_internal {
+        let carried = pages.carry_forward(k_advanced);
+        pages.release(c_advanced);
+        pages.release(s_advanced);
+        pages.release(v_advanced);
+        RoutingResult {
+            output_carried: Some(carried),
+        }
+    } else {
+        pages.release(k_advanced);
+        pages.release(c_advanced);
+        pages.release(s_advanced);
+        pages.release(v_advanced);
+        RoutingResult::default()
+    };
+
+    // CTA-wide barrier; see `lower_rope_append` for rationale (forces
+    // K/V cache stores to be visible to the next op's loader warp).
+    prog.compute(WarpRole::All, "__syncthreads();".to_string());
+
+    result
+}
+
 // ── GemmM1 — M=1 vec-mat decode GEMM ───────────────────────────────
 
 /// Inputs to lower one M=1 vec-mat decode GEMM, mirroring

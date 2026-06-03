@@ -310,8 +310,16 @@ pub fn orchestrator_kernel_args(
     let n_sources = input.sources.len() as u32;
     let mut bufs = Vec::with_capacity(n_bufs as usize);
     for i in 0..n_sources {
+        // E.12: `const` qualifier dropped from source kernel-arg
+        // pointers. Most sources are read-only (weights, prefix
+        // activations) but `PrefixK` / `PrefixV` source slots are
+        // write-targets for RopeAppend's paged-cache writes
+        // (`tma::store_async(buf{idx} + slot * row_bytes, ...)`).
+        // Keeping `const` here would make `reinterpret_cast<char*>`
+        // an nvcc error ("cannot cast away const"). Reads still
+        // typecheck against non-const pointers.
         bufs.push(KernelArg {
-            ty: "const __nv_bfloat16* __restrict__".into(),
+            ty: "__nv_bfloat16* __restrict__".into(),
             name: format!("src{i}"),
         });
     }

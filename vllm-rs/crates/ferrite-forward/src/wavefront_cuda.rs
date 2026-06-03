@@ -291,7 +291,22 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     // compute stream is gated downstream.
     let mut u32_args: Vec<u32> = Vec::new();
     if spec.has_attn_decode {
-        u32_args.push(ctx.kv_cache.num_blocks as u32);
+        // The kernel's KV loop iterates `__num_kv_pages` times.
+        // Setting this to the cache POOL size (`ctx.kv_cache.num_blocks`)
+        // was the original bug — the pool is 138868 blocks for
+        // Llama-1B, but a sequence with 6 prompt tokens only needs
+        // ceil(6 / block_size) = 1 block of K/V context. Iterating
+        // 138868 times reads 142 MB of mostly-uninitialized cache data
+        // and triggers the CUDA_ERROR_LAUNCH_FAILED observed at
+        // decode-time (post-Gap-17 fix).
+        //
+        // Correct value: ceil(seq_len / block_size). For decode
+        // (num_tokens=1), seq_len = prompt_len + decode_position.
+        // `ctx.max_seqlen_k` is that value.
+        let block_size = ctx.kv_cache.block_size as u32;
+        let seq_blocks =
+            (ctx.max_seqlen_k as u32).div_ceil(block_size);
+        u32_args.push(seq_blocks);
     }
     if spec.has_rope {
         let mut pos_host: u32 = 0;

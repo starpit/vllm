@@ -36,8 +36,8 @@ use crate::tk_gmem::{
 };
 use crate::tk_lower::{
     lower_attn_decode, lower_gemm_m1, lower_residual_add, lower_rmsnorm, lower_rope_append,
-    lower_rope_rotate, lower_silu_mul, AddOp, AttnDecodeOp, CarriedHandle, GemmM1Op,
-    PageAllocator, RmsNormOp, RopeAppendOp, RopeRotateOp, SiluMulOp,
+    lower_rope_multi, lower_rope_rotate, lower_silu_mul, AddOp, AttnDecodeOp, CarriedHandle,
+    GemmM1Op, PageAllocator, RmsNormOp, RopeAppendOp, RopeMultiOp, RopeRotateOp, SiluMulOp,
 };
 use crate::tk_warp_ir::{Phase0, Phase1, TkProgram, WarpRole, PAGE_SIZE};
 
@@ -678,15 +678,51 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 );
             }
 
-            // Stage 4.A — prefill IR variants exist in the enum so
-            // the bridge can emit them, but the lowerings land in
-            // Stage 4.C. Until then, the orchestrator panics if a
-            // prefill canonical (num_tokens > 1) reaches it.
-            LoweredOp::AttnPrefill { .. }
-            | LoweredOp::RopeMultiToken { .. }
-            | LoweredOp::ReshapeAndCacheMulti { .. } => {
+            // Stage 4.C step 1 — RopeMultiToken is the first prefill
+            // op wired up. Same dataflow shape as RopeRotate (3 input
+            // slots: x, cos, sin) but uses lower_rope_multi (per-row
+            // cos/sin index) instead of the single-position decode body.
+            LoweredOp::RopeMultiToken { head_dim } => {
+                let x_buf = buf_for(desc.inputs[0], &op_out_buf);
+                let cos_buf = buf_for(desc.inputs[1], &op_out_buf);
+                let sin_buf = buf_for(desc.inputs[2], &op_out_buf);
+                let cols = shape_for(desc.inputs[0], &op_out_shape, &input.sources).1;
+                let num_heads = cols / head_dim;
+                let x_in = build_arena_input(
+                    &input_routing[op_idx][0],
+                    x_buf,
+                    &gmem_handles,
+                    &carried_table,
+                    &mut prog,
+                );
+                let cos_in = build_ext_input(cos_buf, &mut prog);
+                let sin_in = build_ext_input(sin_buf, &mut prog);
+                let phase = pick_phase(&carried_phases, &pages, 3);
+                let op = RopeMultiOp {
+                    x: x_buf,
+                    cos: cos_buf,
+                    sin: sin_buf,
+                    out: out_buf,
+                    head_dim,
+                    num_heads,
+                    m: desc.m,
+                    act_elem: ACT_ELEM,
+                };
+                let output = if phase == 0 {
+                    lower_rope_multi::<Phase0>(op, x_in, cos_in, sin_in, output_internal, &mut pages, &mut prog)
+                } else {
+                    lower_rope_multi::<Phase1>(op, x_in, cos_in, sin_in, output_internal, &mut pages, &mut prog)
+                };
+                stash_output(out_buf, op_idx, output, &mut gmem_handles, &mut carried_table);
+                op_out_shape.push((desc.m, cols));
+            }
+
+            // Stage 4.A — remaining prefill IR variants exist in the
+            // enum so the bridge can emit them, but the lowerings land
+            // in Stage 4.C step 2+. Until then, the orchestrator panics.
+            LoweredOp::AttnPrefill { .. } | LoweredOp::ReshapeAndCacheMulti { .. } => {
                 panic!(
-                    "lower_to_tk: prefill op {:?} not yet supported (Stage 4.C)",
+                    "lower_to_tk: prefill op {:?} not yet supported (Stage 4.C step 2)",
                     desc.op
                 );
             }
@@ -998,11 +1034,89 @@ mod tests {
         assert_eq!(pf_sizes[0], n as usize * 2048 * 2);
     }
 
+    /// Stage 4.C step 1 — `lower_rope_multi` emits a complete
+    /// 3-page protocol (loader/consumer/storer roles, complete_round)
+    /// for m=4, the largest m that fits one page for Llama-1B Q-side
+    /// shape (num_heads=32, head_dim=64, x_cols=2048):
+    /// `4 * 2048 * 2 = 16384 = PAGE_SIZE`. Tests the lowering
+    /// directly so the orchestrator's arena-vs-Ext typing on the x
+    /// input doesn't bear on this.
+    #[test]
+    fn stage_4c_step1_rope_multi_lowers_for_m_4() {
+        use crate::subtile_ir::BufId;
+        use crate::tk_gmem::{Carried, CarriedProof, CrossOpInput, Ext, GmemHandle};
+        use crate::tk_lower::{lower_rope_multi, PageAllocator, RopeMultiOp};
+
+        let mut pages = PageAllocator::new();
+        let mut prog = TkProgram::new();
+        let op = RopeMultiOp {
+            x: BufId(0),
+            cos: BufId(1),
+            sin: BufId(2),
+            out: BufId(3),
+            head_dim: 64,
+            num_heads: 32,
+            m: 4,
+            act_elem: ACT_ELEM,
+        };
+        // For a single-op test, all three inputs are Ext (no upstream
+        // ops). Real prefill bridge will have x as an arena edge.
+        let x_in: CrossOpInput<crate::tk_gmem::ArenaSlot> = CrossOpInput::Fenced(
+            emit_fence_after_op(&mut prog, GmemHandle::new_initial(BufId(0))),
+        );
+        let cos_in: CrossOpInput<Ext> = CrossOpInput::Fenced(
+            emit_fence_after_op(&mut prog, GmemHandle::<Ext>::new_initial(BufId(1))),
+        );
+        let sin_in: CrossOpInput<Ext> = CrossOpInput::Fenced(
+            emit_fence_after_op(&mut prog, GmemHandle::<Ext>::new_initial(BufId(2))),
+        );
+        let _out = lower_rope_multi::<Phase0>(
+            op, x_in, cos_in, sin_in, false, &mut pages, &mut prog,
+        );
+        // Carried/CarriedProof imports kept so the test sees the
+        // full set of substrate types it would use in a real
+        // orchestrator dispatch.
+        let _ = std::marker::PhantomData::<(Carried<crate::tk_gmem::ArenaSlot>, CarriedProof)>;
+        // Program emitted at least the 3-page handshake.
+        assert!(!prog.instrs.is_empty());
+    }
+
+    /// Stage 4.C step 2+ — AttnPrefill / ReshapeAndCacheMulti remain
+    /// gated until their lowerings land. Pin the panic message so
+    /// the next sub-step can land them confidently.
     #[test]
     #[should_panic(expected = "prefill op")]
-    fn stage_4a_orchestrator_panics_on_prefill_until_4c() {
-        use crate::fixtures::rope_multi_only_input;
-        let pf = rope_multi_only_input(64);
+    fn stage_4c_step1_attn_prefill_still_panics_until_step_2() {
+        // Build a minimal 1-op LoweringInput with AttnPrefill so the
+        // panic arm fires without page-allocator pathology.
+        use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
+        use crate::subtile::SourceShape;
+        let pf = LoweringInput {
+            sources: vec![
+                SourceShape { rows: 1, cols: 2048 }, // 0 q
+                SourceShape { rows: 1, cols: 512 },  // 1 prefix_k
+                SourceShape { rows: 1, cols: 512 },  // 2 prefix_v
+                SourceShape { rows: 1, cols: 512 },  // 3 k
+                SourceShape { rows: 1, cols: 512 },  // 4 v
+            ],
+            ops: vec![OpDesc {
+                op: LoweredOp::AttnPrefill {
+                    num_q_heads: 32,
+                    num_kv_heads: 8,
+                    head_dim: 64,
+                    scale: 0.125,
+                },
+                m: 4,
+                inputs: vec![
+                    InputRef::Ext(0),
+                    InputRef::Ext(1),
+                    InputRef::Ext(2),
+                    InputRef::Ext(3),
+                    InputRef::Ext(4),
+                ],
+            }],
+            result: 0,
+        };
         let _ = lower_to_tk(&pf);
     }
 

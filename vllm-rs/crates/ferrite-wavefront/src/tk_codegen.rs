@@ -1024,6 +1024,72 @@ pub mod tk20 {
         )
     }
 
+    /// Stage 4.C — multi-token RoPE consumer body. Same NeoX rotation
+    /// as [`rope_consumer_body`] but cos/sin are indexed per-row
+    /// (`__cos_smem[row * head_dim + lane]`) so each token row
+    /// rotates against its own RoPE position. The cos/sin source
+    /// shape is `[m, head_dim]`; the bridge slices the canonical
+    /// bucket's m rows into the source before dispatch.
+    ///
+    /// `x_id` / `c_id` / `s_id`: page slots for the activation, cos
+    /// table, sin table. `num_heads`: heads sharing one rotation
+    /// (Q-side in Llama-1B prefill: 32). `head_dim`: per-head width.
+    /// `m`: number of token rows in this dispatch (the canonical
+    /// bucket size). Total rotation pairs = `m * num_heads * head_dim/2`.
+    ///
+    /// Caller's responsibility: assert `m * num_heads * head_dim *
+    /// elem_bytes <= PAGE_SIZE` so the activation tile fits one
+    /// Phase-12-routed smem page (Stage 4.B `m_chunk_fits_page`).
+    pub fn rope_multi_consumer_body(
+        x_id: u8,
+        c_id: u8,
+        s_id: u8,
+        num_heads: u32,
+        head_dim: u32,
+        m: u32,
+    ) -> String {
+        let half = head_dim / 2;
+        let total_pairs = (m as u64) * (num_heads as u64) * (half as u64);
+        format!(
+            r#"
+            // tk_warp_ir multi-token RoPE rotate (NeoX) — in place on x's page (all consumer warps)
+            using T_act = __nv_bfloat16;
+            auto* __x_smem   = reinterpret_cast<T_act*>(page_buf[{x_id}]);
+            auto* __cos_smem = reinterpret_cast<T_act*>(page_buf[{c_id}]);
+            auto* __sin_smem = reinterpret_cast<T_act*>(page_buf[{s_id}]);
+            const unsigned int __num_heads = {num_heads}u;
+            const unsigned int __head_dim  = {head_dim}u;
+            const unsigned int __half      = {half}u;
+            const unsigned int __pairs     = {total_pairs}u;
+            const unsigned int __pairs_per_row = __num_heads * __half;
+            const int __tid_in_consumers =
+                static_cast<int>(threadIdx.x) - 4 * 32;
+            const int __consumer_threads = 16 * 32;
+            for (unsigned int __p = static_cast<unsigned int>(__tid_in_consumers);
+                 __p < __pairs; __p += static_cast<unsigned int>(__consumer_threads)) {{
+                // Decompose pair index → (row, head_idx, lane).
+                const unsigned int __row      = __p / __pairs_per_row;
+                const unsigned int __row_p    = __p - __row * __pairs_per_row;
+                const unsigned int __head_idx = __row_p / __half;
+                const unsigned int __lane     = __row_p - __head_idx * __half;
+                // x layout: [m, num_heads, head_dim] flattened.
+                const unsigned int __row_off  = __row * __num_heads * __head_dim
+                                              + __head_idx * __head_dim;
+                const unsigned int __i_lo     = __row_off + __lane;
+                const unsigned int __i_hi     = __i_lo + __half;
+                // cos/sin layout: [m, head_dim] flattened — per-row.
+                const unsigned int __cs_off   = __row * __head_dim + __lane;
+                const float __c    = __bfloat162float(__cos_smem[__cs_off]);
+                const float __s    = __bfloat162float(__sin_smem[__cs_off]);
+                const float __x_lo = __bfloat162float(__x_smem[__i_lo]);
+                const float __x_hi = __bfloat162float(__x_smem[__i_hi]);
+                __x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);
+                __x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);
+            }}
+"#
+        )
+    }
+
     /// Emit the residual-Add consumer body. Element-wise A+B in place
     /// on A's page, parallelised across all 8 consumer warps × 32
     /// lanes (256 threads). All consumers participate (no
@@ -1990,12 +2056,35 @@ pub enum Tk20Call {
     /// warp parallel over `m * num_heads * (head_dim / 2)` rotation
     /// pairs. Used by both `RopeRotate` and `RopeAppend` lowerings.
     /// Bound through `tk20::rope_consumer_body`.
+    ///
+    /// cos/sin indexed by `__cos_smem[__lane]` (single-position): all
+    /// rows share the same cos/sin row. Decode-only (m=1 implicit;
+    /// for m>1 every row gets the SAME rotation, which is wrong for
+    /// prefill). Use `RopeMultiConsumerBody` for prefill where each
+    /// row needs its per-token cos/sin.
     RopeConsumerBody {
         x_id: u8,
         c_id: u8,
         s_id: u8,
         head_dim: u32,
         total_pairs: u64,
+    },
+
+    /// Stage 4.C — multi-token RoPE consumer body. Same NeoX rotation
+    /// as `RopeConsumerBody` but cos/sin are indexed per-row:
+    /// `__cos_smem[row * head_dim + lane]`. Required for prefill
+    /// (`num_tokens > 1`) where each token row has its own RoPE
+    /// position. cos/sin source shape is `[num_tokens, head_dim]`
+    /// (the bridge pre-slices to the canonical bucket's m).
+    ///
+    /// Bound through `tk20::rope_multi_consumer_body`.
+    RopeMultiConsumerBody {
+        x_id: u8,
+        c_id: u8,
+        s_id: u8,
+        num_heads: u32,
+        head_dim: u32,
+        m: u32,
     },
 
     /// GemmM1 consumer compute body. M=1 dot product per consumer
@@ -2114,6 +2203,22 @@ impl Tk20Call {
                 head_dim,
                 total_pairs,
             } => tk20::rope_consumer_body(*x_id, *c_id, *s_id, *head_dim, *total_pairs),
+
+            Tk20Call::RopeMultiConsumerBody {
+                x_id,
+                c_id,
+                s_id,
+                num_heads,
+                head_dim,
+                m,
+            } => tk20::rope_multi_consumer_body(
+                *x_id,
+                *c_id,
+                *s_id,
+                *num_heads,
+                *head_dim,
+                *m,
+            ),
 
             Tk20Call::GemmM1ConsumerBody {
                 x_id,

@@ -355,7 +355,13 @@ pub fn prefill_one_layer_input(num_tokens: u32) -> LoweringInput {
 /// num_tokens Q rows. All inputs are external (no upstream ops), so
 /// the orchestrator reaches the prefill match arm directly without
 /// hitting the upstream-handle-missing path the multi-op fixture
-/// trips. Used by `stage_4a_orchestrator_panics_on_prefill_until_4c`.
+/// trips.
+///
+/// Stage 4.C step 1: `lower_rope_multi` requires `num_tokens *
+/// num_heads * head_dim * 2 <= PAGE_SIZE = 16384`, so for the
+/// Llama-1B Q-side shape (num_heads=32, head_dim=64) the maximum
+/// supported num_tokens is `pick_m_chunk(2048) = 4`. Larger buckets
+/// require Stage 4.C step 2's outer m-axis ForLoop.
 pub fn rope_multi_only_input(num_tokens: u32) -> LoweringInput {
     let head_dim = 64u32;
     let num_heads = 32u32;

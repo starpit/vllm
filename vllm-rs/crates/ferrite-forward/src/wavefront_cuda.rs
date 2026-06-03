@@ -44,6 +44,112 @@ pub type LaunchFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
+// ── Typed kernel u32-arg witnesses (Gap 18) ────────────────────────
+//
+// The kernel's `__num_kv_pages` runtime arg is the count of KV cache
+// blocks for THIS sequence — not the cache pool size. Using the pool
+// size (138868 for Llama-1B) caused the post-Gap-17 crash (Step E.9):
+// the kernel iterated 138868 times reading 142 MB of mostly-
+// uninitialized cache, eventually triggering CUDA_ERROR_LAUNCH_FAILED.
+//
+// `SeqBlockCount` newtype-wraps the u32 with a sealed constructor
+// `from_max_seqlen_k(seqlen, block_size)`. The pool size has no path
+// to construct one. `KernelU32ArgsBuilder::push_num_kv_pages`
+// requires a `SeqBlockCount`, so passing
+// `ctx.kv_cache.num_blocks as u32` directly is a Rust compile error.
+//
+// Verification: revert dispatch_cuda to `u32_builder.push_num_kv_pages(
+// ctx.kv_cache.num_blocks as u32)` — the call fails to typecheck.
+
+/// Per-sequence count of KV cache blocks. Constructed only via
+/// `from_max_seqlen_k`, which derives the value from
+/// `(max_seqlen_k, block_size)` — never from the cache pool size.
+///
+/// # Compile-fail proof (Gap 18)
+///
+/// Passing a raw `u32` (e.g., `kv_cache.num_blocks`) to
+/// `push_num_kv_pages` is a Rust compile error.
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::*;
+/// let mut b = KernelU32ArgsBuilder::new();
+/// // The pool size is just a u32 — but push_num_kv_pages requires
+/// // SeqBlockCount. Compile error.
+/// let pool_size: u32 = 138868;
+/// b.push_num_kv_pages(pool_size);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SeqBlockCount(u32);
+
+impl SeqBlockCount {
+    /// Construct from a sequence's `max_seqlen_k` (current K_LEN =
+    /// prompt + decode position) and the cache `block_size`.
+    pub fn from_max_seqlen_k(max_seqlen_k: u32, block_size: u32) -> Self {
+        Self(max_seqlen_k.div_ceil(block_size))
+    }
+
+    /// Raw u32 for FFI. Crate-private — only the typed
+    /// `KernelU32ArgsBuilder` should access this.
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Decode position for the current decode token. D2H-copied from
+/// `ctx.positions[0]` once per dispatch. Newtype to keep it from
+/// being conflated with `SeqBlockCount` or any other u32 arg.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodePosition(u32);
+
+impl DecodePosition {
+    pub fn from_raw(pos: u32) -> Self {
+        Self(pos)
+    }
+
+    pub(crate) fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+/// Typed builder for kernel u32 args. Args are pushed in a fixed
+/// order matching `KernelArgs::u32_args` (set by
+/// `fixtures::orchestrator_kernel_args`): num_kv_pages first
+/// (gated by has_attn_decode), then decode_position (gated by
+/// has_rope). Wrong-typed pushes are Rust compile errors.
+pub struct KernelU32ArgsBuilder {
+    args: Vec<u32>,
+}
+
+impl KernelU32ArgsBuilder {
+    pub fn new() -> Self {
+        Self { args: Vec::new() }
+    }
+
+    /// Push the per-sequence KV block count. **Compile-time
+    /// guarantee**: caller must produce a [`SeqBlockCount`]; the
+    /// pool size (raw `u32` from `kv_cache.num_blocks`) cannot be
+    /// passed without going through `SeqBlockCount::from_max_seqlen_k`,
+    /// which only derives the value from
+    /// `(max_seqlen_k, block_size)`.
+    pub fn push_num_kv_pages(&mut self, count: SeqBlockCount) {
+        self.args.push(count.raw());
+    }
+
+    /// Push the decode position.
+    pub fn push_decode_position(&mut self, pos: DecodePosition) {
+        self.args.push(pos.raw());
+    }
+
+    pub fn finalize(self) -> Vec<u32> {
+        self.args
+    }
+}
+
+impl Default for KernelU32ArgsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One source's resolution recipe — typed at macro time, walked at
 /// dispatch time. Each entry encodes the (bucket, op_idx, slot, layer)
 /// tuple `WeightAccessors` consumes plus, where applicable, a
@@ -289,24 +395,17 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     // `cos_sin_cache`. `event_synchronize` on the dedicated d2h
     // event blocks the host ~5 us while the value lands; the
     // compute stream is gated downstream.
-    let mut u32_args: Vec<u32> = Vec::new();
+    // Typed u32-args builder. `KernelU32Args::push_num_kv_pages` takes
+    // a [`SeqBlockCount`] — passing a pool-size count (Gap 18, the
+    // crash bug E.9 fixed) is a Rust compile error. The newtype's
+    // private constructor only accepts (max_seqlen_k, block_size).
+    let mut u32_builder = KernelU32ArgsBuilder::new();
     if spec.has_attn_decode {
-        // The kernel's KV loop iterates `__num_kv_pages` times.
-        // Setting this to the cache POOL size (`ctx.kv_cache.num_blocks`)
-        // was the original bug — the pool is 138868 blocks for
-        // Llama-1B, but a sequence with 6 prompt tokens only needs
-        // ceil(6 / block_size) = 1 block of K/V context. Iterating
-        // 138868 times reads 142 MB of mostly-uninitialized cache data
-        // and triggers the CUDA_ERROR_LAUNCH_FAILED observed at
-        // decode-time (post-Gap-17 fix).
-        //
-        // Correct value: ceil(seq_len / block_size). For decode
-        // (num_tokens=1), seq_len = prompt_len + decode_position.
-        // `ctx.max_seqlen_k` is that value.
-        let block_size = ctx.kv_cache.block_size as u32;
-        let seq_blocks =
-            (ctx.max_seqlen_k as u32).div_ceil(block_size);
-        u32_args.push(seq_blocks);
+        let count = SeqBlockCount::from_max_seqlen_k(
+            ctx.max_seqlen_k as u32,
+            ctx.kv_cache.block_size as u32,
+        );
+        u32_builder.push_num_kv_pages(count);
     }
     if spec.has_rope {
         let mut pos_host: u32 = 0;
@@ -320,8 +419,12 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
                 .expect("d2h decode position");
         }
         device.sync_d2h().expect("sync d2h decode position");
-        u32_args.push(pos_host);
+        u32_builder.push_decode_position(DecodePosition::from_raw(pos_host));
     }
+
+    // Finalize u32 args from the typed builder. Order is fixed:
+    // num_kv_pages (if present), then decode_position (if present).
+    let u32_args: Vec<u32> = u32_builder.finalize();
 
     // ── 5. Call the FFI wrapper. Pointer table + u32 table are kept
     //     alive across the call by virtue of the `Vec`s outliving

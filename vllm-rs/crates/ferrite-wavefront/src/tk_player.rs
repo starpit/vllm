@@ -21,7 +21,9 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{Instr, TkTape};
+use crate::tk_tape::{
+    CommitKind, FenceScope, Instr, SyncScope, TkTape, WaitMode,
+};
 
 /// Emit the full CUDA kernel body from a [`TkTape`].
 ///
@@ -43,18 +45,33 @@ pub fn emit_kernel(tape: &TkTape) -> String {
 fn emit_instr(out: &mut String, instr: &Instr) {
     match instr {
         // ── synchronization primitives ───────────────────────────
-        Instr::Syncthreads { .. } => {
-            // Phase 1: emit __syncthreads() (or scoped variant).
-        }
-        Instr::Threadfence { .. } => {
-            // Phase 1: emit __threadfence{,_block,_system}().
-        }
-        Instr::CommitGroup { .. } => {
-            // Phase 1: emit cp.async.bulk.commit_group;.
-        }
-        Instr::WaitGroup { .. } => {
-            // Phase 1: emit cp.async.bulk.wait_group N;.
-        }
+        Instr::Syncthreads { scope } => match scope {
+            SyncScope::Cta => out.push_str("__syncthreads();\n"),
+            SyncScope::GroupOf(n) => {
+                let _ = writeln!(out, "kittens::group<{n}>::sync();");
+            }
+        },
+        Instr::Threadfence { scope } => match scope {
+            FenceScope::Block => out.push_str("__threadfence_block();\n"),
+            FenceScope::Device => out.push_str("__threadfence();\n"),
+            FenceScope::System => out.push_str("__threadfence_system();\n"),
+        },
+        Instr::CommitGroup { kind } => match kind {
+            CommitKind::BulkStore => {
+                out.push_str("asm volatile(\"cp.async.bulk.commit_group;\");\n");
+            }
+            CommitKind::NonBulk => {
+                out.push_str("asm volatile(\"cp.async.commit_group;\");\n");
+            }
+        },
+        Instr::WaitGroup { kind, n } => match kind {
+            CommitKind::BulkStore => {
+                let _ = writeln!(out, "asm volatile(\"cp.async.bulk.wait_group {n};\");");
+            }
+            CommitKind::NonBulk => {
+                let _ = writeln!(out, "asm volatile(\"cp.async.wait_group {n};\");");
+            }
+        },
 
         // ── consolidated cross-op + kernel-end fence ─────────────
         Instr::Fence(_spec) => {
@@ -109,6 +126,13 @@ fn emit_instr(out: &mut String, instr: &Instr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tk_tape::{CommitKind, FenceScope, SyncScope};
+
+    fn emit(instr: Instr) -> String {
+        let mut out = String::new();
+        emit_instr(&mut out, &instr);
+        out
+    }
 
     #[test]
     fn empty_tape_emits_only_header() {
@@ -116,5 +140,119 @@ mod tests {
         let out = emit_kernel(&tape);
         assert!(out.contains("// emitted by tk_player"));
         assert!(!out.contains("for ("));
+    }
+
+    // ── Phase 1: sync primitives ──────────────────────────────────
+    //
+    // Each arm must emit byte-identical CUDA to today's
+    // tk_codegen.rs hardcoded strings — anything else regresses
+    // the megakernel.
+
+    #[test]
+    fn syncthreads_cta_matches_legacy() {
+        assert_eq!(
+            emit(Instr::Syncthreads { scope: SyncScope::Cta }),
+            "__syncthreads();\n"
+        );
+    }
+
+    #[test]
+    fn syncthreads_group_emits_kittens_sync() {
+        assert_eq!(
+            emit(Instr::Syncthreads { scope: SyncScope::GroupOf(8) }),
+            "kittens::group<8>::sync();\n"
+        );
+    }
+
+    #[test]
+    fn threadfence_device_matches_legacy() {
+        assert_eq!(
+            emit(Instr::Threadfence { scope: FenceScope::Device }),
+            "__threadfence();\n"
+        );
+    }
+
+    #[test]
+    fn threadfence_block_emits_block_scope() {
+        assert_eq!(
+            emit(Instr::Threadfence { scope: FenceScope::Block }),
+            "__threadfence_block();\n"
+        );
+    }
+
+    #[test]
+    fn threadfence_system_emits_system_scope() {
+        assert_eq!(
+            emit(Instr::Threadfence { scope: FenceScope::System }),
+            "__threadfence_system();\n"
+        );
+    }
+
+    #[test]
+    fn commit_group_bulk_matches_legacy() {
+        // Legacy: tk_codegen.rs:69 / :157.
+        assert_eq!(
+            emit(Instr::CommitGroup { kind: CommitKind::BulkStore }),
+            "asm volatile(\"cp.async.bulk.commit_group;\");\n"
+        );
+    }
+
+    #[test]
+    fn wait_group_bulk_zero_matches_legacy() {
+        // Legacy: tk_codegen.rs:70 / :158 — wait_group 0 = drain
+        // all.
+        assert_eq!(
+            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0 }),
+            "asm volatile(\"cp.async.bulk.wait_group 0;\");\n"
+        );
+    }
+
+    #[test]
+    fn wait_group_bulk_nonzero_emits_n() {
+        assert_eq!(
+            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 3 }),
+            "asm volatile(\"cp.async.bulk.wait_group 3;\");\n"
+        );
+    }
+
+    #[test]
+    fn commit_and_wait_nonbulk_emit_sm80_path() {
+        assert_eq!(
+            emit(Instr::CommitGroup { kind: CommitKind::NonBulk }),
+            "asm volatile(\"cp.async.commit_group;\");\n"
+        );
+        assert_eq!(
+            emit(Instr::WaitGroup { kind: CommitKind::NonBulk, n: 0 }),
+            "asm volatile(\"cp.async.wait_group 0;\");\n"
+        );
+    }
+
+    /// Sequence test: a five-instruction tape reproducing today's
+    /// `cross_op_gmem_fence_body` byte-for-byte. Phase 2 will
+    /// consolidate this into a single `Instr::Fence` — for now we
+    /// prove the building blocks compose.
+    #[test]
+    fn cross_op_fence_sequence_matches_legacy_body() {
+        let tape = TkTape {
+            instrs: vec![
+                Instr::Syncthreads { scope: SyncScope::Cta },
+                Instr::CommitGroup { kind: CommitKind::BulkStore },
+                Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0 },
+                Instr::Threadfence { scope: FenceScope::Device },
+                Instr::Syncthreads { scope: SyncScope::Cta },
+            ],
+            ..Default::default()
+        };
+        let out = emit_kernel(&tape);
+        // Strip the header to compare just the body.
+        let body = out.strip_prefix("// emitted by tk_player\n").unwrap();
+        let expected = concat!(
+            "__syncthreads();\n",
+            "asm volatile(\"cp.async.bulk.commit_group;\");\n",
+            "asm volatile(\"cp.async.bulk.wait_group 0;\");\n",
+            "__threadfence();\n",
+            "__syncthreads();\n",
+        );
+        assert_eq!(body, expected);
     }
 }

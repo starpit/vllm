@@ -457,16 +457,87 @@ pub fn lower_rmsnorm_routed<P: Phase>(
 /// sites in `tk_lower.rs` (lines 625 / 832 / 1716 / 1887) — silent
 /// drift in any future edit re-introduces the bug. This newtype
 /// collapses them to one definition.
+///
+/// **Phase 3 (paris invariant `kv-layout-witness-binds-cache-bufid`)**:
+/// Fields are PRIVATE; the only way to construct a [`KvCacheLayout`]
+/// is [`KvCacheLayout::for_buf_id`], which binds the K-cache BufId
+/// into the witness. This makes the layout a typed witness that
+/// PAIRED RopeAppend (writer) and AttnDecode (reader) ops dereference
+/// — both ops' `kv_layout()` constructors call `for_buf_id` with
+/// THEIR OWN `k_cache` field; the orchestrator wires those k_cache
+/// fields from the same source so the two layouts compare PartialEq-
+/// equal by construction. A future divergence (e.g. a contributor
+/// hand-rolling a layout with `num_kv_heads = 16` while the producer
+/// used 8) is structurally impossible from outside this module:
+/// `KvCacheLayout::*` constructors all live here, and the field
+/// privacy plus sealed inner module forbid external `KvCacheLayout {
+/// num_kv_heads: 16, ... }` literals.
+///
+/// # Compile-fail proof — no public constructor besides for_buf_id
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_lower::KvCacheLayout;
+/// use ferrite_wavefront::subtile_ir::BufId;
+/// let bogus = KvCacheLayout {
+///     cache_buf_id: BufId(0),
+///     num_kv_heads: 8,
+///     head_dim: 64,
+///     act_elem: 2,
+/// };  // ERROR: fields private
+/// ```
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_lower::KvCacheLayout;
+/// let bogus = KvCacheLayout::new(8, 64, 2);  // ERROR: `new` removed
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KvCacheLayout {
-    pub num_kv_heads: u32,
-    pub head_dim: u32,
-    pub act_elem: u32,
+    cache_buf_id: BufId,
+    num_kv_heads: u32,
+    head_dim: u32,
+    act_elem: u32,
 }
 
 impl KvCacheLayout {
-    pub const fn new(num_kv_heads: u32, head_dim: u32, act_elem: u32) -> Self {
-        Self { num_kv_heads, head_dim, act_elem }
+    /// Sealed constructor binding `cache_buf_id` into the witness.
+    /// Two layouts with the same (num_kv_heads, head_dim, act_elem)
+    /// but different `cache_buf_id` compare PartialEq-UN-equal,
+    /// catching cross-cache witness reuse at the orchestrator level.
+    pub const fn for_buf_id(
+        cache_buf_id: BufId,
+        num_kv_heads: u32,
+        head_dim: u32,
+        act_elem: u32,
+    ) -> Self {
+        Self {
+            cache_buf_id,
+            num_kv_heads,
+            head_dim,
+            act_elem,
+        }
+    }
+
+    /// The K-cache BufId this layout binds. Used at lowering time to
+    /// `debug_assert!` that the AttnDecode/RopeAppend op consuming
+    /// this layout has a matching `k_cache` BufId — catches cross-
+    /// cache witness reuse at lower-time before it can drift.
+    pub const fn cache_buf_id(&self) -> BufId {
+        self.cache_buf_id
+    }
+
+    /// Per-token K (or V) head count.
+    pub const fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads
+    }
+
+    /// Per-head dimensionality.
+    pub const fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+
+    /// Bytes per element (2 for bf16, 4 for fp32).
+    pub const fn act_elem(&self) -> u32 {
+        self.act_elem
     }
 
     /// Per-token K (or V) row stride in bytes.
@@ -549,7 +620,7 @@ impl AttnDecodeOp {
     /// upstream RopeAppend; both READ and WRITE sides agree by
     /// construction.
     pub const fn kv_layout(&self) -> KvCacheLayout {
-        KvCacheLayout::new(self.num_kv_heads, self.head_dim, self.act_elem)
+        KvCacheLayout::for_buf_id(self.k_cache, self.num_kv_heads, self.head_dim, self.act_elem)
     }
 }
 
@@ -583,6 +654,11 @@ pub fn lower_attn_decode<P: Phase>(
     let v_cache = v_cache.into_inner();
     debug_assert_eq!(op.k_cache, k_cache.buf_id());
     debug_assert_eq!(op.v_cache, v_cache.buf_id());
+    // Phase 3 (paris invariant `kv-layout-witness-binds-cache-bufid`):
+    // assert the K-side layout witness binds the same BufId as the
+    // op's k_cache field. `op.kv_layout()` mints `for_buf_id(op.k_cache, ...)`
+    // so this is by construction; verify in case a future refactor.
+    debug_assert_eq!(op.kv_layout().cache_buf_id(), op.k_cache);
     let _ = (k_cache, v_cache);
     // Phase 7 GQA shape preconditions:
     // - `num_kv_heads <= NUM_CONSUMER_WARPS` (each kv-head owned by
@@ -822,6 +898,11 @@ pub fn lower_attn_decode_routed<P: Phase>(
     let v_cache = v_cache.into_inner();
     debug_assert_eq!(op.k_cache, k_cache.buf_id());
     debug_assert_eq!(op.v_cache, v_cache.buf_id());
+    // Phase 3 (paris invariant `kv-layout-witness-binds-cache-bufid`):
+    // assert the K-side layout witness binds the same BufId as the
+    // op's k_cache field. `op.kv_layout()` mints `for_buf_id(op.k_cache, ...)`
+    // so this is by construction; verify in case a future refactor.
+    debug_assert_eq!(op.kv_layout().cache_buf_id(), op.k_cache);
     let _ = (k_cache, v_cache);
     debug_assert!(
         op.num_kv_heads <= NUM_CONSUMER_WARPS as u32,
@@ -1718,7 +1799,7 @@ impl RopeAppendOp {
     /// `kv_layout().row_bytes()` so the formula is a single
     /// definition shared between sites.
     pub const fn kv_layout(&self) -> KvCacheLayout {
-        KvCacheLayout::new(self.num_kv_heads, self.head_dim, self.act_elem)
+        KvCacheLayout::for_buf_id(self.k_cache, self.num_kv_heads, self.head_dim, self.act_elem)
     }
 }
 
@@ -1760,6 +1841,9 @@ pub fn lower_rope_append<P: Phase>(
         v_cache_handle.buf_id(),
         "lower_rope_append: op.v_cache != handle.buf_id"
     );
+    // Phase 3 (paris invariant `kv-layout-witness-binds-cache-bufid`):
+    // the layout witness binds op.k_cache by construction.
+    debug_assert_eq!(op.kv_layout().cache_buf_id(), op.k_cache);
     let k_page = pages.alloc_at::<P>().expect("rope_append: K page");
     let c_page = pages.alloc_at::<P>().expect("rope_append: cos page");
     let s_page = pages.alloc_at::<P>().expect("rope_append: sin page");

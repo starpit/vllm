@@ -1761,6 +1761,181 @@ pub enum Tk20Call {
 /// = `expf(m_old - m_new)`, `p = expf(s - m_new)`, `l_sum =
 /// renorm * l_sum + p`, lane-strided `o_accum *= renorm`, finally
 /// `m_max = m_new`).
+// ── AttnDecode SoftmaxState typestate (paris invariant
+//    `attn-decode-init-qkt-sv-finalise-order`) ─────────────────────
+//
+// AttnDecode's per-warp softmax accumulators (`__m_max_a<u>`,
+// `__l_sum_a<u>`, `__o_accum_a<u>[]`) follow a strict per-decode-
+// step lifecycle: prelude declares (Empty) → init zeros (FreshLoop)
+// → for each KV iter, qkt updates (PostQkt) and sv accumulates
+// (PostSv) → finalise normalizes and writes O (Finalised). Calling
+// the bodies in the wrong order corrupts the recurrence silently.
+//
+// `SoftmaxState<Phase>` is the typestate witness. Each builder fn
+// consumes the state (move-by-value) and returns it advanced to
+// the next phase; mis-ordering is a Rust compile error. The
+// `unique_id` lives on the witness — passing the wrong `u` to a
+// downstream builder is structurally impossible because the witness
+// only emits with its own `u`.
+
+mod softmax_phase {
+    pub trait Sealed {}
+    pub struct Empty;
+    pub struct FreshLoop;
+    pub struct PostQkt;
+    pub struct PostSv;
+    pub struct Finalised;
+    impl Sealed for Empty {}
+    impl Sealed for FreshLoop {}
+    impl Sealed for PostQkt {}
+    impl Sealed for PostSv {}
+    impl Sealed for Finalised {}
+}
+pub use softmax_phase::{Empty, FreshLoop, PostQkt, PostSv, Finalised};
+pub trait SoftmaxPhase: softmax_phase::Sealed {}
+impl SoftmaxPhase for Empty {}
+impl SoftmaxPhase for FreshLoop {}
+impl SoftmaxPhase for PostQkt {}
+impl SoftmaxPhase for PostSv {}
+impl SoftmaxPhase for Finalised {}
+
+/// AttnDecode online-softmax typestate witness. Construct only via
+/// [`SoftmaxState::new`]; advance only by calling the typed
+/// `init_compute_calls` / `qkt_compute_calls` / `sv_compute_calls`
+/// / `finalise_compute_calls` methods in order. Calling them out of
+/// order is a Rust compile error.
+///
+/// # Compile-fail proofs (paris invariant `attn-decode-init-qkt-sv-finalise-order`)
+///
+/// QKt before init (no `qkt_compute_calls` on `Empty`):
+/// ```compile_fail
+/// use ferrite_wavefront::tk_codegen::SoftmaxState;
+/// let s = SoftmaxState::new(7, 64);
+/// let _ = s.qkt_compute_calls();
+/// ```
+///
+/// SV before QKt (no `sv_compute_calls` on `FreshLoop`):
+/// ```compile_fail
+/// use ferrite_wavefront::tk_codegen::SoftmaxState;
+/// let s = SoftmaxState::new(7, 64);
+/// let (_, s) = s.init_compute_calls();
+/// let _ = s.sv_compute_calls();
+/// ```
+///
+/// Finalise before SV (no `finalise_compute_calls` on `PostQkt`):
+/// ```compile_fail
+/// use ferrite_wavefront::tk_codegen::SoftmaxState;
+/// let s = SoftmaxState::new(7, 64);
+/// let (_, s) = s.init_compute_calls();
+/// let (_, s) = s.qkt_compute_calls();
+/// let _ = s.finalise_compute_calls();
+/// ```
+///
+/// Init twice (no `init_compute_calls` on anything but `Empty`):
+/// ```compile_fail
+/// use ferrite_wavefront::tk_codegen::SoftmaxState;
+/// let s = SoftmaxState::new(7, 64);
+/// let (_, s) = s.init_compute_calls();
+/// let _ = s.init_compute_calls();
+/// ```
+pub struct SoftmaxState<Phase: SoftmaxPhase> {
+    unique_id: u32,
+    head_dim: u32,
+    _phase: std::marker::PhantomData<Phase>,
+}
+
+impl SoftmaxState<Empty> {
+    /// Construct a fresh softmax state for AttnDecode op `unique_id`
+    /// with the given `head_dim`. Both values are baked into the
+    /// witness; downstream builders read them off the witness instead
+    /// of re-receiving them as args (single source of truth).
+    pub fn new(unique_id: u32, head_dim: u32) -> Self {
+        Self {
+            unique_id,
+            head_dim,
+            _phase: std::marker::PhantomData,
+        }
+    }
+
+    /// Init-softmax body. Consumes `Empty`, returns `FreshLoop`.
+    /// Calling `qkt_compute_calls` on `Empty` is a compile error
+    /// (trait bound `SoftmaxState<FreshLoop | PostSv>` not satisfied).
+    pub fn init_compute_calls(self) -> (Vec<Tk20Call>, SoftmaxState<FreshLoop>) {
+        let calls = attn_decode_init_softmax_compute_calls(self.unique_id);
+        (
+            calls,
+            SoftmaxState {
+                unique_id: self.unique_id,
+                head_dim: self.head_dim,
+                _phase: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
+impl SoftmaxState<FreshLoop> {
+    /// First-iteration QKt step (after init or after sv: see
+    /// [`SoftmaxState<PostSv>::qkt_compute_calls`]).
+    pub fn qkt_compute_calls(self) -> (Vec<Tk20Call>, SoftmaxState<PostQkt>) {
+        let calls = attn_decode_qkt_softmax_step_compute_calls(self.unique_id, self.head_dim);
+        (
+            calls,
+            SoftmaxState {
+                unique_id: self.unique_id,
+                head_dim: self.head_dim,
+                _phase: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
+impl SoftmaxState<PostQkt> {
+    /// SV step. Consumes `PostQkt`, returns `PostSv`. Calling sv
+    /// before qkt is a compile error (no impl for `Empty`/`FreshLoop`).
+    pub fn sv_compute_calls(self) -> (Vec<Tk20Call>, SoftmaxState<PostSv>) {
+        let calls = attn_decode_sv_accum_compute_calls(self.unique_id);
+        (
+            calls,
+            SoftmaxState {
+                unique_id: self.unique_id,
+                head_dim: self.head_dim,
+                _phase: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
+impl SoftmaxState<PostSv> {
+    /// Continue the KV-sweep loop with another qkt step. Consumes
+    /// `PostSv`, returns `PostQkt` so the loop body re-runs sv next.
+    pub fn qkt_compute_calls(self) -> (Vec<Tk20Call>, SoftmaxState<PostQkt>) {
+        let calls = attn_decode_qkt_softmax_step_compute_calls(self.unique_id, self.head_dim);
+        (
+            calls,
+            SoftmaxState {
+                unique_id: self.unique_id,
+                head_dim: self.head_dim,
+                _phase: std::marker::PhantomData,
+            },
+        )
+    }
+
+    /// Finalise the softmax (`O = O_accum / l_sum`). Consumes
+    /// `PostSv`, returns `Finalised`. Calling finalise before sv
+    /// is a compile error (no impl for `FreshLoop`/`PostQkt`).
+    pub fn finalise_compute_calls(self) -> (Vec<Tk20Call>, SoftmaxState<Finalised>) {
+        let calls = attn_decode_finalise_softmax_norm_compute_calls(self.unique_id);
+        (
+            calls,
+            SoftmaxState {
+                unique_id: self.unique_id,
+                head_dim: self.head_dim,
+                _phase: std::marker::PhantomData,
+            },
+        )
+    }
+}
+
 pub fn attn_decode_qkt_softmax_step_compute_calls(
     unique_id: u32,
     head_dim: u32,
@@ -3503,6 +3678,26 @@ mod tests {
         assert!(init.contains("if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a7)"));
         assert!(init.contains("for (unsigned int __h = 0u; __h < __q_heads_per_warp_a7; ++__h)"));
         assert!(!init.contains("kittens::tma::"));
+    }
+
+    #[test]
+    fn softmax_state_typestate_threads_in_correct_order() {
+        // Init → QKt → SV → QKt (next iter) → SV → Finalise.
+        // Compiles only because each step's return-typestate matches
+        // the next step's required input typestate. Out-of-order calls
+        // are compile-fail (see SoftmaxState's compile_fail doctests).
+        let s = SoftmaxState::new(11, 64);
+        let (_, s) = s.init_compute_calls();
+        let (_, s) = s.qkt_compute_calls();
+        let (_, s) = s.sv_compute_calls();
+        let (_, s) = s.qkt_compute_calls();
+        let (_, s) = s.sv_compute_calls();
+        let (calls, _final) = s.finalise_compute_calls();
+        // Sanity: finalise body emits the unique_id-correlated identifiers.
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("__l_sum_a11"));
+        assert!(body.contains("__o_accum_a11"));
+        assert!(body.contains("__out_smem_a11"));
     }
 
     #[test]

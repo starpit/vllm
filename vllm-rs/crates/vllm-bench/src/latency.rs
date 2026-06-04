@@ -29,13 +29,19 @@ fn create_llm(args: &BenchLatencyArgs, model: &str) -> Result<LLM> {
         .enable_prefix_caching(!args.no_prefix_caching)
         .enforce_eager(args.enforce_eager);
 
-    // Default max_num_batched_tokens to cover the full batch prefill in one
-    // scheduler iteration, matching Python's auto-sizing behavior.
-    let max_batched = args.max_num_batched_tokens.unwrap_or_else(|| {
-        let max_bs = *args.batch_sizes.iter().max().unwrap_or(&1);
-        (max_bs * args.input_len).max(8192)
-    });
-    builder = builder.max_num_batched_tokens(max_batched);
+    // Honor the user's --max-num-batched-tokens, otherwise leave the
+    // SchedulerConfig default (2048) and let chunked prefill amortize
+    // the prefill across iterations. Python's `vllm bench latency` does
+    // the same — this is the apples-to-apples comparison. The previous
+    // auto-bump to `max(bs*il, 8192)` claimed to mirror Python but does
+    // not (verified against vllm 0.19.1 vllm/benchmarks/latency.py: it
+    // never touches max_num_batched_tokens) and forced a single
+    // un-chunked forward at M=bs*il, OOMing at 14B bs=32 il=2048
+    // (3.6 GiB MLP gate_up output past the budget) and regressing 14B
+    // bs=32 il=1024 by ~3x because the scheduler couldn't chunk.
+    if let Some(mnbt) = args.max_num_batched_tokens {
+        builder = builder.max_num_batched_tokens(mnbt);
+    }
     if let Some(len) = args.max_model_len {
         builder = builder.max_model_len(len);
     }

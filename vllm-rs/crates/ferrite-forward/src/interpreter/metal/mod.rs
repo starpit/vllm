@@ -51,7 +51,7 @@ pub use pipelines::{PipelineLookupError, SpecializedPipelines};
 #[cfg(feature = "metal")]
 pub use ferrite_fusion_synth::BLOCKS_PER_CHUNK;
 #[cfg(feature = "metal")]
-pub use forward::{ForwardError, ForwardInputs};
+pub use forward::{ForwardError, ForwardInputs, build_mrope_cos_sin_override};
 #[cfg(feature = "metal")]
 pub use pool::{
     MetalBucketSpec, MetalWorkerPool, PoolBuildError, PooledWorker, RuntimeFactory, WorkerGuard,

@@ -1,0 +1,31 @@
+[package]
+name = "ferrite-model-qwen3-5-vl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Qwen3.5-VL vision tower (text decoder is the GDN hybrid in ferrite-model-qwen3-5)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda", "ferrite-forward-macro/cuda"]
+metal = ["ferrite-cuda-core/metal", "ferrite-kernels/metal", "ferrite-forward/metal", "ferrite-vision/metal", "ferrite-forward-macro/metal"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-vision/nccl", "ferrite-forward-macro/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-forward = { path = "../ferrite-forward" }
+ferrite-vision = { path = "../ferrite-vision" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+half = { workspace = true }
+
+# macOS-only test dep for the metal vision green-gate (`src/lib.rs`
+# `green_gate` mod). Gated on `target_os = "macos"` so Linux CUDA test
+# builds (which never compile the `feature = "metal"` test mod) don't
+# pull the Apple-only `objc2-metal`. We only need
+# `MTLCreateSystemDefaultDevice` to stand up a `MetalAllocator` /
+# `GpuDevice` the way `MetalAllocator`'s own unit tests do.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3", features = ["MTLDevice"] }

@@ -119,6 +119,15 @@ pub struct ModelParams {
     /// `visual.patch_embed.proj.weight` leading_dim 0 (today's
     /// hardcoded 5D behavior).
     pub vision_patch_embed_flatten: Option<VisionPatchEmbedFlatten>,
+    /// Safetensors key of a learned positional-embedding table that the
+    /// vision wrapper interpolates host-side per forward
+    /// (`fast_pos_embed_interpolate`) — Qwen3.5-VL's
+    /// `vision_tower.pos_embed.weight` `[num_grid², embed_dim]`. `None`
+    /// for towers without one (most), so the wrapper leaves `pos_embeds`
+    /// unset and the DSL never emits `LoadPosEmbeds`. Distinct from the
+    /// SigLIP `pos_embed(position_ids, weight)` row-gather (Gemma3-MM),
+    /// which is a DSL op over a `vision_num_positions`-driven extern.
+    pub vision_pos_embed_key: Option<String>,
     /// Decoder-side safetensors prefix to prepend to every text-decoder
     /// safetensors key. `None` for text-only and Qwen-style VL arches
     /// where the text decoder ships at top-level (`model.layers.<L>.<...>`,
@@ -197,6 +206,13 @@ impl VisionDModelFingerprint {
 pub struct VisionPatchEmbedFlatten {
     pub key: String,
     pub leading_dim: usize,
+    /// `true` when the on-disk conv weight is channels-LAST
+    /// (`[out, kt, kh, kw, in]`, MLX convention) and must be permuted to
+    /// `[out, in, kt, kh, kw]` before flattening so it pairs with the
+    /// channels-FIRST `[in, kt, kh, kw]` patch packing. `false` (the
+    /// default) does a plain reshape — correct for channels-first
+    /// (torch/SigLIP `[out, in, p, p]`) checkpoints.
+    pub channels_last: bool,
 }
 
 impl VisionPatchEmbedFlatten {
@@ -204,6 +220,7 @@ impl VisionPatchEmbedFlatten {
         Self {
             key: "visual.patch_embed.proj.weight".to_string(),
             leading_dim: 0,
+            channels_last: false,
         }
     }
 }
@@ -859,6 +876,10 @@ fn model_params_from_json(
     let vision_layout = extract_vision_layout(json);
     let vision_d_model_fingerprint = extract_vision_d_model_fingerprint(json);
     let vision_patch_embed_flatten = extract_vision_patch_embed_flatten(json);
+    let vision_pos_embed_key = json
+        .get("vision_pos_embed_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     let decoder_safetensors_prefix = json
         .get("decoder_safetensors_prefix")
         .and_then(|v| v.as_str())
@@ -884,6 +905,7 @@ fn model_params_from_json(
         vision_layout,
         vision_d_model_fingerprint,
         vision_patch_embed_flatten,
+        vision_pos_embed_key,
         decoder_safetensors_prefix,
         torch_dtype,
     })
@@ -922,18 +944,34 @@ fn extract_vision_patch_embed_flatten(json: &serde_json::Value) -> Option<Vision
     let obj = json.get("vision_patch_embed_flatten")?.as_object()?;
     let key = obj.get("key")?.as_str()?.to_string();
     let leading_dim = obj.get("leading_dim")?.as_u64()? as usize;
-    Some(VisionPatchEmbedFlatten { key, leading_dim })
+    let channels_last = obj
+        .get("channels_last")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(VisionPatchEmbedFlatten {
+        key,
+        leading_dim,
+        channels_last,
+    })
 }
 
-/// Extract `rope_scaling.mrope_section` as a fixed `[u32; 3]`. Returns
-/// `None` when the field is absent (every text-only arch) or has
-/// fewer than three entries (malformed configs are silently
-/// rejected — text-side fallback). Qwen2-VL writes it as
-/// `[16, 24, 24]`; Qwen2.5-VL the same. The values must sum to
-/// `head_dim/2`; that invariant is checked at emission time
-/// against `bounds["head_dim"]`.
+/// Extract `mrope_section` as a fixed `[u32; 3]`, from a TOP-LEVEL
+/// `mrope_section` first, else `rope_scaling.mrope_section`. Returns
+/// `None` when absent (every text-only arch) or malformed (<3 entries).
+/// Qwen2-VL/2.5-VL ship it under `rope_scaling` in the HF config (so the
+/// checkpoint carries it and the rope_scaling fingerprint still matches).
+/// Qwen3.5-VL DOESN'T carry it in the checkpoint (it's a model-code
+/// default `[11,11,10]`) — so its ferrite config sets it TOP-LEVEL,
+/// keeping `rope_scaling` absent (== the checkpoint) so the
+/// `HfFingerprint` rope_scaling_hash disambiguation still matches.
 fn extract_mrope_section(json: &serde_json::Value) -> Option<[u32; 3]> {
-    let arr = json.get("rope_scaling")?.get("mrope_section")?.as_array()?;
+    let arr = json
+        .get("mrope_section")
+        .or_else(|| {
+            json.get("rope_scaling")
+                .and_then(|rs| rs.get("mrope_section"))
+        })?
+        .as_array()?;
     if arr.len() < 3 {
         return None;
     }

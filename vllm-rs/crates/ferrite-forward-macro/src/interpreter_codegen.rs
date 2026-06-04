@@ -347,6 +347,10 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let a = lit_u32(a);
             quote! { LoadPixels(#a) }
         }
+        I::LoadPosEmbeds(a) => {
+            let a = lit_u32(a);
+            quote! { LoadPosEmbeds(#a) }
+        }
         I::GeluErf(a, b) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -875,6 +879,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::Gelu(..) => "Gelu",
         I::PosEmbed(..) => "PosEmbed",
         I::LoadPixels(..) => "LoadPixels",
+        I::LoadPosEmbeds(..) => "LoadPosEmbeds",
         I::GeluErf(..) => "GeluErf",
         I::EmbeddingGather(..) => "EmbeddingGather",
         I::AvgPool2d(..) => "AvgPool2d",
@@ -1184,6 +1189,10 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             _ => None,
         },
         I::LoadPixels(a) => match idx {
+            0 => u(a),
+            _ => None,
+        },
+        I::LoadPosEmbeds(a) => match idx {
             0 => u(a),
             _ => None,
         },
@@ -1880,6 +1889,10 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
         I::LoadPixels(_a) => match idx {
             0 => I::LoadPixels(n),
             _ => panic!("LoadPixels: bad idx {idx}"),
+        },
+        I::LoadPosEmbeds(_a) => match idx {
+            0 => I::LoadPosEmbeds(n),
+            _ => panic!("LoadPosEmbeds: bad idx {idx}"),
         },
         I::GeluErf(a, b) => match idx {
             0 => I::GeluErf(n, b),
@@ -2611,6 +2624,52 @@ pub fn colored_slot_map(
     let mut sm = SlotMap::new();
 
     for (dp, tile, slot) in pairs {
+        // Owners that are DIRECT inputs to the tile being defined at this
+        // position, WHEN that tile is a non-pointwise op (output element
+        // depends on input elements other than its own index). Such an op
+        // reads across its input while writing its output — a tiled gemm
+        // streams `input` from device across threadgroups (see
+        // `gemm_bf16_specialized`), vision RoPE reads the rotate-half
+        // partner, varlen attention reads every key/value in the segment.
+        // If the output reused an input's color (implicit in-place) one
+        // threadgroup's write clobbers a region another threadgroup still
+        // has to read → cross-threadgroup RAW/WAR corruption (gemm
+        // overflows to NaN; rope/attn silently wrong). So an input stays
+        // live THROUGH such a tile's def and must not be freed for that
+        // tile's own output.
+        //
+        // POINTWISE ops (Add/Mul/Gelu/…, and per-row RmsNorm with one
+        // threadgroup per row) are left untouched: `out[i]` reads only
+        // `in[i]`, so implicit in-place chain-collapse is safe and stays
+        // (preserves the elementwise color-chain coalescing + byte-
+        // equivalence across layers). Genuinely-safe element-wise in-place
+        // is also pinned explicitly via `output_alias` (collapses below).
+        //
+        // Op set: `Gemm` is shared with text, but text never coalesces it
+        // in-place (fused QKV / down-proj outputs are a DIFFERENT shape
+        // than their input, so the shape-partitioned pool can't reuse it);
+        // the exclusion is a no-op there and only bites Qwen3.5-VL's
+        // separate same-shape q/k/v gemms. `VisionRope` / `VarlenAttention`
+        // are vision-only opcodes (text uses `RopeAppend` / `Attention`).
+        let reads_across_input = matches!(
+            fuf.get(tile).op,
+            crate::classified::OpKind::Gemm
+                | crate::classified::OpKind::VisionRope
+                | crate::classified::OpKind::VarlenAttention
+        );
+        let cur_inputs: std::collections::HashSet<(TileId, u8)> = if reads_across_input {
+            fuf.get(tile)
+                .inputs
+                .iter()
+                .filter_map(|input| match input {
+                    FufInput::Tile { id, slot } => Some(resolve((*id, *slot))),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Free expired colors before allocating. `lu <= dp` is the
         // standard "use kills before def" semantics: a slot whose
         // last reader is the subgraph at `dp` dies after that
@@ -2618,9 +2677,11 @@ pub fn colored_slot_map(
         // color is reusable. Without `<=`, layer 0's body would
         // differ from layer 1's because the embed slot wouldn't
         // be freed in time for layer 0's add output to take its
-        // color, breaking byte-equivalence across layers.
-        active.retain(|&(lu, color, _ts)| {
-            if lu <= dp {
+        // color, breaking byte-equivalence across layers. Exception:
+        // a color last-read by THIS tile (its own input) is held one
+        // position longer (see `cur_inputs` above).
+        active.retain(|&(lu, color, ts)| {
+            if lu <= dp && !cur_inputs.contains(&ts) {
                 let s = color_shape[&color].clone();
                 free_colors_by_shape.entry(s).or_default().insert(color);
                 false

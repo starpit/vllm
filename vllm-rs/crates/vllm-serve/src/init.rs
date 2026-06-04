@@ -1559,9 +1559,9 @@ pub fn initialize_stack(
     // ferrite-vision::MmMetadata (collected via ferrite-forward's
     // inventory). vllm-serve names no arch; if no MM arch claims the
     // current HF architectures, the engine stays text-only.
-    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
     let hf_config = &core.hf_config;
-    #[cfg(all(feature = "multimodal", feature = "cuda"))]
+    #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
     if let Some(processor) = crate::multimodal::resolve(
         &hf_config.architectures,
         &hf_config.extra,
@@ -2741,7 +2741,7 @@ fn initialize_stack_tp(
         // See the single-rank `initialize_stack` path for the rationale;
         // this is the same call shape, threaded through the TP-init
         // engine instead.
-        #[cfg(all(feature = "multimodal", feature = "cuda"))]
+        #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
         if let Some(processor) = crate::multimodal::resolve(
             &hf_config.architectures,
             &hf_config.extra,

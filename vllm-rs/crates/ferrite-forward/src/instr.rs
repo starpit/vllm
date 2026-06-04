@@ -128,6 +128,12 @@ pub trait CanonicalParams: WeightAccessors {
     /// rank-3). Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`].
     const VISION_Q_SIZE: usize = 0;
+    /// Vision patch-embed input width = `in_chans * temporal_patch_size
+    /// * patch_size²` (Qwen3.5-VL: 3·2·16² = 1536). The rank-2 last-dim
+    /// of the `pixels` extern; the metal `LoadPixels` arm uses it to
+    /// size the copy-into-arena dispatch. Same defaults / set-by rule as
+    /// [`Self::VISION_NUM_HEADS`] (0 on non-vision arches).
+    const VISION_IN_FEATURES: usize = 0;
     /// Vision-tower softmax scale: `1 / sqrt(vision_head_dim)`. Same
     /// defaults / set-by rule as [`Self::VISION_NUM_HEADS`].
     const VISION_ATTN_SCALE: f32 = 0.0;
@@ -758,6 +764,16 @@ pub enum Instruction {
     /// exclusively by `vision_lowering::materialize_pixels` —
     /// never appears in any DSL.
     LoadPixels(u32),
+    /// Materialize the Qwen3.5-VL `pos_embeds` extern as a tile:
+    /// `(out_slot)`. The exact sibling of [`Self::LoadPixels`] — reads
+    /// `ctx.fwd.pos_embeds` (the rank-2 `[num_tokens, vision_embed_dim]`
+    /// host-interpolated learned positional embedding the
+    /// `vision_forward` wrapper writes onto `ForwardCtx`), D2D-copies it
+    /// into a fresh `OwnedTensor`, and publishes it at `out_slot` so the
+    /// downstream `add(pos_embeds, hidden_states)` reads it as an `Owned`
+    /// tile. Synthesized exclusively by
+    /// `vision_lowering::materialize_pos_embeds` — never appears in any DSL.
+    LoadPosEmbeds(u32),
     /// Erf-form GELU activation: same shape as `QuickGelu`. Distinct
     /// numerics (`0.5 * x * (1 + erf(x / sqrt(2)))`).
     GeluErf(u32, u32),
@@ -2420,6 +2436,26 @@ impl Instruction {
                     ctx.device.compute_stream,
                 )
                 .expect("LoadPixels D2D copy");
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
+            },
+            Instruction::LoadPosEmbeds(out_slot) => unsafe {
+                let view = ctx.fwd.pos_embeds.expect(
+                    "Instruction::LoadPosEmbeds invoked without ForwardCtx::pos_embeds — \
+                     caller (vision_forward host wrapper) must populate this view \
+                     (host-interpolated learned positional embedding) before driving \
+                     the vision interpreter, mirroring the pixels contract",
+                );
+                let raw = view.as_raw();
+                let shape: Vec<usize> = raw.shape().iter().map(|&d| d as usize).collect();
+                let owned = ctx.device.caching.alloc_tensor(&shape, raw.dtype());
+                let bytes = raw.size_bytes();
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*owned).raw_ptr(),
+                    raw.raw_ptr(),
+                    bytes,
+                    ctx.device.compute_stream,
+                )
+                .expect("LoadPosEmbeds D2D copy");
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(owned));
             },
             Instruction::FlashInferAttentionDecode(

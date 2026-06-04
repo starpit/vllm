@@ -484,6 +484,7 @@ impl Instruction {
                 vec![F::Slot(out_slot), F::LayerKind("Embedding")],
             ),
             Instruction::LoadPixels(out_slot) => ("LoadPixels", vec![F::Slot(out_slot)]),
+            Instruction::LoadPosEmbeds(out_slot) => ("LoadPosEmbeds", vec![F::Slot(out_slot)]),
             Instruction::EmbeddingGather(in_slot, out_slot, indices_kind) => (
                 "EmbeddingGather",
                 vec![

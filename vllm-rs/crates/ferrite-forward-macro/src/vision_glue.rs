@@ -101,6 +101,34 @@ pub fn emit_per_variant(
         .unwrap_or_else(crate::config::VisionPatchEmbedFlatten::qwen_default);
     let flatten_key_lit = syn::LitStr::new(&flatten.key, proc_macro2::Span::call_site());
     let flatten_lead_lit = proc_macro2::Literal::usize_unsuffixed(flatten.leading_dim);
+    let flatten_channels_last = flatten.channels_last;
+
+    // Construct the `VisionWrapper`, attaching the learned positional-
+    // embedding table host-side when the arch declares one
+    // (`vision_pos_embed_key`). The wrapper then runs
+    // `fast_pos_embed_interpolate` over it per forward and uploads the
+    // result as the `pos_embeds` extern. Other arches emit a plain
+    // `VisionWrapper::new`. `num_grid_per_side = sqrt(table rows)`.
+    let wrapper_ctor: TokenStream = match &model.vision_pos_embed_key {
+        ::std::option::Option::Some(key) => {
+            let key_lit = syn::LitStr::new(key, proc_macro2::Span::call_site());
+            quote! {{
+                let mut __vw = ::ferrite_forward::VisionWrapper::new(weights);
+                if let (
+                    ::std::option::Option::Some(__pe_tbl),
+                    ::std::option::Option::Some(__pe_shape),
+                ) = (gw.tensor_to_f32(#key_lit), gw.tensor_shape_any(#key_lit))
+                {
+                    let __ng = (__pe_shape[0] as f64).sqrt().round() as usize;
+                    __vw = __vw.with_pos_embed_table(__pe_tbl, __ng);
+                }
+                __vw
+            }}
+        }
+        ::std::option::Option::None => {
+            quote! { ::ferrite_forward::VisionWrapper::new(weights) }
+        }
+    };
 
     let embed_dim_lit = proc_macro2::Literal::u32_unsuffixed(embed_dim);
     let depth_lit = proc_macro2::Literal::u32_unsuffixed(depth);
@@ -240,9 +268,9 @@ pub fn emit_per_variant(
             unsafe fn vision_forward(
                 &self,
                 ctx: &::ferrite_forward::ForwardCtx<'_>,
-                device: &mut ::ferrite_cuda_core::device::GpuDevice,
+                device: &mut ::ferrite_cuda_core::GpuDevice,
                 num_tokens: u64,
-            ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+            ) -> ::ferrite_cuda_core::OwnedTensor {
                 unsafe { forward(self, ctx, device, num_tokens) }
             }
         }
@@ -282,15 +310,24 @@ pub fn emit_per_variant(
                 gw.tensor_shape_any(#flatten_key_lit)
             {
                 if pe.len() > 2 {
-                    let lead = pe[#flatten_lead_lit];
-                    let rest: usize = pe.iter().skip(#flatten_lead_lit + 1).product();
-                    gw.reshape_in_place(#flatten_key_lit, &[lead, rest])?;
+                    if #flatten_channels_last {
+                        // MLX channels-LAST conv weight ([out, kt,kh,kw, in]):
+                        // permute `in` to the front of the kernel dims, then
+                        // flatten, so it pairs with the channels-FIRST patch
+                        // packing. A plain reshape would mispair elements and
+                        // silently corrupt the high-variance patches.
+                        gw.flatten_conv_weight_channels_last(#flatten_key_lit, #flatten_lead_lit)?;
+                    } else {
+                        let lead = pe[#flatten_lead_lit];
+                        let rest: usize = pe.iter().skip(#flatten_lead_lit + 1).product();
+                        gw.reshape_in_place(#flatten_key_lit, &[lead, rest])?;
+                    }
                 }
             }
             #pad_prelude
             let weights = load(gw, stream, max_model_len, tp_rank)?;
             ::std::result::Result::Ok(::std::option::Option::Some(
-                ::std::boxed::Box::new(::ferrite_forward::VisionWrapper::new(weights))
+                ::std::boxed::Box::new(#wrapper_ctor)
                     as ::std::boxed::Box<dyn ::ferrite_forward::MultimodalForward>,
             ))
         }

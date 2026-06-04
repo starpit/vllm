@@ -1657,6 +1657,73 @@ impl GpuWeights {
         Ok(())
     }
 
+    /// Physically permute a **channels-last** conv weight to the
+    /// flattened 2D form the patch-embed gemm needs, moving the
+    /// trailing in-channels axis to the front of the kernel dims.
+    ///
+    /// MLX ships Conv3d/Conv2d weights channels-LAST, e.g. Qwen3.5-VL's
+    /// `vision_tower.patch_embed.proj.weight` is `[out, kt, kh, kw, in]`.
+    /// The Conv's forward `moveaxis(in→last)` on the input means the
+    /// equivalent gemm pairs each patch (packed channels-FIRST as
+    /// `[in, kt, kh, kw]` by the processor / mlx `reshape(-1,C,T,P,P)`)
+    /// with the weight flattened in the SAME `[in, kt, kh, kw]` order.
+    /// A plain `reshape_in_place` keeps the on-disk `[kt,kh,kw,in]`
+    /// order, mispairing every element — the dot product is only
+    /// order-invariant for uniform patches, so it silently corrupts the
+    /// high-variance (image-content) patches and leaves the flat
+    /// background ones correct. This moves `in` to the front and
+    /// flattens to `[out, in*kt*kh*kw]`. `leading_dim` is the output
+    /// axis (0); all axes after it are the conv dims, the LAST of which
+    /// is in-channels.
+    pub fn flatten_conv_weight_channels_last(
+        &mut self,
+        name: &str,
+        leading_dim: usize,
+    ) -> Result<()> {
+        let cpu_ref = self.tensors.get_mut(name).ok_or_else(|| {
+            anyhow::anyhow!("flatten_conv_weight_channels_last: not found: {name}")
+        })?;
+        let shape = cpu_ref.shape.clone();
+        anyhow::ensure!(
+            leading_dim + 2 < shape.len(),
+            "flatten_conv_weight_channels_last: {name} shape {shape:?} needs >=2 conv dims after \
+             leading_dim {leading_dim}",
+        );
+        let lead: usize = shape[..=leading_dim].iter().product(); // = out
+        // conv dims after leading_dim: [k0, k1, ..., k_{m-1}, in]
+        let conv = &shape[leading_dim + 1..];
+        let in_ch = *conv.last().unwrap();
+        let kdims = &conv[..conv.len() - 1];
+        let kprod: usize = kdims.iter().product(); // kt*kh*kw
+        let rest = in_ch * kprod;
+        let elem = cpu_ref.dtype.size_bytes();
+        let total_bytes = lead * rest * elem;
+        let src = cpu_ref.data();
+        anyhow::ensure!(
+            src.len() == total_bytes,
+            "flatten_conv_weight_channels_last: {name} byte len {} != shape {shape:?} × elem {elem}",
+            src.len(),
+        );
+        // src row-major [out, kdims..., in]: src_flat = (out*kprod + kidx)*in_ch + ic
+        // dst row-major [out, in, kdims...]:  dst_flat =  out*rest + ic*kprod + kidx
+        let mut buf = vec![0u8; total_bytes];
+        for out in 0..lead {
+            for kidx in 0..kprod {
+                for ic in 0..in_ch {
+                    let s = ((out * kprod + kidx) * in_ch + ic) * elem;
+                    let d = (out * rest + ic * kprod + kidx) * elem;
+                    buf[d..d + elem].copy_from_slice(&src[s..s + elem]);
+                }
+            }
+        }
+        cpu_ref.mmap = None;
+        cpu_ref.data_offset = 0;
+        cpu_ref.size_bytes = total_bytes;
+        cpu_ref.shape = vec![lead, rest];
+        cpu_ref.owned = Some(Arc::new(buf));
+        Ok(())
+    }
+
     /// Zero-pad a 2D weight's `dim` axis (0 or 1) to the next multiple
     /// of `mult` at CPU side, before any `take`/`take_with_shape` runs.
     /// The CpuTensorRef switches from mmap-backed to owned-backed: an
@@ -1744,6 +1811,32 @@ impl GpuWeights {
             return Some(vec![s.nrows, s.ncols]);
         }
         None
+    }
+
+    /// Read a CPU-side weight and convert to `f32`, regardless of its
+    /// on-disk dtype (bf16 / f16 / f32). For host-side preprocessing that
+    /// can't run on the GPU — e.g. Qwen3.5-VL's `fast_pos_embed_interpolate`
+    /// over the learned `pos_embed.weight`. Returns `None` if the tensor is
+    /// absent or quantized (not a plain dense float).
+    pub fn tensor_to_f32(&self, name: &str) -> Option<Vec<f32>> {
+        let r = self.tensors.get(name)?;
+        let bytes = r.data();
+        let v = match r.dtype {
+            DType::F32 => bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            DType::BF16 => bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect(),
+            DType::F16 => bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect(),
+            _ => return None,
+        };
+        Some(v)
     }
 
     /// Get a tensor by name (copies to GPU). For read-only access.

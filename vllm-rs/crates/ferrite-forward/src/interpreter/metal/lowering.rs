@@ -474,6 +474,18 @@ pub fn lower<W: CanonicalParams>(
     let mut barrier_before: Vec<bool> = Vec::with_capacity(instructions.len());
     let mut splitk_scratch_bytes: u32 = 0;
     let mut moe_scratch_bytes: u32 = 0;
+    // Shape state for the dimensionless vision arms (`Gelu`,
+    // `MeanSubRmsNormBiasAdd`, vision `Add`) and the merger's row
+    // reduction. `cur_width` tracks the activation row-width (set by
+    // each `Gemm`'s output-N and the merger `Reshape`'s static col dim);
+    // `m_divisor` tracks the row-count divisor in force (1 normally,
+    // `vision_merge_factor` after the merger reshape). Updated by
+    // `update_shape_state` after each instruction is lowered, so each
+    // arm sees the state in force AT its position. Text arches never set
+    // a non-1 divisor (their reshapes carry `dims_div = 1`), so this is
+    // inert outside vision towers.
+    let mut cur_width: u32 = 0;
+    let mut m_divisor: u32 = 1;
     let mut i = 0usize;
     // Macro-static-aligned barrier accessor: the macro emits one bool
     // per `Instruction` (pre-loop-unrolling). Loop expansion at
@@ -522,7 +534,10 @@ pub fn lower<W: CanonicalParams>(
                             &mut splitk_scratch_bytes,
                             &mut moe_scratch_bytes,
                             profile,
+                            cur_width,
+                            m_divisor,
                         )?;
+                        update_shape_state(inst, &mut cur_width, &mut m_divisor);
                         let n_cmds = cmds.len();
                         commands.extend(cmds);
                         if n_cmds >= 1 {
@@ -543,7 +558,10 @@ pub fn lower<W: CanonicalParams>(
                     &mut splitk_scratch_bytes,
                     &mut moe_scratch_bytes,
                     profile,
+                    cur_width,
+                    m_divisor,
                 )?;
+                update_shape_state(other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -571,6 +589,45 @@ pub fn lower<W: CanonicalParams>(
         splitk_scratch_bytes,
         moe_scratch_bytes,
     })
+}
+
+/// Abstract-interpret the activation shape across the instruction
+/// stream so the dimensionless vision arms can recover the width / row
+/// count the macro already solved (see `feedback_we_are_a_compiler` —
+/// the info is read from the IR, not re-derived).
+///
+/// - `cur_width` (row-width): set by each `Gemm`'s output-N and by the
+///   merger `Reshape`'s static (num_tokens-independent) col dim. The
+///   `MeanSubRmsNormBiasAdd` (LayerNorm HIDDEN) and `Gelu` (cols) arms
+///   read it; the vision `Add` arm reads it as the residual width.
+/// - `m_divisor` (row divisor): the merger `Reshape`
+///   `[num_tokens / vision_merge_factor, vision_merge_hidden]` carries
+///   `dims_div_lit[row_axis] = vision_merge_factor`; every op after it
+///   operates on `bucket_m / vision_merge_factor` rows. Text reshapes
+///   carry `dims_div = 1`, so this never fires outside vision towers.
+fn update_shape_state(inst: &Instruction, cur_width: &mut u32, m_divisor: &mut u32) {
+    use Instruction as I;
+    match inst {
+        // A dense GEMM publishes a `[*, n]` activation.
+        I::Gemm(_, _, _, n, _) => {
+            *cur_width = *n;
+        }
+        // The merger reshape `[num_tokens / div, width]`: the
+        // num_tokens-scaling axis (`dims_nt_pow != 0`) carries the row
+        // divisor; the static axis (`dims_nt_pow == 0`) is the new width.
+        I::Reshape(_, _, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
+            for ax in 0..(*ndim as usize).min(dims_lit.len()) {
+                if dims_nt_pow[ax] != 0 {
+                    if dims_div_lit[ax] > 1 {
+                        *m_divisor = dims_div_lit[ax];
+                    }
+                } else {
+                    *cur_width = dims_lit[ax];
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Lower one non-`Loop` instruction to zero, one, or many
@@ -606,7 +663,24 @@ fn lower_one<W: CanonicalParams>(
     splitk_scratch_bytes: &mut u32,
     moe_scratch_bytes: &mut u32,
     profile: Option<&ferrite_metal_kernels::ferrite_metal_targets::MetalTargetProfile>,
+    // Shape state threaded by `lower()` (see [`ShapeState`]). `cur_width`
+    // is the current activation row-width (← each `Gemm`'s output-N, or
+    // the merger `Reshape`'s static col dim) — the dimensionless vision
+    // `Gelu` / LayerNorm arms read it. `m_divisor` is the row-count
+    // divisor in force (1 normally; `vision_merge_factor` after the
+    // merger reshape) so post-merge ops dispatch over `bucket_m /
+    // m_divisor` rows.
+    cur_width: u32,
+    m_divisor: u32,
 ) -> Result<Vec<LoweredCommand>, LoweringError> {
+    // `eff_m` = the live row count this op operates on at the bucket
+    // level. For everything before the merger reshape this is `bucket_m`;
+    // for the merger's `[num_tokens / vision_merge_factor, ...]` ops it
+    // shrinks by the merge factor. m_scaling's `bucket_m` field stays the
+    // FULL bucket so the runtime `num_tokens` rescale is relative to the
+    // whole bucket (correct for both partial-bucket prefill and the
+    // num_tokens == bucket_m vision golden path).
+    let eff_m = bucket_m / m_divisor.max(1);
     // Quiet the "unused mut" warning until the I::FusedMoe / I::SharedFusedMoe
     // arms land; the variable is threaded so the MoE lowering pass can grow
     // the bucket's scratch footprint as it stamps Binding::MoeScratch offsets.
@@ -799,7 +873,13 @@ fn lower_one<W: CanonicalParams>(
             // hypothetical hand-rolled GEMM tile shader could still
             // consume it. Tile values are placeholders; the actual
             // execution path picks its own.
-            let tg_x = bucket_m.div_ceil(GEMM_TILE_M);
+            // `eff_m` shrinks by the merge factor for the merger's
+            // post-reshape GEMMs (`[num_tokens / vision_merge_factor,
+            // vision_merge_hidden]`); == bucket_m everywhere else. The
+            // bf16 GEMM path bakes M from `gemm_dims.m` (m_scaling is
+            // forced None for it in the worker), so the divisor MUST land
+            // on `gemm_dims.m`, not just the placeholder dispatch.
+            let tg_x = eff_m.div_ceil(GEMM_TILE_M);
             let tg_y = (*n).div_ceil(GEMM_TILE_N);
             LoweredCommand {
                 kernel: KernelId::Gemm,
@@ -842,7 +922,7 @@ fn lower_one<W: CanonicalParams>(
                     },
                 ],
                 gemm_dims: Some(GemmDims {
-                    m: bucket_m,
+                    m: eff_m,
                     n: *n,
                     k: *k,
                 }),
@@ -2627,11 +2707,21 @@ fn lower_one<W: CanonicalParams>(
             // Token-parallel kernel reads element count from dispatch
             // shape; no function constants.
             constants: Vec::new(),
-            // Token-parallel; reduction is per-element so the
-            // dispatch covers `M * hidden_size` elements.
+            // Token-parallel; reduction is per-element so the dispatch
+            // covers `M * width` elements. Width is `W::Q_SIZE` on the
+            // text path (the residual stream); on vision towers
+            // (`VISION_Q_SIZE > 0`) the text `Q_SIZE` is garbage (the
+            // config lacks text fields), so use the shape-tracked
+            // `cur_width` (the residual width = vision_embed_dim at every
+            // residual add). `eff_m` is bucket_m for these block-residual
+            // adds (they precede the merger reshape).
             dispatch: {
-                let mut d =
-                    DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
+                let add_width: u32 = if W::VISION_Q_SIZE > 0 {
+                    cur_width
+                } else {
+                    W::Q_SIZE as u32
+                };
+                let mut d = DispatchShape::dispatch_1d(eff_m * add_width, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
@@ -2717,7 +2807,11 @@ fn lower_one<W: CanonicalParams>(
             ),
             constants: vec![ConstantValue::uint(0, *n)],
             dispatch: {
-                let mut d = DispatchShape::dispatch_1d(bucket_m * *n, THREADS_PER_GROUP);
+                // `eff_m * n` baseline (eff_m shrinks by the merge factor
+                // for the merger's post-reshape bias_adds); m_scaling
+                // keeps the FULL bucket_m so the runtime num_tokens
+                // rescale stays relative to the whole bucket.
+                let mut d = DispatchShape::dispatch_1d(eff_m * *n, THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
@@ -3061,6 +3155,346 @@ fn lower_one<W: CanonicalParams>(
             return Ok(cmds);
         }
 
+        // ── Vision LayerNorm-with-bias (Qwen3.5-VL ViT norm1/norm2/
+        //    merger.norm) ────────────────────────────────────────────
+        //
+        // Faithful to the cuda `Instruction::MeanSubRmsNormBiasAdd` eval
+        // (`instr.rs`): one fused `(x-mean)*rsqrt(var+eps)*weight + bias`
+        // pass over the row-width. The `vision_layernorm` kernel does one
+        // threadgroup per row; `LN_HIDDEN` is the shape-tracked residual
+        // width (`cur_width` = vision_embed_dim at every norm site) and
+        // `LN_M` / the grid are `eff_m` (= bucket_m here — all three
+        // norms precede the merger reshape). Weight + bias resolve from
+        // one `WeightBundleKind::LayerNorm` bundle at the same locator,
+        // mirroring the multi-tensor `GatedDeltaNet` binding pattern.
+        I::MeanSubRmsNormBiasAdd(in_slot, out_slot, layer) => {
+            let layer_id = super::ids::LayerId(*layer + layer_offset);
+            let locator = WeightLocator {
+                bucket: tape_index,
+                op_idx: index as u32,
+                slot: 0,
+            };
+            LoweredCommand {
+                kernel: KernelId::VisionLayerNorm,
+                library: "vision_layernorm",
+                function: vision_layernorm_static_name(W::METAL_DTYPE),
+                constants: vec![
+                    ConstantValue::uint(0, eff_m),
+                    ConstantValue::uint(1, cur_width),
+                    ConstantValue::float(2, W::RMS_NORM_EPS),
+                ],
+                dispatch: DispatchShape {
+                    threadgroups: (eff_m, 1, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LayerNorm,
+                        which: WeightTensor::Weight,
+                        layer: layer_id,
+                        locator,
+                        binding_index: 2,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::LayerNorm,
+                        which: WeightTensor::Bias,
+                        layer: layer_id,
+                        locator,
+                        binding_index: 3,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Vision standalone tanh-approx GELU (ViT MLP / merger MLP) ─
+        //
+        // Faithful to the cuda `Instruction::Gelu` eval
+        // (`kernels::gelu_tanh_inplace`). Flat token-parallel; `n` =
+        // bucket-level element count `eff_m * cur_width`, so the merger's
+        // post-reshape gelu (`eff_m = bucket_m / vision_merge_factor`,
+        // `cur_width = vision_merge_hidden`) shrinks rows by the merge
+        // factor for free. The `gelu_tanh` kernel guards `gid >= n`, so
+        // the m_scaling tail and any padding rows are no-ops. `n` is the
+        // kernel's runtime `constant uint& n` at buffer(2) — bound as a
+        // `setBytes` inline value (NOT a function constant).
+        I::Gelu(in_slot, out_slot) => {
+            let n_elems = eff_m * cur_width;
+            LoweredCommand {
+                kernel: KernelId::VisionGelu,
+                library: "activation",
+                function: gelu_tanh_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: n_elems,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Vision pixels materialization (Qwen3.5-VL ViT prelude) ──
+        //
+        // Faithful to the cuda `Instruction::LoadPixels` eval (a D2D
+        // copy of `ForwardCtx::pixels` into a fresh tile). Here the
+        // pixels live in the `Pixels` runtime extern (overwritten per
+        // forward); `copy_rows` blits them into the arena `out_slot` the
+        // patch_embed GEMM reads. `n` = bucket-level pixel count
+        // `eff_m * VISION_IN_FEATURES` (LoadPixels is the prelude op, so
+        // eff_m == bucket_m); m_scaling shrinks the grid to live
+        // num_tokens and the kernel's `gid >= n` guard caps the tail.
+        I::LoadPixels(out_slot) => {
+            let n_elems = eff_m * W::VISION_IN_FEATURES as u32;
+            LoweredCommand {
+                kernel: KernelId::VisionLoadPixels,
+                library: "elementwise",
+                function: copy_rows_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::Pixels,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: n_elems,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Vision pos_embeds materialization (Qwen3.5-VL ViT) ──────
+        //
+        // The exact sibling of the `LoadPixels` arm above: `copy_rows`
+        // blits the host-interpolated learned positional embedding from
+        // the `VisionPosEmbeds` runtime extern into the arena `out_slot`
+        // that the downstream `add(pos_embeds, hidden_states)` consumes.
+        // `n` = `eff_m * VISION_Q_SIZE` — VISION_Q_SIZE (=
+        // vision_num_heads * vision_head_dim) is the residual-stream
+        // width (= vision_embed_dim), matching the patch_embed output
+        // pos_embeds is added to. m_scaling shrinks the grid to live
+        // num_tokens; the kernel's `gid >= n` guard caps the tail.
+        I::LoadPosEmbeds(out_slot) => {
+            let n_elems = eff_m * W::VISION_Q_SIZE as u32;
+            LoweredCommand {
+                kernel: KernelId::VisionLoadPixels,
+                library: "elementwise",
+                function: copy_rows_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::VisionPosEmbeds,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: n_elems,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Vision 2D NeoX RoPE (Qwen3.5-VL ViT) ────────────────────
+        //
+        // `vision_rope_2d` rotates ONE tensor per dispatch, so q and k
+        // get one command each. The kernel reads `freqs` (f32, the
+        // VisionRopeFreqs runtime extern) and computes cos/sin
+        // internally; output and input are DISTINCT arena slots
+        // (VisionRopeImpl declares no `output_alias`, so liveness
+        // coloring keeps them separate — required because the kernel
+        // reads a rotate_half `partner` element, so in-place would race
+        // across threadgroups). Faithful to the cuda
+        // `Instruction::VisionRope` eval (rotate_half on `[L, H, D]`).
+        I::VisionRope(q_slot, k_slot, q_out_slot, k_out_slot) => {
+            let hd = W::VISION_HEAD_DIM;
+            let nh = W::VISION_NUM_HEADS;
+            // N_ELEMS guard = L * H * D = eff_m * VISION_Q_SIZE (rope is
+            // a per-block op, so eff_m == bucket_m). m_scaling rescales
+            // the grid to the live num_tokens; the function-constant
+            // guard caps it at the baked bucket level.
+            let n_elems = eff_m * W::VISION_Q_SIZE as u32;
+            let consts = || {
+                vec![
+                    ConstantValue::uint(0, hd),
+                    ConstantValue::uint(1, nh),
+                    ConstantValue::uint(2, n_elems),
+                ]
+            };
+            let dispatch = || {
+                let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
+                d
+            };
+            let rope_cmd = |out_slot: u32, in_slot: u32| LoweredCommand {
+                kernel: KernelId::VisionRope,
+                library: "vision_rope_2d",
+                function: vision_rope_2d_static_name(W::METAL_DTYPE),
+                constants: consts(),
+                dispatch: dispatch(),
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::VisionRopeFreqs,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            };
+            return Ok(vec![
+                rope_cmd(*q_out_slot, *q_slot),
+                rope_cmd(*k_out_slot, *k_slot),
+            ]);
+        }
+
+        // ── Vision bidirectional varlen attention (Qwen3.5-VL ViT) ──
+        //
+        // Faithful to the cuda `Instruction::VarlenAttention` eval
+        // (cacheless, non-causal, per-segment SDPA, scale =
+        // VISION_ATTN_SCALE). Qwen3.5-VL emits cu_seqlens_kind == 0, so
+        // the segment boundaries come from the existing `CuSeqlensQ`
+        // runtime binding (the vision wrapper writes the per-image
+        // cu_seqlens into `ForwardCtx::cu_seqlens_q`). `VA_NUM_SEGS` is
+        // baked to `bucket_m` — a safe upper bound: the kernel's
+        // segment-search loop breaks at the first containing segment
+        // (O(1) for the common full-image case), and zero-padded
+        // cu_seqlens entries past the real segments form empty ranges
+        // that never match. q/k/v/out are `[L, H, D]` token-major.
+        I::VarlenAttention(q_slot, k_slot, v_slot, out_slot, cu_seqlens_kind) => {
+            if *cu_seqlens_kind != 0 {
+                // kind 1 (full) / 2 (window) are Qwen2.5-VL windowed
+                // attention; their cu_seqlens externs aren't wired on
+                // metal yet (Qwen3.5-VL is single-segment, kind 0).
+                return Err(LoweringError::UnsupportedVariant {
+                    index,
+                    variant_type: "VarlenAttention(cu_seqlens_kind != 0) \
+                                   — metal vision attention only wires kind 0 \
+                                   (Qwen3.5-VL); window attention is unported",
+                });
+            }
+            let hd = W::VISION_HEAD_DIM;
+            let nh = W::VISION_NUM_HEADS;
+            LoweredCommand {
+                kernel: KernelId::VisionVarlenAttn,
+                library: "vision_varlen_attn",
+                function: vision_varlen_attn_static_name(W::METAL_DTYPE),
+                constants: vec![
+                    ConstantValue::uint(0, hd),
+                    ConstantValue::uint(1, nh),
+                    // Safe upper bound on segment count (= max tokens);
+                    // padded cu_seqlens entries are empty no-ops.
+                    ConstantValue::uint(2, bucket_m),
+                    // VA_N_TOKENS guard (= bucket_m; m_scaling shrinks the
+                    // grid to live num_tokens, the guard caps the tail).
+                    ConstantValue::uint(3, eff_m),
+                    ConstantValue::float(4, W::VISION_ATTN_SCALE),
+                ],
+                dispatch: {
+                    // 1 thread per (query token, head); 64 threads/tg.
+                    let mut d = DispatchShape::dispatch_1d(eff_m * nh, 64);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *q_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *k_slot,
+                        binding_index: 2,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *v_slot,
+                        binding_index: 3,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::CuSeqlensQ,
+                        binding_index: 4,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Metadata-only: no Metal dispatch ───────────────────────
         I::Reshape(_, _, _, _, _, _) | I::Alias(_, _) | I::Free(_) => {
             // These rebind / drop slots in the dispatcher's logical
@@ -3068,6 +3502,60 @@ fn lower_one<W: CanonicalParams>(
             // in the lowered tape see the new logical shape via the
             // worker's slot tracker (resolved at worker init).
             return Ok(Vec::new());
+        }
+
+        // ── Multimodal embed splice (VL text decoder) ──────────────
+        //
+        // Scatter the projected vision embeddings into the text
+        // embedding stream at the image-placeholder rows. Faithful to
+        // the cuda `Instruction::SpliceMmEmbeds` eval (a per-patch D2D
+        // memcpy), but expressed as one scatter kernel: each source row
+        // `s` of `mm_embeds` is copied to text-embedding row
+        // `dst_rows[s]` (or skipped when `dst_rows[s] == u32::MAX`,
+        // which covers text-only batches AND the padding tail past
+        // `total_mm`). `slot` is the Embed-output arena tile (in/out —
+        // `MmEmbedSpliceImpl` aliases its output onto this input).
+        // `n` = `bucket_m * HIDDEN_SIZE` (safe upper bound: total_mm <=
+        // num_tokens <= bucket_m); m_scaling shrinks the grid to the
+        // live num_tokens. HIDDEN_SIZE is the residual width (matches
+        // the `Embed` arm; mm_embeds rows are HIDDEN_SIZE wide).
+        I::SpliceMmEmbeds(slot) => {
+            let hidden = W::HIDDEN_SIZE as u32;
+            let n_elems = bucket_m * hidden;
+            LoweredCommand {
+                kernel: KernelId::MmEmbedSplice,
+                library: "elementwise",
+                function: mm_embed_splice_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *slot,
+                        binding_index: 0,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::MmEmbeds,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: RuntimeBindingKind::MmDstRows,
+                        binding_index: 2,
+                    },
+                    Binding::Inline {
+                        binding_index: 3,
+                        value: hidden,
+                    },
+                ],
+                gemm_dims: None,
+            }
         }
 
         // ── Loop already handled by the caller ─────────────────────
@@ -3182,6 +3670,67 @@ fn gdn_rms_norm_gated_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gdn_rms_norm_gated_f16",
         DequantDtype::Bf16 => "gdn_rms_norm_gated_bf16",
+    }
+}
+
+/// `vision_layernorm.metal` host-name picker. The ViT is unquantized
+/// (bf16); Int4 is unreachable (no quantized vision tower today).
+fn vision_layernorm_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "vision_layernorm_f16",
+        MetalDtype::Bf16 => "vision_layernorm_bf16",
+        MetalDtype::Int4 => {
+            panic!("vision_layernorm: Int4 unsupported (vision tower is unquantized bf16/f16)")
+        }
+    }
+}
+
+/// `activation.metal` `gelu_tanh` (tanh-approx GELU) host-name picker.
+fn gelu_tanh_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "gelu_tanh_f16",
+        MetalDtype::Bf16 => "gelu_tanh_bf16",
+        MetalDtype::Int4 => {
+            panic!("gelu_tanh: Int4 unsupported (activations are bf16/f16)")
+        }
+    }
+}
+
+/// `vision_rope_2d.metal` host-name picker.
+fn vision_rope_2d_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "vision_rope_2d_f16",
+        MetalDtype::Bf16 => "vision_rope_2d_bf16",
+        MetalDtype::Int4 => panic!("vision_rope_2d: Int4 unsupported (vision tower is bf16/f16)"),
+    }
+}
+
+/// `vision_varlen_attn.metal` host-name picker.
+fn vision_varlen_attn_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "vision_varlen_attn_f16",
+        MetalDtype::Bf16 => "vision_varlen_attn_bf16",
+        MetalDtype::Int4 => {
+            panic!("vision_varlen_attn: Int4 unsupported (vision tower is bf16/f16)")
+        }
+    }
+}
+
+/// `elementwise.metal` `copy_rows` host-name picker (LoadPixels blit).
+fn copy_rows_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "copy_rows_f16",
+        MetalDtype::Bf16 => "copy_rows_bf16",
+        MetalDtype::Int4 => panic!("copy_rows: Int4 unsupported (pixels are bf16/f16)"),
+    }
+}
+
+/// `elementwise.metal` `mm_embed_splice` host-name picker (MM splice).
+fn mm_embed_splice_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "mm_embed_splice_f16",
+        MetalDtype::Bf16 => "mm_embed_splice_bf16",
+        MetalDtype::Int4 => panic!("mm_embed_splice: Int4 unsupported (embeds are bf16/f16)"),
     }
 }
 

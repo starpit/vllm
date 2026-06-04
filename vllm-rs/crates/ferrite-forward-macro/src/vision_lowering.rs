@@ -81,6 +81,55 @@ pub(crate) fn materialize_pixels(fuf: &mut Fuf) {
     }
 }
 
+/// Synthesize a single `LoadPosEmbeds` tile and rewire every
+/// `FufInput::Extern { kind: PosEmbeds, .. }` to read it. The exact
+/// sibling of [`materialize_pixels`] for Qwen3.5-VL's host-interpolated
+/// learned positional embedding (consumed by `add(pos_embeds, …)` after
+/// patch_embed). No-op when the FUF carries no PosEmbeds-extern
+/// reference (any tower without a learned pos-embed).
+pub(crate) fn materialize_pos_embeds(fuf: &mut Fuf) {
+    let needs_load = fuf.nodes.iter().any(|node| {
+        node.inputs.iter().any(|i| {
+            matches!(
+                i,
+                FufInput::Extern {
+                    kind: ExternKind::PosEmbeds,
+                    ..
+                }
+            )
+        })
+    });
+    if !needs_load {
+        return;
+    }
+
+    let load_id = TileId(fuf.nodes.len() as u32);
+    fuf.nodes.push(FufNode {
+        id: load_id,
+        op: OpKind::LoadPosEmbeds,
+        inputs: Vec::new(),
+        outputs: vec![extern_shape(ExternKind::PosEmbeds)],
+    });
+
+    for node in &mut fuf.nodes {
+        if node.id == load_id {
+            continue;
+        }
+        for input in &mut node.inputs {
+            if let FufInput::Extern {
+                kind: ExternKind::PosEmbeds,
+                ..
+            } = input
+            {
+                *input = FufInput::Tile {
+                    id: load_id,
+                    slot: 0,
+                };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -464,6 +464,16 @@ pub fn apply_signature(
                      when inserting the node post-FUF-build"
                 .into(),
         }),
+        // Same story as LoadPixels: synthesized post-FUF-build with its
+        // output shape written directly by materialize_pos_embeds.
+        OpKind::LoadPosEmbeds => Err(ShapeError::BadArgs {
+            op: OpKind::LoadPosEmbeds,
+            reason: "apply_signature should not be called on LoadPosEmbeds; \
+                     the vision_lowering::materialize_pos_embeds pass sets \
+                     FufNode.outputs[0] to extern_shape(PosEmbeds) directly \
+                     when inserting the node post-FUF-build"
+                .into(),
+        }),
         // Row-permutation gather: shape-preserving on x. The indices
         // arg is a vision extern with an opaque empty Shape (rank-1
         // u32 of length L), so unification against x's leading dim
@@ -985,6 +995,9 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // LoadPixels has zero FUF inputs (the tile is materialized
         // from `ctx.fwd.pixels` at runtime), so no weight-arg ranks.
         OpKind::LoadPixels => &[],
+        // LoadPosEmbeds: same as LoadPixels — zero FUF inputs (tile
+        // materialized from `ctx.fwd.pos_embeds` at runtime).
+        OpKind::LoadPosEmbeds => &[],
         // EmbeddingGather: arg 0 is a tile, arg 1 is a vision extern
         // (no rank assertion via this table — extern_shape arms carry
         // empty Shape for the indices externs).
@@ -1066,6 +1079,13 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
         // (N = `vision_num_positions`) per image; consumed by
         // `OpKind::PosEmbed` via `kernels::embedding_gather_masked`.
         ExternKind::PositionIds => vec![Dim::Bound("num_tokens".into())],
+        // Qwen3.5-VL host-interpolated positional embedding, added to
+        // the patch-embed output, so its inner dim is the residual
+        // width `vision_embed_dim` (= vision_num_heads * vision_head_dim).
+        ExternKind::PosEmbeds => vec![
+            Dim::Bound("num_tokens".into()),
+            Dim::Bound("vision_embed_dim".into()),
+        ],
     }
 }
 

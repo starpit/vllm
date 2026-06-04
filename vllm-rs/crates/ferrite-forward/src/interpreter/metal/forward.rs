@@ -85,6 +85,122 @@ pub struct ForwardInputs<'a> {
     /// forward (GDN kernels treat its state as zero). `None` for
     /// non-hybrid arches.
     pub gdn_is_fresh: Option<&'a [u32]>,
+    /// Vision 2D-RoPE angle table (`freqs`, f32) as raw bytes. `None`
+    /// for non-vision arches; required for any bucket that runs
+    /// `Instruction::VisionRope`. Carried as bytes so the worker copies
+    /// it verbatim into `RuntimeBindings::vision_rope_freqs` regardless
+    /// of element dtype.
+    pub vision_rope_freqs: Option<&'a [u8]>,
+    /// Vision patch pixel rows (`[num_tokens, vision_in_features]`,
+    /// model dtype) as raw bytes. `None` for non-vision arches;
+    /// required for any bucket that runs `Instruction::LoadPixels`.
+    pub pixels: Option<&'a [u8]>,
+    /// Qwen3.5-VL host-interpolated learned positional embedding
+    /// (`[num_tokens, vision_embed_dim]`, model dtype) as raw bytes.
+    /// `None` for non-vision arches and towers without a learned
+    /// positional embedding; required for any bucket that runs
+    /// `Instruction::LoadPosEmbeds`. (Field name matches the macro's
+    /// emitted `ForwardInputs { .., pos_embeds }` shorthand, which reads
+    /// `ctx.pos_embeds`; the worker copies it into
+    /// `RuntimeBindings::vision_pos_embeds`.)
+    pub pos_embeds: Option<&'a [u8]>,
+    /// Projected vision embeddings (`[total_mm, hidden]`, model dtype) as
+    /// raw bytes, for the multimodal splice. `None` for text-only
+    /// forwards / non-MM arches.
+    pub mm_embeds: Option<&'a [u8]>,
+    /// Per-`mm_embeds`-row destination text-embedding row (`u32::MAX` =
+    /// skip), `[num_tokens]`. Built by the worker from `embed_patches`;
+    /// `None` for arches without the splice.
+    pub mm_dst_rows: Option<&'a [u32]>,
+    /// MRoPE per-token cos/sin override table (`[num_tokens, ROT_DIM]`,
+    /// model dtype) as raw bytes. `Some` only on MRoPE text decoders
+    /// (`W::MROPE_SECTION.is_some()`), where the macro forward builds it
+    /// from the `[3, num_tokens]` positions each forward and the worker
+    /// copies it into `RuntimeBindings::mrope_cos_sin` (the rope kernel
+    /// reads it in place of the static cos/sin cache, with identity
+    /// positions). `None` for 1D-rope arches.
+    pub mrope_cos_sin: Option<&'a [u8]>,
+}
+
+/// Build the per-token MRoPE cos/sin override table for the text decoder
+/// (option (b): per-token table + identity positions).
+///
+/// Returns `[n_tokens, rot_dim]` rows in `dtype` (the rope kernel's
+/// element type), laid out `[cos(0..half) | sin(half..rot_dim)]` per row —
+/// byte-identical to a single row of the static
+/// [`ferrite_kernels::rotary::RotaryCache`] cos/sin cache, so binding it
+/// in place of that cache (with `positions[t] = t`) is a no-op for the
+/// kernel math. The angle math mirrors
+/// `RotaryCache::new_partial_from_gpuweights` exactly
+/// (`inv_freq[i] = θ^(-2i/rot_dim)`, `angle = pos·inv_freq[i]`, cos/sin in
+/// `f32`, then cast), so the 1D (text) case matches the legacy path to the
+/// bit.
+///
+/// `positions` is either `[n_tokens]` (1D — every band uses the same
+/// position, e.g. pure-text / decode) or `[3·n_tokens]` (MRoPE: rows
+/// T,H,W). `mrope_section` is the `[T, H, W]` rotary-pair split (sums to
+/// `rot_dim/2`); pair `i` rotates under T if `i < T`, H if `i < T+H`, else
+/// W. No-scaling only (Qwen3.5-VL is partial-rotary with no rope_scaling).
+pub fn build_mrope_cos_sin_override(
+    positions: &[u32],
+    n_tokens: usize,
+    rot_dim: usize,
+    rope_theta: f64,
+    mrope_section: [u32; 3],
+    dtype: super::lowered::MetalDtype,
+) -> Vec<u8> {
+    use super::lowered::MetalDtype;
+    let half = rot_dim / 2;
+    // `[3, n]` (band-split) vs `[n]` (broadcast all bands to one position).
+    let is_3d = positions.len() == 3 * n_tokens;
+    // inv_freq[i] = 1 / θ^(2i/rot_dim) — identical to the RotaryCache builder.
+    let inv_freqs: Vec<f64> = (0..half)
+        .map(|i| 1.0 / rope_theta.powf(2.0 * i as f64 / rot_dim as f64))
+        .collect();
+    let sec0 = mrope_section[0] as usize;
+    let sec01 = (mrope_section[0] + mrope_section[1]) as usize;
+    let elem_bytes: usize = match dtype {
+        MetalDtype::F16 | MetalDtype::Bf16 => 2,
+        MetalDtype::Int4 => panic!(
+            "build_mrope_cos_sin_override: int4 cos/sin cache is not a thing — \
+             the rope kernel reads f16/bf16"
+        ),
+    };
+    let mut out = vec![0u8; n_tokens * rot_dim * elem_bytes];
+    let write = |out: &mut [u8], idx: usize, v: f32| {
+        let bytes: [u8; 2] = match dtype {
+            MetalDtype::F16 => half::f16::from_f32(v).to_bits().to_ne_bytes(),
+            MetalDtype::Bf16 => half::bf16::from_f32(v).to_bits().to_ne_bytes(),
+            MetalDtype::Int4 => unreachable!(),
+        };
+        out[idx * 2..idx * 2 + 2].copy_from_slice(&bytes);
+    };
+    for t in 0..n_tokens {
+        let (pos_t, pos_h, pos_w) = if is_3d {
+            (
+                positions[t],
+                positions[n_tokens + t],
+                positions[2 * n_tokens + t],
+            )
+        } else {
+            let p = positions.get(t).copied().unwrap_or(0);
+            (p, p, p)
+        };
+        let row = t * rot_dim;
+        for (i, &inv_f) in inv_freqs.iter().enumerate() {
+            let pos = if i < sec0 {
+                pos_t
+            } else if i < sec01 {
+                pos_h
+            } else {
+                pos_w
+            };
+            let angle = pos as f64 * inv_f;
+            write(&mut out, row + i, angle.cos() as f32);
+            write(&mut out, row + half + i, angle.sin() as f32);
+        }
+    }
+    out
 }
 
 /// Errors produced by [`super::pool::MetalWorkerPool::forward`] before

@@ -416,7 +416,7 @@ struct CompileMode {
     /// patch hidden states. Only consulted under `cuda` (the splice
     /// pass is cuda-specific); declared cuda-only so non-cuda builds
     /// don't carry a dead field.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     apply_mm_splice: bool,
     /// True for `#[forward]` (which fans out over `{1, 2, 4, 8}` at
     /// nccl-enabled), false for `#[vision_forward]` (always tp=1).
@@ -439,7 +439,7 @@ impl CompileMode {
     const DECODER: Self = Self {
         prelude: classified::Prelude::Decoder,
         apply_tp_lowering: true,
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         apply_mm_splice: true,
         enable_tp_fanout: true,
         emit_arch_dispatch: true,
@@ -447,7 +447,7 @@ impl CompileMode {
     const VISION: Self = Self {
         prelude: classified::Prelude::Vision,
         apply_tp_lowering: false,
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         apply_mm_splice: false,
         enable_tp_fanout: false,
         emit_arch_dispatch: false,
@@ -825,12 +825,12 @@ fn compile_common(
             // `MmEmbedSpliceImpl` (D2D-copy via cuMemcpyDtoDAsync). Under
             // `--features metal` the impl pool can't claim the synthesized
             // splice node, so the solver explodes with "no Impl matched
-            // tile … op MmEmbedSplice". Keep the splice insertion CUDA-
-            // only until a Metal MmEmbedSplice lands. Text-only models
-            // are unaffected at the runtime level — this splice is a
-            // no-op there in both backends. Multimodal Metal will need
-            // a Metal `MmEmbedSpliceImpl` and to flip this back on.
-            #[cfg(feature = "cuda")]
+            // Inserts a post-Embed `OpKind::MmEmbedSplice` that D2D-copies
+            // the vision-encoder embeddings into the image-placeholder
+            // rows. Text-only batches make it a runtime no-op
+            // (`embed_patches` empty) on both backends. Now wired on metal
+            // too (metal `MmEmbedSpliceImpl` + `SpliceMmEmbeds` lowering).
+            #[cfg(any(feature = "cuda", feature = "metal"))]
             if mode.apply_mm_splice {
                 tp_lowering::insert_mm_splices(&mut model_fuf, &classified);
             }
@@ -843,6 +843,10 @@ fn compile_common(
             // makes the two extern sets disjoint).
             if mode.prelude == classified::Prelude::Vision {
                 vision_lowering::materialize_pixels(&mut model_fuf);
+                // Qwen3.5-VL `pos_embeds` extern → tile (sibling of the
+                // pixels materialization above). No-op for towers without
+                // a learned positional embedding.
+                vision_lowering::materialize_pos_embeds(&mut model_fuf);
             }
 
             // At tp>1, the runtime weight tensors are per-rank shards
@@ -1040,6 +1044,9 @@ fn compile_common(
                 // emits a single D2D copy that wraps `ctx.fwd.pixels`
                 // into a tile-table OwnedTensor. Not a compute kernel.
                 "load_pixels",
+                // Qwen3.5-VL pos_embeds materialization (sibling of
+                // load_pixels) — wraps `ctx.fwd.pos_embeds` into a tile.
+                "load_pos_embeds",
                 // Vision-side varlen attention + vision rope.
                 // Shape-preserving non-gemm primitives.
                 "varlen_attention",
@@ -1132,7 +1139,9 @@ fn compile_common(
                         // AllGather after lm_head). Maps to NCCL —
                         // semantically distinct from compute kernels.
                         Some(7) // comm
-                    } else if cfg!(feature = "cuda") && name == "mm_embed_splice" {
+                    } else if (cfg!(feature = "cuda") || cfg!(feature = "metal"))
+                        && name == "mm_embed_splice"
+                    {
                         // Multimodal post-Embed D2D splice inserted by
                         // `tp_lowering::insert_mm_splices`. Not a
                         // compute kernel — runs a sequence of
@@ -1956,9 +1965,9 @@ fn emit_arch_dispatcher(
         pub unsafe fn forward_backbone(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
-        ) -> ::ferrite_cuda_core::alloc::OwnedTensor {
+        ) -> ::ferrite_cuda_core::OwnedTensor {
             match w {
                 #(#forward_backbone_arms)*
             }
@@ -1973,7 +1982,7 @@ fn emit_arch_dispatcher(
         pub unsafe fn forward_piecewise_capture(
             w: &Weights,
             ctx: &::ferrite_forward::ForwardCtx,
-            device: &mut ::ferrite_cuda_core::device::GpuDevice,
+            device: &mut ::ferrite_cuda_core::GpuDevice,
             num_tokens: u64,
         ) -> ::anyhow::Result<::ferrite_forward::piecewise::PiecewiseRunner> {
             match w {

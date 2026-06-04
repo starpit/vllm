@@ -8,6 +8,11 @@ description = "Ferrite vision-tower host glue (rope tables, varlen cu_seqlens, p
 [features]
 default = []
 cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda"]
+# Metal: only the pure-CPU host glue (rope tables, cu_seqlens, patch flatten)
+# and the `MmMetadata` type compile — the GPU helpers (k_pad/dump_tensor) stay
+# `#[cfg(feature = "cuda")]`. Brings the backend deps in with their metal
+# feature so `ferrite-kernels` (which needs a backend) builds.
+metal = ["ferrite-cuda-core/metal", "ferrite-kernels/metal"]
 nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl"]
 
 [dependencies]

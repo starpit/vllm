@@ -2180,6 +2180,30 @@ pub fn starter_library() -> ImplementationLibrary {
         // peer is available. Standalone Gelu / Mul tiles also fall
         // out of the claim when a fusion isn't applicable.
         lib.push(Box::new(FusedGateUpGeluMulImpl));
+
+        // Vision-tower op singletons (Qwen2-VL / Qwen2.5-VL / Qwen3.5-VL /
+        // Gemma3-MM `#[vision_forward]` bodies). All target-agnostic
+        // (`target_compatible ≡ true`, `single_tile_match`) — they emit
+        // `Instruction::{VarlenAttention,VisionRope,Gelu,...}` which the
+        // metal interpreter lowering maps to the vision kernels
+        // (`vision_varlen_attn` / `vision_rope_2d` / `gelu_tanh`). These
+        // mirror the identical registrations in the cuda block below;
+        // without them the metal solve fails ("no Impl matched ... Sub" —
+        // a misleading first-uncovered-singleton report when the global
+        // cover is infeasible because the vision ops have no metal Impl).
+        lib.push(Box::new(VarlenAttentionImpl));
+        lib.push(Box::new(VisionRopeImpl));
+        lib.push(Box::new(QuickGeluImpl));
+        lib.push(Box::new(GeluErfImpl));
+        lib.push(Box::new(GeluImpl));
+        lib.push(Box::new(PosEmbedRefImpl));
+        lib.push(Box::new(LoadPixelsImpl));
+        lib.push(Box::new(LoadPosEmbedsImpl));
+        // Multimodal embed splice (metal) — claims the post-Embed
+        // `OpKind::MmEmbedSplice` that `insert_mm_splices` injects.
+        // Target-agnostic matcher; the metal `SpliceMmEmbeds` lowering
+        // arm blits the vision embeddings into the placeholder rows.
+        lib.push(Box::new(MmEmbedSpliceImpl));
     }
     #[cfg(feature = "cuda")]
     {
@@ -2559,6 +2583,8 @@ pub fn starter_library() -> ImplementationLibrary {
         // under `Prelude::Vision`; the Impl runs only when that pass
         // produced a tile. Decoder bodies never see this OpKind.
         lib.push(Box::new(LoadPixelsImpl));
+        // Qwen3.5-VL pos_embeds materialization (sibling of LoadPixels).
+        lib.push(Box::new(LoadPosEmbedsImpl));
         // Row-permutation gather (Phase G.6.4). Claims any DSL call to
         // `embedding_gather(x, indices)`. The `indices` arg is one of
         // `vision_window_index` / `vision_reverse_indices` (both vision-
@@ -16290,6 +16316,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16337,6 +16364,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16418,6 +16446,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16522,6 +16551,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17060,6 +17090,7 @@ mod tests {
             vision_layout: None,
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
+            vision_pos_embed_key: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {
@@ -18400,6 +18431,88 @@ impl Implementation for LoadPixelsImpl {
         let tile = m.claimed_tiles[0];
         let out_slot = slots.of(tile, 0);
         Some(vec![Instruction::LoadPixels(out_slot)])
+    }
+}
+
+// ── LoadPosEmbedsImpl (Qwen3.5-VL pos_embed) ─────────────────────
+//
+// The exact sibling of `LoadPixelsImpl`: a singleton claiming
+// `OpKind::LoadPosEmbeds`, synthesized by
+// `vision_lowering::materialize_pos_embeds`. No FUF/weight inputs —
+// the runtime tile is built from `ctx.fwd.pos_embeds` (the
+// host-interpolated learned positional embedding the vision wrapper
+// writes onto `ForwardCtx` before driving the interpreter). Emits a
+// single `Instruction::LoadPosEmbeds { out_slot }` row.
+
+#[derive(Debug, Default)]
+pub struct LoadPosEmbedsImpl;
+
+impl Implementation for LoadPosEmbedsImpl {
+    fn name(&self) -> &'static str {
+        "load_pos_embeds"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let node = fuf.get(seed);
+        if node.op != OpKind::LoadPosEmbeds || !node.inputs.is_empty() {
+            return None;
+        }
+        Some(MatchInfo {
+            claimed_tiles: vec![seed],
+            boundary_inputs: Vec::new(),
+            boundary_outputs: vec![seed],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        0.0
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new("LoadPosEmbeds", vec![("out_slot", syn::parse_quote!(u32))])
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        _fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let out_slot = slots.of(tile, 0);
+        Some(vec![Instruction::LoadPosEmbeds(out_slot)])
     }
 }
 

@@ -76,6 +76,34 @@ pub struct RuntimeBindings {
     pub gdn_state_indices: Buffer,
     /// `[num_seqs]` u32 — per-sequence fresh flag. Shared storage.
     pub gdn_is_fresh: Buffer,
+    /// `[total_L, vision_head_dim/2]` f32 — vision 2D-RoPE angle table
+    /// (`freqs`). Shared storage; the pool overwrites `contents()` each
+    /// forward. 16-byte placeholder on non-vision arches.
+    pub vision_rope_freqs: Buffer,
+    /// `[num_tokens, vision_in_features]` model-dtype — vision patch
+    /// pixel rows. Shared storage; overwritten per forward. 16-byte
+    /// placeholder on non-vision arches.
+    pub pixels: Buffer,
+    /// `[num_tokens, vision_embed_dim]` model-dtype — Qwen3.5-VL
+    /// host-interpolated learned positional embedding. Shared storage;
+    /// overwritten per forward. 16-byte placeholder on non-vision arches
+    /// and on towers without a learned positional embedding.
+    pub vision_pos_embeds: Buffer,
+    /// `[max_m, hidden]` model-dtype — projected vision embeddings for
+    /// the multimodal splice. Shared storage; overwritten per forward
+    /// (text-only batches leave it untouched). 16-byte placeholder on
+    /// arches without the splice.
+    pub mm_embeds: Buffer,
+    /// `[max_m]` u32 — per-`mm_embeds`-row destination text-embedding row
+    /// (`u32::MAX` = skip). Shared storage; overwritten per forward.
+    pub mm_dst_rows: Buffer,
+    /// `[max_m, ROT_DIM]` model-dtype — per-token MRoPE cos/sin override
+    /// table (Qwen3.5-VL text decoder). Shared storage; the pool
+    /// overwrites `contents()` each forward with the band-split rows the
+    /// macro forward builds. Bound at the rope kernel's cos/sin slot in
+    /// place of the static `WeightBundleKind::CosSin` cache when
+    /// `W::MROPE_SECTION.is_some()`. 16-byte placeholder on 1D-rope arches.
+    pub mrope_cos_sin: Buffer,
 }
 
 impl RuntimeBindings {
@@ -102,6 +130,12 @@ impl RuntimeBindings {
             RuntimeBindingKind::GdnSsmState { layer } => &self.gdn_state_ssm[layer.get() as usize],
             RuntimeBindingKind::GdnStateIndices => &self.gdn_state_indices,
             RuntimeBindingKind::GdnIsFresh => &self.gdn_is_fresh,
+            RuntimeBindingKind::VisionRopeFreqs => &self.vision_rope_freqs,
+            RuntimeBindingKind::Pixels => &self.pixels,
+            RuntimeBindingKind::VisionPosEmbeds => &self.vision_pos_embeds,
+            RuntimeBindingKind::MmEmbeds => &self.mm_embeds,
+            RuntimeBindingKind::MmDstRows => &self.mm_dst_rows,
+            RuntimeBindingKind::MropeCosSin => &self.mrope_cos_sin,
         }
     }
 }

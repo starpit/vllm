@@ -134,6 +134,17 @@ pub enum ExternKind {
     /// `Embed` OpKind because that one anchors on `vocab_size` /
     /// `hidden_size` bounds that don't apply to a vision tower.
     PositionIds,
+    /// Qwen3.5-VL learned positional embedding, already interpolated
+    /// host-side, shape `[num_tokens, vision_embed_dim]` model-dtype.
+    /// Qwen3.5-VL's pos-embed is a `fast_pos_embed_interpolate`
+    /// (4-corner bilinear over a 48×48 learned grid) that is far
+    /// cheaper to compute on the host than to express as a kernel —
+    /// so unlike Gemma3's `PositionIds`→`pos_embed` row-gather, this
+    /// arch ships the *result* as an extern and the DSL just
+    /// `add(pos_embeds, hidden_states)` after patch_embed. Materialized
+    /// into a tile by `vision_lowering::materialize_pos_embeds`
+    /// (mirrors [`Pixels`]).
+    PosEmbeds,
 }
 
 /// Which DSL prelude (extern + op name set) is in scope when a
@@ -192,6 +203,7 @@ impl ExternKind {
             (Prelude::Vision, "window_index") => Some(Self::WindowIndex),
             (Prelude::Vision, "reverse_indices") => Some(Self::ReverseIndices),
             (Prelude::Vision, "position_ids") => Some(Self::PositionIds),
+            (Prelude::Vision, "pos_embeds") => Some(Self::PosEmbeds),
             _ => None,
         }
     }
@@ -413,6 +425,14 @@ pub enum OpKind {
     /// `AllGather` and `MmEmbedSplice`), so `apply_signature` rejects
     /// this OpKind.
     LoadPixels,
+    /// Vision-prelude `pos_embeds` extern → tile materialization
+    /// (Qwen3.5-VL). The exact sibling of [`Self::LoadPixels`]:
+    /// synthesized by `vision_lowering::materialize_pos_embeds`, takes
+    /// zero FUF inputs, produces a single rank-2 output
+    /// `[num_tokens, vision_embed_dim]` whose runtime value is the
+    /// host-interpolated `ctx.fwd.pos_embeds` view. No DSL surface;
+    /// `apply_signature` rejects it (output shape written directly).
+    LoadPosEmbeds,
     /// Row-permutation gather: `out = embedding_gather(x, indices)`.
     /// `x` is a rank-2 tile `[L, N]` (any inner-dim factorization);
     /// `indices` is a vision-prelude extern of `[`[`ExternKind::WindowIndex`]`
@@ -552,6 +572,7 @@ impl OpKind {
             // Vision lowering-pass-only op kind — see
             // `OpKind::LoadPixels` doc-comment. No DSL surface.
             Self::LoadPixels => "load_pixels",
+            Self::LoadPosEmbeds => "load_pos_embeds",
             Self::EmbeddingGather => "embedding_gather",
             Self::AvgPool2d => "avg_pool_2d",
             Self::StripCls => "strip_cls",

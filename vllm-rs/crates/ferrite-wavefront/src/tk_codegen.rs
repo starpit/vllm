@@ -26,6 +26,65 @@ use crate::tk_warp_ir::{
     LoopBound, PageBarrier, TileShape, TkInstr, TkProgram, WarpRole, NUM_CONSUMER_WARPS,
 };
 
+/// **Kernel-end cp.async.bulk drain witness** (paris invariant
+/// `kernel-end-cp-async-bulk-drain`).
+///
+/// Before the megakernel returns to the host, ALL outstanding
+/// `cp.async.bulk` stores MUST be drained via `commit_group +
+/// wait_group N=0 + __threadfence()`. CUDA stream serialization
+/// guarantees kernel N ends before kernel N+1 STARTS, but
+/// `cp.async.bulk` acks complete asynchronously w.r.t. the issuing
+/// thread — without an explicit drain at the kernel-end, the next
+/// dispatch's `tma::load_async` may observe pre-write gmem at slots
+/// the prior dispatch's storer wrote. Empirically the symptom is
+/// the `Paris!!!!!!!!!` decode-degenerate stream (every step-2+
+/// token attends to stale K).
+///
+/// `KernelEndDrain` is the typed witness that the drain WILL be
+/// emitted. The ZST is constructed exactly once inside
+/// [`emit_kernel_with_opts`] just before the kernel's closing `}` is
+/// written. The only path to discharge the obligation is
+/// [`KernelEndDrain::emit`], which writes the four lines of the
+/// drain (`__syncthreads(); commit_group; wait_group 0;
+/// __threadfence(); __syncthreads();`) to the output string. The
+/// ZST is `#[must_use]`; its `Drop` impl panics if the token is
+/// dropped without `.emit()`, so a future refactor that strips the
+/// drain emission cannot silently re-introduce the bug.
+#[must_use = "kernel-end cp.async.bulk drain MUST be `.emit()`'d before drop; \
+              forgetting it leaves cp.async.bulk stores in flight when the kernel returns to the host"]
+pub struct KernelEndDrain {
+    consumed: bool,
+}
+
+impl KernelEndDrain {
+    pub(crate) fn new() -> Self {
+        Self { consumed: false }
+    }
+
+    /// Emit the kernel-end fence (CTA sync + bulk-store drain +
+    /// system threadfence + final sync) into the output string.
+    /// Consumes the witness.
+    pub fn emit(mut self, out: &mut String) {
+        out.push_str("    __syncthreads();\n");
+        out.push_str("    asm volatile(\"cp.async.bulk.commit_group;\");\n");
+        out.push_str("    asm volatile(\"cp.async.bulk.wait_group 0;\");\n");
+        out.push_str("    __threadfence();\n");
+        out.push_str("    __syncthreads();\n");
+        self.consumed = true;
+    }
+}
+
+impl Drop for KernelEndDrain {
+    fn drop(&mut self) {
+        if !self.consumed {
+            panic!(
+                "KernelEndDrain dropped without `.emit(...)` — kernel-end cp.async.bulk drain \
+                 was lost (paris invariant `kernel-end-cp-async-bulk-drain`)"
+            );
+        }
+    }
+}
+
 // ── tk20 — typed CUDA-source emitters ───────────────────────────────
 
 /// Stub for the `tk20::*` Rust API. Each function returns the textual
@@ -1712,24 +1771,15 @@ pub fn emit_kernel_with_opts(
     out.push_str(&emit_body_with_opts(prog, opts));
     out.push_str("\n");
 
-    // E.13 kernel-end fence: any cp.async.bulk stores still in
-    // flight at this point would otherwise be observed as stale gmem
-    // by the NEXT kernel launch (CUDA stream serialization
-    // guarantees kernel-N-ends-before-kernel-N+1-starts at the
-    // queueing level, but cp.async.bulk acks complete asynchronously
-    // and aren't guaranteed visible without an explicit
-    // commit_group + wait_group N=0 emitted from the storing warp).
-    // The persistent-CTA megakernel's storer warp's per-store
-    // `tma::store_async_wait` covers same-warp ordering, but stores
-    // landing late (e.g. RopeAppend's cache writes near end of the
-    // tape) may still be in flight when the storer warp reaches
-    // here. Force a CTA-wide commit + wait + system fence so the
-    // kernel doesn't exit with pending bulk stores.
-    out.push_str("    __syncthreads();\n");
-    out.push_str("    asm volatile(\"cp.async.bulk.commit_group;\");\n");
-    out.push_str("    asm volatile(\"cp.async.bulk.wait_group 0;\");\n");
-    out.push_str("    __threadfence();\n");
-    out.push_str("    __syncthreads();\n");
+    // E.13 kernel-end fence — any cp.async.bulk stores still in
+    // flight at this point would otherwise be observed as stale
+    // gmem by the next kernel launch. Bound through the
+    // [`KernelEndDrain`] typestate witness (paris invariant
+    // `kernel-end-cp-async-bulk-drain`); the ZST is `#[must_use]`
+    // and its drop-bomb panics if a future refactor removes the
+    // `.emit(...)` call before constructing emit_kernel's output
+    // string.
+    KernelEndDrain::new().emit(&mut out);
     out.push_str("}\n");
     out.push_str("\n");
 

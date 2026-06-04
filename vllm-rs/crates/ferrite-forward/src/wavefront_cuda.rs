@@ -351,6 +351,100 @@ impl<T> Drop for Pending<T> {
     }
 }
 
+/// **Compute-sync typestate witness** (paris invariant
+/// `sync-compute-after-launch`).
+///
+/// Hopper's `cp.async.bulk` writes complete asynchronously w.r.t.
+/// the issuing thread. The kernel's exit `__syncthreads()` does
+/// a CTA `bar.sync` but does NOT drain the async proxy: the next
+/// dispatch's `tma::load_async` may observe pre-write gmem at the
+/// K/V cache slots the prior dispatch's RopeAppend storer wrote.
+/// Empirically the symptom is the `Paris!!!!!!!!!` decode-degenerate
+/// stream (every decode token after the first attends to stale K).
+///
+/// `Unsynced<T>` is the typed witness that a kernel was launched
+/// but the host hasn't yet drained the compute stream. The wrapped
+/// `T` (typically the op-output `Vec<OwnedTensor>` produced by the
+/// launch) is private — there is no `.inner()` getter — so reading
+/// the result requires consuming the witness via [`Unsynced::sync`],
+/// which calls [`GpuDevice::sync_compute`] in the same call.
+/// Forgetting the sync trips the drop-bomb, naming the launch site
+/// instead of producing silently-stale tensors downstream.
+///
+/// # Compile-fail proofs
+///
+/// Direct field access rejected (private field):
+///
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::Unsynced;
+/// let u: Unsynced<u32> = unimplemented!();
+/// let _ = u.inner;  // private field
+/// ```
+///
+/// `sync` consumes self — double-sync rejected (use of moved value):
+///
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::Unsynced;
+/// let u: Unsynced<u32> = unimplemented!();
+/// let mut device: ferrite_forward::GpuDevice = unimplemented!();
+/// let _ = u.sync(&mut device);
+/// let _ = u.sync(&mut device);  // value used after move
+/// ```
+#[must_use = "Unsynced<T> must be sync()'d before its inner T is read; dropping without sync panics at runtime"]
+pub struct Unsynced<T> {
+    inner: std::mem::ManuallyDrop<T>,
+    consumed: bool,
+    site: &'static str,
+}
+
+impl<T> Unsynced<T> {
+    /// Wrap a freshly-launched kernel's outputs as un-synced. Caller
+    /// MUST call [`Unsynced::sync`] before observing any device-side
+    /// memory the inner `T` references.
+    ///
+    /// `site` names the launch (e.g. `"wavefront_megakernel"`) for
+    /// the drop-bomb panic message.
+    pub fn after_launch(inner: T, site: &'static str) -> Self {
+        Self {
+            inner: std::mem::ManuallyDrop::new(inner),
+            consumed: false,
+            site,
+        }
+    }
+
+    /// Drain the compute stream and unwrap the inner value. Consumes
+    /// the witness (move-only), so double-sync is a Rust use-after-
+    /// move compile error.
+    pub fn sync(mut self, device: &mut GpuDevice) -> T {
+        device
+            .sync_compute()
+            .unwrap_or_else(|e| panic!("Unsynced::sync ({}): {e:?}", self.site));
+        self.consumed = true;
+        // SAFETY: ManuallyDrop::take moves the inner value out;
+        // self.consumed = true disarms the Drop bomb so we don't
+        // double-drop. We `mem::forget(self)` after move-out.
+        let inner = unsafe { std::mem::ManuallyDrop::take(&mut self.inner) };
+        std::mem::forget(self);
+        inner
+    }
+}
+
+impl<T> Drop for Unsynced<T> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            // SAFETY: only fires on the panic path; the consumed=true
+            // path is `mem::forget`'d before drop.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.inner) };
+            panic!(
+                "Unsynced<{}> ({}) dropped without sync — host would observe stale device memory \
+                 (paris invariant `sync-compute-after-launch`)",
+                std::any::type_name::<T>(),
+                self.site,
+            );
+        }
+    }
+}
+
 /// Typed builder for kernel u32 args. Args are pushed in a fixed
 /// order matching `KernelArgs::u32_args` (set by
 /// `fixtures::orchestrator_kernel_args`): num_kv_pages first
@@ -712,27 +806,24 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
         eprintln!("[wavefront-cuda] launch_tk_decode_full returned cudaError {err}");
         return None;
     }
-    // E.13: drain the persistent-CTA megakernel before returning.
-    // The kernel's `tma::store_async + store_commit_group +
-    // store_async_wait` per-store sequence covers same-warp
-    // ordering, and the substrate-emitted cross-op `Fenced<H>` fence
-    // covers intra-kernel cross-warp ordering. Neither, however, is
-    // sufficient for cross-kernel-launch ordering on Hopper:
-    // `cp.async.bulk` writes complete asynchronously w.r.t. the
-    // issuing thread, and the kernel's exit `__syncthreads()` does
-    // a CTA `bar.sync` but does not drain the async proxy. The next
-    // megakernel launch (next decode token) reads K_cache via
-    // `tma::load_async`; without an explicit stream sync between
-    // launches, the loads may observe pre-write gmem.
+    // sync-compute-after-launch invariant: wrap the post-launch
+    // op-outputs collection in `Unsynced<...>`. The only path to
+    // unwrap is `Unsynced::sync(device)`, which calls
+    // `device.sync_compute()` in the same call. Any code path that
+    // tries to read `op_outputs` before `.sync()` is a use-of-moved-
+    // value compile error; dropping the witness without sync trips
+    // the drop-bomb so the failure is loud.
     //
-    // `sync_compute()` (cuStreamSynchronize on the compute stream)
-    // is the host-side guarantee that the kernel has fully drained
-    // before the next call begins. Empirically: with this in place,
-    // `Paris -> " Paris. The Eiffel Tower is located in"` (coherent
-    // megakernel decode); without it, `" Paris!!!!!!!!!"`.
-    device
-        .sync_compute()
-        .expect("sync compute after wavefront megakernel");
+    // Hopper's `cp.async.bulk` writes complete asynchronously
+    // w.r.t. the issuing thread, and the kernel's exit
+    // `__syncthreads()` does NOT drain the async proxy: the next
+    // dispatch's `tma::load_async` may observe pre-write gmem at
+    // the K/V cache slots the prior dispatch's RopeAppend storer
+    // wrote. Empirically: without the host sync, `Paris ->
+    // " Paris!!!!!!!!!"`; with the typed sync witness, the sync
+    // is structurally unforgettable.
+    let unsynced_outputs = Unsynced::after_launch(op_outputs, "wavefront_megakernel");
+    let mut op_outputs = unsynced_outputs.sync(device);
 
     // ── 6. Pluck the result op output and reshape it in place from
     //     the U8 byte layout the kernel writes (the alloc is sized to

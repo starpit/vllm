@@ -21,7 +21,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{CommitKind, FenceScope, Instr, SyncScope, TkTape};
+use crate::tk_tape::{FenceScope, Instr, SyncScope, TkTape};
 
 /// Emit the full CUDA kernel body from a [`TkTape`].
 ///
@@ -55,31 +55,12 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             FenceScope::Device => out.push_str("__threadfence();\n"),
             FenceScope::System => out.push_str("__threadfence_system();\n"),
         },
-        Instr::CommitGroup { kind } => match kind {
-            // sm90+ TMA `cp.async.bulk.commit_group` via the TK 2.0
-            // wrapper at `include/ops/group/util/tma.cuh:38`. Per the
-            // [[dogfood-tk20-rust]] rule, never raw asm.
-            CommitKind::BulkStore => {
-                out.push_str("kittens::group<1>::tma::store_commit_group();\n");
-            }
-            // sm80 fallback — not used on Hopper for K/V cache writes;
-            // raw asm because TK 2.0 has no non-bulk wrapper.
-            CommitKind::NonBulk => {
-                out.push_str("asm volatile(\"cp.async.commit_group;\");\n");
-            }
-        },
-        Instr::WaitGroup { kind, n } => match kind {
-            // TK 2.0 `store_async_wait<N>` (tma.cuh:47) wraps
-            // `cp.async.bulk.wait_group N`. Const generic = compile-
-            // time `N`, same SASS as raw asm.
-            CommitKind::BulkStore => {
-                let _ =
-                    writeln!(out, "kittens::group<1>::tma::store_async_wait<{n}>();");
-            }
-            CommitKind::NonBulk => {
-                let _ = writeln!(out, "asm volatile(\"cp.async.wait_group {n};\");");
-            }
-        },
+        Instr::CommitGroup => {
+            out.push_str("kittens::group<1>::tma::store_commit_group();\n");
+        }
+        Instr::WaitGroup { n } => {
+            let _ = writeln!(out, "kittens::group<1>::tma::store_async_wait<{n}>();");
+        }
 
         // ── named barrier ops ────────────────────────────────────
         Instr::BarrierInit { .. } => {
@@ -129,7 +110,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tk_tape::{CommitKind, FenceScope, SyncScope};
+    use crate::tk_tape::{FenceScope, SyncScope};
 
     fn emit(instr: Instr) -> String {
         let mut out = String::new();
@@ -192,44 +173,26 @@ mod tests {
     }
 
     #[test]
-    fn commit_group_bulk_emits_tk20_wrapper() {
-        // TK 2.0 wrapper at include/ops/group/util/tma.cuh:38 —
-        // expands to `cp.async.bulk.commit_group;`. We always go
-        // through the typed wrapper, never raw asm
-        // ([[dogfood-tk20-rust]]).
+    fn commit_group_emits_tk20_wrapper() {
         assert_eq!(
-            emit(Instr::CommitGroup { kind: CommitKind::BulkStore }),
+            emit(Instr::CommitGroup),
             "kittens::group<1>::tma::store_commit_group();\n"
         );
     }
 
     #[test]
-    fn wait_group_bulk_zero_emits_tk20_wrapper() {
-        // TK 2.0 wrapper at include/ops/group/util/tma.cuh:47 —
-        // expands to `cp.async.bulk.wait_group N;`.
+    fn wait_group_zero_emits_tk20_wrapper() {
         assert_eq!(
-            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0 }),
+            emit(Instr::WaitGroup { n: 0 }),
             "kittens::group<1>::tma::store_async_wait<0>();\n"
         );
     }
 
     #[test]
-    fn wait_group_bulk_nonzero_emits_n() {
+    fn wait_group_nonzero_emits_n() {
         assert_eq!(
-            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 3 }),
+            emit(Instr::WaitGroup { n: 3 }),
             "kittens::group<1>::tma::store_async_wait<3>();\n"
-        );
-    }
-
-    #[test]
-    fn commit_and_wait_nonbulk_emit_sm80_path() {
-        assert_eq!(
-            emit(Instr::CommitGroup { kind: CommitKind::NonBulk }),
-            "asm volatile(\"cp.async.commit_group;\");\n"
-        );
-        assert_eq!(
-            emit(Instr::WaitGroup { kind: CommitKind::NonBulk, n: 0 }),
-            "asm volatile(\"cp.async.wait_group 0;\");\n"
         );
     }
 
@@ -245,8 +208,8 @@ mod tests {
         let tape = TkTape {
             instrs: vec![
                 Instr::Syncthreads { scope: SyncScope::Cta },
-                Instr::CommitGroup { kind: CommitKind::BulkStore },
-                Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0 },
+                Instr::CommitGroup,
+                Instr::WaitGroup { n: 0 },
                 Instr::Threadfence { scope: FenceScope::Device },
                 Instr::Syncthreads { scope: SyncScope::Cta },
             ],

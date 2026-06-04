@@ -1900,13 +1900,14 @@ pub fn lower_rope_append<P: Phase>(
     pages.release(prog.complete_round(s_page));
     pages.release(prog.complete_round(v_page));
 
-    // E.13: cross-op gmem ordering for the K/V cache writes is now
-    // emitted by the orchestrator via `tk_gmem::emit_fence_after_op`
-    // between this op and the next reader (typically AttnDecode).
-    // The CTA-wide `__syncthreads()` E.12.B emitted here is removed —
-    // the typed `Fenced<GmemHandle<...>>` substrate enforces fence
-    // emission structurally, so a single source of truth for the
-    // primitive sits in `tk_codegen::tk20::cross_op_gmem_fence_body`.
+    // Cross-op gmem ordering for the K/V cache writes is emitted by
+    // the orchestrator via `tk_gmem::emit_fence_after_op` between
+    // this op and the next reader (typically AttnDecode). The typed
+    // `Fenced<GmemHandle<...>>` substrate enforces fence emission
+    // structurally; the fence is a 5-Instr atomic sequence
+    // (Sync/TmaStoreCommitGroup/TmaStoreAsyncWait/Threadfence/Sync)
+    // pushed by `TkProgram::emit_cross_op_gmem_fence`, with one
+    // one-line codegen arm per Instr.
     (k_cache_handle, v_cache_handle)
 }
 

@@ -141,12 +141,11 @@ pub enum Instr {
     /// `__threadfence_system()`.
     Threadfence { scope: FenceScope },
 
-    /// `cp.async.bulk.commit_group;` (sm90+) or the non-bulk
-    /// equivalent.
-    CommitGroup { kind: CommitKind },
+    /// `kittens::group<1>::tma::store_commit_group()`.
+    CommitGroup,
 
-    /// `cp.async.bulk.wait_group N;`.
-    WaitGroup { kind: CommitKind, n: u32 },
+    /// `kittens::group<1>::tma::store_async_wait<N>()`.
+    WaitGroup { n: u32 },
 
     /// `mbarrier.init` for a named barrier.
     BarrierInit { id: BarrierId, count: u32 },
@@ -205,16 +204,6 @@ pub enum FenceScope {
     Device,
     /// `__threadfence_system()` — system-scope.
     System,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitKind {
-    /// `cp.async.bulk.{commit,wait}_group` — sm90+ TMA bulk path.
-    BulkStore,
-    /// `cp.async.{commit,wait}_group` — sm80 plain async copy. Not
-    /// used on Hopper for K/V cache writes; provided for future
-    /// non-TMA paths.
-    NonBulk,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -460,14 +460,22 @@ pub enum TkInstr {
         body: Vec<TkInstr>,
     },
 
-    /// E.13: cross-op gmem-fence. Codegen lowers this to a CTA-wide
-    /// sequence (commit + wait for outstanding TMA stores +
-    /// threadfence + syncthreads) so a subsequent op's TMA loads on
-    /// the same gmem region observe the prior op's TMA stores. Emit
-    /// only via [`crate::tk_gmem::emit_fence_after_op`] — direct
-    /// construction is permitted by Rust visibility but the typed
-    /// `Fenced<H>` wrapper is the actual safety boundary.
-    CrossOpGmemFence,
+    /// `kittens::group<1>::tma::store_commit_group()`. Atomic Instr;
+    /// one TK 2.0 call. Composed with [`Self::Sync`],
+    /// [`Self::TmaStoreAsyncWait`], [`Self::Threadfence`] in a
+    /// 5-Instr sequence by [`TkProgram::emit_cross_op_gmem_fence`]
+    /// (paris invariant `cross-op-gmem-fence-as-instr-sequence`,
+    /// per [[tk-player-one-call-per-arm]]).
+    TmaStoreCommitGroup { role: WarpRole },
+
+    /// `kittens::group<1>::tma::store_async_wait<N>()`. Atomic Instr;
+    /// `n=0` drains all groups.
+    TmaStoreAsyncWait { role: WarpRole, n: u32 },
+
+    /// `__threadfence()` (device-scope). Composed with
+    /// [`Self::TmaStoreCommitGroup`] / [`Self::TmaStoreAsyncWait`] /
+    /// [`Self::Sync`] to form the 5-Instr cross-op fence sequence.
+    Threadfence { role: WarpRole },
 }
 
 /// Loop trip count for [`TkInstr::ForLoop`]: either a const baked at
@@ -743,12 +751,32 @@ impl TkProgram {
         });
     }
 
-    /// E.13: append a [`TkInstr::CrossOpGmemFence`]. Use only via
-    /// [`crate::tk_gmem::emit_fence_after_op`] — that is the only
-    /// path that yields the [`crate::tk_gmem::Fenced`] witness
-    /// required by gmem-reading lowerings.
+    /// Append the kernel-end drain as a 5-Instr atomic sequence,
+    /// identical shape to the cross-op fence. Called by
+    /// `tk_codegen::emit_kernel_with_opts` exactly once before body
+    /// emit so any in-flight `cp.async.bulk` TMA stores are drained
+    /// to gmem before the kernel returns to the host.
+    pub fn emit_kernel_end_drain(&mut self) {
+        self.emit_cross_op_gmem_fence();
+    }
+
+    /// Append the cross-op gmem-fence as a 5-Instr atomic sequence:
+    /// `[Sync, TmaStoreCommitGroup, TmaStoreAsyncWait{n=0},
+    /// Threadfence, Sync]` — every Instr maps to ONE TK 2.0 call,
+    /// per [[tk-player-one-call-per-arm]] / [[dogfood-tk20-rust]].
+    /// No multi-line helper; the codegen has one one-line arm per
+    /// primitive.
+    ///
+    /// Use only via [`crate::tk_gmem::emit_fence_after_op`] — that is
+    /// the only path that yields the [`crate::tk_gmem::Fenced`]
+    /// witness required by gmem-reading lowerings.
     pub(crate) fn emit_cross_op_gmem_fence(&mut self) {
-        self.instrs.push(TkInstr::CrossOpGmemFence);
+        let role = WarpRole::All;
+        self.instrs.push(TkInstr::Sync { role });
+        self.instrs.push(TkInstr::TmaStoreCommitGroup { role });
+        self.instrs.push(TkInstr::TmaStoreAsyncWait { role, n: 0 });
+        self.instrs.push(TkInstr::Threadfence { role });
+        self.instrs.push(TkInstr::Sync { role });
     }
 
     /// Append a `Compute` whose body is a typed `tk20::*` call list.

@@ -20,9 +20,10 @@
 //!   pending writes have been committed and made CTA-visible by an
 //!   explicit fence emit.
 //! - [`emit_fence_after_op`] — the only path to construct
-//!   `Fenced<...>`. Appends a [`crate::tk_warp_ir::TkInstr::CrossOpGmemFence`]
-//!   to the program, which the codegen lowers to the actual CUDA
-//!   primitive.
+//!   `Fenced<...>`. Appends the 5-Instr cross-op fence sequence
+//!   (`Sync, TmaStoreCommitGroup, TmaStoreAsyncWait{0}, Threadfence,
+//!   Sync`) via `TkProgram::emit_cross_op_gmem_fence`. Each Instr
+//!   maps 1:1 to one TK 2.0 call in the codegen.
 //!
 //! Lowerings that read a previously-written gmem buffer (e.g.
 //! [`crate::tk_lower::lower_attn_decode`]) take `Fenced<GmemHandle<...>>`
@@ -92,8 +93,8 @@ impl<Buf> GmemHandle<Buf> {
 
 // ── Fenced<H> + sealed FenceProof ───────────────────────────────────
 
-/// Sealed token witnessing that a [`crate::tk_warp_ir::TkInstr::CrossOpGmemFence`]
-/// has been emitted into the program. Only [`emit_fence_after_op`]
+/// Sealed token witnessing that the cross-op fence sequence has
+/// been emitted into the program. Only [`emit_fence_after_op`]
 /// constructs one — the field is private to this crate, and there
 /// is no `pub fn new()` / `pub const`.
 #[derive(Clone, Copy, Debug)]
@@ -138,11 +139,11 @@ impl<H> Fenced<H> {
 
 // ── emit_fence_after_op ─────────────────────────────────────────────
 
-/// Emit the cross-op gmem-fence primitive into `prog` and lift the
-/// handle to [`Fenced<H>`]. The fence body is a single
-/// [`crate::tk_warp_ir::TkInstr::CrossOpGmemFence`] instruction; the
-/// codegen ([`crate::tk_codegen`]) lowers it to the actual CUDA
-/// primitive (commit/wait + threadfence + syncthreads).
+/// Emit the cross-op gmem-fence sequence into `prog` and lift the
+/// handle to [`Fenced<H>`]. The fence is a 5-Instr atomic sequence
+/// (`Sync, TmaStoreCommitGroup, TmaStoreAsyncWait{0}, Threadfence,
+/// Sync`) pushed by [`crate::tk_warp_ir::TkProgram::emit_cross_op_gmem_fence`];
+/// the codegen has one one-line arm per Instr.
 ///
 /// This is the ONLY public path to a [`Fenced<H>`] value. Any
 /// lowering that requires `Fenced<GmemHandle<...>>` for safety

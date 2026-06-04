@@ -234,10 +234,25 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
     // bypass this — `lower_attn_decode` requires
     // `Fenced<GmemHandle<...>>`, and the only way to construct one
     // is `tk_gmem::emit_fence_after_op`.
-    let mut pending_k_unfenced: Option<crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>> =
-        None;
-    let mut pending_v_unfenced: Option<crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>> =
-        None;
+    // paris invariant `k-cache-buf-id-matches-rope-producer`:
+    // index pending K/V handles by BufId (one per layer's K_cache /
+    // V_cache buffer) instead of a global `Option<...>`. The prior
+    // single-slot Option silently relied on topo order — if a future
+    // refactor visited layer N+1's RopeAppend before layer N's
+    // AttnDecode, the Option would overwrite layer N's pending
+    // handle and AttnDecode would silently fence the wrong buffer.
+    // With BufId-keyed HashMaps, the lookup is by the consumer's
+    // own `k_cache: BufId`, eliminating the cross-wiring failure
+    // mode at the type level (mismatched BufId = no entry, fall
+    // through to `new_initial`).
+    let mut pending_k_unfenced: BTreeMap<
+        BufId,
+        crate::tk_gmem::GmemHandle<crate::tk_gmem::KCache>,
+    > = BTreeMap::new();
+    let mut pending_v_unfenced: BTreeMap<
+        BufId,
+        crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
+    > = BTreeMap::new();
 
     for (op_idx, desc) in input.ops.iter().enumerate() {
         let out_buf = BufId(n_sources + op_idx as u32);
@@ -472,8 +487,8 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         }
                     }
                 };
-                pending_k_unfenced = Some(k_out);
-                pending_v_unfenced = Some(v_out);
+                pending_k_unfenced.insert(k_out.buf_id(), k_out);
+                pending_v_unfenced.insert(v_out.buf_id(), v_out);
                 op_out_shape.push((desc.m, cols));
             }
 
@@ -521,21 +536,22 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                 // fresh `new_initial` handle. Either path goes
                 // through `emit_fence_after_op` — AttnDecode's
                 // `Fenced<...>` requirement is satisfied uniformly.
-                let k_unfenced = pending_k_unfenced.take().unwrap_or_else(|| {
+                // BufId-keyed lookup: the consumer's own `k_cache:
+                // BufId` is the key. Cross-wiring is impossible
+                // because a mismatched BufId returns `None` and we
+                // fall through to `new_initial(k_cache)` — the new
+                // handle's BufId is the same key as the lookup, so
+                // the prior runtime debug_assert_eq is now a
+                // structural identity (paris invariant
+                // `k-cache-buf-id-matches-rope-producer`).
+                let k_unfenced = pending_k_unfenced.remove(&k_cache).unwrap_or_else(|| {
                     crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache)
                 });
-                let v_unfenced = pending_v_unfenced.take().unwrap_or_else(|| {
+                let v_unfenced = pending_v_unfenced.remove(&v_cache).unwrap_or_else(|| {
                     crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache)
                 });
-                debug_assert_eq!(
-                    k_unfenced.buf_id(),
-                    k_cache,
-                    "lower_to_tk: AttnDecode's k_cache buf doesn't match producer's K handle",
-                );
-                debug_assert_eq!(
-                    v_unfenced.buf_id(),
-                    v_cache,
-                );
+                debug_assert_eq!(k_unfenced.buf_id(), k_cache);
+                debug_assert_eq!(v_unfenced.buf_id(), v_cache);
                 let k_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, k_unfenced);
                 let v_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, v_unfenced);
                 match hints_opt.as_ref() {

@@ -447,6 +447,66 @@ pub fn lower_rmsnorm_routed<P: Phase>(
 /// the inside-loop parity is bound to the loop variable directly via
 /// [`TkProgram::wait_loop_parity`] — so codegen never invents the
 /// parity at emit time.
+/// **Paged K/V cache layout** (paris invariant
+/// `kv-cache-write-slot-offset-correctness`).
+///
+/// Single source of truth for the byte stride of one token's K
+/// (or V) row in the paged cache (`[num_blocks, block_size,
+/// num_kv_heads, head_dim]` — one row =
+/// `num_kv_heads * head_dim * act_elem` bytes) AND for the cos/sin
+/// rotary cache row stride (`head_dim * act_elem`).
+///
+/// Both the WRITE side (RopeAppend's K/V cache writes inside its
+/// storer) and the READ side (AttnDecode's per-iter K/V loads
+/// inside its `for_loop_runtime` body) MUST use the same row
+/// stride, or the reads observe rotated/shifted slots vs the
+/// writes — silently wrong attention, the empirical
+/// `Paris!!!!!!!!!` decode-degenerate stream's structural class.
+///
+/// Today (E.13 baseline) the formula is recomputed at four call
+/// sites in `tk_lower.rs` (lines 625 / 832 / 1716 / 1887) — silent
+/// drift in any future edit re-introduces the bug. This newtype
+/// collapses them to one definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvCacheLayout {
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub act_elem: u32,
+}
+
+impl KvCacheLayout {
+    pub const fn new(num_kv_heads: u32, head_dim: u32, act_elem: u32) -> Self {
+        Self { num_kv_heads, head_dim, act_elem }
+    }
+
+    /// Per-token K (or V) row stride in bytes.
+    /// `num_kv_heads * head_dim * act_elem`.
+    pub const fn row_bytes(&self) -> u64 {
+        (self.num_kv_heads as u64) * (self.head_dim as u64) * (self.act_elem as u64)
+    }
+
+    /// Per-position cos/sin row stride in bytes.
+    /// `head_dim * act_elem`.
+    pub const fn cos_sin_row_bytes(&self) -> u64 {
+        (self.head_dim as u64) * (self.act_elem as u64)
+    }
+
+    /// CUDA expression for the K/V cache slot byte offset:
+    /// `(<slot_arg> * row_bytes)`. Both the RopeAppend write and the
+    /// AttnDecode read must reach for this method on the SAME
+    /// [`KvCacheLayout`] value, which is constructed from a single
+    /// (num_kv_heads, head_dim, act_elem) tuple per op.
+    pub fn slot_offset_expr(&self, slot_arg: impl std::fmt::Display) -> String {
+        format!("({} * {}u)", slot_arg, self.row_bytes())
+    }
+
+    /// CUDA expression for the cos/sin TMA load byte offset:
+    /// `<position_arg> * cos_sin_row_bytes`.
+    pub fn cos_sin_offset_expr(&self, position_arg: impl std::fmt::Display) -> String {
+        format!("{} * {}u", position_arg, self.cos_sin_row_bytes())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AttnDecodeOp {
     /// `[1, num_q_heads * head_dim]` query (post-RoPE). Loaded once
@@ -490,6 +550,17 @@ pub struct AttnDecodeOp {
     /// collide on the same identifiers. The orchestrator passes the
     /// LoweringInput op index — unique across all ops in a forward.
     pub unique_id: u32,
+}
+
+impl AttnDecodeOp {
+    /// Bind this op's K/V cache layout to the single
+    /// [`KvCacheLayout`] source. The same layout instance is
+    /// produced by the matching `RopeAppendOp::kv_layout` of the
+    /// upstream RopeAppend; both READ and WRITE sides agree by
+    /// construction.
+    pub const fn kv_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new(self.num_kv_heads, self.head_dim, self.act_elem)
+    }
 }
 
 /// Lower one decode-attention op into a `TkProgram` fragment.
@@ -622,7 +693,13 @@ pub fn lower_attn_decode<P: Phase>(
     // `block_table[__kv_i / block_size] * block_bytes + (__kv_i %
     // block_size) * row_bytes`. Single-block sequences match the
     // flat stride; multi-block needs block-table indirection.
-    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    //
+    // `kv_row_bytes` comes from the typed [`KvCacheLayout`] so the
+    // READ stride here matches the WRITE stride RopeAppend uses
+    // for the matching K/V cache slot — a single-source-of-truth
+    // construction (paris invariant
+    // `kv-cache-write-slot-offset-correctness`).
+    let kv_row_bytes = op.kv_layout().row_bytes();
     // Structural enforcement (Gap 17): for_loop_runtime is the ONLY
     // path that constructs `LoopBound::RuntimeU32` (the constructor
     // is sealed). Plain `prog.for_loop(_, LoopBound::RuntimeU32(...))`
@@ -828,8 +905,11 @@ pub fn lower_attn_decode_routed<P: Phase>(
     let loop_var = "__kv_i";
     let start = P::VALUE;
     // Per-iter K/V row stride; see `lower_attn_decode` for the
-    // block-table-indirection caveat.
-    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
+    // block-table-indirection caveat. Bound to the typed
+    // [`KvCacheLayout`] so READ stride here matches WRITE stride
+    // in the matching RopeAppend (paris invariant
+    // `kv-cache-write-slot-offset-correctness`).
+    let kv_row_bytes = op.kv_layout().row_bytes();
     // Structural enforcement (Gap 17) for the routed AttnDecode too.
     let post_pages = prog.for_loop_runtime(
         loop_var,
@@ -1649,6 +1729,19 @@ pub struct RopeAppendOp {
     pub decode_slot_arg: crate::tk_warp_ir::DecodeSlotSym,
 }
 
+impl RopeAppendOp {
+    /// Bind this op's K/V cache layout to the single
+    /// [`KvCacheLayout`] source. Both the WRITE side (this
+    /// lowering's storer cache writes) and the matching
+    /// AttnDecode's READ side (`AttnDecodeOp::kv_layout`) reach
+    /// for `kv_layout().slot_offset_expr(...)` /
+    /// `kv_layout().row_bytes()` so the formula is a single
+    /// definition shared between sites.
+    pub const fn kv_layout(&self) -> KvCacheLayout {
+        KvCacheLayout::new(self.num_kv_heads, self.head_dim, self.act_elem)
+    }
+}
+
 /// Lower one RoPE-append into a `TkProgram` fragment.
 ///
 /// Tape shape (4 page slots):
@@ -1710,12 +1803,13 @@ pub fn lower_rope_append<P: Phase>(
     };
 
     // Per-token row stride for both the cos/sin cache and the paged
-    // K/V cache. `head_dim * act_elem` for cos/sin (1 head row) and
-    // `num_kv_heads * head_dim * act_elem` for K/V (full kv-row).
-    let cs_row_bytes = op.head_dim * op.act_elem;
-    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
-    let pos_off = format!("__decode_position * {cs_row_bytes}u");
-    let slot_off = format!("({} * {kv_row_bytes}u)", op.decode_slot_arg);
+    // K/V cache, bound through the typed [`KvCacheLayout`] (paris
+    // invariant `kv-cache-write-slot-offset-correctness`). The
+    // matching AttnDecode read uses the SAME `op.kv_layout()` value
+    // by construction — no drift between WRITE here and READ there.
+    let layout = op.kv_layout();
+    let pos_off = layout.cos_sin_offset_expr("__decode_position");
+    let slot_off = layout.slot_offset_expr(op.decode_slot_arg);
 
     // ── Loader: fill K, cos, sin, V ──
     let k_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, k_page);
@@ -1883,10 +1977,11 @@ pub fn lower_rope_append_routed<P: Phase>(
         cols: op.head_dim,
         elem_bytes: op.act_elem,
     };
-    let cs_row_bytes = op.head_dim * op.act_elem;
-    let kv_row_bytes = (kv_cols as u64) * (op.act_elem as u64);
-    let pos_off = format!("__decode_position * {cs_row_bytes}u");
-    let slot_off = format!("({} * {kv_row_bytes}u)", op.decode_slot_arg);
+    // Per-token row stride bound through [`KvCacheLayout`] (paris
+    // invariant `kv-cache-write-slot-offset-correctness`).
+    let layout = op.kv_layout();
+    let pos_off = layout.cos_sin_offset_expr("__decode_position");
+    let slot_off = layout.slot_offset_expr(op.decode_slot_arg);
 
     let k_page = prog.wait(WarpRole::Loader, PageBarrier::Consumed, k_page);
     if in_k_carried.is_some() {

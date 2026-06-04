@@ -1288,21 +1288,9 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
                 elem_bytes,
             } = *tile;
             let byte_off = (dst_region.region.cols.start as u64) * (elem_bytes as u64);
-            // Step C.3 — when `dst` opted in to descriptor TMA via
-            // `EmitOpts::descriptor_layouts`, emit the typed `gl<>`
-            // store. Initial scope (rmsnorm output, vector form) is the
-            // single-tile {0,0,0,0} case: byte_off==0 and no dynamic
-            // offset. Anything else falls back to the raw-bulk path —
-            // defensive fallback so a stray opt-in for a wrong shape
-            // can't break correctness silently.
-            let typed_body: Option<String> = opts
-                .descriptor_layouts
-                .get(&dst.0)
-                .filter(|_| byte_off == 0 && dyn_byte_off.is_none())
-                .map(|layout| tk20::tma_store_async_typed(*page_id, dst.0, &layout.tile_type));
-            let body = match typed_body {
-                Some(s) => s,
-                None => tk20::tma_store_async(
+            (
+                WarpRole::Storer,
+                tk20::tma_store_async(
                     *page_id,
                     dst.0,
                     byte_off,
@@ -1311,9 +1299,16 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
                     elem_bytes,
                     dyn_byte_off.as_deref(),
                 ),
-            };
-            (WarpRole::Storer, body)
+            )
         }
+        TkInstr::StoreAsyncTyped {
+            page_id,
+            dst,
+            tile_type,
+        } => (
+            WarpRole::Storer,
+            tk20::tma_store_async_typed(*page_id, dst.0, tile_type),
+        ),
         TkInstr::Compute { role, calls } => {
             // Walk `calls` in order, emitting one CUDA fragment per
             // primitive. Each `Tk20Call` lowers via `Tk20Call::emit()`,
@@ -1408,8 +1403,16 @@ pub fn emit_body(prog: &TkProgram) -> String {
 /// As [`emit_body`] but takes an explicit [`EmitOpts`] so debug knobs
 /// (e.g. handshake printf wrapping) can be toggled at the call site.
 pub fn emit_body_with_opts(prog: &TkProgram, opts: &EmitOpts) -> String {
+    let mut prog_owned;
+    let prog_ref = if opts.descriptor_layouts.is_empty() {
+        prog
+    } else {
+        prog_owned = prog.clone();
+        rewrite_typed_stores(&mut prog_owned, opts);
+        &prog_owned
+    };
     let mut out = String::new();
-    for instr in &prog.instrs {
+    for instr in &prog_ref.instrs {
         emit_one(instr, opts, &mut out);
     }
     out
@@ -1465,6 +1468,51 @@ pub struct KernelArgs {
 /// init, and final sync are byte-identical to TK 2.0.
 pub fn emit_kernel(name: &str, args: &KernelArgs, prog: &TkProgram) -> String {
     emit_kernel_with_opts(name, args, prog, &EmitOpts::default())
+}
+
+/// Rewrite `TkInstr::StoreAsync` into `TkInstr::StoreAsyncTyped` for
+/// every `dst` declared in [`EmitOpts::descriptor_layouts`] whose
+/// store is the single-tile {0,0,0,0} case (no static byte offset
+/// and no dynamic byte offset). All other stores keep the raw-bulk
+/// path. Runs once at the start of [`emit_kernel_with_opts`] so the
+/// emit walker has no `opts` lookup at instr-emit time — one Instr,
+/// one TK 2.0 call (paris invariant `descriptor-rewrite-once`,
+/// per [[tk-player-one-call-per-arm]]).
+fn rewrite_typed_stores(prog: &mut TkProgram, opts: &EmitOpts) {
+    use crate::tk_warp_ir::TkInstr;
+    if opts.descriptor_layouts.is_empty() {
+        return;
+    }
+    fn walk(instrs: &mut Vec<TkInstr>, opts: &EmitOpts) {
+        for instr in instrs.iter_mut() {
+            match instr {
+                TkInstr::StoreAsync {
+                    page_id,
+                    dst,
+                    dst_region,
+                    tile,
+                    dyn_byte_off,
+                } => {
+                    let byte_off =
+                        (dst_region.region.cols.start as u64) * (tile.elem_bytes as u64);
+                    if byte_off != 0 || dyn_byte_off.is_some() {
+                        continue;
+                    }
+                    let Some(layout) = opts.descriptor_layouts.get(&dst.0) else {
+                        continue;
+                    };
+                    *instr = TkInstr::StoreAsyncTyped {
+                        page_id: *page_id,
+                        dst: *dst,
+                        tile_type: layout.tile_type.clone(),
+                    };
+                }
+                TkInstr::ForLoop { body, .. } => walk(body, opts),
+                _ => {}
+            }
+        }
+    }
+    walk(&mut prog.instrs, opts);
 }
 
 /// As [`emit_kernel`] but takes an explicit [`EmitOpts`]. Used by the

@@ -471,6 +471,17 @@ pub enum TkInstr {
         parity_var: String,
     },
 
+    /// Typed-descriptor TMA store: `tma::store_async<cache_policy::NORMAL>(arg<dst>, ...)`.
+    /// Pushed by the emit-time descriptor-rewrite pass when the
+    /// caller's `EmitOpts::descriptor_layouts` declares this `dst`.
+    /// Distinct from [`Self::StoreAsync`] so the codegen has no
+    /// opts-lookup at emit time — one Instr, one TK 2.0 call.
+    StoreAsyncTyped {
+        page_id: u8,
+        dst: BufId,
+        tile_type: String,
+    },
+
     /// `kittens::group<1>::tma::store_commit_group()`. Atomic Instr;
     /// one TK 2.0 call. Composed with [`Self::Sync`],
     /// [`Self::TmaStoreAsyncWait`], [`Self::Threadfence`] in a

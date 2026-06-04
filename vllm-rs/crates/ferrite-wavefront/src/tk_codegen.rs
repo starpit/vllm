@@ -434,80 +434,6 @@ pub mod tk20 {
     // identical to the legacy `rmsnorm_compute_body` so the existing
     // `rmsnorm_kernel_matches_cpu_golden` test passes unchanged.
 
-    /// Emit the RmsNorm consumer compute body. Per-thread bf16
-    /// squared-sum + warp-wide `__shfl_xor_sync` reduce + per-thread
-    /// normalize. Gated to `__consumer_idx == 0` (single-warp scope —
-    /// other consumer warps fall through to `arrive(Done)`).
-    ///
-    /// `x_id` / `w_id`: page slot indices for the activation row and
-    /// gain weight row. `hidden`: row width. `eps`: rms epsilon
-    /// literal.
-    pub fn rmsnorm_consumer_body(x_id: u8, w_id: u8, hidden: u32, eps: f32) -> String {
-        // Phase 10: replace the per-warp `__shfl_xor_sync` butterfly
-        // squared-sum with the Phase-8-style TK 2.0 register-vector
-        // reduction (`warp::load → warp::copy → warp::mul →
-        // warp::sum`) over K_TILE=128 chunks. Hidden=2048 → 16 inner
-        // iters; per-warp register footprint stays well under the
-        // 224-reg consumer budget.
-        //
-        // The second pass (apply `scale * w` and write back to
-        // `__x_smem` in-place) stays per-thread — no shfl involved
-        // there; the lane-strided writeback maps naturally to the
-        // in-place x_smem store and avoids the rv→bf→sv store dance
-        // that would require a scratch sv (no rv→sv-with-conversion
-        // primitive in TK 2.0; would need rv_fl → rv_bf via copy
-        // then `kittens::warp::store(sv, rv)`).
-        const K_TILE: u32 = 128;
-        debug_assert_eq!(
-            hidden % K_TILE,
-            0,
-            "rmsnorm_consumer_body: hidden={hidden} must be a multiple of K_TILE={K_TILE}"
-        );
-        let k_blocks = hidden / K_TILE;
-
-        let x_sv_decl = decl_sv_view_bf("__x_sv", &format!("page_buf[{x_id}]"), hidden);
-        let x_rv_bf_decl = decl_rv_bf("__x_rv_bf", K_TILE);
-        let x_rv_fl_decl = decl_rv_fl("__x_rv_fl", K_TILE);
-        let load_x = warp_load_rv_from_sv(
-            "__x_rv_bf",
-            "__x_sv.template subvec<128>(__k_i)",
-        );
-        let copy_x = warp_copy_rv("__x_rv_fl", "__x_rv_bf");
-        let mul_xx = warp_mul_rv("__x_rv_fl", "__x_rv_fl", "__x_rv_fl");
-        let sum_expr = warp_sum_rv("__x_rv_fl");
-
-        format!(
-            r#"
-            // tk_warp_ir RmsNorm — RMS reduce + scale + apply weight (consumer warp 0)
-            using T_act = __nv_bfloat16;
-            auto* __x_smem = reinterpret_cast<T_act*>(page_buf[{x_id}]);
-            auto* __w_smem = reinterpret_cast<T_act*>(page_buf[{w_id}]);
-            {x_sv_decl}
-            if (__consumer_idx == 0) {{
-                const unsigned int __hidden = {hidden}u;
-                const float __eps = {eps:?}f;
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                float __sumsq = 0.0f;
-                for (int __k_i = 0; __k_i < {k_blocks}; ++__k_i) {{
-                    {x_rv_bf_decl}
-                    {x_rv_fl_decl}
-                    {load_x}
-                    {copy_x}
-                    {mul_xx}
-                    __sumsq += {sum_expr};
-                }}
-                const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);
-                for (unsigned int __i = static_cast<unsigned int>(__lane);
-                     __i < __hidden; __i += 32u) {{
-                    const float __v = __bfloat162float(__x_smem[__i]);
-                    const float __g = __bfloat162float(__w_smem[__i]);
-                    __x_smem[__i] = __float2bfloat16(__v * __scale * __g);
-                }}
-            }}
-"#
-        )
-    }
-
     // ── AttnDecode body atoms (Phase 4) ────────────────────────────
     //
     // AttnDecode's compute spans FIVE separate bodies: a function-
@@ -1880,6 +1806,67 @@ pub enum Tk20Call {
         rhs2: String,
     },
 
+    /// `kittens::sv_bf<{k}>& {var} = *reinterpret_cast<kittens::sv_bf<{k}>*>({ptr});`
+    DeclSvBfView { var: String, ptr: String, k: u32 },
+
+    /// `kittens::rv_bf<{k}> {var};`
+    DeclRvBf { var: String, k: u32 },
+
+    /// `kittens::rv_fl<{k}> {var};`
+    DeclRvFl { var: String, k: u32 },
+
+    /// `kittens::warp::load({rv}, {sv});`
+    WarpLoadRvFromSv { rv: String, sv: String },
+
+    /// `kittens::warp::copy({dst}, {src});`
+    WarpCopyRv { dst: String, src: String },
+
+    /// `kittens::warp::mul({dst}, {lhs}, {rhs});`
+    WarpMulRv { dst: String, lhs: String, rhs: String },
+
+    /// `if (__consumer_idx == 0) { ...body... }` — gate the body to
+    /// the first consumer warp only. Recursively emits each body
+    /// Tk20Call.
+    IfConsumerIdxZero { body: Vec<Tk20Call> },
+
+    /// `const int {var} = static_cast<int>(threadIdx.x & 31);`
+    DeclConstI32Lane { var: String },
+
+    /// `const float {var} = {expr};`
+    DeclConstFloat { var: String, expr: String },
+
+    /// `float {var} = {init_expr};` — mutable float local
+    /// (e.g. `float __sumsq = 0.0f;`).
+    DeclMutableFloat { var: String, init: String },
+
+    /// `for (int {iter} = 0; {iter} < {end}; ++{iter}) { ...body... }` —
+    /// integer-counter for-loop with const upper bound (no thread
+    /// striding).
+    ForLoopIntK { iter: String, end: String, body: Vec<Tk20Call> },
+
+    /// `{dst} += kittens::warp::sum({rv});` — accumulate a warp-
+    /// collective register-vector sum into a float scalar.
+    FloatAddAssignWarpSum { dst: String, rv: String },
+
+    /// `const float {var} = rsqrtf({sumsq} / static_cast<float>({hidden}) + {eps});` —
+    /// the RmsNorm scaling factor.
+    DeclConstFloatRsqrtScale {
+        var: String,
+        sumsq: String,
+        hidden: String,
+        eps: String,
+    },
+
+    /// `{smem}[{idx}] = __float2bfloat16({a} * {b} * {c});` — three-
+    /// way scalar product store (RmsNorm: `v * scale * g`).
+    Bf16StoreFromFloatTripleProduct {
+        smem: String,
+        idx: String,
+        a: String,
+        b: String,
+        c: String,
+    },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -1966,10 +1953,6 @@ pub enum Tk20Call {
     // with `kittens::sv_bf<N>` only as a typed page alias.
 
     /// RmsNorm consumer compute body. Per-thread bf16 squared-sum +
-    /// warp shfl-reduce + per-thread normalize. Bound through
-    /// `tk20::rmsnorm_consumer_body`.
-    RmsNormConsumerBody { x_id: u8, w_id: u8, hidden: u32, eps: f32 },
-
     /// GemmM1 consumer compute body. M=1 dot product per consumer
     /// warp (warp `c` produces `y[c]` for `c < bn`), lane-parallel K
     /// reduce via `__shfl_xor_sync`. Bound through
@@ -2020,6 +2003,117 @@ pub enum Tk20Call {
     /// AttnDecode finalise (O = O_accum / l_sum). Bound through
     /// `tk20::attn_decode_finalise_softmax_norm_body`.
     AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
+}
+
+/// Tape-build helper: RmsNorm consumer compute as a typed Tk20Call
+/// sequence. Consumer-warp-0-only (other warps idle); two-pass:
+/// (1) K_TILE-block sumsq reduce via TK 2.0 register-vector
+/// `warp::load → warp::copy → warp::mul → warp::sum` then
+/// `rsqrtf(sumsq/hidden + eps)`; (2) lane-strided in-place
+/// `x[i] = x[i] * scale * w[i]` write-back over hidden cols.
+pub fn rmsnorm_compute_calls(x_id: u8, w_id: u8, hidden: u32, eps: f32) -> Vec<Tk20Call> {
+    const K_TILE: u32 = 128;
+    debug_assert_eq!(
+        hidden % K_TILE,
+        0,
+        "rmsnorm_compute_calls: hidden={hidden} must be a multiple of K_TILE={K_TILE}"
+    );
+    let k_blocks = hidden / K_TILE;
+    let inner_loop_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclRvBf {
+            var: "__x_rv_bf".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__x_rv_fl".into(),
+            k: K_TILE,
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__x_rv_bf".into(),
+            sv: "__x_sv.template subvec<128>(__k_i)".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__x_rv_fl".into(),
+            src: "__x_rv_bf".into(),
+        },
+        Tk20Call::WarpMulRv {
+            dst: "__x_rv_fl".into(),
+            lhs: "__x_rv_fl".into(),
+            rhs: "__x_rv_fl".into(),
+        },
+        Tk20Call::FloatAddAssignWarpSum {
+            dst: "__sumsq".into(),
+            rv: "__x_rv_fl".into(),
+        },
+    ];
+    let writeback_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstFloatFromBf16Smem {
+            var: "__v".into(),
+            smem: "__x_smem".into(),
+            idx: "__i".into(),
+        },
+        Tk20Call::DeclConstFloatFromBf16Smem {
+            var: "__g".into(),
+            smem: "__w_smem".into(),
+            idx: "__i".into(),
+        },
+        Tk20Call::Bf16StoreFromFloatTripleProduct {
+            smem: "__x_smem".into(),
+            idx: "__i".into(),
+            a: "__v".into(),
+            b: "__scale".into(),
+            c: "__g".into(),
+        },
+    ];
+    let warp0_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstU32 {
+            var: "__hidden".into(),
+            expr: format!("{hidden}u"),
+        },
+        Tk20Call::DeclConstFloat {
+            var: "__eps".into(),
+            expr: format!("{eps:?}f"),
+        },
+        Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+        Tk20Call::DeclMutableFloat {
+            var: "__sumsq".into(),
+            init: "0.0f".into(),
+        },
+        Tk20Call::ForLoopIntK {
+            iter: "__k_i".into(),
+            end: format!("{k_blocks}"),
+            body: inner_loop_body,
+        },
+        Tk20Call::DeclConstFloatRsqrtScale {
+            var: "__scale".into(),
+            sumsq: "__sumsq".into(),
+            hidden: "__hidden".into(),
+            eps: "__eps".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__i".into(),
+            start_var: "__lane".into(),
+            end_var: "__hidden".into(),
+            stride_var: "32u".into(),
+            body: writeback_body,
+        },
+    ];
+    vec![
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__x_smem".into(),
+            page_id: x_id,
+        },
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__w_smem".into(),
+            page_id: w_id,
+        },
+        Tk20Call::DeclSvBfView {
+            var: "__x_sv".into(),
+            ptr: format!("page_buf[{x_id}]"),
+            k: hidden,
+        },
+        Tk20Call::IfConsumerIdxZero { body: warp0_body },
+    ]
 }
 
 /// Tape-build helper: NeoX RoPE rotate as a typed Tk20Call sequence.
@@ -2299,6 +2393,39 @@ impl Tk20Call {
                 lhs2,
                 rhs2,
             } => format!("{smem}[{idx}] = __float2bfloat16({lhs1} * {rhs1} + {lhs2} * {rhs2});"),
+            Tk20Call::DeclSvBfView { var, ptr, k } => tk20::decl_sv_view_bf(var, ptr, *k),
+            Tk20Call::DeclRvBf { var, k } => tk20::decl_rv_bf(var, *k),
+            Tk20Call::DeclRvFl { var, k } => tk20::decl_rv_fl(var, *k),
+            Tk20Call::WarpLoadRvFromSv { rv, sv } => tk20::warp_load_rv_from_sv(rv, sv),
+            Tk20Call::WarpCopyRv { dst, src } => tk20::warp_copy_rv(dst, src),
+            Tk20Call::WarpMulRv { dst, lhs, rhs } => tk20::warp_mul_rv(dst, lhs, rhs),
+            Tk20Call::IfConsumerIdxZero { body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("if (__consumer_idx == 0) {{ {inner} }}")
+            }
+            Tk20Call::DeclConstI32Lane { var } => {
+                format!("const int {var} = static_cast<int>(threadIdx.x & 31);")
+            }
+            Tk20Call::DeclConstFloat { var, expr } => format!("const float {var} = {expr};"),
+            Tk20Call::DeclMutableFloat { var, init } => format!("float {var} = {init};"),
+            Tk20Call::ForLoopIntK { iter, end, body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("for (int {iter} = 0; {iter} < {end}; ++{iter}) {{ {inner} }}")
+            }
+            Tk20Call::FloatAddAssignWarpSum { dst, rv } => {
+                format!("{dst} += {};", tk20::warp_sum_rv(rv))
+            }
+            Tk20Call::DeclConstFloatRsqrtScale {
+                var,
+                sumsq,
+                hidden,
+                eps,
+            } => format!(
+                "const float {var} = rsqrtf({sumsq} / static_cast<float>({hidden}) + {eps});"
+            ),
+            Tk20Call::Bf16StoreFromFloatTripleProduct { smem, idx, a, b, c } => {
+                format!("{smem}[{idx}] = __float2bfloat16({a} * {b} * {c});")
+            }
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2330,13 +2457,6 @@ impl Tk20Call {
             Tk20Call::WarpgroupDecreaseRegisters { n } => {
                 tk20::warpgroup_decrease_registers(*n)
             }
-
-            Tk20Call::RmsNormConsumerBody {
-                x_id,
-                w_id,
-                hidden,
-                eps,
-            } => tk20::rmsnorm_consumer_body(*x_id, *w_id, *hidden, *eps),
 
 
             Tk20Call::GemmM1ConsumerBody {
@@ -2898,12 +3018,11 @@ mod tests {
     }
 
     #[test]
-    fn tk20_rmsnorm_consumer_body_emits_tk20_register_vector_reduce() {
-        // Phase 10: replace the per-warp shfl butterfly with TK 2.0
-        // register-vector reduction over K_TILE=128 chunks.
-        let body = tk20::rmsnorm_consumer_body(0, 1, 2048, 1.0e-5);
-        assert!(body.contains("auto* __x_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
-        assert!(body.contains("auto* __w_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+    fn rmsnorm_compute_calls_emit_atomic_typed_primitives() {
+        let calls = rmsnorm_compute_calls(0, 1, 2048, 1.0e-5);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("auto* __x_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[0]);"));
+        assert!(body.contains("auto* __w_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[1]);"));
         assert!(body
             .contains("kittens::sv_bf<2048>& __x_sv = *reinterpret_cast<kittens::sv_bf<2048>*>(page_buf[0]);"));
         assert!(body.contains("const unsigned int __hidden = 2048u;"));
@@ -2915,12 +3034,11 @@ mod tests {
         assert!(body.contains("kittens::warp::copy(__x_rv_fl, __x_rv_bf);"));
         assert!(body.contains("kittens::warp::mul(__x_rv_fl, __x_rv_fl, __x_rv_fl);"));
         assert!(body.contains("__sumsq += kittens::warp::sum(__x_rv_fl);"));
-        assert!(body.contains("rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps)"));
-        assert!(body.contains("__float2bfloat16(__v * __scale * __g)"));
+        assert!(body.contains("const float __scale = rsqrtf(__sumsq / static_cast<float>(__hidden) + __eps);"));
+        assert!(body.contains("__x_smem[__i] = __float2bfloat16(__v * __scale * __g);"));
         // Legacy shfl + per-thread squared-sum loop gone.
         assert!(!body.contains("__shfl_xor_sync"));
-        assert!(!body.contains("__sumsq += __v * __v"));
-        // Strictly TK 2.0 (no warpgroup wgmma in consumer body).
+        // Strictly TK 2.0.
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
         assert!(!body.contains("kittens::warpgroup::mma_AB"));
@@ -2937,21 +3055,6 @@ mod tests {
         assert!(body.contains("__a_smem[__i] = __float2bfloat16(__a + __b);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
-    }
-
-    #[test]
-    fn tk20_call_rmsnorm_atom_round_trip_matches_binding() {
-        // Tk20Call::RmsNormConsumerBody.emit() must byte-equal the
-        // direct binding call (delegation contract).
-        let direct = tk20::rmsnorm_consumer_body(0, 1, 2048, 1.0e-5);
-        let via_atom = Tk20Call::RmsNormConsumerBody {
-            x_id: 0,
-            w_id: 1,
-            hidden: 2048,
-            eps: 1.0e-5,
-        }
-        .emit();
-        assert_eq!(direct, via_atom);
     }
 
     // Phase 5 cutover: byte-identity-vs-legacy tests deleted. They

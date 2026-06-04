@@ -299,12 +299,7 @@ pub fn lower_rmsnorm<P: Phase>(op: RmsNormOp, pages: &mut PageAllocator, prog: &
     let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
-            x_id,
-            w_id,
-            hidden: op.hidden,
-            eps: op.eps,
-        }],
+        crate::tk_codegen::rmsnorm_compute_calls(x_id, w_id, op.hidden, op.eps),
     );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);
@@ -396,12 +391,7 @@ pub fn lower_rmsnorm_routed<P: Phase>(
     let w_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, w_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RmsNormConsumerBody {
-            x_id,
-            w_id,
-            hidden: op.hidden,
-            eps: op.eps,
-        }],
+        crate::tk_codegen::rmsnorm_compute_calls(x_id, w_id, op.hidden, op.eps),
     );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let w_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, w_page);

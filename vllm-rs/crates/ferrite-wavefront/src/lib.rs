@@ -36,4 +36,6 @@ pub mod tk_barrier;
 pub mod tk_gmem;
 pub mod tk_lower;
 pub mod tk_orchestrate;
+pub mod tk_player;
+pub mod tk_tape;
 pub mod tk_warp_ir;

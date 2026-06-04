@@ -712,10 +712,10 @@ pub fn lower_attn_decode<P: Phase>(
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
             body.compute_calls(
                 WarpRole::AllConsumers,
-                vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
-                    unique_id: op.unique_id,
-                    head_dim: op.head_dim,
-                }],
+                crate::tk_codegen::attn_decode_qkt_softmax_step_compute_calls(
+                    op.unique_id,
+                    op.head_dim,
+                ),
             );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
 
@@ -909,10 +909,10 @@ pub fn lower_attn_decode_routed<P: Phase>(
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, k_id, loop_var, start);
             body.compute_calls(
                 WarpRole::AllConsumers,
-                vec![crate::tk_codegen::Tk20Call::AttnDecodeQktSoftmaxStepBody {
-                    unique_id: op.unique_id,
-                    head_dim: op.head_dim,
-                }],
+                crate::tk_codegen::attn_decode_qkt_softmax_step_compute_calls(
+                    op.unique_id,
+                    op.head_dim,
+                ),
             );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, k_id);
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, k_id, loop_var, start);

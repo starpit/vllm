@@ -494,87 +494,6 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the AttnDecode init-softmax body. Sets `__m_max = -INF`,
-    /// Emit the AttnDecode Q@K^T + online-softmax step body. Runs
-    /// inside the KV-sweep loop, once per K page. Computes the
-    /// per-q-head scaled dot-product, applies the online-softmax
-    /// renormalisation `__renorm = exp(m_old - m_new)`, updates
-    /// `__l_sum`, and rescales `__o_accum` by `__renorm`.
-    ///
-    /// Phase 9: replace the `__shfl_xor_sync` butterfly K-reduce with
-    /// TK 2.0 register-vector primitives (`warp::load → warp::copy →
-    /// warp::mul → warp::sum`), matching the Phase 8 `gemm_m1` pattern.
-    /// `head_dim` is now a body-emit parameter (was prelude-scope-only)
-    /// so `kittens::sv_bf<head_dim>` reaches the emit as a literal.
-    /// Per-q-head softmax math (m_max/l_sum/renorm/p scalars) stays on
-    /// per-thread float arrays declared in the prelude — those are
-    /// scalars not vectors. The full register-tile online-softmax with
-    /// `mma_AB`/`mma_ABt` waits on the typed `gl<>` substrate-deep phase
-    /// (same precondition as Phase 8: m=1 1×head_dim shapes don't fit
-    /// TK 2.0 register tiles which require ≥16×16).
-    pub fn attn_decode_qkt_softmax_step_body(unique_id: u32, head_dim: u32) -> String {
-        let u = unique_id;
-        let q_sv_decl = decl_sv_view_bf(
-            "__q_row_sv",
-            &format!("(reinterpret_cast<__nv_bfloat16*>(__q_smem_a{u}) + __q_off)"),
-            head_dim,
-        );
-        let k_sv_decl = decl_sv_view_bf(
-            "__k_row_sv",
-            &format!("(reinterpret_cast<__nv_bfloat16*>(__k_smem_a{u}) + __k_off)"),
-            head_dim,
-        );
-        let q_rv_bf_decl = decl_rv_bf("__q_rv_bf", head_dim);
-        let k_rv_bf_decl = decl_rv_bf("__k_rv_bf", head_dim);
-        let q_rv_fl_decl = decl_rv_fl("__q_rv_fl", head_dim);
-        let k_rv_fl_decl = decl_rv_fl("__k_rv_fl", head_dim);
-        let load_q = warp_load_rv_from_sv("__q_rv_bf", "__q_row_sv");
-        let load_k = warp_load_rv_from_sv("__k_rv_bf", "__k_row_sv");
-        let copy_q = warp_copy_rv("__q_rv_fl", "__q_rv_bf");
-        let copy_k = warp_copy_rv("__k_rv_fl", "__k_rv_bf");
-        let mul_qk = warp_mul_rv("__q_rv_fl", "__q_rv_fl", "__k_rv_fl");
-        let sum_expr = warp_sum_rv("__q_rv_fl");
-        format!(
-            r#"
-            // tk_warp_ir AttnDecode #{u} — Q@K^T + online softmax
-            // Phase 7: gate to active warps. Phase 9: K-axis reduce via
-            // TK 2.0 register-vector primitives.
-            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
-                const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
-                const unsigned int __k_off = __kv_head * __head_dim_a{u};
-                {k_sv_decl}
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    const unsigned int __q_off = (__q_head_base + __h) * __head_dim_a{u};
-                    {q_sv_decl}
-                    {q_rv_bf_decl}
-                    {k_rv_bf_decl}
-                    {q_rv_fl_decl}
-                    {k_rv_fl_decl}
-                    {load_q}
-                    {load_k}
-                    {copy_q}
-                    {copy_k}
-                    {mul_qk}
-                    float __s = {sum_expr};
-                    __s *= __scale_a{u};
-                    const float __m_new = fmaxf(__m_max_a{u}[__h], __s);
-                    __renorm_a{u}[__h] = expf(__m_max_a{u}[__h] - __m_new);
-                    __p_a{u}[__h]      = expf(__s              - __m_new);
-                    __l_sum_a{u}[__h]  = __renorm_a{u}[__h] * __l_sum_a{u}[__h] + __p_a{u}[__h];
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] *= __renorm_a{u}[__h];
-                    }}
-                    __m_max_a{u}[__h] = __m_new;
-                }}
-            }}
-"#
-        )
-    }
-
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1682,6 +1601,62 @@ pub enum Tk20Call {
         scalar: String,
     },
 
+    /// `float {var} = kittens::warp::sum({rv});` — initialise a
+    /// scalar from a register-vector warp-collective sum.
+    DeclMutableFloatFromWarpSum { var: String, rv: String },
+
+    /// `{var} *= {expr};` — float compound multiply-assign (used for
+    /// `__s *= __scale`).
+    FloatMulAssign { var: String, expr: String },
+
+    /// `const float {var} = fmaxf({array}[{idx}], {other});`
+    DeclConstFloatFmaxArray {
+        var: String,
+        array: String,
+        idx: String,
+        other: String,
+    },
+
+    /// `{array}[{idx}] = expf({lhs} - {rhs});` — used by online-
+    /// softmax for renorm (`expf(m_old - m_new)`) and p
+    /// (`expf(s - m_new)`).
+    ScalarFloatStoreExpDiff {
+        array: String,
+        idx: String,
+        lhs: String,
+        rhs: String,
+    },
+
+    /// `{dst}[{idx}] = {a}[{idx}] * {b}[{idx}] + {c}[{idx}];` —
+    /// per-element FMA into a 1-D scalar array. Used by AttnDecode's
+    /// `__l_sum[h] = __renorm[h] * __l_sum[h] + __p[h]` update.
+    ScalarFloat1DStoreFma {
+        dst: String,
+        idx: String,
+        a: String,
+        b: String,
+        c: String,
+    },
+
+    /// `{array}[{i}][{j}] *= {scalar}[{i}];` — 2D scalar in-place
+    /// scale by a per-row scalar. Used by AttnDecode's o_accum
+    /// rescale: `__o_accum[h][j] *= __renorm[h]`.
+    ScalarFloat2DMulAssignFromArray {
+        array: String,
+        i: String,
+        j: String,
+        scalar: String,
+    },
+
+    /// `{array}[{idx}] = {src};` — copy a scalar variable into a
+    /// 1-D float array slot. Used by AttnDecode's m_max update:
+    /// `__m_max[h] = __m_new;`.
+    ScalarFloatStoreVar {
+        array: String,
+        idx: String,
+        src: String,
+    },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -1767,14 +1742,151 @@ pub enum Tk20Call {
     // same: per-thread squared-sum + warp shfl + per-thread normalize,
     // with `kittens::sv_bf<N>` only as a typed page alias.
 
-    /// AttnDecode Q@K^T + online-softmax step (inside KV-sweep loop).
-    /// Bound through `tk20::attn_decode_qkt_softmax_step_body`.
-    /// `head_dim` carried so the body emit declares
-    /// `kittens::sv_bf<head_dim>` / `kittens::rv_bf<head_dim>` views
-    /// with a literal compile-time length (Phase 9).
-    AttnDecodeQktSoftmaxStepBody { unique_id: u32, head_dim: u32 },
 
 
+}
+
+/// Tape-build helper: AttnDecode Q@K^T + online-softmax step
+/// (inside KV-sweep loop). Per active consumer warp, loops over
+/// q-heads-per-warp; within each h loops register-vector
+/// `kittens::warp::{load, copy, mul, sum}` over Q and K slices,
+/// then runs scalar online-softmax (`m_new = max(m_max, s)`, renorm
+/// = `expf(m_old - m_new)`, `p = expf(s - m_new)`, `l_sum =
+/// renorm * l_sum + p`, lane-strided `o_accum *= renorm`, finally
+/// `m_max = m_new`).
+pub fn attn_decode_qkt_softmax_step_compute_calls(
+    unique_id: u32,
+    head_dim: u32,
+) -> Vec<Tk20Call> {
+    let u = unique_id;
+    // Inner h-loop body — one h-head's K-reduce + softmax update.
+    let inner_o_accum_rescale: Vec<Tk20Call> = vec![Tk20Call::ScalarFloat2DMulAssignFromArray {
+        array: format!("__o_accum_a{u}"),
+        i: "__h".into(),
+        j: "__j".into(),
+        scalar: format!("__renorm_a{u}"),
+    }];
+    let h_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstU32 {
+            var: "__q_off".into(),
+            expr: format!("(__q_head_base + __h) * __head_dim_a{u}"),
+        },
+        Tk20Call::DeclSvBfView {
+            var: "__q_row_sv".into(),
+            ptr: format!("(reinterpret_cast<__nv_bfloat16*>(__q_smem_a{u}) + __q_off)"),
+            k: head_dim,
+        },
+        Tk20Call::DeclRvBf {
+            var: "__q_rv_bf".into(),
+            k: head_dim,
+        },
+        Tk20Call::DeclRvBf {
+            var: "__k_rv_bf".into(),
+            k: head_dim,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__q_rv_fl".into(),
+            k: head_dim,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__k_rv_fl".into(),
+            k: head_dim,
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__q_rv_bf".into(),
+            sv: "__q_row_sv".into(),
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__k_rv_bf".into(),
+            sv: "__k_row_sv".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__q_rv_fl".into(),
+            src: "__q_rv_bf".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__k_rv_fl".into(),
+            src: "__k_rv_bf".into(),
+        },
+        Tk20Call::WarpMulRv {
+            dst: "__q_rv_fl".into(),
+            lhs: "__q_rv_fl".into(),
+            rhs: "__k_rv_fl".into(),
+        },
+        Tk20Call::DeclMutableFloatFromWarpSum {
+            var: "__s".into(),
+            rv: "__q_rv_fl".into(),
+        },
+        Tk20Call::FloatMulAssign {
+            var: "__s".into(),
+            expr: format!("__scale_a{u}"),
+        },
+        Tk20Call::DeclConstFloatFmaxArray {
+            var: "__m_new".into(),
+            array: format!("__m_max_a{u}"),
+            idx: "__h".into(),
+            other: "__s".into(),
+        },
+        Tk20Call::ScalarFloatStoreExpDiff {
+            array: format!("__renorm_a{u}"),
+            idx: "__h".into(),
+            lhs: format!("__m_max_a{u}[__h]"),
+            rhs: "__m_new".into(),
+        },
+        Tk20Call::ScalarFloatStoreExpDiff {
+            array: format!("__p_a{u}"),
+            idx: "__h".into(),
+            lhs: "__s".into(),
+            rhs: "__m_new".into(),
+        },
+        Tk20Call::ScalarFloat1DStoreFma {
+            dst: format!("__l_sum_a{u}"),
+            idx: "__h".into(),
+            a: format!("__renorm_a{u}"),
+            b: format!("__l_sum_a{u}"),
+            c: format!("__p_a{u}"),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__j".into(),
+            start_var: "__lane".into(),
+            end_var: format!("__head_dim_a{u}"),
+            stride_var: "32u".into(),
+            body: inner_o_accum_rescale,
+        },
+        Tk20Call::ScalarFloatStoreVar {
+            array: format!("__m_max_a{u}"),
+            idx: "__h".into(),
+            src: "__m_new".into(),
+        },
+    ];
+    let active_warp_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+        Tk20Call::DeclConstU32FromConsumerIdx { var: "__kv_head".into() },
+        Tk20Call::DeclConstU32 {
+            var: "__q_head_base".into(),
+            expr: format!(
+                "static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u}"
+            ),
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__k_off".into(),
+            expr: format!("__kv_head * __head_dim_a{u}"),
+        },
+        Tk20Call::DeclSvBfView {
+            var: "__k_row_sv".into(),
+            ptr: format!("(reinterpret_cast<__nv_bfloat16*>(__k_smem_a{u}) + __k_off)"),
+            k: head_dim,
+        },
+        Tk20Call::ForLoopUnsignedH {
+            iter: "__h".into(),
+            end: format!("__q_heads_per_warp_a{u}"),
+            body: h_body,
+        },
+    ];
+    vec![Tk20Call::IfConsumerIdxLtVar {
+        var: format!("__num_kv_heads_a{u}"),
+        body: active_warp_body,
+    }]
 }
 
 /// Tape-build helper: AttnDecode SV-accumulate step (inside KV
@@ -2598,6 +2710,34 @@ impl Tk20Call {
                 j,
                 scalar,
             } => format!("{smem}[{idx}] = __float2bfloat16({accum}[{i}][{j}] * {scalar});"),
+            Tk20Call::DeclMutableFloatFromWarpSum { var, rv } => {
+                format!("float {var} = {};", tk20::warp_sum_rv(rv))
+            }
+            Tk20Call::FloatMulAssign { var, expr } => format!("{var} *= {expr};"),
+            Tk20Call::DeclConstFloatFmaxArray {
+                var,
+                array,
+                idx,
+                other,
+            } => format!("const float {var} = fmaxf({array}[{idx}], {other});"),
+            Tk20Call::ScalarFloatStoreExpDiff {
+                array,
+                idx,
+                lhs,
+                rhs,
+            } => format!("{array}[{idx}] = expf({lhs} - {rhs});"),
+            Tk20Call::ScalarFloat1DStoreFma { dst, idx, a, b, c } => {
+                format!("{dst}[{idx}] = {a}[{idx}] * {b}[{idx}] + {c}[{idx}];")
+            }
+            Tk20Call::ScalarFloat2DMulAssignFromArray {
+                array,
+                i,
+                j,
+                scalar,
+            } => format!("{array}[{i}][{j}] *= {scalar}[{i}];"),
+            Tk20Call::ScalarFloatStoreVar { array, idx, src } => {
+                format!("{array}[{idx}] = {src};")
+            }
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2631,10 +2771,6 @@ impl Tk20Call {
             }
 
 
-            Tk20Call::AttnDecodeQktSoftmaxStepBody {
-                unique_id,
-                head_dim,
-            } => tk20::attn_decode_qkt_softmax_step_body(*unique_id, *head_dim),
         }
     }
 }
@@ -3358,12 +3494,9 @@ mod tests {
     }
 
     #[test]
-    fn tk20_attn_decode_qkt_sv_finalise_emit_legacy_compatible_cuda() {
-
-        // Phase 9: K-axis reduce via TK 2.0 register-vector primitives;
-        // shfl butterfly removed.
-        let qkt = tk20::attn_decode_qkt_softmax_step_body(7, 64);
-        assert!(qkt.contains("AttnDecode #7 — Q@K^T + online softmax"));
+    fn attn_decode_qkt_compute_calls_emit_atomic_typed_primitives() {
+        let calls = attn_decode_qkt_softmax_step_compute_calls(7, 64);
+        let qkt: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
         assert!(qkt.contains("kittens::sv_bf<64>& __k_row_sv ="));
         assert!(qkt.contains("kittens::sv_bf<64>& __q_row_sv ="));
         assert!(qkt.contains("kittens::rv_bf<64> __q_rv_bf;"));
@@ -3376,13 +3509,18 @@ mod tests {
         assert!(qkt.contains("kittens::warp::copy(__k_rv_fl, __k_rv_bf);"));
         assert!(qkt.contains("kittens::warp::mul(__q_rv_fl, __q_rv_fl, __k_rv_fl);"));
         assert!(qkt.contains("float __s = kittens::warp::sum(__q_rv_fl);"));
+        assert!(qkt.contains("__s *= __scale_a7;"));
+        assert!(qkt.contains("const float __m_new = fmaxf(__m_max_a7[__h], __s);"));
         assert!(qkt.contains("__renorm_a7[__h] = expf(__m_max_a7[__h] - __m_new);"));
+        assert!(qkt.contains("__p_a7[__h] = expf(__s - __m_new);"));
+        assert!(qkt.contains("__l_sum_a7[__h] = __renorm_a7[__h] * __l_sum_a7[__h] + __p_a7[__h];"));
+        assert!(qkt.contains("__o_accum_a7[__h][__j] *= __renorm_a7[__h];"));
+        assert!(qkt.contains("__m_max_a7[__h] = __m_new;"));
         assert!(!qkt.contains("__shfl_xor_sync"));
         assert!(!qkt.contains("__bfloat162float(__q_smem"));
         assert!(!qkt.contains("__bfloat162float(__k_smem"));
         assert!(!qkt.contains("kittens::warp::mma_AB"));
         assert!(!qkt.contains("kittens::warpgroup::mma_AB"));
-
     }
 
     #[test]

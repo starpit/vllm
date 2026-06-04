@@ -311,12 +311,26 @@ pub fn emit_per_variant(
             {
                 if pe.len() > 2 {
                     if #flatten_channels_last {
-                        // MLX channels-LAST conv weight ([out, kt,kh,kw, in]):
-                        // permute `in` to the front of the kernel dims, then
-                        // flatten, so it pairs with the channels-FIRST patch
-                        // packing. A plain reshape would mispair elements and
-                        // silently corrupt the high-variance patches.
-                        gw.flatten_conv_weight_channels_last(#flatten_key_lit, #flatten_lead_lit)?;
+                        // Conv weight (4D or 5D). Two on-disk layouts ship
+                        // for the same arch: HF-native PyTorch Conv3d
+                        // `[out, in, kt, kh, kw]` (channels-FIRST, e.g.
+                        // `Qwen/Qwen3.5-9B`'s
+                        // `model.visual.patch_embed.proj.weight` is
+                        // `[1152, 3, 2, 16, 16]`) and MLX-converted
+                        // checkpoints `[out, kt, kh, kw, in]` (channels-LAST).
+                        // Sniff: if dim immediately AFTER the leading dim
+                        // equals `in_chans`, the weight is channels-FIRST
+                        // and just needs flattening; otherwise apply the
+                        // permute. Hard-coding channels_last (the previous
+                        // behavior) misperms HF-native weights — the result
+                        // has the right total element count but every index
+                        // is mispaired, silently corrupting all patches.
+                        let in_chans_usize: usize = #in_chans_lit as usize;
+                        gw.flatten_conv_weight(
+                            #flatten_key_lit,
+                            #flatten_lead_lit,
+                            ::std::option::Option::Some(in_chans_usize),
+                        )?;
                     } else {
                         let lead = pe[#flatten_lead_lit];
                         let rest: usize = pe.iter().skip(#flatten_lead_lit + 1).product();

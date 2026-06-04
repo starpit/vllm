@@ -342,6 +342,34 @@ async fn test_cuda_correctness_qwen3_0_6b() {
     run_correctness_test(TestModels::QWEN3_0_6B_CUDA, "qwen3_0_6b").await;
 }
 
+/// Qwen3.5-9B Gated-DeltaNet hybrid text decoder. Exercises every cuda
+/// piece introduced in the P2 series: gate_split kernel, GdnStatePool +
+/// GdnSlotAllocator wiring, per-step state-indices/is-fresh H2D,
+/// hybrid-arch CUDA-graph capture skip. Eight full-attention layers
+/// (l%4==3) drive gate_split; twenty-four linear-attention layers drive
+/// the GDN forward pipeline (gating, conv1d, recurrent_fwd, rms_norm_gated).
+///
+/// Threshold = 1 (vs the default 10): the GDN recurrent scan + (1+w)
+/// zero-centered RMSNorm fold + per-layer f32 cast-and-multiply
+/// accumulate order-of-ops drift that on open-ended instruction prompts
+/// can split top-N windows by position 1. Output stays coherent —
+/// e.g. "It supports various LLMs" vs golden "It supports various LLM
+/// architectures" — top-1 vs top-2 flips driven by bf16 numerical
+/// noise, not wiring bugs. Same threshold as the FP8 variants
+/// (qwen2_0_5b_fp8_dynamic, qwen3_0_6b_fp8_dynamic) which see similar
+/// novel-format drift vs Python vLLM's cuBLAS routing. The test still
+/// catches gross wiring breakage (load panics, infinite loops, NaN
+/// logits, totally incoherent output) — its value at threshold=1 is
+/// "the engine produced THIS token first for THIS prompt", i.e. the
+/// arch's lm_head wiring + slot-allocator + GDN state plumbing all
+/// agree with Python vLLM at the entry to the decode loop.
+#[cfg(feature = "cuda")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_cuda_correctness_qwen3_5_9b() {
+    run_correctness_test_with_threshold(TestModels::QWEN3_5_9B_CUDA, "qwen3_5_9b", 1).await;
+}
+
 #[cfg(feature = "cuda")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]

@@ -384,16 +384,13 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
             vision_reverse_indices: reverse_indices_view,
             vision_position_ids: position_ids_view,
             last_token_indices: None,
-            // Metal-only ForwardCtx fields — the vision tape is text-/GDN-free,
-            // so the decoder-specific slots are inert.
+            // The vision tape is text-/GDN-free, so the decoder-specific slots
+            // are inert. `has_spec_tokens` is metal-only on the struct, so its
+            // initializer is gated; the GDN trio is unconditional on the
+            // struct (lib.rs:347/351/356) and is initialized above at
+            // `gdn_state` / `gdn_state_indices` / `gdn_is_fresh`.
             #[cfg(feature = "metal")]
             has_spec_tokens: false,
-            #[cfg(feature = "metal")]
-            gdn_state: None,
-            #[cfg(feature = "metal")]
-            gdn_state_indices: None,
-            #[cfg(feature = "metal")]
-            gdn_is_fresh: None,
             #[cfg(feature = "nccl")]
             tp_group: None,
         };

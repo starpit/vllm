@@ -1325,10 +1325,20 @@ impl Instruction {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
-                let out = kernels::rms_norm(
+                // `W::NORM_WEIGHT_OFFSET` folds the `(1 + w)` zero-centered
+                // RMSNorm convention (Gemma / Qwen3.5) at kernel time. Metal
+                // reads this through the same `CanonicalParams` const; cuda
+                // matches by routing through `rms_norm_with_offset`. For
+                // arches where the DSL already wrote `(Add(w, 1.0), rmsnorm)`
+                // explicitly (Gemma2/3) the solver claims it as
+                // `Instruction::ScalarOffsetRmsNorm` BEFORE this arm fires,
+                // so the offset doesn't double-apply. Default 0.0 makes
+                // standard arches (Llama / Qwen2 / Qwen3) byte-identical.
+                let out = kernels::rms_norm_with_offset(
                     *v,
                     w.weight,
                     w.eps,
+                    W::NORM_WEIGHT_OFFSET,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -1468,11 +1478,14 @@ impl Instruction {
                 let delta = tile_ref(ctx.tiles, delta_slot).as_view(ctx.tiles);
                 let residual = tile_ref(ctx.tiles, residual_slot).as_view(ctx.tiles);
                 let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);
-                let _ = kernels::fused_add_rms_norm_inplace(
+                // Same `(1 + w)` fold as the standalone RmsNorm arm above —
+                // see that comment for the rationale and double-apply guard.
+                let _ = kernels::fused_add_rms_norm_inplace_with_offset(
                     *delta,
                     *residual,
                     w.weight,
                     w.eps,
+                    W::NORM_WEIGHT_OFFSET,
                     ctx.device.compute_stream,
                 );
             },
@@ -1525,10 +1538,13 @@ impl Instruction {
                     k,
                     tp_active(ctx),
                 );
-                let normed = kernels::rms_norm(
+                // (1+w) zero-centered RMSNorm fold (Qwen3.5 / Gemma) —
+                // see Instruction::RmsNorm arm for rationale.
+                let normed = kernels::rms_norm_with_offset(
                     *v,
                     nw.weight,
                     nw.eps,
+                    W::NORM_WEIGHT_OFFSET,
                     &mut ctx.device.caching,
                     ctx.device.compute_stream,
                 );
@@ -1605,11 +1621,14 @@ impl Instruction {
                 // residual buffer = updated residual. The residual
                 // alias is set up by the codegen prelude (TileEntry::View
                 // on (add_id, 0) → residual upstream).
-                let (normed_view, _) = kernels::fused_add_rms_norm_inplace(
+                // (1+w) zero-centered RMSNorm fold (Qwen3.5 / Gemma) —
+                // see Instruction::RmsNorm arm for rationale.
+                let (normed_view, _) = kernels::fused_add_rms_norm_inplace_with_offset(
                     *delta,
                     *residual,
                     nw.weight,
                     nw.eps,
+                    W::NORM_WEIGHT_OFFSET,
                     ctx.device.compute_stream,
                 );
                 // Last-token-per-seq narrow before lm_head GEMM. At
@@ -1676,15 +1695,11 @@ impl Instruction {
                 // either has `k == INTERMEDIATE_SIZE` (down_proj) or
                 // `n <= INTERMEDIATE_SIZE` (q/k/v/o/gate/up). VOCAB ≫
                 // INTERMEDIATE on every modern arch.
-                let is_lm_head = (k as usize) == W::HIDDEN_SIZE
-                    && (n as usize) > W::INTERMEDIATE_SIZE;
+                let is_lm_head =
+                    (k as usize) == W::HIDDEN_SIZE && (n as usize) > W::INTERMEDIATE_SIZE;
                 let gathered_owned: Option<OwnedTensor>;
                 let gemm_input = match ctx.fwd.last_token_indices {
-                    Some(idx)
-                        if !narrow_disabled
-                            && is_lm_head
-                            && idx.dim(0) < (*v).dim(0) =>
-                    {
+                    Some(idx) if !narrow_disabled && is_lm_head && idx.dim(0) < (*v).dim(0) => {
                         let owned = kernels::embedding_gather(
                             *v,
                             *idx,
@@ -1700,10 +1715,10 @@ impl Instruction {
                         *v
                     }
                 };
-                let out = ctx
-                    .device
-                    .cublas
-                    .gemm(gemm_input, w.dense_weight(), &mut ctx.device.caching);
+                let out =
+                    ctx.device
+                        .cublas
+                        .gemm(gemm_input, w.dense_weight(), &mut ctx.device.caching);
                 drop(gathered_owned);
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
@@ -2777,16 +2792,23 @@ impl Instruction {
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
             },
-            Instruction::GateSplit(_qg_slot, _q_slot, _gate_slot) => {
-                // Per-head deinterleave qg[T, nh*2*hd] → q,gate [T, nh*hd].
-                // CUDA path deferred to the cuda-host phase (needs a strided
-                // deinterleave kernel / memcpy2d-per-head); Mac-first uses the
-                // metal deinterleave lowering. See project_qwen35_gdn_port.md.
-                unimplemented!(
-                    "GateSplit cuda eval not yet implemented — per-head deinterleave \
-                     of the doubled q_proj. Implement in the cuda-host verification phase."
+            Instruction::GateSplit(qg_slot, q_slot, gate_slot) => unsafe {
+                // Per-head deinterleave qg[T, nh*2*hd] → q,gate [T, nh*hd] via
+                // gate_split.{metal,cu}. Each head's 2*head_dim block is
+                // [query | gate]; the cuda kernel mirrors the metal source byte-for-byte.
+                let qg_tv = tile_ref(ctx.tiles, qg_slot).as_view(ctx.tiles);
+                let num_heads = W::NUM_Q_HEADS as usize;
+                let head_dim = W::HEAD_DIM as usize;
+                let (q_out, gate_out) = kernels::gate_split(
+                    *qg_tv,
+                    num_heads,
+                    head_dim,
+                    &mut ctx.device.caching,
+                    ctx.device.compute_stream,
                 );
-            }
+                ctx.tiles[q_slot as usize] = Some(TileEntry::Owned(q_out));
+                ctx.tiles[gate_slot as usize] = Some(TileEntry::Owned(gate_out));
+            },
             Instruction::DeepSeekMoe(in_slot, out_slot, layer) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
@@ -3991,6 +4013,28 @@ unsafe fn gdn_dtoh_i32(
     host
 }
 
+/// Sibling of [`gdn_dtoh_i32`] for u32 tensors — used by the GDN eval
+/// to read the per-seq `is_fresh` mask before zeroing recycled-slot state.
+#[cfg(feature = "cuda")]
+unsafe fn gdn_dtoh_u32(
+    t: ferrite_cuda_core::tensor::TensorView<'_>,
+    count: usize,
+    stream: ferrite_cuda_core::CUstream,
+) -> Vec<u32> {
+    let mut host = vec![0u32; count];
+    unsafe {
+        ferrite_cuda_core::driver::memcpy_dtoh_async(
+            host.as_mut_ptr() as *mut u8,
+            (*t).as_ptr::<u8>(),
+            count * 4,
+            stream,
+        )
+        .expect("gdn_dtoh_u32: D2H copy failed");
+        ferrite_cuda_core::driver::stream_synchronize(stream).expect("gdn_dtoh_u32: sync");
+    }
+    host
+}
+
 /// Gated-DeltaNet eval — orchestrates the surviving `gdn_*` kernels for one
 /// linear-attention layer. Validated op-by-op against the cpu_golden oracle
 /// (`cpu_golden::gdn_*`):
@@ -4062,9 +4106,55 @@ unsafe fn gated_delta_net_eval<W: CanonicalParams>(
             .fwd
             .gdn_state_indices
             .expect("GatedDeltaNet eval: ForwardCtx.gdn_state_indices is None");
+        let is_fresh_view = ctx
+            .fwd
+            .gdn_is_fresh
+            .expect("GatedDeltaNet eval: ForwardCtx.gdn_is_fresh is None");
         let conv_state = gdn_state.conv_state(layer as usize);
         let ssm_state = gdn_state.ssm_state(layer as usize);
         let num_seqs = (*state_indices).dim(0);
+
+        // Honor the per-seq `is_fresh` flag by zeroing the recurrent
+        // conv/ssm regions for any slot whose owning request is on its
+        // first forward (slot just allocated, OR a recycled slot whose
+        // prior owner finished). Without this the cuda gdn_conv1d /
+        // gdn_recurrent_fwd kernels would continue from the prior
+        // sequence's stale state — silent decode corruption that
+        // surfaces as identical-token loops on the second prompt
+        // through a recycled slot. The metal kernels gate the zero-
+        // init INSIDE the kernel via the `is_fresh` buffer; cuda
+        // doesn't (no fresh-aware branch in
+        // `crates/vllm-cuda/csrc/gdn_*_kernels.cu`), so we pre-zero
+        // here on the same compute stream.
+        let fresh_host = gdn_dtoh_u32(is_fresh_view, num_seqs, stream);
+        let slots_for_fresh = gdn_dtoh_i32(state_indices, num_seqs, stream);
+        // conv_state shape: [num_slots, conv_dim, conv_state_len]
+        // ssm_state shape:  [num_slots, num_v_heads, head_v_dim, head_k_dim]
+        let conv_slot_bytes = conv_state.dim(1) * conv_state.dim(2) * DType::F32.size_bytes();
+        let ssm_slot_bytes =
+            ssm_state.dim(1) * ssm_state.dim(2) * ssm_state.dim(3) * DType::F32.size_bytes();
+        for s in 0..num_seqs {
+            if fresh_host[s] == 0 {
+                continue;
+            }
+            let slot = slots_for_fresh[s] as usize;
+            let conv_off = slot * conv_slot_bytes;
+            let ssm_off = slot * ssm_slot_bytes;
+            ferrite_cuda_core::driver::memset_d8(
+                conv_state.raw_ptr().add(conv_off),
+                0,
+                conv_slot_bytes,
+                stream,
+            )
+            .expect("GDN fresh: zero conv_state slot");
+            ferrite_cuda_core::driver::memset_d8(
+                ssm_state.raw_ptr().add(ssm_off),
+                0,
+                ssm_slot_bytes,
+                stream,
+            )
+            .expect("GDN fresh: zero ssm_state slot");
+        }
 
         // 1. Cast inputs + small weights to f32 (the gdn_* kernels are f32).
         let mixed_qkv = gdn_cast_to_f32(&mut ctx.device.caching, *qkv_tv, &[nt, conv_dim], stream);

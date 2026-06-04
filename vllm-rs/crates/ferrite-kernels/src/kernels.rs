@@ -9185,6 +9185,28 @@ unsafe extern "C" {
         conv_dim: c_int,
         stream: CUstream,
     );
+
+    // Qwen3.5 attention output-gate split: per-head deinterleave of doubled
+    // q_proj output `qg[T, num_heads*2*head_dim]` into `q[T, num_heads*head_dim]`
+    // and `gate[T, num_heads*head_dim]`. Mirrors gate_split.metal.
+    fn gate_split_bf16(
+        q_out: *mut u16,
+        gate_out: *mut u16,
+        qg: *const u16,
+        num_tokens: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        stream: CUstream,
+    );
+    fn gate_split_f16(
+        q_out: *mut u16,
+        gate_out: *mut u16,
+        qg: *const u16,
+        num_tokens: c_int,
+        num_heads: c_int,
+        head_dim: c_int,
+        stream: CUstream,
+    );
 }
 
 /// Fused GDN gating computation (all f32 on GPU).
@@ -9491,6 +9513,63 @@ pub unsafe fn gdn_conv_split(
     );
 
     (q, k, v)
+}
+
+/// Qwen3.5 attention output-gate split (CUDA mirror of gate_split.metal).
+///
+/// Per-head deinterleave of the doubled q_proj output:
+///   `qg[T, num_heads*2*head_dim]` → `q[T, num_heads*head_dim]`, `gate[T, num_heads*head_dim]`.
+/// Each head's `2*head_dim` block in `qg` is laid out `[query | gate]`.
+///
+/// Allocates the two outputs from `alloc` with `qg.dtype()`. Supports BF16/F16
+/// only (matches the metal kernel's host-name instantiations).
+#[cfg(feature = "cuda")]
+pub unsafe fn gate_split(
+    qg: GpuTensor,
+    num_heads: usize,
+    head_dim: usize,
+    alloc: &mut ferrite_cuda_core::alloc::CachingAllocator,
+    stream: CUstream,
+) -> (
+    ferrite_cuda_core::alloc::OwnedTensor, // q    [num_tokens, num_heads * head_dim]
+    ferrite_cuda_core::alloc::OwnedTensor, // gate [num_tokens, num_heads * head_dim]
+) {
+    let num_tokens = qg.dim(0);
+    debug_assert_eq!(
+        qg.dim(1),
+        num_heads * 2 * head_dim,
+        "gate_split: qg.dim(1)={} but num_heads*2*head_dim={}",
+        qg.dim(1),
+        num_heads * 2 * head_dim,
+    );
+    let cols = num_heads * head_dim;
+    let dt = qg.dtype();
+    let q_out = alloc.alloc_tensor(&[num_tokens, cols], dt);
+    let gate_out = alloc.alloc_tensor(&[num_tokens, cols], dt);
+
+    match dt {
+        DType::BF16 => gate_split_bf16(
+            q_out.as_gpu_tensor().as_mut_ptr() as *mut u16,
+            gate_out.as_gpu_tensor().as_mut_ptr() as *mut u16,
+            qg.as_ptr() as *const u16,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_dim as c_int,
+            stream,
+        ),
+        DType::F16 => gate_split_f16(
+            q_out.as_gpu_tensor().as_mut_ptr() as *mut u16,
+            gate_out.as_gpu_tensor().as_mut_ptr() as *mut u16,
+            qg.as_ptr() as *const u16,
+            num_tokens as c_int,
+            num_heads as c_int,
+            head_dim as c_int,
+            stream,
+        ),
+        _ => panic!("gate_split: unsupported dtype {:?} (bf16/f16 only)", dt),
+    }
+
+    (q_out, gate_out)
 }
 
 // ---------------------------------------------------------------------------

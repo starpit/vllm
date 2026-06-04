@@ -503,10 +503,13 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
             // CUDA: the mirror — `mlx-affine-*` weights are an Apple
             // checkpoint format with no CUDA Impl in the pool (the
             // Affine quant flow lives entirely in the metal kernels).
-            // Skip them so the cuda solver doesn't fail with
-            // `UnclaimedTile` on `Embed` / `Gemm` for the Affine
-            // storage tag.
-            if cfg!(feature = "cuda") && preset_name.starts_with("mlx-affine-") {
+            // `nvfp4` is currently metal-only too (E2M1 dequant qmv/qmm_t
+            // shaders + `MetalNvfp4QmmImpl`); a CUDA NVFP4 path is future
+            // work. Skip both so the cuda solver doesn't fail with
+            // `UnclaimedTile` on `Embed` / `Gemm` for those storage tags.
+            if cfg!(feature = "cuda")
+                && (preset_name.starts_with("mlx-affine-") || preset_name == "nvfp4")
+            {
                 continue;
             }
             let preset_path = preset_root.join(format!("{preset_name}.json"));

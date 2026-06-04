@@ -38,6 +38,15 @@ MODELS = {
     "gemma2_2b": "unsloth/gemma-2-2b-it",
     "granite_3_3_2b": "ibm-granite/granite-3.3-2b-instruct",
     "qwen3_0_6b": "Qwen/Qwen3-0.6B",
+    # Qwen3.5-9B — Gated-DeltaNet hybrid text decoder (24 linear + 8 full
+    # attention layers, 1-in-4 full pattern, head_dim=256, partial_rotary
+    # factor=0.25). 19.3 GB BF16 sharded into 4 safetensors. The full
+    # `Qwen3_5ForConditionalGeneration` is multimodal; this golden
+    # exercises the TEXT decoder only (no vision encoder, no image
+    # tokens in PROMPTS) — the same path our `ferrite-model-qwen3-5`
+    # crate compiles. Exercises the GDN state pool, gate_split,
+    # gate_apply, MRoPE positions, partial-RoPE.
+    "qwen3_5_9b": "Qwen/Qwen3.5-9B",
     # AWQ — exercises the ferrite-forward MarlinLinear / marlin_gemm path.
     # Both FERRITE_ENABLED and FERRITE_DISABLE=1 runs should match this
     # golden within the same top-N tolerance used for dense correctness tests.

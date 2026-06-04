@@ -243,6 +243,24 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
                 .or_else(|| {
                     name.strip_prefix("model.language_model.")
                         .map(|rest| format!("language_model.model.{rest}"))
+                })
+                // VL-tower prefix aliasing. Qwen3.5-VL ships under
+                // `model.visual.*` on the official HF repo (`Qwen/Qwen3.5-9B`),
+                // but the qwen3-5-vl ferrite variant config bakes
+                // `vision_tower.*` (matching the mlx-community 4bit repack
+                // the metal green_gate test loads from). A compiled variant
+                // bakes ONE ordering, so without this alias `try_load_mm`'s
+                // fingerprint key `vision_tower.merger.linear_fc2.weight` is
+                // absent on the HF repo and `try_load_mm` returns Ok(None).
+                // Same shape as the `language_model` swap above; cheap
+                // (Arc-clones an mmap-backed ref) and collision-free.
+                .or_else(|| {
+                    name.strip_prefix("model.visual.")
+                        .map(|rest| format!("vision_tower.{rest}"))
+                })
+                .or_else(|| {
+                    name.strip_prefix("vision_tower.")
+                        .map(|rest| format!("model.visual.{rest}"))
                 })?;
             if tensors.contains_key(&alt) {
                 return None;
@@ -1680,30 +1698,68 @@ impl GpuWeights {
         name: &str,
         leading_dim: usize,
     ) -> Result<()> {
-        let cpu_ref = self.tensors.get_mut(name).ok_or_else(|| {
-            anyhow::anyhow!("flatten_conv_weight_channels_last: not found: {name}")
-        })?;
+        self.flatten_conv_weight(name, leading_dim, /* in_chans_hint */ None)
+    }
+
+    /// Same as [`flatten_conv_weight_channels_last`] but with a shape-
+    /// discriminator. When `in_chans_hint` is `Some(c)`, sniffs whether the
+    /// on-disk weight is channels-LAST `[out, kt, kh, kw, c]` (mlx-converted
+    /// checkpoints) or already channels-FIRST `[out, c, kt, kh, kw]` (HF
+    /// native PyTorch Conv3d weight, e.g. `Qwen/Qwen3.5-9B`'s
+    /// `model.visual.patch_embed.proj.weight` `[1152, 3, 2, 16, 16]`).
+    /// Channels-FIRST inputs are just flattened in place; channels-LAST go
+    /// through the existing permute. `None` for the hint preserves the
+    /// always-permute legacy behavior.
+    pub fn flatten_conv_weight(
+        &mut self,
+        name: &str,
+        leading_dim: usize,
+        in_chans_hint: Option<usize>,
+    ) -> Result<()> {
+        let cpu_ref = self
+            .tensors
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("flatten_conv_weight: not found: {name}"))?;
         let shape = cpu_ref.shape.clone();
         anyhow::ensure!(
             leading_dim + 2 < shape.len(),
-            "flatten_conv_weight_channels_last: {name} shape {shape:?} needs >=2 conv dims after \
+            "flatten_conv_weight: {name} shape {shape:?} needs >=2 conv dims after \
              leading_dim {leading_dim}",
         );
         let lead: usize = shape[..=leading_dim].iter().product(); // = out
-        // conv dims after leading_dim: [k0, k1, ..., k_{m-1}, in]
         let conv = &shape[leading_dim + 1..];
-        let in_ch = *conv.last().unwrap();
-        let kdims = &conv[..conv.len() - 1];
-        let kprod: usize = kdims.iter().product(); // kt*kh*kw
-        let rest = in_ch * kprod;
         let elem = cpu_ref.dtype.size_bytes();
+
+        // Channels-FIRST detection: if the caller supplied `in_chans_hint`
+        // and the FIRST conv dim equals it (and the LAST does not), the
+        // weight is already in PyTorch Conv3d native order — just flatten,
+        // no permute needed. Equivalent old code path was a partial
+        // identity permute that mispaired indices.
+        let channels_first = match in_chans_hint {
+            Some(c) => conv.first() == Some(&c) && conv.last() != Some(&c),
+            None => false,
+        };
+
+        let rest: usize = conv.iter().product(); // in*kt*kh*kw
         let total_bytes = lead * rest * elem;
         let src = cpu_ref.data();
         anyhow::ensure!(
             src.len() == total_bytes,
-            "flatten_conv_weight_channels_last: {name} byte len {} != shape {shape:?} × elem {elem}",
+            "flatten_conv_weight: {name} byte len {} != shape {shape:?} × elem {elem}",
             src.len(),
         );
+
+        if channels_first {
+            // Already row-major [out, in, kt, kh, kw]; just reshape to
+            // [out, in*kt*kh*kw]. No data copy.
+            cpu_ref.shape = vec![lead, rest];
+            return Ok(());
+        }
+
+        // Channels-LAST permute: src [out, kt, kh, kw, in] -> dst [out, in, kt, kh, kw].
+        let in_ch = *conv.last().unwrap();
+        let kdims = &conv[..conv.len() - 1];
+        let kprod: usize = kdims.iter().product(); // kt*kh*kw
         // src row-major [out, kdims..., in]: src_flat = (out*kprod + kidx)*in_ch + ic
         // dst row-major [out, in, kdims...]:  dst_flat =  out*rest + ic*kprod + kidx
         let mut buf = vec![0u8; total_bytes];

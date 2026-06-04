@@ -124,6 +124,15 @@ fn safetensors_prefix(
         Some(prefix) => {
             // Tolerate a trailing dot in the config value.
             let prefix = prefix.trim_end_matches('.');
+            // `lm_head` is always at the safetensors top level — VL repos
+            // (Qwen3.5, Gemma3-MM, ...) don't nest it under the decoder
+            // prefix because it sits beside the `model` namespace, not
+            // inside it. Both checkpoint orderings (the official
+            // `model.language_model.*` and the mlx-community
+            // `language_model.model.*`) keep `lm_head.weight` at the root.
+            if key == "lm_head" {
+                return key;
+            }
             match key.strip_prefix("model") {
                 // Replace-the-`model`-root form: the prefix already names
                 // the `model` root (e.g. Qwen3.5-VL `model.language_model`),
@@ -131,9 +140,7 @@ fn safetensors_prefix(
                 // `model.language_model.embed_tokens`,
                 // `model.language_model.layers.N.*`, `model.language_model.norm`
                 // — NOT nested as `<prefix>.model.<key>`. Splice the prefix
-                // in for the leading `model` segment. (`lm_head` has no
-                // `model` root, so it falls through to the wrapper arm;
-                // tied-embedding arches like Qwen3.5 never look it up.)
+                // in for the leading `model` segment.
                 Some(rest) if prefix.starts_with("model") => format!("{prefix}{rest}"),
                 // Namespace-wrapper form (Gemma3-MM `language_model`): the
                 // whole standard `model.<key>` / `lm_head` namespace nests
@@ -6349,6 +6356,58 @@ fn emit_canonical_params_impl(
             #scale_dtype_override
         }
     }
+}
+
+/// Emit a per-variant arm body — the `GdnRuntimeConfig` literal for one
+/// specialization. Returns `None` if the variant has no
+/// `OpKind::GatedDeltaNet` (non-hybrid) — caller emits a `None` arm.
+pub fn emit_gdn_runtime_config_arm_body(
+    fuf: &Fuf,
+    model: &ModelParams,
+) -> Option<proc_macro2::TokenStream> {
+    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
+        Some(&n) => n as usize,
+        None => return None,
+    };
+    let mut linear = vec![false; num_hidden_layers];
+    let mut is_hybrid = false;
+    for node in &fuf.nodes {
+        if node.op != OpKind::GatedDeltaNet {
+            continue;
+        }
+        is_hybrid = true;
+        for inp in &node.inputs {
+            if let FufInput::Weight { index: Some(l), .. } = inp {
+                let l = *l as usize;
+                if l < num_hidden_layers {
+                    linear[l] = true;
+                }
+            }
+        }
+    }
+    if !is_hybrid {
+        return None;
+    }
+    let conv_dim = *model.bounds.get("gdn_conv_dim").unwrap_or(&0) as u32;
+    let conv_kernel = *model.bounds.get("linear_conv_kernel_dim").unwrap_or(&0) as u32;
+    let num_k_heads = *model.bounds.get("linear_num_key_heads").unwrap_or(&0) as u32;
+    let num_v_heads = *model.bounds.get("linear_num_value_heads").unwrap_or(&0) as u32;
+    let head_k_dim = *model.bounds.get("linear_key_head_dim").unwrap_or(&0) as u32;
+    let head_v_dim = *model.bounds.get("linear_value_head_dim").unwrap_or(&0) as u32;
+    let bits = linear.iter().copied();
+    Some(quote! {
+        ::core::option::Option::Some(
+            ::ferrite_forward::gdn_state_layout::GdnRuntimeConfig {
+                conv_dim: #conv_dim,
+                conv_kernel: #conv_kernel,
+                num_k_heads: #num_k_heads,
+                num_v_heads: #num_v_heads,
+                head_k_dim: #head_k_dim,
+                head_v_dim: #head_v_dim,
+                linear_layers: ::std::vec![ #(#bits),* ],
+            },
+        )
+    })
 }
 
 /// Emit the per-arch `FerriteWeights::gdn_runtime_config()` override for

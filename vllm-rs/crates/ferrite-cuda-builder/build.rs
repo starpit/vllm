@@ -56,6 +56,7 @@ fn cuda_build() {
         "../../crates/vllm-cuda/csrc/gdn_conv1d_kernels.cu",
         "../../crates/vllm-cuda/csrc/gdn_recurrent_kernels.cu",
         "../../crates/vllm-cuda/csrc/gdn_split_kernels.cu",
+        "../../crates/vllm-cuda/csrc/gate_split_kernels.cu",
         "../../crates/vllm-cuda/csrc/mla_kernels.cu",
         "../../crates/vllm-cuda/csrc/dequant_gather_pages.cu",
         "../../crates/vllm-cuda/csrc/fp8_scale_kernels.cu",

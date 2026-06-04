@@ -331,6 +331,14 @@ impl TestModels {
     // Qwen3 — safetensors BF16 for cuda-backend (~1.2GB)
     pub const QWEN3_0_6B_CUDA: &str = "Qwen/Qwen3-0.6B";
 
+    // Qwen3.5-9B — Gated-DeltaNet hybrid text decoder (~19.3GB BF16, 4
+    // safetensors shards). The full repo is `Qwen3_5ForConditionalGeneration`
+    // (multimodal); the text path our `ferrite-model-qwen3-5` crate
+    // compiles exercises 32 layers (24 linear-attn / 8 full-attn,
+    // 1-in-4 pattern), head_dim=256, partial_rotary_factor=0.25,
+    // mrope_section=[11,11,10]. Fits on a single H100 (80GB).
+    pub const QWEN3_5_9B_CUDA: &str = "Qwen/Qwen3.5-9B";
+
     // Gemma2 — safetensors BF16 for cuda-backend (~5GB, Gemma2ForCausalLM)
     pub const GEMMA2_2B_IT_CUDA: &str = "unsloth/gemma-2-2b-it";
 

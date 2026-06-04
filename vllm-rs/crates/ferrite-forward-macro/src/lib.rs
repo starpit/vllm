@@ -1379,14 +1379,58 @@ fn compile_common(
         // Hybrid (Gated-DeltaNet) arches: the per-arch
         // `FerriteWeights::gdn_runtime_config` override the worker reads
         // to size + allocate the GDN state pool. Empty for non-hybrid
-        // arches (they keep the trait default `None`). Read off a
-        // representative specialization's FUF — every workload bucket
-        // shares the same op graph and per-layer GDN/full-attn dispatch,
-        // so the `linear_layers` mask is identical across them.
-        let gdn_runtime_config_tokens = solved
-            .first()
-            .map(|sm| codegen::emit_gdn_runtime_config(&sm.fuf, sm.model))
-            .unwrap_or_default();
+        // arches (they keep the trait default `None`). Per-variant arms
+        // dispatch on the matched `Weights::Variant(_)` so each variant
+        // returns its own (conv_dim, num_v_heads, linear_layers) — load-
+        // bearing for arches with multiple sizes (e.g. Qwen3.5 0.8b vs
+        // 9b: 24 layers vs 32, different conv_dim). Across workload
+        // buckets within one variant the FUF op graph is identical so
+        // we read it off the first bucket per variant.
+        // Per-variant `gdn_runtime_config` arms — each `Weights::Variant(_)`
+        // returns its own (conv_dim, num_v_heads, linear_layers) literal or
+        // None for non-hybrid variants. Load-bearing for arches with
+        // multiple sizes (Qwen3.5 0.8b vs 9b: 24 vs 32 layers, different
+        // conv_dim). Workload-bucket dups collapse via `mod_name` dedup;
+        // FUF op graph is bucket-invariant for the GDN predicate.
+        let gdn_runtime_config_tokens = {
+            let mut per_variant: std::collections::BTreeMap<
+                String,
+                Option<proc_macro2::TokenStream>,
+            > = std::collections::BTreeMap::new();
+            for sm in &solved {
+                let key = sm.mod_name.clone();
+                per_variant.entry(key).or_insert_with(|| {
+                    codegen::emit_gdn_runtime_config_arm_body(&sm.fuf, sm.model)
+                });
+            }
+            if per_variant.values().all(|v| v.is_none()) {
+                proc_macro2::TokenStream::new()
+            } else {
+                let arms: Vec<proc_macro2::TokenStream> = arch_dispatch_arms
+                    .iter()
+                    .map(|a| {
+                        let variant_ident = pascal_case(&a.model_ident);
+                        let body = per_variant
+                            .get(&a.model_ident.to_string())
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| quote! { ::core::option::Option::None });
+                        quote! { Weights::#variant_ident(_) => #body, }
+                    })
+                    .collect();
+                quote! {
+                    fn gdn_runtime_config(
+                        &self,
+                    ) -> ::core::option::Option<
+                        ::ferrite_forward::gdn_state_layout::GdnRuntimeConfig,
+                    > {
+                        match self {
+                            #(#arms)*
+                        }
+                    }
+                }
+            }
+        };
         emit_arch_dispatcher(
             &arch_ident,
             &hf_arches,

@@ -568,6 +568,99 @@ impl KvCacheLayout {
     }
 }
 
+/// Typed dataflow edge naming HOW the K (or V) cache buffer that
+/// AttnDecode reads got populated. The enum is sealed; downstream
+/// `match` arms must cover every variant — adding a new producer
+/// kind without updating consumers is a Rust compile error.
+///
+/// **Phase 4 (paris invariant `kv-cache-producer-typed-edge`)**:
+/// replaces the orchestrator's silent
+/// `unwrap_or_else(|| GmemHandle::new_initial(k_cache))` fallback
+/// at `tk_orchestrate.rs:539-544`. The fallback was dead code on
+/// well-formed Llama-1B FUFs but represented exactly the
+/// "side-table lookup with a null-default" pattern the redesign
+/// kills — a future contributor adding a fan-out path that didn't
+/// populate `pending_k_unfenced` would silently get a fresh
+/// initial handle (wrong cache contents) instead of a build-time
+/// error.
+///
+/// # Compile-fail proof — sealed enum (no external constructor)
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_lower::KvCacheProducer;
+/// let bogus = KvCacheProducer::SameForwardRopeAppend {
+///     producer_op_idx: 7,
+///     _seal: ferrite_wavefront::tk_lower::sealed_kv_producer::Seal,
+/// };  // ERROR: Seal is private to sealed_kv_producer
+/// ```
+///
+/// # Compile-fail proof — exhaustive match required
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_lower::KvCacheProducer;
+/// fn handle(p: KvCacheProducer) {
+///     match p {
+///         KvCacheProducer::SameForwardRopeAppend { .. } => {}
+///         // ERROR: non-exhaustive patterns: `PrePopulatedExt { .. }` not covered
+///     }
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvCacheProducer {
+    /// The K (or V) cache was written by a RopeAppend earlier in this
+    /// same forward (LoweringInput::ops[producer_op_idx]). Constructed
+    /// only via [`KvCacheProducer::from_rope_append`].
+    SameForwardRopeAppend {
+        producer_op_idx: u32,
+        #[doc(hidden)]
+        _seal: sealed_kv_producer::Seal,
+    },
+    /// The K (or V) cache is pre-populated by an out-of-band per-op
+    /// forward and is read-only inside this megakernel. Used by
+    /// test fixtures and the future-variant cited at
+    /// `tk_orchestrate.rs:525-528` (decode-only block where prefill
+    /// populated the cache externally). Constructed only via
+    /// [`KvCacheProducer::pre_populated_ext`].
+    PrePopulatedExt {
+        #[doc(hidden)]
+        _seal: sealed_kv_producer::Seal,
+    },
+}
+
+#[doc(hidden)]
+pub mod sealed_kv_producer {
+    /// Sealed marker — only constructible inside `tk_lower`. Closes
+    /// the `_seal` field on `KvCacheProducer`'s variants so external
+    /// code can't bypass the typed constructors.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Seal(pub(super) ());
+}
+
+impl KvCacheProducer {
+    /// Construct an `SameForwardRopeAppend` producer for the given
+    /// `producer_op_idx` (the LoweringInput op-index of the
+    /// RopeAppend that wrote the cache). The orchestrator mints
+    /// this at the RopeAppend match arm alongside
+    /// `pending_k_unfenced.insert(...)`.
+    pub const fn from_rope_append(producer_op_idx: u32) -> Self {
+        Self::SameForwardRopeAppend {
+            producer_op_idx,
+            _seal: sealed_kv_producer::Seal(()),
+        }
+    }
+
+    /// Construct a `PrePopulatedExt` producer. Test fixtures and
+    /// future decode-only variants explicitly opt in by calling
+    /// this — the typed witness makes "K cache without a producer
+    /// in this forward" a structural choice, not a side-table
+    /// fallthrough.
+    pub const fn pre_populated_ext() -> Self {
+        Self::PrePopulatedExt {
+            _seal: sealed_kv_producer::Seal(()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct AttnDecodeOp {
     /// `[1, num_q_heads * head_dim]` query (post-RoPE). Loaded once
@@ -611,6 +704,12 @@ pub struct AttnDecodeOp {
     /// collide on the same identifiers. The orchestrator passes the
     /// LoweringInput op index — unique across all ops in a forward.
     pub unique_id: u32,
+    /// Typed dataflow edge: who populated the K cache this AttnDecode
+    /// reads. See [`KvCacheProducer`]. Mandatory — replaces the
+    /// orchestrator's previous silent `new_initial` fallback.
+    pub k_producer: KvCacheProducer,
+    /// Typed dataflow edge for the V cache. Same shape as `k_producer`.
+    pub v_producer: KvCacheProducer,
 }
 
 impl AttnDecodeOp {
@@ -2722,6 +2821,10 @@ mod tests {
             softmax_scale: 0.088388_35,
             num_kv_pages_arg: crate::tk_warp_ir::NumKvPagesSym,
             unique_id: 0,
+            // Test fixture explicitly opts into the pre-populated
+            // path — no preceding RopeAppend in this isolated test.
+            k_producer: KvCacheProducer::pre_populated_ext(),
+            v_producer: KvCacheProducer::pre_populated_ext(),
         }
     }
 

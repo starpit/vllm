@@ -253,6 +253,18 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
         BufId,
         crate::tk_gmem::GmemHandle<crate::tk_gmem::VCache>,
     > = BTreeMap::new();
+    // Phase 4 (paris invariant `kv-cache-producer-typed-edge`):
+    // parallel BufId-keyed map naming WHICH RopeAppend (by op_idx)
+    // populated each cache buffer. AttnDecode reads this to set its
+    // typed `k_producer` / `v_producer` fields. Any cache BufId not
+    // in the map at AttnDecode-construction time falls back to
+    // `KvCacheProducer::pre_populated_ext()` — the fallback is
+    // explicit (not a side-table-default null), so the typed match
+    // arm in `lower_attn_decode` enumerates both producer paths.
+    let mut k_cache_producers: BTreeMap<BufId, crate::tk_lower::KvCacheProducer> =
+        BTreeMap::new();
+    let mut v_cache_producers: BTreeMap<BufId, crate::tk_lower::KvCacheProducer> =
+        BTreeMap::new();
 
     for (op_idx, desc) in input.ops.iter().enumerate() {
         let out_buf = BufId(n_sources + op_idx as u32);
@@ -479,6 +491,10 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                         }
                     }
                 };
+                let producer =
+                    crate::tk_lower::KvCacheProducer::from_rope_append(op_idx as u32);
+                k_cache_producers.insert(k_out.buf_id(), producer);
+                v_cache_producers.insert(v_out.buf_id(), producer);
                 pending_k_unfenced.insert(k_out.buf_id(), k_out);
                 pending_v_unfenced.insert(v_out.buf_id(), v_out);
                 op_out_shape.push((desc.m, cols));
@@ -506,6 +522,14 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     inputs: h.inputs.iter().take(3).cloned().collect(),
                     output_internal: h.output_internal,
                 });
+                let k_producer = k_cache_producers
+                    .get(&k_cache)
+                    .copied()
+                    .unwrap_or_else(crate::tk_lower::KvCacheProducer::pre_populated_ext);
+                let v_producer = v_cache_producers
+                    .get(&v_cache)
+                    .copied()
+                    .unwrap_or_else(crate::tk_lower::KvCacheProducer::pre_populated_ext);
                 let attn_decode_op = AttnDecodeOp {
                     q,
                     k_cache,
@@ -518,30 +542,45 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     softmax_scale: scale,
                     num_kv_pages_arg: crate::tk_warp_ir::NumKvPagesSym,
                     unique_id: op_idx as u32,
+                    k_producer,
+                    v_producer,
                 };
-                // E.13: take the unfenced handles from the prior
+                // Phase 4: take the unfenced handles from the prior
                 // RopeAppend (if any), emit the cross-op gmem fence,
-                // and pass the Fenced wrappers to the consumer. If no
-                // RopeAppend ran (test fixtures + future variants
-                // where the cache is pre-populated by per-op forward
-                // and read-only inside the megakernel), construct a
-                // fresh `new_initial` handle. Either path goes
-                // through `emit_fence_after_op` — AttnDecode's
-                // `Fenced<...>` requirement is satisfied uniformly.
-                // BufId-keyed lookup: the consumer's own `k_cache:
-                // BufId` is the key. Cross-wiring is impossible
-                // because a mismatched BufId returns `None` and we
-                // fall through to `new_initial(k_cache)` — the new
-                // handle's BufId is the same key as the lookup, so
-                // the prior runtime debug_assert_eq is now a
-                // structural identity (paris invariant
-                // `k-cache-buf-id-matches-rope-producer`).
-                let k_unfenced = pending_k_unfenced.remove(&k_cache).unwrap_or_else(|| {
-                    crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache)
-                });
-                let v_unfenced = pending_v_unfenced.remove(&v_cache).unwrap_or_else(|| {
-                    crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache)
-                });
+                // and pass the Fenced wrappers to the consumer. The
+                // typed `KvCacheProducer` enum drives the dispatch:
+                // `SameForwardRopeAppend` REQUIRES a pending entry
+                // (panic with a precise diagnostic if missing — the
+                // orchestrator guaranteed it just inserted one),
+                // while `PrePopulatedExt` constructs a fresh
+                // `new_initial` handle. Adding a future producer
+                // variant requires extending this match — the
+                // orchestrator can't silently fall through to a
+                // stale handle.
+                let k_unfenced = match attn_decode_op.k_producer {
+                    crate::tk_lower::KvCacheProducer::SameForwardRopeAppend { producer_op_idx, .. } => {
+                        pending_k_unfenced.remove(&k_cache).unwrap_or_else(|| {
+                            panic!(
+                                "phase4: AttnDecode op_idx={op_idx} declared SameForwardRopeAppend(producer_op_idx={producer_op_idx}) for k_cache {k_cache:?} but pending_k_unfenced has no entry — orchestrator wiring bug"
+                            )
+                        })
+                    }
+                    crate::tk_lower::KvCacheProducer::PrePopulatedExt { .. } => {
+                        crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(k_cache)
+                    }
+                };
+                let v_unfenced = match attn_decode_op.v_producer {
+                    crate::tk_lower::KvCacheProducer::SameForwardRopeAppend { producer_op_idx, .. } => {
+                        pending_v_unfenced.remove(&v_cache).unwrap_or_else(|| {
+                            panic!(
+                                "phase4: AttnDecode op_idx={op_idx} declared SameForwardRopeAppend(producer_op_idx={producer_op_idx}) for v_cache {v_cache:?} but pending_v_unfenced has no entry — orchestrator wiring bug"
+                            )
+                        })
+                    }
+                    crate::tk_lower::KvCacheProducer::PrePopulatedExt { .. } => {
+                        crate::tk_gmem::GmemHandle::<crate::tk_gmem::VCache>::new_initial(v_cache)
+                    }
+                };
                 debug_assert_eq!(k_unfenced.buf_id(), k_cache);
                 debug_assert_eq!(v_unfenced.buf_id(), v_cache);
                 let k_fenced = crate::tk_gmem::emit_fence_after_op(&mut prog, k_unfenced);

@@ -86,6 +86,10 @@ fn main() {
         softmax_scale: 0.088_388_35,
         num_kv_pages_arg: ferrite_wavefront::tk_warp_ir::NumKvPagesSym,
         unique_id: 0,
+        // Standalone example with no preceding RopeAppend; opt into
+        // the pre-populated cache path explicitly.
+        k_producer: ferrite_wavefront::tk_lower::KvCacheProducer::pre_populated_ext(),
+        v_producer: ferrite_wavefront::tk_lower::KvCacheProducer::pre_populated_ext(),
     };
     let k = ferrite_wavefront::tk_gmem::GmemHandle::<ferrite_wavefront::tk_gmem::KCache>::new_initial(
         attn_op.k_cache,

@@ -445,6 +445,41 @@ impl<T> Drop for Unsynced<T> {
     }
 }
 
+/// **Decode-only token-count witness** (paris invariant
+/// `num_tokens_eq_1_gate`).
+///
+/// The orchestrator-emitted megakernel's tile shapes, page allocator
+/// state, and barrier-arrival counts are baked for a single-token
+/// decode (m=1). Calling [`dispatch_cuda`] with `num_tokens > 1`
+/// (e.g. prefill, or vLLM's 1024-token dummy memory-profile pass)
+/// feeds prefill-shaped buffers to a decode-shaped kernel —
+/// resulting in a GPU hang or illegal memory access.
+///
+/// Today the worker hook (`vllm-executor::ferrite_worker`) gates the
+/// dispatch on `if num_tokens == 1` at runtime, but the dispatch fn
+/// signature still accepts `u64`. A future caller that forgets the
+/// `if` would silently launch the decode kernel on prefill input.
+///
+/// `DecodeNumTokens(u64)` makes the m=1 contract a type-level
+/// witness: the only constructor is [`DecodeNumTokens::from_one`],
+/// which yields a value with `raw() == 1`. [`dispatch_cuda`] takes
+/// `DecodeNumTokens` (not `u64`), so a caller cannot pass anything
+/// the type system hasn't certified as the single decode token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecodeNumTokens(u64);
+
+impl DecodeNumTokens {
+    /// The sole constructor. Always returns the witness for the
+    /// `num_tokens = 1` decode path.
+    pub const fn from_one() -> Self {
+        Self(1)
+    }
+
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// Typed builder for kernel u32 args. Args are pushed in a fixed
 /// order matching `KernelArgs::u32_args` (set by
 /// `fixtures::orchestrator_kernel_args`): num_kv_pages first
@@ -617,9 +652,10 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     wm: &W,
     ctx: &ForwardCtx<'_>,
     device: &mut GpuDevice,
-    num_tokens: u64,
+    num_tokens: DecodeNumTokens,
     spec: &DispatchSpec,
 ) -> Option<OwnedTensor> {
+    let num_tokens = num_tokens.raw();
     use ferrite_kernels::kernels;
 
     // ── 1. Run embed: host gather → [num_tokens, hidden] bf16.

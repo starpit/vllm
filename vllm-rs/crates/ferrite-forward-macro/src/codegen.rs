@@ -6802,9 +6802,21 @@ fn emit_wavefront_dispatch_cuda(d: &CudaDispatchData) -> TokenStream {
                 vocab_size: #vocab_size,
                 launch_fn: #kernel_ident,
             };
+            // paris invariant `num_tokens_eq_1_gate`: the megakernel's
+            // tile shapes and barrier counts are baked for m=1.
+            // `DecodeNumTokens::from_one()` is the typed witness; the
+            // dispatch fn signature accepts only this witness, not a
+            // raw u64 (so passing prefill-shaped num_tokens is a
+            // compile error).
+            debug_assert_eq!(
+                num_tokens, 1,
+                "wavefront_megakernel_dispatch_cuda called with num_tokens={num_tokens} \
+                 (m=1 contract violated; worker hook must gate on `if num_tokens == 1`)"
+            );
+            let dnt = ::ferrite_forward::wavefront_cuda::DecodeNumTokens::from_one();
             unsafe {
                 ::ferrite_forward::wavefront_cuda::dispatch_cuda(
-                    wm, ctx, device, num_tokens, &spec,
+                    wm, ctx, device, dnt, &spec,
                 )
             }
         }

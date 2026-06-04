@@ -426,17 +426,9 @@ pub enum TkInstr {
     },
 
     /// Inline compute fragment in a consumer (or other) warp role.
-    ///
-    /// The body is a `Vec<Tk20Call>`: each entry is one TK 2.0
-    /// primitive call (or, during transition, a `RawString` carrying a
-    /// pre-resolved CUDA fragment from a legacy `format!()` body).
-    /// Codegen walks `calls` in order, emitting one CUDA statement per
-    /// element via the typed `tk20::*` Rust API.
-    ///
-    /// This replaces a previous `Compute { body: String }` shape; the
-    /// `RawString` `Tk20Call` variant is the bridge — it forwards the
-    /// String verbatim — and gets sunset when every `lower_*` has been
-    /// migrated to typed primitives (per `feedback_dogfood_tk20_rust`).
+    /// The body is a `Vec<Tk20Call>` — each entry is one TK 2.0
+    /// primitive call. Codegen walks `calls` in order, emitting one
+    /// CUDA statement per element via the typed `tk20::*` Rust API.
     Compute {
         role: WarpRole,
         calls: Vec<crate::tk_codegen::Tk20Call>,
@@ -763,15 +755,6 @@ impl TkProgram {
         });
     }
 
-    /// Append a `Compute { calls: vec![Tk20Call::RawString(body)] }`.
-    /// Bridge for legacy `format!()` lowerings; sunset when every
-    /// `lower_*` migrates to the typed `tk20::*` API.
-    pub fn compute(&mut self, role: WarpRole, body: impl Into<String>) {
-        self.instrs.push(TkInstr::Compute {
-            role,
-            calls: vec![crate::tk_codegen::Tk20Call::RawString(body.into())],
-        });
-    }
 
     /// Append the kernel-end drain as a 5-Instr atomic sequence,
     /// identical shape to the cross-op fence. Called by
@@ -802,9 +785,8 @@ impl TkProgram {
     }
 
     /// Append a `Compute` whose body is a typed `tk20::*` call list.
-    /// New per-op lowerings (Phase 1+) build a `Vec<Tk20Call>` of
-    /// typed primitive variants and call this. The `RawString` variant
-    /// is forbidden in lowerings landed via this entry point.
+    /// Per-op lowerings build a `Vec<Tk20Call>` of typed primitive
+    /// variants — one TK 2.0 call per Tk20Call.
     pub fn compute_calls(&mut self, role: WarpRole, calls: Vec<crate::tk_codegen::Tk20Call>) {
         self.instrs.push(TkInstr::Compute { role, calls });
     }

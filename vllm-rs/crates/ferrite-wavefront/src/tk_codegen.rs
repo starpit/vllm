@@ -74,6 +74,20 @@ pub mod tk20 {
         format!("kittens::sv_bf<{cols}>")
     }
 
+    /// `asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");` —
+    /// async-proxy fence used by the kernel scaffold AFTER the
+    /// `init_semaphore(...)` calls so the per-warp barrier-init
+    /// writes are observable to subsequent `mbarrier.try_wait`
+    /// consumers. `__syncthreads()` only orders generic-proxy ops
+    /// with each other; the async proxy's parity bits need this
+    /// fence to flush. TK 2.0's KVM scaffold issues the same
+    /// intrinsic at `third_party/thunderkittens/prototype/vm/vm.cuh:99`
+    /// (no Rust wrapper exists in the upstream API surface yet, so
+    /// this is the SOLE TK-2.0-justified raw asm in the emit path).
+    pub fn fence_proxy_async_shared_cta() -> String {
+        "asm volatile(\"fence.proxy.async.shared::cta;\\n\" ::: \"memory\");".to_string()
+    }
+
     /// `kittens::group<1>::sync()` / `<N>::sync()`.
     pub fn sync(n_warps: u32) -> String {
         format!("kittens::group<{n_warps}>::sync();")
@@ -779,11 +793,7 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
         TkInstr::Compute { role, calls } => {
             // Walk `calls` in order, emitting one CUDA fragment per
             // primitive. Each `Tk20Call` lowers via `Tk20Call::emit()`,
-            // which delegates to a `tk20::*` Rust function (or, for
-            // the `RawString` bridge, returns the verbatim String).
-            // Whitespace between fragments matches the legacy
-            // `format!()` body's natural newlines so the per-canonical
-            // emit is byte-identical during the Phase 0 transition.
+            // which returns one TK 2.0 call's spelling.
             let mut s = String::new();
             for (i, call) in calls.iter().enumerate() {
                 if i > 0 {
@@ -1196,7 +1206,9 @@ pub fn emit_kernel_with_opts(
     // polling against its stale view. TK 2.0's KVM scaffold issues
     // this exact fence at
     // `third_party/thunderkittens/prototype/vm/vm.cuh:99`.
-    out.push_str("    asm volatile(\"fence.proxy.async.shared::cta;\\n\" ::: \"memory\");\n");
+    out.push_str("    ");
+    out.push_str(&tk20::fence_proxy_async_shared_cta());
+    out.push('\n');
     // CTA-wide sync. `kittens::group<N>::sync()` (barrier-less) is
     // only legal for single-warp groups (asserts `GROUP_WARPS==1`); the
     // multi-warp form takes a `bar.sync` barrier id. Easiest portable
@@ -1303,16 +1315,9 @@ pub fn emit_kernel_with_opts(
 // ── Tk20Call — typed primitive call list for `TkInstr::Compute` ─────
 //
 // Per `feedback_dogfood_tk20_rust`: every `kittens::*` text in an
-// emitted .cu MUST come from a `tk20::*` Rust function. The legacy
-// `Compute { body: String }` shape allowed inline `format!("kittens::
-// warp::*")` — that's the failure mode that drifted the prior
-// cuda_emit revision into TK 1.0 idioms. `Tk20Call` makes the binding
-// step explicit: each variant binds one TK 2.0 primitive (or, during
-// transition, carries a RawString legacy fragment).
-//
-// `RawString` is the bridge variant: `prog.compute(role, body)` wraps
-// the legacy body in a single-element `vec![Tk20Call::RawString(body)]`
-// for byte-identical emit during Phase 0. Sunset at Phase 5.
+// emitted .cu MUST come from a `tk20::*` Rust function. `Tk20Call`
+// makes the binding step explicit: each variant binds one TK 2.0
+// primitive call.
 //
 // Every typed variant's `emit()` cites the TK 2.0 header path + line
 // for its primitive, both in the doc comment AND in the source code
@@ -1323,16 +1328,9 @@ pub fn emit_kernel_with_opts(
 /// Typed primitive-call atom for `TkInstr::Compute::calls`.
 ///
 /// Each variant binds one TK 2.0 primitive call. `emit()` returns the
-/// CUDA fragment for that call. `RawString` is a transitional bridge
-/// for legacy `format!()` lowerings.
+/// CUDA fragment for that call.
 #[derive(Clone, Debug)]
 pub enum Tk20Call {
-    /// Bridge for legacy `prog.compute(role, format!(...))` lowerings.
-    /// Forwarded verbatim to the emitted CUDA. Sunset at Phase 5 of the
-    /// substrate rebuild plan; new lowerings MUST construct a typed
-    /// variant (Mma, RmsReduce, etc.).
-    RawString(String),
-
     // ── Hopper warpgroup wgmma (default for prefill, m>1 matmuls) ──
     /// `kittens::warpgroup::mma_fence(d)`. Doc:
     /// `third_party/thunderkittens/include/ops/group/mma/warpgroup.cuh:23`.
@@ -2829,7 +2827,6 @@ impl Tk20Call {
     /// header line in the binding.
     pub fn emit(&self) -> String {
         match self {
-            Tk20Call::RawString(s) => s.clone(),
 
             Tk20Call::WarpgroupMmaFence { d } => tk20::warpgroup_mma_fence(d),
             Tk20Call::WarpgroupMmaAB { d, a, b } => tk20::warpgroup_mma_ab(d, a, b),
@@ -3088,7 +3085,10 @@ mod tests {
         let page = p.arrive(WarpRole::Loader, PageBarrier::Ready, page);
 
         let page = p.wait(WarpRole::AllConsumers, PageBarrier::Ready, page);
-        p.compute(WarpRole::AllConsumers, "/* rms reduce + scale */");
+        p.compute_calls(
+            WarpRole::AllConsumers,
+            vec![Tk20Call::WarpZeroRt { rt: "__smoke".into() }],
+        );
         let page = p.arrive(WarpRole::AllConsumers, PageBarrier::Done, page);
 
         let page = p.wait(WarpRole::Storer, PageBarrier::Done, page);
@@ -3117,7 +3117,13 @@ mod tests {
         assert!(src.contains("if (__role == ROLE_LOADER)"), "loader gate\n{src}");
         assert!(src.contains("if (__role == ROLE_STORER)"), "storer gate\n{src}");
         assert!(src.contains("if (__role == ROLE_CONSUMER)"), "consumer gate\n{src}");
-        assert!(src.contains("rms reduce + scale"), "compute body pasted\n{src}");
+        // The smoke test pushes a typed Tk20Call (WarpZeroRt) so the
+        // consumer body emits a real TK 2.0 call rather than a free-
+        // form comment.
+        assert!(
+            src.contains("kittens::warp::zero(__smoke)"),
+            "consumer body emitted typed Tk20Call\n{src}"
+        );
     }
 
     #[test]
@@ -3859,16 +3865,6 @@ mod tests {
 
     // RoPE + ResidualAdd byte-identity tests deleted in Phase 5
     // cutover (legacy body fns gone).
-
-    #[test]
-    fn tk20_call_raw_string_bridge_passes_legacy_body_unchanged() {
-        // The RawString bridge is what `prog.compute(role, body)` wraps
-        // legacy format!() bodies in. emit() returns the body verbatim
-        // — preserves byte-identical legacy output during Phase 0.
-        let body = "for (int i = 0; i < 16; ++i) { /* legacy */ }";
-        let call = Tk20Call::RawString(body.to_string());
-        assert_eq!(call.emit(), body);
-    }
 
     #[test]
     fn compute_calls_setter_round_trips_to_emit() {

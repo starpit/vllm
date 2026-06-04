@@ -123,8 +123,21 @@ impl SeqTokenCount {
 pub struct DecodePosition(u32);
 
 impl DecodePosition {
+    /// Test-only constructor. Production code MUST go through
+    /// [`DecodePosition::from_pending`] so the host-side d2h sync
+    /// happens before the value reaches the kernel arg builder.
+    #[doc(hidden)]
     pub fn from_raw(pos: u32) -> Self {
         Self(pos)
+    }
+
+    /// Production constructor: drains a [`Pending<u32>`] by consuming
+    /// the typed sync witness. Callers cannot construct a
+    /// `DecodePosition` from a raw u32 without first going through
+    /// `Pending::async_d2h(...)?.sync(device)`, which forces the
+    /// d2h drain.
+    pub fn from_pending(pending: Pending<u32>, device: &mut GpuDevice) -> Self {
+        Self(pending.sync(device))
     }
 
     pub(crate) fn raw(self) -> u32 {
@@ -164,15 +177,177 @@ impl DecodePosition {
 pub struct DecodeSlot(u32);
 
 impl DecodeSlot {
-    /// Construct from a `slot_mapping[token_i]` value (typically i64
-    /// from the runtime tensor; cast to u32 — paged-cache indices
-    /// for in-scope models fit in u32).
+    /// Test-only constructor. Production code MUST go through
+    /// [`DecodeSlot::from_pending_i64`] so the host-side d2h sync
+    /// for `ctx.slot_mapping[0]` (an i64 tensor) happens before the
+    /// value reaches the kernel arg builder.
+    #[doc(hidden)]
     pub fn from_slot_mapping(slot: u32) -> Self {
         Self(slot)
     }
 
+    /// Production constructor: drains a [`Pending<i64>`] (vLLM's
+    /// slot-mapping tensor is I64), validates the slot fits in u32,
+    /// and packs the synced value. Forgetting to issue the d2h or
+    /// to sync it is a compile error (Pending's drop-bomb /
+    /// move-only sync).
+    pub fn from_pending_i64(pending: Pending<i64>, device: &mut GpuDevice) -> Self {
+        let raw = pending.sync_i64(device);
+        debug_assert!(
+            raw >= 0 && raw <= u32::MAX as i64,
+            "decode slot {raw} out of u32 range",
+        );
+        Self(raw as u32)
+    }
+
     pub(crate) fn raw(self) -> u32 {
         self.0
+    }
+}
+
+/// **D2H-sync typestate witness** (paris invariant
+/// `d2h-sync-before-launch`).
+///
+/// The kernel reads its u32 args (decode position, decode slot) by
+/// value from the host's launch call. The host fills those values
+/// via async device-to-host copies, but the GPU's d2h queue is
+/// asynchronous: reading the host-side u32 BEFORE
+/// [`GpuDevice::sync_d2h`] runs returns whatever was at that stack
+/// slot when the launch began (zero-initialised, or stale from a
+/// prior dispatch). The resulting wrong slot/position drives a
+/// kernel that writes K/V to slot 0 every iter, producing the exact
+/// `Paris!!!!!!!!!` decode-degenerate stream.
+///
+/// `Pending<T>` is the typed witness that the value has NOT yet been
+/// sync'd. Construct via [`Pending::async_d2h`] (which fires the
+/// async copy); the only way to read the value is via
+/// [`Pending::sync`], which consumes the token AND calls
+/// [`GpuDevice::sync_d2h`] in the same call. Forgetting the sync
+/// is impossible at the type level: the value field is private (no
+/// public getter); dropping the token without sync trips a
+/// drop-bomb panic that names the originating call site, not a
+/// silent stale read.
+///
+/// # Compile-fail proofs
+///
+/// Direct field access rejected (private field):
+///
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::Pending;
+/// let p: Pending<u32> = unimplemented!();
+/// let _ = p.value;  // private field
+/// ```
+///
+/// `sync` consumes self — double-sync rejected (use of moved value):
+///
+/// ```compile_fail
+/// use ferrite_forward::wavefront_cuda::Pending;
+/// let p: Pending<u32> = unimplemented!();
+/// let mut device: ferrite_forward::GpuDevice = unimplemented!();
+/// let _ = p.sync(&mut device);
+/// let _ = p.sync(&mut device);  // value used after move
+/// ```
+#[must_use = "Pending<T> must be sync()'d before reading; dropping without sync panics at runtime"]
+pub struct Pending<T> {
+    value: std::cell::UnsafeCell<T>,
+    /// `true` after [`Pending::sync`] runs — disarms the drop-bomb so the
+    /// `mem::forget`-equivalent "value moved out" path doesn't panic.
+    consumed: bool,
+    /// Site name for the drop-bomb panic message ("decode position",
+    /// "decode slot", etc.). Static so we don't allocate during the
+    /// hot dispatch path.
+    site: &'static str,
+}
+
+impl Pending<u32> {
+    /// Issue an async u32 device→host copy and return the typed
+    /// witness. Caller MUST call [`Pending::sync`] before the value is
+    /// usable.
+    ///
+    /// `site` is a short label (e.g. `"decode_position"`) used in the
+    /// drop-bomb panic message if the caller forgets to sync.
+    ///
+    /// # Safety
+    /// `src` must point to at least 4 valid u32 bytes on the device,
+    /// alive until the async copy completes (i.e. until [`Pending::sync`]
+    /// returns).
+    pub unsafe fn async_d2h(
+        device: &mut GpuDevice,
+        src: *const u8,
+        site: &'static str,
+    ) -> Self {
+        let token = Self {
+            value: std::cell::UnsafeCell::new(0u32),
+            consumed: false,
+            site,
+        };
+        unsafe {
+            device
+                .async_d2h(token.value.get().cast::<u8>(), src, std::mem::size_of::<u32>())
+                .unwrap_or_else(|e| panic!("Pending::async_d2h ({site}): {e:?}"));
+        }
+        token
+    }
+
+    /// Drain the host-side d2h queue and return the synced value.
+    /// Consumes the token (move-out of `self`); double-sync is a
+    /// Rust compile error.
+    pub fn sync(mut self, device: &mut GpuDevice) -> u32 {
+        device
+            .sync_d2h()
+            .unwrap_or_else(|e| panic!("Pending::sync ({}): {e:?}", self.site));
+        self.consumed = true;
+        // SAFETY: sync_d2h returned, so the d2h queue is drained and
+        // the host-side u32 in self.value reflects the device-side
+        // bytes at the source pointer.
+        unsafe { *self.value.get() }
+    }
+}
+
+impl Pending<i64> {
+    /// `i64` variant for `slot_mapping[0]` (vLLM's slot-mapping
+    /// tensor is I64). Same protocol as the u32 variant.
+    ///
+    /// # Safety
+    /// Same as the u32 variant — `src` must point to at least 8
+    /// valid bytes alive until [`Pending::sync`] returns.
+    pub unsafe fn async_d2h_i64(
+        device: &mut GpuDevice,
+        src: *const u8,
+        site: &'static str,
+    ) -> Self {
+        let token = Self {
+            value: std::cell::UnsafeCell::new(0i64),
+            consumed: false,
+            site,
+        };
+        unsafe {
+            device
+                .async_d2h(token.value.get().cast::<u8>(), src, std::mem::size_of::<i64>())
+                .unwrap_or_else(|e| panic!("Pending::async_d2h_i64 ({site}): {e:?}"));
+        }
+        token
+    }
+
+    pub fn sync_i64(mut self, device: &mut GpuDevice) -> i64 {
+        device
+            .sync_d2h()
+            .unwrap_or_else(|e| panic!("Pending::sync_i64 ({}): {e:?}", self.site));
+        self.consumed = true;
+        unsafe { *self.value.get() }
+    }
+}
+
+impl<T> Drop for Pending<T> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            panic!(
+                "Pending<{}> ({}) dropped without sync — host would read pre-sync stale memory \
+                 (paris invariant `d2h-sync-before-launch`)",
+                std::any::type_name::<T>(),
+                self.site,
+            );
+        }
     }
 }
 
@@ -489,40 +664,34 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
         u32_builder.push_num_kv_pages(count);
     }
     if spec.has_rope {
-        let mut pos_host: u32 = 0;
-        unsafe {
-            device
-                .async_d2h(
-                    (&raw mut pos_host).cast::<u8>(),
-                    ctx.positions.raw_ptr().cast::<u8>(),
-                    std::mem::size_of::<u32>(),
-                )
-                .expect("d2h decode position");
-        }
-        device.sync_d2h().expect("sync d2h decode position");
-        u32_builder.push_decode_position(DecodePosition::from_raw(pos_host));
+        // d2h-sync-before-launch invariant: Pending<u32>'s typestate
+        // forces the sync_d2h to happen before DecodePosition is
+        // constructed. Forgetting the sync is impossible at the type
+        // level (private value field, sync consumes self by move).
+        let pending = unsafe {
+            Pending::<u32>::async_d2h(
+                device,
+                ctx.positions.raw_ptr().cast::<u8>(),
+                "decode_position",
+            )
+        };
+        u32_builder.push_decode_position(DecodePosition::from_pending(pending, device));
     }
     if spec.has_rope_append {
         // `slot_mapping` is a `[num_tokens]` I64 tensor — for
         // num_tokens=1 decode, slot_mapping[0] is the absolute paged
         // cache slot for the new token's K/V (the runtime has already
         // resolved block-table indirection into a flat slot index).
-        let mut slot_host: i64 = 0;
-        unsafe {
-            device
-                .async_d2h(
-                    (&raw mut slot_host).cast::<u8>(),
-                    ctx.slot_mapping.raw_ptr().cast::<u8>(),
-                    std::mem::size_of::<i64>(),
-                )
-                .expect("d2h decode slot");
-        }
-        device.sync_d2h().expect("sync d2h decode slot");
-        debug_assert!(
-            slot_host >= 0 && slot_host <= u32::MAX as i64,
-            "decode slot {slot_host} out of u32 range",
-        );
-        u32_builder.push_decode_slot(DecodeSlot::from_slot_mapping(slot_host as u32));
+        // Pending<i64> + DecodeSlot::from_pending_i64 enforces the
+        // d2h sync at the type level.
+        let pending = unsafe {
+            Pending::<i64>::async_d2h_i64(
+                device,
+                ctx.slot_mapping.raw_ptr().cast::<u8>(),
+                "decode_slot",
+            )
+        };
+        u32_builder.push_decode_slot(DecodeSlot::from_pending_i64(pending, device));
     }
 
     // Finalize u32 args from the typed builder. Order is fixed:

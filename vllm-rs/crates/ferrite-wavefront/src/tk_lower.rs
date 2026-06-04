@@ -1119,11 +1119,11 @@ pub fn lower_residual_add<P: Phase>(
     let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+        crate::tk_codegen::residual_add_compute_calls(
             a_id,
             b_id,
-            total: op.hidden as u64 * op.m as u64,
-        }],
+            op.hidden as u64 * op.m as u64,
+        ),
     );
     let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
     let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);
@@ -1218,11 +1218,11 @@ pub fn lower_residual_add_routed<P: Phase>(
     let b_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, b_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::ResidualAddConsumerBody {
+        crate::tk_codegen::residual_add_compute_calls(
             a_id,
             b_id,
-            total: op.hidden as u64 * op.m as u64,
-        }],
+            op.hidden as u64 * op.m as u64,
+        ),
     );
     let a_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, a_page);
     let b_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, b_page);

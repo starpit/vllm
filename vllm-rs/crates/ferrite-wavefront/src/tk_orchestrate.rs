@@ -901,7 +901,11 @@ mod tests {
         assert!(src.contains("RoPE rotate"), "{src}");
         assert!(src.contains("AttnDecode"), "{src}");
         assert!(src.contains("SiluMul"), "{src}");
-        assert!(src.contains("Residual Add"), "{src}");
+        // Residual-Add body decomposed into atomic Tk20Calls — check
+        // a uniquely-residual-add identifier instead of the old
+        // marker comment.
+        assert!(src.contains("__a_smem"), "{src}");
+        assert!(src.contains("__b_smem"), "{src}");
     }
 
     /// Sanity: every BufId referenced in an emitted load/store points

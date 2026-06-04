@@ -692,7 +692,13 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     let post_embed_gpu = post_embed.as_gpu_tensor();
     let post_embed_ptr = post_embed_gpu.as_mut_ptr::<u8>() as *mut c_void;
 
-    for entry in spec.source_recipe {
+    // Paris-probe: when FERRITE_PARIS_PROBE=1, record every
+    // LinearDenseWeight entry's resolved pointer + base + offset for a
+    // post-loop D2H dump. Fixed-size to avoid alloc churn on hot path.
+    let paris_probe = std::env::var_os("FERRITE_PARIS_PROBE").is_some();
+    let mut probe_rows: Vec<(usize, u32, u32, u32, u32, u64, *mut u8, usize, *mut u8)> = Vec::new();
+
+    for (entry_idx, entry) in spec.source_recipe.iter().enumerate() {
         let p: *mut c_void = match *entry {
             SourceRecipeEntry::EmbeddedHidden => post_embed_ptr,
             SourceRecipeEntry::Cos {
@@ -753,7 +759,22 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
                 }
                 let dense_w = lin.dense_weight();
                 let base = dense_w.as_mut_ptr::<u8>();
-                unsafe { base.add(byte_offset as usize) as *mut c_void }
+                let resolved = unsafe { base.add(byte_offset as usize) };
+                if paris_probe && layer == 0 {
+                    let total_bytes = dense_w.numel() * dense_w.dtype().size_bytes();
+                    probe_rows.push((
+                        entry_idx,
+                        bucket,
+                        op_idx,
+                        slot,
+                        layer,
+                        byte_offset,
+                        base,
+                        total_bytes,
+                        resolved,
+                    ));
+                }
+                resolved as *mut c_void
             }
             SourceRecipeEntry::EmbeddingWeight {
                 bucket,
@@ -769,6 +790,47 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     }
     for buf in &op_outputs {
         bufs.push(buf.as_gpu_tensor().as_mut_ptr::<u8>() as *mut c_void);
+    }
+
+    // Paris-probe: D2H 16 bytes at each LinearDenseWeight resolved
+    // address + the same offset relative to the base pointer for the
+    // entire dense buffer (so we can spot fused-base aliasing). One
+    // line per layer-0 entry; bucket/op/slot/layer/byte_offset on the
+    // left, base ptr / total bytes / first 16 bytes-as-u16 on the
+    // right. Read the bytes as bf16-shaped u16 to match the empirical
+    // dump in the handoff (which printed bf16 magnitudes via raw u16).
+    if paris_probe && !probe_rows.is_empty() {
+        // Allocate one host buffer for all 16-byte slices (8 u16s
+        // each) so we issue the D2H copies first, then sync once.
+        let n = probe_rows.len();
+        let mut host: Vec<u16> = vec![0u16; n * 8];
+        for (i, &(_, _, _, _, _, _, _, _, resolved)) in probe_rows.iter().enumerate() {
+            unsafe {
+                let _ = device.async_d2h(
+                    host.as_mut_ptr().add(i * 8) as *mut u8,
+                    resolved,
+                    16,
+                );
+            }
+        }
+        if device.sync_d2h().is_ok() {
+            eprintln!("[paris-probe] LinearDenseWeight resolved entries (layer 0):");
+            for (i, &(idx, bucket, op_idx, slot, layer, byte_offset, base, total, resolved))
+                in probe_rows.iter().enumerate()
+            {
+                let s = i * 8;
+                eprintln!(
+                    "[paris-probe]   recipe[{idx:3}] (b={bucket} op={op_idx} slot={slot} \
+                     L={layer}) base=0x{:016x} total={total} byte_off={byte_offset:>10} \
+                     resolved=0x{:016x} first16={:?}",
+                    base as usize,
+                    resolved as usize,
+                    &host[s..s + 8],
+                );
+            }
+        } else {
+            eprintln!("[paris-probe] sync_d2h failed; skipping dump");
+        }
     }
 
     // ── 4. u32 args — order matches the kernel signature:
@@ -828,6 +890,22 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     // num_kv_pages (if present), decode_position (if present),
     // decode_slot (if present).
     let u32_args: Vec<u32> = u32_builder.finalize();
+    if paris_probe {
+        // Read input_ids[0] (i32) to confirm step's input token id.
+        let mut tok: u32 = 0;
+        unsafe {
+            let _ = device.async_d2h(
+                (&mut tok as *mut u32).cast::<u8>(),
+                ctx.input_ids.raw_ptr().cast::<u8>(),
+                4,
+            );
+            let _ = device.sync_d2h();
+        }
+        eprintln!(
+            "[paris-probe] u32_args (max_seqlen_k={}): {:?} input_ids[0]={tok}",
+            ctx.max_seqlen_k, u32_args
+        );
+    }
 
     // ── 5. Call the FFI wrapper. Pointer table + u32 table are kept
     //     alive across the call by virtue of the `Vec`s outliving
@@ -860,6 +938,34 @@ pub unsafe fn dispatch_cuda<W: CanonicalParams + WeightAccessors>(
     // is structurally unforgettable.
     let unsynced_outputs = Unsynced::after_launch(op_outputs, "wavefront_megakernel");
     let mut op_outputs = unsynced_outputs.sync(device);
+
+    // Paris-probe: dump first 8 bf16 values of EVERY op_output. Aim
+    // to find first op whose values look anomalous (zeros, NaN,
+    // unchanged across decode steps that should differ, etc.).
+    if paris_probe {
+        let n = op_outputs.len();
+        let mut host: Vec<u16> = vec![0u16; n * 8];
+        for (i, buf) in op_outputs.iter().enumerate() {
+            unsafe {
+                let _ = device.async_d2h(
+                    host.as_mut_ptr().add(i * 8) as *mut u8,
+                    buf.as_gpu_tensor().as_mut_ptr::<u8>(),
+                    16,
+                );
+            }
+        }
+        if device.sync_d2h().is_ok() {
+            for i in 0..n {
+                let s = i * 8;
+                let bytes = spec.op_output_bytes.get(i).copied().unwrap_or(0);
+                eprintln!(
+                    "[paris-probe]   op_outputs[{i:3}] bytes={bytes:>7} (mskk={}) first8 = {:?}",
+                    ctx.max_seqlen_k,
+                    &host[s..s + 8],
+                );
+            }
+        }
+    }
 
     // ── 6. Pluck the result op output and reshape it in place from
     //     the U8 byte layout the kernel writes (the alloc is sized to

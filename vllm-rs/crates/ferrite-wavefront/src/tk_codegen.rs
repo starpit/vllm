@@ -1001,32 +1001,6 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the residual-Add consumer body. Element-wise A+B in place
-    /// on A's page, parallelised across all 8 consumer warps × 32
-    /// lanes (256 threads). All consumers participate (no
-    /// `__consumer_idx == 0` gate).
-    ///
-    /// `a_id` / `b_id`: page slots. `total`: `m * hidden` element count.
-    pub fn residual_add_consumer_body(a_id: u8, b_id: u8, total: u64) -> String {
-        format!(
-            r#"
-            // tk_warp_ir Residual Add — A+B in place on A's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __a_smem = reinterpret_cast<T_act*>(page_buf[{a_id}]);
-            auto* __b_smem = reinterpret_cast<T_act*>(page_buf[{b_id}]);
-            const unsigned int __total = {total}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 4 * 32;
-            const int __consumer_threads = 16 * 32;
-            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
-                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
-                const float __a = __bfloat162float(__a_smem[__i]);
-                const float __b = __bfloat162float(__b_smem[__i]);
-                __a_smem[__i] = __float2bfloat16(__a + __b);
-            }}
-"#
-        )
-    }
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1919,6 +1893,47 @@ pub enum Tk20Call {
     /// stores are still pending (typically 0).
     GroupTmaStoreAsyncWait { n: u32 },
 
+    // ── Atomic CUDA-statement primitives (≤2 lines emit each) ─────
+    // Used to compose compute bodies as N typed primitives instead
+    // of one multi-line `*_consumer_body` helper, per
+    // [[tk-player-one-call-per-arm]]. Each variant emits exactly
+    // ONE CUDA statement (or a `for` loop wrapping recursive emit).
+
+    /// `auto* {var} = reinterpret_cast<__nv_bfloat16*>(page_buf[{page_id}]);`
+    DeclSmemPtrBf16 { var: String, page_id: u8 },
+
+    /// `const unsigned int {var} = {expr}u;`. `expr` is a CUDA u32-
+    /// expression (a literal or a name).
+    DeclConstU32 { var: String, expr: String },
+
+    /// `const int {var} = {expr};`. `expr` is a CUDA int-expression.
+    DeclConstI32 { var: String, expr: String },
+
+    /// `const float {var} = __bfloat162float({smem}[{idx}]);`
+    DeclConstFloatFromBf16Smem {
+        var: String,
+        smem: String,
+        idx: String,
+    },
+
+    /// `{smem}[{idx}] = __float2bfloat16({lhs} + {rhs});`
+    Bf16StoreFromFloatAdd {
+        smem: String,
+        idx: String,
+        lhs: String,
+        rhs: String,
+    },
+
+    /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
+    /// Recursively emits each `body` Tk20Call.
+    ForLoopThreadStrided {
+        iter: String,
+        start_var: String,
+        end_var: String,
+        stride_var: String,
+        body: Vec<Tk20Call>,
+    },
+
     /// `kittens::group<1>::tma::store_async_read_wait<N>()`. Doc:
     /// `ops/group/util/tma.cuh:61`. Blocks until at most `n` stores
     /// have outstanding READS — i.e. the source shared-tile is safe to
@@ -1999,11 +2014,6 @@ pub enum Tk20Call {
     /// `tk20::rmsnorm_consumer_body`.
     RmsNormConsumerBody { x_id: u8, w_id: u8, hidden: u32, eps: f32 },
 
-    /// Residual-Add consumer compute body. All-consumer-warp
-    /// element-wise A+B in place on A's page. Bound through
-    /// `tk20::residual_add_consumer_body`.
-    ResidualAddConsumerBody { a_id: u8, b_id: u8, total: u64 },
-
     /// SiluMul consumer compute body. Fused `silu(gate) * up` in
     /// place on gate's page, all-consumer-warp parallel. Bound
     /// through `tk20::silu_mul_consumer_body`.
@@ -2073,6 +2083,59 @@ pub enum Tk20Call {
     AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
 }
 
+/// Tape-build helper: residual-add as a typed Tk20Call sequence.
+/// Pushed by `lower_residual_add` (and the routed variant) into a
+/// single `Compute { calls: ... }`. Each emitted CUDA statement is
+/// ONE Tk20Call variant — no multi-line emit-side helper.
+pub fn residual_add_compute_calls(a_id: u8, b_id: u8, total: u64) -> Vec<Tk20Call> {
+    vec![
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__a_smem".into(),
+            page_id: a_id,
+        },
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__b_smem".into(),
+            page_id: b_id,
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__total".into(),
+            expr: format!("{total}u"),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__tid_in_consumers".into(),
+            expr: "static_cast<int>(threadIdx.x) - 4 * 32".into(),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__consumer_threads".into(),
+            expr: "16 * 32".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__i".into(),
+            start_var: "__tid_in_consumers".into(),
+            end_var: "__total".into(),
+            stride_var: "__consumer_threads".into(),
+            body: vec![
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__a".into(),
+                    smem: "__a_smem".into(),
+                    idx: "__i".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__b".into(),
+                    smem: "__b_smem".into(),
+                    idx: "__i".into(),
+                },
+                Tk20Call::Bf16StoreFromFloatAdd {
+                    smem: "__a_smem".into(),
+                    idx: "__i".into(),
+                    lhs: "__a".into(),
+                    rhs: "__b".into(),
+                },
+            ],
+        },
+    ]
+}
+
 impl Tk20Call {
     /// Lower the typed primitive call to its CUDA fragment via the
     /// matching `tk20::*` Rust function. The match is exhaustive — any
@@ -2098,6 +2161,36 @@ impl Tk20Call {
                 tk20::group_tma_store_async_read_wait(*n)
             }
 
+            Tk20Call::DeclSmemPtrBf16 { var, page_id } => {
+                format!("auto* {var} = reinterpret_cast<__nv_bfloat16*>(page_buf[{page_id}]);")
+            }
+            Tk20Call::DeclConstU32 { var, expr } => {
+                format!("const unsigned int {var} = {expr};")
+            }
+            Tk20Call::DeclConstI32 { var, expr } => {
+                format!("const int {var} = {expr};")
+            }
+            Tk20Call::DeclConstFloatFromBf16Smem { var, smem, idx } => {
+                format!("const float {var} = __bfloat162float({smem}[{idx}]);")
+            }
+            Tk20Call::Bf16StoreFromFloatAdd { smem, idx, lhs, rhs } => {
+                format!("{smem}[{idx}] = __float2bfloat16({lhs} + {rhs});")
+            }
+            Tk20Call::ForLoopThreadStrided {
+                iter,
+                start_var,
+                end_var,
+                stride_var,
+                body,
+            } => {
+                let body_cuda: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!(
+                    "for (unsigned int {iter} = static_cast<unsigned int>({start_var}); \
+                     {iter} < {end_var}; \
+                     {iter} += static_cast<unsigned int>({stride_var})) {{ {body_cuda} }}"
+                )
+            }
+
             Tk20Call::WarpRowMax { rv, rt } => tk20::warp_row_max(rv, rt),
             Tk20Call::WarpRowSum { rv, rt } => tk20::warp_row_sum(rv, rt),
             Tk20Call::WarpExp2 { rt } => tk20::warp_exp2(rt),
@@ -2121,10 +2214,6 @@ impl Tk20Call {
                 hidden,
                 eps,
             } => tk20::rmsnorm_consumer_body(*x_id, *w_id, *hidden, *eps),
-
-            Tk20Call::ResidualAddConsumerBody { a_id, b_id, total } => {
-                tk20::residual_add_consumer_body(*a_id, *b_id, *total)
-            }
 
             Tk20Call::SiluMulConsumerBody { g_id, u_id, total } => {
                 tk20::silu_mul_consumer_body(*g_id, *u_id, *total)
@@ -2726,15 +2815,14 @@ mod tests {
     }
 
     #[test]
-    fn tk20_residual_add_consumer_body_emits_legacy_compatible_cuda() {
-        let body = tk20::residual_add_consumer_body(2, 3, 2048);
-        assert!(body.contains("auto* __a_smem = reinterpret_cast<T_act*>(page_buf[2]);"));
-        assert!(body.contains("auto* __b_smem = reinterpret_cast<T_act*>(page_buf[3]);"));
+    fn residual_add_compute_calls_emit_atomic_typed_primitives() {
+        let calls = residual_add_compute_calls(2, 3, 2048);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("auto* __a_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[2]);"));
+        assert!(body.contains("auto* __b_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[3]);"));
         assert!(body.contains("const unsigned int __total = 2048u;"));
-        // All-consumer parallelism: each consumer thread processes a
-        // strided slice of the row.
         assert!(body.contains("const int __consumer_threads = 16 * 32;"));
-        assert!(body.contains("__float2bfloat16(__a + __b)"));
+        assert!(body.contains("__a_smem[__i] = __float2bfloat16(__a + __b);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
     }
@@ -2749,18 +2837,6 @@ mod tests {
             w_id: 1,
             hidden: 2048,
             eps: 1.0e-5,
-        }
-        .emit();
-        assert_eq!(direct, via_atom);
-    }
-
-    #[test]
-    fn tk20_call_residual_add_atom_round_trip_matches_binding() {
-        let direct = tk20::residual_add_consumer_body(2, 3, 2048);
-        let via_atom = Tk20Call::ResidualAddConsumerBody {
-            a_id: 2,
-            b_id: 3,
-            total: 2048,
         }
         .emit();
         assert_eq!(direct, via_atom);

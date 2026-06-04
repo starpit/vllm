@@ -495,31 +495,6 @@ pub mod tk20 {
     }
 
     /// Emit the AttnDecode init-softmax body. Sets `__m_max = -INF`,
-    /// `__l_sum = 0`, zeroes `__o_accum`. Run once before the
-    /// KV-sweep loop on the consumer warps.
-    pub fn attn_decode_init_softmax_body(unique_id: u32) -> String {
-        let u = unique_id;
-        format!(
-            r#"
-            // tk_warp_ir AttnDecode #{u} — init per-warp softmax state
-            // Phase 7: gate to active warps (`__consumer_idx <
-            // num_kv_heads`); idle warps skip but still arrive on
-            // barriers via the role-routed `arrive(Done)` outside.
-            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    __m_max_a{u}[__h] = -INFINITY;
-                    __l_sum_a{u}[__h] = 0.0f;
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] = 0.0f;
-                    }}
-                }}
-            }}
-"#
-        )
-    }
-
     /// Emit the AttnDecode Q@K^T + online-softmax step body. Runs
     /// inside the KV-sweep loop, once per K page. Computes the
     /// per-q-head scaled dot-product, applies the online-softmax
@@ -1701,6 +1676,34 @@ pub enum Tk20Call {
     /// `auto*` for callers that name the explicit type.
     DeclSmemPtrTypedBf16 { var: String, page_id: u8 },
 
+    /// `if (static_cast<unsigned int>(__consumer_idx) < {var}) { ...body... }` —
+    /// gate by a runtime u32 variable name (typically a prelude-scope
+    /// `__num_kv_heads_a<u>` constant declared by the AttnDecode
+    /// prelude).
+    IfConsumerIdxLtVar { var: String, body: Vec<Tk20Call> },
+
+    /// `for (unsigned int {iter} = 0u; {iter} < {end}; ++{iter}) { ...body... }` —
+    /// `unsigned int` for-loop with a runtime u32 expression as the
+    /// upper bound.
+    ForLoopUnsignedH {
+        iter: String,
+        end: String,
+        body: Vec<Tk20Call>,
+    },
+
+    /// `{array}[{idx}] = -INFINITY;`
+    ScalarFloatStoreNegInfty { array: String, idx: String },
+
+    /// `{array}[{idx}] = 0.0f;`
+    ScalarFloatStoreZero { array: String, idx: String },
+
+    /// `{array}[{i}][{j}] = 0.0f;`
+    ScalarFloat2DStoreZero {
+        array: String,
+        i: String,
+        j: String,
+    },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -1786,10 +1789,6 @@ pub enum Tk20Call {
     // same: per-thread squared-sum + warp shfl + per-thread normalize,
     // with `kittens::sv_bf<N>` only as a typed page alias.
 
-    /// AttnDecode init-softmax body. Bound through
-    /// `tk20::attn_decode_init_softmax_body`.
-    AttnDecodeInitSoftmaxBody { unique_id: u32 },
-
     /// AttnDecode Q@K^T + online-softmax step (inside KV-sweep loop).
     /// Bound through `tk20::attn_decode_qkt_softmax_step_body`.
     /// `head_dim` carried so the body emit declares
@@ -1804,6 +1803,48 @@ pub enum Tk20Call {
     /// AttnDecode finalise (O = O_accum / l_sum). Bound through
     /// `tk20::attn_decode_finalise_softmax_norm_body`.
     AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
+}
+
+/// Tape-build helper: AttnDecode init-softmax — zero per-warp
+/// softmax accumulators (`__m_max = -INF`, `__l_sum = 0`,
+/// `__o_accum[][] = 0`). Run ONCE before the KV-sweep loop on the
+/// active consumer warps. `unique_id` distinguishes the per-op
+/// prelude-scope identifiers across multiple AttnDecode instances
+/// in one TkProgram.
+pub fn attn_decode_init_softmax_compute_calls(unique_id: u32) -> Vec<Tk20Call> {
+    let u = unique_id;
+    let h_loop_body: Vec<Tk20Call> = vec![
+        Tk20Call::ScalarFloatStoreNegInfty {
+            array: format!("__m_max_a{u}"),
+            idx: "__h".into(),
+        },
+        Tk20Call::ScalarFloatStoreZero {
+            array: format!("__l_sum_a{u}"),
+            idx: "__h".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__j".into(),
+            start_var: "__lane".into(),
+            end_var: format!("__head_dim_a{u}"),
+            stride_var: "32u".into(),
+            body: vec![Tk20Call::ScalarFloat2DStoreZero {
+                array: format!("__o_accum_a{u}"),
+                i: "__h".into(),
+                j: "__j".into(),
+            }],
+        },
+    ];
+    vec![Tk20Call::IfConsumerIdxLtVar {
+        var: format!("__num_kv_heads_a{u}"),
+        body: vec![
+            Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+            Tk20Call::ForLoopUnsignedH {
+                iter: "__h".into(),
+                end: format!("__q_heads_per_warp_a{u}"),
+                body: h_loop_body,
+            },
+        ],
+    }]
 }
 
 /// Tape-build helper: GemmM1 internal-output variant (Phase 12
@@ -2457,6 +2498,23 @@ impl Tk20Call {
             Tk20Call::DeclSmemPtrTypedBf16 { var, page_id } => {
                 format!("__nv_bfloat16* {var} = reinterpret_cast<__nv_bfloat16*>(page_buf[{page_id}]);")
             }
+            Tk20Call::IfConsumerIdxLtVar { var, body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("if (static_cast<unsigned int>(__consumer_idx) < {var}) {{ {inner} }}")
+            }
+            Tk20Call::ForLoopUnsignedH { iter, end, body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("for (unsigned int {iter} = 0u; {iter} < {end}; ++{iter}) {{ {inner} }}")
+            }
+            Tk20Call::ScalarFloatStoreNegInfty { array, idx } => {
+                format!("{array}[{idx}] = -INFINITY;")
+            }
+            Tk20Call::ScalarFloatStoreZero { array, idx } => {
+                format!("{array}[{idx}] = 0.0f;")
+            }
+            Tk20Call::ScalarFloat2DStoreZero { array, i, j } => {
+                format!("{array}[{i}][{j}] = 0.0f;")
+            }
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2490,9 +2548,6 @@ impl Tk20Call {
             }
 
 
-            Tk20Call::AttnDecodeInitSoftmaxBody { unique_id } => {
-                tk20::attn_decode_init_softmax_body(*unique_id)
-            }
             Tk20Call::AttnDecodeQktSoftmaxStepBody {
                 unique_id,
                 head_dim,
@@ -3214,12 +3269,19 @@ mod tests {
     }
 
     #[test]
-    fn tk20_attn_decode_compute_bodies_emit_legacy_compatible_cuda() {
-        let init = tk20::attn_decode_init_softmax_body(7);
-        assert!(init.contains("AttnDecode #7 — init per-warp softmax state"));
+    fn attn_decode_init_compute_calls_emit_atomic_typed_primitives() {
+        let calls = attn_decode_init_softmax_compute_calls(7);
+        let init: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
         assert!(init.contains("__m_max_a7[__h] = -INFINITY;"));
         assert!(init.contains("__l_sum_a7[__h] = 0.0f;"));
+        assert!(init.contains("__o_accum_a7[__h][__j] = 0.0f;"));
+        assert!(init.contains("if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a7)"));
+        assert!(init.contains("for (unsigned int __h = 0u; __h < __q_heads_per_warp_a7; ++__h)"));
         assert!(!init.contains("kittens::tma::"));
+    }
+
+    #[test]
+    fn tk20_attn_decode_qkt_sv_finalise_emit_legacy_compatible_cuda() {
 
         // Phase 9: K-axis reduce via TK 2.0 register-vector primitives;
         // shfl butterfly removed.

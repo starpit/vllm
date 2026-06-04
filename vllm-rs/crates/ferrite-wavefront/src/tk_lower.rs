@@ -641,9 +641,7 @@ pub fn lower_attn_decode<P: Phase>(
     let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
-            unique_id: op.unique_id,
-        }],
+        crate::tk_codegen::attn_decode_init_softmax_compute_calls(op.unique_id),
     );
     // No `arrive(Done)` here — the Q+O slot is ONE round: loader fills
     // (TMA load_async signals page_ready), the consumer holds the page
@@ -880,9 +878,7 @@ pub fn lower_attn_decode_routed<P: Phase>(
     let q_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, q_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::AttnDecodeInitSoftmaxBody {
-            unique_id: op.unique_id,
-        }],
+        crate::tk_codegen::attn_decode_init_softmax_compute_calls(op.unique_id),
     );
 
     // ── KV sweep — unchanged from legacy (K/V always Ext) ──

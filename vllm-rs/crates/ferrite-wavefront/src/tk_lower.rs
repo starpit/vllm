@@ -736,9 +736,7 @@ pub fn lower_attn_decode<P: Phase>(
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
             body.compute_calls(
                 WarpRole::AllConsumers,
-                vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
-                    unique_id: op.unique_id,
-                }],
+                crate::tk_codegen::attn_decode_sv_accum_compute_calls(op.unique_id),
             );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
 
@@ -788,9 +786,7 @@ pub fn lower_attn_decode<P: Phase>(
     // single round (loader Ready → consumer Done → storer Consumed).
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
-            unique_id: op.unique_id,
-        }],
+        crate::tk_codegen::attn_decode_finalise_softmax_norm_compute_calls(op.unique_id),
     );
     let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
 
@@ -933,9 +929,7 @@ pub fn lower_attn_decode_routed<P: Phase>(
             body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, v_id, loop_var, start);
             body.compute_calls(
                 WarpRole::AllConsumers,
-                vec![crate::tk_codegen::Tk20Call::AttnDecodeSvAccumStepBody {
-                    unique_id: op.unique_id,
-                }],
+                crate::tk_codegen::attn_decode_sv_accum_compute_calls(op.unique_id),
             );
             body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, v_id);
             body.wait_loop_parity(WarpRole::Storer, PageBarrier::Done, v_id, loop_var, start);
@@ -962,9 +956,7 @@ pub fn lower_attn_decode_routed<P: Phase>(
     };
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::AttnDecodeFinaliseSoftmaxNormBody {
-            unique_id: op.unique_id,
-        }],
+        crate::tk_codegen::attn_decode_finalise_softmax_norm_compute_calls(op.unique_id),
     );
     let o_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, o_page);
 

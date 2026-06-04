@@ -575,60 +575,6 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the AttnDecode softmax(P)@V accumulation step body.
-    /// Runs inside the KV-sweep loop, once per V page (paired with a
-    /// preceding `qkt_softmax_step` against the same iteration's K).
-    /// Adds `__p[h] * v[__j]` to each `__o_accum[h][__j]`.
-    pub fn attn_decode_sv_accum_step_body(unique_id: u32) -> String {
-        let u = unique_id;
-        format!(
-            r#"
-            // tk_warp_ir AttnDecode #{u} — softmax(P) @ V
-            // Phase 7: gate to active warps.
-            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __kv_head = static_cast<unsigned int>(__consumer_idx);
-                const unsigned int __v_off = __kv_head * __head_dim_a{u};
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __o_accum_a{u}[__h][__j] += __p_a{u}[__h]
-                            * __bfloat162float(__v_smem_a{u}[__v_off + __j]);
-                    }}
-                }}
-            }}
-"#
-        )
-    }
-
-    /// Emit the AttnDecode finalise body. Divides `__o_accum` by
-    /// `__l_sum` and writes the result to `__out_smem` (which aliases
-    /// the Q page slot — output is in place on Q's page so the
-    /// storer drains it as a single round on the Q+O slot).
-    pub fn attn_decode_finalise_softmax_norm_body(unique_id: u32) -> String {
-        let u = unique_id;
-        format!(
-            r#"
-            // tk_warp_ir AttnDecode #{u} — finalise: O = O_accum / l_sum
-            // Phase 7: gate to active warps.
-            if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a{u}) {{
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                const unsigned int __q_head_base =
-                    static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u};
-                for (unsigned int __h = 0u; __h < __q_heads_per_warp_a{u}; ++__h) {{
-                    const unsigned int __out_off = (__q_head_base + __h) * __head_dim_a{u};
-                    const float __inv_l = 1.0f / __l_sum_a{u}[__h];
-                    for (unsigned int __j = static_cast<unsigned int>(__lane);
-                         __j < __head_dim_a{u}; __j += 32u) {{
-                        __out_smem_a{u}[__out_off + __j] =
-                            __float2bfloat16(__o_accum_a{u}[__h][__j] * __inv_l);
-                    }}
-                }}
-            }}
-"#
-        )
-    }
-
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1704,6 +1650,38 @@ pub enum Tk20Call {
         j: String,
     },
 
+    /// `{accum}[{i}][{j}] += {p}[{i}] * __bfloat162float({smem}[{idx}]);` —
+    /// FMA of a per-warp scalar `p[i]` and a bf16 smem value into a
+    /// 2D float accumulator. Used by AttnDecode SV step
+    /// (`__o_accum[h][j] += __p[h] * v_smem[__v_off + j]`).
+    Float2DAccumPTimesBf16 {
+        accum: String,
+        i: String,
+        j: String,
+        p_array: String,
+        smem: String,
+        idx: String,
+    },
+
+    /// `const float {var} = 1.0f / {array}[{idx}];`
+    DeclConstFloatReciprocal {
+        var: String,
+        array: String,
+        idx: String,
+    },
+
+    /// `{smem}[{idx}] = __float2bfloat16({accum}[{i}][{j}] * {scalar});` —
+    /// store a 2D-accumulator entry scaled by a per-warp scalar.
+    /// Used by AttnDecode finalise (`O = O_accum / l_sum`).
+    Bf16StoreFrom2DAccumTimesScalar {
+        smem: String,
+        idx: String,
+        accum: String,
+        i: String,
+        j: String,
+        scalar: String,
+    },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -1796,13 +1774,97 @@ pub enum Tk20Call {
     /// with a literal compile-time length (Phase 9).
     AttnDecodeQktSoftmaxStepBody { unique_id: u32, head_dim: u32 },
 
-    /// AttnDecode softmax(P)@V accumulation step (inside KV-sweep
-    /// loop). Bound through `tk20::attn_decode_sv_accum_step_body`.
-    AttnDecodeSvAccumStepBody { unique_id: u32 },
 
-    /// AttnDecode finalise (O = O_accum / l_sum). Bound through
-    /// `tk20::attn_decode_finalise_softmax_norm_body`.
-    AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
+}
+
+/// Tape-build helper: AttnDecode SV-accumulate step (inside KV
+/// loop). Per active consumer warp (idx < num_kv_heads), loops over
+/// q-heads-per-warp and lane-strided over head_dim, FMA-ing
+/// `__p[h] * v_smem[__v_off + j]` into `__o_accum[h][j]`.
+pub fn attn_decode_sv_accum_compute_calls(unique_id: u32) -> Vec<Tk20Call> {
+    let u = unique_id;
+    let inner_body: Vec<Tk20Call> = vec![Tk20Call::Float2DAccumPTimesBf16 {
+        accum: format!("__o_accum_a{u}"),
+        i: "__h".into(),
+        j: "__j".into(),
+        p_array: format!("__p_a{u}"),
+        smem: format!("__v_smem_a{u}"),
+        idx: "__v_off + __j".into(),
+    }];
+    let h_body: Vec<Tk20Call> = vec![Tk20Call::ForLoopThreadStrided {
+        iter: "__j".into(),
+        start_var: "__lane".into(),
+        end_var: format!("__head_dim_a{u}"),
+        stride_var: "32u".into(),
+        body: inner_body,
+    }];
+    vec![Tk20Call::IfConsumerIdxLtVar {
+        var: format!("__num_kv_heads_a{u}"),
+        body: vec![
+            Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+            Tk20Call::DeclConstU32FromConsumerIdx { var: "__kv_head".into() },
+            Tk20Call::DeclConstU32 {
+                var: "__v_off".into(),
+                expr: format!("__kv_head * __head_dim_a{u}"),
+            },
+            Tk20Call::ForLoopUnsignedH {
+                iter: "__h".into(),
+                end: format!("__q_heads_per_warp_a{u}"),
+                body: h_body,
+            },
+        ],
+    }]
+}
+
+/// Tape-build helper: AttnDecode finalise — divide each
+/// `__o_accum[h][j]` by `__l_sum[h]` and write the bf16 result to
+/// `__out_smem[(__q_head_base + h) * head_dim + j]`. Last AttnDecode
+/// step in the kernel.
+pub fn attn_decode_finalise_softmax_norm_compute_calls(unique_id: u32) -> Vec<Tk20Call> {
+    let u = unique_id;
+    let writeback_body: Vec<Tk20Call> = vec![Tk20Call::Bf16StoreFrom2DAccumTimesScalar {
+        smem: format!("__out_smem_a{u}"),
+        idx: "__out_off + __j".into(),
+        accum: format!("__o_accum_a{u}"),
+        i: "__h".into(),
+        j: "__j".into(),
+        scalar: "__inv_l".into(),
+    }];
+    let h_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstU32 {
+            var: "__out_off".into(),
+            expr: format!("(__q_head_base + __h) * __head_dim_a{u}"),
+        },
+        Tk20Call::DeclConstFloatReciprocal {
+            var: "__inv_l".into(),
+            array: format!("__l_sum_a{u}"),
+            idx: "__h".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__j".into(),
+            start_var: "__lane".into(),
+            end_var: format!("__head_dim_a{u}"),
+            stride_var: "32u".into(),
+            body: writeback_body,
+        },
+    ];
+    vec![Tk20Call::IfConsumerIdxLtVar {
+        var: format!("__num_kv_heads_a{u}"),
+        body: vec![
+            Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+            Tk20Call::DeclConstU32 {
+                var: "__q_head_base".into(),
+                expr: format!(
+                    "static_cast<unsigned int>(__consumer_idx) * __q_heads_per_warp_a{u}"
+                ),
+            },
+            Tk20Call::ForLoopUnsignedH {
+                iter: "__h".into(),
+                end: format!("__q_heads_per_warp_a{u}"),
+                body: h_body,
+            },
+        ],
+    }]
 }
 
 /// Tape-build helper: AttnDecode init-softmax — zero per-warp
@@ -2515,6 +2577,27 @@ impl Tk20Call {
             Tk20Call::ScalarFloat2DStoreZero { array, i, j } => {
                 format!("{array}[{i}][{j}] = 0.0f;")
             }
+            Tk20Call::Float2DAccumPTimesBf16 {
+                accum,
+                i,
+                j,
+                p_array,
+                smem,
+                idx,
+            } => format!(
+                "{accum}[{i}][{j}] += {p_array}[{i}] * __bfloat162float({smem}[{idx}]);"
+            ),
+            Tk20Call::DeclConstFloatReciprocal { var, array, idx } => {
+                format!("const float {var} = 1.0f / {array}[{idx}];")
+            }
+            Tk20Call::Bf16StoreFrom2DAccumTimesScalar {
+                smem,
+                idx,
+                accum,
+                i,
+                j,
+                scalar,
+            } => format!("{smem}[{idx}] = __float2bfloat16({accum}[{i}][{j}] * {scalar});"),
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2552,12 +2635,6 @@ impl Tk20Call {
                 unique_id,
                 head_dim,
             } => tk20::attn_decode_qkt_softmax_step_body(*unique_id, *head_dim),
-            Tk20Call::AttnDecodeSvAccumStepBody { unique_id } => {
-                tk20::attn_decode_sv_accum_step_body(*unique_id)
-            }
-            Tk20Call::AttnDecodeFinaliseSoftmaxNormBody { unique_id } => {
-                tk20::attn_decode_finalise_softmax_norm_body(*unique_id)
-            }
         }
     }
 }
@@ -3306,13 +3383,27 @@ mod tests {
         assert!(!qkt.contains("kittens::warp::mma_AB"));
         assert!(!qkt.contains("kittens::warpgroup::mma_AB"));
 
-        let sv = tk20::attn_decode_sv_accum_step_body(7);
-        assert!(sv.contains("AttnDecode #7 — softmax(P) @ V"));
-        assert!(sv.contains("__o_accum_a7[__h][__j] += __p_a7[__h]"));
+    }
 
-        let fin = tk20::attn_decode_finalise_softmax_norm_body(7);
-        assert!(fin.contains("AttnDecode #7 — finalise: O = O_accum / l_sum"));
-        assert!(fin.contains("__float2bfloat16(__o_accum_a7[__h][__j] * __inv_l)"));
+    #[test]
+    fn attn_decode_sv_accum_compute_calls_emit_atomic_typed_primitives() {
+        let calls = attn_decode_sv_accum_compute_calls(7);
+        let sv: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(sv.contains("if (static_cast<unsigned int>(__consumer_idx) < __num_kv_heads_a7)"));
+        assert!(sv.contains(
+            "__o_accum_a7[__h][__j] += __p_a7[__h] * __bfloat162float(__v_smem_a7[__v_off + __j]);"
+        ));
+        assert!(!sv.contains("kittens::tma::"));
+    }
+
+    #[test]
+    fn attn_decode_finalise_compute_calls_emit_atomic_typed_primitives() {
+        let calls = attn_decode_finalise_softmax_norm_compute_calls(7);
+        let fin: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(fin.contains("const float __inv_l = 1.0f / __l_sum_a7[__h];"));
+        assert!(fin.contains(
+            "__out_smem_a7[__out_off + __j] = __float2bfloat16(__o_accum_a7[__h][__j] * __inv_l);"
+        ));
     }
 
     // AttnDecode + SiluMul byte-identity tests deleted in Phase 5

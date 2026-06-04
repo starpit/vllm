@@ -1491,7 +1491,7 @@ pub fn lower_rope_rotate<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        crate::tk_codegen::rope_compute_calls(
+        crate::tk_codegen::rope_compute_calls::<crate::tk_codegen::NeoX>(
             x_id,
             c_id,
             s_id,
@@ -1610,7 +1610,7 @@ pub fn lower_rope_rotate_routed<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        crate::tk_codegen::rope_compute_calls(
+        crate::tk_codegen::rope_compute_calls::<crate::tk_codegen::NeoX>(
             x_id,
             c_id,
             s_id,
@@ -1828,7 +1828,7 @@ pub fn lower_rope_append<P: Phase>(
     // touched.
     prog.compute_calls(
         WarpRole::AllConsumers,
-        crate::tk_codegen::rope_compute_calls(
+        crate::tk_codegen::rope_compute_calls::<crate::tk_codegen::NeoX>(
             k_id,
             c_id,
             s_id,
@@ -2012,7 +2012,7 @@ pub fn lower_rope_append_routed<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_kv_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        crate::tk_codegen::rope_compute_calls(
+        crate::tk_codegen::rope_compute_calls::<crate::tk_codegen::NeoX>(
             k_id,
             c_id,
             s_id,

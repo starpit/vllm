@@ -2524,10 +2524,93 @@ pub fn rmsnorm_compute_calls(x_id: u8, w_id: u8, hidden: u32, eps: f32) -> Vec<T
     ]
 }
 
-/// Tape-build helper: NeoX RoPE rotate as a typed Tk20Call sequence.
+// ── RopeForm typed witness (paris invariant
+//    `rope-form-consistent-across-forward`) ─────────────────────
+//
+// NeoX (Llama, Mistral) and Interleaved (Gemma2 partial, GPT-NeoX
+// historical) RoPE differ in pair indexing: NeoX rotates `(i, i+half)`
+// pairs; Interleaved rotates `(2i, 2i+1)` pairs. Switching between
+// the two requires DIFFERENT scalar arithmetic in the rotate
+// builder. With `Bf16StoreFromFloatFmaSub`/`...FmaAdd` hardcoding
+// the NeoX pair shape, an Interleaved rotation would silently emit
+// the wrong CUDA — exactly the bug class the typed witness pattern
+// kills.
+//
+// `RopeForm` is a sealed trait with two impls: `NeoX` and `Interleaved`.
+// Each carries the pair-index expressions as associated consts.
+// `rope_compute_calls<F: RopeForm>` is generic over the form; mixing
+// NeoX and Interleaved within one forward (passing different `F` to
+// two RopeRotate ops) is a Rust type error at the orchestrator's
+// type-inference site.
+
+mod rope_form_seal {
+    pub trait Sealed {}
+}
+
+/// Sealed trait — exactly two impls (NeoX, Interleaved). Carries
+/// the pair-index expressions as associated consts so the rope
+/// builder reads them off the type rather than hardcoding them.
+pub trait RopeForm: rope_form_seal::Sealed {
+    /// CUDA expression yielding the lo-half index given a pair
+    /// index `__p`, half `__half`, head_dim `__head_dim`. For NeoX:
+    /// `"__row_head * __head_dim + __lane"`. For Interleaved:
+    /// `"__row_head * __head_dim + 2u * __lane"`.
+    const PAIR_LO_EXPR: &'static str;
+    /// CUDA expression yielding the hi-half index. NeoX:
+    /// `"__i_lo + __half"`. Interleaved: `"__i_lo + 1u"`.
+    const PAIR_HI_EXPR: &'static str;
+    /// Stable identifier suffix used in unique-id correlation; lets
+    /// callers tag tests by form.
+    const NAME: &'static str;
+}
+
+/// NeoX RoPE: `(i, i+half)` half-split pairs.
+///
+/// # Compile-fail proof (paris invariant `rope-form-consistent-across-forward`)
+///
+/// A function generic over `F: RopeForm` cannot accept BOTH `NeoX`
+/// AND `Interleaved` at the same instantiation; the type system
+/// pins one form per call. To "prove" two forms can't mix, the
+/// natural shape is a fn that receives two ropes' values:
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_codegen::{rope_compute_calls, NeoX, Interleaved};
+/// fn one_form_per_forward<F: ferrite_wavefront::tk_codegen::RopeForm>() {
+///     let _q = rope_compute_calls::<F>(0, 1, 2, 64, 32);
+///     let _k = rope_compute_calls::<F>(3, 1, 2, 64, 32);
+/// }
+/// // Pin Q to NeoX, K to Interleaved at the same call site:
+/// fn mixed() {
+///     let _q = rope_compute_calls::<NeoX>(0, 1, 2, 64, 32);
+///     let _k: () = rope_compute_calls::<Interleaved>(3, 1, 2, 64, 32);
+/// }
+/// ```
+pub struct NeoX;
+impl rope_form_seal::Sealed for NeoX {}
+impl RopeForm for NeoX {
+    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + __lane";
+    const PAIR_HI_EXPR: &'static str = "__i_lo + __half";
+    const NAME: &'static str = "NeoX";
+}
+
+/// Interleaved RoPE: `(2i, 2i+1)` adjacent pairs (Gemma2 partial,
+/// GPT-NeoX legacy).
+pub struct Interleaved;
+impl rope_form_seal::Sealed for Interleaved {}
+impl RopeForm for Interleaved {
+    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + 2u * __lane";
+    const PAIR_HI_EXPR: &'static str = "__i_lo + 1u";
+    const NAME: &'static str = "Interleaved";
+}
+
+/// Tape-build helper: RoPE rotate as a typed Tk20Call sequence.
 /// In-place rotation on x's page, all-consumer-warp parallel over
 /// `total_pairs = m * num_heads * (head_dim / 2)` rotation pairs.
-pub fn rope_compute_calls(
+/// Generic over [`RopeForm`] (NeoX vs Interleaved): the form's
+/// `PAIR_LO_EXPR` / `PAIR_HI_EXPR` associated consts drive the
+/// pair-index decomposition. Mixing forms within one forward is a
+/// Rust type error at every call site that fixes `F`.
+pub fn rope_compute_calls<F: RopeForm>(
     x_id: u8,
     c_id: u8,
     s_id: u8,
@@ -2584,11 +2667,11 @@ pub fn rope_compute_calls(
                 },
                 Tk20Call::DeclConstU32 {
                     var: "__i_lo".into(),
-                    expr: "__row_head * __head_dim + __lane".into(),
+                    expr: F::PAIR_LO_EXPR.into(),
                 },
                 Tk20Call::DeclConstU32 {
                     var: "__i_hi".into(),
-                    expr: "__i_lo + __half".into(),
+                    expr: F::PAIR_HI_EXPR.into(),
                 },
                 Tk20Call::DeclConstFloatFromBf16Smem {
                     var: "__c".into(),
@@ -3548,8 +3631,8 @@ mod tests {
     }
 
     #[test]
-    fn rope_compute_calls_emit_atomic_typed_primitives() {
-        let calls = rope_compute_calls(0, 1, 2, 64, 32);
+    fn rope_compute_calls_emit_atomic_typed_primitives_neox() {
+        let calls = rope_compute_calls::<NeoX>(0, 1, 2, 64, 32);
         let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
         assert!(body.contains("auto* __x_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[0]);"));
         assert!(body.contains("auto* __cos_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[1]);"));
@@ -3557,11 +3640,31 @@ mod tests {
         assert!(body.contains("const unsigned int __head_dim = 64u;"));
         assert!(body.contains("const unsigned int __half = 32u;"));
         assert!(body.contains("const unsigned int __pairs = 32u;"));
-        // NeoX rotation pair math: __x_lo * cos - __x_hi * sin.
+        // NeoX pair-index decomposition: i_lo = row*head + lane, i_hi = i_lo + half.
+        assert!(body.contains("const unsigned int __i_lo = __row_head * __head_dim + __lane;"));
+        assert!(body.contains("const unsigned int __i_hi = __i_lo + __half;"));
         assert!(body.contains("__x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);"));
         assert!(body.contains("__x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
+    }
+
+    #[test]
+    fn rope_compute_calls_interleaved_emits_2i_2i_plus_1_pair_indices() {
+        // Interleaved RoPE has DIFFERENT pair indexing than NeoX:
+        // i_lo = row*head + 2*lane (not row*head + lane), i_hi = i_lo + 1
+        // (not i_lo + half). This proves the const-generic dispatch
+        // actually changes the emit at compile time per F: RopeForm.
+        let calls = rope_compute_calls::<Interleaved>(0, 1, 2, 64, 32);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("const unsigned int __i_lo = __row_head * __head_dim + 2u * __lane;"));
+        assert!(body.contains("const unsigned int __i_hi = __i_lo + 1u;"));
+        // FMA pair math is form-agnostic.
+        assert!(body.contains("__x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);"));
+        assert!(body.contains("__x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);"));
+        // No NeoX-specific pair math.
+        assert!(!body.contains("__row_head * __head_dim + __lane;"));
+        assert!(!body.contains("__i_lo + __half;"));
     }
 
     #[test]

@@ -71,6 +71,80 @@ pub const NUM_SERVICE_WARPS: u8 = 4;
 /// threads. `__launch_bounds__(640)` and `<<<1, 640, ...>>>` follow.
 pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
 
+// ── Kernel u32-arg symbols (paris invariant `u32-args-name-matches-runtime-string`) ─────
+//
+// Per-op lowerings emit format!() strings that reference the
+// kernel's runtime u32 args by name (e.g. `format!("({} *
+// {kv_row_bytes}u)", op.decode_slot_arg)`). The same names appear in
+// `fixtures::orchestrator_kernel_args` when it builds
+// `KernelArgs::u32_args`. If the two sites drift (emit says
+// `"__decode_slot"`, sig declares `"__decode_slo"`), nvcc emits a
+// kernel that references an undeclared identifier — silent
+// miscompile or runtime crash, often after garbage K writes.
+//
+// The ZSTs below are the SOLE source of truth for those names. Each
+// per-op `*Op` struct carries the ZST corresponding to its required
+// arg (`AttnDecodeOp::num_kv_pages_arg: NumKvPagesSym`,
+// `RopeAppendOp::decode_slot_arg: DecodeSlotSym`); the bridge
+// constructs them with `Default::default()`. Display fmt emits the
+// canonical name string. Passing the wrong ZST is a Rust type
+// mismatch — `op.num_kv_pages_arg = DecodeSlotSym;` rejects.
+
+mod kernel_u32_sym_seal {
+    /// Sealed marker — only types in `tk_warp_ir` implement it.
+    pub trait Sealed {}
+}
+
+/// Sealed trait implemented by exactly one ZST per kernel u32 arg.
+/// `NAME` is the canonical kernel-side identifier; `Display` returns
+/// the same string. Carry the ZST alongside an `*Op` struct's other
+/// fields so the kernel-sig declaration and the emit-time format
+/// share a single source of truth.
+pub trait KernelU32Sym: kernel_u32_sym_seal::Sealed + std::fmt::Display + Copy + Default {
+    const NAME: &'static str;
+}
+
+macro_rules! decl_kernel_u32_sym {
+    ($name:ident, $canonical:literal, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+        pub struct $name;
+
+        impl kernel_u32_sym_seal::Sealed for $name {}
+
+        impl KernelU32Sym for $name {
+            const NAME: &'static str = $canonical;
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(Self::NAME)
+            }
+        }
+    };
+}
+
+decl_kernel_u32_sym!(
+    NumKvPagesSym,
+    "__num_kv_pages",
+    "ZST for the per-sequence KV iteration count (formerly the\n\
+     `&'static str` `\"__num_kv_pages\"`). Lives on `AttnDecodeOp`."
+);
+
+decl_kernel_u32_sym!(
+    DecodePositionSym,
+    "__decode_position",
+    "ZST for the decode-token position used by RoPE's per-row\n\
+     cos/sin TMA offset. Lives on `RopeRotateOp` / `RopeAppendOp`."
+);
+
+decl_kernel_u32_sym!(
+    DecodeSlotSym,
+    "__decode_slot",
+    "ZST for the new decode token's absolute paged-cache slot used\n\
+     by RopeAppend's K/V cache writes. Lives on `RopeAppendOp`."
+);
+
 // ── Phase as a type ─────────────────────────────────────────────────
 
 /// A phase parity, encoded as a marker type so phase advance is a type-
@@ -707,8 +781,10 @@ impl TkProgram {
     pub fn complete_round_with_parity_correction<P: Phase>(
         &mut self,
         page: PageHandleAfterRuntimeLoop<P>,
-        parity_var: &str,
+        parity_var: impl std::fmt::Display,
     ) -> PageHandle<P::Next> {
+        let parity_var = parity_var.to_string();
+        let parity_var = parity_var.as_str();
         let id = page.id;
         // Sync all warps before the phantom round. The for_loop body
         // synchronizes warps via per-iter barriers; after the loop,
@@ -778,8 +854,8 @@ impl TkProgram {
     /// `complete_round_with_parity_correction`.
     pub fn for_loop_runtime<P, F>(
         &mut self,
-        var: impl Into<String>,
-        count_var: impl Into<String>,
+        var: impl std::fmt::Display,
+        count_var: impl std::fmt::Display,
         pages: Vec<PageHandle<P>>,
         build: F,
     ) -> Vec<PageHandleAfterRuntimeLoop<P>>
@@ -787,8 +863,8 @@ impl TkProgram {
         P: Phase,
         F: FnOnce(&mut LoopBody<'_>),
     {
-        let count_var_string = count_var.into();
-        let var_string = var.into();
+        let count_var_string = count_var.to_string();
+        let var_string = var.to_string();
         let mut body_prog = TkProgram::new();
         let mut body = LoopBody {
             inner: &mut body_prog,

@@ -476,11 +476,13 @@ pub struct AttnDecodeOp {
     pub act_elem: u32,
     /// `softmax_scale = 1 / sqrt(head_dim)`. Baked literal.
     pub softmax_scale: f32,
-    /// Name of the runtime u32 the persistent kernel scaffold provides
-    /// for the number of KV pages this query streams (e.g.
-    /// `"__num_kv_pages"`). The lowering does not invent this — the
-    /// scaffold's signature defines it.
-    pub num_kv_pages_arg: &'static str,
+    /// Typed ZST for the runtime u32 arg the kernel scaffold provides
+    /// for the number of KV iterations this query streams. Display
+    /// fmt emits the canonical name `"__num_kv_pages"` — the SOLE
+    /// source of truth shared with `fixtures::orchestrator_kernel_args`'s
+    /// kernel-sig declaration. Drift between emit and sig is a
+    /// compile error (sealed trait, ZST alone constructs the name).
+    pub num_kv_pages_arg: crate::tk_warp_ir::NumKvPagesSym,
     /// Per-AttnDecode unique id, used as a suffix on the function-
     /// scope prelude variable names (`__q_smem_a0`, `__m_max_a0`, …)
     /// so multiple AttnDecode ops in one TkProgram (e.g. one per
@@ -1639,11 +1641,12 @@ pub struct RopeAppendOp {
     /// Decode rows. m=1 for standard decode.
     pub m: u32,
     pub act_elem: u32,
-    /// Name of the runtime u32 the persistent kernel scaffold provides
-    /// for the decode slot (`"__decode_slot"`). Multiplied by
-    /// `num_kv_heads * head_dim * act_elem` (per-token row stride) to
-    /// compute the cache write byte offset.
-    pub decode_slot_arg: &'static str,
+    /// Typed ZST for the kernel scaffold's decode-slot u32 arg.
+    /// Display fmt emits `"__decode_slot"` — the SOLE source of
+    /// truth shared with `fixtures::orchestrator_kernel_args`'s
+    /// kernel-sig declaration. Drift between emit and sig is a
+    /// compile error (sealed trait, ZST alone constructs the name).
+    pub decode_slot_arg: crate::tk_warp_ir::DecodeSlotSym,
 }
 
 /// Lower one RoPE-append into a `TkProgram` fragment.
@@ -2575,7 +2578,7 @@ mod tests {
             num_kv_heads: 8,
             act_elem: 2,
             softmax_scale: 0.088388_35,
-            num_kv_pages_arg: "__num_kv_pages",
+            num_kv_pages_arg: crate::tk_warp_ir::NumKvPagesSym,
             unique_id: 0,
         }
     }

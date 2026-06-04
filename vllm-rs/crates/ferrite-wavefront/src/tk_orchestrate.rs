@@ -416,7 +416,7 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     num_kv_heads,
                     m: desc.m,
                     act_elem: ACT_ELEM,
-                    decode_slot_arg: "__decode_slot",
+                    decode_slot_arg: crate::tk_warp_ir::DecodeSlotSym,
                 };
                 let k_handle = crate::tk_gmem::GmemHandle::<crate::tk_gmem::KCache>::new_initial(
                     k_cache,
@@ -509,7 +509,7 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
                     num_kv_heads,
                     act_elem: ACT_ELEM,
                     softmax_scale: scale,
-                    num_kv_pages_arg: "__num_kv_pages",
+                    num_kv_pages_arg: crate::tk_warp_ir::NumKvPagesSym,
                     unique_id: op_idx as u32,
                 };
                 // E.13: take the unfenced handles from the prior

@@ -84,7 +84,7 @@ fn main() {
         num_kv_heads: 8,
         act_elem: 2,
         softmax_scale: 0.088_388_35,
-        num_kv_pages_arg: "__num_kv_pages",
+        num_kv_pages_arg: ferrite_wavefront::tk_warp_ir::NumKvPagesSym,
         unique_id: 0,
     };
     let k = ferrite_wavefront::tk_gmem::GmemHandle::<ferrite_wavefront::tk_gmem::KCache>::new_initial(

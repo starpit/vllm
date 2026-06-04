@@ -460,6 +460,17 @@ pub enum TkInstr {
         body: Vec<TkInstr>,
     },
 
+    /// `if ((parity_var & 1u) == 0u) {
+    /// kittens::group<1>::arrive(<barrier>[page_id]); }`. Used by
+    /// the parity-correction phantom round after a runtime-iter-count
+    /// for_loop. One TK 2.0 call gated on a runtime parity expression.
+    ArriveIfRuntimeEven {
+        role: WarpRole,
+        kind: PageBarrier,
+        page_id: u8,
+        parity_var: String,
+    },
+
     /// `kittens::group<1>::tma::store_commit_group()`. Atomic Instr;
     /// one TK 2.0 call. Composed with [`Self::Sync`],
     /// [`Self::TmaStoreAsyncWait`], [`Self::Threadfence`] in a
@@ -820,43 +831,28 @@ impl TkProgram {
         // assumes all 16 consumer warps will fire arrive_done, which
         // requires them to be past the for_loop. __syncthreads()
         // forces convergence before the phantom round runs.
-        self.compute(
-            WarpRole::All,
-            "__syncthreads();".to_string(),
-        );
+        self.instrs.push(TkInstr::Sync { role: WarpRole::All });
         // Phantom round: 1 arrive Ready (loader), NUM_CONSUMER_WARPS
         // arrives Done (consumers, from each warp's lane 0), 1 arrive
         // Consumed (storer). Each gated on `(parity_var & 1u) == 0u`.
-        self.compute(
-            WarpRole::Loader,
-            format!(
-                "if (({pv} & 1u) == 0u) {{ \
-                 kittens::group<1>::arrive(page_ready[{id}]); \
-                 }}",
-                pv = parity_var,
-                id = id,
-            ),
-        );
-        self.compute(
-            WarpRole::AllConsumers,
-            format!(
-                "if (({pv} & 1u) == 0u) {{ \
-                 kittens::group<1>::arrive(page_done[{id}]); \
-                 }}",
-                pv = parity_var,
-                id = id,
-            ),
-        );
-        self.compute(
-            WarpRole::Storer,
-            format!(
-                "if (({pv} & 1u) == 0u) {{ \
-                 kittens::group<1>::arrive(page_consumed[{id}]); \
-                 }}",
-                pv = parity_var,
-                id = id,
-            ),
-        );
+        self.instrs.push(TkInstr::ArriveIfRuntimeEven {
+            role: WarpRole::Loader,
+            kind: PageBarrier::Ready,
+            page_id: id,
+            parity_var: parity_var.to_string(),
+        });
+        self.instrs.push(TkInstr::ArriveIfRuntimeEven {
+            role: WarpRole::AllConsumers,
+            kind: PageBarrier::Done,
+            page_id: id,
+            parity_var: parity_var.to_string(),
+        });
+        self.instrs.push(TkInstr::ArriveIfRuntimeEven {
+            role: WarpRole::Storer,
+            kind: PageBarrier::Consumed,
+            page_id: id,
+            parity_var: parity_var.to_string(),
+        });
         // Now hardware advanced once more; typed advance via
         // PageHandle::advance is consistent.
         PageHandle::<P> {

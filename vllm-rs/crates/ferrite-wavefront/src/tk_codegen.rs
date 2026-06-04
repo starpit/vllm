@@ -58,6 +58,22 @@ pub mod tk20 {
         format!("kittens::group<{n_warps}>::arrive({bar}[{page_id}]);")
     }
 
+    /// `if ((<parity_var> & 1u) == 0u) {
+    /// kittens::group<1>::arrive(<barrier>[<page_id>]); }`. Single
+    /// CUDA statement; one TK 2.0 call inside the runtime-parity
+    /// guard. Used by the post-runtime-loop phantom round.
+    pub fn arrive_if_runtime_even(kind: PageBarrier, page_id: u8, parity_var: &str) -> String {
+        let inner = arrive(1, kind, page_id);
+        format!("if (({parity_var} & 1u) == 0u) {{ {inner} }}")
+    }
+
+    /// `kittens::sv_bf<N>` — typed shared-memory vector tile spelling
+    /// used as a TMA descriptor's `tile_type` argument. Single source
+    /// of truth for the C++ type name.
+    pub fn sv_bf_tile_type(cols: i32) -> String {
+        format!("kittens::sv_bf<{cols}>")
+    }
+
     /// `kittens::group<1>::sync()` / `<N>::sync()`.
     pub fn sync(n_warps: u32) -> String {
         format!("kittens::group<{n_warps}>::sync();")
@@ -1325,6 +1341,15 @@ fn emit_one(instr: &TkInstr, opts: &EmitOpts, out: &mut String) {
         TkInstr::TmaStoreCommitGroup { role } => (*role, tk20::group_tma_store_commit_group()),
         TkInstr::TmaStoreAsyncWait { role, n } => (*role, tk20::group_tma_store_async_wait(*n)),
         TkInstr::Threadfence { role } => (*role, "__threadfence();".to_string()),
+        TkInstr::ArriveIfRuntimeEven {
+            role,
+            kind,
+            page_id,
+            parity_var,
+        } => (
+            *role,
+            tk20::arrive_if_runtime_even(*kind, *page_id, parity_var),
+        ),
         // Handled by the early return above. Reachable only if a
         // future refactor breaks that contract; an `unreachable!` is
         // the right tripwire.

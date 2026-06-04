@@ -709,7 +709,7 @@ pub fn descriptor_layouts_for_rmsnorm_outputs(input: &LoweringInput) -> BTreeMap
                         depth: 1,
                         rows: 1,
                         cols: hidden as i32,
-                        tile_type: format!("kittens::sv_bf<{hidden}>"),
+                        tile_type: crate::tk_codegen::tk20::sv_bf_tile_type(hidden as i32),
                     },
                 );
             }
@@ -878,7 +878,7 @@ mod tests {
             assert!(layout.cols > 0, "rmsnorm hidden must be positive");
             assert_eq!(
                 layout.tile_type,
-                format!("kittens::sv_bf<{}>", layout.cols),
+                crate::tk_codegen::tk20::sv_bf_tile_type(layout.cols),
                 "tile_type must match cols for buf {buf_id}"
             );
         }

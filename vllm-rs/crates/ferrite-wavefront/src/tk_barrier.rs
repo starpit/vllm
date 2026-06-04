@@ -106,6 +106,10 @@ pub trait BarrierKind {
     /// The CUDA `__shared__` semaphore-array name in the kernel
     /// scaffold (`page_ready` / `page_done` / `page_consumed`).
     const FIELD: &'static str;
+    /// The matching [`crate::tk_warp_ir::PageBarrier`] enum value
+    /// — single source of truth for the field-name string lives in
+    /// `tk_codegen::tk20::barrier_field`.
+    const PAGE_BARRIER: crate::tk_warp_ir::PageBarrier;
 }
 
 /// Ready barrier: TMA load_async auto-arrives once with byte-count
@@ -113,6 +117,7 @@ pub trait BarrierKind {
 pub struct Ready;
 impl BarrierKind for Ready {
     const FIELD: &'static str = "page_ready";
+    const PAGE_BARRIER: crate::tk_warp_ir::PageBarrier = crate::tk_warp_ir::PageBarrier::Ready;
 }
 
 /// Done barrier: each active consumer warp arrives after computing.
@@ -120,6 +125,7 @@ impl BarrierKind for Ready {
 pub struct Done;
 impl BarrierKind for Done {
     const FIELD: &'static str = "page_done";
+    const PAGE_BARRIER: crate::tk_warp_ir::PageBarrier = crate::tk_warp_ir::PageBarrier::Done;
 }
 
 /// Consumed barrier: storer arrives once after the gmem store
@@ -127,6 +133,7 @@ impl BarrierKind for Done {
 pub struct Consumed;
 impl BarrierKind for Consumed {
     const FIELD: &'static str = "page_consumed";
+    const PAGE_BARRIER: crate::tk_warp_ir::PageBarrier = crate::tk_warp_ir::PageBarrier::Consumed;
 }
 
 // ── Phase parity markers ────────────────────────────────────────────
@@ -387,11 +394,7 @@ where
     /// `(N8): private::Lt<N8>`, which has no impl.
     pub fn arrive(self, page_id: u8) -> Emit<Barrier<K, E, P, count::S<A>>> {
         Emit {
-            cuda: format!(
-                "kittens::group<1>::arrive({field}[{page_id}]);",
-                field = K::FIELD,
-                page_id = page_id,
-            ),
+            cuda: crate::tk_codegen::tk20::arrive(1, K::PAGE_BARRIER, page_id),
             handle: Barrier::fresh_internal(),
         }
     }
@@ -655,11 +658,11 @@ where
     /// ```
     pub fn wait(self, page_id: u8, nwaiters: u32) -> Emit<Barrier<K, N, P::Flip, count::Z>> {
         Emit {
-            cuda: format!(
-                "kittens::group<{nwaiters}>::wait({field}[{page_id}], {phase});",
-                field = K::FIELD,
-                page_id = page_id,
-                phase = P::VAL,
+            cuda: crate::tk_codegen::tk20::wait(
+                nwaiters,
+                K::PAGE_BARRIER,
+                page_id,
+                &P::VAL.to_string(),
             ),
             handle: Barrier::fresh_internal(),
         }
@@ -1564,20 +1567,15 @@ where
     where
         OffsetKind: OffsetKindAllowedIn<P>,
     {
-        let bytes: u32 = ROWS * COLS * ELEM_BYTES;
         Emit {
-            cuda: format!(
-                "kittens::group<1>::tma::expect_bytes(page_ready[{slot}], {bytes}); \
-                 kittens::group<1>::tma::load_async(\
-                 reinterpret_cast<void*>(page_buf[{slot}]), \
-                 reinterpret_cast<void*>(\
-                 reinterpret_cast<uintptr_t>(buf{src}) + ({offset})), \
-                 {bytes}, \
-                 page_ready[{slot}]);",
-                slot = SLOT_ID,
-                bytes = bytes,
-                src = src_buf,
-                offset = descriptor.offset_expr,
+            cuda: crate::tk_codegen::tk20::tma_load_async(
+                SLOT_ID,
+                src_buf,
+                0,
+                ROWS,
+                COLS,
+                ELEM_BYTES,
+                Some(&descriptor.offset_expr),
             ),
             handle: Page::default(),
         }
@@ -1805,12 +1803,7 @@ where
             _ => format!("(({loop_var} & 1) ^ 1)"),
         };
         Emit {
-            cuda: format!(
-                "kittens::group<{nwaiters}>::wait({field}[{page_id}], {parity});",
-                field = K::FIELD,
-                page_id = page_id,
-                parity = parity_expr,
-            ),
+            cuda: crate::tk_codegen::tk20::wait(nwaiters, K::PAGE_BARRIER, page_id, &parity_expr),
             handle: Barrier::fresh_internal(),
         }
     }

@@ -1657,6 +1657,13 @@ pub enum Tk20Call {
         src: String,
     },
 
+    /// `#ifdef TK_DEBUG_HANDSHAKE if (threadIdx.x == 0) { printf("[BEGIN
+    /// {op_tag}]\n"); } #endif` — per-op trace marker; fires from
+    /// thread 0 only when TK_DEBUG_HANDSHAKE is defined at compile
+    /// time. One Tk20Call variant; orchestrator passes `op_tag` as
+    /// e.g. `"op7/RmsNorm"`.
+    DebugOpBeginMarker { op_tag: String },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -2738,6 +2745,11 @@ impl Tk20Call {
             Tk20Call::ScalarFloatStoreVar { array, idx, src } => {
                 format!("{array}[{idx}] = {src};")
             }
+            Tk20Call::DebugOpBeginMarker { op_tag } => format!(
+                "#ifdef TK_DEBUG_HANDSHAKE\n        \
+                 if (threadIdx.x == 0) {{ printf(\"[BEGIN {op_tag}]\\n\"); }}\n        \
+                 #endif"
+            ),
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,

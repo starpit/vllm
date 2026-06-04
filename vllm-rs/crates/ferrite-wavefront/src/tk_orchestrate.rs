@@ -258,22 +258,14 @@ pub fn lower_to_tk(input: &LoweringInput) -> (TkProgram, u32) {
         let out_buf = BufId(n_sources + op_idx as u32);
         op_out_buf.push(out_buf);
 
-        // Per-op trace marker — fires from thread 0 (warp 0 lane 0) so
-        // the printf trace tagged by `EmitOpts::debug_handshake` can be
-        // partitioned by op. Wrapped in `#ifdef TK_DEBUG_HANDSHAKE` so
-        // it's a compile-time no-op when the dbg-handshake instrumentation
-        // is off (the same macro `tk_codegen` toggles for the per-op
-        // wait/arrive printfs). One thread, one line per op — negligible
-        // even if always on.
+        // Per-op trace marker — fires from thread 0 only when
+        // TK_DEBUG_HANDSHAKE is defined at compile time. Routes through
+        // the typed Tk20Call::DebugOpBeginMarker so every CUDA fragment
+        // in the final .cu is traceable to a typed Rust atom.
         let op_tag = format!("op{op_idx}/{}", op_kind_name(&desc.op));
-        prog.compute(
+        prog.compute_calls(
             WarpRole::All,
-            format!(
-                "#ifdef TK_DEBUG_HANDSHAKE\n        \
-                 if (threadIdx.x == 0) {{ \
-                 printf(\"[BEGIN {op_tag}]\\n\"); }}\n        \
-                 #endif"
-            ),
+            vec![crate::tk_codegen::Tk20Call::DebugOpBeginMarker { op_tag }],
         );
 
         // Phase 12: build per-op routing hints from the analysis +

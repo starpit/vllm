@@ -318,6 +318,24 @@ impl From<GateSplitConstants> for Vec<ConstantValue> {
     }
 }
 
+/// `KernelId::GateScale` (`gate_scale.metal::gate_scale_<dtype>`).
+/// `n` = total output elements (`M * hidden_size`); `cols` =
+/// `hidden_size` — the gate's row index for the `[T, 1]` broadcast is
+/// `gid / cols`.
+pub struct GateScaleConstants {
+    pub n: HiddenSize,
+    pub cols: u32,
+}
+
+impl From<GateScaleConstants> for Vec<ConstantValue> {
+    fn from(c: GateScaleConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.n.get()),
+            ConstantValue::uint(ConstSlot(1), c.cols),
+        ]
+    }
+}
+
 // ── AffineEmbed (MLX-affine int4 embedding lookup) ────────────────
 
 /// `KernelId::AffineEmbed`

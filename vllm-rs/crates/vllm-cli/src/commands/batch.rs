@@ -41,6 +41,7 @@ pub async fn run_batch(args: BatchArgs) -> Result<()> {
         device: args.device,
         dtype: args.dtype,
         gpu_memory_utilization: args.gpu_memory_utilization,
+        max_num_seqs: args.max_num_seqs,
         hf_token: args.hf_token,
         gguf_file: args.gguf_file,
         ..VllmConfig::default()

@@ -607,6 +607,15 @@ impl Instruction {
                 "GateApply",
                 vec![F::Slot(attn_slot), F::Slot(gate_slot), F::Slot(out_slot)],
             ),
+            Instruction::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => (
+                "GateScale",
+                vec![
+                    F::Slot(routed_slot),
+                    F::Slot(shared_slot),
+                    F::Slot(gate_slot),
+                    F::Slot(out_slot),
+                ],
+            ),
             Instruction::DeepSeekMoe(in_slot, out_slot, layer) => (
                 "DeepSeekMoe",
                 vec![
@@ -1218,9 +1227,14 @@ impl Instruction {
                     F::LayerKind("LinearLayer"),
                 ],
             ),
-            Instruction::SiluMul(gate_slot, up_slot, out_slot) => (
+            Instruction::SiluMul(gate_slot, up_slot, out_slot, width) => (
                 "SiluMul",
-                vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],
+                vec![
+                    F::Slot(gate_slot),
+                    F::Slot(up_slot),
+                    F::Slot(out_slot),
+                    F::ConstU32(width),
+                ],
             ),
             // Metal-only fused gather+dequant for `*-4bit` checkpoints
             // (P6). Variant is cfg-gated on `Instruction<W>` so the

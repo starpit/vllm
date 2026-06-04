@@ -162,6 +162,10 @@ pub enum KernelId {
     /// Qwen3.5 attention output gate `out = attn * sigmoid(gate)`. Maps
     /// to `gate_apply_<dtype>` in `gate_apply.metallib`.
     GateApply,
+    /// Qwen3.5-MoE shared-expert combine `out = routed + shared_y *
+    /// sigmoid(g)` with `g` `[T, 1]` row-broadcast. Maps to
+    /// `gate_scale_<dtype>` in `gate_scale.metallib`.
+    GateScale,
     /// Qwen3.5 attention output-gate split: per-head deinterleave of the
     /// doubled `q_proj` output into `query` + `gate`. Maps to
     /// `gate_split_<dtype>` in `gate_split.metallib`.

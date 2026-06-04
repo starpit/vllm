@@ -35,6 +35,7 @@ pub mod chain_advance;
 pub mod cpu_reference;
 pub mod device;
 pub mod fused_kernels;
+pub mod gate_scale;
 pub mod gemm;
 pub mod moe_weighted_sum;
 pub mod quantized;

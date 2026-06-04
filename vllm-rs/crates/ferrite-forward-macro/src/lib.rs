@@ -495,7 +495,15 @@ fn compile_common(
     // validation guarantees every model's bounds resolve the
     // manifest's formulas consistently, so any one model's bounds
     // suffice — we use the first (alphabetical) model.
-    let models = config::load_dir(&models_dir).map_err(|e| {
+    let models = match mode.prelude {
+        // `#[vision_forward]` configs are verbatim VL-wrapper HF
+        // checkpoints; the vision loader derives the `vision_*`
+        // bound set from the nested `vision_config` block instead
+        // of the decoder's flat top-level harvest.
+        classified::Prelude::Vision => config::load_dir_vision(&models_dir),
+        _ => config::load_dir(&models_dir),
+    }
+    .map_err(|e| {
         syn::Error::new(
             carrier.sig.ident.span(),
             format!("models_dir `{}`: {e}", models_dir.display()),
@@ -952,6 +960,7 @@ fn compile_common(
                 "gated_delta_net_ref",
                 "gate_split_ref",
                 "gate_apply_ref",
+                "gate_scale_ref",
                 // Metal MoE Impls. Same "host-callback dispatch
                 // wrapper, internal compute steps already classified
                 // (Gemm via metal_gemm_, gather_qmv via

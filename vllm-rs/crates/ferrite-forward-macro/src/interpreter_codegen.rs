@@ -444,6 +444,13 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let c = lit_u32(c);
             quote! { GateApply(#a, #b, #c) }
         }
+        I::GateScale(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            quote! { GateScale(#a, #b, #c, #d) }
+        }
         I::DeepSeekMoe(a, b, c) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -810,11 +817,12 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_u32(g);
             quote! { SynthMlpPreDown(#a, #b, #c, #d, #e, #f, #g, #h) }
         }
-        I::SiluMul(a, b, c) => {
+        I::SiluMul(a, b, c, w) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
-            quote! { SiluMul(#a, #b, #c) }
+            let w = lit_u32(w);
+            quote! { SiluMul(#a, #b, #c, #w) }
         }
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(a, b, c, d, e, f) => {
@@ -894,6 +902,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::GatedDeltaNet(..) => "GatedDeltaNet",
         I::GateSplit(..) => "GateSplit",
         I::GateApply(..) => "GateApply",
+        I::GateScale(..) => "GateScale",
         I::DeepSeekMoe(..) => "DeepSeekMoe",
         I::DeepSeekMoeFp8Block(..) => "DeepSeekMoeFp8Block",
         I::DeepSeekMoeGgml(..) => "DeepSeekMoeGgml",
@@ -1280,6 +1289,13 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
+        I::GateScale(a, b, c, d) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
         I::DeepSeekMoe(a, b, c) => match idx {
             0 => u(a),
             1 => u(b),
@@ -1625,7 +1641,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             6 => u(g),
             _ => None,
         },
-        I::SiluMul(a, b, c) => match idx {
+        I::SiluMul(a, b, c, _w) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -1983,6 +1999,13 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             2 => I::GateApply(a, b, n),
             _ => panic!("GateApply: bad idx {idx}"),
         },
+        I::GateScale(a, b, c, d) => match idx {
+            0 => I::GateScale(n, b, c, d),
+            1 => I::GateScale(a, n, c, d),
+            2 => I::GateScale(a, b, n, d),
+            3 => I::GateScale(a, b, c, n),
+            _ => panic!("GateScale: bad idx {idx}"),
+        },
         I::DeepSeekMoe(a, b, c) => match idx {
             0 => I::DeepSeekMoe(n, b, c),
             1 => I::DeepSeekMoe(a, n, c),
@@ -2339,10 +2362,10 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             6 => I::SynthMlpPreDown(a, b, c, d, e, f, n, h),
             _ => panic!("SynthMlpPreDown: bad idx {idx}"),
         },
-        I::SiluMul(a, b, c) => match idx {
-            0 => I::SiluMul(n, b, c),
-            1 => I::SiluMul(a, n, c),
-            2 => I::SiluMul(a, b, n),
+        I::SiluMul(a, b, c, w) => match idx {
+            0 => I::SiluMul(n, b, c, w),
+            1 => I::SiluMul(a, n, c, w),
+            2 => I::SiluMul(a, b, n, w),
             _ => panic!("SiluMul: bad idx {idx}"),
         },
         #[cfg(feature = "metal")]

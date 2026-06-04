@@ -337,6 +337,7 @@ mod tests {
                 | KernelId::SiluMul
                 | KernelId::GateApply
                 | KernelId::GateSplit
+                | KernelId::GateScale
                 | KernelId::GatedDeltaNet
                 | KernelId::SplitKReduceSum
                 | KernelId::FusedAffineQkvRopeCache
@@ -429,6 +430,7 @@ mod tests {
             | KernelId::SiluMul
             | KernelId::GateApply
             | KernelId::GateSplit
+            | KernelId::GateScale
             | KernelId::GatedDeltaNet
             | KernelId::SplitKReduceSum
             | KernelId::FusedAffineQkvRopeCache

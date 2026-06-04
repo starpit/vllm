@@ -3,7 +3,7 @@
 //! (port of MLX `block_sort`). MoE router uses this to express
 //! `mx.argpartition(±gates, kth=±k, axis=-1)` — a full sort
 //! plus trailing-k slice is correct for the small router widths
-//! (E ≤ 128) we target.
+//! (E ≤ 256) we target.
 //!
 //! The output is `[rows, axis_size]` u32 with each row holding
 //! the ascending-sorted indices of the input row. NaN entries
@@ -61,6 +61,8 @@ pub struct ArgsortKernels {
     pub u32_bn32_tn4: ComputePipelineState,
     pub f32_bn64_tn4: ComputePipelineState,
     pub u32_bn64_tn4: ComputePipelineState,
+    pub f16_bn64_tn4: ComputePipelineState,
+    pub bf16_bn64_tn4: ComputePipelineState,
     _library: Library,
 }
 
@@ -87,6 +89,13 @@ impl ArgsortKernels {
             build_pipeline(device, &library, "c_arg_block_sort_float32_uint32_bn64_tn4")?;
         let u32_bn64_tn4 =
             build_pipeline(device, &library, "c_arg_block_sort_uint32_uint32_bn64_tn4")?;
+        let f16_bn64_tn4 =
+            build_pipeline(device, &library, "c_arg_block_sort_float16_uint32_bn64_tn4")?;
+        let bf16_bn64_tn4 = build_pipeline(
+            device,
+            &library,
+            "c_arg_block_sort_bfloat16_uint32_bn64_tn4",
+        )?;
         Ok(Self {
             f32_bn32_tn4,
             f16_bn32_tn4,
@@ -94,6 +103,8 @@ impl ArgsortKernels {
             u32_bn32_tn4,
             f32_bn64_tn4,
             u32_bn64_tn4,
+            f16_bn64_tn4,
+            bf16_bn64_tn4,
             _library: library,
         })
     }
@@ -111,6 +122,8 @@ impl ArgsortKernels {
             (ArgsortDType::U32, 32, 4) => Ok(&self.u32_bn32_tn4),
             (ArgsortDType::F32, 64, 4) => Ok(&self.f32_bn64_tn4),
             (ArgsortDType::U32, 64, 4) => Ok(&self.u32_bn64_tn4),
+            (ArgsortDType::F16, 64, 4) => Ok(&self.f16_bn64_tn4),
+            (ArgsortDType::Bf16, 64, 4) => Ok(&self.bf16_bn64_tn4),
             _ => Err(MetalStreamError::ShaderCompilationFailed(format!(
                 "no pipeline for ({:?}, bn={bn}, tn={tn})",
                 dtype

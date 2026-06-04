@@ -406,6 +406,12 @@ pub enum OpKind {
     /// Shape-preserving 2-input elementwise. A fused op because bare `*` and
     /// `sigmoid` are not DSL-callable (`Silu`/`Mul` are synthesis-only).
     GateApply,
+    /// Qwen3.5-MoE shared-expert combine: `out = routed + shared_y *
+    /// sigmoid(g)` with `g` `[T, 1]` broadcast across the hidden axis.
+    /// 3-input elementwise-with-row-broadcast; a fused op because bare
+    /// `*`/`sigmoid` aren't DSL-callable and `Mul`'s shape sig unifies
+    /// dims, so `[T, 1] × [T, H]` cannot be expressed with `mul`.
+    GateScale,
     /// Vision-prelude pixels materialization. Synthesized by
     /// `vision_lowering::materialize_pixels` between `fuf::unroll`
     /// and the solver: takes zero FUF inputs and produces a single
@@ -522,6 +528,7 @@ impl OpKind {
             "gated_delta_net" => Some(Self::GatedDeltaNet),
             "gate_split" => Some(Self::GateSplit),
             "gate_apply" => Some(Self::GateApply),
+            "gate_scale" => Some(Self::GateScale),
             "embedding_gather" => Some(Self::EmbeddingGather),
             "avg_pool_2d" => Some(Self::AvgPool2d),
             "strip_cls" => Some(Self::StripCls),
@@ -558,6 +565,7 @@ impl OpKind {
             Self::GatedDeltaNet => "gated_delta_net",
             Self::GateSplit => "gate_split",
             Self::GateApply => "gate_apply",
+            Self::GateScale => "gate_scale",
             // No DSL surface — produced only by the post-FUF lowering
             // pass at tp>1. `from_name` deliberately omits it so a
             // user can't write `all_reduce(...)` in a `#[forward]`
@@ -695,6 +703,18 @@ impl WeightTable {
 
     pub fn path(&self, id: WeightId) -> &[String] {
         &self.entries[id.0 as usize]
+    }
+
+    /// Whether any interned path lies strictly under the given segment
+    /// prefix (a proper subtree — not the prefix node itself). Drives
+    /// the single-owner rule: a struct accessor (e.g. the MoE `mlp`)
+    /// must not also load weight paths the DSL claims as ordinary
+    /// leaves (e.g. `mlp.shared_expert.*` when the model expresses the
+    /// shared expert as DSL gemms + `gate_scale`).
+    pub fn has_subtree(&self, prefix: &[&str]) -> bool {
+        self.entries
+            .iter()
+            .any(|p| p.len() > prefix.len() && p.iter().zip(prefix).all(|(s, t)| s == t))
     }
 
     pub fn len(&self) -> usize {

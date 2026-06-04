@@ -1423,10 +1423,21 @@ fn lower_one<W: CanonicalParams>(
         // currently rejects non-Dense storage. SiluMul is the
         // elementwise tail of that decomposition; the gate / up
         // arena slots hold the two AffineQmm outputs and SiluMul
-        // writes `silu(gate) * up` into out_slot.
-        I::SiluMul(gate_slot, up_slot, out_slot) => {
+        // writes `silu(gate) * up` into out_slot. `width` (per-row
+        // element count) rides on the instruction — baked at macro
+        // time from the claim's solved gate/up Gemm N, NOT from
+        // `W::INTERMEDIATE_SIZE`: one model can carry SwiGLU blocks
+        // of different widths (Qwen3.5-MoE's 512-wide shared expert
+        // vs a dense MLP), and a zero/mismatched global bound made
+        // this dispatch a silent no-op.
+        I::SiluMul(gate_slot, up_slot, out_slot, width) => {
             let dtype = dequant_dtype_for::<W>();
-            let n = bucket_m * (W::INTERMEDIATE_SIZE as u32);
+            assert!(
+                *width > 0,
+                "SiluMul: width must be > 0 — a zero width dispatches no threads \
+                 and silently passes raw gate_proj output downstream"
+            );
+            let n = bucket_m * width;
             LoweredCommand {
                 kernel: KernelId::SiluMul,
                 library: "silu_mul",
@@ -1503,6 +1514,56 @@ fn lower_one<W: CanonicalParams>(
                     Binding::ArenaSlot {
                         slot: *gate_slot,
                         binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Qwen3.5-MoE shared-expert combine: out = routed + shared_y * sigmoid(g) ──
+        I::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => {
+            let dtype = dequant_dtype_for::<W>();
+            // routed/shared_y/out are [M, hidden] residual-stream tiles
+            // (the op sits post-MoE); g is [M, 1], row-broadcast via
+            // `row = gid / cols` in the shader. One thread per output
+            // element, m_scaling rescales X to the runtime token count
+            // (cols stays hidden_size, so the row index is M-invariant).
+            let cols = W::HIDDEN_SIZE as u32;
+            let n = bucket_m * cols;
+            LoweredCommand {
+                kernel: KernelId::GateScale,
+                library: "gate_scale",
+                function: gate_scale_static_name(dtype),
+                constants: super::kernel_constants::GateScaleConstants {
+                    n: super::ids::HiddenSize(n),
+                    cols,
+                }
+                .into(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *routed_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *shared_slot,
+                        binding_index: 2,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *gate_slot,
+                        binding_index: 3,
                     },
                 ],
                 gemm_dims: None,
@@ -3646,6 +3707,13 @@ fn gate_split_static_name(dtype: DequantDtype) -> &'static str {
     }
 }
 
+fn gate_scale_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gate_scale_f16",
+        DequantDtype::Bf16 => "gate_scale_bf16",
+    }
+}
+
 // ── Gated-DeltaNet kernel symbol pickers ──────────────────────────
 // The conv1d / gating / gated-RMSNorm kernels read model-dtype inputs
 // (`x`/`a`/`b`/`z`/weights) and write f32 scratch (or, for the final
@@ -4193,14 +4261,18 @@ fn moe_weighted_sum_symbol<W: CanonicalParams>() -> &'static str {
 }
 
 /// `c_arg_block_sort_<dtype>_uint32_bn<bn>_tn4` symbol picker for
-/// MoE router argsort. Today `bn=32` always (Mixtral E=8, Qwen3 E=128,
-/// all ≤ bn*tn = 128). The router input is router-probs (Qwen) or
-/// router-logits (Mixtral), both in W::METAL_DTYPE.
-fn argpartition_symbol<W: CanonicalParams>() -> &'static str {
-    match W::METAL_DTYPE {
-        MetalDtype::F16 => "c_arg_block_sort_float16_uint32_bn32_tn4",
-        MetalDtype::Bf16 => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
-        MetalDtype::Int4 => {
+/// MoE router argsort. `bn=32` (N_PER_BLOCK=128) covers Mixtral E=8,
+/// Qwen2-MoE E=60, Qwen3-MoE E=128; Qwen3.5-MoE E=256 needs the
+/// `bn=64` (N_PER_BLOCK=256) instantiation. The router input is
+/// router-probs (Qwen) or router-logits (Mixtral), both in
+/// W::METAL_DTYPE.
+fn argpartition_symbol<W: CanonicalParams>(num_experts: u32) -> &'static str {
+    match (W::METAL_DTYPE, num_experts > 128) {
+        (MetalDtype::F16, false) => "c_arg_block_sort_float16_uint32_bn32_tn4",
+        (MetalDtype::Bf16, false) => "c_arg_block_sort_bfloat16_uint32_bn32_tn4",
+        (MetalDtype::F16, true) => "c_arg_block_sort_float16_uint32_bn64_tn4",
+        (MetalDtype::Bf16, true) => "c_arg_block_sort_bfloat16_uint32_bn64_tn4",
+        (MetalDtype::Int4, _) => {
             panic!("argpartition_symbol: MoE router argsort over int4 dtype is nonsensical")
         }
     }
@@ -4426,11 +4498,13 @@ fn lower_metal_moe<W: CanonicalParams>(
     // for the small E we target) trailing. SliceTrailingColsU32
     // pulls the top-k window next.
     {
-        let bn: u32 = 32; // Mixtral E=8, Qwen3 E=128 → bn*tn=128 covers.
+        // bn*tn=128 covers Mixtral E=8 / Qwen3-MoE E=128; Qwen3.5-MoE
+        // E=256 takes the bn=64 (N_PER_BLOCK=256) instantiation.
+        let bn: u32 = if p.num_experts > 128 { 64 } else { 32 };
         cmds.push(make_moe_command(
             KernelId::ArgPartitionTopK,
             "argpartition",
-            argpartition_symbol::<W>(),
+            argpartition_symbol::<W>(p.num_experts),
             Vec::new(),
             DispatchShape {
                 threadgroups: (1, p.bucket_m, 1),
@@ -5228,13 +5302,15 @@ mod tests {
         }
     }
 
-    /// SiluMul lowers to a 1D dispatch over `bucket_m * intermediate_size`
+    /// SiluMul lowers to a 1D dispatch over `bucket_m * width`
     /// elements with three ArenaSlot bindings (out, gate, up). Function
-    /// constant 0 holds the total element count.
+    /// constant 0 holds the total element count; `width` rides on the
+    /// instruction (macro-baked from the claim's gate/up Gemm N).
     #[test]
     fn silu_mul_lowers_with_three_arena_bindings_and_n_constant() {
-        let inst: Instruction<TestParams> =
-            Instruction::SiluMul(/*gate=*/ 5, /*up=*/ 6, /*out=*/ 7);
+        let inst: Instruction<TestParams> = Instruction::SiluMul(
+            /*gate=*/ 5, /*up=*/ 6, /*out=*/ 7, /*width=*/ 11008,
+        );
         let mut scratch = 0u32;
         let cmds = lower_one(
             &inst,
@@ -5249,8 +5325,9 @@ mod tests {
         assert_eq!(cmd.kernel, KernelId::SiluMul);
         assert_eq!(cmd.library, "silu_mul");
         assert_eq!(cmd.function, "silu_mul_bf16");
-        // n = bucket_m * INTERMEDIATE_SIZE = 64 * 8192.
-        let n_expected = 64 * (TestParams::INTERMEDIATE_SIZE as u32);
+        // n = bucket_m * width = 64 * 11008 (the instruction-carried
+        // width, independent of TestParams::INTERMEDIATE_SIZE).
+        let n_expected = 64 * 11008_u32;
         assert_eq!(cmd.constants, vec![ConstantValue::uint(0, n_expected)]);
         assert_eq!(cmd.bindings.len(), 3);
         match &cmd.bindings[0] {

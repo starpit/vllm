@@ -261,6 +261,16 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
                 .or_else(|| {
                     name.strip_prefix("vision_tower.")
                         .map(|rest| format!("model.visual.{rest}"))
+                })
+                // lm_head prefix aliasing. Compiled variants always bake the
+                // root `lm_head.*` key (codegen's safetensors_prefix keeps
+                // lm_head outside the decoder prefix), and official VL repos
+                // store it there — but mlx-community repacks nest it under
+                // `language_model.lm_head.*` (e.g. Qwen3.5-9B-4bit /
+                // Qwen3.5-35B-A3B-4bit). Alias it back to the root.
+                .or_else(|| {
+                    name.strip_prefix("language_model.lm_head.")
+                        .map(|rest| format!("lm_head.{rest}"))
                 })?;
             if tensors.contains_key(&alt) {
                 return None;

@@ -9034,6 +9034,77 @@ pub unsafe fn sigmoid_mul_inplace(
 }
 
 // ---------------------------------------------------------------------------
+// Sigmoid-rowgate-add: out += sh * sigmoid(gate[row]) — Qwen3.5-MoE
+// shared-expert combine. `gate` is [rows, 1], row-broadcast across cols.
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn sigmoid_rowgate_add_f32(
+        out: *mut f32,
+        sh: *const f32,
+        gate: *const f32,
+        numel: c_int,
+        cols: c_int,
+        stream: CUstream,
+    );
+    fn sigmoid_rowgate_add_f16(
+        out: *mut u16,
+        sh: *const u16,
+        gate: *const u16,
+        numel: c_int,
+        cols: c_int,
+        stream: CUstream,
+    );
+    fn sigmoid_rowgate_add_bf16(
+        out: *mut u16,
+        sh: *const u16,
+        gate: *const u16,
+        numel: c_int,
+        cols: c_int,
+        stream: CUstream,
+    );
+}
+
+/// Apply `out += sh * sigmoid(gate[row])` in-place on `out` (`[T, H]`),
+/// with `gate` `[T, 1]` row-broadcast across the hidden axis.
+pub unsafe fn sigmoid_rowgate_add_inplace(
+    out: GpuTensor,
+    sh: GpuTensor,
+    gate: GpuTensor,
+    stream: CUstream,
+) {
+    let numel = out.numel() as c_int;
+    let cols = out.dim(1) as c_int;
+    match out.dtype() {
+        DType::F32 => sigmoid_rowgate_add_f32(
+            out.as_mut_ptr(),
+            sh.as_ptr(),
+            gate.as_ptr(),
+            numel,
+            cols,
+            stream,
+        ),
+        DType::F16 => sigmoid_rowgate_add_f16(
+            out.as_mut_ptr() as *mut u16,
+            sh.as_ptr() as *const u16,
+            gate.as_ptr() as *const u16,
+            numel,
+            cols,
+            stream,
+        ),
+        DType::BF16 => sigmoid_rowgate_add_bf16(
+            out.as_mut_ptr() as *mut u16,
+            sh.as_ptr() as *const u16,
+            gate.as_ptr() as *const u16,
+            numel,
+            cols,
+            stream,
+        ),
+        _ => panic!("sigmoid_rowgate_add: unsupported dtype {:?}", out.dtype()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GDN kernels (Gated Delta Net for Qwen3-Next)
 // ---------------------------------------------------------------------------
 

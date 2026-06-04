@@ -834,6 +834,10 @@ pub enum Instruction {
     /// Qwen3.5 attention output gate. Args `(attn_slot, gate_slot, out_slot)`.
     /// `out = attn * sigmoid(gate)`.
     GateApply(u32, u32, u32),
+    /// Qwen3.5-MoE shared-expert combine. Args `(routed_slot, shared_slot,
+    /// gate_slot, out_slot)`. `out = routed + shared_y * sigmoid(g)`; `g` is
+    /// `[T, 1]`, row-broadcast across the hidden axis.
+    GateScale(u32, u32, u32, u32),
     DeepSeekMoe(u32, u32, u32),
     DeepSeekMoeFp8Block(u32, u32, u32),
     DeepSeekMoeGgml(u32, u32, u32),
@@ -1029,11 +1033,16 @@ pub enum Instruction {
     /// than a single fused `FusedGateUpSiluMul` (which assumes Dense
     /// storage).
     ///
-    /// Tuple fields: `(gate_slot, up_slot, out_slot)`. Both inputs
-    /// must be `[M, intermediate_size]` in the activation dtype;
-    /// output is the same shape. CUDA eval is `unreachable!` —
-    /// metal-only (CUDA's q-MLP routes through Marlin/Bnb/etc).
-    SiluMul(u32, u32, u32),
+    /// Tuple fields: `(gate_slot, up_slot, out_slot, width)`. Both
+    /// inputs are `[M, width]` in the activation dtype; output is the
+    /// same shape. `width` is the per-row element count, baked at
+    /// macro time from the claim's solved gate/up Gemm N — NOT from a
+    /// model-level bound, because one model can carry SwiGLU blocks of
+    /// different widths (e.g. Qwen3.5-MoE's 512-wide shared expert
+    /// next to a dense `intermediate_size`-wide MLP in hybrid
+    /// configs). CUDA eval is `unreachable!` — metal-only (CUDA's
+    /// q-MLP routes through Marlin/Bnb/etc).
+    SiluMul(u32, u32, u32, u32),
     /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
     /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
     /// Fields: `(x_norm_slot, out_slot, layer, group_size, bits,
@@ -2788,6 +2797,31 @@ impl Instruction {
                     *out.view(),
                     *gate_tv,
                     &mut ctx.device.caching,
+                    ctx.device.compute_stream,
+                );
+                ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));
+            },
+            Instruction::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => unsafe {
+                // out = routed + shared_y * sigmoid(g)  (Qwen3.5-MoE shared
+                // expert; g is [T, 1], row-broadcast across the hidden axis).
+                let routed_tv = tile_ref(ctx.tiles, routed_slot).as_view(ctx.tiles);
+                let shared_tv = tile_ref(ctx.tiles, shared_slot).as_view(ctx.tiles);
+                let gate_tv = tile_ref(ctx.tiles, gate_slot).as_view(ctx.tiles);
+                let nt = (*routed_tv).dim(0);
+                let ncols = (*routed_tv).dim(1);
+                let dt = (*routed_tv).dtype();
+                let out = ctx.device.caching.alloc_tensor(&[nt, ncols], dt);
+                ferrite_cuda_core::driver::memcpy_dtod_async(
+                    (*out.view()).raw_ptr(),
+                    (*routed_tv).as_ptr::<u8>(),
+                    (*routed_tv).size_bytes(),
+                    ctx.device.compute_stream,
+                )
+                .expect("GateScale: copy routed");
+                kernels::sigmoid_rowgate_add_inplace(
+                    *out.view(),
+                    *shared_tv,
+                    *gate_tv,
                     ctx.device.compute_stream,
                 );
                 ctx.tiles[out_slot as usize] = Some(TileEntry::Owned(out));

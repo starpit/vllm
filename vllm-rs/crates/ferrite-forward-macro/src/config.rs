@@ -183,6 +183,28 @@ impl VisionSafetensorsLayout {
             subtrees: BTreeMap::new(),
         }
     }
+
+    /// Qwen3.5-VL on-disk convention: the wrapper checkpoint roots
+    /// the tower at `vision_tower.*` (not `visual.*`).
+    pub fn qwen3_5_default() -> Self {
+        Self {
+            default_root: "vision_tower".to_string(),
+            layered_subpath: "blocks".to_string(),
+            subtrees: BTreeMap::new(),
+        }
+    }
+
+    /// Gemma3-MM SigLIP convention: tower under
+    /// `vision_tower.vision_model.encoder.layers.{l}.*`, with the
+    /// `mm.*` DSL subtree routed to the sibling
+    /// `multi_modal_projector.*`.
+    pub fn gemma3_default() -> Self {
+        Self {
+            default_root: "vision_tower.vision_model".to_string(),
+            layered_subpath: "encoder.layers".to_string(),
+            subtrees: BTreeMap::from([("mm".to_string(), "multi_modal_projector".to_string())]),
+        }
+    }
 }
 
 /// d_model fingerprint key + dim — see [`ModelParams::vision_d_model_fingerprint`].
@@ -197,6 +219,24 @@ impl VisionDModelFingerprint {
         Self {
             key: "visual.merger.mlp.2.weight".to_string(),
             dim: 0,
+        }
+    }
+
+    /// Qwen3.5-VL: merger renamed `merger.linear_fc2`, rooted at
+    /// `vision_tower.*`.
+    pub fn qwen3_5_default() -> Self {
+        Self {
+            key: "vision_tower.merger.linear_fc2.weight".to_string(),
+            dim: 0,
+        }
+    }
+
+    /// Gemma3-MM: the SigLIP→text projector matrix is
+    /// `[vision_embed_dim, d_model]`, so d_model is dim 1.
+    pub fn gemma3_default() -> Self {
+        Self {
+            key: "multi_modal_projector.mm_input_projection_weight".to_string(),
+            dim: 1,
         }
     }
 }
@@ -219,6 +259,28 @@ impl VisionPatchEmbedFlatten {
     pub fn qwen_default() -> Self {
         Self {
             key: "visual.patch_embed.proj.weight".to_string(),
+            leading_dim: 0,
+            channels_last: false,
+        }
+    }
+
+    /// Qwen3.5-VL: 5D conv weight at `vision_tower.*`; MLX-converted
+    /// checkpoints ship channels-LAST (`try_load_mm` sniffs the
+    /// actual layout at load — see vision_glue's channels-first
+    /// detection — so this flag only marks "may need the permute").
+    pub fn qwen3_5_default() -> Self {
+        Self {
+            key: "vision_tower.patch_embed.proj.weight".to_string(),
+            leading_dim: 0,
+            channels_last: true,
+        }
+    }
+
+    /// Gemma3-MM SigLIP: 4D `[E, C, P, P]` torch conv weight,
+    /// channels-first.
+    pub fn gemma3_default() -> Self {
+        Self {
+            key: "vision_tower.vision_model.embeddings.patch_embedding.weight".to_string(),
             leading_dim: 0,
             channels_last: false,
         }
@@ -289,6 +351,14 @@ pub enum ConfigError {
         path: PathBuf,
         reason: &'static str,
     },
+    /// A `#[vision_forward]` config (verbatim HF VL-wrapper
+    /// checkpoint) is missing a field the per-family `vision_*`
+    /// bound derivation needs, or its arch family is unknown to
+    /// [`VisionFamily`].
+    VisionDerivation {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -305,6 +375,9 @@ impl std::fmt::Display for ConfigError {
             }
             Self::BadQuantizations { path, reason } => {
                 write!(f, "{}: {reason}", path.display())
+            }
+            Self::VisionDerivation { path, reason } => {
+                write!(f, "vision config {}: {reason}", path.display())
             }
         }
     }
@@ -333,6 +406,40 @@ impl std::error::Error for ConfigError {}
 /// Results are sorted alphabetically by file stem for build
 /// determinism; synthesized variants appear after their base.
 pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
+    load_dir_mode(dir, ConfigMode::Decoder)
+}
+
+/// [`load_dir`] for a `#[vision_forward]` crate's configs/ dir.
+/// Same file discovery / overlay synthesis / filtering; per-file
+/// `ModelParams` construction goes through the vision path
+/// (per-family `vision_*` bound derivation from the nested HF
+/// `vision_config` block) instead of the flat decoder harvest.
+pub fn load_dir_vision(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
+    load_dir_mode(dir, ConfigMode::Vision)
+}
+
+/// Which macro is consuming the configs — `#[forward]` (Decoder) or
+/// `#[vision_forward]` (Vision). The configs/ files themselves are
+/// VERBATIM HF checkpoint configs either way; the mode selects which
+/// view of the checkpoint the crate compiles:
+///
+/// - **Decoder** harvests the flat top-level fields (after
+///   `normalize_hf_config` hoists `text_config` / `rope_parameters`)
+///   — the text decoder's identity.
+/// - **Vision** derives the `vision_*` bound set + `d_model` +
+///   `vision_norm_eps` from the nested `vision_config` block,
+///   arch-family-keyed, and deliberately harvests NOTHING else from
+///   the top level (a VL-wrapper's text fields like
+///   `intermediate_size` / `head_dim` would otherwise leak into the
+///   vision expansion's `W::` consts — e.g. shadowing Qwen2.5-VL's
+///   `vision_intermediate_size_padded` SwiGLU split-point).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConfigMode {
+    Decoder,
+    Vision,
+}
+
+fn load_dir_mode(dir: &Path, mode: ConfigMode) -> Result<Vec<ModelParams>, ConfigError> {
     if !dir.is_dir() {
         return Err(ConfigError::NotADirectory(dir.to_path_buf()));
     }
@@ -393,7 +500,7 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
     for p in &base_paths {
         let (raw, json) = read_json_file(p)?;
         let stem = stem_of(p)?;
-        let model = model_params_from_json(&json, &stem, p, Vec::new())?;
+        let model = model_params_from_json_mode(&json, &stem, p, Vec::new(), mode)?;
         base_raw.push((p.clone(), stem, json));
         out.push(model);
         let _ = raw;
@@ -528,8 +635,13 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ModelParams>, ConfigError> {
                     extra_tracked.push(override_path);
                 }
 
-                let variant =
-                    model_params_from_json(&merged, &variant_stem, base_path, extra_tracked)?;
+                let variant = model_params_from_json_mode(
+                    &merged,
+                    &variant_stem,
+                    base_path,
+                    extra_tracked,
+                    mode,
+                )?;
                 out.push(variant);
             }
         }
@@ -841,12 +953,79 @@ fn stem_of(path: &Path) -> Result<String, ConfigError> {
 /// synthesized variants; `extra_tracked_paths` carries the preset +
 /// override files so the `#[forward]` macro can `include_str!` them
 /// for cargo change detection.
+/// Normalize an HF `config.json` for macro consumption. VL-wrapper
+/// checkpoints (Qwen3.5 / Qwen3.5-MoE / …) nest the text decoder's
+/// fields under `text_config`, and newer transformers nest rotary
+/// params under `rope_parameters` — while the per-field readers
+/// (`extract_bounds`, `extract_scalars`, `extract_mrope_section`, …)
+/// all consume the flat single-decoder view. Hoist both levels.
+///
+/// An explicit top-level field always wins (hoisting never
+/// overwrites), and `vision_config` deliberately stays nested — the
+/// vision glue owns that subtree. The `configs/` files themselves are
+/// VERBATIM copies of the HF checkpoint configs (fetched by
+/// `probe-weights`); this normalization is the macro's job, never an
+/// edit to the json.
+fn normalize_hf_config(json: &serde_json::Value) -> serde_json::Value {
+    let mut out = json.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    if let Some(text) = obj.get("text_config").cloned()
+        && let Some(text_obj) = text.as_object()
+    {
+        for (k, v) in text_obj {
+            obj.entry(k.clone()).or_insert(v.clone());
+        }
+    }
+    if let Some(rope) = obj.get("rope_parameters").cloned()
+        && let Some(rope_obj) = rope.as_object()
+    {
+        for (k, v) in rope_obj {
+            obj.entry(k.clone()).or_insert(v.clone());
+        }
+    }
+    // ModernBERT spells its dual rotary bases `global_rope_theta` /
+    // `local_rope_theta`; the per-field readers (and the emitted
+    // `rotary` / `rotary_local` cache ctors) consume the
+    // gemma-convention `rope_theta` / `rope_local_base_freq` names.
+    // Alias, don't rename — the config stays verbatim and an
+    // explicit standard-name field still wins.
+    if obj.get("model_type").and_then(|v| v.as_str()) == Some("modernbert") {
+        if let Some(g) = obj.get("global_rope_theta").cloned() {
+            obj.entry("rope_theta".to_string()).or_insert(g);
+        }
+        if let Some(l) = obj.get("local_rope_theta").cloned() {
+            obj.entry("rope_local_base_freq".to_string()).or_insert(l);
+        }
+    }
+    out
+}
+
+fn model_params_from_json_mode(
+    json: &serde_json::Value,
+    source_stem: &str,
+    source_path: &Path,
+    extra_tracked_paths: Vec<PathBuf>,
+    mode: ConfigMode,
+) -> Result<ModelParams, ConfigError> {
+    match mode {
+        ConfigMode::Decoder => {
+            model_params_from_json(json, source_stem, source_path, extra_tracked_paths)
+        }
+        ConfigMode::Vision => {
+            vision_params_from_json(json, source_stem, source_path, extra_tracked_paths)
+        }
+    }
+}
+
 fn model_params_from_json(
     json: &serde_json::Value,
     source_stem: &str,
     source_path: &Path,
     extra_tracked_paths: Vec<PathBuf>,
 ) -> Result<ModelParams, ConfigError> {
+    let json = &normalize_hf_config(json);
     let name = stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
         path: source_path.to_path_buf(),
         reason,
@@ -860,10 +1039,10 @@ fn model_params_from_json(
             source: e,
         }
     })?;
-    let tie_word_embeddings = json
-        .get("tie_word_embeddings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // `None` (field absent) lets `apply_arch_semantic_defaults`
+    // supply the family's modeling-code default (HF's own default is
+    // TRUE; gemma3 checkpoints rely on it); explicit json wins.
+    let mut tie_word_embeddings = json.get("tie_word_embeddings").and_then(|v| v.as_bool());
     let architectures: Vec<String> = json
         .get("architectures")
         .and_then(|v| v.as_array())
@@ -883,14 +1062,30 @@ fn model_params_from_json(
         .get("vision_pos_embed_key")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let decoder_safetensors_prefix = json
+    let mut decoder_safetensors_prefix = json
         .get("decoder_safetensors_prefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // Top-level → `text_config.torch_dtype` → `text_config.dtype`
+    // (newer transformers serialization: Qwen3.5 wrappers carry the
+    // compute dtype only as `text_config.dtype`, which the hoist
+    // surfaces as `dtype`, never `torch_dtype`). Same chain as the
+    // vision path.
     let torch_dtype = json
         .get("torch_dtype")
+        .or_else(|| {
+            json.get("text_config")
+                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
+        })
         .and_then(|v| v.as_str())
         .map(|s| s.to_ascii_lowercase());
+
+    apply_arch_semantic_defaults(
+        &architectures,
+        &mut bounds,
+        &mut decoder_safetensors_prefix,
+        &mut tie_word_embeddings,
+    );
 
     Ok(ModelParams {
         name,
@@ -899,7 +1094,7 @@ fn model_params_from_json(
         bounds,
         scalars,
         quantization,
-        tie_word_embeddings,
+        tie_word_embeddings: tie_word_embeddings.unwrap_or(false),
         architectures,
         extra_tracked_paths,
         rope_scaling,
@@ -912,6 +1107,426 @@ fn model_params_from_json(
         decoder_safetensors_prefix,
         torch_dtype,
     })
+}
+
+/// VL arch families known to the vision-bound derivation. Keyed on
+/// `architectures[0]` — the same string the runtime's
+/// `FerriteMmRegistration` dispatch matches on. Each family maps the
+/// HF `vision_config` block's (renamed-per-family) keys onto the
+/// flat `vision_*` bound set the `#[vision_forward]` pipeline
+/// consumes (vision_glue / codegen / shape.rs / weights.json shape
+/// exprs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VisionFamily {
+    /// `Qwen2VLForConditionalGeneration` — vision_config keys
+    /// `embed_dim` / `depth` / `num_heads` / `mlp_ratio` / `in_chans`.
+    Qwen2Vl,
+    /// `Qwen2_5_VLForConditionalGeneration` — `hidden_size` (= embed
+    /// dim) / `intermediate_size` / `out_hidden_size` / `window_size`.
+    Qwen2_5Vl,
+    /// `Qwen3_5*` / `Qwen3_6*` wrappers — `hidden_size` /
+    /// `intermediate_size` / `out_hidden_size` / `in_channels` /
+    /// `num_position_embeddings`.
+    Qwen3_5Vl,
+    /// `Gemma3ForConditionalGeneration` — SigLIP vision_config:
+    /// `hidden_size` / `intermediate_size` / `num_attention_heads` /
+    /// `num_hidden_layers` / `num_channels` / `image_size` /
+    /// `layer_norm_eps`; learned pos-embed, no rope, no merge.
+    Gemma3,
+}
+
+impl VisionFamily {
+    fn detect(architectures: &[String]) -> Option<Self> {
+        match architectures.first().map(String::as_str) {
+            Some("Qwen2VLForConditionalGeneration") => Some(Self::Qwen2Vl),
+            Some("Qwen2_5_VLForConditionalGeneration") => Some(Self::Qwen2_5Vl),
+            Some(a) if a.starts_with("Qwen3_5") || a.starts_with("Qwen3_6") => {
+                Some(Self::Qwen3_5Vl)
+            }
+            Some("Gemma3ForConditionalGeneration") => Some(Self::Gemma3),
+            _ => None,
+        }
+    }
+}
+
+/// Build a `#[vision_forward]` variant's `ModelParams` from a
+/// VERBATIM HF VL-wrapper config.json.
+///
+/// Everything the vision pipeline needs is DERIVED here from the
+/// nested `vision_config` block (formulas) + arch-keyed structural
+/// defaults (on-disk weight layout), so the configs/ files stay
+/// byte-verbatim checkpoint copies. Flat top-level `vision_*` /
+/// `d_model` keys always win when present — that is the
+/// `.overrides.json` surface, and it keeps legacy flat configs
+/// loading identically during migration.
+///
+/// Deliberately NOT harvested (unlike the decoder path):
+/// - top-level / `text_config` text-decoder fields — they would leak
+///   into the vision expansion's `W::` consts (see [`ConfigMode`]);
+/// - `rope_scaling` / `mrope_section` — text-side rotary identity;
+///   the tower's 2D rope is the DSL's `vision_rope` op and the mm
+///   registration carries no rope fingerprint.
+fn vision_params_from_json(
+    json: &serde_json::Value,
+    source_stem: &str,
+    source_path: &Path,
+    extra_tracked_paths: Vec<PathBuf>,
+) -> Result<ModelParams, ConfigError> {
+    let name = stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
+        path: source_path.to_path_buf(),
+        reason,
+    })?;
+    let architectures: Vec<String> = json
+        .get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let family = VisionFamily::detect(&architectures).ok_or_else(|| {
+        ConfigError::VisionDerivation {
+            path: source_path.to_path_buf(),
+            reason: format!(
+                "unknown VL arch family {architectures:?} — teach \
+                 VisionFamily::detect + derive_vision_bounds the new family",
+            ),
+        }
+    })?;
+
+    // Flat harvest restricted to the vision namespace: `d_model` +
+    // `vision_*` integers, minus the wrapper's `vision_*_token_id`
+    // text-tokenizer ids (those are decoder-side splice identity,
+    // not tower geometry).
+    let mut bounds: BTreeMap<String, u64> = json
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| {
+                    (*k == "d_model" || k.starts_with("vision_")) && !k.ends_with("_token_id")
+                })
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
+    derive_vision_bounds(json, family, &mut bounds, source_path)?;
+
+    // Mirror of the decoder path's int/float double-counting: every
+    // derived integer bound is also visible as a scalar, plus the
+    // one real float the vision glue reads (`vision_norm_eps`).
+    let mut scalars: BTreeMap<String, f64> =
+        bounds.iter().map(|(k, v)| (k.clone(), *v as f64)).collect();
+    let norm_eps = json
+        .get("vision_norm_eps")
+        .and_then(|v| v.as_f64())
+        .or_else(|| match family {
+            // SigLIP carries a real eps key; Qwen vision towers
+            // don't — their modeling code hardcodes 1e-6
+            // (transformers Qwen2VL/Qwen2_5_VL/Qwen3_5 vision
+            // blocks, mlx-vlm likewise).
+            VisionFamily::Gemma3 => json
+                .get("vision_config")
+                .and_then(|vc| vc.get("layer_norm_eps"))
+                .and_then(|v| v.as_f64()),
+            _ => None,
+        })
+        .unwrap_or(1e-6);
+    scalars.insert("vision_norm_eps".to_string(), norm_eps);
+
+    // `None` lets `apply_arch_semantic_defaults` (below) supply the
+    // family modeling default, same as the decoder path. Inert
+    // vision-side either way — lm_head tying is text-decoder
+    // identity.
+    let mut tie_word_embeddings = json.get("tie_word_embeddings").and_then(|v| v.as_bool());
+
+    let quantization = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
+        ConfigError::Quantization {
+            path: source_path.to_path_buf(),
+            source: e,
+        }
+    })?;
+
+    // Structural weight-layout sidecars: explicit JSON fields win
+    // (the `.overrides.json` surface), else the arch family implies
+    // them. Qwen2-VL / Qwen2.5-VL take the `qwen_default()`s at the
+    // use sites (vision_glue / codegen), so `None` here.
+    let vision_layout = extract_vision_layout(json).or_else(|| match family {
+        VisionFamily::Qwen3_5Vl => Some(VisionSafetensorsLayout::qwen3_5_default()),
+        VisionFamily::Gemma3 => Some(VisionSafetensorsLayout::gemma3_default()),
+        _ => None,
+    });
+    let vision_d_model_fingerprint =
+        extract_vision_d_model_fingerprint(json).or_else(|| match family {
+            VisionFamily::Qwen3_5Vl => Some(VisionDModelFingerprint::qwen3_5_default()),
+            VisionFamily::Gemma3 => Some(VisionDModelFingerprint::gemma3_default()),
+            _ => None,
+        });
+    let vision_patch_embed_flatten =
+        extract_vision_patch_embed_flatten(json).or_else(|| match family {
+            VisionFamily::Qwen3_5Vl => Some(VisionPatchEmbedFlatten::qwen3_5_default()),
+            VisionFamily::Gemma3 => Some(VisionPatchEmbedFlatten::gemma3_default()),
+            _ => None,
+        });
+    let vision_pos_embed_key = json
+        .get("vision_pos_embed_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| match family {
+            VisionFamily::Qwen3_5Vl => Some("vision_tower.pos_embed.weight".to_string()),
+            _ => None,
+        });
+
+    // top-level `torch_dtype` (Qwen2-VL flat / Gemma3 wrapper) →
+    // `text_config.torch_dtype` → `text_config.dtype` (newer
+    // transformers serialization, e.g. Qwen3.5).
+    let torch_dtype = json
+        .get("torch_dtype")
+        .or_else(|| {
+            json.get("text_config")
+                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
+        })
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    let mut decoder_safetensors_prefix = json
+        .get("decoder_safetensors_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    apply_arch_semantic_defaults(
+        &architectures,
+        &mut bounds,
+        &mut decoder_safetensors_prefix,
+        &mut tie_word_embeddings,
+    );
+    let tie_word_embeddings = tie_word_embeddings.unwrap_or(false);
+
+    Ok(ModelParams {
+        name,
+        source_stem: source_stem.to_string(),
+        source_path: source_path.to_path_buf(),
+        bounds,
+        scalars,
+        quantization,
+        tie_word_embeddings,
+        architectures,
+        extra_tracked_paths,
+        rope_scaling: None,
+        rope_scaling_hash: None,
+        mrope_section: None,
+        vision_layout,
+        vision_d_model_fingerprint,
+        vision_patch_embed_flatten,
+        vision_pos_embed_key,
+        decoder_safetensors_prefix,
+        torch_dtype,
+    })
+}
+
+/// Fill the flat `vision_*` + `d_model` bound set from the HF
+/// `vision_config` block (and `text_config.hidden_size` /
+/// `mm_tokens_per_image` where the family needs them). Bounds
+/// already present (flat-key overrides) always win; only absent
+/// keys are derived. Every inserted key is load-bearing: vision_glue
+/// panics, codegen bakes silent zeros, or shape inference fails on
+/// a missing one (or it is named by a weights.json shape expr / a
+/// DSL body).
+fn derive_vision_bounds(
+    json: &serde_json::Value,
+    family: VisionFamily,
+    bounds: &mut BTreeMap<String, u64>,
+    source_path: &Path,
+) -> Result<(), ConfigError> {
+    let err = |reason: String| ConfigError::VisionDerivation {
+        path: source_path.to_path_buf(),
+        reason,
+    };
+    let vc = json.get("vision_config").and_then(|v| v.as_object());
+    let vcu = |k: &str| vc.and_then(|o| o.get(k)).and_then(|v| v.as_u64());
+    let vcf = |k: &str| vc.and_then(|o| o.get(k)).and_then(|v| v.as_f64());
+
+    // Per-family vision_config key spellings for the shared
+    // geometry. (Qwen2-VL: `embed_dim`/`num_heads`/`in_chans`;
+    // Qwen2.5-VL: embed dim is `hidden_size`; Qwen3.5: chans is
+    // `in_channels`; Gemma3/SigLIP: transformers-standard names.)
+    let (embed_key, depth_key, heads_key, chans_key) = match family {
+        VisionFamily::Qwen2Vl => ("embed_dim", "depth", "num_heads", "in_chans"),
+        VisionFamily::Qwen2_5Vl => ("hidden_size", "depth", "num_heads", "in_chans"),
+        VisionFamily::Qwen3_5Vl => ("hidden_size", "depth", "num_heads", "in_channels"),
+        VisionFamily::Gemma3 => (
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_channels",
+        ),
+    };
+    let got = |bounds: &BTreeMap<String, u64>, k: &str| bounds.get(k).copied();
+
+    let embed = got(bounds, "vision_embed_dim")
+        .or_else(|| vcu(embed_key))
+        .ok_or_else(|| err(format!("cannot derive vision_embed_dim (vision_config.{embed_key})")))?;
+    let depth = got(bounds, "vision_depth")
+        .or_else(|| vcu(depth_key))
+        .ok_or_else(|| err(format!("cannot derive vision_depth (vision_config.{depth_key})")))?;
+    let heads = got(bounds, "vision_num_heads")
+        .or_else(|| vcu(heads_key))
+        .ok_or_else(|| err(format!("cannot derive vision_num_heads (vision_config.{heads_key})")))?;
+    let chans = got(bounds, "vision_in_chans")
+        .or_else(|| vcu(chans_key))
+        .ok_or_else(|| err(format!("cannot derive vision_in_chans (vision_config.{chans_key})")))?;
+    let patch = got(bounds, "vision_patch_size")
+        .or_else(|| vcu("patch_size"))
+        .ok_or_else(|| err("cannot derive vision_patch_size".to_string()))?;
+    // SigLIP has no temporal axis and no spatial merge — the keys
+    // are simply absent from its vision_config; 1 is the identity
+    // for both.
+    let temporal = got(bounds, "vision_temporal_patch_size")
+        .or_else(|| vcu("temporal_patch_size"))
+        .unwrap_or(1);
+    let merge = got(bounds, "vision_spatial_merge_size")
+        .or_else(|| vcu("spatial_merge_size"))
+        .unwrap_or(1);
+    if heads == 0 || !embed.is_multiple_of(heads) {
+        return Err(err(format!(
+            "vision_embed_dim={embed} not divisible by vision_num_heads={heads}"
+        )));
+    }
+    let head_dim = got(bounds, "vision_head_dim").unwrap_or(embed / heads);
+
+    bounds.insert("vision_embed_dim".to_string(), embed);
+    bounds.insert("vision_depth".to_string(), depth);
+    bounds.insert("vision_num_heads".to_string(), heads);
+    bounds.insert("vision_head_dim".to_string(), head_dim);
+    bounds.insert("vision_in_chans".to_string(), chans);
+    bounds.insert("vision_patch_size".to_string(), patch);
+    bounds.insert("vision_temporal_patch_size".to_string(), temporal);
+    bounds.insert("vision_spatial_merge_size".to_string(), merge);
+    // patch_embed GEMM K: one patch's flattened pixel count.
+    bounds
+        .entry("vision_in_features".to_string())
+        .or_insert(chans * temporal * patch * patch);
+    bounds
+        .entry("vision_merge_factor".to_string())
+        .or_insert(merge * merge);
+    bounds
+        .entry("vision_merge_hidden".to_string())
+        .or_insert(embed * merge * merge);
+    // Rotary towers (every Qwen VL) rope half the head dim; SigLIP
+    // uses a learned absolute pos-embed and no rope at all.
+    bounds
+        .entry("vision_rope_half_dim".to_string())
+        .or_insert(match family {
+            VisionFamily::Gemma3 => 0,
+            _ => head_dim / 2,
+        });
+
+    match family {
+        VisionFamily::Qwen2Vl => {
+            // Qwen2-VL spells MLP width as a ratio (int or float in
+            // the wild).
+            let mlp = got(bounds, "vision_mlp_hidden")
+                .or_else(|| vcf("mlp_ratio").map(|r| (embed as f64 * r) as u64))
+                .ok_or_else(|| err("cannot derive vision_mlp_hidden (vision_config.mlp_ratio)".to_string()))?;
+            bounds.insert("vision_mlp_hidden".to_string(), mlp);
+        }
+        VisionFamily::Qwen2_5Vl => {
+            let inter = got(bounds, "vision_intermediate_size")
+                .or_else(|| vcu("intermediate_size"))
+                .ok_or_else(|| {
+                    err("cannot derive vision_intermediate_size".to_string())
+                })?;
+            bounds.insert("vision_intermediate_size".to_string(), inter);
+            // cuBLAS bf16 GEMM rejects K not divisible by 8; the
+            // manifest's __pad_to_mult8__ entries zero-pad gate/up/
+            // down to this width at load (no-op when already %8==0,
+            // e.g. the 72B's 3456).
+            bounds
+                .entry("vision_intermediate_size_padded".to_string())
+                .or_insert(inter.div_ceil(8) * 8);
+            let win = got(bounds, "vision_window_size")
+                .or_else(|| vcu("window_size"))
+                .ok_or_else(|| err("cannot derive vision_window_size".to_string()))?;
+            bounds.insert("vision_window_size".to_string(), win);
+        }
+        VisionFamily::Qwen3_5Vl => {
+            let mlp = got(bounds, "vision_mlp_hidden")
+                .or_else(|| vcu("intermediate_size"))
+                .ok_or_else(|| err("cannot derive vision_mlp_hidden".to_string()))?;
+            bounds.insert("vision_mlp_hidden".to_string(), mlp);
+            // (`num_position_embeddings` stays un-derived: the
+            // learned pos-embed table's row count is read from the
+            // tensor itself at load — vision_glue's `sqrt(rows)`.)
+        }
+        VisionFamily::Gemma3 => {
+            let mlp = got(bounds, "vision_mlp_hidden")
+                .or_else(|| vcu("intermediate_size"))
+                .ok_or_else(|| err("cannot derive vision_mlp_hidden".to_string()))?;
+            bounds.insert("vision_mlp_hidden".to_string(), mlp);
+            // `image_size` is a pure intermediate (only grid_side /
+            // num_positions are consumed downstream) — not inserted.
+            let image = got(bounds, "vision_image_size")
+                .or_else(|| vcu("image_size"))
+                .ok_or_else(|| err("cannot derive vision_image_size".to_string()))?;
+            if patch == 0 || !image.is_multiple_of(patch) {
+                return Err(err(format!(
+                    "vision_image_size={image} not divisible by vision_patch_size={patch}"
+                )));
+            }
+            let grid = got(bounds, "vision_patch_grid_side").unwrap_or(image / patch);
+            bounds.insert("vision_patch_grid_side".to_string(), grid);
+            let num_positions = got(bounds, "vision_num_positions").unwrap_or(grid * grid);
+            bounds.insert("vision_num_positions".to_string(), num_positions);
+            // Pooling: SigLIP's grid² tokens collapse to the
+            // wrapper's `mm_tokens_per_image` via a square
+            // avg-pool; kernel side = sqrt(grid² / tokens). The
+            // pooled-token count itself is an intermediate — only
+            // pool_factor / pool_kernel are consumed downstream.
+            let pooled = got(bounds, "vision_pooled_tokens")
+                .or_else(|| json.get("mm_tokens_per_image").and_then(|v| v.as_u64()))
+                .ok_or_else(|| {
+                    err("cannot derive vision_pooled_tokens (mm_tokens_per_image)".to_string())
+                })?;
+            if pooled == 0 || !num_positions.is_multiple_of(pooled) {
+                return Err(err(format!(
+                    "vision_num_positions={num_positions} not divisible by \
+                     vision_pooled_tokens={pooled}"
+                )));
+            }
+            let pool_factor = got(bounds, "vision_pool_factor").unwrap_or(num_positions / pooled);
+            bounds.insert("vision_pool_factor".to_string(), pool_factor);
+            let pool_kernel = got(bounds, "vision_pool_kernel").unwrap_or_else(|| {
+                (pool_factor as f64).sqrt().round() as u64
+            });
+            if pool_kernel * pool_kernel != pool_factor {
+                return Err(err(format!(
+                    "vision_pool_factor={pool_factor} is not a perfect square \
+                     (pool kernel must be square)"
+                )));
+            }
+            bounds.insert("vision_pool_kernel".to_string(), pool_kernel);
+        }
+    }
+
+    // The text decoder's hidden size = the merger/projector output
+    // width. Qwen2.5/3.5 carry it in vision_config directly
+    // (`out_hidden_size`); Qwen2-VL's vision_config spells it
+    // `hidden_size` (its embed dim is `embed_dim`); Gemma3's
+    // projector targets `text_config.hidden_size`.
+    let d_model = got(bounds, "d_model")
+        .or_else(|| match family {
+            VisionFamily::Qwen2_5Vl | VisionFamily::Qwen3_5Vl => vcu("out_hidden_size"),
+            VisionFamily::Qwen2Vl => {
+                vcu("hidden_size").or_else(|| json.get("hidden_size").and_then(|v| v.as_u64()))
+            }
+            VisionFamily::Gemma3 => json
+                .get("text_config")
+                .and_then(|t| t.get("hidden_size"))
+                .and_then(|v| v.as_u64()),
+        })
+        .ok_or_else(|| err("cannot derive d_model (text hidden / merger out width)".to_string()))?;
+    bounds.insert("d_model".to_string(), d_model);
+
+    Ok(())
 }
 
 /// Parse `vision_safetensors_layout`, if present. Missing or
@@ -1225,6 +1840,19 @@ fn extract_scalars(json: &serde_json::Value) -> BTreeMap<String, f64> {
 /// Explicit values in the JSON always win — we only fill absent
 /// keys.
 fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
+    // MLA (DeepSeek family) head_dim — MUST run before the generic
+    // hidden/heads rule: MLA's per-head Q/K width is
+    // `qk_nope_head_dim + qk_rope_head_dim` (V2-Lite: 128+64=192),
+    // NOT hidden/heads (2048/16=128). The verbatim HF configs carry
+    // the two summands but no `head_dim`.
+    if !bounds.contains_key("head_dim")
+        && let (Some(&nope), Some(&rope)) = (
+            bounds.get("qk_nope_head_dim"),
+            bounds.get("qk_rope_head_dim"),
+        )
+    {
+        bounds.insert("head_dim".to_string(), nope + rope);
+    }
     if !bounds.contains_key("head_dim")
         && let (Some(&hidden), Some(&heads)) =
             (bounds.get("hidden_size"), bounds.get("num_attention_heads"))
@@ -1232,6 +1860,35 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         && hidden.is_multiple_of(heads)
     {
         bounds.insert("head_dim".to_string(), hidden / heads);
+    }
+    // MLA projection out-dims referenced by the deepseek crates'
+    // weights.json shape exprs — pure arithmetic over the verbatim
+    // checkpoint fields. `q_proj_out` is q_proj's (or q_b_proj's,
+    // under Q-LoRA) output width; `kv_a_proj_out` is the compressed
+    // KV + rope-K width; `kv_lora_out` is kv_b_proj's decompressed
+    // output; `attn_out` is o_proj's input (heads · v_head_dim,
+    // consumed by the non-flat deepseek-v3 manifest). Explicit
+    // values (synthetic test configs) always win.
+    if let (Some(&heads), Some(&nope), Some(&rope), Some(&vhd)) = (
+        bounds.get("num_attention_heads"),
+        bounds.get("qk_nope_head_dim"),
+        bounds.get("qk_rope_head_dim"),
+        bounds.get("v_head_dim"),
+    ) {
+        bounds
+            .entry("q_proj_out".to_string())
+            .or_insert(heads * (nope + rope));
+        bounds
+            .entry("kv_lora_out".to_string())
+            .or_insert(heads * (nope + vhd));
+        bounds
+            .entry("attn_out".to_string())
+            .or_insert(heads * vhd);
+        if let Some(&kv_lora_rank) = bounds.get("kv_lora_rank") {
+            bounds
+                .entry("kv_a_proj_out".to_string())
+                .or_insert(kv_lora_rank + rope);
+        }
     }
     if !bounds.contains_key("num_key_value_heads")
         && let Some(&heads) = bounds.get("num_attention_heads")
@@ -1243,6 +1900,147 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         && p > 0
     {
         bounds.insert("sliding_window_global_remainder".to_string(), p - 1);
+    }
+    // All-MoE decoders (Qwen3.5-MoE) have no dense MLP, so their HF
+    // configs omit `intermediate_size` — but the bound is a universal
+    // DISPATCH_FIELDS constant and the MLP-fusion seams
+    // (SynthGateUpSiluMul, FusedGateUpSiluMul) size their SwiGLU from
+    // it. For such configs the model's only non-routed SwiGLU is the
+    // shared expert, so derive its width (0 when there is no shared
+    // expert either). Dense / hybrid models ship `intermediate_size`
+    // explicitly — explicit values always win.
+    if !bounds.contains_key("intermediate_size") && bounds.contains_key("moe_intermediate_size") {
+        let shared = bounds
+            .get("shared_expert_intermediate_size")
+            .copied()
+            .unwrap_or(0);
+        bounds.insert("intermediate_size".to_string(), shared);
+    }
+    // Geometry dims referenced by weights.json shape exprs — pure
+    // arithmetic over checkpoint fields, derived here so the configs/
+    // files stay verbatim HF copies. Explicit values always win.
+    if !bounds.contains_key("attn_q_dim")
+        && let (Some(&heads), Some(&hd)) =
+            (bounds.get("num_attention_heads"), bounds.get("head_dim"))
+    {
+        bounds.insert("attn_q_dim".to_string(), heads * hd);
+    }
+    if !bounds.contains_key("q_gate_dim")
+        && let Some(&q) = bounds.get("attn_q_dim")
+    {
+        // `attn_output_gate` (Qwen3.5 family) doubles q_proj's output:
+        // per head `[query | gate]`.
+        let gate = bounds.get("attn_output_gate").copied().unwrap_or(0) != 0;
+        bounds.insert("q_gate_dim".to_string(), if gate { 2 * q } else { q });
+    }
+    if !bounds.contains_key("kv_dim")
+        && let (Some(&kvh), Some(&hd)) = (bounds.get("num_key_value_heads"), bounds.get("head_dim"))
+    {
+        bounds.insert("kv_dim".to_string(), kvh * hd);
+    }
+    if !bounds.contains_key("gdn_value_dim")
+        && let (Some(&vh), Some(&vd)) = (
+            bounds.get("linear_num_value_heads"),
+            bounds.get("linear_value_head_dim"),
+        )
+    {
+        bounds.insert("gdn_value_dim".to_string(), vh * vd);
+    }
+    // Gated-DeltaNet conv channel count: q and k at key width plus v
+    // at value width (`in_proj_qkv`'s output / `conv1d`'s channels).
+    if !bounds.contains_key("gdn_conv_dim")
+        && let (Some(&kh), Some(&kd), Some(&vdim)) = (
+            bounds.get("linear_num_key_heads"),
+            bounds.get("linear_key_head_dim"),
+            bounds.get("gdn_value_dim"),
+        )
+    {
+        bounds.insert("gdn_conv_dim".to_string(), 2 * kh * kd + vdim);
+    }
+}
+
+/// Modeling-code semantics that HF checkpoint configs do NOT carry —
+/// defaults the transformers / mlx-lm modeling source hardcodes per
+/// architecture family. The `configs/` files stay verbatim HF copies,
+/// so these arch-keyed defaults live here. Explicit config fields
+/// (synthesized test configs, `.overrides.json` overlays) always win.
+fn apply_arch_semantic_defaults(
+    architectures: &[String],
+    bounds: &mut BTreeMap<String, u64>,
+    decoder_safetensors_prefix: &mut Option<String>,
+    tie_word_embeddings: &mut Option<bool>,
+) {
+    let qwen3_5_family = architectures
+        .iter()
+        .any(|a| a.starts_with("Qwen3_5") || a.starts_with("Qwen3_6"));
+    let gemma3_family = architectures.iter().any(|a| a.starts_with("Gemma3"));
+    let gemma2_family = architectures.iter().any(|a| a.starts_with("Gemma2"));
+    // Gemma2 alternates sliding/global attention every other layer
+    // (`layer_is_sliding[i] = i % 2 == 0`). The checkpoint configs
+    // don't carry a cadence field (newer transformers serializes an
+    // expanded `layer_types` list instead); the DSL's
+    // `layer % sliding_window_pattern` predicate needs the
+    // compressed form.
+    if gemma2_family {
+        bounds
+            .entry("sliding_window_pattern".to_string())
+            .or_insert(2);
+        // `derive_implicit_bounds` (which fills the remainder from an
+        // EXPLICIT config pattern) has already run by the time this
+        // default lands, so supply the matching remainder here too —
+        // keeps the "pattern present ⇒ remainder present" invariant
+        // for any DSL that predicates on it (gemma3-style
+        // `layer % pattern == remainder`; gemma2's own DSL uses the
+        // literal `== 0`).
+        bounds
+            .entry("sliding_window_global_remainder".to_string())
+            .or_insert(1);
+    }
+    // Qwen3.5 / Qwen3.6 `*RMSNorm` stores zero-centered gains
+    // (`x * (1 + w)`); mlx-lm's sanitize adds +1 on load, ferrite
+    // keeps the on-disk form and offsets in-kernel via
+    // NORM_WEIGHT_OFFSET.
+    if qwen3_5_family {
+        bounds
+            .entry("rms_norm_zero_centered".to_string())
+            .or_insert(1);
+    }
+    // Qwen3-family sparse-MoE routers renormalize the top-k weights;
+    // newer configs omit `norm_topk_prob` and the modeling code
+    // defaults it to TRUE (transformers Qwen3Next / Qwen3.5-MoE,
+    // mlx-lm ModelArgs, vLLM's `getattr(config, "norm_topk_prob",
+    // True)`). Qwen2-MoE's modeling default is false — its arch
+    // prefix doesn't match. Qwen3-MoE ships the field explicitly, so
+    // this only fires where the checkpoint config is silent.
+    if bounds.contains_key("num_experts") && architectures.iter().any(|a| a.starts_with("Qwen3")) {
+        bounds.entry("norm_topk_prob".to_string()).or_insert(1);
+    }
+    // VL-wrapper checkpoints nest the text decoder's weights under
+    // `language_model.*` / `model.language_model.*` on disk (the two
+    // orderings are alias-bridged at load by GpuWeights). The wrapper
+    // arch implies the prefix; text-only `*ForCausalLM` repos leave
+    // it unset. Qwen2-VL / Qwen2.5-VL wrappers ship the text decoder
+    // at top-level `model.*` despite the wrapper arch — their
+    // families deliberately stay off this rule.
+    if decoder_safetensors_prefix.is_none()
+        && (qwen3_5_family || gemma3_family)
+        && architectures
+            .iter()
+            .any(|a| a.ends_with("ForConditionalGeneration"))
+    {
+        *decoder_safetensors_prefix = Some("language_model".to_string());
+    }
+    // Gemma ties embed_tokens ⟷ lm_head; HF's modeling default for
+    // `tie_word_embeddings` is TRUE and the google/unsloth gemma2 /
+    // gemma3 checkpoint configs rely on it (no field in the json, no
+    // `lm_head.*` on disk). Ferrite's parse default is false, which
+    // would route lm_head to a dense disk load and fail with
+    // `weight not found: lm_head.weight`. Explicit json values win —
+    // a genuinely untied repack (e.g. mlx-community/gemma-3-1b-it-4bit
+    // ships a real quantized lm_head) declares
+    // `"tie_word_embeddings": false` via its `.overrides.json`.
+    if tie_word_embeddings.is_none() && (gemma3_family || gemma2_family) {
+        *tie_word_embeddings = Some(true);
     }
 }
 
@@ -1356,13 +2154,14 @@ mod tests {
     fn load_real_qwen2_configs() {
         let dir = repo_model_archs("qwen2");
         let configs = load_dir(&dir).expect("load qwen2 configs");
-        // 11 dense × (1 dense + 7 presets: awq-gemm, bnb-nf4-dq,
+        // 13 dense (11 text + qwen2-vl-2b + qwen2.5-vl-3b text
+        // decoders) × (1 dense + 7 presets: awq-gemm, bnb-nf4-dq,
         // ct-int4-sym, gptq-sym, fp8-dynamic-per-tensor,
-        // fp8-static-per-tensor, ggml) = 88.
+        // fp8-static-per-tensor, ggml) = 104.
         assert_eq!(
             configs.len(),
-            88,
-            "expected 88 Qwen2 variants (11 bases × 8 variants)"
+            104,
+            "expected 104 Qwen2 variants (13 bases × 8 variants)"
         );
 
         // Ground-truth check on Qwen2-0.5B:
@@ -1401,7 +2200,7 @@ mod tests {
         //      anchoring `vision_in_features` / `vision_rope_half_dim`)
         //      lands in `bounds`.
         let dir = repo_model_archs("qwen2-vl");
-        let configs = load_dir(&dir).expect("load qwen2-vl vision configs");
+        let configs = load_dir_vision(&dir).expect("load qwen2-vl vision configs");
         assert_eq!(
             configs.len(),
             3,
@@ -1419,14 +2218,14 @@ mod tests {
                 .get("d_model")
                 .expect("d_model")
         };
-        assert_eq!(d_model_for("qwen2-vl-2b"), 1536);
-        assert_eq!(d_model_for("qwen2-vl-7b"), 3584);
-        assert_eq!(d_model_for("qwen2-vl-72b"), 8192);
+        assert_eq!(d_model_for("qwen2-vl-2b-instruct"), 1536);
+        assert_eq!(d_model_for("qwen2-vl-7b-instruct"), 3584);
+        assert_eq!(d_model_for("qwen2-vl-72b-instruct"), 8192);
 
         let cfg = configs
             .iter()
-            .find(|c| c.source_stem == "qwen2-vl-2b")
-            .expect("qwen2-vl-2b present");
+            .find(|c| c.source_stem == "qwen2-vl-2b-instruct")
+            .expect("qwen2-vl-2b-instruct present");
 
         // Bounds the codegen reads via `emit_canonical_params_impl`
         // and `extern_shape`.
@@ -1459,12 +2258,16 @@ mod tests {
         // `extract_scalars` from any f64 field.
         assert_eq!(cfg.scalars.get("vision_norm_eps"), Some(&1e-6));
 
-        // HF arch claim string + tie flag (per handoff, false for VL).
+        // HF arch claim string + tie flag. The 2B checkpoint TIES
+        // embed/lm_head (`tie_word_embeddings: true` in the verbatim
+        // HF config — the old invented config wrongly said false);
+        // inert vision-side (no lm_head in the tower), but the value
+        // must mirror the checkpoint.
         assert_eq!(
             cfg.architectures,
             vec!["Qwen2VLForConditionalGeneration".to_string()]
         );
-        assert!(!cfg.tie_word_embeddings);
+        assert!(cfg.tie_word_embeddings);
     }
 
     #[test]

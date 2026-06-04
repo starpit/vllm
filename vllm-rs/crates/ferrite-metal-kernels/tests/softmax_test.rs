@@ -184,3 +184,14 @@ fn softmax_f16_mixtral_shape() {
 fn softmax_f16_qwen3_moe_shape() {
     run_case_f16(11, 128, 0x1234_5678);
 }
+
+#[test]
+fn softmax_bf16_qwen3_5_moe_shape() {
+    // E=256 (Qwen3.5-MoE-35B-A3B router width).
+    run_case_bf16(9, 256, 0xFEED_FACE);
+}
+
+#[test]
+fn softmax_f16_qwen3_5_moe_shape() {
+    run_case_f16(9, 256, 0xACE0_CAFE);
+}

@@ -399,3 +399,7 @@ INSTANTIATE_ARG_SORT(bfloat16, bfloat, 32, 4)
 INSTANTIATE_ARG_SORT(uint32, uint, 32, 4)
 INSTANTIATE_ARG_SORT(float32, float, 64, 4)
 INSTANTIATE_ARG_SORT(uint32, uint, 64, 4)
+// bn=64 tn=4 ⇒ N_PER_BLOCK=256: Qwen3.5-MoE router (E=256). The bn=32
+// variants above cap at 128 experts.
+INSTANTIATE_ARG_SORT(float16, half, 64, 4)
+INSTANTIATE_ARG_SORT(bfloat16, bfloat, 64, 4)

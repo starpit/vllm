@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ferrite-model-qwen3-5-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite Qwen3.5-MoE architecture (Gated-DeltaNet + full-attention hybrid with sparse MoE + shared expert, one #[forward] body)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-forward-macro/cuda"]
+metal = ["ferrite-forward/metal", "ferrite-forward-macro/metal"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-forward-macro/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-forward = { path = "../ferrite-forward" }
+ferrite-gguf = { path = "../ferrite-gguf" }
+anyhow = { workspace = true }
+tracing = { workspace = true }

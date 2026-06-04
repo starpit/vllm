@@ -2166,6 +2166,7 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(GatedDeltaNetImpl));
         lib.push(Box::new(GateSplitImpl));
         lib.push(Box::new(GateApplyImpl));
+        lib.push(Box::new(GateScaleImpl));
         lib.push(Box::new(DeepSeekMoeRefImpl));
         lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
@@ -2548,6 +2549,7 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(GatedDeltaNetImpl));
         lib.push(Box::new(GateSplitImpl));
         lib.push(Box::new(GateApplyImpl));
+        lib.push(Box::new(GateScaleImpl));
         lib.push(Box::new(DeepSeekMoeRefImpl));
         lib.push(Box::new(DeepSeekFp8BlockMoeImpl));
         lib.push(Box::new(DeepSeekGgmlMoeImpl));
@@ -15652,6 +15654,94 @@ impl Implementation for GateApplyImpl {
     }
 }
 
+// ── GateScaleImpl ────────────────────────────────────────────────────────────
+//
+// Singleton for `OpKind::GateScale` — Qwen3.5-MoE shared-expert combine:
+// `out = routed + shared_y * sigmoid(g)` with `g` `[T, 1]` row-broadcast
+// across the hidden axis. 3-input elementwise-with-broadcast.
+
+#[derive(Debug, Default)]
+pub struct GateScaleImpl;
+
+impl Implementation for GateScaleImpl {
+    fn name(&self) -> &'static str {
+        "gate_scale_ref"
+    }
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::GateScale)
+    }
+    fn cost_us(&self, _m: &MatchInfo, _ctx: &CostCtx) -> f64 {
+        UNCALIBRATED_COST_US
+    }
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "GateScale",
+            vec![
+                ("routed_slot", syn::parse_quote!(u32)),
+                ("shared_slot", syn::parse_quote!(u32)),
+                ("gate_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let resolve = |idx: usize| -> (TileId, u8) {
+            match node.inputs.get(idx) {
+                Some(FufInput::Tile { id, slot }) => (*id, *slot),
+                other => panic!("GateScale: input {idx} must be a Tile (got {other:?})"),
+            }
+        };
+        let (routed_id, routed_in) = resolve(0);
+        let (shared_id, shared_in) = resolve(1);
+        let (gate_id, gate_in) = resolve(2);
+        let routed_slot = slots.of(routed_id, routed_in);
+        let shared_slot = slots.of(shared_id, shared_in);
+        let gate_slot = slots.of(gate_id, gate_in);
+        let out_slot = slots.of(tile, 0);
+        Some(vec![ferrite_forward::Instruction::GateScale(
+            routed_slot,
+            shared_slot,
+            gate_slot,
+            out_slot,
+        )])
+    }
+}
+
 // ── DeepSeekFp8BlockMoeImpl ──────────────────────────────────────────────────
 //
 // Singleton for `OpKind::Moe` over blockwise-FP8 expert weights —
@@ -16317,6 +16407,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let scale = attention_scale_for(&model);
@@ -16342,6 +16434,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -16365,6 +16458,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = DeepSeekMoeRefImpl;
@@ -16425,6 +16520,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16447,6 +16543,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = FusedMoeRefImpl;
@@ -16530,6 +16628,7 @@ mod tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16552,6 +16651,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         };
 
         let imp = SharedFusedMoeRefImpl;
@@ -17091,6 +17192,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         }
     }
     fn attention_model(name: &str) -> crate::config::ModelParams {

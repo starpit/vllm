@@ -3042,9 +3042,29 @@ pub(crate) fn first_weight_ref(node: &crate::fuf::FufNode) -> Option<(WeightId, 
 
 /// Build a stable, structural accessor name covering multiple
 /// source weights. Joins each source weight's
-/// [`weight_field_name`] with `"__fused__"`, sorted for
-/// order-independence. Two impls that declare the same source set
-/// produce the same name.
+/// [`weight_field_name`] with `"__fused__"` **in source-declaration
+/// order** — the same order these source weights flow into
+/// [`LinearLayer::load_dense_concat`], so the fused accessor name's
+/// `__fused__`-split equals the on-disk byte-layout order of the
+/// concatenated GPU buffer.
+///
+/// **Paris invariant `fused-accessor-name-matches-load-order`**: do
+/// NOT sort the parts. The recipe-walker
+/// [`crate::codegen::fused_byte_offset`] computes per-constituent
+/// byte offsets by walking `fused_key.split("__fused__")` and
+/// summing the size of each predecessor — those byte offsets ONLY
+/// correspond to actual on-disk positions when the name's split
+/// order matches `load_dense_concat`'s prefix iteration. Sorting the
+/// parts (e.g. alphabetical k/q/v) while [`load_dense_concat`] keeps
+/// source-declaration order (q/k/v) caused the megakernel decode's
+/// Paris!!! divergence: k_proj's recipe entry resolved to byte 0 of
+/// the QKV buffer (= start of Q's weights), so the megakernel's
+/// k_proj read Q's weights and produced Q-flavored values where K
+/// values belonged. V was byte-identical with per-op only because
+/// alphabetical position 2 (v) and source-declaration position 2
+/// (v) coincidentally agreed for v. (Empirically reproduced on
+/// `nick` H100 pod, jun 4 — see
+/// `feedback_ff_subtile_fused_qkv_offset_hypothesis`.)
 ///
 /// All sources of one fused accessor share the same layer index
 /// (or all are unindexed) — this is structural: a layer-N gate_proj
@@ -3061,11 +3081,10 @@ pub fn fused_accessor_name(program: &Program, sources: &[(WeightId, Option<u64>)
         sources.iter().all(|(_, idx)| *idx == layer),
         "fused_accessor_name: sources span multiple layer indices ({sources:?})"
     );
-    let mut parts: Vec<String> = sources
+    let parts: Vec<String> = sources
         .iter()
         .map(|(id, _idx)| weight_field_name(program, *id, None).to_string())
         .collect();
-    parts.sort();
     let mut joined = parts.join("__fused__");
     if let Some(l) = layer {
         joined = format!("{joined}_{l}");

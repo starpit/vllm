@@ -432,7 +432,7 @@ impl Implementation for MetalSharedFusedMoeImpl {
         let acc = accessors
             .first()
             .expect("MetalSharedFusedMoe: required_weights returned empty");
-        let (_base, layer) = split_base_layer(&acc.name.to_string());
+        let (base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
 
         let num_experts = read_num_experts(bounds, "MetalSharedFusedMoe") as u32;
@@ -441,10 +441,27 @@ impl Implementation for MetalSharedFusedMoeImpl {
         let hidden = bound_or_die(bounds, "hidden_size", "MetalSharedFusedMoe") as u32;
         // shared_expert_intermediate_size is optional; 0 means no
         // shared expert (modern Qwen3-MoE-30B-A3B-Instruct ships 0).
-        let shared_inter = bounds
-            .get("shared_expert_intermediate_size")
-            .copied()
-            .unwrap_or(0) as u32;
+        //
+        // Single-owner rule: when the DSL declares `<base>.shared_expert.*`
+        // leaves in the manifest (Qwen3.5-MoE expresses the shared expert
+        // as ordinary DSL gemms + `gate_scale`), the MoE struct does NOT
+        // own an internal shared expert — force the payload width to 0
+        // regardless of the HF bound, so the config can carry the real
+        // `shared_expert_intermediate_size` field without double-claiming
+        // those weights. Without DSL ownership the bound flows verbatim
+        // (Qwen2-MoE-style internal shared expert; the metal lowering
+        // still asserts 0 there — loud, not silent).
+        let dsl_owns_shared = program
+            .weights
+            .has_subtree(&[base.as_str(), "shared_expert"]);
+        let shared_inter = if dsl_owns_shared {
+            0
+        } else {
+            bounds
+                .get("shared_expert_intermediate_size")
+                .copied()
+                .unwrap_or(0) as u32
+        };
         let (group_size, bits) = affine_gs_bits(node)
             .expect("MetalSharedFusedMoe: matches() admitted a non-Affine MoE tile");
         // norm_topk_prob is a Qwen3-MoE config knob. Older Qwen2-MoE

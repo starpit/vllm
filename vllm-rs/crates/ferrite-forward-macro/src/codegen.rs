@@ -980,6 +980,16 @@ fn plan_field_load(
             });
         let hidden_size = model.bounds.get("hidden_size").copied().unwrap_or(2048) as usize;
         let only_src = accessor.source_weights[0].0;
+        // Single-owner rule (mirrors `MetalSharedFusedMoeImpl::fan_out`):
+        // when the DSL claims `<moe>.shared_expert.*` leaves in the
+        // manifest, the struct loader must not also load them — zero the
+        // internal shared width so `load_affine`/dense load skip the
+        // shared tensors and the DSL leaf accessors keep sole ownership.
+        let moe_base = program.weights.path(only_src).first().cloned();
+        let shared_expert_intermediate_size = match &moe_base {
+            Some(b) if program.weights.has_subtree(&[b.as_str(), "shared_expert"]) => 0,
+            _ => shared_expert_intermediate_size,
+        };
         let affine =
             match crate::quantization::storage_format_for_weight(program, fuf, only_src, model) {
                 crate::quantization::StorageFormat::Affine { group_size, bits } => {
@@ -1332,20 +1342,18 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
     // Llama/Qwen2/Mistral/etc.) or `layer_norm_eps` (CohereLayerNorm
     // convention used by CommandR). Both name the same numerical
     // role — the eps inside the row-normalization kernel — so the
-    // RmsNorm-typed weight loader accepts either. Reads the JSON
-    // directly because the bounds map captures only integers.
-    let fallback: f32 = 1e-5;
-    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
-        return fallback;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return fallback;
-    };
-    let read = |key| v.get(key).and_then(|x| x.as_f64()).map(|x| x as f32);
+    // RmsNorm-typed weight loader accepts either. Reads the parsed
+    // `scalars` table (every numeric config field, populated from the
+    // NORMALIZED view — `normalize_hf_config` hoists nested
+    // `text_config`) rather than re-parsing `source_path`: a raw
+    // re-read sees only top-level keys, so a verbatim VL-wrapper
+    // config (Qwen3.5 / Qwen3.5-MoE) would silently fall back to
+    // 1e-5 while the checkpoint uses 1e-6.
+    let read = |key: &str| model.scalars.get(key).map(|&x| x as f32);
     read("rms_norm_eps")
         .or_else(|| read("layer_norm_eps"))
         .or_else(|| read("vision_norm_eps"))
-        .unwrap_or(fallback)
+        .unwrap_or(1e-5)
 }
 
 /// Runtime RMSNorm gain offset for zero-centered (Gemma-style) norms.
@@ -1357,15 +1365,17 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
 fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
-    let Ok(s) = std::fs::read_to_string(&model.source_path) else {
-        return 0.0;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
-        return 0.0;
-    };
-    if v.get("rms_norm_zero_centered")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false)
+    // Read the parsed `bounds` table (booleans land there as 0/1, and
+    // `apply_arch_semantic_defaults` inserts the flag for the
+    // Qwen3.5/3.6 family whose verbatim HF configs never carry it)
+    // rather than re-parsing `source_path`, which sees only literal
+    // top-level keys.
+    if model
+        .bounds
+        .get("rms_norm_zero_centered")
+        .copied()
+        .unwrap_or(0)
+        != 0
     {
         // The standard kernels fold `weight + 1.0`, assuming the
         // checkpoint stores the gain ZERO-CENTERED (`weight = gain - 1`,
@@ -8464,6 +8474,8 @@ mod tests {
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
+            decoder_safetensors_prefix: None,
+            torch_dtype: None,
         }
     }
 
@@ -9181,6 +9193,7 @@ mod fingerprint_tests {
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
+            decoder_safetensors_prefix: None,
         }
     }
 

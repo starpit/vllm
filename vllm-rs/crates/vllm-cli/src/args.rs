@@ -539,6 +539,12 @@ pub struct BatchArgs {
     #[arg(long, default_value = "auto")]
     pub dtype: String,
 
+    /// Maximum number of concurrent sequences. Hybrid GDN arches
+    /// (Qwen3.5 / Qwen3-Next) reserve a recurrent-state slot per
+    /// sequence up-front, so large values cost real GPU memory.
+    #[arg(long, default_value_t = 256)]
+    pub max_num_seqs: usize,
+
     /// HuggingFace token for gated models.
     #[arg(long, env = "HF_TOKEN")]
     pub hf_token: Option<String>,

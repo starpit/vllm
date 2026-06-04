@@ -48,6 +48,8 @@ extern crate ferrite_model_qwen2_vl as _keep_qwen2_vl;
 extern crate ferrite_model_qwen3 as _keep_qwen3;
 #[cfg(feature = "arch-qwen3-5")]
 extern crate ferrite_model_qwen3_5 as _keep_qwen3_5;
+#[cfg(feature = "arch-qwen3-5-moe")]
+extern crate ferrite_model_qwen3_5_moe as _keep_qwen3_5_moe;
 #[cfg(feature = "arch-qwen3-5-vl")]
 extern crate ferrite_model_qwen3_5_vl as _keep_qwen3_5_vl;
 #[cfg(feature = "arch-qwen3-moe")]
@@ -91,5 +93,7 @@ pub use ferrite_model_qwen2_vl as qwen2_vl;
 pub use ferrite_model_qwen3 as qwen3;
 #[cfg(feature = "arch-qwen3-5")]
 pub use ferrite_model_qwen3_5 as qwen3_5;
+#[cfg(feature = "arch-qwen3-5-moe")]
+pub use ferrite_model_qwen3_5_moe as qwen3_5_moe;
 #[cfg(feature = "arch-qwen3-moe")]
 pub use ferrite_model_qwen3_moe as qwen3_moe;

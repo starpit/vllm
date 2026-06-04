@@ -130,7 +130,7 @@ fn qwen3_5_vl() {
 //       mispaired elements, corrupting only the high-variance patches
 //       (the flat background patches stayed correct, masking the bug).
 //
-// Run: `FERRITE_MODELS=qwen3-5-9b-vl cargo test -p ferrite-model-qwen3-5-vl \
+// Run: `FERRITE_MODELS=qwen3.5-9b cargo test -p ferrite-model-qwen3-5-vl \
 //        --features metal --release green_gate -- --nocapture`
 // Debug hooks (env-gated): FERRITE_VL_PROBE=<golden-basename> truncates
 //   + compares an intermediate stage; FERRITE_VL_ROWS=1 prints per-row
@@ -217,7 +217,7 @@ mod green_gate {
             .expect("flatten patch_embed.proj.weight");
         // `stream` is `()` on metal; max_model_len/tp_rank mirror the worker.
         // The macro emits `load`/`Weights` in a per-variant module.
-        let w = crate::qwen3_5_9b_vl::load(&mut gw, (), 4096, 0).expect("load (vision weights)");
+        let w = crate::qwen3_5_9b::load(&mut gw, (), 4096, 0).expect("load (vision weights)");
 
         // ── Inputs from the mlx-vlm golden (red_circle_224, grid 1×16×16) ──
         let cfg = w.vision_config();

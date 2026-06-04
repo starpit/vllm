@@ -669,10 +669,13 @@ fn storage_of_first_gemm(claimed_tiles: &[TileId], fuf: &Fuf) -> GateStorage {
     GateStorage::Other
 }
 
-/// `Instruction::SiluMul` variant shape: `(gate_slot, up_slot, out_slot)`.
-/// Three u32s — the lowering arm in `lower_one` at
-/// `interpreter/metal/lowering.rs` consumes exactly these three slots
-/// into the `silu_mul_<dtype>` kernel's three buffer bindings.
+/// `Instruction::SiluMul` variant shape: `(gate_slot, up_slot,
+/// out_slot, width)`. The three slots feed the `silu_mul_<dtype>`
+/// kernel's three buffer bindings; `width` (the per-row element count
+/// = the claim's gate/up Gemm N) sizes the dispatch — carried on the
+/// instruction rather than derived from `W::INTERMEDIATE_SIZE` so
+/// SwiGLU blocks of any width (dense MLP, MoE shared expert) lower
+/// correctly in the same model.
 fn silu_mul_opcode_shape() -> OpcodeShape {
     OpcodeShape::new(
         "SiluMul",
@@ -680,6 +683,7 @@ fn silu_mul_opcode_shape() -> OpcodeShape {
             ("gate_slot", syn::parse_quote!(u32)),
             ("up_slot", syn::parse_quote!(u32)),
             ("out_slot", syn::parse_quote!(u32)),
+            ("width", syn::parse_quote!(u32)),
         ],
     )
 }
@@ -782,8 +786,24 @@ fn quant_decomposed_fan_out(
         gate_k,
     );
     let up_inst = decomposed_qmm_inst(up_node, in_slot_idx, up_out_idx, up_layer_lit, up_n, up_k);
+    // SwiGLU invariant: gate and up project to the same width; that
+    // width sizes the elementwise SiluMul tail.
+    assert_eq!(
+        gate_n, up_n,
+        "MetalFusedGateUpSiluMul(Affine): gate N ({gate_n}) != up N ({up_n})"
+    );
+    // Catch the `intermediate_size: 0` config-bug class at macro
+    // expansion (a 0-width SiluMul is a silent no-op kernel — the
+    // runtime lowering also asserts, but failing the build beats
+    // failing the first forward).
+    assert!(
+        gate_n > 0,
+        "MetalFusedGateUpSiluMul(Affine): SwiGLU width is 0 — \
+         `intermediate_size` (or the all-MoE shared-expert derivation) \
+         resolved to 0 for a body that has a dense SwiGLU MLP"
+    );
     let silu_mul_inst =
-        ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx);
+        ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx, gate_n);
     vec![gate_inst, up_inst, silu_mul_inst]
 }
 

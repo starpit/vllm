@@ -27,9 +27,9 @@
   "rope_theta": 1000000,
   "sliding_window": 512,
   "sliding_window_pattern": 6,
-  "tie_word_embeddings": true,
   "torch_dtype": "bfloat16",
-  "transformers_version": "4.52.0.dev0",
+  "transformers_version": "4.51.3",
+  "unsloth_fixed": true,
   "use_cache": true,
   "vocab_size": 262144
 }

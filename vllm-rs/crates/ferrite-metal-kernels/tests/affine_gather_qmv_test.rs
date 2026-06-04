@@ -794,3 +794,235 @@ fn affine_gather_qmv_bf16_s_bf16_qwen3_moe_down_proj_production_dispatch() {
         "production dispatch produced {fail_count} out-of-tolerance elements"
     );
 }
+
+#[test]
+fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_down_proj_fast_k512() {
+    // Qwen3.5-MoE-35B-A3B down_proj at decode: num_experts=256,
+    // n_out=hidden=2048, k=moe_intermediate=512, gs=64, top_k=8, M=1.
+    // k=512 is a multiple of 512 → the FAST gather variant (unlike
+    // Qwen3-MoE's k=768 down which takes the generic variant); the
+    // single-512-block K loop is the newly exercised edge.
+    let num_experts = 256usize;
+    let n_out = 2048usize;
+    let k = 512usize;
+    let group_size = 64usize;
+    let top_k = 8usize;
+    let num_tokens = 1usize;
+
+    let mut seed = 0x35B0_A3B0_DEAD_BEEFu64;
+
+    let mut packed = vec![0u8; num_experts * n_out * k / 2];
+    for b in &mut packed {
+        *b = (splitmix(&mut seed) as u8) & 0xFF;
+    }
+    let mut scales_bf16 = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+    for s in &mut scales_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0 + 0.001;
+        *s = bf16::from_f32(r * 0.05);
+    }
+    let mut biases_bf16 = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+    for b in &mut biases_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0;
+        *b = bf16::from_f32((r - 0.5) * 0.1);
+    }
+    let mut x_bf16 = vec![bf16::ZERO; num_tokens * k];
+    for v in &mut x_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0;
+        *v = bf16::from_f32((r - 0.5) * 2.0);
+    }
+    // Spread experts across the full 256 range incl. the last expert.
+    let indices: Vec<u32> = vec![0, 31, 64, 127, 128, 200, 254, 255];
+
+    let mdev = detect_device().expect("device");
+    let queue = mdev.device.newCommandQueue().expect("queue");
+    let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
+
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
+    let w_buf = buf_from_bytes(&mdev.device, &packed);
+    let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
+    let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
+    let x_buf = buf_from_bytes(&mdev.device, bytes_of(&x_bf16));
+    let idx_buf = buf_from_bytes(&mdev.device, bytes_of_u32(&indices));
+    let y_buf = zeros_buf(&mdev.device, num_tokens * top_k * n_out * 2);
+
+    let cmdbuf = queue.commandBuffer().expect("cmdbuf");
+    let enc = cmdbuf.computeCommandEncoder().expect("enc");
+    executor
+        .execute(
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
+            num_tokens as u32,
+            top_k as u32,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
+        )
+        .expect("execute");
+    enc.endEncoding();
+    cmdbuf.commit();
+    cmdbuf.waitUntilCompleted();
+
+    let got = read_bf16(&y_buf, num_tokens * top_k * n_out);
+    let packed_per_expert = n_out * k / 2;
+    let sb_per_expert = n_out * k / group_size;
+    let mut max_err = 0.0_f32;
+    for n in 0..num_tokens {
+        for slot in 0..top_k {
+            let expert = indices[n * top_k + slot] as usize;
+            let want = affine_qmv_b4_bf16_s_bf16(
+                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                &x_bf16[n * k..(n + 1) * k],
+                1,
+                n_out,
+                k,
+                group_size,
+            );
+            let base = (n * top_k + slot) * n_out;
+            let allowed_abs = 0.2_f32;
+            let allowed_rel = 0.20_f32;
+            for c in 0..n_out {
+                let g = got[base + c].to_f32();
+                let w = want[c].to_f32();
+                let err = (g - w).abs();
+                if err > max_err {
+                    max_err = err;
+                }
+                assert!(
+                    err < allowed_abs || err / w.abs().max(1e-3) < allowed_rel,
+                    "qwen3.5-down n={n} slot={slot} expert={expert} c={c} got={g} want={w} err={err}",
+                );
+            }
+        }
+    }
+    eprintln!(
+        "affine_gather_qmv qwen3.5 down fast k512 E=256 max_err={:.3e}",
+        max_err
+    );
+}
+
+#[test]
+fn affine_gather_qmv_bf16_s_bf16_qwen3_5_moe_gate_proj_e256() {
+    // Qwen3.5-MoE-35B-A3B gate/up_proj at decode: num_experts=256,
+    // n_out=moe_intermediate=512, k=hidden=2048, gs=64, top_k=8, M=1.
+    let num_experts = 256usize;
+    let n_out = 512usize;
+    let k = 2048usize;
+    let group_size = 64usize;
+    let top_k = 8usize;
+    let num_tokens = 1usize;
+
+    let mut seed = 0xA5A5_5A5A_DEAD_BEEFu64;
+
+    let mut packed = vec![0u8; num_experts * n_out * k / 2];
+    for b in &mut packed {
+        *b = (splitmix(&mut seed) as u8) & 0xFF;
+    }
+    let mut scales_bf16 = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+    for s in &mut scales_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0 + 0.001;
+        *s = bf16::from_f32(r * 0.05);
+    }
+    let mut biases_bf16 = vec![bf16::ZERO; num_experts * n_out * k / group_size];
+    for b in &mut biases_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0;
+        *b = bf16::from_f32((r - 0.5) * 0.1);
+    }
+    let mut x_bf16 = vec![bf16::ZERO; num_tokens * k];
+    for v in &mut x_bf16 {
+        let r = (splitmix(&mut seed) % 1000) as f32 / 1000.0;
+        *v = bf16::from_f32((r - 0.5) * 2.0);
+    }
+    let indices: Vec<u32> = vec![3, 17, 99, 130, 177, 201, 233, 255];
+
+    let mdev = detect_device().expect("device");
+    let queue = mdev.device.newCommandQueue().expect("queue");
+    let executor = MetalAffineGatherQmv::new(mdev.device.clone()).expect("gather qmv");
+
+    let bytes_of =
+        |s: &[bf16]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 2) };
+    let bytes_of_u32 =
+        |s: &[u32]| unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * 4) };
+    let w_buf = buf_from_bytes(&mdev.device, &packed);
+    let s_buf = buf_from_bytes(&mdev.device, bytes_of(&scales_bf16));
+    let b_buf = buf_from_bytes(&mdev.device, bytes_of(&biases_bf16));
+    let x_buf = buf_from_bytes(&mdev.device, bytes_of(&x_bf16));
+    let idx_buf = buf_from_bytes(&mdev.device, bytes_of_u32(&indices));
+    let y_buf = zeros_buf(&mdev.device, num_tokens * top_k * n_out * 2);
+
+    let cmdbuf = queue.commandBuffer().expect("cmdbuf");
+    let enc = cmdbuf.computeCommandEncoder().expect("enc");
+    executor
+        .execute(
+            &x_buf,
+            &w_buf,
+            &s_buf,
+            &b_buf,
+            &idx_buf,
+            &y_buf,
+            num_tokens as u32,
+            top_k as u32,
+            n_out as u32,
+            k as u32,
+            group_size as u32,
+            4,
+            DequantDtype::Bf16,
+            ScaleDtype::Bf16,
+            &enc,
+        )
+        .expect("execute");
+    enc.endEncoding();
+    cmdbuf.commit();
+    cmdbuf.waitUntilCompleted();
+
+    let got = read_bf16(&y_buf, num_tokens * top_k * n_out);
+    let packed_per_expert = n_out * k / 2;
+    let sb_per_expert = n_out * k / group_size;
+    let mut max_err = 0.0_f32;
+    for n in 0..num_tokens {
+        for slot in 0..top_k {
+            let expert = indices[n * top_k + slot] as usize;
+            let want = affine_qmv_b4_bf16_s_bf16(
+                &packed[expert * packed_per_expert..(expert + 1) * packed_per_expert],
+                &scales_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                &biases_bf16[expert * sb_per_expert..(expert + 1) * sb_per_expert],
+                &x_bf16[n * k..(n + 1) * k],
+                1,
+                n_out,
+                k,
+                group_size,
+            );
+            let base = (n * top_k + slot) * n_out;
+            let allowed_abs = 0.3_f32;
+            let allowed_rel = 0.20_f32;
+            for c in 0..n_out {
+                let g = got[base + c].to_f32();
+                let w = want[c].to_f32();
+                let err = (g - w).abs();
+                if err > max_err {
+                    max_err = err;
+                }
+                assert!(
+                    err < allowed_abs || err / w.abs().max(1e-3) < allowed_rel,
+                    "qwen3.5-gate n={n} slot={slot} expert={expert} c={c} got={g} want={w} err={err}",
+                );
+            }
+        }
+    }
+    eprintln!(
+        "affine_gather_qmv qwen3.5 gate E=256 max_err={:.3e}",
+        max_err
+    );
+}

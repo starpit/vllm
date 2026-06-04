@@ -442,6 +442,7 @@ pub fn apply_signature(
         OpKind::GatedDeltaNet => sig_gated_delta_net(solver, inputs),
         OpKind::GateSplit => sig_gate_split(solver, inputs),
         OpKind::GateApply => sig_gate_apply(solver, inputs),
+        OpKind::GateScale => sig_gate_scale(solver, inputs),
         // MmEmbedSplice: identity-shape one-input in-place. Same
         // signature as AllReduce — the splice mutates the embed
         // output buffer, shape unchanged. Never inserted by the DSL;
@@ -875,6 +876,37 @@ fn sig_gate_apply(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
     })
 }
 
+/// `gate_scale(routed, shared_y, g)` → `[T, H]` (= routed shape).
+/// `out = routed + shared_y * sigmoid(g)` — the Qwen3.5-MoE shared-expert
+/// combine. `g` is `[T, 1]`, row-broadcast across the hidden axis, so it
+/// is deliberately NOT unified against the `[T, H]` operands
+/// (`sig_binary_elementwise` would reject `unify(1, H)`).
+fn sig_gate_scale(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::GateScale, inputs, 3)?;
+    let routed = &inputs[0];
+    if routed.is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GateScale,
+            reason: "routed must have rank >= 1".into(),
+        });
+    }
+    if inputs[1].len() != routed.len() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GateScale,
+            reason: "shared_y must have the same rank as routed".into(),
+        });
+    }
+    if inputs[2].is_empty() {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::GateScale,
+            reason: "gate must have rank >= 1".into(),
+        });
+    }
+    Ok(OpSig {
+        output: routed.clone(),
+    })
+}
+
 /// `moe_block(x: [T, H], moe_weight)` → `[T, H]`. Shape-preserving;
 /// the second arg is a MoE layer struct (`FusedMoELayer` /
 /// `SharedFusedMoELayer` / `DeepSeekV2MoELayer` or their quant
@@ -987,9 +1019,10 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         // GatedDeltaNet's linear_attn[layer] is a GatedDeltaNetLayer struct
         // (not a tensor); like Moe, skip the tensor-rank assertion.
         OpKind::GatedDeltaNet => &[],
-        // GateSplit/GateApply take only activation inputs; no tensor weight args.
+        // GateSplit/GateApply/GateScale take only activation inputs; no tensor weight args.
         OpKind::GateSplit => &[],
         OpKind::GateApply => &[],
+        OpKind::GateScale => &[],
         // MmEmbedSplice takes one activation input, no tensor weight.
         OpKind::MmEmbedSplice => &[],
         // LoadPixels has zero FUF inputs (the tile is materialized
@@ -2635,11 +2668,11 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir).expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
-            .find(|c| c.source_stem == "qwen2-vl-2b")
-            .expect("qwen2-vl-2b config present");
+            .find(|c| c.source_stem == "qwen2-vl-2b-instruct")
+            .expect("qwen2-vl-2b-instruct config present");
         let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
         bounds.insert("num_tokens".into(), 256);
 
@@ -2704,11 +2737,11 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir(&dir).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir).expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
-            .find(|c| c.source_stem == "qwen2-vl-2b")
-            .expect("qwen2-vl-2b config present");
+            .find(|c| c.source_stem == "qwen2-vl-2b-instruct")
+            .expect("qwen2-vl-2b-instruct config present");
         let mut bounds: std::collections::BTreeMap<String, u64> = cfg.bounds.clone();
         bounds.insert("num_tokens".into(), 256);
 

@@ -323,6 +323,8 @@ impl SpecializedPipelineCache {
                 // first forward.
                 ("gate_apply", crate::embedded_metallib!("gate_apply")),
                 ("gate_split", crate::embedded_metallib!("gate_split")),
+                // Qwen3.5-MoE shared-expert combine.
+                ("gate_scale", crate::embedded_metallib!("gate_scale")),
                 ("gdn_gating", crate::embedded_metallib!("gdn_gating")),
                 (
                     "gdn_rms_norm_gated",

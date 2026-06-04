@@ -114,10 +114,17 @@ removes the bug class.
 pub struct TkTape {
     pub kernel_args: Vec<KernelArg>,        // ordered, ABI-fixed
     pub prelude: Vec<PreludeDecl>,          // one decl per Instr; was a String
-    pub instrs: Vec<Instr>,                 // the body
-    pub end_drain: FenceSpec,               // tail Instr, separated for type clarity
+    pub instrs: Vec<Instr>,                 // the body — kernel-end drain is the tail of this Vec
 }
 ```
+
+A "fence" or "drain" is NOT one Instr. It is a SEQUENCE of primitive
+Instrs (Syncthreads, CommitGroup, WaitGroup, Threadfence, Syncthreads).
+The walker enumerates the sequence; the player has one one-line arm
+per primitive. There is no consolidated `Fence` or `Drain` Instr —
+that would force the player to grow a fat helper that re-invents
+what the IR was supposed to encode (the very bug class this redesign
+kills).
 
 The walker produces a `TkTape` from a `LoweringInput`. The player
 runs `match` over `instrs` (and `prelude`, and `kernel_args`,
@@ -132,9 +139,6 @@ pub enum Instr {
     Threadfence { scope: FenceScope },
     CommitGroup { kind: CommitKind },          // BulkStore | NonBulk
     WaitGroup { kind: CommitKind, n: u32 },
-
-    // ── cross-op + kernel-end fence (consolidated, fully fielded)
-    Fence(FenceSpec),
 
     // ── named barriers (page-ready / page-done / page-consumed etc.)
     BarrierInit { id: BarrierId, count: u32 },
@@ -155,17 +159,7 @@ pub enum Instr {
     Asm { role: WarpRole, lines: AsmLines },
 }
 
-pub struct FenceSpec {
-    pub scope: FenceScope,
-    pub wait: WaitMode,
-    pub producer_role: WarpRoleSet,
-    pub consumer_role: WarpRoleSet,
-    pub bracket_pre_sync: bool,
-    pub bracket_post_sync: bool,
-}
-
 pub enum FenceScope { Block, Device, System }
-pub enum WaitMode { DrainAll, DrainN(u32) }
 pub enum SyncScope { Cta, GroupOf(u32) }
 pub enum CommitKind { BulkStore, NonBulk }
 
@@ -189,7 +183,7 @@ pub struct StoreSpec {
 
 pub enum StoreCommitStrategy {
     InlineCommitWait,                    // store + commit_group + wait_group<0>
-    DeferredToFence(FenceId),            // store; commit/wait emitted by a later Fence Instr
+    DeferredToFence,                     // store only; storer pushes its own CommitGroup/WaitGroup Instrs at the fence site
 }
 
 pub enum ByteOffsetExpr {
@@ -201,8 +195,6 @@ pub enum ParityExpr {
     Static(u8),                          // compile-time 0 or 1
     LoopParity(LoopVarId),               // (var & 1) at runtime
 }
-
-pub struct WarpRoleSet(u32);             // bitmask over WarpRole
 ```
 
 ### 2.3 ComputeBody — sealed templates, fully fielded
@@ -300,19 +292,15 @@ Instr::Threadfence { scope: FenceScope::Device } =>
     out.push_str("__threadfence();\n"),
 
 Instr::CommitGroup { kind: CommitKind::BulkStore } =>
-    out.push_str("asm volatile(\"cp.async.bulk.commit_group;\");\n"),
+    out.push_str("kittens::group<1>::tma::store_commit_group();\n"),
 
 Instr::WaitGroup { kind: CommitKind::BulkStore, n } =>
-    write!(out, "asm volatile(\"cp.async.bulk.wait_group {n};\");\n").unwrap(),
+    writeln!(out, "kittens::group<1>::tma::store_async_wait<{n}>();").unwrap(),
 
-// Fence — fully fielded, no branches besides scope.
-Instr::Fence(FenceSpec { scope, wait, bracket_pre_sync, bracket_post_sync, .. }) => {
-    if *bracket_pre_sync { out.push_str("__syncthreads();\n"); }
-    write!(out, "asm volatile(\"cp.async.bulk.commit_group;\");\n").unwrap();
-    write!(out, "asm volatile(\"cp.async.bulk.wait_group {};\");\n", wait_n_for(*wait)).unwrap();
-    write!(out, "{}\n", threadfence_call(*scope)).unwrap();
-    if *bracket_post_sync { out.push_str("__syncthreads();\n"); }
-}
+// A "fence" is a SEQUENCE of primitive Instrs the walker pushes —
+// [Syncthreads, CommitGroup, WaitGroup, Threadfence, Syncthreads] —
+// NEVER one Instr expanding into 5 lines. There is no Instr::Fence;
+// the player has one one-line arm per primitive above.
 
 // LoadAsync — single TK 2.0 call (`expect_bytes` arms barrier; load fires).
 Instr::LoadAsync(LoadSpec { dst_page, src_buf, src_byte_off, bytes, role, barrier }) =>
@@ -481,7 +469,7 @@ regresses, stop and bisect before moving on.
 ### Phase 0 — scaffold
 
 - Add new module `crates/ferrite-wavefront/src/tk_tape.rs` with
-  empty `TkTape`, `Instr`, `FenceSpec`, etc. Compiles, no callers.
+  empty `TkTape` and `Instr` enum. Compiles, no callers.
 - Add new module `crates/ferrite-wavefront/src/tk_player.rs` with
   `emit_kernel(tape: &TkTape) -> String` returning empty kernel.
 - Stop condition: workspace builds, tests pass, megakernel still
@@ -496,16 +484,19 @@ regresses, stop and bisect before moving on.
 - Stop condition: pod build + decode produces same Paris!!! output
   as today (no regression). Confirms the migration is byte-identical.
 
-### Phase 2 — Fence consolidation
+### Phase 2 — walker emits fence + drain as primitive-Instr sequences
 
-- Replace `TkInstr::CrossOpGmemFence` and `KernelEndDrain` with
-  `Instr::Fence(FenceSpec)`. All five fields populated by the
-  orchestrator/walker.
+- Replace `TkInstr::CrossOpGmemFence` and `KernelEndDrain` callers in
+  `tk_orchestrate.rs` / `tk_lower.rs` with the 5-Instr sequence
+  `[Syncthreads(Cta), CommitGroup(BulkStore), WaitGroup(BulkStore, 0),
+  Threadfence(Device), Syncthreads(Cta)]`.
+- The walker pushes these into `TkTape.instrs` directly. No
+  `Instr::Fence` variant; no helper fn in the player. The kernel-end
+  drain is the same 5-Instr sequence at the tail of `instrs`.
 - Stop condition: pod decode unchanged (Paris!!! still). The
-  consolidation alone shouldn't fix anything; if it FIXES the bug,
-  we have learned something — the fence shape differed by accident
-  before and we just fixed it (welcome surprise; document and move
-  on).
+  rewrite alone shouldn't fix anything; if it FIXES the bug, the
+  fence shape differed by accident before and we just fixed it
+  (welcome surprise; document and move on).
 
 ### Phase 3 — KvLayoutWitness
 

@@ -21,9 +21,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{
-    CommitKind, FenceScope, Instr, SyncScope, TkTape, WaitMode,
-};
+use crate::tk_tape::{CommitKind, FenceScope, Instr, SyncScope, TkTape};
 
 /// Emit the full CUDA kernel body from a [`TkTape`].
 ///
@@ -40,8 +38,9 @@ pub fn emit_kernel(tape: &TkTape) -> String {
     out
 }
 
-/// Single match dispatch — the entire player is this function plus
-/// a few small projection helpers.
+/// Single match dispatch — the entire player is this function. No
+/// helper fns: a multi-step CUDA sequence is multiple Instrs in the
+/// tape, never one Instr expanding to many lines.
 fn emit_instr(out: &mut String, instr: &Instr) {
     match instr {
         // ── synchronization primitives ───────────────────────────
@@ -57,27 +56,30 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             FenceScope::System => out.push_str("__threadfence_system();\n"),
         },
         Instr::CommitGroup { kind } => match kind {
+            // sm90+ TMA `cp.async.bulk.commit_group` via the TK 2.0
+            // wrapper at `include/ops/group/util/tma.cuh:38`. Per the
+            // [[dogfood-tk20-rust]] rule, never raw asm.
             CommitKind::BulkStore => {
-                out.push_str("asm volatile(\"cp.async.bulk.commit_group;\");\n");
+                out.push_str("kittens::group<1>::tma::store_commit_group();\n");
             }
+            // sm80 fallback — not used on Hopper for K/V cache writes;
+            // raw asm because TK 2.0 has no non-bulk wrapper.
             CommitKind::NonBulk => {
                 out.push_str("asm volatile(\"cp.async.commit_group;\");\n");
             }
         },
         Instr::WaitGroup { kind, n } => match kind {
+            // TK 2.0 `store_async_wait<N>` (tma.cuh:47) wraps
+            // `cp.async.bulk.wait_group N`. Const generic = compile-
+            // time `N`, same SASS as raw asm.
             CommitKind::BulkStore => {
-                let _ = writeln!(out, "asm volatile(\"cp.async.bulk.wait_group {n};\");");
+                let _ =
+                    writeln!(out, "kittens::group<1>::tma::store_async_wait<{n}>();");
             }
             CommitKind::NonBulk => {
                 let _ = writeln!(out, "asm volatile(\"cp.async.wait_group {n};\");");
             }
         },
-
-        // ── consolidated cross-op + kernel-end fence ─────────────
-        Instr::Fence(_spec) => {
-            // Phase 2: emit pre-sync? + commit_group + wait_group +
-            // threadfence + post-sync? per FenceSpec fields.
-        }
 
         // ── named barrier ops ────────────────────────────────────
         Instr::BarrierInit { .. } => {
@@ -106,6 +108,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         }
 
         // ── control flow ─────────────────────────────────────────
+        #[allow(clippy::needless_borrows_for_generic_args)]
         Instr::ForLoop { var, count, body } => {
             let _ = writeln!(
                 out,
@@ -189,21 +192,24 @@ mod tests {
     }
 
     #[test]
-    fn commit_group_bulk_matches_legacy() {
-        // Legacy: tk_codegen.rs:69 / :157.
+    fn commit_group_bulk_emits_tk20_wrapper() {
+        // TK 2.0 wrapper at include/ops/group/util/tma.cuh:38 —
+        // expands to `cp.async.bulk.commit_group;`. We always go
+        // through the typed wrapper, never raw asm
+        // ([[dogfood-tk20-rust]]).
         assert_eq!(
             emit(Instr::CommitGroup { kind: CommitKind::BulkStore }),
-            "asm volatile(\"cp.async.bulk.commit_group;\");\n"
+            "kittens::group<1>::tma::store_commit_group();\n"
         );
     }
 
     #[test]
-    fn wait_group_bulk_zero_matches_legacy() {
-        // Legacy: tk_codegen.rs:70 / :158 — wait_group 0 = drain
-        // all.
+    fn wait_group_bulk_zero_emits_tk20_wrapper() {
+        // TK 2.0 wrapper at include/ops/group/util/tma.cuh:47 —
+        // expands to `cp.async.bulk.wait_group N;`.
         assert_eq!(
             emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0 }),
-            "asm volatile(\"cp.async.bulk.wait_group 0;\");\n"
+            "kittens::group<1>::tma::store_async_wait<0>();\n"
         );
     }
 
@@ -211,7 +217,7 @@ mod tests {
     fn wait_group_bulk_nonzero_emits_n() {
         assert_eq!(
             emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 3 }),
-            "asm volatile(\"cp.async.bulk.wait_group 3;\");\n"
+            "kittens::group<1>::tma::store_async_wait<3>();\n"
         );
     }
 
@@ -227,12 +233,15 @@ mod tests {
         );
     }
 
-    /// Sequence test: a five-instruction tape reproducing today's
-    /// `cross_op_gmem_fence_body` byte-for-byte. Phase 2 will
-    /// consolidate this into a single `Instr::Fence` — for now we
-    /// prove the building blocks compose.
+    /// A "fence" is NOT one Instr — it's a SEQUENCE of primitive
+    /// Instrs. The walker pushes the five sync/commit/wait/fence/sync
+    /// Instrs into the tape; the player has one one-line arm per
+    /// primitive. There is no Instr::Fence; if the IR ever grew one,
+    /// the player would gain a fat helper that re-invents what the
+    /// IR was supposed to encode (the very bug class this redesign
+    /// kills).
     #[test]
-    fn cross_op_fence_sequence_matches_legacy_body() {
+    fn cross_op_fence_is_a_sequence_of_primitive_instrs() {
         let tape = TkTape {
             instrs: vec![
                 Instr::Syncthreads { scope: SyncScope::Cta },
@@ -243,13 +252,14 @@ mod tests {
             ],
             ..Default::default()
         };
-        let out = emit_kernel(&tape);
-        // Strip the header to compare just the body.
-        let body = out.strip_prefix("// emitted by tk_player\n").unwrap();
+        let body = emit_kernel(&tape)
+            .strip_prefix("// emitted by tk_player\n")
+            .unwrap()
+            .to_string();
         let expected = concat!(
             "__syncthreads();\n",
-            "asm volatile(\"cp.async.bulk.commit_group;\");\n",
-            "asm volatile(\"cp.async.bulk.wait_group 0;\");\n",
+            "kittens::group<1>::tma::store_commit_group();\n",
+            "kittens::group<1>::tma::store_async_wait<0>();\n",
             "__threadfence();\n",
             "__syncthreads();\n",
         );

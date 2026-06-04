@@ -30,8 +30,10 @@ use crate::subtile_ir::BufId;
 /// The flat instruction tape — produced by the walker, consumed by
 /// the dumb player.
 ///
-/// Phase 0: empty scaffold. Phases 1+ fill in fields per the
-/// migration plan in `SUBTILE_IR_REDESIGN.md`.
+/// A multi-step CUDA sequence (e.g. a "fence") is a SEQUENCE of
+/// primitive Instrs in `instrs`, never one Instr that expands into
+/// many lines. Same goes for the kernel-end drain: the walker pushes
+/// the drain's primitive Instrs at the tail of `instrs`.
 #[derive(Debug, Default)]
 pub struct TkTape {
     /// Kernel-arg declarations in ABI order. Order is the C++
@@ -45,10 +47,6 @@ pub struct TkTape {
 
     /// The instruction stream — flat, role-gated per Instr.
     pub instrs: Vec<Instr>,
-
-    /// Tail drain emitted at kernel exit. Separate from the body so
-    /// the kernel-end-drain witness pattern stays type-explicit.
-    pub end_drain: FenceSpec,
 }
 
 // ── kernel-arg declarations ───────────────────────────────────────
@@ -150,10 +148,6 @@ pub enum Instr {
     /// `cp.async.bulk.wait_group N;`.
     WaitGroup { kind: CommitKind, n: u32 },
 
-    /// Cross-op gmem fence + kernel-end drain — consolidated. See
-    /// [`FenceSpec`].
-    Fence(FenceSpec),
-
     /// `mbarrier.init` for a named barrier.
     BarrierInit { id: BarrierId, count: u32 },
 
@@ -223,39 +217,6 @@ pub enum CommitKind {
     NonBulk,
 }
 
-/// Cross-op fence specification — fully fielded so the player can
-/// emit the fence with no ambient lookups. Replaces today's
-/// `cross_op_gmem_fence_body` (hardcoded 5-line string) and
-/// `KernelEndDrain` (separate hardcoded shape).
-#[derive(Debug, Clone, Default)]
-pub struct FenceSpec {
-    pub scope: FenceScope,
-    pub wait: WaitMode,
-    /// Which warp roles' stores this fence drains.
-    pub producer_role: WarpRoleSet,
-    /// Which warp roles' loads must observe drained writes after
-    /// this fence.
-    pub consumer_role: WarpRoleSet,
-    /// `__syncthreads()` before the commit/wait pair.
-    pub bracket_pre_sync: bool,
-    /// `__syncthreads()` after the threadfence.
-    pub bracket_post_sync: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WaitMode {
-    /// `wait_group 0;` — drain all groups.
-    #[default]
-    DrainAll,
-    /// `wait_group N;` — drain all but the most-recent N.
-    DrainN(u32),
-}
-
-/// Bitmask over [`WarpRole`] discriminants. Allows a fence to be
-/// declared "all roles" or "loader+storer only" without a Vec.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct WarpRoleSet(pub u32);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WarpRole {
     Loader,
@@ -314,21 +275,7 @@ pub struct StoreSpec {
     pub dst_byte_off: ByteOffsetExpr,
     pub bytes: u32,
     pub role: WarpRole,
-    pub commit_strategy: StoreCommitStrategy,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreCommitStrategy {
-    /// `store_async + store_commit_group + store_async_wait<0>`
-    /// inline. Today's raw-bulk `tma_store_async` shape.
-    InlineCommitWait,
-    /// Just `store_async`; commit/wait emitted by a later
-    /// [`Instr::Fence`] with matching producer_role.
-    DeferredToFence(FenceId),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FenceId(pub u32);
 
 /// Sealed identifier for one ComputeBody template. Each variant
 /// maps to a fixed `&'static str` CUDA template in

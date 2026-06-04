@@ -2804,6 +2804,8 @@ impl Instruction {
             Instruction::GateScale(routed_slot, shared_slot, gate_slot, out_slot) => unsafe {
                 // out = routed + shared_y * sigmoid(g)  (Qwen3.5-MoE shared
                 // expert; g is [T, 1], row-broadcast across the hidden axis).
+                // 4-buffer combine kernel reads routed directly — no
+                // staging copy (mirrors the metal gate_scale binding).
                 let routed_tv = tile_ref(ctx.tiles, routed_slot).as_view(ctx.tiles);
                 let shared_tv = tile_ref(ctx.tiles, shared_slot).as_view(ctx.tiles);
                 let gate_tv = tile_ref(ctx.tiles, gate_slot).as_view(ctx.tiles);
@@ -2811,15 +2813,9 @@ impl Instruction {
                 let ncols = (*routed_tv).dim(1);
                 let dt = (*routed_tv).dtype();
                 let out = ctx.device.caching.alloc_tensor(&[nt, ncols], dt);
-                ferrite_cuda_core::driver::memcpy_dtod_async(
-                    (*out.view()).raw_ptr(),
-                    (*routed_tv).as_ptr::<u8>(),
-                    (*routed_tv).size_bytes(),
-                    ctx.device.compute_stream,
-                )
-                .expect("GateScale: copy routed");
-                kernels::sigmoid_rowgate_add_inplace(
+                kernels::sigmoid_rowgate_combine(
                     *out.view(),
+                    *routed_tv,
                     *shared_tv,
                     *gate_tv,
                     ctx.device.compute_stream,

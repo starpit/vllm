@@ -202,14 +202,18 @@ __global__ void sigmoid_mul_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Sigmoid-rowgate-add kernel: out += sh * sigmoid(gate[row]) (Qwen3.5-MoE
-// shared-expert combine; gate is [rows, 1], row-broadcast across cols).
-// Mirrors gate_scale.metal.
+// Sigmoid-rowgate-combine kernel: out = routed + sh * sigmoid(gate[row])
+// (Qwen3.5-MoE shared-expert combine; gate is [rows, 1], row-broadcast
+// across cols). Mirrors gate_scale.metal's 4-buffer form so the caller
+// binds the arena's routed/out slots directly — no staging copy. Aliasing
+// out == routed is safe (each thread reads then writes only element idx),
+// which preserves the old in-place accumulate as a special case.
 // ---------------------------------------------------------------------------
 
 template <typename T>
-__global__ void sigmoid_rowgate_add_kernel(
-    T* __restrict__ out,          // [rows*cols] in/out — routed, accumulated into
+__global__ void sigmoid_rowgate_combine_kernel(
+    T* __restrict__ out,          // [rows*cols] combined output
+    const T* __restrict__ routed, // [rows*cols] routed-expert sum
     const T* __restrict__ sh,     // [rows*cols] shared-expert output
     const T* __restrict__ gate,   // [rows] shared_expert_gate output ([T, 1])
     int numel,
@@ -218,11 +222,11 @@ __global__ void sigmoid_rowgate_add_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numel) return;
     int row = idx / cols;
-    float o = static_cast<float>(out[idx]);
+    float r = static_cast<float>(routed[idx]);
     float s = static_cast<float>(sh[idx]);
     float g = static_cast<float>(gate[row]);
     float sig = 1.0f / (1.0f + expf(-g));
-    out[idx] = static_cast<T>(o + s * sig);
+    out[idx] = static_cast<T>(r + s * sig);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,32 +377,36 @@ void sigmoid_mul_bf16(
     sigmoid_mul_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(input, gate, numel);
 }
 
-// Sigmoid-rowgate-add (Qwen3.5-MoE shared-expert combine)
+// Sigmoid-rowgate-combine (Qwen3.5-MoE shared-expert combine)
 
-void sigmoid_rowgate_add_f32(
-    float* out, const float* sh, const float* gate, int numel, int cols, cudaStream_t stream)
-{
-    int threads = 256;
-    int blocks = (numel + threads - 1) / threads;
-    sigmoid_rowgate_add_kernel<float><<<blocks, threads, 0, stream>>>(out, sh, gate, numel, cols);
-}
-
-void sigmoid_rowgate_add_f16(
-    __half* out, const __half* sh, const __half* gate, int numel, int cols, cudaStream_t stream)
-{
-    int threads = 256;
-    int blocks = (numel + threads - 1) / threads;
-    sigmoid_rowgate_add_kernel<__half><<<blocks, threads, 0, stream>>>(out, sh, gate, numel, cols);
-}
-
-void sigmoid_rowgate_add_bf16(
-    __nv_bfloat16* out, const __nv_bfloat16* sh, const __nv_bfloat16* gate, int numel, int cols,
+void sigmoid_rowgate_combine_f32(
+    float* out, const float* routed, const float* sh, const float* gate, int numel, int cols,
     cudaStream_t stream)
 {
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
-    sigmoid_rowgate_add_kernel<__nv_bfloat16>
-        <<<blocks, threads, 0, stream>>>(out, sh, gate, numel, cols);
+    sigmoid_rowgate_combine_kernel<float>
+        <<<blocks, threads, 0, stream>>>(out, routed, sh, gate, numel, cols);
+}
+
+void sigmoid_rowgate_combine_f16(
+    __half* out, const __half* routed, const __half* sh, const __half* gate, int numel, int cols,
+    cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+    sigmoid_rowgate_combine_kernel<__half>
+        <<<blocks, threads, 0, stream>>>(out, routed, sh, gate, numel, cols);
+}
+
+void sigmoid_rowgate_combine_bf16(
+    __nv_bfloat16* out, const __nv_bfloat16* routed, const __nv_bfloat16* sh,
+    const __nv_bfloat16* gate, int numel, int cols, cudaStream_t stream)
+{
+    int threads = 256;
+    int blocks = (numel + threads - 1) / threads;
+    sigmoid_rowgate_combine_kernel<__nv_bfloat16>
+        <<<blocks, threads, 0, stream>>>(out, routed, sh, gate, numel, cols);
 }
 
 } // extern "C"

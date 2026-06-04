@@ -141,7 +141,15 @@ fn run(rows: usize, cols: usize, seed: u64, dtype: GateScaleDType) {
     }
 }
 
+/// Raw byte view of a host slice for buffer upload. Callers must
+/// pass slices whose element size matches the kernel-side dtype —
+/// asserted here so a mismatched `T` fails loudly instead of
+/// producing a wrong-length upload.
 fn bytemuck_cast<T: Copy>(v: &[T]) -> Vec<u8> {
+    assert!(
+        matches!(std::mem::size_of::<T>(), 2 | 4),
+        "gate_scale uploads are 2-byte (f16/bf16) or 4-byte (f32) elements"
+    );
     let bytes = std::mem::size_of_val(v);
     let mut out = vec![0u8; bytes];
     unsafe {

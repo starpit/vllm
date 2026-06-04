@@ -654,199 +654,6 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the GemmM1 consumer body. M=1 dot product computed per
-    /// consumer warp (warp `c` produces `y[c]` when `c < bn`), with
-    /// lane-parallel K reduction via `__shfl_xor_sync` butterfly.
-    /// `kittens::warp::mma_AB` (16x16 register tiles) doesn't fit
-    /// the m=1 case naturally — a single output value at row=1 would
-    /// need 15 zeroed pad rows; the per-thread form matches both
-    /// mk-v2's RmsNorm idiom and the natural decode m=1 fast path.
-    /// Phase 3 adds `Tk20Call::WarpMmaAB` and `WarpgroupMmaAB`
-    /// bindings (Phase 0) for future m>1 prefill lowerings, while
-    /// keeping the m=1 body's per-thread shape.
-    ///
-    /// `x_id` / `w_id`: page slots for X / W. `out_buf`: kernel arg
-    /// index of the output gmem buffer (`buf{out_buf}` lookup);
-    /// matches the `BufId` of `op.out` in the lowering. `k` / `bn`:
-    /// GEMM tile dims. Consumer warp count enforced ≤
-    /// NUM_CONSUMER_WARPS by the caller (`tk_orchestrate::pick_bn`).
-    pub fn gemm_m1_consumer_body(x_id: u8, w_id: u8, out_buf: u32, k: u32, bn: u32) -> String {
-        // Phase 8 m=1 matvec: TK 2.0 register-vector K-reduce.
-        //
-        // Per-warp parallelism unchanged: warp `c` produces `y[c]`
-        // when `c < bn`. The K-axis reduction is replaced from the
-        // legacy `__shfl_xor_sync` butterfly to TK 2.0 register-
-        // vector primitives:
-        //
-        //   warp::load(rv_bf<K_TILE>, sv_chunk) →
-        //   warp::copy(rv_fl, rv_bf)            →
-        //   warp::mul(rv_fl, rv_fl, rv_fl)      →
-        //   acc += warp::sum(rv_fl)
-        //
-        // K_TILE=128, K_BLOCKS=K/128. Per-warp register footprint
-        // ~48 B/thread (4×rv<128>: 8 bf16 + 8 fl32 elements per
-        // lane), well under the 224-reg consumer budget. K=2048
-        // (q/k/v/o/up/gate/lm_head) → 16 inner iters; K=8192
-        // (down_proj) → 64 iters. No special-case.
-        //
-        // Output: lane 0 of warp `c` writes
-        // `buf{out_buf}[n_i*bn+c]` directly to gmem — bypasses the
-        // Y staging page (the per-iter 8-byte TMA store violated
-        // `cp.async.bulk`'s 16-byte minimum and silently dropped).
-        const K_TILE: u32 = 128;
-        debug_assert_eq!(
-            k % K_TILE,
-            0,
-            "gemm_m1_consumer_body: K={k} must be a multiple of K_TILE={K_TILE}"
-        );
-        let k_blocks = k / K_TILE;
-
-        let x_sv_decl = decl_sv_view_bf("__x_sv", &format!("page_buf[{x_id}]"), k);
-        let w_row_sv_decl = decl_sv_view_bf(
-            "__w_row_sv",
-            &format!("(reinterpret_cast<__nv_bfloat16*>(page_buf[{w_id}]) + __row * {k}u)"),
-            k,
-        );
-        let x_rv_bf_decl = decl_rv_bf("__x_rv_bf", K_TILE);
-        let w_rv_bf_decl = decl_rv_bf("__w_rv_bf", K_TILE);
-        let x_rv_fl_decl = decl_rv_fl("__x_rv_fl", K_TILE);
-        let w_rv_fl_decl = decl_rv_fl("__w_rv_fl", K_TILE);
-        let load_x = warp_load_rv_from_sv(
-            "__x_rv_bf",
-            "__x_sv.template subvec<128>(__k_i)",
-        );
-        let load_w = warp_load_rv_from_sv(
-            "__w_rv_bf",
-            "__w_row_sv.template subvec<128>(__k_i)",
-        );
-        let copy_x = warp_copy_rv("__x_rv_fl", "__x_rv_bf");
-        let copy_w = warp_copy_rv("__w_rv_fl", "__w_rv_bf");
-        let mul_xw = warp_mul_rv("__x_rv_fl", "__x_rv_fl", "__w_rv_fl");
-        let sum_expr = warp_sum_rv("__x_rv_fl");
-
-        format!(
-            r#"
-            // tk_warp_ir GemmM1 — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
-            // TK 2.0 register-vector K-reduce; lane 0 of warp c writes
-            // buf{out_buf}[__n_i * bn + row] directly to gmem.
-            using T_act = __nv_bfloat16;
-            T_act* __y_gmem = reinterpret_cast<T_act*>(buf{out_buf});
-            const unsigned int __bn = {bn}u;
-            {x_sv_decl}
-            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
-                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                {w_row_sv_decl}
-                float __acc = 0.0f;
-                for (int __k_i = 0; __k_i < {k_blocks}; ++__k_i) {{
-                    {x_rv_bf_decl}
-                    {w_rv_bf_decl}
-                    {x_rv_fl_decl}
-                    {w_rv_fl_decl}
-                    {load_x}
-                    {load_w}
-                    {copy_x}
-                    {copy_w}
-                    {mul_xw}
-                    __acc += {sum_expr};
-                }}
-                if (__lane == 0) {{
-                    __y_gmem[__n_i * __bn + __row] = __float2bfloat16(__acc);
-                }}
-            }}
-"#
-        )
-    }
-
-    /// Phase 12 internal-output variant of [`gemm_m1_consumer_body`].
-    /// Same TK 2.0 register-vector K-reduce; lane 0 of warp c writes
-    /// `page_buf[y_id][__n_i * bn + row]` (smem) instead of
-    /// `buf{out_buf}[...]` (gmem). Used by `lower_gemm_m1_routed`
-    /// when the gemm's output is consumed only by a downstream op in
-    /// this same kernel — the storer skips TMA store and the Y page
-    /// is carried-forward to the consumer.
-    ///
-    /// Phase 8's cp.async.bulk-min issue (8-byte TMA store dropped)
-    /// does NOT apply here because we don't TMA-store at all. The Y
-    /// page stays in smem; the producer's writes flow through
-    /// Done→Consumed→Ready barrier ordering when the consumer reads
-    /// from this same slot.
-    ///
-    /// `y_id`: the smem page slot holding the full
-    /// `[1, n]` output across all N-block iterations. Consumer warps
-    /// each write their own row at the per-iter offset.
-    pub fn gemm_m1_consumer_body_internal(
-        x_id: u8,
-        w_id: u8,
-        y_id: u8,
-        k: u32,
-        bn: u32,
-    ) -> String {
-        const K_TILE: u32 = 128;
-        debug_assert_eq!(
-            k % K_TILE,
-            0,
-            "gemm_m1_consumer_body_internal: K={k} must be multiple of K_TILE={K_TILE}"
-        );
-        let k_blocks = k / K_TILE;
-
-        let x_sv_decl = decl_sv_view_bf("__x_sv", &format!("page_buf[{x_id}]"), k);
-        let w_row_sv_decl = decl_sv_view_bf(
-            "__w_row_sv",
-            &format!("(reinterpret_cast<__nv_bfloat16*>(page_buf[{w_id}]) + __row * {k}u)"),
-            k,
-        );
-        let x_rv_bf_decl = decl_rv_bf("__x_rv_bf", K_TILE);
-        let w_rv_bf_decl = decl_rv_bf("__w_rv_bf", K_TILE);
-        let x_rv_fl_decl = decl_rv_fl("__x_rv_fl", K_TILE);
-        let w_rv_fl_decl = decl_rv_fl("__w_rv_fl", K_TILE);
-        let load_x = warp_load_rv_from_sv(
-            "__x_rv_bf",
-            "__x_sv.template subvec<128>(__k_i)",
-        );
-        let load_w = warp_load_rv_from_sv(
-            "__w_rv_bf",
-            "__w_row_sv.template subvec<128>(__k_i)",
-        );
-        let copy_x = warp_copy_rv("__x_rv_fl", "__x_rv_bf");
-        let copy_w = warp_copy_rv("__w_rv_fl", "__w_rv_bf");
-        let mul_xw = warp_mul_rv("__x_rv_fl", "__x_rv_fl", "__w_rv_fl");
-        let sum_expr = warp_sum_rv("__x_rv_fl");
-
-        format!(
-            r#"
-            // tk_warp_ir GemmM1 (internal) — y[1, {bn}] = X[1, {k}] @ W[{bn}, {k}]^T
-            // TK 2.0 register-vector K-reduce; lane 0 of warp c writes
-            // page_buf[{y_id}][__n_i * bn + row] (smem; carry-forward).
-            using T_act = __nv_bfloat16;
-            T_act* __y_smem = reinterpret_cast<T_act*>(page_buf[{y_id}]);
-            const unsigned int __bn = {bn}u;
-            {x_sv_decl}
-            if (static_cast<unsigned int>(__consumer_idx) < __bn) {{
-                const unsigned int __row = static_cast<unsigned int>(__consumer_idx);
-                const int __lane = static_cast<int>(threadIdx.x & 31);
-                {w_row_sv_decl}
-                float __acc = 0.0f;
-                for (int __k_i = 0; __k_i < {k_blocks}; ++__k_i) {{
-                    {x_rv_bf_decl}
-                    {w_rv_bf_decl}
-                    {x_rv_fl_decl}
-                    {w_rv_fl_decl}
-                    {load_x}
-                    {load_w}
-                    {copy_x}
-                    {copy_w}
-                    {mul_xw}
-                    __acc += {sum_expr};
-                }}
-                if (__lane == 0) {{
-                    __y_smem[__n_i * __bn + __row] = __float2bfloat16(__acc);
-                }}
-            }}
-"#
-        )
-    }
-
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1867,6 +1674,33 @@ pub enum Tk20Call {
         c: String,
     },
 
+    /// `if (static_cast<unsigned int>(__consumer_idx) < {bn}) { ...body... }` —
+    /// gate the body to the first `bn` consumer warps.
+    IfConsumerIdxLtBnVar { bn_var: String, body: Vec<Tk20Call> },
+
+    /// `if (__lane == 0) { ...body... }` — gate body to lane 0.
+    IfLane0 { body: Vec<Tk20Call> },
+
+    /// `const unsigned int {var} = static_cast<unsigned int>(__consumer_idx);`
+    DeclConstU32FromConsumerIdx { var: String },
+
+    /// `__nv_bfloat16* {var} = reinterpret_cast<__nv_bfloat16*>(buf{buf});`
+    DeclGmemPtrBf16FromBuf { var: String, buf: u32 },
+
+    /// `{gmem}[{idx}] = __float2bfloat16({src});` — gmem scalar bf16
+    /// store from a float local.
+    Bf16GmemStoreFromFloat {
+        gmem: String,
+        idx: String,
+        src: String,
+    },
+
+    /// `__nv_bfloat16* {var} = reinterpret_cast<__nv_bfloat16*>(page_buf[{page_id}]);` —
+    /// smem-pointer typedef-style decl. Same shape as
+    /// [`Self::DeclSmemPtrBf16`] but `__nv_bfloat16*` rather than
+    /// `auto*` for callers that name the explicit type.
+    DeclSmemPtrTypedBf16 { var: String, page_id: u8 },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -1952,39 +1786,6 @@ pub enum Tk20Call {
     // same: per-thread squared-sum + warp shfl + per-thread normalize,
     // with `kittens::sv_bf<N>` only as a typed page alias.
 
-    /// RmsNorm consumer compute body. Per-thread bf16 squared-sum +
-    /// GemmM1 consumer compute body. M=1 dot product per consumer
-    /// warp (warp `c` produces `y[c]` for `c < bn`), lane-parallel K
-    /// reduce via `__shfl_xor_sync`. Bound through
-    /// `tk20::gemm_m1_consumer_body`.
-    ///
-    /// Phase 8: writes the per-warp result DIRECTLY to gmem
-    /// (`buf{out_buf}[__n_i * bn + __row]`) from lane 0 — bypassing the
-    /// Y staging page entirely. The TMA-backed Y store path violates
-    /// `cp.async.bulk`'s 16-byte minimum (Y store is 8 bytes per iter
-    /// when `bn=4`, `act_elem=2`), silently dropping outputs.
-    GemmM1ConsumerBody {
-        x_id: u8,
-        w_id: u8,
-        out_buf: u32,
-        k: u32,
-        bn: u32,
-    },
-
-    /// GemmM1 consumer compute body — internal-output variant
-    /// (Phase 12 routing). Same K-reduce as `GemmM1ConsumerBody` but
-    /// writes to `page_buf[y_id]` (smem) instead of `buf{out_buf}`
-    /// (gmem). Used when the gemm's output is consumed only by a
-    /// downstream op in this same kernel; the producer's storer
-    /// skips TMA store and the Y smem page is carried-forward.
-    GemmM1ConsumerBodyInternal {
-        x_id: u8,
-        w_id: u8,
-        y_id: u8,
-        k: u32,
-        bn: u32,
-    },
-
     /// AttnDecode init-softmax body. Bound through
     /// `tk20::attn_decode_init_softmax_body`.
     AttnDecodeInitSoftmaxBody { unique_id: u32 },
@@ -2003,6 +1804,216 @@ pub enum Tk20Call {
     /// AttnDecode finalise (O = O_accum / l_sum). Bound through
     /// `tk20::attn_decode_finalise_softmax_norm_body`.
     AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
+}
+
+/// Tape-build helper: GemmM1 internal-output variant (Phase 12
+/// carry-forward). Same K-reduce as [`gemm_m1_compute_calls`] but
+/// lane 0 of warp `c` writes to `page_buf[y_id]` (smem) instead of
+/// `buf{out_buf}` (gmem) — the consuming op reads from this op's
+/// smem page directly without a TMA-store round-trip.
+pub fn gemm_m1_compute_calls_internal(
+    x_id: u8,
+    w_id: u8,
+    y_id: u8,
+    k: u32,
+    bn: u32,
+) -> Vec<Tk20Call> {
+    const K_TILE: u32 = 128;
+    debug_assert_eq!(
+        k % K_TILE,
+        0,
+        "gemm_m1_compute_calls_internal: K={k} must be multiple of K_TILE={K_TILE}"
+    );
+    let k_blocks = k / K_TILE;
+    let inner_loop_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclRvBf {
+            var: "__x_rv_bf".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvBf {
+            var: "__w_rv_bf".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__x_rv_fl".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__w_rv_fl".into(),
+            k: K_TILE,
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__x_rv_bf".into(),
+            sv: "__x_sv.template subvec<128>(__k_i)".into(),
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__w_rv_bf".into(),
+            sv: "__w_row_sv.template subvec<128>(__k_i)".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__x_rv_fl".into(),
+            src: "__x_rv_bf".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__w_rv_fl".into(),
+            src: "__w_rv_bf".into(),
+        },
+        Tk20Call::WarpMulRv {
+            dst: "__x_rv_fl".into(),
+            lhs: "__x_rv_fl".into(),
+            rhs: "__w_rv_fl".into(),
+        },
+        Tk20Call::FloatAddAssignWarpSum {
+            dst: "__acc".into(),
+            rv: "__x_rv_fl".into(),
+        },
+    ];
+    let active_warp_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstU32FromConsumerIdx { var: "__row".into() },
+        Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+        Tk20Call::DeclSvBfView {
+            var: "__w_row_sv".into(),
+            ptr: format!("(reinterpret_cast<__nv_bfloat16*>(page_buf[{w_id}]) + __row * {k}u)"),
+            k,
+        },
+        Tk20Call::DeclMutableFloat {
+            var: "__acc".into(),
+            init: "0.0f".into(),
+        },
+        Tk20Call::ForLoopIntK {
+            iter: "__k_i".into(),
+            end: format!("{k_blocks}"),
+            body: inner_loop_body,
+        },
+        Tk20Call::IfLane0 {
+            body: vec![Tk20Call::Bf16GmemStoreFromFloat {
+                gmem: "__y_smem".into(),
+                idx: "__n_i * __bn + __row".into(),
+                src: "__acc".into(),
+            }],
+        },
+    ];
+    vec![
+        Tk20Call::DeclSmemPtrTypedBf16 {
+            var: "__y_smem".into(),
+            page_id: y_id,
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__bn".into(),
+            expr: format!("{bn}u"),
+        },
+        Tk20Call::DeclSvBfView {
+            var: "__x_sv".into(),
+            ptr: format!("page_buf[{x_id}]"),
+            k,
+        },
+        Tk20Call::IfConsumerIdxLtBnVar {
+            bn_var: "__bn".into(),
+            body: active_warp_body,
+        },
+    ]
+}
+
+/// Tape-build helper: GemmM1 consumer compute as a typed Tk20Call
+/// sequence. Consumer warp `c` (for `c < bn`) computes `y[c] =
+/// dot(x_row, w_row[c])` via TK 2.0 register-vector K-reduce. Lane
+/// 0 of warp `c` writes the scalar bf16 result directly to gmem
+/// (`buf{out_buf}[__n_i * bn + c]`) — bypasses the Y staging page.
+pub fn gemm_m1_compute_calls(x_id: u8, w_id: u8, out_buf: u32, k: u32, bn: u32) -> Vec<Tk20Call> {
+    const K_TILE: u32 = 128;
+    debug_assert_eq!(
+        k % K_TILE,
+        0,
+        "gemm_m1_compute_calls: K={k} must be a multiple of K_TILE={K_TILE}"
+    );
+    let k_blocks = k / K_TILE;
+    let inner_loop_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclRvBf {
+            var: "__x_rv_bf".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvBf {
+            var: "__w_rv_bf".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__x_rv_fl".into(),
+            k: K_TILE,
+        },
+        Tk20Call::DeclRvFl {
+            var: "__w_rv_fl".into(),
+            k: K_TILE,
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__x_rv_bf".into(),
+            sv: "__x_sv.template subvec<128>(__k_i)".into(),
+        },
+        Tk20Call::WarpLoadRvFromSv {
+            rv: "__w_rv_bf".into(),
+            sv: "__w_row_sv.template subvec<128>(__k_i)".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__x_rv_fl".into(),
+            src: "__x_rv_bf".into(),
+        },
+        Tk20Call::WarpCopyRv {
+            dst: "__w_rv_fl".into(),
+            src: "__w_rv_bf".into(),
+        },
+        Tk20Call::WarpMulRv {
+            dst: "__x_rv_fl".into(),
+            lhs: "__x_rv_fl".into(),
+            rhs: "__w_rv_fl".into(),
+        },
+        Tk20Call::FloatAddAssignWarpSum {
+            dst: "__acc".into(),
+            rv: "__x_rv_fl".into(),
+        },
+    ];
+    let active_warp_body: Vec<Tk20Call> = vec![
+        Tk20Call::DeclConstU32FromConsumerIdx { var: "__row".into() },
+        Tk20Call::DeclConstI32Lane { var: "__lane".into() },
+        Tk20Call::DeclSvBfView {
+            var: "__w_row_sv".into(),
+            ptr: format!("(reinterpret_cast<__nv_bfloat16*>(page_buf[{w_id}]) + __row * {k}u)"),
+            k,
+        },
+        Tk20Call::DeclMutableFloat {
+            var: "__acc".into(),
+            init: "0.0f".into(),
+        },
+        Tk20Call::ForLoopIntK {
+            iter: "__k_i".into(),
+            end: format!("{k_blocks}"),
+            body: inner_loop_body,
+        },
+        Tk20Call::IfLane0 {
+            body: vec![Tk20Call::Bf16GmemStoreFromFloat {
+                gmem: "__y_gmem".into(),
+                idx: "__n_i * __bn + __row".into(),
+                src: "__acc".into(),
+            }],
+        },
+    ];
+    vec![
+        Tk20Call::DeclGmemPtrBf16FromBuf {
+            var: "__y_gmem".into(),
+            buf: out_buf,
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__bn".into(),
+            expr: format!("{bn}u"),
+        },
+        Tk20Call::DeclSvBfView {
+            var: "__x_sv".into(),
+            ptr: format!("page_buf[{x_id}]"),
+            k,
+        },
+        Tk20Call::IfConsumerIdxLtBnVar {
+            bn_var: "__bn".into(),
+            body: active_warp_body,
+        },
+    ]
 }
 
 /// Tape-build helper: RmsNorm consumer compute as a typed Tk20Call
@@ -2426,6 +2437,26 @@ impl Tk20Call {
             Tk20Call::Bf16StoreFromFloatTripleProduct { smem, idx, a, b, c } => {
                 format!("{smem}[{idx}] = __float2bfloat16({a} * {b} * {c});")
             }
+            Tk20Call::IfConsumerIdxLtBnVar { bn_var, body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("if (static_cast<unsigned int>(__consumer_idx) < {bn_var}) {{ {inner} }}")
+            }
+            Tk20Call::IfLane0 { body } => {
+                let inner: String = body.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+                format!("if (__lane == 0) {{ {inner} }}")
+            }
+            Tk20Call::DeclConstU32FromConsumerIdx { var } => {
+                format!("const unsigned int {var} = static_cast<unsigned int>(__consumer_idx);")
+            }
+            Tk20Call::DeclGmemPtrBf16FromBuf { var, buf } => {
+                format!("__nv_bfloat16* {var} = reinterpret_cast<__nv_bfloat16*>(buf{buf});")
+            }
+            Tk20Call::Bf16GmemStoreFromFloat { gmem, idx, src } => {
+                format!("{gmem}[{idx}] = __float2bfloat16({src});")
+            }
+            Tk20Call::DeclSmemPtrTypedBf16 { var, page_id } => {
+                format!("__nv_bfloat16* {var} = reinterpret_cast<__nv_bfloat16*>(page_buf[{page_id}]);")
+            }
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2458,22 +2489,6 @@ impl Tk20Call {
                 tk20::warpgroup_decrease_registers(*n)
             }
 
-
-            Tk20Call::GemmM1ConsumerBody {
-                x_id,
-                w_id,
-                out_buf,
-                k,
-                bn,
-            } => tk20::gemm_m1_consumer_body(*x_id, *w_id, *out_buf, *k, *bn),
-
-            Tk20Call::GemmM1ConsumerBodyInternal {
-                x_id,
-                w_id,
-                y_id,
-                k,
-                bn,
-            } => tk20::gemm_m1_consumer_body_internal(*x_id, *w_id, *y_id, *k, *bn),
 
             Tk20Call::AttnDecodeInitSoftmaxBody { unique_id } => {
                 tk20::attn_decode_init_softmax_body(*unique_id)
@@ -3095,20 +3110,17 @@ mod tests {
     }
 
     #[test]
-    fn tk20_gemm_m1_consumer_body_emits_tk20_register_vector_kreduce() {
-        let body = tk20::gemm_m1_consumer_body(0, 1, 2, 2048, 4);
-        // Direct gmem write (Y page bypassed).
-        assert!(body.contains("T_act* __y_gmem = reinterpret_cast<T_act*>(buf2);"));
+    fn gemm_m1_compute_calls_emit_atomic_typed_primitives() {
+        let calls = gemm_m1_compute_calls(0, 1, 2, 2048, 4);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("__nv_bfloat16* __y_gmem = reinterpret_cast<__nv_bfloat16*>(buf2);"));
         assert!(body.contains("const unsigned int __bn = 4u;"));
         assert!(body.contains("if (static_cast<unsigned int>(__consumer_idx) < __bn)"));
         assert!(body.contains("__y_gmem[__n_i * __bn + __row] = __float2bfloat16(__acc);"));
-        // TK 2.0 SV views.
         assert!(body
             .contains("kittens::sv_bf<2048>& __x_sv = *reinterpret_cast<kittens::sv_bf<2048>*>(page_buf[0]);"));
         assert!(body.contains("kittens::sv_bf<2048>& __w_row_sv = *reinterpret_cast<kittens::sv_bf<2048>*>"));
-        // K_BLOCKS=16 inner loop.
         assert!(body.contains("for (int __k_i = 0; __k_i < 16; ++__k_i)"));
-        // TK 2.0 register-vector primitives.
         assert!(body.contains("kittens::rv_bf<128> __x_rv_bf;"));
         assert!(body.contains("kittens::rv_bf<128> __w_rv_bf;"));
         assert!(body.contains("kittens::rv_fl<128> __x_rv_fl;"));
@@ -3120,14 +3132,21 @@ mod tests {
         assert!(body.contains("kittens::warp::copy(__w_rv_fl, __w_rv_bf);"));
         assert!(body.contains("kittens::warp::mul(__x_rv_fl, __x_rv_fl, __w_rv_fl);"));
         assert!(body.contains("__acc += kittens::warp::sum(__x_rv_fl);"));
-        // Legacy shfl K-reduce gone.
         assert!(!body.contains("__shfl_xor_sync"));
         assert!(!body.contains("__bfloat162float"));
         assert!(!body.contains("__y_smem"));
-        // Strictly TK 2.0 (no warpgroup mma in m=1 decode body).
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
         assert!(!body.contains("kittens::warpgroup::mma_AB"));
+    }
+
+    #[test]
+    fn gemm_m1_compute_calls_internal_writes_to_smem_not_gmem() {
+        let calls = gemm_m1_compute_calls_internal(0, 1, 7, 2048, 4);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("__nv_bfloat16* __y_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[7]);"));
+        assert!(body.contains("__y_smem[__n_i * __bn + __row] = __float2bfloat16(__acc);"));
+        assert!(!body.contains("__y_gmem"));
     }
 
     #[test]

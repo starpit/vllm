@@ -896,16 +896,19 @@ mod tests {
         assert_eq!(n_bufs, 14 + 12);
 
         // Each op's body fired at least once. Decomposed bodies
-        // expose unique identifiers from the typed Tk20Call sequence
-        // instead of the legacy marker comments.
-        assert!(src.contains("RmsNorm"), "{src}");
-        assert!(src.contains("GemmM1"), "{src}");
-        // RoPE: __pairs / __x_lo / __x_hi unique to rope_compute_calls.
+        // expose unique identifiers from the typed Tk20Call sequence.
+        // RmsNorm: __sumsq + the rsqrtf scale formula.
+        assert!(src.contains("__sumsq"), "{src}");
+        assert!(src.contains("rsqrtf(__sumsq"), "{src}");
+        // GemmM1: __y_gmem + the K-reduce accumulator __acc.
+        assert!(src.contains("__y_gmem"), "{src}");
+        assert!(src.contains("__acc"), "{src}");
+        // RoPE: __pairs / __x_lo / __x_hi.
         assert!(src.contains("__pairs"), "{src}");
         assert!(src.contains("AttnDecode"), "{src}");
-        // SiluMul: __silu_g unique to silu_mul_compute_calls.
+        // SiluMul: __silu_g.
         assert!(src.contains("__silu_g"), "{src}");
-        // Residual-Add: __a_smem / __b_smem unique to residual_add_compute_calls.
+        // Residual-Add: __a_smem / __b_smem.
         assert!(src.contains("__a_smem"), "{src}");
         assert!(src.contains("__b_smem"), "{src}");
     }

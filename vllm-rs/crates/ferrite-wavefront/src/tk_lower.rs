@@ -2219,13 +2219,7 @@ pub fn lower_gemm_m1<P: Phase>(op: GemmM1Op, pages: &mut PageAllocator, prog: &m
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
         body.compute_calls(
             WarpRole::AllConsumers,
-            vec![crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
-                x_id,
-                w_id,
-                out_buf: op.out.0,
-                k: op.k,
-                bn: op.bn,
-            }],
+            crate::tk_codegen::gemm_m1_compute_calls(x_id, w_id, op.out.0, op.k, op.bn),
         );
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
 
@@ -2397,24 +2391,12 @@ pub fn lower_gemm_m1_routed<P: Phase>(
         // Consumer compute body — switch between gmem and smem
         // output based on routing hint.
         body.wait_loop_parity(WarpRole::AllConsumers, PageBarrier::Ready, w_id, loop_var, start);
-        let compute_call = if let Some(y_id) = y_id_opt {
-            crate::tk_codegen::Tk20Call::GemmM1ConsumerBodyInternal {
-                x_id,
-                w_id,
-                y_id,
-                k: op.k,
-                bn: op.bn,
-            }
+        let compute_calls = if let Some(y_id) = y_id_opt {
+            crate::tk_codegen::gemm_m1_compute_calls_internal(x_id, w_id, y_id, op.k, op.bn)
         } else {
-            crate::tk_codegen::Tk20Call::GemmM1ConsumerBody {
-                x_id,
-                w_id,
-                out_buf: op.out.0,
-                k: op.k,
-                bn: op.bn,
-            }
+            crate::tk_codegen::gemm_m1_compute_calls(x_id, w_id, op.out.0, op.k, op.bn)
         };
-        body.compute_calls(WarpRole::AllConsumers, vec![compute_call]);
+        body.compute_calls(WarpRole::AllConsumers, compute_calls);
         body.arrive_loop(WarpRole::AllConsumers, PageBarrier::Done, w_id);
 
         // Storer: free W slot.

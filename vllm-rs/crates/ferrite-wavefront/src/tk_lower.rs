@@ -1308,12 +1308,13 @@ pub fn lower_silu_mul<P: Phase>(
     let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+        crate::tk_codegen::silu_mul_compute_calls(
             g_id,
             u_id,
-            total: op.intermediate as u64 * op.m as u64,
-        }],
+            op.intermediate as u64 * op.m as u64,
+        ),
     );
+
     let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
     let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
 
@@ -1386,12 +1387,13 @@ pub fn lower_silu_mul_routed<P: Phase>(
     let u_page = prog.wait(WarpRole::AllConsumers, PageBarrier::Ready, u_page);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::SiluMulConsumerBody {
+        crate::tk_codegen::silu_mul_compute_calls(
             g_id,
             u_id,
-            total: op.intermediate as u64 * op.m as u64,
-        }],
+            op.intermediate as u64 * op.m as u64,
+        ),
     );
+
     let g_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, g_page);
     let u_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, u_page);
 
@@ -1511,13 +1513,13 @@ pub fn lower_rope_rotate<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+        crate::tk_codegen::rope_compute_calls(
             x_id,
             c_id,
             s_id,
-            head_dim: op.head_dim,
+            op.head_dim,
             total_pairs,
-        }],
+        ),
     );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
@@ -1630,13 +1632,13 @@ pub fn lower_rope_rotate_routed<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
+        crate::tk_codegen::rope_compute_calls(
             x_id,
             c_id,
             s_id,
-            head_dim: op.head_dim,
+            op.head_dim,
             total_pairs,
-        }],
+        ),
     );
     let x_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, x_page);
     let c_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, c_page);
@@ -1848,13 +1850,13 @@ pub fn lower_rope_append<P: Phase>(
     // touched.
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
-            x_id: k_id,
+        crate::tk_codegen::rope_compute_calls(
+            k_id,
             c_id,
             s_id,
-            head_dim: op.head_dim,
+            op.head_dim,
             total_pairs,
-        }],
+        ),
     );
     let _ = half; // silence unused-binding warning if linter complains
     let k_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, k_page);
@@ -2032,13 +2034,13 @@ pub fn lower_rope_append_routed<P: Phase>(
     let total_pairs = (op.m as u64) * (op.num_kv_heads as u64) * (half as u64);
     prog.compute_calls(
         WarpRole::AllConsumers,
-        vec![crate::tk_codegen::Tk20Call::RopeConsumerBody {
-            x_id: k_id,
+        crate::tk_codegen::rope_compute_calls(
+            k_id,
             c_id,
             s_id,
-            head_dim: op.head_dim,
+            op.head_dim,
             total_pairs,
-        }],
+        ),
     );
     let _ = half;
     let k_page = prog.arrive(WarpRole::AllConsumers, PageBarrier::Done, k_page);

@@ -921,86 +921,6 @@ pub mod tk20 {
         )
     }
 
-    /// Emit the SiluMul consumer body. Fused `silu(gate) * up` in
-    /// place on gate's page, all-consumer-warp parallel. Same per-
-    /// thread bf16 + sigmoid-via-`expf` pattern as the legacy fused
-    /// SwiGLU activation path. No TK 2.0 sv-scope `silu` primitive
-    /// exists; the per-thread form matches mk-v2's idiom of treating
-    /// `kittens::sv_bf<N>` as a typed page alias for raw bf16 access.
-    ///
-    /// `g_id` / `u_id`: page slots for gate / up activations.
-    /// `total`: `m * intermediate` element count.
-    pub fn silu_mul_consumer_body(g_id: u8, u_id: u8, total: u64) -> String {
-        format!(
-            r#"
-            // tk_warp_ir SiluMul — silu(gate) * up in place on gate's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __g_smem = reinterpret_cast<T_act*>(page_buf[{g_id}]);
-            auto* __u_smem = reinterpret_cast<T_act*>(page_buf[{u_id}]);
-            const unsigned int __total = {total}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 4 * 32;
-            const int __consumer_threads = 16 * 32;
-            for (unsigned int __i = static_cast<unsigned int>(__tid_in_consumers);
-                 __i < __total; __i += static_cast<unsigned int>(__consumer_threads)) {{
-                const float __g = __bfloat162float(__g_smem[__i]);
-                const float __u = __bfloat162float(__u_smem[__i]);
-                const float __silu_g = __g / (1.0f + expf(-__g));
-                __g_smem[__i] = __float2bfloat16(__silu_g * __u);
-            }}
-"#
-        )
-    }
-
-    /// Emit the RoPE rotate consumer body (NeoX form: pairs `(i,
-    /// i + half)` rotated by `(cos, sin)`). All-consumer-warp
-    /// parallel over `(m * num_heads * head_dim/2)` rotation pairs.
-    /// Used by both `RopeRotate` and `RopeAppend` lowerings.
-    ///
-    /// `x_id` / `c_id` / `s_id`: page slots for the activation, cos
-    /// table, sin table. `head_dim`: per-head width (rotation pairs
-    /// span `(0, head_dim/2)` low and `(head_dim/2, head_dim)` high).
-    /// `total_pairs`: `m * num_heads * (head_dim / 2)` total rotation
-    /// pairs.
-    pub fn rope_consumer_body(
-        x_id: u8,
-        c_id: u8,
-        s_id: u8,
-        head_dim: u32,
-        total_pairs: u64,
-    ) -> String {
-        let half = head_dim / 2;
-        format!(
-            r#"
-            // tk_warp_ir RoPE rotate (NeoX) — in place on x's page (all consumer warps)
-            using T_act = __nv_bfloat16;
-            auto* __x_smem   = reinterpret_cast<T_act*>(page_buf[{x_id}]);
-            auto* __cos_smem = reinterpret_cast<T_act*>(page_buf[{c_id}]);
-            auto* __sin_smem = reinterpret_cast<T_act*>(page_buf[{s_id}]);
-            const unsigned int __head_dim = {head_dim}u;
-            const unsigned int __half     = {half}u;
-            const unsigned int __pairs    = {total_pairs}u;
-            const int __tid_in_consumers =
-                static_cast<int>(threadIdx.x) - 4 * 32;
-            const int __consumer_threads = 16 * 32;
-            for (unsigned int __p = static_cast<unsigned int>(__tid_in_consumers);
-                 __p < __pairs; __p += static_cast<unsigned int>(__consumer_threads)) {{
-                // Decompose pair index → (row * head, lane in head_dim/2).
-                const unsigned int __row_head = __p / __half;
-                const unsigned int __lane     = __p % __half;
-                const unsigned int __i_lo     = __row_head * __head_dim + __lane;
-                const unsigned int __i_hi     = __i_lo + __half;
-                const float __c   = __bfloat162float(__cos_smem[__lane]);
-                const float __s   = __bfloat162float(__sin_smem[__lane]);
-                const float __x_lo = __bfloat162float(__x_smem[__i_lo]);
-                const float __x_hi = __bfloat162float(__x_smem[__i_hi]);
-                __x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);
-                __x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);
-            }}
-"#
-        )
-    }
-
 }
 
 // ── Role routing ───────────────────────────────────────────────────
@@ -1924,6 +1844,42 @@ pub enum Tk20Call {
         rhs: String,
     },
 
+    /// `{smem}[{idx}] = __float2bfloat16({lhs} * {rhs});`
+    Bf16StoreFromFloatMul {
+        smem: String,
+        idx: String,
+        lhs: String,
+        rhs: String,
+    },
+
+    /// `const float {var} = {src} / (1.0f + expf(-{src}));` —
+    /// scalar SiLU activation `x * sigmoid(x)` via `expf`.
+    DeclConstFloatSilu { var: String, src: String },
+
+    /// `{smem}[{idx}] = __float2bfloat16({lhs1} * {rhs1} - {lhs2} * {rhs2});` —
+    /// scalar FMA-sub-store; used for the lo half of NeoX RoPE
+    /// rotation (`x_lo * cos - x_hi * sin`).
+    Bf16StoreFromFloatFmaSub {
+        smem: String,
+        idx: String,
+        lhs1: String,
+        rhs1: String,
+        lhs2: String,
+        rhs2: String,
+    },
+
+    /// `{smem}[{idx}] = __float2bfloat16({lhs1} * {rhs1} + {lhs2} * {rhs2});` —
+    /// scalar FMA-add-store; used for the hi half of NeoX RoPE
+    /// rotation (`x_lo * sin + x_hi * cos`).
+    Bf16StoreFromFloatFmaAdd {
+        smem: String,
+        idx: String,
+        lhs1: String,
+        rhs1: String,
+        lhs2: String,
+        rhs2: String,
+    },
+
     /// `for (uint {iter} = (uint){start}; {iter} < {end}; {iter} += (uint){stride}) { body }`.
     /// Recursively emits each `body` Tk20Call.
     ForLoopThreadStrided {
@@ -2014,23 +1970,6 @@ pub enum Tk20Call {
     /// `tk20::rmsnorm_consumer_body`.
     RmsNormConsumerBody { x_id: u8, w_id: u8, hidden: u32, eps: f32 },
 
-    /// SiluMul consumer compute body. Fused `silu(gate) * up` in
-    /// place on gate's page, all-consumer-warp parallel. Bound
-    /// through `tk20::silu_mul_consumer_body`.
-    SiluMulConsumerBody { g_id: u8, u_id: u8, total: u64 },
-
-    /// RoPE rotate consumer compute body (NeoX pairs). All-consumer-
-    /// warp parallel over `m * num_heads * (head_dim / 2)` rotation
-    /// pairs. Used by both `RopeRotate` and `RopeAppend` lowerings.
-    /// Bound through `tk20::rope_consumer_body`.
-    RopeConsumerBody {
-        x_id: u8,
-        c_id: u8,
-        s_id: u8,
-        head_dim: u32,
-        total_pairs: u64,
-    },
-
     /// GemmM1 consumer compute body. M=1 dot product per consumer
     /// warp (warp `c` produces `y[c]` for `c < bn`), lane-parallel K
     /// reduce via `__shfl_xor_sync`. Bound through
@@ -2081,6 +2020,168 @@ pub enum Tk20Call {
     /// AttnDecode finalise (O = O_accum / l_sum). Bound through
     /// `tk20::attn_decode_finalise_softmax_norm_body`.
     AttnDecodeFinaliseSoftmaxNormBody { unique_id: u32 },
+}
+
+/// Tape-build helper: NeoX RoPE rotate as a typed Tk20Call sequence.
+/// In-place rotation on x's page, all-consumer-warp parallel over
+/// `total_pairs = m * num_heads * (head_dim / 2)` rotation pairs.
+pub fn rope_compute_calls(
+    x_id: u8,
+    c_id: u8,
+    s_id: u8,
+    head_dim: u32,
+    total_pairs: u64,
+) -> Vec<Tk20Call> {
+    let half = head_dim / 2;
+    vec![
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__x_smem".into(),
+            page_id: x_id,
+        },
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__cos_smem".into(),
+            page_id: c_id,
+        },
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__sin_smem".into(),
+            page_id: s_id,
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__head_dim".into(),
+            expr: format!("{head_dim}u"),
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__half".into(),
+            expr: format!("{half}u"),
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__pairs".into(),
+            expr: format!("{total_pairs}u"),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__tid_in_consumers".into(),
+            expr: "static_cast<int>(threadIdx.x) - 4 * 32".into(),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__consumer_threads".into(),
+            expr: "16 * 32".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__p".into(),
+            start_var: "__tid_in_consumers".into(),
+            end_var: "__pairs".into(),
+            stride_var: "__consumer_threads".into(),
+            body: vec![
+                Tk20Call::DeclConstU32 {
+                    var: "__row_head".into(),
+                    expr: "__p / __half".into(),
+                },
+                Tk20Call::DeclConstU32 {
+                    var: "__lane".into(),
+                    expr: "__p % __half".into(),
+                },
+                Tk20Call::DeclConstU32 {
+                    var: "__i_lo".into(),
+                    expr: "__row_head * __head_dim + __lane".into(),
+                },
+                Tk20Call::DeclConstU32 {
+                    var: "__i_hi".into(),
+                    expr: "__i_lo + __half".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__c".into(),
+                    smem: "__cos_smem".into(),
+                    idx: "__lane".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__s".into(),
+                    smem: "__sin_smem".into(),
+                    idx: "__lane".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__x_lo".into(),
+                    smem: "__x_smem".into(),
+                    idx: "__i_lo".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__x_hi".into(),
+                    smem: "__x_smem".into(),
+                    idx: "__i_hi".into(),
+                },
+                Tk20Call::Bf16StoreFromFloatFmaSub {
+                    smem: "__x_smem".into(),
+                    idx: "__i_lo".into(),
+                    lhs1: "__x_lo".into(),
+                    rhs1: "__c".into(),
+                    lhs2: "__x_hi".into(),
+                    rhs2: "__s".into(),
+                },
+                Tk20Call::Bf16StoreFromFloatFmaAdd {
+                    smem: "__x_smem".into(),
+                    idx: "__i_hi".into(),
+                    lhs1: "__x_lo".into(),
+                    rhs1: "__s".into(),
+                    lhs2: "__x_hi".into(),
+                    rhs2: "__c".into(),
+                },
+            ],
+        },
+    ]
+}
+
+/// Tape-build helper: silu·mul as a typed Tk20Call sequence.
+/// `silu(gate) * up` in place on gate's page, all consumer warps.
+pub fn silu_mul_compute_calls(g_id: u8, u_id: u8, total: u64) -> Vec<Tk20Call> {
+    vec![
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__g_smem".into(),
+            page_id: g_id,
+        },
+        Tk20Call::DeclSmemPtrBf16 {
+            var: "__u_smem".into(),
+            page_id: u_id,
+        },
+        Tk20Call::DeclConstU32 {
+            var: "__total".into(),
+            expr: format!("{total}u"),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__tid_in_consumers".into(),
+            expr: "static_cast<int>(threadIdx.x) - 4 * 32".into(),
+        },
+        Tk20Call::DeclConstI32 {
+            var: "__consumer_threads".into(),
+            expr: "16 * 32".into(),
+        },
+        Tk20Call::ForLoopThreadStrided {
+            iter: "__i".into(),
+            start_var: "__tid_in_consumers".into(),
+            end_var: "__total".into(),
+            stride_var: "__consumer_threads".into(),
+            body: vec![
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__g".into(),
+                    smem: "__g_smem".into(),
+                    idx: "__i".into(),
+                },
+                Tk20Call::DeclConstFloatFromBf16Smem {
+                    var: "__u".into(),
+                    smem: "__u_smem".into(),
+                    idx: "__i".into(),
+                },
+                Tk20Call::DeclConstFloatSilu {
+                    var: "__silu_g".into(),
+                    src: "__g".into(),
+                },
+                Tk20Call::Bf16StoreFromFloatMul {
+                    smem: "__g_smem".into(),
+                    idx: "__i".into(),
+                    lhs: "__silu_g".into(),
+                    rhs: "__u".into(),
+                },
+            ],
+        },
+    ]
 }
 
 /// Tape-build helper: residual-add as a typed Tk20Call sequence.
@@ -2176,6 +2277,28 @@ impl Tk20Call {
             Tk20Call::Bf16StoreFromFloatAdd { smem, idx, lhs, rhs } => {
                 format!("{smem}[{idx}] = __float2bfloat16({lhs} + {rhs});")
             }
+            Tk20Call::Bf16StoreFromFloatMul { smem, idx, lhs, rhs } => {
+                format!("{smem}[{idx}] = __float2bfloat16({lhs} * {rhs});")
+            }
+            Tk20Call::DeclConstFloatSilu { var, src } => {
+                format!("const float {var} = {src} / (1.0f + expf(-{src}));")
+            }
+            Tk20Call::Bf16StoreFromFloatFmaSub {
+                smem,
+                idx,
+                lhs1,
+                rhs1,
+                lhs2,
+                rhs2,
+            } => format!("{smem}[{idx}] = __float2bfloat16({lhs1} * {rhs1} - {lhs2} * {rhs2});"),
+            Tk20Call::Bf16StoreFromFloatFmaAdd {
+                smem,
+                idx,
+                lhs1,
+                rhs1,
+                lhs2,
+                rhs2,
+            } => format!("{smem}[{idx}] = __float2bfloat16({lhs1} * {rhs1} + {lhs2} * {rhs2});"),
             Tk20Call::ForLoopThreadStrided {
                 iter,
                 start_var,
@@ -2215,17 +2338,6 @@ impl Tk20Call {
                 eps,
             } => tk20::rmsnorm_consumer_body(*x_id, *w_id, *hidden, *eps),
 
-            Tk20Call::SiluMulConsumerBody { g_id, u_id, total } => {
-                tk20::silu_mul_consumer_body(*g_id, *u_id, *total)
-            }
-
-            Tk20Call::RopeConsumerBody {
-                x_id,
-                c_id,
-                s_id,
-                head_dim,
-                total_pairs,
-            } => tk20::rope_consumer_body(*x_id, *c_id, *s_id, *head_dim, *total_pairs),
 
             Tk20Call::GemmM1ConsumerBody {
                 x_id,
@@ -2850,29 +2962,31 @@ mod tests {
     // spelling, which is the load-bearing audit gate.
 
     #[test]
-    fn tk20_silu_mul_consumer_body_emits_legacy_compatible_cuda() {
-        let body = tk20::silu_mul_consumer_body(0, 1, 8192);
-        assert!(body.contains("auto* __g_smem = reinterpret_cast<T_act*>(page_buf[0]);"));
-        assert!(body.contains("auto* __u_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
+    fn silu_mul_compute_calls_emit_atomic_typed_primitives() {
+        let calls = silu_mul_compute_calls(0, 1, 8192);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("auto* __g_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[0]);"));
+        assert!(body.contains("auto* __u_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[1]);"));
         assert!(body.contains("const unsigned int __total = 8192u;"));
         assert!(body.contains("const float __silu_g = __g / (1.0f + expf(-__g));"));
-        assert!(body.contains("__float2bfloat16(__silu_g * __u)"));
+        assert!(body.contains("__g_smem[__i] = __float2bfloat16(__silu_g * __u);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
     }
 
     #[test]
-    fn tk20_rope_consumer_body_emits_legacy_compatible_cuda() {
-        let body = tk20::rope_consumer_body(0, 1, 2, 64, 32);
-        assert!(body.contains("auto* __x_smem   = reinterpret_cast<T_act*>(page_buf[0]);"));
-        assert!(body.contains("auto* __cos_smem = reinterpret_cast<T_act*>(page_buf[1]);"));
-        assert!(body.contains("auto* __sin_smem = reinterpret_cast<T_act*>(page_buf[2]);"));
+    fn rope_compute_calls_emit_atomic_typed_primitives() {
+        let calls = rope_compute_calls(0, 1, 2, 64, 32);
+        let body: String = calls.iter().map(|c| c.emit()).collect::<Vec<_>>().join(" ");
+        assert!(body.contains("auto* __x_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[0]);"));
+        assert!(body.contains("auto* __cos_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[1]);"));
+        assert!(body.contains("auto* __sin_smem = reinterpret_cast<__nv_bfloat16*>(page_buf[2]);"));
         assert!(body.contains("const unsigned int __head_dim = 64u;"));
-        assert!(body.contains("const unsigned int __half     = 32u;"));
-        assert!(body.contains("const unsigned int __pairs    = 32u;"));
+        assert!(body.contains("const unsigned int __half = 32u;"));
+        assert!(body.contains("const unsigned int __pairs = 32u;"));
         // NeoX rotation pair math: __x_lo * cos - __x_hi * sin.
-        assert!(body.contains("__float2bfloat16(__x_lo * __c - __x_hi * __s)"));
-        assert!(body.contains("__float2bfloat16(__x_lo * __s + __x_hi * __c)"));
+        assert!(body.contains("__x_smem[__i_lo] = __float2bfloat16(__x_lo * __c - __x_hi * __s);"));
+        assert!(body.contains("__x_smem[__i_hi] = __float2bfloat16(__x_lo * __s + __x_hi * __c);"));
         assert!(!body.contains("kittens::tma::"));
         assert!(!body.contains("kittens::warp::mma_AB"));
     }

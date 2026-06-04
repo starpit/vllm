@@ -895,15 +895,17 @@ mod tests {
         // 14 sources + 12 ops = 26 buffer ids.
         assert_eq!(n_bufs, 14 + 12);
 
-        // Each op's body comment fired at least once.
+        // Each op's body fired at least once. Decomposed bodies
+        // expose unique identifiers from the typed Tk20Call sequence
+        // instead of the legacy marker comments.
         assert!(src.contains("RmsNorm"), "{src}");
         assert!(src.contains("GemmM1"), "{src}");
-        assert!(src.contains("RoPE rotate"), "{src}");
+        // RoPE: __pairs / __x_lo / __x_hi unique to rope_compute_calls.
+        assert!(src.contains("__pairs"), "{src}");
         assert!(src.contains("AttnDecode"), "{src}");
-        assert!(src.contains("SiluMul"), "{src}");
-        // Residual-Add body decomposed into atomic Tk20Calls — check
-        // a uniquely-residual-add identifier instead of the old
-        // marker comment.
+        // SiluMul: __silu_g unique to silu_mul_compute_calls.
+        assert!(src.contains("__silu_g"), "{src}");
+        // Residual-Add: __a_smem / __b_smem unique to residual_add_compute_calls.
         assert!(src.contains("__a_smem"), "{src}");
         assert!(src.contains("__b_smem"), "{src}");
     }

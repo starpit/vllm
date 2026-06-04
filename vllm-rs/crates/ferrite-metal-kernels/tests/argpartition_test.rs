@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Argsort kernel parity test — compare against a CPU stable sort
 //! (ties broken by index) for the MoE router shapes Mixtral (E=8),
-//! Qwen2-MoE (E=60), Qwen3-MoE (E=128).
+//! Qwen2-MoE (E=60), Qwen3-MoE (E=128), Qwen3.5-MoE (E=256, the
+//! bn=64 / N_PER_BLOCK=256 instantiation).
 //!
 //! Top-k semantics: the trailing `top_k` indices of the sorted-
 //! ascending output are the indices of the top-k entries by value.
 
 use ferrite_metal_kernels::argpartition::{dispatch_argsort, ArgsortDType, ArgsortKernels};
 use ferrite_metal_kernels::device::detect_device;
-use half::f16;
+use half::{bf16, f16};
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 
 fn fill_random_f32(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
@@ -43,16 +44,59 @@ fn cpu_argsort_ascending_f32(input: &[f32], rows: usize, cols: usize) -> Vec<u32
     out
 }
 
-fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
+/// One parity case at any router dtype. Host values are generated
+/// as f32; for the half dtypes the GPU input is the cast values and
+/// the CPU reference sorts the SAME rounded values (so reference and
+/// kernel see identical keys).
+fn run_case(dtype: ArgsortDType, rows: usize, cols: usize, top_k: usize, seed: u64) {
     let mdev = detect_device().expect("metal device");
     let queue = mdev.device.newCommandQueue().expect("queue");
     let kernels = ArgsortKernels::new(&mdev.device).expect("argsort kernels");
 
     let host = fill_random_f32(rows, cols, seed);
-    let in_bytes = host.len() * 4;
+    // (gpu input bytes, the values the CPU reference must sort)
+    let (in_host_bytes, cmp_host): (Vec<u8>, Vec<f32>) = match dtype {
+        ArgsortDType::F32 => {
+            let mut bytes = vec![0u8; host.len() * 4];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    host.as_ptr() as *const u8,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+            (bytes, host.clone())
+        }
+        ArgsortDType::F16 => {
+            let cast: Vec<f16> = host.iter().map(|&v| f16::from_f32(v)).collect();
+            let mut bytes = vec![0u8; cast.len() * 2];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    cast.as_ptr() as *const u8,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+            (bytes, cast.iter().map(|v| v.to_f32()).collect())
+        }
+        ArgsortDType::Bf16 => {
+            let cast: Vec<bf16> = host.iter().map(|&v| bf16::from_f32(v)).collect();
+            let mut bytes = vec![0u8; cast.len() * 2];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    cast.as_ptr() as *const u8,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                );
+            }
+            (bytes, cast.iter().map(|v| v.to_f32()).collect())
+        }
+        other => unreachable!("router-prob parity cases are float-typed, got {other:?}"),
+    };
+
     let in_buf = mdev
         .device
-        .newBufferWithLength_options(in_bytes, MTLResourceOptions::StorageModeShared)
+        .newBufferWithLength_options(in_host_bytes.len(), MTLResourceOptions::StorageModeShared)
         .expect("in buf");
     let out_bytes = rows * cols * 4;
     let out_buf = mdev
@@ -62,9 +106,9 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
 
     unsafe {
         std::ptr::copy_nonoverlapping(
-            host.as_ptr() as *const u8,
+            in_host_bytes.as_ptr(),
             in_buf.contents().as_ptr() as *mut u8,
-            in_bytes,
+            in_host_bytes.len(),
         );
     }
 
@@ -75,7 +119,7 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
         &out_buf,
         rows as u32,
         cols as u32,
-        ArgsortDType::F32,
+        dtype,
     )
     .expect("argsort dispatch");
 
@@ -88,7 +132,7 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
         );
     }
 
-    let want = cpu_argsort_ascending_f32(&host, rows, cols);
+    let want = cpu_argsort_ascending_f32(&cmp_host, rows, cols);
 
     // Compare trailing top-k slot by slot: those should be exactly
     // the top-k indices (stable order). The interior of the sort
@@ -105,7 +149,8 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
         want_topk.sort();
         assert_eq!(
             got_topk, want_topk,
-            "row {r}: top-{top_k} indices differ (got={got_topk:?}, want={want_topk:?})"
+            "row {r}: {dtype:?} top-{top_k} indices differ \
+             (got={got_topk:?}, want={want_topk:?})"
         );
     }
 }
@@ -113,14 +158,13 @@ fn run_f32(rows: usize, cols: usize, top_k: usize, seed: u64) {
 #[test]
 fn argsort_f32_mixtral_topk() {
     // E=8, top_k=2 (Mixtral default).
-    run_f32(
-        /*rows=*/ 11, /*cols=*/ 8, /*top_k=*/ 2, 0xC0FFEE,
-    );
+    run_case(ArgsortDType::F32, /*rows=*/ 11, /*cols=*/ 8, /*top_k=*/ 2, 0xC0FFEE);
 }
 
 #[test]
 fn argsort_f32_qwen2_moe_topk() {
-    run_f32(
+    run_case(
+        ArgsortDType::F32,
         /*rows=*/ 7,
         /*cols=*/ 60,
         /*top_k=*/ 4,
@@ -130,7 +174,8 @@ fn argsort_f32_qwen2_moe_topk() {
 
 #[test]
 fn argsort_f32_qwen3_moe_topk() {
-    run_f32(
+    run_case(
+        ArgsortDType::F32,
         /*rows=*/ 13,
         /*cols=*/ 128,
         /*top_k=*/ 8,
@@ -140,71 +185,22 @@ fn argsort_f32_qwen3_moe_topk() {
 
 #[test]
 fn argsort_f16_qwen3_moe_topk() {
-    // bf16 not exercised here — the lowering arm upcasts router
-    // probs to float (precise softmax output is float-then-cast).
-    let mdev = detect_device().expect("metal device");
-    let queue = mdev.device.newCommandQueue().expect("queue");
-    let kernels = ArgsortKernels::new(&mdev.device).expect("argsort kernels");
-
-    let host = fill_random_f32(13, 128, 0x5EED);
-    let host_f16: Vec<f16> = host.iter().map(|&v| f16::from_f32(v)).collect();
-
-    let in_bytes = host_f16.len() * 2;
-    let in_buf = mdev
-        .device
-        .newBufferWithLength_options(in_bytes, MTLResourceOptions::StorageModeShared)
-        .expect("in buf");
-    let out_buf = mdev
-        .device
-        .newBufferWithLength_options(13 * 128 * 4, MTLResourceOptions::StorageModeShared)
-        .expect("out buf");
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            host_f16.as_ptr() as *const u8,
-            in_buf.contents().as_ptr() as *mut u8,
-            in_bytes,
-        );
-    }
-
-    dispatch_argsort(
-        &kernels,
-        &queue,
-        &in_buf,
-        &out_buf,
-        13,
-        128,
+    // f16 router path at E=128.
+    run_case(
         ArgsortDType::F16,
-    )
-    .expect("argsort f16");
-
-    let mut got = vec![0u32; 13 * 128];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            out_buf.contents().as_ptr() as *const u8,
-            got.as_mut_ptr() as *mut u8,
-            13 * 128 * 4,
-        );
-    }
-
-    let host_f32_round: Vec<f32> = host_f16.iter().map(|v| v.to_f32()).collect();
-    let want = cpu_argsort_ascending_f32(&host_f32_round, 13, 128);
-
-    for r in 0..13 {
-        let base = r * 128;
-        let mut got_topk: Vec<u32> = got[base + 128 - 8..base + 128].to_vec();
-        let mut want_topk: Vec<u32> = want[base + 128 - 8..base + 128].to_vec();
-        got_topk.sort();
-        want_topk.sort();
-        assert_eq!(got_topk, want_topk, "row {r} f16 top-8 mismatch");
-    }
+        /*rows=*/ 13,
+        /*cols=*/ 128,
+        /*top_k=*/ 8,
+        0x5EED,
+    );
 }
 
 #[test]
 fn argsort_f32_qwen3_5_moe_topk_bn64() {
     // E=256, top_k=8 (Qwen3.5-MoE-35B-A3B) — exercises the bn=64
     // (N_PER_BLOCK=256) instantiation via pick_pipeline_shape.
-    run_f32(
+    run_case(
+        ArgsortDType::F32,
         /*rows=*/ 9,
         /*cols=*/ 256,
         /*top_k=*/ 8,
@@ -215,122 +211,24 @@ fn argsort_f32_qwen3_5_moe_topk_bn64() {
 #[test]
 fn argsort_f16_qwen3_5_moe_topk_bn64() {
     // E=256 f16 — the W::METAL_DTYPE=F16 router path at bn=64.
-    let mdev = detect_device().expect("metal device");
-    let queue = mdev.device.newCommandQueue().expect("queue");
-    let kernels = ArgsortKernels::new(&mdev.device).expect("argsort kernels");
-
-    let host = fill_random_f32(9, 256, 0xACE0_F16);
-    let host_f16: Vec<f16> = host.iter().map(|&v| f16::from_f32(v)).collect();
-
-    let in_bytes = host_f16.len() * 2;
-    let in_buf = mdev
-        .device
-        .newBufferWithLength_options(in_bytes, MTLResourceOptions::StorageModeShared)
-        .expect("in buf");
-    let out_buf = mdev
-        .device
-        .newBufferWithLength_options(9 * 256 * 4, MTLResourceOptions::StorageModeShared)
-        .expect("out buf");
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            host_f16.as_ptr() as *const u8,
-            in_buf.contents().as_ptr() as *mut u8,
-            in_bytes,
-        );
-    }
-
-    dispatch_argsort(
-        &kernels,
-        &queue,
-        &in_buf,
-        &out_buf,
-        9,
-        256,
+    run_case(
         ArgsortDType::F16,
-    )
-    .expect("argsort f16 bn64");
-
-    let mut got = vec![0u32; 9 * 256];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            out_buf.contents().as_ptr() as *const u8,
-            got.as_mut_ptr() as *mut u8,
-            9 * 256 * 4,
-        );
-    }
-
-    let host_f32_round: Vec<f32> = host_f16.iter().map(|v| v.to_f32()).collect();
-    let want = cpu_argsort_ascending_f32(&host_f32_round, 9, 256);
-
-    for r in 0..9 {
-        let base = r * 256;
-        let mut got_topk: Vec<u32> = got[base + 256 - 8..base + 256].to_vec();
-        let mut want_topk: Vec<u32> = want[base + 256 - 8..base + 256].to_vec();
-        got_topk.sort();
-        want_topk.sort();
-        assert_eq!(got_topk, want_topk, "row {r} f16 bn64 top-8 mismatch");
-    }
+        /*rows=*/ 9,
+        /*cols=*/ 256,
+        /*top_k=*/ 8,
+        0xACE0_F16,
+    );
 }
 
 #[test]
 fn argsort_bf16_qwen3_5_moe_topk_bn64() {
     // E=256 bf16 — the W::METAL_DTYPE=Bf16 router path at bn=64
     // (Qwen3.x MLX checkpoints carry bf16 scales → bf16 router probs).
-    let mdev = detect_device().expect("metal device");
-    let queue = mdev.device.newCommandQueue().expect("queue");
-    let kernels = ArgsortKernels::new(&mdev.device).expect("argsort kernels");
-
-    let host = fill_random_f32(9, 256, 0xBF16_CAFE);
-    let host_bf16: Vec<half::bf16> = host.iter().map(|&v| half::bf16::from_f32(v)).collect();
-
-    let in_bytes = host_bf16.len() * 2;
-    let in_buf = mdev
-        .device
-        .newBufferWithLength_options(in_bytes, MTLResourceOptions::StorageModeShared)
-        .expect("in buf");
-    let out_buf = mdev
-        .device
-        .newBufferWithLength_options(9 * 256 * 4, MTLResourceOptions::StorageModeShared)
-        .expect("out buf");
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            host_bf16.as_ptr() as *const u8,
-            in_buf.contents().as_ptr() as *mut u8,
-            in_bytes,
-        );
-    }
-
-    dispatch_argsort(
-        &kernels,
-        &queue,
-        &in_buf,
-        &out_buf,
-        9,
-        256,
+    run_case(
         ArgsortDType::Bf16,
-    )
-    .expect("argsort bf16 bn64");
-
-    let mut got = vec![0u32; 9 * 256];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            out_buf.contents().as_ptr() as *const u8,
-            got.as_mut_ptr() as *mut u8,
-            9 * 256 * 4,
-        );
-    }
-
-    let host_f32_round: Vec<f32> = host_bf16.iter().map(|v| v.to_f32()).collect();
-    let want = cpu_argsort_ascending_f32(&host_f32_round, 9, 256);
-
-    for r in 0..9 {
-        let base = r * 256;
-        let mut got_topk: Vec<u32> = got[base + 256 - 8..base + 256].to_vec();
-        let mut want_topk: Vec<u32> = want[base + 256 - 8..base + 256].to_vec();
-        got_topk.sort();
-        want_topk.sort();
-        assert_eq!(got_topk, want_topk, "row {r} bf16 bn64 top-8 mismatch");
-    }
+        /*rows=*/ 9,
+        /*cols=*/ 256,
+        /*top_k=*/ 8,
+        0xBF16_CAFE,
+    );
 }

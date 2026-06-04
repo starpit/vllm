@@ -1019,6 +1019,65 @@ fn model_params_from_json_mode(
     }
 }
 
+/// Shared field parsers for the decoder / vision `ModelParams`
+/// heads. Both construction paths call these on their respective
+/// json view (decoder: normalized/hoisted; vision: raw) so a field's
+/// extraction logic lives once.
+fn parse_name(source_stem: &str, source_path: &Path) -> Result<String, ConfigError> {
+    stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
+        path: source_path.to_path_buf(),
+        reason,
+    })
+}
+
+fn parse_architectures(json: &serde_json::Value) -> Vec<String> {
+    json.get("architectures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_quantization(
+    json: &serde_json::Value,
+    source_path: &Path,
+) -> Result<Option<crate::quantization::QuantizationConfig>, ConfigError> {
+    crate::quantization::QuantizationConfig::parse(json).map_err(|e| ConfigError::Quantization {
+        path: source_path.to_path_buf(),
+        source: e,
+    })
+}
+
+/// `None` (field absent) lets `apply_arch_semantic_defaults` supply
+/// the family's modeling-code default (HF's own default is TRUE;
+/// gemma2/gemma3 checkpoints rely on it); explicit json wins.
+fn parse_tie_word_embeddings(json: &serde_json::Value) -> Option<bool> {
+    json.get("tie_word_embeddings").and_then(|v| v.as_bool())
+}
+
+/// Top-level `torch_dtype` → `text_config.torch_dtype` →
+/// `text_config.dtype` (newer transformers serialization: Qwen3.5
+/// wrappers carry the compute dtype only as `text_config.dtype`,
+/// which the hoist surfaces as `dtype`, never `torch_dtype`).
+fn parse_torch_dtype(json: &serde_json::Value) -> Option<String> {
+    json.get("torch_dtype")
+        .or_else(|| {
+            json.get("text_config")
+                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
+        })
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+fn parse_decoder_safetensors_prefix(json: &serde_json::Value) -> Option<String> {
+    json.get("decoder_safetensors_prefix")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 fn model_params_from_json(
     json: &serde_json::Value,
     source_stem: &str,
@@ -1026,32 +1085,13 @@ fn model_params_from_json(
     extra_tracked_paths: Vec<PathBuf>,
 ) -> Result<ModelParams, ConfigError> {
     let json = &normalize_hf_config(json);
-    let name = stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
-        path: source_path.to_path_buf(),
-        reason,
-    })?;
+    let name = parse_name(source_stem, source_path)?;
     let mut bounds = extract_bounds(json);
     derive_implicit_bounds(&mut bounds);
     let scalars = extract_scalars(json);
-    let quantization = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
-        ConfigError::Quantization {
-            path: source_path.to_path_buf(),
-            source: e,
-        }
-    })?;
-    // `None` (field absent) lets `apply_arch_semantic_defaults`
-    // supply the family's modeling-code default (HF's own default is
-    // TRUE; gemma3 checkpoints rely on it); explicit json wins.
-    let mut tie_word_embeddings = json.get("tie_word_embeddings").and_then(|v| v.as_bool());
-    let architectures: Vec<String> = json
-        .get("architectures")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let quantization = parse_quantization(json, source_path)?;
+    let mut tie_word_embeddings = parse_tie_word_embeddings(json);
+    let architectures = parse_architectures(json);
     let rope_scaling = extract_rope_scaling(json);
     let rope_scaling_hash = json.get("rope_scaling").map(hash_json_value);
     let mrope_section = extract_mrope_section(json);
@@ -1062,23 +1102,8 @@ fn model_params_from_json(
         .get("vision_pos_embed_key")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let mut decoder_safetensors_prefix = json
-        .get("decoder_safetensors_prefix")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    // Top-level → `text_config.torch_dtype` → `text_config.dtype`
-    // (newer transformers serialization: Qwen3.5 wrappers carry the
-    // compute dtype only as `text_config.dtype`, which the hoist
-    // surfaces as `dtype`, never `torch_dtype`). Same chain as the
-    // vision path.
-    let torch_dtype = json
-        .get("torch_dtype")
-        .or_else(|| {
-            json.get("text_config")
-                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
-        })
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase());
+    let mut decoder_safetensors_prefix = parse_decoder_safetensors_prefix(json);
+    let torch_dtype = parse_torch_dtype(json);
 
     apply_arch_semantic_defaults(
         &architectures,
@@ -1135,16 +1160,119 @@ enum VisionFamily {
     Gemma3,
 }
 
+/// Arch-string family predicates — the single source of truth for
+/// the prefix spellings, shared by [`VisionFamily::detect`] and
+/// [`apply_arch_semantic_defaults`]. Keeping these in one place is
+/// load-bearing: the vision path runs BOTH detect and the semantic
+/// defaults over the same `architectures` array, and if the two
+/// drifted a family could derive its vision geometry yet miss its
+/// modeling defaults (rms_norm_zero_centered, decoder prefix, tie).
+fn is_qwen3_5_family_arch(a: &str) -> bool {
+    a.starts_with("Qwen3_5") || a.starts_with("Qwen3_6")
+}
+fn is_gemma3_family_arch(a: &str) -> bool {
+    a.starts_with("Gemma3")
+}
+fn is_gemma2_family_arch(a: &str) -> bool {
+    a.starts_with("Gemma2")
+}
+
+/// Per-family data the vision derivation consumes — one compiler-
+/// forced site per family. Everything that previously lived in
+/// scattered `match family { .. , _ => None }` chains (whose
+/// wildcard arms silently handed a NEW family the Qwen defaults)
+/// is a field here instead: adding a [`VisionFamily`] variant now
+/// fails to compile until its spec names every key spelling and
+/// every structural sidecar.
+struct VisionFamilySpec {
+    /// `vision_config` key spellings for the shared tower geometry.
+    /// (Qwen2-VL: `embed_dim`/`num_heads`/`in_chans`; Qwen2.5-VL:
+    /// embed dim is `hidden_size`; Qwen3.5: chans is `in_channels`;
+    /// Gemma3/SigLIP: transformers-standard names.)
+    embed_key: &'static str,
+    depth_key: &'static str,
+    heads_key: &'static str,
+    chans_key: &'static str,
+    /// Rotary towers (every Qwen VL) rope half the head dim;
+    /// SigLIP uses a learned absolute pos-embed and no rope at all
+    /// (`vision_rope_half_dim = 0`).
+    rope: bool,
+    /// `vision_config` key carrying the block-norm eps. `None` =
+    /// the family's modeling code hardcodes 1e-6 (transformers
+    /// Qwen2VL/Qwen2_5_VL/Qwen3_5 vision blocks, mlx-vlm likewise).
+    norm_eps_key: Option<&'static str>,
+    /// Structural weight-layout sidecars. `None` = the Qwen2-VL
+    /// convention via `qwen_default()` at the use sites
+    /// (vision_glue / codegen).
+    layout: Option<VisionSafetensorsLayout>,
+    fingerprint: Option<VisionDModelFingerprint>,
+    patch_embed_flatten: Option<VisionPatchEmbedFlatten>,
+    /// Learned pos-embed table interpolated host-side per forward
+    /// (Qwen3.5-VL only); see [`ModelParams::vision_pos_embed_key`].
+    pos_embed_key: Option<&'static str>,
+}
+
 impl VisionFamily {
     fn detect(architectures: &[String]) -> Option<Self> {
         match architectures.first().map(String::as_str) {
             Some("Qwen2VLForConditionalGeneration") => Some(Self::Qwen2Vl),
             Some("Qwen2_5_VLForConditionalGeneration") => Some(Self::Qwen2_5Vl),
-            Some(a) if a.starts_with("Qwen3_5") || a.starts_with("Qwen3_6") => {
-                Some(Self::Qwen3_5Vl)
-            }
+            Some(a) if is_qwen3_5_family_arch(a) => Some(Self::Qwen3_5Vl),
             Some("Gemma3ForConditionalGeneration") => Some(Self::Gemma3),
             _ => None,
+        }
+    }
+
+    fn spec(self) -> VisionFamilySpec {
+        match self {
+            Self::Qwen2Vl => VisionFamilySpec {
+                embed_key: "embed_dim",
+                depth_key: "depth",
+                heads_key: "num_heads",
+                chans_key: "in_chans",
+                rope: true,
+                norm_eps_key: None,
+                layout: None,
+                fingerprint: None,
+                patch_embed_flatten: None,
+                pos_embed_key: None,
+            },
+            Self::Qwen2_5Vl => VisionFamilySpec {
+                embed_key: "hidden_size",
+                depth_key: "depth",
+                heads_key: "num_heads",
+                chans_key: "in_chans",
+                rope: true,
+                norm_eps_key: None,
+                layout: None,
+                fingerprint: None,
+                patch_embed_flatten: None,
+                pos_embed_key: None,
+            },
+            Self::Qwen3_5Vl => VisionFamilySpec {
+                embed_key: "hidden_size",
+                depth_key: "depth",
+                heads_key: "num_heads",
+                chans_key: "in_channels",
+                rope: true,
+                norm_eps_key: None,
+                layout: Some(VisionSafetensorsLayout::qwen3_5_default()),
+                fingerprint: Some(VisionDModelFingerprint::qwen3_5_default()),
+                patch_embed_flatten: Some(VisionPatchEmbedFlatten::qwen3_5_default()),
+                pos_embed_key: Some("vision_tower.pos_embed.weight"),
+            },
+            Self::Gemma3 => VisionFamilySpec {
+                embed_key: "hidden_size",
+                depth_key: "num_hidden_layers",
+                heads_key: "num_attention_heads",
+                chans_key: "num_channels",
+                rope: false,
+                norm_eps_key: Some("layer_norm_eps"),
+                layout: Some(VisionSafetensorsLayout::gemma3_default()),
+                fingerprint: Some(VisionDModelFingerprint::gemma3_default()),
+                patch_embed_flatten: Some(VisionPatchEmbedFlatten::gemma3_default()),
+                pos_embed_key: None,
+            },
         }
     }
 }
@@ -1172,28 +1300,19 @@ fn vision_params_from_json(
     source_path: &Path,
     extra_tracked_paths: Vec<PathBuf>,
 ) -> Result<ModelParams, ConfigError> {
-    let name = stem_to_ident(source_stem).map_err(|reason| ConfigError::BadStem {
-        path: source_path.to_path_buf(),
-        reason,
-    })?;
-    let architectures: Vec<String> = json
-        .get("architectures")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let name = parse_name(source_stem, source_path)?;
+    let architectures = parse_architectures(json);
     let family = VisionFamily::detect(&architectures).ok_or_else(|| {
         ConfigError::VisionDerivation {
             path: source_path.to_path_buf(),
             reason: format!(
                 "unknown VL arch family {architectures:?} — teach \
-                 VisionFamily::detect + derive_vision_bounds the new family",
+                 VisionFamily::detect + VisionFamily::spec + \
+                 derive_vision_bounds the new family",
             ),
         }
     })?;
+    let spec = family.spec();
 
     // Flat harvest restricted to the vision namespace: `d_model` +
     // `vision_*` integers, minus the wrapper's `vision_*_token_id`
@@ -1210,7 +1329,7 @@ fn vision_params_from_json(
                 .collect()
         })
         .unwrap_or_default();
-    derive_vision_bounds(json, family, &mut bounds, source_path)?;
+    derive_vision_bounds(json, family, &spec, &mut bounds, source_path)?;
 
     // Mirror of the decoder path's int/float double-counting: every
     // derived integer bound is also visible as a scalar, plus the
@@ -1220,16 +1339,12 @@ fn vision_params_from_json(
     let norm_eps = json
         .get("vision_norm_eps")
         .and_then(|v| v.as_f64())
-        .or_else(|| match family {
-            // SigLIP carries a real eps key; Qwen vision towers
-            // don't — their modeling code hardcodes 1e-6
-            // (transformers Qwen2VL/Qwen2_5_VL/Qwen3_5 vision
-            // blocks, mlx-vlm likewise).
-            VisionFamily::Gemma3 => json
-                .get("vision_config")
-                .and_then(|vc| vc.get("layer_norm_eps"))
-                .and_then(|v| v.as_f64()),
-            _ => None,
+        .or_else(|| {
+            spec.norm_eps_key.and_then(|key| {
+                json.get("vision_config")
+                    .and_then(|vc| vc.get(key))
+                    .and_then(|v| v.as_f64())
+            })
         })
         .unwrap_or(1e-6);
     scalars.insert("vision_norm_eps".to_string(), norm_eps);
@@ -1238,61 +1353,28 @@ fn vision_params_from_json(
     // family modeling default, same as the decoder path. Inert
     // vision-side either way — lm_head tying is text-decoder
     // identity.
-    let mut tie_word_embeddings = json.get("tie_word_embeddings").and_then(|v| v.as_bool());
+    let mut tie_word_embeddings = parse_tie_word_embeddings(json);
 
-    let quantization = crate::quantization::QuantizationConfig::parse(json).map_err(|e| {
-        ConfigError::Quantization {
-            path: source_path.to_path_buf(),
-            source: e,
-        }
-    })?;
+    let quantization = parse_quantization(json, source_path)?;
 
     // Structural weight-layout sidecars: explicit JSON fields win
-    // (the `.overrides.json` surface), else the arch family implies
-    // them. Qwen2-VL / Qwen2.5-VL take the `qwen_default()`s at the
-    // use sites (vision_glue / codegen), so `None` here.
-    let vision_layout = extract_vision_layout(json).or_else(|| match family {
-        VisionFamily::Qwen3_5Vl => Some(VisionSafetensorsLayout::qwen3_5_default()),
-        VisionFamily::Gemma3 => Some(VisionSafetensorsLayout::gemma3_default()),
-        _ => None,
-    });
+    // (the `.overrides.json` surface), else the family spec implies
+    // them (`None` in the spec = the Qwen2-VL `qwen_default()`s at
+    // the use sites).
+    let vision_layout = extract_vision_layout(json).or(spec.layout);
     let vision_d_model_fingerprint =
-        extract_vision_d_model_fingerprint(json).or_else(|| match family {
-            VisionFamily::Qwen3_5Vl => Some(VisionDModelFingerprint::qwen3_5_default()),
-            VisionFamily::Gemma3 => Some(VisionDModelFingerprint::gemma3_default()),
-            _ => None,
-        });
+        extract_vision_d_model_fingerprint(json).or(spec.fingerprint);
     let vision_patch_embed_flatten =
-        extract_vision_patch_embed_flatten(json).or_else(|| match family {
-            VisionFamily::Qwen3_5Vl => Some(VisionPatchEmbedFlatten::qwen3_5_default()),
-            VisionFamily::Gemma3 => Some(VisionPatchEmbedFlatten::gemma3_default()),
-            _ => None,
-        });
+        extract_vision_patch_embed_flatten(json).or(spec.patch_embed_flatten);
     let vision_pos_embed_key = json
         .get("vision_pos_embed_key")
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .or_else(|| match family {
-            VisionFamily::Qwen3_5Vl => Some("vision_tower.pos_embed.weight".to_string()),
-            _ => None,
-        });
+        .or_else(|| spec.pos_embed_key.map(str::to_string));
 
-    // top-level `torch_dtype` (Qwen2-VL flat / Gemma3 wrapper) →
-    // `text_config.torch_dtype` → `text_config.dtype` (newer
-    // transformers serialization, e.g. Qwen3.5).
-    let torch_dtype = json
-        .get("torch_dtype")
-        .or_else(|| {
-            json.get("text_config")
-                .and_then(|t| t.get("torch_dtype").or_else(|| t.get("dtype")))
-        })
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase());
+    let torch_dtype = parse_torch_dtype(json);
 
-    let mut decoder_safetensors_prefix = json
-        .get("decoder_safetensors_prefix")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let mut decoder_safetensors_prefix = parse_decoder_safetensors_prefix(json);
     apply_arch_semantic_defaults(
         &architectures,
         &mut bounds,
@@ -1334,6 +1416,7 @@ fn vision_params_from_json(
 fn derive_vision_bounds(
     json: &serde_json::Value,
     family: VisionFamily,
+    spec: &VisionFamilySpec,
     bounds: &mut BTreeMap<String, u64>,
     source_path: &Path,
 ) -> Result<(), ConfigError> {
@@ -1345,21 +1428,14 @@ fn derive_vision_bounds(
     let vcu = |k: &str| vc.and_then(|o| o.get(k)).and_then(|v| v.as_u64());
     let vcf = |k: &str| vc.and_then(|o| o.get(k)).and_then(|v| v.as_f64());
 
-    // Per-family vision_config key spellings for the shared
-    // geometry. (Qwen2-VL: `embed_dim`/`num_heads`/`in_chans`;
-    // Qwen2.5-VL: embed dim is `hidden_size`; Qwen3.5: chans is
-    // `in_channels`; Gemma3/SigLIP: transformers-standard names.)
-    let (embed_key, depth_key, heads_key, chans_key) = match family {
-        VisionFamily::Qwen2Vl => ("embed_dim", "depth", "num_heads", "in_chans"),
-        VisionFamily::Qwen2_5Vl => ("hidden_size", "depth", "num_heads", "in_chans"),
-        VisionFamily::Qwen3_5Vl => ("hidden_size", "depth", "num_heads", "in_channels"),
-        VisionFamily::Gemma3 => (
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_channels",
-        ),
-    };
+    // Per-family vision_config key spellings come from the spec —
+    // see [`VisionFamilySpec`].
+    let (embed_key, depth_key, heads_key, chans_key) = (
+        spec.embed_key,
+        spec.depth_key,
+        spec.heads_key,
+        spec.chans_key,
+    );
     let got = |bounds: &BTreeMap<String, u64>, k: &str| bounds.get(k).copied();
 
     let embed = got(bounds, "vision_embed_dim")
@@ -1411,14 +1487,11 @@ fn derive_vision_bounds(
     bounds
         .entry("vision_merge_hidden".to_string())
         .or_insert(embed * merge * merge);
-    // Rotary towers (every Qwen VL) rope half the head dim; SigLIP
-    // uses a learned absolute pos-embed and no rope at all.
+    // Rotary towers rope half the head dim; non-rope towers
+    // (SigLIP's learned absolute pos-embed) carry 0.
     bounds
         .entry("vision_rope_half_dim".to_string())
-        .or_insert(match family {
-            VisionFamily::Gemma3 => 0,
-            _ => head_dim / 2,
-        });
+        .or_insert(if spec.rope { head_dim / 2 } else { 0 });
 
     match family {
         VisionFamily::Qwen2Vl => {
@@ -1970,11 +2043,12 @@ fn apply_arch_semantic_defaults(
     decoder_safetensors_prefix: &mut Option<String>,
     tie_word_embeddings: &mut Option<bool>,
 ) {
-    let qwen3_5_family = architectures
-        .iter()
-        .any(|a| a.starts_with("Qwen3_5") || a.starts_with("Qwen3_6"));
-    let gemma3_family = architectures.iter().any(|a| a.starts_with("Gemma3"));
-    let gemma2_family = architectures.iter().any(|a| a.starts_with("Gemma2"));
+    // Family membership via the shared predicates (the same
+    // spellings `VisionFamily::detect` keys on — see the predicate
+    // fns for why drift between the two would be a silent bug).
+    let qwen3_5_family = architectures.iter().any(|a| is_qwen3_5_family_arch(a));
+    let gemma3_family = architectures.iter().any(|a| is_gemma3_family_arch(a));
+    let gemma2_family = architectures.iter().any(|a| is_gemma2_family_arch(a));
     // Gemma2 alternates sliding/global attention every other layer
     // (`layer_is_sliding[i] = i % 2 == 0`). The checkpoint configs
     // don't carry a cadence field (newer transformers serializes an

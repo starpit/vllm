@@ -9034,29 +9034,35 @@ pub unsafe fn sigmoid_mul_inplace(
 }
 
 // ---------------------------------------------------------------------------
-// Sigmoid-rowgate-add: out += sh * sigmoid(gate[row]) — Qwen3.5-MoE
-// shared-expert combine. `gate` is [rows, 1], row-broadcast across cols.
+// Sigmoid-rowgate-combine: out = routed + sh * sigmoid(gate[row]) —
+// Qwen3.5-MoE shared-expert combine. `gate` is [rows, 1], row-broadcast
+// across cols. 4-buffer form mirroring gate_scale.metal: the caller binds
+// the routed input and out output directly (no staging copy); aliasing
+// out == routed degrades to the in-place accumulate.
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" {
-    fn sigmoid_rowgate_add_f32(
+    fn sigmoid_rowgate_combine_f32(
         out: *mut f32,
+        routed: *const f32,
         sh: *const f32,
         gate: *const f32,
         numel: c_int,
         cols: c_int,
         stream: CUstream,
     );
-    fn sigmoid_rowgate_add_f16(
+    fn sigmoid_rowgate_combine_f16(
         out: *mut u16,
+        routed: *const u16,
         sh: *const u16,
         gate: *const u16,
         numel: c_int,
         cols: c_int,
         stream: CUstream,
     );
-    fn sigmoid_rowgate_add_bf16(
+    fn sigmoid_rowgate_combine_bf16(
         out: *mut u16,
+        routed: *const u16,
         sh: *const u16,
         gate: *const u16,
         numel: c_int,
@@ -9065,10 +9071,11 @@ unsafe extern "C" {
     );
 }
 
-/// Apply `out += sh * sigmoid(gate[row])` in-place on `out` (`[T, H]`),
-/// with `gate` `[T, 1]` row-broadcast across the hidden axis.
-pub unsafe fn sigmoid_rowgate_add_inplace(
+/// `out = routed + sh * sigmoid(gate[row])` over `[T, H]` tiles, with
+/// `gate` `[T, 1]` row-broadcast across the hidden axis.
+pub unsafe fn sigmoid_rowgate_combine(
     out: GpuTensor,
+    routed: GpuTensor,
     sh: GpuTensor,
     gate: GpuTensor,
     stream: CUstream,
@@ -9076,31 +9083,34 @@ pub unsafe fn sigmoid_rowgate_add_inplace(
     let numel = out.numel() as c_int;
     let cols = out.dim(1) as c_int;
     match out.dtype() {
-        DType::F32 => sigmoid_rowgate_add_f32(
+        DType::F32 => sigmoid_rowgate_combine_f32(
             out.as_mut_ptr(),
+            routed.as_ptr(),
             sh.as_ptr(),
             gate.as_ptr(),
             numel,
             cols,
             stream,
         ),
-        DType::F16 => sigmoid_rowgate_add_f16(
+        DType::F16 => sigmoid_rowgate_combine_f16(
             out.as_mut_ptr() as *mut u16,
+            routed.as_ptr() as *const u16,
             sh.as_ptr() as *const u16,
             gate.as_ptr() as *const u16,
             numel,
             cols,
             stream,
         ),
-        DType::BF16 => sigmoid_rowgate_add_bf16(
+        DType::BF16 => sigmoid_rowgate_combine_bf16(
             out.as_mut_ptr() as *mut u16,
+            routed.as_ptr() as *const u16,
             sh.as_ptr() as *const u16,
             gate.as_ptr() as *const u16,
             numel,
             cols,
             stream,
         ),
-        _ => panic!("sigmoid_rowgate_add: unsupported dtype {:?}", out.dtype()),
+        _ => panic!("sigmoid_rowgate_combine: unsupported dtype {:?}", out.dtype()),
     }
 }
 

@@ -841,22 +841,38 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
         }
     }
 
-    // Active SlotWritten token per node, by id. `take` on consumption,
-    // re-`insert` if more reads remain.
-    let mut written: BTreeMap<u32, SlotWritten> = BTreeMap::new();
+    // Active SlotWritten token per node, indexed by SubtileId.
+    // `Vec<Option<...>>` instead of `BTreeMap<u32, ...>`: the index
+    // is bounded by graph.nodes.len() at construction (no out-of-range
+    // lookup possible), and `Option::take` makes the consumer-count
+    // walk's contract explicit — the only way `take` returns None on
+    // a predecessor is a bug in this function's loop-invariant
+    // (consumer_remaining and predecessors derived from the same
+    // `preds` array, walked in ascending SubtileId order; every
+    // predecessor of node N has id < N and was inserted before N).
+    let mut written: Vec<Option<SlotWritten>> = (0..graph.nodes.len()).map(|_| None).collect();
     let mut builder = TapeBuilder::new();
     for node in &graph.nodes {
         let nid = node.id.0;
         let pred_ids = &preds[nid as usize];
-        // Pull the SlotWritten tokens for predecessors out of the map
-        // by-value so we can borrow them as `&SlotWritten` for the read
-        // slice; reinsert any that still have remaining consumers.
         let mut pred_tokens: Vec<(u32, SlotWritten)> = Vec::with_capacity(pred_ids.len());
         for p in pred_ids {
-            let token = written
-                .remove(&p.0)
-                .expect("lower_dag_to_tape: predecessor slot already freed (consumer count walk \
-                         disagrees with predecessors list)");
+            // SAFETY (algorithmic): preds[nid] lists predecessors of
+            // ascending-id node nid; each predecessor p has p.0 < nid
+            // and was written via `written[p.0] = Some(...)` on its
+            // own iteration (ascending walk). consumer_remaining
+            // re-inserts the token until last consumer — by the time
+            // we observe `None` here, the function would have already
+            // freed the slot, which would mean we're visiting node N
+            // after N's last consumer, which violates the topo order
+            // the SubtileIR's ascending-id invariant guarantees.
+            let token = written[p.0 as usize]
+                .take()
+                .unwrap_or_else(|| unreachable!(
+                    "lower_dag_to_tape: predecessor {} of node {} has no live SlotWritten — \
+                     consumer-count walk disagrees with predecessors list (loop invariant)",
+                    p.0, nid
+                ));
             pred_tokens.push((p.0, token));
         }
         let read_refs: Vec<&SlotWritten> =
@@ -870,11 +886,11 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
             let (mut inside, _var) = builder.open_loop(LoopBound::Runtime(rb));
             let w = inside.compute_to(node.id, h, &read_refs);
             builder = inside.close_loop();
-            written.insert(nid, w);
+            written[nid as usize] = Some(w);
         } else {
             let h = builder.alloc_slot();
             let w = builder.compute_to(node.id, h, &read_refs);
-            written.insert(nid, w);
+            written[nid as usize] = Some(w);
         }
 
         // Decrement each predecessor's consumer count; when zero, free.
@@ -884,16 +900,17 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
             if *remaining == 0 {
                 builder.free_slot(ptoken);
             } else {
-                written.insert(pid, ptoken);
+                written[pid as usize] = Some(ptoken);
             }
         }
     }
 
     // Free any leaf slots (no successors) that remain — typically the
     // graph result. Their consumer_remaining is 0 from the start.
-    let leftovers: Vec<(u32, SlotWritten)> = std::mem::take(&mut written).into_iter().collect();
-    for (_pid, ptoken) in leftovers {
-        builder.free_slot(ptoken);
+    for slot in written.iter_mut() {
+        if let Some(ptoken) = slot.take() {
+            builder.free_slot(ptoken);
+        }
     }
 
     let tape = builder.finish();

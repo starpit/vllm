@@ -380,7 +380,8 @@ pub enum SubOp<F: RopeForm = NeoX> {
     /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
     /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
     /// `Silu` + `Mul` are fused into this one node *before scheduling*
-    /// (so the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
+    /// (so the pair is one node in the dataflow graph and downstream
+    /// schedulers treat it atomically); see `crate::lower::fuse_silu_mul`.
     SiluMul,
     /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
     /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
@@ -770,7 +771,8 @@ fn regions_overlap(a: Region, b: Region) -> bool {
 /// Predecessor node ids for each node: the earlier nodes whose write
 /// overlaps one of this node's input reads on the same op-output tensor.
 /// Reads of leaf sources contribute no dependency. This is the edge set
-/// the wavefront scheduler turns into cross-worker `Wait`/`Signal`.
+/// the per-target lowering turns into cross-execution-unit
+/// synchronization (whatever primitive the target prefers).
 pub fn predecessors<F: RopeForm>(graph: &SubtileIR<F>) -> Vec<Vec<SubtileId>> {
     // writers[t] = (node_id, out_region) for each op-output tensor, in id order.
     let mut writers: Vec<Vec<(u32, Region)>> = vec![Vec::new(); graph.tensors.len()];
@@ -1162,8 +1164,9 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU3
                     LoweredOp::Gemm { .. } => unreachable!("gemm handled above"),
                 };
                 // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the
-                // output column slice like the GEMM N-blocks, so the scheduler
-                // can spread it across workers. rope / attn (head structure) and
+                // output column slice like the GEMM N-blocks, so a downstream
+                // per-target lowering can dispatch the tiles independently.
+                // rope / attn (head structure) and
                 // rmsnorm (RMS reduction) stay WHOLE here — this is the bit-exact,
                 // GPU-correct reference lowering + the live per-op-schedule path.
                 // The head-tiling, split-K all-reduce and replication of the

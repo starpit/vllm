@@ -6051,23 +6051,16 @@ fn dump_wavefront_mega(
             return (None, None);
         }
     };
-    let g = ferrite_wavefront::lower::lower(&lowered.input);
     let st = to_wavefront::stats(fuf, decode_asn, &lowered);
-    let valid = match ferrite_wavefront::subtile::validate(&g) {
-        Ok(n) => format!("valid ({n} nodes)"),
-        Err(e) => format!("INVALID: {e}"),
-    };
     eprintln!(
-        "[wavefront] {stem}: {} fuf tiles, {} subgraphs → {} sources ({} weights, {} prefix-kv) , \
-         {} ops, {} subtile nodes [{}]; ops {:?}",
+        "[wavefront] {stem}: {} fuf tiles, {} subgraphs → {} sources ({} weights, \
+         {} prefix-kv), {} ops; ops {:?}",
         st.fuf_tiles,
         st.subgraphs,
         st.sources,
         st.weight_sources,
         st.prefix_sources,
         st.ops,
-        g.nodes.len(),
-        valid,
         st.op_histogram,
     );
 

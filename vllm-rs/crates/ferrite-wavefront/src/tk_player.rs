@@ -22,7 +22,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{Instr, LoopCount, TkTape};
+use crate::tk_tape::{Instr, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 //
@@ -100,29 +100,14 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::AttnDecodeFinalise { .. } => {}
         Instr::DebugOpBeginMarker { .. } => {}
 
-        // ── control flow ─────────────────────────────────────────
-        Instr::ForLoop { var, count, body } => {
-            match count {
-                LoopCount::Const(n) => {
-                    let _ = writeln!(
-                        out,
-                        "for (uint v{} = 0; v{} < {}u; ++v{}) {{",
-                        var.0, var.0, n, var.0,
-                    );
-                }
-                LoopCount::KernelArg(arg) => {
-                    let _ = writeln!(
-                        out,
-                        "for (uint v{} = 0; v{} < a{}; ++v{}) {{",
-                        var.0, var.0, arg.0, var.0,
-                    );
-                }
-            }
-            for inner in body {
-                emit_instr(out, inner);
-            }
-            out.push_str("}\n");
+        // ── control flow — flat: open / body / close are separate Instrs.
+        Instr::ForLoopOpenConst { var, n } => {
+            let _ = writeln!(out, "for (uint v{0} = 0; v{0} < {1}u; ++v{0}) {{", var.0, n);
         }
+        Instr::ForLoopOpenKernelArg { var, arg } => {
+            let _ = writeln!(out, "for (uint v{0} = 0; v{0} < a{1}; ++v{0}) {{", var.0, arg.0);
+        }
+        Instr::ForLoopClose { var: _ } => out.push_str("}\n"),
     }
 }
 

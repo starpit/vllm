@@ -55,7 +55,7 @@ use crate::subtile_tape::{
 };
 use crate::tk_tape::{
     AccumKind, ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
-    KvLayoutEntry, KvLayoutId, LoadSpec, LoopCount, LoopVarId as TkLoopVarId, PageBarrier, PageId,
+    KvLayoutEntry, KvLayoutId, LoadSpec, LoopVarId as TkLoopVarId, PageBarrier, PageId,
     ParityExpr, RopeFormTag, RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
     TkTape, U32Source, WarpRole, validate_tk_tape,
 };
@@ -95,10 +95,6 @@ struct LoweringState<'g, F: RopeForm> {
     /// Active loop var (matches the SubtileTape `LoopVarId` to a
     /// fresh-minted TkTape `LoopVarId`).
     loop_var_map: BTreeMap<u32, TkLoopVarId>,
-    /// Active loop count witness — `LoopCount::Const(n)` for static, or
-    /// `LoopCount::KernelArg(arg)` for runtime-bound (the `seq_len`
-    /// case).
-    loop_count_map: BTreeMap<u32, LoopCount>,
     /// Kernel args minted so far (mirror of `tape.kernel_args` for
     /// dedupe).
     kernel_args: Vec<KernelArg>,
@@ -144,7 +140,6 @@ impl<'g, F: RopeForm> LoweringState<'g, F> {
             graph,
             instr_stack: vec![Vec::new()],
             loop_var_map: BTreeMap::new(),
-            loop_count_map: BTreeMap::new(),
             kernel_args: Vec::new(),
             seq_len_arg: None,
             position_arg: None,
@@ -343,11 +338,16 @@ fn lower_open_loop<F: RopeForm>(
 ) {
     let tk_var = state.fresh_loop_var();
     state.loop_var_map.insert(var.index(), tk_var);
-    let count = match bound {
-        LoopBound::Const(n) => LoopCount::Const(n),
-        LoopBound::Runtime(_) => LoopCount::KernelArg(state.seq_len()),
+    // Emit the flat ForLoopOpen* into the parent frame.
+    let open = match bound {
+        LoopBound::Const(n) => Instr::ForLoopOpenConst { var: tk_var, n },
+        LoopBound::Runtime(_) => Instr::ForLoopOpenKernelArg {
+            var: tk_var,
+            arg: state.seq_len(),
+        },
     };
-    state.loop_count_map.insert(var.index(), count);
+    state.push(open);
+    // Body builds into a fresh frame; CloseLoop appends it to parent.
     state.instr_stack.push(Vec::new());
     state.active_loop_stack.push(var.index());
 }
@@ -368,19 +368,13 @@ fn lower_close_loop<F: RopeForm>(state: &mut LoweringState<F>, var: STLoopVarId)
         .loop_var_map
         .get(&var.index())
         .expect("CloseLoop var not in map (typestate invariant violated)");
-    let count = *state
-        .loop_count_map
-        .get(&var.index())
-        .expect("CloseLoop count not in map (typestate invariant violated)");
-    state.push(Instr::ForLoop {
-        var: tk_var,
-        count,
-        body,
-    });
+    // Append body into parent + close.
+    state.cur().extend(body);
+    state.push(Instr::ForLoopClose { var: tk_var });
     // Drain any AttnDecode Finalise queued by an AttnDecode::Compute
     // that lived inside this loop body. The Finalise + store + arrive
     // sequence lands in the parent frame, immediately after the
-    // ForLoop instr.
+    // ForLoopClose instr.
     if let Some(actions) = state.pending_post_loop.remove(&var.index()) {
         for action in actions {
             apply_post_loop(state, action);
@@ -829,13 +823,20 @@ fn emit_attn_decode<F: RopeForm>(
          Empty stack means the SubtileTape is malformed — would have been \
          caught by validate_subtile_tape.",
     );
-    state.instr_stack[parent_idx].push(Instr::AttnDecodeInit {
-        state: smx,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        role: COMPUTE_ROLE,
-    });
+    // Parent's last Instr is the ForLoopOpen* we emitted at OpenLoop.
+    // Init must precede the loop, so insert just before that Open.
+    let parent = &mut state.instr_stack[parent_idx];
+    let insert_at = parent.len().saturating_sub(1);
+    parent.insert(
+        insert_at,
+        Instr::AttnDecodeInit {
+            state: smx,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            role: COMPUTE_ROLE,
+        },
+    );
 
     // Qkt + Sv — inside the loop body (current frame).
     let q_page = page_of_nth(state, reads, 0, dst_page);

@@ -362,14 +362,16 @@ pub enum Instr {
     /// when `EmitOpts::debug_handshake` is on.
     DebugOpBeginMarker { op_index: u32 },
 
-    // ── Control flow — only here, never implicit.
+    // ── Control flow — flat: ForLoopOpen* opens the brace,
+    //    body Instrs follow, ForLoopClose closes it. The tape is
+    //    truly linear — no nested Vec<Instr>, no player recursion.
 
-    /// `for (uint var = 0; var < count; ++var) { body... }`.
-    ForLoop {
-        var: LoopVarId,
-        count: LoopCount,
-        body: Vec<Instr>,
-    },
+    /// `for (uint v<var> = 0; v<var> < <n>u; ++v<var>) {`
+    ForLoopOpenConst { var: LoopVarId, n: u32 },
+    /// `for (uint v<var> = 0; v<var> < a<arg>; ++v<var>) {`
+    ForLoopOpenKernelArg { var: LoopVarId, arg: KernelArgRef },
+    /// `}` — closes the matching ForLoopOpen{Const,KernelArg}.
+    ForLoopClose { var: LoopVarId },
 }
 
 // ── instruction field types ─────────────────────────────────────────
@@ -408,11 +410,8 @@ pub struct LoopVarId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SoftmaxStateId(pub u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoopCount {
-    Const(u32),
-    KernelArg(KernelArgRef),
-}
+// LoopCount enum has been folded into ForLoopOpenConst { var, n } /
+// ForLoopOpenKernelArg { var, arg } per plan §3 step 8.
 
 /// Static (compile-time) or runtime parity for a barrier wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -767,15 +766,12 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             Instr::ArriveIfRuntimeEven { .. } => {}
             Instr::BarrierInit { .. } => {}
             Instr::SyncthreadsCta { .. } | Instr::SyncthreadsGroup { .. } => {}
-            Instr::ForLoop { var, body, .. } => {
-                // Walk the body in a fresh sub-state to keep loop-
-                // local pending stores from polluting the outer.
-                let mut inner = WalkState::new();
-                walk(body, &mut inner, errors);
-                // Inner errors with a different var would be tagged at
-                // their deeper position; loop bracket itself just
-                // checks structural well-formedness.
-                let _ = var;
+            Instr::ForLoopOpenConst { .. }
+            | Instr::ForLoopOpenKernelArg { .. }
+            | Instr::ForLoopClose { .. } => {
+                // Loop brackets don't store/fence/load/arrive — pure
+                // structural CUDA. The body Instrs are walked in
+                // sequence after the open.
             }
             // Compute Instrs are pure within-page work; they do not
             // change cross-page barrier or store state.

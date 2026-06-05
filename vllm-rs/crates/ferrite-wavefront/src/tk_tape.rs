@@ -180,22 +180,29 @@ pub struct ComputeOwner(pub u32);
 #[derive(Debug, Clone)]
 pub enum Instr {
     // ── Sync primitives — every variant carries a WarpRole so the
-    //    player has zero ambient lookups.
+    //    player has zero ambient lookups. Per plan §3 step 8 + memory
+    //    feedback_tk_player_one_call_per_arm: one Instr variant per
+    //    architectural primitive (no inner-match dispatch in the
+    //    player).
 
-    /// `__syncthreads()` (or scoped variant). The CTA-scope and the
-    /// `kittens::group<N>::sync()` group-scope variants are distinct.
-    Syncthreads { scope: SyncScope, role: WarpRole },
+    /// `__syncthreads()` — full CTA.
+    SyncthreadsCta { role: WarpRole },
+    /// `kittens::group<N>::sync()` — N-warp group sync.
+    SyncthreadsGroup { n_warps: u32, role: WarpRole },
 
-    /// `__threadfence()` / `__threadfence_block()` /
-    /// `__threadfence_system()`.
-    Threadfence { scope: FenceScope, role: WarpRole },
+    /// `__threadfence_block()` — CTA-scope.
+    ThreadfenceBlock { role: WarpRole },
+    /// `__threadfence()` — device-scope.
+    ThreadfenceDevice { role: WarpRole },
+    /// `__threadfence_system()` — system-scope.
+    ThreadfenceSystem { role: WarpRole },
 
     /// `kittens::group<1>::tma::store_commit_group()`.
-    CommitGroup { kind: CommitKind, role: WarpRole },
+    CommitGroupBulk { role: WarpRole },
 
     /// `kittens::group<1>::tma::store_async_wait<N>()`. `n=0` drains
     /// all groups.
-    WaitGroup { kind: CommitKind, n: u32, role: WarpRole },
+    WaitGroupBulk { n: u32, role: WarpRole },
 
     // ── Page barriers — TK 2.0 mbarrier handshake ────────────────
 
@@ -366,33 +373,12 @@ pub enum Instr {
 }
 
 // ── instruction field types ─────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncScope {
-    /// `__syncthreads()` — full CTA.
-    Cta,
-    /// `kittens::group<N>::sync()` — N-warp group sync.
-    GroupOf(u32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FenceScope {
-    /// `__threadfence_block()` — CTA-scope.
-    Block,
-    /// `__threadfence()` — device-scope.
-    #[default]
-    Device,
-    /// `__threadfence_system()` — system-scope.
-    System,
-}
-
-/// `commit_group` / `wait_group` come in TK 2.0's bulk-store flavour
-/// (TMA store async) and the legacy non-bulk flavour.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommitKind {
-    BulkStore,
-    NonBulk,
-}
+//
+// SyncScope/FenceScope/CommitKind enums have been folded into their
+// owning Instr variants (SyncthreadsCta/Group, ThreadfenceBlock/Device/
+// System, CommitGroupBulk, WaitGroupBulk) per plan §3 step 8 + memory
+// feedback_tk_player_one_call_per_arm — one Instr per architectural
+// primitive, no inner-match dispatch in the player.
 
 /// Which warp role inside the persistent CTA owns an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -525,23 +511,23 @@ pub struct KvLayoutId(pub u32);
 
 impl Instr {
     pub(crate) fn syncthreads_cta(role: WarpRole) -> Self {
-        Self::Syncthreads { scope: SyncScope::Cta, role }
+        Self::SyncthreadsCta { role }
     }
 
-    pub(crate) fn syncthreads_group(role: WarpRole, n: u32) -> Self {
-        Self::Syncthreads { scope: SyncScope::GroupOf(n), role }
+    pub(crate) fn syncthreads_group(role: WarpRole, n_warps: u32) -> Self {
+        Self::SyncthreadsGroup { n_warps, role }
     }
 
     pub(crate) fn threadfence_device(role: WarpRole) -> Self {
-        Self::Threadfence { scope: FenceScope::Device, role }
+        Self::ThreadfenceDevice { role }
     }
 
     pub(crate) fn commit_bulk(role: WarpRole) -> Self {
-        Self::CommitGroup { kind: CommitKind::BulkStore, role }
+        Self::CommitGroupBulk { role }
     }
 
     pub(crate) fn wait_bulk(role: WarpRole, n: u32) -> Self {
-        Self::WaitGroup { kind: CommitKind::BulkStore, n, role }
+        Self::WaitGroupBulk { n, role }
     }
 
     pub(crate) fn wait_static(
@@ -739,11 +725,14 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             Instr::StoreAsyncTyped { dst_page, .. } => {
                 state.pending_store.insert(dst_page.0);
             }
-            Instr::Threadfence { .. } | Instr::WaitGroup { n: 0, .. } => {
-                // Both publish all in-flight stores.
+            Instr::ThreadfenceBlock { .. }
+            | Instr::ThreadfenceDevice { .. }
+            | Instr::ThreadfenceSystem { .. }
+            | Instr::WaitGroupBulk { n: 0, .. } => {
+                // All publish in-flight stores.
                 state.pending_store.clear();
             }
-            Instr::CommitGroup { .. } | Instr::WaitGroup { .. } => {}
+            Instr::CommitGroupBulk { .. } | Instr::WaitGroupBulk { .. } => {}
             Instr::LoadAsync(spec) => {
                 state.armed_load.insert(spec.dst_page.0);
             }
@@ -777,7 +766,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             Instr::PageBarrierWait { .. } => {}
             Instr::ArriveIfRuntimeEven { .. } => {}
             Instr::BarrierInit { .. } => {}
-            Instr::Syncthreads { .. } => {}
+            Instr::SyncthreadsCta { .. } | Instr::SyncthreadsGroup { .. } => {}
             Instr::ForLoop { var, body, .. } => {
                 // Walk the body in a fresh sub-state to keep loop-
                 // local pending stores from polluting the outer.
@@ -813,11 +802,11 @@ mod tests {
         let mut tape = TkTape::new();
         tape.emit_cross_op_gmem_fence();
         assert_eq!(tape.instrs.len(), 5);
-        assert!(matches!(tape.instrs[0], Instr::Syncthreads { .. }));
-        assert!(matches!(tape.instrs[1], Instr::CommitGroup { .. }));
-        assert!(matches!(tape.instrs[2], Instr::WaitGroup { n: 0, .. }));
-        assert!(matches!(tape.instrs[3], Instr::Threadfence { .. }));
-        assert!(matches!(tape.instrs[4], Instr::Syncthreads { .. }));
+        assert!(matches!(tape.instrs[0], Instr::SyncthreadsCta { .. }));
+        assert!(matches!(tape.instrs[1], Instr::CommitGroupBulk { .. }));
+        assert!(matches!(tape.instrs[2], Instr::WaitGroupBulk { n: 0, .. }));
+        assert!(matches!(tape.instrs[3], Instr::ThreadfenceDevice { .. }));
+        assert!(matches!(tape.instrs[4], Instr::SyncthreadsCta { .. }));
     }
 
     #[test]
@@ -849,8 +838,8 @@ mod tests {
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
-                Instr::CommitGroup { kind: CommitKind::BulkStore, role: WarpRole::Storer },
-                Instr::Threadfence { scope: FenceScope::Device, role: WarpRole::All },
+                Instr::CommitGroupBulk { role: WarpRole::Storer },
+                Instr::ThreadfenceDevice { role: WarpRole::All },
                 Instr::PageBarrierArrive { page_id: PageId(0), kind: PageBarrier::Done, role: WarpRole::Storer },
             ],
         };

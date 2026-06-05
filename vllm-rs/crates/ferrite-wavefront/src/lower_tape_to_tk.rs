@@ -54,11 +54,10 @@ use crate::subtile_tape::{
     Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
 };
 use crate::tk_tape::{
-    AccumKind, ByteOffsetExpr, CommitKind, FenceScope, Instr, KernelArg, KernelArgName,
-    KernelArgRef, KernelArgTy, KvLayoutEntry, KvLayoutId, LoadSpec, LoopCount,
-    LoopVarId as TkLoopVarId, PageBarrier, PageId, ParityExpr, RopeFormTag, RopeSide,
-    SoftmaxStateId as TkSoftmaxStateId, StoreSpec, SyncScope, TileShape, TkTape, U32Source,
-    WarpRole, validate_tk_tape,
+    AccumKind, ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
+    KvLayoutEntry, KvLayoutId, LoadSpec, LoopCount, LoopVarId as TkLoopVarId, PageBarrier, PageId,
+    ParityExpr, RopeFormTag, RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
+    TkTape, U32Source, WarpRole, validate_tk_tape,
 };
 
 // ── BF16 element width ──────────────────────────────────────────────
@@ -567,14 +566,8 @@ fn emit_store_and_arrive<F: RopeForm>(
         tile,
         role: STORE_ROLE,
     }));
-    state.push(Instr::CommitGroup {
-        kind: CommitKind::BulkStore,
-        role: STORE_ROLE,
-    });
-    state.push(Instr::Threadfence {
-        scope: FenceScope::Device,
-        role: ALL_ROLE,
-    });
+    state.push(Instr::CommitGroupBulk { role: STORE_ROLE });
+    state.push(Instr::ThreadfenceDevice { role: ALL_ROLE });
     state.push(Instr::PageBarrierArrive {
         page_id: dst_page,
         kind: PageBarrier::Done,
@@ -941,27 +934,11 @@ fn bridge_rope_form_tag<F: RopeForm>() -> RopeFormTag {
 }
 
 fn drain<F: RopeForm>(state: &mut LoweringState<F>) {
-    state.push(Instr::Syncthreads {
-        scope: SyncScope::Cta,
-        role: ALL_ROLE,
-    });
-    state.push(Instr::CommitGroup {
-        kind: CommitKind::BulkStore,
-        role: ALL_ROLE,
-    });
-    state.push(Instr::WaitGroup {
-        kind: CommitKind::BulkStore,
-        n: 0,
-        role: ALL_ROLE,
-    });
-    state.push(Instr::Threadfence {
-        scope: FenceScope::Device,
-        role: ALL_ROLE,
-    });
-    state.push(Instr::Syncthreads {
-        scope: SyncScope::Cta,
-        role: ALL_ROLE,
-    });
+    state.push(Instr::SyncthreadsCta { role: ALL_ROLE });
+    state.push(Instr::CommitGroupBulk { role: ALL_ROLE });
+    state.push(Instr::WaitGroupBulk { n: 0, role: ALL_ROLE });
+    state.push(Instr::ThreadfenceDevice { role: ALL_ROLE });
+    state.push(Instr::SyncthreadsCta { role: ALL_ROLE });
 }
 
 // ── AttnDecode post-loop deferred emit ──────────────────────────────
@@ -1057,11 +1034,11 @@ mod tests {
         assert_eq!(n_silu, 1, "expected exactly one SiluMul, got: {:?}", tk.instrs);
         // Drain at end: last 5 Instrs are Sync/Commit/Wait/Fence/Sync.
         let n = tk.instrs.len();
-        assert!(matches!(tk.instrs[n - 5], Instr::Syncthreads { .. }));
-        assert!(matches!(tk.instrs[n - 4], Instr::CommitGroup { .. }));
-        assert!(matches!(tk.instrs[n - 3], Instr::WaitGroup { n: 0, .. }));
-        assert!(matches!(tk.instrs[n - 2], Instr::Threadfence { .. }));
-        assert!(matches!(tk.instrs[n - 1], Instr::Syncthreads { .. }));
+        assert!(matches!(tk.instrs[n - 5], Instr::SyncthreadsCta { .. }));
+        assert!(matches!(tk.instrs[n - 4], Instr::CommitGroupBulk { .. }));
+        assert!(matches!(tk.instrs[n - 3], Instr::WaitGroupBulk { n: 0, .. }));
+        assert!(matches!(tk.instrs[n - 2], Instr::ThreadfenceDevice { .. }));
+        assert!(matches!(tk.instrs[n - 1], Instr::SyncthreadsCta { .. }));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{CommitKind, FenceScope, Instr, LoopCount, SyncScope, TkTape};
+use crate::tk_tape::{Instr, LoopCount, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 //
@@ -59,49 +59,21 @@ pub fn emit_kernel(tape: &TkTape) -> String {
 /// tape, never one Instr expanding to many lines.
 fn emit_instr(out: &mut String, instr: &Instr) {
     match instr {
-        // ── synchronization primitives ───────────────────────────
-        Instr::Syncthreads { scope, role } => {
-            let _ = role;
-            match scope {
-                SyncScope::Cta => out.push_str("__syncthreads();\n"),
-                SyncScope::GroupOf(n) => {
-                    out.push_str(&tk20::sync(*n));
-                    out.push('\n');
-                }
-            }
+        // ── synchronization primitives — one Instr per CUDA primitive,
+        //    one tk20 call per arm (per plan §3 step 8 + memory
+        //    feedback_tk_player_one_call_per_arm).
+        Instr::SyncthreadsCta { role: _ } => out.push_str("__syncthreads();\n"),
+        Instr::SyncthreadsGroup { n_warps, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::sync(*n_warps));
         }
-        Instr::Threadfence { scope, role } => {
-            let _ = role;
-            match scope {
-                FenceScope::Block => out.push_str("__threadfence_block();\n"),
-                FenceScope::Device => out.push_str("__threadfence();\n"),
-                FenceScope::System => out.push_str("__threadfence_system();\n"),
-            }
+        Instr::ThreadfenceBlock { role: _ } => out.push_str("__threadfence_block();\n"),
+        Instr::ThreadfenceDevice { role: _ } => out.push_str("__threadfence();\n"),
+        Instr::ThreadfenceSystem { role: _ } => out.push_str("__threadfence_system();\n"),
+        Instr::CommitGroupBulk { role: _ } => {
+            let _ = writeln!(out, "{}", tk20::group_tma_store_commit_group());
         }
-        Instr::CommitGroup { kind, role } => {
-            let _ = role;
-            match kind {
-                CommitKind::BulkStore => {
-                    out.push_str(&tk20::group_tma_store_commit_group());
-                    out.push('\n');
-                }
-                CommitKind::NonBulk => {
-                    // No tk20 wrapper for non-bulk yet — only TMA today.
-                    unimplemented!("non-bulk commit_group not yet emitted");
-                }
-            }
-        }
-        Instr::WaitGroup { kind, n, role } => {
-            let _ = role;
-            match kind {
-                CommitKind::BulkStore => {
-                    out.push_str(&tk20::group_tma_store_async_wait(*n));
-                    out.push('\n');
-                }
-                CommitKind::NonBulk => {
-                    unimplemented!("non-bulk wait_group not yet emitted");
-                }
-            }
+        Instr::WaitGroupBulk { n, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::group_tma_store_async_wait(*n));
         }
 
         // ── named barrier ops — full impls land with walker cutover.
@@ -176,7 +148,7 @@ mod tests {
     #[test]
     fn syncthreads_cta_matches_legacy() {
         assert_eq!(
-            emit(Instr::Syncthreads { scope: SyncScope::Cta, role: WarpRole::All }),
+            emit(Instr::SyncthreadsCta { role: WarpRole::All }),
             "__syncthreads();\n"
         );
     }
@@ -184,7 +156,7 @@ mod tests {
     #[test]
     fn syncthreads_group_emits_kittens_sync() {
         assert_eq!(
-            emit(Instr::Syncthreads { scope: SyncScope::GroupOf(8), role: WarpRole::All }),
+            emit(Instr::SyncthreadsGroup { n_warps: 8, role: WarpRole::All }),
             "kittens::group<8>::sync();\n"
         );
     }
@@ -192,7 +164,7 @@ mod tests {
     #[test]
     fn threadfence_device_matches_legacy() {
         assert_eq!(
-            emit(Instr::Threadfence { scope: FenceScope::Device, role: WarpRole::All }),
+            emit(Instr::ThreadfenceDevice { role: WarpRole::All }),
             "__threadfence();\n"
         );
     }
@@ -200,7 +172,7 @@ mod tests {
     #[test]
     fn threadfence_block_emits_block_scope() {
         assert_eq!(
-            emit(Instr::Threadfence { scope: FenceScope::Block, role: WarpRole::All }),
+            emit(Instr::ThreadfenceBlock { role: WarpRole::All }),
             "__threadfence_block();\n"
         );
     }
@@ -208,7 +180,7 @@ mod tests {
     #[test]
     fn threadfence_system_emits_system_scope() {
         assert_eq!(
-            emit(Instr::Threadfence { scope: FenceScope::System, role: WarpRole::All }),
+            emit(Instr::ThreadfenceSystem { role: WarpRole::All }),
             "__threadfence_system();\n"
         );
     }
@@ -216,7 +188,7 @@ mod tests {
     #[test]
     fn commit_group_emits_tk20_wrapper() {
         assert_eq!(
-            emit(Instr::CommitGroup { kind: CommitKind::BulkStore, role: WarpRole::All }),
+            emit(Instr::CommitGroupBulk { role: WarpRole::All }),
             "kittens::group<1>::tma::store_commit_group();\n"
         );
     }
@@ -224,7 +196,7 @@ mod tests {
     #[test]
     fn wait_group_zero_emits_tk20_wrapper() {
         assert_eq!(
-            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 0, role: WarpRole::All }),
+            emit(Instr::WaitGroupBulk { n: 0, role: WarpRole::All }),
             "kittens::group<1>::tma::store_async_wait<0>();\n"
         );
     }
@@ -232,7 +204,7 @@ mod tests {
     #[test]
     fn wait_group_nonzero_emits_n() {
         assert_eq!(
-            emit(Instr::WaitGroup { kind: CommitKind::BulkStore, n: 3, role: WarpRole::All }),
+            emit(Instr::WaitGroupBulk { n: 3, role: WarpRole::All }),
             "kittens::group<1>::tma::store_async_wait<3>();\n"
         );
     }

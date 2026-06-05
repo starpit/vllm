@@ -29,6 +29,5 @@ pub mod routing;
 pub mod subtile_ir;
 pub mod subtile_tape;
 pub mod metal_tape;
-pub mod tk_lower;
 pub mod tk_player;
 pub mod tk_tape;

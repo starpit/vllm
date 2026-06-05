@@ -1,33 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `tk_tape` — the flat instruction tape that backs the dumb tape player.
 //!
-//! This is the **drop-in replacement for `TkInstr` in `tk_warp_ir.rs`**,
-//! per `SUBTILE_IR_REDESIGN.md` §2: every operation the megakernel
+//! Per `SUBTILE_IR_REDESIGN.md` §0/§3: every operation the megakernel
 //! performs at runtime — TMA loads/stores, barrier inits/waits/arrives,
 //! every fence (`commit_group`, `wait_group`, `threadfence`,
 //! `__syncthreads`), persistent-state declarations, loops, kernel-arg
 //! declarations, every compute body — is one [`Instr`] in this tape.
 //!
-//! The walker (`tk_lower.rs`) reads `LoweredOp` nodes and pushes
-//! `Instr`s. The dumb player (`tk_player.rs`) is a single `match` over
-//! [`Instr`] kinds, ≤5 lines per arm, no ambient state.
+//! The dumb player (`tk_player.rs`) is a single `match` over [`Instr`]
+//! kinds, ≤5 lines per arm, no ambient state.
 //!
 //! "Fence" / "drain" is NOT one Instr — it is a SEQUENCE of primitive
 //! Instrs (`Syncthreads`, `CommitGroup`, `WaitGroup`, `Threadfence`,
 //! `Syncthreads`). The walker enumerates the sequence; one one-line
 //! arm per primitive.
+//!
+//! ## TensorId, not BufId
+//!
+//! TkTape references source buffers by [`crate::subtile_ir::TensorId`].
+//! The v1 `metal_tape::BufId` namespace is no longer wired through the
+//! TkTape side of the redesign. The lowering (`lower_tape_to_tk`)
+//! preserves SubtileIR's TensorId for sources; the slot-realization
+//! decision (which slot goes to which page, which lives in smem vs
+//! gmem) lives at the TkTape optimizer passes, NOT at the source-side
+//! identifier.
 
 #![allow(dead_code)]
 
 use std::marker::PhantomData;
 
-use crate::metal_tape::BufId;
-use crate::tk_lower::{KvCacheLayout, KvCacheProducer};
+use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, TensorId};
 
 // ── Sealed RopeForm trait (NeoX vs Interleaved) ─────────────────────
-//
-// Mirrors the const-generic shipped earlier; redefined inline now that
-// the old tk_codegen.rs is gone.
 
 mod rope_form_seal {
     pub trait Sealed {}
@@ -109,13 +113,14 @@ pub enum KernelArgTy {
     /// `uint32_t` runtime arg. `source` ties this u32 to a typed
     /// per-call value built by the dispatcher.
     U32 { source: U32Source },
-    /// Pointer to a typed buffer (weight / activation / kv cache /
-    /// cos-sin cache).
-    BufPtr(BufId),
+    /// Pointer to a typed source tensor (weight / activation / kv cache /
+    /// cos-sin cache). Identified by SubtileIR `TensorId` — the lowering
+    /// preserves source identity from the IR.
+    BufPtr(TensorId),
 }
 
 /// Sealed source of a runtime u32 — there is one variant per kernel
-/// u32 ZST in `tk_warp_ir` (`NumKvPagesSym`, `DecodePositionSym`,
+/// u32 ZST in the runtime (`NumKvPagesSym`, `DecodePositionSym`,
 /// `DecodeSlotSym`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum U32Source {
@@ -135,21 +140,21 @@ pub struct KernelArgRef(pub u16);
 /// One persistent-state declaration emitted before the instruction
 /// stream. Replaces the freeform `TkProgram::prelude: String` —
 /// every persistent state is typed and owned by exactly one
-/// ComputeBody emit (so an orphan decl is a build-time check).
+/// Compute-emit (so an orphan decl is a build-time check).
 #[derive(Debug, Clone)]
 pub enum PreludeDecl {
     /// Per-warp `float[len]` — e.g. softmax `__l_sum`.
     PerWarpFloatArray {
         name: PreludeName,
         len: u32,
-        owner: ComputeBodyOwner,
+        owner: ComputeOwner,
     },
     /// Per-warp `float[rows][cols]` — e.g. softmax `__o_accum`.
     PerWarpFloatMatrix {
         name: PreludeName,
         rows: u32,
         cols: u32,
-        owner: ComputeBodyOwner,
+        owner: ComputeOwner,
     },
     /// `void* page_buf[NUM_PAGES]` aliasing for a specific page slot.
     SmemTilePtr { name: PreludeName, page: PageId },
@@ -161,15 +166,15 @@ pub enum PreludeDecl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PreludeName(pub u32);
 
-/// Identifier for the [`Instr::Compute`] body that owns a prelude
-/// decl. Connecting decl ↔ body at type level prevents orphan decls.
+/// Identifier for the [`Instr`] compute that owns a prelude decl.
+/// Connecting decl ↔ body at type level prevents orphan decls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ComputeBodyOwner(pub u32);
+pub struct ComputeOwner(pub u32);
 
-// ── instruction stream — REPLACES TkInstr ENTIRELY ──────────────────
+// ── instruction stream ──────────────────────────────────────────────
 
 /// One instruction the kernel executes. Each variant maps 1:1 to a
-/// TK 2.0 / CUDA primitive call; ComputeBody variants alone expand to
+/// TK 2.0 / CUDA primitive call. Compute variants alone expand to
 /// a fixed `&'static str` template with field-substitution by the
 /// dumb player.
 #[derive(Debug, Clone)]
@@ -238,23 +243,117 @@ pub enum Instr {
 
     /// Typed-descriptor TMA store — `tma::store_async<NORMAL>(arg<dst>,
     /// ...)`. Pushed by the orchestrator's descriptor-rewrite pass for
-    /// buffers declared in `EmitOpts::descriptor_layouts`.
+    /// tensors declared as descriptor-bound on the kernel-arg side.
     StoreAsyncTyped {
         dst_page: PageId,
-        dst_buf: BufId,
+        dst_tensor: TensorId,
         tile_type: TileType,
         role: WarpRole,
     },
 
-    // ── Compute — body keys a sealed template; fields fill placeholders.
+    // ── Compute — flat, one variant per architectural primitive.
 
-    /// One ComputeBody emit — `body` is a sealed enum with one variant
-    /// per architectural primitive; each variant carries every field
-    /// its CUDA template needs.
-    Compute {
-        body: ComputeBody,
+    /// Float-32 RMSNorm over a tile. `eps_bits` is the f32 bit pattern.
+    RmsNorm {
+        src_page: PageId,
+        dst_page: PageId,
+        gain_tensor: TensorId,
+        rows: u32,
+        cols: u32,
+        eps_bits: u32,
         role: WarpRole,
     },
+
+    /// Single-row GEMM (m=1) — output is `[1, n]`.
+    GemmM1 {
+        lhs_page: PageId,
+        rhs_tensor: TensorId,
+        rhs_byte_off: ByteOffsetExpr,
+        out_page: PageId,
+        m: u32,
+        n: u32,
+        k: u32,
+        accum: AccumKind,
+        role: WarpRole,
+    },
+
+    /// `out = silu(gate) * up` — fused SwiGLU.
+    SiluMul {
+        gate_page: PageId,
+        up_page: PageId,
+        out_page: PageId,
+        cols: u32,
+        role: WarpRole,
+    },
+
+    /// `out = a + b` — residual add.
+    ResidualAdd {
+        a_page: PageId,
+        b_page: PageId,
+        out_page: PageId,
+        cols: u32,
+        role: WarpRole,
+    },
+
+    /// RoPE rotation. The `RopeFormTag` variant is constructed via
+    /// `RopeFormTag::from_form::<F>()` so a Q-side / K-side mismatch
+    /// is a compile error upstream.
+    RopeRotate {
+        src_page: PageId,
+        dst_page: PageId,
+        cos_sin_tensor: TensorId,
+        position: KernelArgRef,
+        kv_layout: KvLayoutId,
+        head_dim: u32,
+        num_heads: u32,
+        form: RopeFormTag,
+        side: RopeSide,
+        role: WarpRole,
+    },
+
+    /// Initialise the online-softmax recurrence.
+    AttnDecodeInit {
+        state: SoftmaxStateId,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        role: WarpRole,
+    },
+
+    /// One iteration of `S = Q · Kᵀ * scale` followed by online softmax.
+    AttnDecodeQkt {
+        state: SoftmaxStateId,
+        q_page: PageId,
+        k_page: PageId,
+        scale_bits: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        role: WarpRole,
+    },
+
+    /// `O += P · V` — second half of one online-softmax iteration.
+    AttnDecodeSv {
+        state: SoftmaxStateId,
+        v_page: PageId,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        role: WarpRole,
+    },
+
+    /// `O / l_sum` and write to `out_page`. Closes the recurrence.
+    AttnDecodeFinalise {
+        state: SoftmaxStateId,
+        out_page: PageId,
+        num_q_heads: u32,
+        head_dim: u32,
+        role: WarpRole,
+    },
+
+    /// Inert marker the orchestrator emits at the start of an op
+    /// when `EmitOpts::debug_handshake` is on.
+    DebugOpBeginMarker { op_index: u32 },
 
     // ── Control flow — only here, never implicit.
 
@@ -370,7 +469,7 @@ impl TileType {
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub dst_page: PageId,
-    pub src_buf: BufId,
+    pub src_tensor: TensorId,
     pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
@@ -381,109 +480,10 @@ pub struct LoadSpec {
 #[derive(Debug, Clone)]
 pub struct StoreSpec {
     pub src_page: PageId,
-    pub dst_buf: BufId,
+    pub dst_tensor: TensorId,
     pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
-}
-
-// ── ComputeBody — sealed templates, fully fielded ───────────────────
-
-/// One architectural compute primitive.
-#[derive(Debug, Clone)]
-pub enum ComputeBody {
-    /// Float-32 RMSNorm over a tile. `eps_bits` is the f32 bit pattern.
-    RmsNorm {
-        src_page: PageId,
-        dst_page: PageId,
-        gain_buf: BufId,
-        rows: u32,
-        cols: u32,
-        eps_bits: u32,
-    },
-
-    /// Single-row GEMM (m=1) — output is `[1, n]`.
-    GemmM1 {
-        lhs_page: PageId,
-        rhs_buf: BufId,
-        rhs_byte_off: ByteOffsetExpr,
-        out_page: PageId,
-        m: u32,
-        n: u32,
-        k: u32,
-        accum: AccumKind,
-    },
-
-    /// `out = silu(gate) * up` — fused SwiGLU.
-    SiluMul {
-        gate_page: PageId,
-        up_page: PageId,
-        out_page: PageId,
-        cols: u32,
-    },
-
-    /// `out = a + b` — residual add.
-    ResidualAdd {
-        a_page: PageId,
-        b_page: PageId,
-        out_page: PageId,
-        cols: u32,
-    },
-
-    /// RoPE rotation. The `RopeFormTag` variant is constructed via
-    /// `RopeFormTag::from_form::<F>()` so a Q-side / K-side mismatch
-    /// is a compile error upstream.
-    RopeRotate {
-        src_page: PageId,
-        dst_page: PageId,
-        cos_sin_buf: BufId,
-        position: KernelArgRef,
-        kv_layout: KvLayoutId,
-        head_dim: u32,
-        num_heads: u32,
-        form: RopeFormTag,
-        side: RopeSide,
-    },
-
-    /// Initialise the online-softmax recurrence.
-    AttnDecodeInit {
-        state: SoftmaxStateId,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    },
-
-    /// One iteration of `S = Q · Kᵀ * scale` followed by online softmax.
-    AttnDecodeQkt {
-        state: SoftmaxStateId,
-        q_page: PageId,
-        k_page: PageId,
-        scale_bits: u32,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    },
-
-    /// `O += P · V` — second half of one online-softmax iteration.
-    AttnDecodeSv {
-        state: SoftmaxStateId,
-        v_page: PageId,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    },
-
-    /// `O / l_sum` and write to `out_page`. Closes the recurrence.
-    AttnDecodeFinalise {
-        state: SoftmaxStateId,
-        out_page: PageId,
-        num_q_heads: u32,
-        head_dim: u32,
-    },
-
-    /// Inert marker the orchestrator emits at the start of an op
-    /// when `EmitOpts::debug_handshake` is on.
-    DebugOpBeginMarker { op_index: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,13 +582,13 @@ impl Instr {
 
     pub(crate) fn store_async_typed(
         dst_page: PageId,
-        dst_buf: BufId,
+        dst_tensor: TensorId,
         tile_type_str: impl Into<String>,
         role: WarpRole,
     ) -> Self {
         Self::StoreAsyncTyped {
             dst_page,
-            dst_buf,
+            dst_tensor,
             tile_type: TileType::from_layout(tile_type_str),
             role,
         }
@@ -597,7 +597,7 @@ impl Instr {
     pub(crate) fn rope_rotate<F: RopeForm>(
         src_page: PageId,
         dst_page: PageId,
-        cos_sin_buf: BufId,
+        cos_sin_tensor: TensorId,
         position: KernelArgRef,
         kv_layout: KvLayoutId,
         head_dim: u32,
@@ -605,18 +605,16 @@ impl Instr {
         side: RopeSide,
         role: WarpRole,
     ) -> Self {
-        Self::Compute {
-            body: ComputeBody::RopeRotate {
-                src_page,
-                dst_page,
-                cos_sin_buf,
-                position,
-                kv_layout,
-                head_dim,
-                num_heads,
-                form: RopeFormTag::from_form::<F>(),
-                side,
-            },
+        Self::RopeRotate {
+            src_page,
+            dst_page,
+            cos_sin_tensor,
+            position,
+            kv_layout,
+            head_dim,
+            num_heads,
+            form: RopeFormTag::from_form::<F>(),
+            side,
             role,
         }
     }
@@ -630,8 +628,8 @@ pub struct KvLayoutEntry {
 }
 
 impl KvLayoutEntry {
-    pub fn row_bytes(&self) -> u64 {
-        self.layout.row_bytes()
+    pub fn cache_tensor(&self) -> TensorId {
+        self.layout.cache_tensor()
     }
 }
 

@@ -22,9 +22,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{
-    CommitKind, FenceScope, Instr, LoopCount, SyncScope, TkTape, WarpRole,
-};
+use crate::tk_tape::{CommitKind, FenceScope, Instr, LoopCount, SyncScope, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 //
@@ -117,8 +115,18 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::StoreAsync(_spec) => {}
         Instr::StoreAsyncTyped { .. } => {}
 
-        // ── compute body ─────────────────────────────────────────
-        Instr::Compute { .. } => {}
+        // ── compute — flat, one arm per architectural primitive.
+        //    Full impls land with the walker cutover.
+        Instr::RmsNorm { .. } => {}
+        Instr::GemmM1 { .. } => {}
+        Instr::SiluMul { .. } => {}
+        Instr::ResidualAdd { .. } => {}
+        Instr::RopeRotate { .. } => {}
+        Instr::AttnDecodeInit { .. } => {}
+        Instr::AttnDecodeQkt { .. } => {}
+        Instr::AttnDecodeSv { .. } => {}
+        Instr::AttnDecodeFinalise { .. } => {}
+        Instr::DebugOpBeginMarker { .. } => {}
 
         // ── control flow ─────────────────────────────────────────
         Instr::ForLoop { var, count, body } => {
@@ -149,6 +157,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tk_tape::WarpRole;
 
     fn emit(instr: Instr) -> String {
         let mut out = String::new();

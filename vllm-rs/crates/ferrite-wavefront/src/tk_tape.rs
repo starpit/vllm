@@ -214,11 +214,22 @@ pub enum Instr {
         count: u32,
     },
 
-    /// Wait on `page_<kind>[page_id]` at the captured `parity`.
-    PageBarrierWait {
+    /// Wait on `page_<kind>[page_id]` at a static parity (compile-time
+    /// known 0 or 1). Per plan §3 step 8: one Instr per architectural
+    /// primitive, no inner-match dispatch in the player.
+    PageBarrierWaitStatic {
         page_id: PageId,
         kind: PageBarrier,
-        parity: ParityExpr,
+        parity: u8,
+        role: WarpRole,
+    },
+    /// Wait on `page_<kind>[page_id]` at a runtime loop-carried parity:
+    /// `(v<var> + start) & 1u`.
+    PageBarrierWaitLoop {
+        page_id: PageId,
+        kind: PageBarrier,
+        var: LoopVarId,
+        start: u8,
         role: WarpRole,
     },
 
@@ -413,12 +424,9 @@ pub struct SoftmaxStateId(pub u32);
 // LoopCount enum has been folded into ForLoopOpenConst { var, n } /
 // ForLoopOpenKernelArg { var, arg } per plan §3 step 8.
 
-/// Static (compile-time) or runtime parity for a barrier wait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParityExpr {
-    Static(u8),
-    LoopParity { var: LoopVarId, start: u8 },
-}
+// ParityExpr enum has been folded into PageBarrierWaitStatic { parity: u8 }
+// / PageBarrierWaitLoop { var, start } per plan §3 step 8 — one Instr per
+// architectural primitive, no inner-match dispatch in the player.
 
 /// Byte-offset expression for TMA load/store source/dest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -535,12 +543,7 @@ impl Instr {
         parity: u8,
         role: WarpRole,
     ) -> Self {
-        Self::PageBarrierWait {
-            page_id: page,
-            kind,
-            parity: ParityExpr::Static(parity),
-            role,
-        }
+        Self::PageBarrierWaitStatic { page_id: page, kind, parity, role }
     }
 
     pub(crate) fn wait_loop(
@@ -550,13 +553,11 @@ impl Instr {
         start_parity: u8,
         role: WarpRole,
     ) -> Self {
-        Self::PageBarrierWait {
+        Self::PageBarrierWaitLoop {
             page_id: page,
             kind,
-            parity: ParityExpr::LoopParity {
-                var,
-                start: start_parity & 1,
-            },
+            var,
+            start: start_parity & 1,
             role,
         }
     }
@@ -748,21 +749,11 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
                 }
             }
             Instr::PageBarrierArrive { .. } => {}
-            Instr::PageBarrierWait {
-                page_id,
-                kind: PageBarrier::Ready,
-                ..
-            } => {
-                // For the conservative all-gmem path the producer's
-                // StoreAsync+Fence+Arrive{Done} discharges visibility;
-                // a Wait{Ready} can legitimately precede the local
-                // LoadAsync because the cross-page handshake itself
-                // doesn't require a paired LoadAsync on this CTA.
-                // Mark the page as no longer requiring a local load.
+            Instr::PageBarrierWaitStatic { page_id, kind: PageBarrier::Ready, .. }
+            | Instr::PageBarrierWaitLoop { page_id, kind: PageBarrier::Ready, .. } => {
                 state.armed_load.remove(&page_id.0);
-                let _ = page_id;
             }
-            Instr::PageBarrierWait { .. } => {}
+            Instr::PageBarrierWaitStatic { .. } | Instr::PageBarrierWaitLoop { .. } => {}
             Instr::ArriveIfRuntimeEven { .. } => {}
             Instr::BarrierInit { .. } => {}
             Instr::SyncthreadsCta { .. } | Instr::SyncthreadsGroup { .. } => {}
@@ -810,7 +801,7 @@ mod tests {
         let var = LoopVarId(0);
         let w = Instr::wait_loop(PageId(2), PageBarrier::Ready, var, 1, WarpRole::AllConsumers);
         match w {
-            Instr::PageBarrierWait { parity: ParityExpr::LoopParity { var: v, start }, .. } => {
+            Instr::PageBarrierWaitLoop { var: v, start, .. } => {
                 assert_eq!(v, var);
                 assert_eq!(start, 1);
             }

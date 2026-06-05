@@ -56,7 +56,7 @@ use crate::subtile_tape::{
 use crate::tk_tape::{
     AccumKind, ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
     KvLayoutEntry, KvLayoutId, LoadSpec, LoopVarId as TkLoopVarId, PageBarrier, PageId,
-    ParityExpr, RopeFormTag, RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
+    RopeFormTag, RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
     TkTape, U32Source, WarpRole, validate_tk_tape,
 };
 
@@ -439,10 +439,10 @@ fn lower_compute<F: RopeForm>(
     // page).
     for r in reads {
         let p = state.page_of(*r);
-        state.push(Instr::PageBarrierWait {
+        state.push(Instr::PageBarrierWaitStatic {
             page_id: p,
             kind: PageBarrier::Ready,
-            parity: ParityExpr::Static(0),
+            parity: 0,
             role: COMPUTE_ROLE,
         });
     }
@@ -1074,7 +1074,11 @@ mod tests {
         let n_wait = tk
             .instrs
             .iter()
-            .filter(|i| matches!(i, Instr::PageBarrierWait { kind: PageBarrier::Ready, .. }))
+            .filter(|i| matches!(
+                i,
+                Instr::PageBarrierWaitStatic { kind: PageBarrier::Ready, .. }
+                    | Instr::PageBarrierWaitLoop { kind: PageBarrier::Ready, .. }
+            ))
             .count();
         assert_eq!(n_wait, 1, "one DAG edge → one Ready wait, got: {:?}", tk.instrs);
     }

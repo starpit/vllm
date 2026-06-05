@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{ByteOffsetExpr, Instr, ParityExpr, TkTape};
+use crate::tk_tape::{ByteOffsetExpr, Instr, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 mod tk20 {
@@ -188,6 +188,12 @@ mod tk20 {
         )
     }
 
+    pub fn tma_store_async_typed(src_page: u8, dst_arg_idx: u32, tile_type: &str) -> String {
+        format!(
+            "kittens::group<1>::tma::store_async_typed<{tile_type}>(a{dst_arg_idx}, page_buf[{src_page}]);"
+        )
+    }
+
     pub fn arrive_if_runtime_even(barrier: &str, page: u8, parity_arg_idx: u32) -> String {
         format!(
             "if ((a{parity_arg_idx} & 1u) == 0u) {{ \
@@ -258,13 +264,12 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::BarrierInit { page_id, kind, count } => {
             let _ = writeln!(out, "{}", tk20::mbarrier_init(barrier_name(*kind), page_id.0, *count));
         }
-        Instr::PageBarrierWait { page_id, kind, parity, role: _ } => {
-            let s = match parity {
-                ParityExpr::Static(p) => tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, *p),
-                ParityExpr::LoopParity { var, start } => {
-                    tk20::mbarrier_wait_loop(barrier_name(*kind), page_id.0, var.0, *start)
-                }
-            };
+        Instr::PageBarrierWaitStatic { page_id, kind, parity, role: _ } => {
+            let s = tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, *parity);
+            let _ = writeln!(out, "{s}");
+        }
+        Instr::PageBarrierWaitLoop { page_id, kind, var, start, role: _ } => {
+            let s = tk20::mbarrier_wait_loop(barrier_name(*kind), page_id.0, var.0, *start);
             let _ = writeln!(out, "{s}");
         }
         Instr::PageBarrierArrive { page_id, kind, role: _ } => {
@@ -297,13 +302,8 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let _ = writeln!(out, "{s}");
         }
         Instr::StoreAsyncTyped { dst_page, dst_tensor, tile_type, role: _ } => {
-            let _ = writeln!(
-                out,
-                "kittens::group<1>::tma::store_async_typed<{}>(a{}, page_buf[{}]);",
-                tile_type.as_str(),
-                dst_tensor.0,
-                dst_page.0,
-            );
+            let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());
+            let _ = writeln!(out, "{s}");
         }
         Instr::RmsNorm { src_page, dst_page, gain_tensor, rows, cols, eps_bits, role: _ } => {
             let s = tk20::rms_norm(src_page.0, dst_page.0, gain_tensor.0, *rows, *cols, *eps_bits);
@@ -465,10 +465,10 @@ mod tests {
 
     #[test]
     fn page_barrier_wait_static_emits_wait() {
-        let s = emit(Instr::PageBarrierWait {
+        let s = emit(Instr::PageBarrierWaitStatic {
             page_id: crate::tk_tape::PageId(2),
             kind: crate::tk_tape::PageBarrier::Ready,
-            parity: ParityExpr::Static(1),
+            parity: 1,
             role: WarpRole::AllConsumers,
         });
         assert_eq!(s, "kittens::mbarrier::wait(&page_ready[2], 1);\n");

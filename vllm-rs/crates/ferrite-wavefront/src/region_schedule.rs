@@ -428,7 +428,7 @@ mod tests {
         let (input, data) = chain_input(24, 16, 20);
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         for nb in [4u32, 8, 1000] {
-            let g = lower_region(&input, nb);
+            let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
             let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
             for p in [1u32, 2, 4, 10] {
                 let s = schedule_wavefront(
@@ -472,7 +472,7 @@ mod tests {
         let (input, data) = chain_input(24, 16, 20);
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         let nb = 4u32;
-        let g = lower_region(&input, nb);
+        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
         let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
         // gemm1 → 4 blocks (ids 0..4, cols 0,4,8,12); silu → 4 tiles (ids 4..8,
         // same cols); gemm2 → 5 blocks reading whole silu.
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn flag_invariants() {
         let (input, _) = chain_input(24, 16, 20);
-        let g = lower_region(&input, 4); // n-block so producers split
+        let g = lower_region(&input, std::num::NonZeroU32::new(4).unwrap()); // n-block so producers split
 
         let s1 = partition_roundrobin(&g, 1);
         assert_eq!(s1.num_flags, 0, "p=1 → no cross-worker edges");
@@ -561,7 +561,7 @@ mod tests {
             }],
             result: 0,
         };
-        let g = lower_region(&input, 4);
+        let g = lower_region(&input, std::num::NonZeroU32::new(4).unwrap());
         assert_eq!(g.nodes.len(), 30, "ceil(120/4) blocks");
         let s = schedule_wavefront(
             &g,

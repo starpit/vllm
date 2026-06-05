@@ -1945,7 +1945,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, nb);
+        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
         assert_eq!(g.nodes.len(), 4, "ceil(128/32) blocks");
         let s = partition_roundrobin(&g, 1); // all blocks on worker 0, ascending id
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
@@ -2014,7 +2014,7 @@ mod tests {
             result: 1,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1), qweight(2)];
-        let g = lower_region(&input, 64); // n0=128 → 2 blocks of 64
+        let g = lower_region(&input, std::num::NonZeroU32::new(64).unwrap()); // n0=128 → 2 blocks of 64
 
         // P=1: a single worker reads its own arena writes → no handoff.
         let p1 = serialize(&g, &partition_roundrobin(&g, 1), &sources, geom()).expect("p1");
@@ -2100,7 +2100,7 @@ mod tests {
             dense(2, WeightBundle::CosSin),
             dense(3, WeightBundle::CosSin),
         ];
-        let g = lower_region(&input, h); // 1 qmv block + 1 rope
+        let g = lower_region(&input, std::num::NonZeroU32::new(h).unwrap()); // 1 qmv block + 1 rope
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2229,7 +2229,7 @@ mod tests {
             SourceDesc::PrefixK { layer },
             SourceDesc::PrefixV { layer },
         ];
-        let g = lower_region(&input, 1000); // coarse: 1 block each
+        let g = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap()); // coarse: 1 block each
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2384,7 +2384,7 @@ mod tests {
     fn attn_subchain_structure_and_flags() {
         let (input, sources) = attn_subchain();
         let nb = 8u32; // qdim 16→2, kvdim 8→1, h 16→2 blocks
-        let g = lower_region(&input, nb);
+        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
         // 1 rms + 2 q + 1 k + 1 v + 1 rope + 1 rope + 1 attn + 2 o + 2 add = 12
         // (the residual add is elementwise ⇒ tiled by nb like the GEMMs; rope/
         // attn stay whole in lower_region — head-tiling lives in lower_partitioned).
@@ -2464,7 +2464,7 @@ mod tests {
     #[test]
     fn byte_serialization_sizes() {
         let (input, sources) = attn_subchain();
-        let g = lower_region(&input, 8);
+        let g = lower_region(&input, std::num::NonZeroU32::new(8).unwrap());
         let s = schedule_wavefront(
             &g,
             cost_area,
@@ -2628,7 +2628,7 @@ mod tests {
         let (input, sources) = full_layer();
         let fused = fuse_silu_mul(&input);
         // Coarse (one block per gemm) gives a clean op histogram.
-        let g = lower_region(&fused, 1000);
+        let g = lower_region(&fused, std::num::NonZeroU32::new(1000).unwrap());
         // 15 ops after fusion, coarse ⇒ 15 nodes.
         assert_eq!(g.nodes.len(), 15);
         for p in [1u32, 4, 10] {
@@ -2664,7 +2664,7 @@ mod tests {
             assert_eq!(hist.get(&op_kind::ADD), Some(&2), "two residual adds");
         }
         // N-block tiling still serializes (more qmv blocks, same op set).
-        let gt = lower_region(&fused, 8);
+        let gt = lower_region(&fused, std::num::NonZeroU32::new(8).unwrap());
         let st = schedule_wavefront(
             &gt,
             cost_area,
@@ -2734,7 +2734,7 @@ mod tests {
             dense(3, WeightBundle::CosSin),
             dense(4, WeightBundle::CosSin),
         ];
-        let g = lower_region(&input, 1000);
+        let g = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap());
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2821,7 +2821,7 @@ mod tests {
             result: 1,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, 8);
+        let g = lower_region(&input, std::num::NonZeroU32::new(8).unwrap());
         let s = partition_roundrobin(&g, 1);
         let err = serialize(&g, &s, &sources, geom()).unwrap_err();
         assert!(
@@ -2905,7 +2905,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, nb);
+        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
         let s = partition_roundrobin(&g, 1); // all 4 blocks on worker 0
         // Tranche mode groups the 4 independent blocks into one packed tranche.
         let prog = serialize_mode(&g, &s, &sources, geom(), EmitMode::Tranche).expect("serialize");
@@ -2940,7 +2940,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, 64); // nb ≥ n ⇒ one block
+        let g = lower_region(&input, std::num::NonZeroU32::new(64).unwrap()); // nb ≥ n ⇒ one block
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
         assert_eq!(prog.tape.len(), 1);

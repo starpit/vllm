@@ -70,14 +70,24 @@ pub fn lower_partitioned(
     // the BW saturate (cost-sweep finding: unit=256 hits the sweet spot on
     // Llama-1B, measured COMPUTE_ONLY ~7.3ms vs head_dim=64 ~7.9ms). Default
     // `mlp_unit = head_dim` preserves the old behaviour (no-op for tests).
-    let chain_unit = head_dim.max(1);
-    let mlp_unit = mlp_unit.max(chain_unit);
+    use std::num::NonZeroU32;
+    // chain_unit / mlp_unit are tile widths (block sizes for n_blocks /
+    // head_blocks). `block == 0` would loop forever in n_blocks; carrying
+    // these as NonZeroU32 makes the termination invariant compile-time
+    // (per feedback_compile_time_or_garbage).
+    let chain_unit = NonZeroU32::new(head_dim.max(1))
+        .expect(".max(1) above guarantees nonzero");
+    let mlp_unit = NonZeroU32::new(mlp_unit.max(chain_unit.get()))
+        .expect(".max(chain_unit) above guarantees nonzero");
     let p = p.max(1);
     // Pick the tile unit for an op whose output is `out_cols` wide: use
     // `mlp_unit` only when it strictly coarsens AND gives at least P blocks
     // (so workers stay utilised — otherwise the wider tile leaves cores idle).
-    let pick_unit = |out_cols: u32| {
-        if mlp_unit > chain_unit && out_cols.is_multiple_of(mlp_unit) && out_cols / mlp_unit >= p {
+    let pick_unit = |out_cols: u32| -> NonZeroU32 {
+        if mlp_unit > chain_unit
+            && out_cols.is_multiple_of(mlp_unit.get())
+            && out_cols / mlp_unit.get() >= p
+        {
             mlp_unit
         } else {
             chain_unit
@@ -102,7 +112,10 @@ pub fn lower_partitioned(
     let mut op_partitioned: Vec<bool> = Vec::with_capacity(input.ops.len());
 
     // Worker owning a block: (column start / head_dim) mod P.
-    let owner_of = |cols_start: u32, u: u32| (cols_start / u) % p;
+    // `u` is a tile width — `NonZeroU32` so division can never be by
+    // zero (the substrate-level termination witness from `n_blocks`
+    // propagates here).
+    let owner_of = |cols_start: u32, u: NonZeroU32| (cols_start / u.get()) % p;
 
     // Resolve an InputRef as read by a consumer on worker `w`: a replicated
     // producer gives worker `w`'s copy; a partitioned producer / a source gives
@@ -168,7 +181,15 @@ pub fn lower_partitioned(
                         // the worker that owns the activation block kb. The
                         // activation was tiled at `kb.len` (uniform tiling), so
                         // that is the unit chain-locality goes by here.
-                        let w = owner_of(kb.start, kb.len);
+                        // kb came from n_blocks/head_blocks with a NonZeroU32
+                        // block width; len is at least 1 (the only zero case
+                        // is the degenerate total==0 placeholder, which can't
+                        // appear here — split-K runs only when the activation
+                        // is actually partitioned, so kchunks is nonempty
+                        // with positive widths).
+                        let kb_len = NonZeroU32::new(kb.len)
+                            .expect("split-K kchunks come from n_blocks with NonZeroU32 width");
+                        let w = owner_of(kb.start, kb_len);
                         let pt = new_tensor(&mut tensors);
                         let id = SubtileId(nodes.len() as u32);
                         nodes.push(SubtileNode {
@@ -427,7 +448,7 @@ pub fn lower_partitioned(
                     LoweredOp::RopeRotate { head_dim } | LoweredOp::RopeAppend { head_dim, .. } => {
                         head_dim
                     }
-                    _ => chain_unit, // placeholder; only Cat::Rope reads it
+                    _ => chain_unit.get(), // placeholder; only Cat::Rope reads it
                 };
                 match cat {
                     Cat::Whole => {
@@ -739,7 +760,7 @@ mod tests {
         let (input, data, hd) = decode_layer();
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         // Bit-exact reference (N-block, single reduction per output).
-        let gref = lower_region(&input, 1000);
+        let gref = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap());
         let want = result_buffer(&gref, &eval_dag(&gref, &srcs)).to_vec();
 
         for p in [1u32, 2, 4, 8, 10] {

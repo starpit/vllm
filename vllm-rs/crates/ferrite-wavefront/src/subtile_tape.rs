@@ -34,21 +34,24 @@
 //!
 //! Slot count, slot lifetime, and slot-write proof are target-agnostic
 //! (a function of the DAG's liveness analysis, not the target). Only
-//! **slot-physical-realization** (smem capacity per slot, gmem fallback,
-//! the sync primitive that discharges the hazard) is target-specific —
+//! **slot-physical-realization** (memory-tier capacity per slot, the
+//! sync primitive that discharges the hazard) is target-specific —
 //! that lives at TkTape.
 //!
 //! ## What does NOT live here
 //!
-//! - **Workers / CTAs / threadgroups / warp roles.** SubtileTape carries
-//!   no parallelism abstraction. The DAG parallelism is in the
-//!   SubtileIR (region-overlap predecessors); how to spread it across a
-//!   target's execution units is a per-target lowering decision.
-//! - **Memory class** (smem / gmem / smem-carry-forward), **fences**,
-//!   **pages / parity**. All TkTape concepts.
-//! - **Witnesses on instrs** (`KvCacheLayout`, `KvCacheProducer`,
-//!   `RopeForm`, `SoftmaxState<Phase>`). Live on the SubtileIR `SubOp`
-//!   variants; the lowering looks them up by `SubtileId`.
+//! All target-specific concepts — execution-unit abstractions
+//! (per-target lowering decision), memory-tier classification
+//! (TkTape concept), visibility primitives (TkTape concept),
+//! pipeline-state tracking (TkTape concept). The IR-level witnesses
+//! (`KvCacheLayout`, `KvCacheProducer`, `RopeForm`, online-softmax
+//! state) live on the SubtileIR `SubOp` variants; the lowering looks
+//! them up by `SubtileId`.
+//!
+//! For the canonical exclusion list see
+//! [`crate::subtile_ir`] and `SUBTILE_TAPE_CONSTRAINTS.md`. K2
+//! (target-agnostic SubtileTape, mechanically grep-checkable) is the
+//! kill criterion this module enforces.
 
 #![allow(dead_code)]
 
@@ -520,9 +523,9 @@ pub enum ValidationError {
     },
 }
 
-/// Per-slot lifecycle phase tracked by the validator.
+/// Per-slot lifecycle state tracked by the validator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlotPhase {
+enum SlotState {
     /// `AllocSlot` seen, no `Compute` has written it yet.
     Allocated,
     /// `Compute { writes }` seen; readers OK; `FreeSlot` not yet seen.
@@ -656,7 +659,7 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
 ) {
     let preds = crate::subtile_ir::predecessors(graph);
     let n_slots = tape.num_slots;
-    let mut phase: BTreeMap<u32, SlotPhase> = BTreeMap::new();
+    let mut phase: BTreeMap<u32, SlotState> = BTreeMap::new();
     // For each slot, the SubtileId of the node whose Compute wrote it
     // (the slot's producer). Used to map a read-slot back to its
     // predecessor for edge coverage.
@@ -674,7 +677,7 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
                     });
                     continue;
                 }
-                phase.insert(s, SlotPhase::Allocated);
+                phase.insert(s, SlotState::Allocated);
             }
             Instr::Compute {
                 node,
@@ -694,15 +697,15 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
                             slot: w,
                             at: i,
                         }),
-                        Some(SlotPhase::Allocated) => {
-                            phase.insert(w, SlotPhase::Written);
+                        Some(SlotState::Allocated) => {
+                            phase.insert(w, SlotState::Written);
                             writer_of.insert(w, *node);
                         }
-                        Some(SlotPhase::Written) => errors.push(ValidationError::DoubleWrite {
+                        Some(SlotState::Written) => errors.push(ValidationError::DoubleWrite {
                             slot: w,
                             at: i,
                         }),
-                        Some(SlotPhase::Freed) => errors.push(ValidationError::UseAfterFree {
+                        Some(SlotState::Freed) => errors.push(ValidationError::UseAfterFree {
                             slot: w,
                             at: i,
                         }),
@@ -720,19 +723,19 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
                         continue;
                     }
                     match phase.get(&s).copied() {
-                        None | Some(SlotPhase::Allocated) => {
+                        None | Some(SlotState::Allocated) => {
                             errors.push(ValidationError::ReadBeforeWrite {
                                 slot: s,
                                 at: i,
                             });
                         }
-                        Some(SlotPhase::Freed) => {
+                        Some(SlotState::Freed) => {
                             errors.push(ValidationError::UseAfterFree {
                                 slot: s,
                                 at: i,
                             });
                         }
-                        Some(SlotPhase::Written) => {
+                        Some(SlotState::Written) => {
                             if let Some(wn) = writer_of.get(&s).copied() {
                                 read_writers.push(wn);
                             }
@@ -770,14 +773,14 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
                         slot: s,
                         at: i,
                     }),
-                    Some(SlotPhase::Allocated) => errors.push(ValidationError::ReadBeforeWrite {
+                    Some(SlotState::Allocated) => errors.push(ValidationError::ReadBeforeWrite {
                         slot: s,
                         at: i,
                     }),
-                    Some(SlotPhase::Written) => {
-                        phase.insert(s, SlotPhase::Freed);
+                    Some(SlotState::Written) => {
+                        phase.insert(s, SlotState::Freed);
                     }
-                    Some(SlotPhase::Freed) => {
+                    Some(SlotState::Freed) => {
                         errors.push(ValidationError::DoubleFree { slot: s, at: i })
                     }
                 }
@@ -786,7 +789,7 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
         }
     }
     for (&s, &p) in &phase {
-        if !matches!(p, SlotPhase::Freed) {
+        if !matches!(p, SlotState::Freed) {
             errors.push(ValidationError::SlotNeverFreed { slot: s });
         }
     }

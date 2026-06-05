@@ -881,9 +881,14 @@ pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
 // ── LoweringInput → SubtileIR ──────────────────────────────────────
 
 /// Tile `[0, total)` into contiguous blocks of width `block` (last block
-/// may be shorter). `block >= total` yields a single whole block.
-pub fn n_blocks(total: u32, block: u32) -> Vec<Range> {
-    assert!(block >= 1, "block width must be >= 1");
+/// may be shorter). `block.get() >= total` yields a single whole block.
+///
+/// `block: NonZeroU32` discharges the load-bearing termination invariant
+/// at the type level — `block == 0` would loop forever (per
+/// `feedback_compile_time_or_garbage` this must be a compile error, not
+/// a runtime assert).
+pub fn n_blocks(total: u32, block: std::num::NonZeroU32) -> Vec<Range> {
+    let block = block.get();
     let mut out = Vec::new();
     let mut start = 0;
     while start < total {
@@ -901,10 +906,18 @@ pub fn n_blocks(total: u32, block: u32) -> Vec<Range> {
 /// down to a whole number of `head_dim`-wide heads (at least one head). Used
 /// for rope/attention so every block is a clean set of heads — the q→rope→
 /// attn chain partitions on head boundaries (and o_proj split-Ks on them).
-pub fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
+///
+/// `nb: NonZeroU32` propagates the same termination witness as
+/// [`n_blocks`].
+pub fn head_blocks(total: u32, nb: std::num::NonZeroU32, head_dim: u32) -> Vec<Range> {
     let hd = head_dim.max(1);
-    let heads_per_block = (nb / hd).max(1);
-    n_blocks(total, heads_per_block * hd)
+    // `nb.get() / hd` may be zero (when nb < hd); `.max(1)` floors at one
+    // head; `* hd` is at least `hd >= 1`. So the product is always >= 1
+    // → NonZeroU32 by construction.
+    let heads_per_block = (nb.get() / hd).max(1);
+    let block = std::num::NonZeroU32::new(heads_per_block * hd)
+        .expect("heads_per_block * hd >= 1 by .max(1) above");
+    n_blocks(total, block)
 }
 
 /// Out-columns of an op (mirrors `crate::lower`): GEMM → n, attention →
@@ -942,7 +955,7 @@ pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, in0_cols: u32) -> u32 {
 /// forms in one IR is impossible by construction (the IR's rope nodes
 /// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
 /// Interleaved-form rope node).
-pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR<NeoX> {
+pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU32) -> SubtileIR<NeoX> {
     use crate::lower::{InputRef, LoweredOp};
     let num_sources = input.sources.len() as u32;
     let mut tensors: Vec<TensorShape> = input
@@ -1457,7 +1470,7 @@ mod tests {
         ];
 
         for nb in [4u32, 8, 1000] {
-            let g = lower_region(&input, nb);
+            let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
             assert!(validate(&g).is_ok(), "valid layer nb={nb}");
             let bufs = eval_dag(&g, &srcs);
             assert_eq!(
@@ -1492,7 +1505,7 @@ mod tests {
             ],
             result: 1,
         };
-        let g = lower_region(&input, 2);
+        let g = lower_region(&input, std::num::NonZeroU32::new(2).unwrap());
         let preds = predecessors(&g);
         // 3 matmul blocks (0,1,2) + 3 silu tiles (3,4,5).
         assert_eq!(g.nodes.len(), 6);

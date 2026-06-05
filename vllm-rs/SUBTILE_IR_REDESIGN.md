@@ -11,15 +11,23 @@ Fuf  (ferrite-forward macro internal)
  ▼
 SubtileIR     (DAG, target-agnostic; "the math at subtile granularity")
  │
- ▼            [DAG → linear: every edge becomes an explicit instruction]
-SubtileTape   (linear, target-agnostic; sync/barrier/memory hazards explicit)
+ ▼            [DAG → linear: a topological linearization, sequential semantics]
+SubtileTape   (linear, target-agnostic; just Compute + OpenLoop + CloseLoop)
  │
- ▼            [target-agnostic → target-specific, table-driven]
+ ▼            [target-agnostic → target-specific; work-distribution + sync chosen here]
 TkTape  /  MetalTape  /  …
  │
  ▼            [trivial executor, no interpretation]
 GPU
 ```
+
+**SubtileTape carries no parallelism, no sync, no memory tier.** Workers
+(CTAs / threadgroups / warp roles), barriers, fences, signals, waits,
+shmem-vs-gmem routing — all of that is target-specific and lives at
+the per-target lowering. The tape is a single-thread topological order
+of the SubtileIR's Computes, with explicit `OpenLoop` / `CloseLoop`
+brackets for runtime-bounded loops. The DAG parallelism is recoverable
+by the lowering from the SubtileIR's region-overlap predecessors.
 
 Two **syntax-directed** lowerings (`lower_dag_to_tape`,
 `lower_tape_to_tk`); a pipeline of **`TkTape → TkTape` optimizer
@@ -66,12 +74,12 @@ Witness placement (per layer):
 
 | Witness | DAG | SubtileTape | TkTape |
 |---|---|---|---|
-| `KvCacheLayout` | field on `SubOp::RopeAppend`, `SubOp::AttnDecode` (single instance per K-cache BufId; both reach for same value) | propagates as opaque id | propagates; consumer reads via single-source method |
-| `KvCacheProducer` | field on `SubOp::AttnDecode` | propagates | exhaustive match in lowering, no `_ =>` arm |
-| `RopeForm` | const generic on `SubOp::Rope*` | const generic on tape's rope op | const generic on `ComputeBody::RopeRotate`'s template |
-| `SoftmaxState<Phase>` | id on `SubOp::AttnDecode` | typestate threaded through `lower_tape_to_tk`'s emit of init/qkt/sv/finalise | template field-substitution |
-| `BarrierId` | n/a (DAG has no barriers) | sealed; `Wait(B)` and `Signal(B)` share the same id by construction | sealed; PageBarrier kind layered on top |
-| `Phase` (parity) | n/a | n/a (SubtileTape is target-agnostic; phase is a TK concept) | const-generic split `Instr` variants (e.g. `CarryForwardWaitP0` carries `PhaseW<0>`, `CarryForwardWaitP1` carries `PhaseW<1>`); the runtime→const dispatch happens once at the optimizer pass's `match` site, never as a `u8` field on a single Instr |
+| `KvCacheLayout` | field on `SubOp::RopeAppend`, `SubOp::AttnDecode` (single instance per K-cache BufId; both reach for same value) | n/a (SubtileTape carries no per-Compute fields beyond `SubtileId`; lowering looks up the witness on the SubtileIR node) | propagates; consumer reads via single-source method |
+| `KvCacheProducer` | field on `SubOp::AttnDecode` | n/a (same reason) | exhaustive match in lowering, no `_ =>` arm |
+| `RopeForm` | const generic on `SubOp::Rope*` | n/a (carried by the SubtileIR `<F>`) | const generic on `ComputeBody::RopeRotate`'s template |
+| `SoftmaxState<Phase>` | id on `SubOp::AttnDecode` | n/a | typestate threaded through `lower_tape_to_tk`'s emit of init/qkt/sv/finalise; template field-substitution |
+| `LoopVarId` | n/a | sealed; `OpenLoop(v)` and matching `CloseLoop(v)` share the same id by construction | sealed; carries through to `Instr::ForLoop` |
+| `Phase` (parity) | n/a | n/a | const-generic split `Instr` variants on TkTape; runtime→const dispatch at the optimizer pass's `match` site, never as a `u8` field |
 
 ## 3. The validator stretch
 
@@ -96,25 +104,15 @@ barrier-id matching, cross-worker deadlock cycles).
 
 Two validators, mirroring the two tapes:
 
-- **`validate_subtile_tape(&SubtileTape, &SubtileIR)`** —
-  target-agnostic, sync-graph + DAG-shape only. No fence checks (fence
-  is a target primitive; SubtileTape doesn't name it). No memory-class
-  checks (shmem/gmem don't exist at this layer).
-  - **Orphan signal/wait**: every `BarrierId` has ≥1 `Signal` and ≥1
-    `Wait`; one-shot signals fire at most once.
-  - **Deadlock cycle**: build worker × barrier digraph; cycle = every
-    worker waiting on someone else's signal that never fires.
-  - **Cross-worker data race**: per-tensor read on worker `Wc` of a
-    region written by worker `Wp ≠ Wc` must be preceded by a
-    `Wait`/`Signal` pair edge `Wp → Wc`. (No fence required at this
-    layer; the visibility primitive is whatever the TkTape lowering
-    picks.)
+- **`validate_subtile_tape(&SubtileTape, &SubtileIR)`** — target-
+  agnostic, IR-shape only. No worker, no barrier, no fence, no memory
+  class — none of those exist at this layer.
   - **Compute well-formedness**: every `Compute` names an in-range
-    `SubtileId`; per-worker subset is a topological order of that
-    worker's assigned nodes.
+    `SubtileId`; every SubtileIR node is `Compute`'d exactly once;
+    adjacent Computes appear in strictly ascending `SubtileId` order
+    (the tape is a topological linearization of the DAG).
   - **Loop balance**: every `OpenLoop` has a matching `CloseLoop`
-    on the same worker with the same `LoopVarId`; no cross-worker
-    sync inside a loop.
+    with the same `LoopVarId`; no nesting; no unclosed loops.
 - **`validate_tk_tape(&TkTape)`** — TK-specific. Runs **after lowering
   and again after every optimizer pass**. Each pass declares the
   postcondition it must preserve; the validator is the conjunction.
@@ -196,18 +194,21 @@ fallbacks added, no `_ =>` match arms added.
    pass policy, not a SubtileTape rule). The `subtile_tape.rs` module
    header documents: "no smem, no gmem, no fence, no page, no parity".
 
-5. **Implement `lower_dag_to_tape(&SubtileIR) -> SubtileTape`.**
-   Single deterministic fn: validate → assign workers → topo → emit.
-   Cross-worker `Operand::Sub` → `Signal`/`Wait`; runtime-bounded loop
-   only for `AttnDecode`'s KV sweep. **No `Fence`, no `Route`** —
-   target-agnostic, target-agnostic, target-agnostic. Returns a
-   `TapeBuilder<EndState>` that gates the call to `validate`. Unit
-   tests: chain, fork, join, attn, runtime loop.
+5. **Implement `lower_dag_to_tape(&SubtileIR<F>) -> SubtileTape`.**
+   Single deterministic fn: validate the IR, walk
+   `graph.nodes` in ascending `SubtileId` order, emit one `Compute`
+   per node — wrapping `SubOp::AttnDecode` in an
+   `OpenLoop`/`CloseLoop` pair over a runtime-bounded count (the
+   KV-sweep). **No worker assignment, no Signal/Wait emission, no
+   fence, no route** — every parallelism / sync / memory-tier
+   decision lives at the per-target lowering. Returns a validated
+   `SubtileTape`. Unit tests: chain, attn-decode loop wrap, multiple
+   AttnDecodes get distinct LoopVarIds.
 
-5b. **`validate_subtile_tape`** — full impl + tests. Orphan
-    signal/wait, deadlock cycle, cross-worker data race (sync-edge
-    based, fence-free), compute well-formedness, loop balance. Runs
-    at `lower_dag_to_tape`'s exit.
+5b. **`validate_subtile_tape`** — full impl + tests. Compute
+    well-formedness (every node Compute'd exactly once; ascending-id
+    adjacency); loop balance (matching `OpenLoop`/`CloseLoop`, no
+    nesting, no unclosed loops). Runs at `lower_dag_to_tape`'s exit.
 
 6. **Implement `lower_tape_to_tk(&SubtileTape) -> TkTape`.** Trivial
    syntax-directed translation. **Always-executable invariant: the
@@ -287,8 +288,9 @@ Revert the entire stack to commit `5206d10d49` if **any** of:
   the cleverness should have been a TkTape pass.
 - **K2 (target-agnostic SubtileTape).** `subtile_tape.rs` source
   contains any of `smem`, `gmem`, `Route`, `Fence`, `Page`, `Phase`,
-  `parity`. Mechanically grep-checkable. SubtileTape leaks GPU memory
-  hierarchy → re-design, not patch.
+  `parity`, `Worker`, `Signal`, `Wait`, `Barrier`. Mechanically
+  grep-checkable. SubtileTape leaks parallelism or memory model →
+  re-design, not patch.
 - **K3 (always-executable TkTape).** `lower_tape_to_tk`'s output is
   not a runnable, validator-green tape. Optimizer passes are *strict
   performance* rewrites; if a pass is required for correctness, the

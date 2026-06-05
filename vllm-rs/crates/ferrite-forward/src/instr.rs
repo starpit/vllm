@@ -239,6 +239,18 @@ pub trait CanonicalParams: WeightAccessors {
     /// corruption.
     const HIDDEN_SIZE: usize = 0;
 
+    /// Vocabulary size — the lm_head Gemm's output dim. Used by the
+    /// generic `Instruction::Gemm` arm to identify the lm_head call
+    /// site (so it can apply the last-token-per-seq narrow before the
+    /// GEMM). The previous heuristic `n > INTERMEDIATE_SIZE` mis-fires
+    /// on MoE arches whose `INTERMEDIATE_SIZE` is `moe_intermediate_size`
+    /// (Qwen3.5-MoE: 512), making q_proj / linear_attn.in_proj_qkv
+    /// (n=8192) look like an lm_head and narrowing their input to one
+    /// token at multi-token prefill → garbage activations → NaN logits.
+    /// `n == VOCAB_SIZE` is the unambiguous test. Default 0 so non-MoE
+    /// arches still hit the legacy `INTERMEDIATE_SIZE` fallback.
+    const VOCAB_SIZE: usize = 0;
+
     /// On-disk storage dtype for `*.scales` / `*.biases` tensors on
     /// mlx-affine-b4 checkpoints. The affine quant Metal kernels
     /// (`affine_qmv`, `affine_qmm_t`, `affine_qvm`, `affine_gather_qmv`,
@@ -1699,13 +1711,20 @@ impl Instruction {
                     std::env::var("LMHEAD_NARROW").as_deref(),
                     Ok("0") | Ok("off") | Ok("false")
                 );
-                // lm_head is the unique Gemm with `k == HIDDEN_SIZE && n
-                // > INTERMEDIATE_SIZE` — every other linear in the block
-                // either has `k == INTERMEDIATE_SIZE` (down_proj) or
-                // `n <= INTERMEDIATE_SIZE` (q/k/v/o/gate/up). VOCAB ≫
-                // INTERMEDIATE on every modern arch.
-                let is_lm_head =
-                    (k as usize) == W::HIDDEN_SIZE && (n as usize) > W::INTERMEDIATE_SIZE;
+                // lm_head detection: prefer the unambiguous `n == VOCAB_SIZE`
+                // when the canonical sets it (every modern arch). The
+                // legacy `n > INTERMEDIATE_SIZE` fallback (when
+                // VOCAB_SIZE is unset) mis-fires on MoE arches whose
+                // INTERMEDIATE_SIZE is `moe_intermediate_size` and
+                // therefore smaller than q_proj / linear_attn projections
+                // (Qwen3.5-MoE: moe_inter=512 < q_gate_dim=8192) —
+                // narrowing their input to last-token-per-seq at
+                // multi-token prefill produces NaN activations.
+                let is_lm_head = if W::VOCAB_SIZE > 0 {
+                    (n as usize) == W::VOCAB_SIZE
+                } else {
+                    (k as usize) == W::HIDDEN_SIZE && (n as usize) > W::INTERMEDIATE_SIZE
+                };
                 let gathered_owned: Option<OwnedTensor>;
                 let gemm_input = match ctx.fwd.last_token_indices {
                     Some(idx) if !narrow_disabled && is_lm_head && idx.dim(0) < (*v).dim(0) => {

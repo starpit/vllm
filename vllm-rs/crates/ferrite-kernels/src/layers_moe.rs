@@ -906,10 +906,26 @@ impl DenseSharedFusedMoELayer {
 
         let gate = crate::layers::Linear::load(gw, &format!("{prefix}.gate"))?;
 
-        let first_gate = format!("{prefix}.experts.0.gate_proj.weight");
+        // Stacked-experts probe: modern HF Qwen3.5-MoE / Qwen3-MoE-Instruct
+        // checkpoints ship the routed experts as two pre-stacked tensors
+        // (`{prefix}.experts.gate_up_proj` `[E, 2*inter, hidden]` and
+        // `{prefix}.experts.down_proj` `[E, hidden, inter]`) instead of
+        // per-expert `experts.{e}.{gate,up,down}_proj.weight`. The stacked
+        // dim-(-2) order is gate||up (Python vLLM `qwen3_5.py` chunks
+        // `gate_up_proj` along dim=-2 with chunk[0]=w1=gate, chunk[1]=w3=up
+        // — matches our w1 buffer layout byte-for-byte). Use a single
+        // bulk DMA per stacked tensor when present; fall back to the
+        // per-expert loop for older Mixtral-style checkpoints.
+        let stacked_gate_up = format!("{prefix}.experts.gate_up_proj");
+        let use_stacked = gw.contains(&stacked_gate_up);
+        let probe = if use_stacked {
+            stacked_gate_up.clone()
+        } else {
+            format!("{prefix}.experts.0.gate_proj.weight")
+        };
         let (_, disk_dtype) = gw
-            .tensor_info(&first_gate)
-            .ok_or_else(|| anyhow::anyhow!("weight not found: {first_gate}"))?;
+            .tensor_info(&probe)
+            .ok_or_else(|| anyhow::anyhow!("weight not found: {probe}"))?;
         // Use post-cast dtype for the stacked buffer; see
         // `FusedMoELayer::load` for the rationale.
         let dtype = gw.target_dtype().unwrap_or(disk_dtype);
@@ -921,21 +937,28 @@ impl DenseSharedFusedMoELayer {
         let w1_ptr = unsafe { driver::mem_alloc(w1_bytes)? };
         let w2_ptr = unsafe { driver::mem_alloc(w2_bytes)? };
 
-        let gate_proj_bytes = inter * hidden_size * elem;
-        for e in 0..num_experts {
-            let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
-            let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
-            let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
-            let expert_w1_off = e * 2 * inter * hidden_size * elem;
-            let expert_w2_off = e * hidden_size * inter * elem;
+        if use_stacked {
             unsafe {
-                gw.take_into(&gate_name, w1_ptr.add(expert_w1_off), stream)?;
-                gw.take_into(
-                    &up_name,
-                    w1_ptr.add(expert_w1_off + gate_proj_bytes),
-                    stream,
-                )?;
-                gw.take_into(&down_name, w2_ptr.add(expert_w2_off), stream)?;
+                gw.take_into(&stacked_gate_up, w1_ptr, stream)?;
+                gw.take_into(&format!("{prefix}.experts.down_proj"), w2_ptr, stream)?;
+            }
+        } else {
+            let gate_proj_bytes = inter * hidden_size * elem;
+            for e in 0..num_experts {
+                let gate_name = format!("{prefix}.experts.{e}.gate_proj.weight");
+                let up_name = format!("{prefix}.experts.{e}.up_proj.weight");
+                let down_name = format!("{prefix}.experts.{e}.down_proj.weight");
+                let expert_w1_off = e * 2 * inter * hidden_size * elem;
+                let expert_w2_off = e * hidden_size * inter * elem;
+                unsafe {
+                    gw.take_into(&gate_name, w1_ptr.add(expert_w1_off), stream)?;
+                    gw.take_into(
+                        &up_name,
+                        w1_ptr.add(expert_w1_off + gate_proj_bytes),
+                        stream,
+                    )?;
+                    gw.take_into(&down_name, w2_ptr.add(expert_w2_off), stream)?;
+                }
             }
         }
 

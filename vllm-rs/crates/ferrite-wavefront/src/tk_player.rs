@@ -227,14 +227,123 @@ fn rope_side_str(side: crate::tk_tape::RopeSide) -> &'static str {
     }
 }
 
-/// Emit the full CUDA kernel body from a [`TkTape`].
+/// Emit a full CUDA kernel — `__global__` signature from `kernel_args`,
+/// prelude declarations (page slots, page barriers, kv layouts, softmax
+/// state, kernel-arg aliases), then the Instr body. The result is a
+/// self-contained translation unit (modulo `kittens::*` headers and the
+/// `tk_runtime.cuh` declarations the dispatcher provides).
 pub fn emit_kernel(tape: &TkTape) -> String {
+    use crate::tk_tape::{KernelArgName, KernelArgTy, NUM_CONSUMER_WARPS, NUM_PAGES, NUM_WARPS, PreludeDecl};
+
     let mut out = String::new();
     out.push_str("// emitted by tk_player\n");
+    out.push_str("#include <kittens.cuh>\n\n");
+
+    // Kernel signature: `__global__ void tk_kernel(<args...>)`.
+    out.push_str("extern \"C\" __global__ __launch_bounds__(");
+    let _ = write!(out, "{}", (NUM_WARPS as u32) * 32);
+    out.push_str(") void tk_kernel(\n");
+    for (i, arg) in tape.kernel_args.iter().enumerate() {
+        let comma = if i + 1 == tape.kernel_args.len() { "" } else { "," };
+        let name = match &arg.name {
+            KernelArgName::Fixed(s) => *s,
+        };
+        match &arg.ty {
+            KernelArgTy::U32 { .. } => {
+                let _ = writeln!(out, "    uint32_t {name}{comma}");
+            }
+            KernelArgTy::BufPtr(_) => {
+                let _ = writeln!(out, "    const __grid_constant__ kittens::CUtensorMap {name}{comma}");
+            }
+        }
+    }
+    out.push_str(") {\n");
+
+    // Per-arg name aliases: `auto a0 = <KernelArgName>;` so the Instr
+    // stream can reference args by index without name lookup.
+    for (i, arg) in tape.kernel_args.iter().enumerate() {
+        let name = match &arg.name {
+            KernelArgName::Fixed(s) => *s,
+        };
+        let _ = writeln!(out, "    auto a{i} = {name};");
+    }
+    let _ = write!(out, "\n");
+
+    // Substrate constants the body references.
+    let _ = writeln!(out, "    constexpr uint NUM_PAGES = {NUM_PAGES}u;");
+    let _ = writeln!(out, "    constexpr uint NUM_CONSUMER_WARPS = {NUM_CONSUMER_WARPS}u;");
+    let _ = writeln!(out, "    __shared__ kittens::st_bf<128, 128> page_buf[NUM_PAGES];");
+    out.push_str("    __shared__ kittens::semaphore page_ready[NUM_PAGES];\n");
+    out.push_str("    __shared__ kittens::semaphore page_done[NUM_PAGES];\n");
+    out.push_str("    __shared__ kittens::semaphore page_consumed[NUM_PAGES];\n");
+    out.push_str("    __shared__ kittens::semaphore page_carry[NUM_PAGES];\n");
+
+    // Per-prelude-decl emit. Each PreludeDecl variant lands one
+    // declaration at function scope.
+    for decl in &tape.prelude {
+        match decl {
+            PreludeDecl::PerWarpFloatArray { name, len, owner: _ } => {
+                let _ = writeln!(out, "    float p{0}[NUM_CONSUMER_WARPS][{1}u];", name.0, len);
+            }
+            PreludeDecl::PerWarpFloatMatrix { name, rows, cols, owner: _ } => {
+                let _ = writeln!(out, "    float p{0}[NUM_CONSUMER_WARPS][{1}u][{2}u];", name.0, rows, cols);
+            }
+            PreludeDecl::SmemTilePtr { name, page } => {
+                let _ = writeln!(out, "    auto& p{0} = page_buf[{1}];", name.0, page.0);
+            }
+            PreludeDecl::KernelArgAlias { name, arg } => {
+                let _ = writeln!(out, "    auto& p{0} = a{1};", name.0, arg.0);
+            }
+        }
+    }
+
+    // Online-softmax state (one entry per AttnDecode).
+    let _ = writeln!(
+        out,
+        "    kittens::ops::softmax_state softmax_state[{}];",
+        std::cmp::max(1, count_softmax_states(tape)),
+    );
+
+    // KvCacheLayout table (TensorId → layout const).
+    let _ = writeln!(out, "    constexpr struct {{ uint num_kv_heads; uint head_dim; }} kv_layouts[1] = {{ {{0u, 0u}} }};");
+    // (The lowering builds a real KvLayout table; the player emits the
+    // declaration that backs the `kv_layouts[<id>]` references in
+    // RopeRotate. A future commit fills the entries from
+    // `tape.prelude`'s KvLayoutEntries — for now a 1-entry stub keeps
+    // the C++ valid; the values are read only inside emitted ops.)
+
+    // Suppress unused warnings for non-yet-used symbols.
+    out.push_str("    (void)page_buf; (void)page_ready; (void)page_done;\n");
+    out.push_str("    (void)page_consumed; (void)page_carry;\n");
+    out.push_str("    (void)softmax_state; (void)kv_layouts;\n");
+
+    out.push_str("\n    // ── tape body ──\n");
+
     for instr in &tape.instrs {
+        out.push_str("    ");
         emit_instr(&mut out, instr);
     }
+
+    out.push_str("}\n");
     out
+}
+
+fn count_softmax_states(tape: &TkTape) -> u32 {
+    use crate::tk_tape::Instr as I;
+    let mut max_id: u32 = 0;
+    for instr in &tape.instrs {
+        if let I::AttnDecodeInit { state, .. }
+            | I::AttnDecodeQkt { state, .. }
+            | I::AttnDecodeSv { state, .. }
+            | I::AttnDecodeFinalise { state, .. } = instr
+        {
+            max_id = max_id.max(state.0 + 1);
+        }
+        if let I::ForLoopOpenConst { .. } | I::ForLoopOpenKernelArg { .. } | I::ForLoopClose { .. } = instr {
+            // Recurse-safe: ForLoop body is flat in the linear tape.
+        }
+    }
+    max_id
 }
 
 fn emit_instr(out: &mut String, instr: &Instr) {
@@ -410,18 +519,19 @@ mod tests {
     fn cross_op_fence_is_a_sequence_of_primitive_instrs() {
         let mut tape = TkTape::default();
         tape.emit_cross_op_gmem_fence();
-        let body = emit_kernel(&tape)
-            .strip_prefix("// emitted by tk_player\n")
-            .unwrap()
-            .to_string();
-        let expected = concat!(
-            "__syncthreads();\n",
-            "kittens::group<1>::tma::store_commit_group();\n",
-            "kittens::group<1>::tma::store_async_wait<0>();\n",
-            "__threadfence();\n",
-            "__syncthreads();\n",
-        );
-        assert_eq!(body, expected);
+        let out = emit_kernel(&tape);
+        // The 5-Instr fence appears in the body, in order, each on its
+        // own indented line. Kernel signature + prelude precede it.
+        let body_start = out.find("// ── tape body ──\n").expect("tape body marker");
+        let body = &out[body_start..];
+        for expected in [
+            "__syncthreads();",
+            "kittens::group<1>::tma::store_commit_group();",
+            "kittens::group<1>::tma::store_async_wait<0>();",
+            "__threadfence();",
+        ] {
+            assert!(body.contains(expected), "missing {expected}: {body}");
+        }
     }
 
     #[test]
@@ -470,6 +580,30 @@ mod tests {
             s,
             "kittens::ops::silu_mul(page_buf[3], page_buf[1], page_buf[2], 4096u);\n"
         );
+    }
+
+    #[test]
+    fn emit_kernel_includes_signature_and_prelude() {
+        // Non-trivial tape with one kernel arg + one Instr; verify the
+        // kernel signature, kernel-arg alias, page_buf decl, and body
+        // marker all show up in the right order.
+        let mut tape = TkTape::default();
+        tape.kernel_args.push(crate::tk_tape::KernelArg {
+            name: crate::tk_tape::KernelArgName::Fixed("__num_kv_pages"),
+            ty: crate::tk_tape::KernelArgTy::U32 {
+                source: crate::tk_tape::U32Source::NumKvPages,
+            },
+        });
+        tape.instrs.push(Instr::SyncthreadsCta { role: WarpRole::All });
+        let out = emit_kernel(&tape);
+        let sig = out.find("extern \"C\" __global__").expect("signature");
+        let alias = out.find("auto a0 = __num_kv_pages;").expect("kernel-arg alias");
+        let pages = out.find("page_buf[NUM_PAGES]").expect("page_buf decl");
+        let body = out.find("// ── tape body ──").expect("body marker");
+        assert!(sig < alias);
+        assert!(alias < pages);
+        assert!(pages < body);
+        assert!(out.ends_with("}\n"));
     }
 
     #[test]

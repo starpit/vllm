@@ -6141,7 +6141,7 @@ fn dump_wavefront_mega(
             mlp_unit,
             num_workers,
         );
-        let preds = ferrite_wavefront::region::predecessors(&g);
+        let preds = ferrite_wavefront::subtile_ir::predecessors(&g);
         let sched = ferrite_wavefront::region_schedule::schedule_from_assignment(
             &g,
             &preds,
@@ -6150,7 +6150,7 @@ fn dump_wavefront_mega(
         );
         (g, sched)
     } else {
-        let rg = ferrite_wavefront::region::lower_region(&fused, nb);
+        let rg = ferrite_wavefront::subtile_ir::lower_region(&fused, nb);
         // PERF DIAG (droppable): cost a matmul block by its WEIGHT-READ bytes
         // (N_block × K) — the bandwidth-bound cost — instead of output area
         // (N_block), so the load-balancer doesn't leave workers idle at a join
@@ -6171,7 +6171,7 @@ fn dump_wavefront_mega(
             &rg,
             |n| {
                 let area = (n.output.region.rows.len * n.output.region.cols.len) as f64;
-                if read_cost && matches!(n.op, ferrite_wavefront::subtile::SubOp::MatmulTile) {
+                if read_cost && matches!(n.op, ferrite_wavefront::subtile_ir::SubOp::MatmulTile) {
                     (n.output.region.cols.len as f64) * (n.inputs[0].region.cols.len as f64)
                 } else {
                     area

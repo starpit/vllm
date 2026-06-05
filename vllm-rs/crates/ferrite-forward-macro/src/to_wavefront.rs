@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
 use ferrite_wavefront::mega::SourceDesc;
-use ferrite_wavefront::subtile::SourceShape;
+use ferrite_wavefront::subtile_ir::SourceShape;
 use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
 use crate::classified::{ExternKind, OpKind, Program, WeightId};

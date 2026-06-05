@@ -5,7 +5,7 @@
 //!
 //! # What this is
 //!
-//! [`crate::region_schedule`] bin-packs a [`crate::region::RegionGraph`]
+//! [`crate::region_schedule`] bin-packs a [`crate::subtile_ir::SubtileIR`]
 //! into `P` co-resident worker tapes ([`Schedule`]) with cross-worker
 //! `Wait`/`Signal` flags. This module flattens that schedule into the
 //! exact data the persistent megakernel reads:
@@ -54,7 +54,7 @@
 //!
 //! # Three region-IR ↔ GPU-atom impedance mismatches it resolves
 //!
-//! 1. **Dense weight tensor → quantized triple.** `region.rs` models a GEMM
+//! 1. **Dense weight tensor → quantized triple.** `subtile_ir` models a GEMM
 //!    weight as one dense tensor; the GPU `qmv` atom needs `(packed w,
 //!    scales, biases)`. The serializer expands a [`SubOp::MatmulTile`]'s
 //!    weight source through its [`SourceDesc::QuantWeight`] descriptor (the
@@ -81,9 +81,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion, predecessors};
 use crate::region_schedule::{Schedule, TapeInstr};
-use crate::subtile::{EwKind, SubOp, SubtileId};
+use crate::subtile_ir::{
+    EwKind, SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion, predecessors,
+};
 use crate::metal_tape::{
     BufId, BufferRef, InputKind, WeightBundle, affine_scale_row_bytes, packed_weight_row_bytes,
 };
@@ -347,7 +348,7 @@ pub struct Geometry {
     pub max_blocks: u32,
 }
 
-/// What a leaf source tensor of the [`RegionGraph`] binds to on the GPU —
+/// What a leaf source tensor of the [`SubtileIR`] binds to on the GPU —
 /// parallel to `graph.tensors[0..num_sources]`, the megakernel-resolution
 /// counterpart of the macro's `to_wavefront::SourceBinding`. The macro
 /// fills the concrete [`BufferRef`]s (a weight's [`WeightLoc`], quant
@@ -436,12 +437,12 @@ pub enum EmitMode {
     ComputeOnly,
 }
 
-/// Flatten a wavefront [`Schedule`] over a [`RegionGraph`] into a
+/// Flatten a wavefront [`Schedule`] over a [`SubtileIR`] into a
 /// [`MegaProgram`] with the default ([`EmitMode::Pipelined`]) layout. `sources`
 /// is parallel to `graph.tensors[0..num_sources]`; `geom` supplies the element
 /// width and the attention paged-cache geometry the abstract graph omits.
 pub fn serialize(
-    graph: &RegionGraph,
+    graph: &SubtileIR,
     schedule: &Schedule,
     sources: &[SourceDesc],
     geom: Geometry,
@@ -451,7 +452,7 @@ pub fn serialize(
 
 /// As [`serialize`], choosing the worker-tape [`EmitMode`].
 pub fn serialize_mode(
-    graph: &RegionGraph,
+    graph: &SubtileIR,
     schedule: &Schedule,
     sources: &[SourceDesc],
     geom: Geometry,
@@ -967,7 +968,7 @@ fn pack_simdgroup_ranges(
 /// `Compute(id)` in worker `w`'s tape means node `id` runs on worker `w`.
 /// The handoff planner needs the assignment the scheduler chose; the
 /// [`Schedule`] only exposes the per-worker instruction streams, so rebuild it.
-fn reconstruct_worker_of(graph: &RegionGraph, schedule: &Schedule) -> Vec<u32> {
+fn reconstruct_worker_of(graph: &SubtileIR, schedule: &Schedule) -> Vec<u32> {
     let mut worker_of = vec![0u32; graph.nodes.len()];
     for (wi, worker) in schedule.workers.iter().enumerate() {
         for instr in &worker.tape {
@@ -998,7 +999,7 @@ struct Handoff {
 /// Mutable serializer state: the interned buffer / shape tables, the
 /// operand list, the tensor→arena-slot map, and the cross-worker handoff plan.
 struct Ser<'a> {
-    graph: &'a RegionGraph,
+    graph: &'a SubtileIR,
     sources: &'a [SourceDesc],
     geom: Geometry,
     num_sources: u32,
@@ -1020,7 +1021,7 @@ struct Ser<'a> {
 }
 
 impl<'a> Ser<'a> {
-    fn new(graph: &'a RegionGraph, sources: &'a [SourceDesc], geom: Geometry) -> Self {
+    fn new(graph: &'a SubtileIR, sources: &'a [SourceDesc], geom: Geometry) -> Self {
         Self {
             graph,
             sources,
@@ -1848,10 +1849,9 @@ impl<'a> Ser<'a> {
 mod tests {
     use super::*;
     use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-    use crate::region::{SubtileNode, lower_region};
-    use crate::region_schedule::{ScheduleParams, partition_roundrobin, schedule_wavefront};
-    use crate::subtile::SourceShape;
     use crate::metal_tape::{WeightBundle, WeightLoc, WeightRole};
+    use crate::region_schedule::{ScheduleParams, partition_roundrobin, schedule_wavefront};
+    use crate::subtile_ir::{SourceShape, SubtileNode, lower_region};
 
     const ACT_ELEM: u32 = 2;
     fn geom() -> Geometry {

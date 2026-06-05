@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Tensor-parallel **partition** of the decode RegionGraph for the wavefront
+//! Tensor-parallel **partition** of the decode SubtileIR for the wavefront
 //! megakernel: turn the per-op dataflow into `P` local worker-chains joined
 //! only at the genuine reductions, so the megakernel stops paying the
 //! cross-worker dependency-WAIT (the measured ~2.3 ms gap vs the per-op path,
@@ -25,20 +25,19 @@
 //!
 //! `lower_partitioned` re-lowers from the [`LoweringInput`] (not a post-pass on
 //! the flat graph) because the split-K transform needs the op boundaries the
-//! flat RegionGraph has erased. It reuses region.rs's tiling helpers and per-op
-//! arithmetic verbatim, so [`crate::region::eval_dag`] validates it the same
+//! flat SubtileIR has erased. It reuses `subtile_ir`'s tiling helpers and per-op
+//! arithmetic verbatim, so [`crate::subtile_ir::eval_dag`] validates it the same
 //! way: bit-exact for head/column tiling; within-tol where split-K reassociates
 //! the reduction (PLAN Tier A′).
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
-use crate::region::{
-    RegionGraph, SubtileNode, TensorId, TensorRegion, TensorShape, head_blocks, n_blocks,
-    op_out_cols,
+use crate::subtile_ir::{
+    EwKind, Range, Region, SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion,
+    TensorShape, head_blocks, n_blocks, op_out_cols,
 };
-use crate::subtile::{EwKind, Range, Region, SubOp, SubtileId};
 
 /// Lower a decode `LoweringInput` to its tensor-parallel partition: the
-/// finely-tiled RegionGraph plus a `owner[node]` worker assignment. Tiling is
+/// finely-tiled SubtileIR plus a `owner[node]` worker assignment. Tiling is
 /// at `head_dim` granularity so head-structured ops and column-tiled ops share
 /// the slice-index. `p` = worker count. Reductions (a GEMM whose activation is
 /// a partitioned op output — o_proj, down) become split-K: one partial per
@@ -51,7 +50,7 @@ pub fn lower_partitioned(
     head_dim: u32,
     mlp_unit: u32,
     p: u32,
-) -> (RegionGraph, Vec<u32>) {
+) -> (SubtileIR, Vec<u32>) {
     /// One op's output: partitioned (a single tensor written by per-block
     /// nodes) or replicated (P per-worker whole copies — a consumer on worker
     /// `w` reads copy `w`, so the backbone is local to every worker).
@@ -507,7 +506,7 @@ pub fn lower_partitioned(
         OpOut::Part(t) => *t,
         OpOut::Repl(reps) => reps[0],
     };
-    let graph = RegionGraph {
+    let graph = SubtileIR {
         tensors,
         num_sources,
         nodes,
@@ -522,10 +521,11 @@ mod tests {
     use super::*;
     use crate::lower::{OpDesc, fuse_silu_mul};
     use crate::mega::{Geometry, SourceDesc, op_kind, serialize};
-    use crate::region::{eval_dag, lower_region, predecessors, result_buffer, validate};
-    use crate::region_schedule::{TapeInstr, play, schedule_from_assignment};
-    use crate::subtile::SourceShape;
     use crate::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+    use crate::region_schedule::{TapeInstr, play, schedule_from_assignment};
+    use crate::subtile_ir::{
+        SourceShape, eval_dag, lower_region, predecessors, result_buffer, validate,
+    };
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -549,7 +549,7 @@ mod tests {
             })
     }
 
-    /// A whole Llama-style decode layer (same fixture shape as region.rs's
+    /// A whole Llama-style decode layer (same fixture shape as subtile_ir's
     /// `full_decode_layer_nblock_bit_exact`), returning the input + sources +
     /// the bit-exact reference result via `lower_region` (N-block, no split-K).
     fn decode_layer() -> (LoweringInput, Vec<Vec<f32>>, u32) {

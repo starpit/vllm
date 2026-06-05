@@ -253,7 +253,7 @@ pub fn coalesce_carry_forwards(
 mod tests {
     use super::*;
     use crate::lower::{LoweredOp, OpDesc};
-    use crate::subtile::SourceShape;
+    use crate::subtile_ir::SourceShape;
 
     fn input_with_ops(sources: Vec<SourceShape>, ops: Vec<OpDesc>, result: usize) -> LoweringInput {
         LoweringInput { sources, ops, result }

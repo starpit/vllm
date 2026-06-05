@@ -6,7 +6,7 @@
 //! `LoweringInput` directly from a solved decode FUF via the proc-macro.
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-use crate::subtile::SourceShape;
+use crate::subtile_ir::SourceShape;
 
 /// Minimal one-layer Llama-3.2-1B-style decode forward.
 ///
@@ -259,7 +259,7 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
 
     let shape_for = |r: InputRef,
                      op_shapes: &[(u32, u32)],
-                     srcs: &[crate::subtile::SourceShape]|
+                     srcs: &[crate::subtile_ir::SourceShape]|
      -> (u32, u32) {
         match r {
             InputRef::Ext(e) => (srcs[e].rows, srcs[e].cols),

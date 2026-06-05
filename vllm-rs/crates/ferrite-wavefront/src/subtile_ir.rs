@@ -1,48 +1,161 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Tensor-region subtile IR — the v2 dataflow model for the wavefront
-//! decode megakernel, built to support **true subtile granularity** on
-//! the GPU.
+//! The canonical wavefront **SubtileIR** — region-granular SSA over
+//! tensors, the fold of `region.rs` (v2) + `subtile.rs` (v1) into one
+//! module.
 //!
-//! The v1 IR ([`crate::subtile`]) modeled each node as producing its own
-//! whole output buffer, with consumers reading either a whole producer
-//! (`Operand::Sub`) or a slice of a leaf `Source`. That is fine at coarse
-//! (one-subtile-per-op) granularity, but it cannot express the thing
-//! subtiling needs: an op's output **assembled from several subtiles'
-//! slices**. When `q_proj` is split into N-blocks, each block writes a
-//! *slice* of Q, and the next op (rope → attention) reads the *whole* Q —
-//! there is no single node holding it.
+//! ## What this is
 //!
-//! The tensor-region model fixes that, and matches the GPU arena exactly:
-//!   - Every value lives in a **tensor** (a logical buffer): leaf
-//!     `sources` (weights / activations / prefix-KV / embed / cos-sin)
-//!     and one **op-output tensor** per op.
-//!   - A [`SubtileNode`] **writes a region** of one output tensor and
-//!     **reads regions** of input tensors.
-//!   - Dependencies are derived from **region overlap**: a node that
-//!     reads region `R` of an op-output tensor `T` depends on every
-//!     earlier node whose write-region on `T` overlaps `R`. (Reads of a
-//!     leaf source have no dependency — sources are bound at eval time.)
+//! Every value lives in a **tensor** (a logical row-major buffer): leaf
+//! `sources` (weights / activations / prefix-KV / embed / cos-sin) and one
+//! **op-output tensor** per op. A [`SubtileNode`] *writes a region* of
+//! one output tensor and *reads regions* of input tensors. Dependencies
+//! are derived from **region overlap**: a node that reads region `R` of
+//! an op-output tensor `T` depends on every earlier node whose
+//! write-region on `T` overlaps `R`. Reads of a leaf source have no
+//! dependency (sources are bound at eval time).
 //!
-//! This is the standard "tensor SSA with sub-tensor writes" model. On the
-//! GPU each tensor is an arena buffer; a subtile dispatch writes its
-//! `out_region` at a byte offset and a consumer reads the buffer — the
-//! `qmv` atom already supports this (offset the weight/scales/biases/output
-//! bindings, specialize `OUT_VEC_SIZE = nb`; see `quantized_qmv.metal`).
+//! That is the SSA model that supports **true subtile granularity** on
+//! the GPU: `q_proj` split into N-blocks where each block writes a slice
+//! of Q, then rope → attention reads the *whole* Q assembled from those
+//! slices. The v1 whole-output `Operand::Sub` model couldn't express
+//! that — and is gone (it lives only in [`legacy`] for the few v1-only
+//! carcasses that have not been deleted yet: [`crate::tape`],
+//! [`crate::scheduler`], [`crate::lower::lower`] which are slated for
+//! deletion in later staged commits).
 //!
-//! Host validation is the same two-tier scheme as v1: [`eval_dag`] here is
-//! bit-exact vs `cpu_golden` whole-op at `k_chunks = 1` (N-block tiling
-//! never reorders a per-output reduction); split-K (with [`SubOp::SumReduce`])
-//! is within f32 tolerance. The op vocabulary + per-op arithmetic is reused
-//! verbatim from [`crate::subtile`] so the two IRs compute identically.
+//! ## Two-tier validation
+//!
+//! - **Tier A′ (decomposition equivalence):** [`eval_dag`] equals
+//!   `cpu_golden` whole-op output. Bit-exact at `nb >= n` and at every
+//!   N-block width that doesn't reorder a per-output reduction; only
+//!   token-exact once a reduction is reassociated (split-K).
+//! - **Tier A (self-consistency):** scheduled tape replay equals
+//!   [`eval_dag`] (lands with the wavefront scheduler).
+//!
+//! `cpu_golden` (in `ferrite-forward`) is the deterministic f32 substrate
+//! the player computes with — not the correctness *oracle* (that is
+//! ferrite-metal non-mega at temp=0).
 
 #![allow(dead_code)]
 
-use crate::lower::{InputRef, LoweredOp, LoweringInput};
-use crate::subtile::{EwKind, Range, Region, SubOp, SubtileId};
+// ── Identifiers & geometry ─────────────────────────────────────────
+
+/// Dense index into a [`SubtileIR::nodes`] vector. The DAG is
+/// topologically ordered: every overlap-predecessor of a node has a
+/// smaller id (so a single pass over `nodes` is a valid evaluation
+/// order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubtileId(pub u32);
+
+/// Half-open range `[start, start + len)` along one axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Range {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl Range {
+    pub fn new(start: u32, len: u32) -> Self {
+        Self { start, len }
+    }
+    pub fn end(&self) -> u32 {
+        self.start + self.len
+    }
+}
+
+/// A rectangular slice of a logically row-major `[rows, cols]` buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub rows: Range,
+    pub cols: Range,
+}
+
+/// Logical shape of a leaf source buffer (used by the v1
+/// `LoweringInput`-side bridge in [`crate::lower`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceShape {
+    pub rows: u32,
+    pub cols: u32,
+}
+
+// ── Sub-operations (shared by both granularities) ──────────────────
+
+/// The sub-operation a node performs. Every variant has a
+/// `cpu_golden`-backed host evaluation in [`eval_node`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SubOp {
+    /// Matmul output tile over one K-chunk:
+    /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
+    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
+    /// (W is row-major `[N, K]`, read transposed). Output is the dense
+    /// partial `[mr.len, nr.len]` contributed by this K-chunk.
+    MatmulTile,
+    /// Elementwise sum of equal-shaped inputs — the split-K combine. All
+    /// inputs and the output are `[out_rows, out_cols]`.
+    SumReduce,
+    /// Shape-preserving elementwise op over a tile. Unary (`Silu`) reads
+    /// `inputs[0]`; binary (`Mul`, `Add`) read `inputs[0]` and
+    /// `inputs[1]`, both matching the output shape. Col-tiling never
+    /// reorders a computation, so always bit-exact vs the whole op.
+    Elementwise(EwKind),
+    /// Fused SwiGLU activation: `out[j] = silu(gate[j]) * up[j]`.
+    /// `inputs[0]` = gate, `inputs[1]` = up, both `[out_rows, out_cols]`.
+    /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
+    /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
+    /// `Silu` + `Mul` are fused into this one node *before scheduling* (so
+    /// the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
+    SiluMul,
+    /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
+    /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
+    /// `inputs[1]` = weight `[1, cols]`. The per-row reduction is kept
+    /// whole (single node) so it is bit-exact vs `cpu_golden::rmsnorm`;
+    /// rms-norm is cheap and hides in the matvec shadow, so there is no
+    /// reason to split its reduction.
+    RmsNorm { eps: f32 },
+    /// NeoX-pairing rotary embedding over `[rows, heads * head_dim]`.
+    /// `inputs[0]` = x, `inputs[1]` = cos row `[1, >=head_dim]`,
+    /// `inputs[2]` = sin row — the new token's position, pre-sliced.
+    /// Pairs `(d, d + half)`; matches `cpu_golden::rope`/`rope_append`'s
+    /// rotation. Shape-preserving, so bit-exact vs the reference.
+    RopeRotate { head_dim: u32 },
+    /// The K-side `rope_append` for the GPU megakernel: rotate K (NeoX)
+    /// **and** write the rotated K + un-rotated V into the paged KV
+    /// cache, so the downstream attention reads the new token from the
+    /// cache like the oracle non-mega path (Tier-B exact). The host eval
+    /// is **rotation only** (identical to [`SubOp::RopeRotate`]); V and
+    /// the cache write are GPU-only — V is carried for the schedule edge
+    /// and so the serializer can bind it. `layer` names the KV-cache
+    /// layer the serializer routes the cache operands to.
+    RopeAppend { head_dim: u32, layer: u32 },
+    /// Decode attention. `inputs[0]` = Q `[Mq, num_q_heads * head_dim]`;
+    /// the remaining inputs are alternating `(K_seg, V_seg)`, each
+    /// `[seg_len, num_kv_heads * head_dim]`, concatenated along the KV
+    /// axis in input order. The **fused** decode passes the prefix cache
+    /// as a read-only segment and the just-rotated new token as the
+    /// dataflow segment — so the new K/V is an internal edge, not a
+    /// cache round-trip.
+    AttnDecode {
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+    },
+}
+
+/// Elementwise op kind. Numerics mirror `cpu_golden` exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EwKind {
+    /// `x / (1 + e^-x)`.
+    Silu,
+    /// `a * b`.
+    Mul,
+    /// `a + b`.
+    Add,
+}
 
 // ── Tensors & regions ──────────────────────────────────────────────
 
-/// Dense index into [`RegionGraph::tensors`]. Tensors `[0, num_sources)`
+/// Dense index into [`SubtileIR::tensors`]. Tensors `[0, num_sources)`
 /// are leaf sources bound at eval time; the rest are op outputs written
 /// by subtile nodes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -77,8 +190,9 @@ pub struct TensorRegion {
 
 /// One unit of work: reads `inputs` (regions of tensors), computes its
 /// `op`, and writes the result to `output` (a region of one op-output
-/// tensor). Produces a dense `[output.region.rows.len, output.region.cols.len]`
-/// buffer that is scattered into the output tensor.
+/// tensor). Produces a dense
+/// `[output.region.rows.len, output.region.cols.len]` buffer that is
+/// scattered into the output tensor.
 #[derive(Clone, Debug)]
 pub struct SubtileNode {
     pub id: SubtileId,
@@ -87,12 +201,12 @@ pub struct SubtileNode {
     pub output: TensorRegion,
 }
 
-/// A tensor-region subtile dataflow graph. Nodes are topologically
-/// ordered: every node that reads an op-output region is preceded by the
-/// nodes that write the overlapping region (so a single pass over `nodes`
-/// is a valid evaluation order).
+/// The canonical wavefront SubtileIR — a tensor-region SSA dataflow
+/// graph. Nodes are topologically ordered: every node that reads an
+/// op-output region is preceded by the nodes that write the overlapping
+/// region (so a single pass over `nodes` is a valid evaluation order).
 #[derive(Clone, Debug)]
-pub struct RegionGraph {
+pub struct SubtileIR {
     pub tensors: Vec<TensorShape>,
     /// `tensors[0..num_sources]` are leaf sources.
     pub num_sources: u32,
@@ -101,7 +215,7 @@ pub struct RegionGraph {
     pub result: TensorId,
 }
 
-impl RegionGraph {
+impl SubtileIR {
     pub fn shape(&self, t: TensorId) -> TensorShape {
         self.tensors[t.0 as usize]
     }
@@ -113,7 +227,7 @@ impl RegionGraph {
 // ── Host evaluation ────────────────────────────────────────────────
 
 /// Gather a tensor region into a dense row-major `(buf, rows, cols)`.
-fn gather(tr: &TensorRegion, graph: &RegionGraph, bufs: &[Vec<f32>]) -> (Vec<f32>, u32, u32) {
+fn gather(tr: &TensorRegion, graph: &SubtileIR, bufs: &[Vec<f32>]) -> (Vec<f32>, u32, u32) {
     let shape = graph.shape(tr.tensor);
     let src = &bufs[tr.tensor.0 as usize];
     let (r, c) = (tr.region.rows.len, tr.region.cols.len);
@@ -127,7 +241,7 @@ fn gather(tr: &TensorRegion, graph: &RegionGraph, bufs: &[Vec<f32>]) -> (Vec<f32
 }
 
 /// Scatter a dense `[rows, cols]` buffer into `bufs[tensor]` at `region`.
-pub(crate) fn scatter(
+pub fn scatter(
     bufs: &mut [Vec<f32>],
     tensor: TensorId,
     region: Region,
@@ -144,11 +258,11 @@ pub(crate) fn scatter(
     }
 }
 
-/// Evaluate a tensor-region DAG on the host. `sources[s]` is the
-/// row-major buffer for source tensor `s` (`s < num_sources`), matching
+/// Evaluate the SubtileIR on the host. `sources[s]` is the row-major
+/// buffer for source tensor `s` (`s < num_sources`), matching
 /// `graph.tensors[s]`. Returns the backing buffer of every tensor
-/// (indexed by [`TensorId`]); the logits are `result[graph.result]`.
-pub fn eval_dag(graph: &RegionGraph, sources: &[&[f32]]) -> Vec<Vec<f32>> {
+/// (indexed by [`TensorId`]); the logits are `bufs[graph.result]`.
+pub fn eval_dag(graph: &SubtileIR, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     assert_eq!(
         sources.len(),
         graph.num_sources as usize,
@@ -177,10 +291,9 @@ pub fn eval_dag(graph: &RegionGraph, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     bufs
 }
 
-/// Compute one node's dense `[out_rows, out_cols]` output. The per-op
-/// arithmetic is identical to [`crate::subtile::eval_node`] (which is
-/// `cpu_golden`-matched), so the two IRs agree bit-for-bit.
-pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> Vec<f32> {
+/// Compute one node's dense `[out_rows, out_cols]` output. Per-op
+/// arithmetic mirrors `cpu_golden`.
+pub fn eval_node(node: &SubtileNode, graph: &SubtileIR, bufs: &[Vec<f32>]) -> Vec<f32> {
     let out_rows = node.output.region.rows.len;
     let out_cols = node.output.region.cols.len;
     match node.op {
@@ -264,7 +377,7 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
             out
         }
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
-        // its V input (3) + the paged-cache write are GPU-only.
+        // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim } | SubOp::RopeAppend { head_dim, .. } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (cos, _, cc) = gather(&node.inputs[1], graph, bufs);
@@ -376,7 +489,7 @@ pub fn eval_node(node: &SubtileNode, graph: &RegionGraph, bufs: &[Vec<f32>]) -> 
 }
 
 /// The forward result buffer (logits) — `bufs[graph.result]`.
-pub fn result_buffer<'a>(graph: &RegionGraph, bufs: &'a [Vec<f32>]) -> &'a [f32] {
+pub fn result_buffer<'a>(graph: &SubtileIR, bufs: &'a [Vec<f32>]) -> &'a [f32] {
     &bufs[graph.result.0 as usize]
 }
 
@@ -394,7 +507,7 @@ fn regions_overlap(a: Region, b: Region) -> bool {
 /// overlaps one of this node's input reads on the same op-output tensor.
 /// Reads of leaf sources contribute no dependency. This is the edge set
 /// the wavefront scheduler turns into cross-worker `Wait`/`Signal`.
-pub fn predecessors(graph: &RegionGraph) -> Vec<Vec<SubtileId>> {
+pub fn predecessors(graph: &SubtileIR) -> Vec<Vec<SubtileId>> {
     // writers[t] = (node_id, out_region) for each op-output tensor, in id order.
     let mut writers: Vec<Vec<(u32, Region)>> = vec![Vec::new(); graph.tensors.len()];
     let mut preds: Vec<Vec<SubtileId>> = Vec::with_capacity(graph.nodes.len());
@@ -424,7 +537,7 @@ pub fn predecessors(graph: &RegionGraph) -> Vec<Vec<SubtileId>> {
 /// op arity, and that every op-output read is covered by writers with a
 /// strictly smaller id (acyclic + assembled-before-read). Returns the
 /// node count on success.
-pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
+pub fn validate(graph: &SubtileIR) -> Result<usize, String> {
     let n_tensors = graph.tensors.len() as u32;
     if graph.num_sources > n_tensors {
         return Err(format!(
@@ -510,11 +623,11 @@ pub fn validate(graph: &RegionGraph) -> Result<usize, String> {
     Ok(graph.nodes.len())
 }
 
-// ── LoweringInput → tensor-region graph ────────────────────────────
+// ── LoweringInput → SubtileIR ──────────────────────────────────────
 
 /// Tile `[0, total)` into contiguous blocks of width `block` (last block
 /// may be shorter). `block >= total` yields a single whole block.
-pub(crate) fn n_blocks(total: u32, block: u32) -> Vec<Range> {
+pub fn n_blocks(total: u32, block: u32) -> Vec<Range> {
     assert!(block >= 1, "block width must be >= 1");
     let mut out = Vec::new();
     let mut start = 0;
@@ -533,7 +646,7 @@ pub(crate) fn n_blocks(total: u32, block: u32) -> Vec<Range> {
 /// down to a whole number of `head_dim`-wide heads (at least one head). Used
 /// for rope/attention so every block is a clean set of heads — the q→rope→
 /// attn chain partitions on head boundaries (and o_proj split-Ks on them).
-pub(crate) fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
+pub fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
     let hd = head_dim.max(1);
     let heads_per_block = (nb / hd).max(1);
     n_blocks(total, heads_per_block * hd)
@@ -541,7 +654,8 @@ pub(crate) fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
 
 /// Out-columns of an op (mirrors `crate::lower`): GEMM → n, attention →
 /// `num_q_heads * head_dim`, everything else preserves input-0 width.
-pub(crate) fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
+pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, in0_cols: u32) -> u32 {
+    use crate::lower::LoweredOp;
     match op {
         LoweredOp::Gemm { n, .. } => n,
         LoweredOp::AttnDecode {
@@ -559,14 +673,16 @@ pub(crate) fn op_out_cols(op: LoweredOp, in0_cols: u32) -> u32 {
     }
 }
 
-/// Lower a flat [`LoweringInput`] to a tensor-region graph, **N-block
-/// tiling every GEMM** by `nb` (output columns split into `ceil(n/nb)`
-/// MatmulTile subtiles, each writing a disjoint column slice of the op's
-/// output tensor — no reduce, bit-exact). All other ops stay whole (one
-/// subtile writing the whole output tensor). `nb >= n` ⇒ a single block
-/// (coarse, equivalent to v1). Source tensors mirror `input.sources`;
-/// op-output tensor `i` is `TensorId(num_sources + i)`.
-pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
+/// Lower a flat [`crate::lower::LoweringInput`] to a SubtileIR,
+/// **N-block tiling every GEMM** by `nb` (output columns split into
+/// `ceil(n/nb)` MatmulTile subtiles, each writing a disjoint column
+/// slice of the op's output tensor — no reduce, bit-exact). All other
+/// ops stay whole (one subtile writing the whole output tensor).
+/// `nb >= n` ⇒ a single block (coarse, equivalent to v1). Source tensors
+/// mirror `input.sources`; op-output tensor `i` is
+/// `TensorId(num_sources + i)`.
+pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR {
+    use crate::lower::{InputRef, LoweredOp};
     let num_sources = input.sources.len() as u32;
     let mut tensors: Vec<TensorShape> = input
         .sources
@@ -732,7 +848,7 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
         op_cols.push(out_cols);
     }
 
-    RegionGraph {
+    SubtileIR {
         tensors,
         num_sources,
         nodes,
@@ -740,11 +856,12 @@ pub fn lower_region(input: &LoweringInput, nb: u32) -> RegionGraph {
     }
 }
 
+// ── Tests (canonical region IR) ────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::OpDesc;
-    use crate::subtile::SourceShape;
+    use crate::lower::{InputRef, LoweredOp, OpDesc};
     use ferrite_forward::cpu_golden;
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
@@ -813,7 +930,7 @@ mod tests {
                 });
                 start += len;
             }
-            let g = RegionGraph {
+            let g = SubtileIR {
                 tensors,
                 num_sources: 2,
                 nodes,
@@ -827,9 +944,7 @@ mod tests {
 
     /// Build a whole Llama-style decode layer as a `LoweringInput` and
     /// lower it with [`lower_region`] at several N-block widths; each must
-    /// be bit-exact vs the `cpu_golden` composition. This is the v2
-    /// analogue of `subtile::full_decode_layer_bit_exact`, now exercising
-    /// the assembled-output (N-block → whole-consumer) edges.
+    /// be bit-exact vs the `cpu_golden` composition.
     #[test]
     fn full_decode_layer_nblock_bit_exact() {
         let (h, hd, hq, hkv, i, l) = (16u32, 4u32, 4u32, 2u32, 32u32, 3u32);
@@ -909,7 +1024,7 @@ mod tests {
 
         // Same layer as a LoweringInput (sources 0..=13).
         let ss = |rows: u32, cols: u32| SourceShape { rows, cols };
-        let input = LoweringInput {
+        let input = crate::lower::LoweringInput {
             sources: vec![
                 ss(1, h),
                 ss(1, h),
@@ -1026,7 +1141,6 @@ mod tests {
             &wgate, &wup, &wdown,
         ];
 
-        // nb = qdim/kvdim/inter all split; nb = huge → coarse (one block).
         for nb in [4u32, 8, 1000] {
             let g = lower_region(&input, nb);
             assert!(validate(&g).is_ok(), "valid layer nb={nb}");
@@ -1043,13 +1157,8 @@ mod tests {
     /// block; a reader of a leaf source has no dependency.
     #[test]
     fn tiled_elementwise_depends_on_matching_block() {
-        // act[1,8] @ W[6,8] with nb=2 → 3 matmul blocks; then a Silu. Silu is a
-        // pure elementwise op, so the subtile-IR completion TILES it by the same
-        // nb — each silu tile reads ONLY its matching matmul block's slice (a
-        // local dependence), instead of one whole-tensor silu joining all 3
-        // blocks. That is what lets the scheduler keep the chain on one worker.
         let (m, n, k) = (1u32, 6u32, 8u32);
-        let input = LoweringInput {
+        let input = crate::lower::LoweringInput {
             sources: vec![
                 SourceShape { rows: m, cols: k },
                 SourceShape { rows: n, cols: k },
@@ -1076,7 +1185,6 @@ mod tests {
             preds[0].is_empty() && preds[1].is_empty() && preds[2].is_empty(),
             "matmul blocks read only sources"
         );
-        // Each silu tile joins ONLY the matmul block that wrote its slice.
         assert_eq!(preds[3], vec![SubtileId(0)], "silu tile 0 ← matmul block 0");
         assert_eq!(preds[4], vec![SubtileId(1)], "silu tile 1 ← matmul block 1");
         assert_eq!(preds[5], vec![SubtileId(2)], "silu tile 2 ← matmul block 2");
@@ -1084,12 +1192,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_uncovered_read() {
-        // A node reading an op-output region that nobody wrote → rejected.
         let tensors = vec![
             TensorShape { rows: 1, cols: 4 }, // 0 source
             TensorShape { rows: 1, cols: 4 }, // 1 op output (never written)
         ];
-        let bad = RegionGraph {
+        let bad = SubtileIR {
             tensors,
             num_sources: 1,
             nodes: vec![SubtileNode {

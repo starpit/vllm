@@ -54,7 +54,7 @@
 
 #![allow(dead_code)]
 
-use crate::subtile::{Range, Region};
+use crate::subtile_ir::{Range, Region};
 
 // ── Handles ─────────────────────────────────────────────────────────
 
@@ -200,7 +200,7 @@ impl Binding {
 
 /// A 2-D region of a buffer a dispatch reads or writes — the DATAFLOW the
 /// validator checks, distinct from the kernel `Binding`s the player
-/// issues. Row-major `Region{rows, cols}` (region.rs's model), so it
+/// issues. Row-major `Region{rows, cols}` (subtile_ir's model), so it
 /// expresses a column slice (an N-block), a whole tensor (elementwise),
 /// or a strided sub-block — what a flat byte interval cannot. The
 /// validator derives byte extents from `region` + the buffer's element

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Bin-pack a tensor-region SSA graph ([`crate::region::RegionGraph`]) into
+//! Bin-pack a tensor-region SSA graph ([`crate::subtile_ir::SubtileIR`]) into
 //! `P` co-resident worker tapes for the persistent decode megakernel, and
 //! stamp every cross-worker producer→consumer edge as a point-to-point
 //! `Wait`/`Signal` flag.
@@ -11,19 +11,20 @@
 //! bandwidth argument — single-TG is 1/10 BW), and the consumer of the whole
 //! output `Wait`s on every block's flag.
 //!
-//! Edges come from [`crate::region::predecessors`] (region overlap on
+//! Edges come from [`crate::subtile_ir::predecessors`] (region overlap on
 //! op-output tensors; leaf-source reads have none). Same point-to-point design
 //! as `tape.rs`: each surviving cross-worker edge is **one flag** (measured
 //! 0.18 µs/hop, flat in core count), NOT a global barrier; the co-resident
 //! threadgroups spin on the producer's flag.
 //!
 //! Host-first correctness: [`play`] replays a schedule honoring the flags,
-//! computing each node with [`crate::region::eval_node`], and Tier A asserts
-//! it equals [`crate::region::eval_dag`] bit-for-bit — proving the assignment
+//! computing each node with [`crate::subtile_ir::eval_node`], and Tier A asserts
+//! it equals [`crate::subtile_ir::eval_dag`] bit-for-bit — proving the assignment
 //! + flag stamping are deadlock-free and order-correct before any GPU/MSL.
 
-use crate::region::{RegionGraph, SubtileNode, eval_node, predecessors, scatter};
-use crate::subtile::SubtileId;
+use crate::subtile_ir::{
+    SubtileId, SubtileIR, SubtileNode, eval_node, predecessors, scatter,
+};
 
 // ── Scheduled form ──────────────────────────────────────────────────
 
@@ -94,13 +95,13 @@ pub struct ScheduleMetrics {
 /// (topological) order; a one-shot flag is allocated per producer that has
 /// any cross-worker consumer; consumers `Wait` on it, the producer `Signal`s.
 ///
-/// **Deadlock-free for *any* assignment:** [`crate::region::validate`]
+/// **Deadlock-free for *any* assignment:** [`crate::subtile_ir::validate`]
 /// guarantees every predecessor has a strictly smaller id than its consumer,
 /// and every worker emits in ascending-id order, so a producer's `Signal`
 /// always precedes — across the whole emission — the point any consumer could
 /// block on it. The scheduler therefore only has to choose a good `worker_of`.
 pub fn schedule_from_assignment(
-    graph: &RegionGraph,
+    graph: &SubtileIR,
     preds: &[Vec<SubtileId>],
     worker_of: &[u32],
     num_workers: usize,
@@ -162,7 +163,7 @@ pub fn schedule_from_assignment(
 
 /// Round-robin partition (node `i` → worker `i % p`) — a test fixture; the
 /// real assignment is [`schedule_wavefront`].
-pub fn partition_roundrobin(graph: &RegionGraph, p: u32) -> Schedule {
+pub fn partition_roundrobin(graph: &SubtileIR, p: u32) -> Schedule {
     let p = p.max(1) as usize;
     let preds = predecessors(graph);
     let worker_of: Vec<u32> = (0..graph.nodes.len()).map(|i| (i % p) as u32).collect();
@@ -178,7 +179,7 @@ pub fn partition_roundrobin(graph: &RegionGraph, p: u32) -> Schedule {
 /// (`Fn(&SubtileNode) -> f64` in µs) so this crate stays decoupled from the
 /// target's cost tables; the metal compiler supplies the real `cost_us`.
 pub fn schedule_wavefront(
-    graph: &RegionGraph,
+    graph: &SubtileIR,
     cost: impl Fn(&SubtileNode) -> f64,
     params: ScheduleParams,
 ) -> Schedule {
@@ -228,7 +229,7 @@ pub fn schedule_wavefront(
 /// Cross-worker edges survive only at the genuine joins — the o_proj/down
 /// reductions and the rmsnorm broadcast — which the split-K + replication
 /// transforms remove ([`crate::partition`]).
-pub fn assign_owners_slice_index(graph: &RegionGraph, unit: u32, num_workers: u32) -> Vec<u32> {
+pub fn assign_owners_slice_index(graph: &SubtileIR, unit: u32, num_workers: u32) -> Vec<u32> {
     let p = num_workers.max(1);
     let unit = unit.max(1);
     graph
@@ -239,7 +240,7 @@ pub fn assign_owners_slice_index(graph: &RegionGraph, unit: u32, num_workers: u3
 }
 
 /// Build a [`Schedule`] from the slice-index owner assignment.
-pub fn schedule_slice_index(graph: &RegionGraph, unit: u32, num_workers: u32) -> Schedule {
+pub fn schedule_slice_index(graph: &SubtileIR, unit: u32, num_workers: u32) -> Schedule {
     let preds = predecessors(graph);
     let worker_of = assign_owners_slice_index(graph, unit, num_workers);
     schedule_from_assignment(graph, &preds, &worker_of, num_workers.max(1) as usize)
@@ -247,7 +248,7 @@ pub fn schedule_slice_index(graph: &RegionGraph, unit: u32, num_workers: u32) ->
 
 /// Read P1 / P2 / total off a schedule under the given cost model.
 pub fn measure(
-    graph: &RegionGraph,
+    graph: &SubtileIR,
     schedule: &Schedule,
     cost: impl Fn(&SubtileNode) -> f64,
 ) -> ScheduleMetrics {
@@ -273,11 +274,11 @@ pub fn measure(
 
 /// Replay a schedule on the host, honoring `Wait`/`Signal`, and return the
 /// backing buffer of every tensor (indexed by `TensorId`) — identical to
-/// [`crate::region::eval_dag`] when the schedule's sync is correct. Panics on
+/// [`crate::subtile_ir::eval_dag`] when the schedule's sync is correct. Panics on
 /// deadlock (a missing `Signal` or cyclic `Wait`s) and on any node computed
 /// before a producer it reads (a missing `Wait` edge) — the bugs host-first
 /// is meant to catch.
-pub fn play(graph: &RegionGraph, schedule: &Schedule, sources: &[&[f32]]) -> Vec<Vec<f32>> {
+pub fn play(graph: &SubtileIR, schedule: &Schedule, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     assert_eq!(
         sources.len(),
         graph.num_sources as usize,
@@ -363,8 +364,7 @@ pub fn play(graph: &RegionGraph, schedule: &Schedule, sources: &[&[f32]]) -> Vec
 mod tests {
     use super::*;
     use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-    use crate::region::{lower_region, result_buffer};
-    use crate::subtile::SourceShape;
+    use crate::subtile_ir::{SourceShape, lower_region, result_buffer};
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -429,7 +429,7 @@ mod tests {
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         for nb in [4u32, 8, 1000] {
             let g = lower_region(&input, nb);
-            let want = result_buffer(&g, &crate::region::eval_dag(&g, &srcs)).to_vec();
+            let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
             for p in [1u32, 2, 4, 10] {
                 let s = schedule_wavefront(
                     &g,
@@ -473,7 +473,7 @@ mod tests {
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         let nb = 4u32;
         let g = lower_region(&input, nb);
-        let want = result_buffer(&g, &crate::region::eval_dag(&g, &srcs)).to_vec();
+        let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
         // gemm1 → 4 blocks (ids 0..4, cols 0,4,8,12); silu → 4 tiles (ids 4..8,
         // same cols); gemm2 → 5 blocks reading whole silu.
         assert_eq!(g.nodes.len(), 13);
@@ -583,7 +583,7 @@ mod tests {
         let srcs: Vec<&[f32]> = vec![&act, &w];
         assert_eq!(
             result_buffer(&g, &play(&g, &s, &srcs)),
-            result_buffer(&g, &crate::region::eval_dag(&g, &srcs)),
+            result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)),
             "spread matmul replays bit-exact"
         );
     }

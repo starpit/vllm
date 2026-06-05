@@ -1,92 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Phase 7 (PD-wavefront): lower the *solved* FUF to a subtile dataflow
-//! graph — the granularity at which the persistent decode megakernel is
-//! scheduled.
+//! v1 whole-output subtile dataflow graph — kept alive for the v1-only
+//! consumers ([`crate::lower::lower`], [`crate::tape`],
+//! [`crate::scheduler`]) until those are themselves deleted in later
+//! staged commits.
 //!
-//! `fuf.rs` is frozen. It is whole-op granularity: a linear chain of
-//! parallel ops with a join between each, where the irregular ops
-//! (attention) leave most workers idle. The wavefront megakernel needs a
-//! finer unit so cheap irregular ops can overlap into the matvec
-//! bandwidth shadow. That finer unit is the **subtile**: an output
-//! (row-block × col-block) computed over a K-chunk, plus the split-K
-//! combine that reduces the chunks.
+//! New code uses [`crate::subtile_ir::SubtileIR`] (region-granularity SSA
+//! over tensors); the whole-output [`Operand::Sub`] model here cannot
+//! express an op's output assembled from several subtiles' slices, which
+//! is exactly what true subtile granularity on the GPU needs.
 //!
-//! This module introduces a distinct IR rather than mutating `FufNode`,
-//! because (a) the FUF is a hub type consumed by the solver, cost model,
-//! tp/vision lowering, and codegen — adding subtile variants there has
-//! large blast radius and breaks the "one node = one DSL op = one Impl"
-//! invariant — and (b) producer→consumer *sync* is a scheduling artifact,
-//! not forward-pass semantics, so it has no business in an IR that "has
-//! no idea what a transformer is." This is the standard lower-to-a-new-
-//! dialect move.
-//!
-//! Two representations live here:
-//!   - [`SubtileGraph`] — a pure dataflow **DAG**. Producer→consumer
-//!     edges are the [`Operand::Sub`] references. This is what lowering
-//!     produces and what the decomposition-equivalence check validates.
-//!   - (later) a **Tape** — per-worker instruction lists where the
-//!     wavefront scheduler turns surviving cross-worker edges into
-//!     explicit `Wait`/`Signal`. That is what the host/GPU players replay.
-//!
-//! Validation is host-first (correctness is what bit prior attempts):
-//!   - **Tier A′ (decomposition equivalence):** [`eval_dag`] of the DAG
-//!     equals `cpu_golden` whole-op output. Bit-exact at `k_chunks = 1`
-//!     (col-tiling does not change any per-output reduction order); only
-//!     temp=0-token-exact once K is split, since float add is not
-//!     associative — that is expected and checked separately.
-//!   - **Tier A (self-consistency):** tape replay equals this `eval_dag`
-//!     baseline (lands with the scheduler/player).
-//!
-//! `cpu_golden` (in `ferrite-forward`, which this crate depends on) is the
-//! host *calculator* — the deterministic f32 substrate the player computes
-//! with — not the correctness *oracle*. The oracle is ferrite-metal
-//! non-mega at temp=0.
+//! Validation is host-first (Tier A′ — `cpu_golden` whole-op equivalence,
+//! bit-exact at `k_chunks = 1`).
 
 #![allow(dead_code)]
 
-// ── Identifiers & geometry ─────────────────────────────────────────
+pub use crate::subtile_ir::{EwKind, Range, Region, SourceShape, SubOp, SubtileId};
 
-/// Dense index into [`SubtileGraph::nodes`]. The DAG is topologically
-/// ordered: a node's [`Operand::Sub`] inputs always have smaller ids
-/// (straight-line SSA, same invariant as `Fuf`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SubtileId(pub u32);
+// ── Identifiers ────────────────────────────────────────────────────
 
 /// Dense index into [`SubtileGraph::sources`] — a leaf buffer bound at
 /// eval time: a prior-op activation (when a subgraph is lowered in
 /// isolation), a weight, or an extern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId(pub u32);
-
-/// Half-open range `[start, start + len)` along one axis.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Range {
-    pub start: u32,
-    pub len: u32,
-}
-
-impl Range {
-    pub fn new(start: u32, len: u32) -> Self {
-        Self { start, len }
-    }
-    pub fn end(&self) -> u32 {
-        self.start + self.len
-    }
-}
-
-/// A rectangular slice of a logically row-major `[rows, cols]` buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Region {
-    pub rows: Range,
-    pub cols: Range,
-}
-
-/// Logical shape of a leaf source buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SourceShape {
-    pub rows: u32,
-    pub cols: u32,
-}
 
 // ── Nodes ──────────────────────────────────────────────────────────
 
@@ -99,84 +35,6 @@ pub enum Operand {
     /// to exactly what the consumer needs, so there is no slicing here —
     /// slicing happens where a value is first read off a `Source`.
     Sub(SubtileId),
-}
-
-/// The sub-operation a node performs. This enum grows as ops are ported;
-/// every variant has a `cpu_golden`-backed host evaluation in [`eval_dag`]
-/// and (later) a validated MSL primitive.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SubOp {
-    /// Matmul output tile over one K-chunk:
-    /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
-    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
-    /// (W is row-major `[N, K]`, read transposed). Output is the dense
-    /// partial `[mr.len, nr.len]` contributed by this K-chunk.
-    MatmulTile,
-    /// Elementwise sum of equal-shaped inputs — the split-K combine. All
-    /// inputs and the output are `[out_rows, out_cols]`.
-    SumReduce,
-    /// Shape-preserving elementwise op over a tile. Unary (`Silu`) reads
-    /// `inputs[0]`; binary (`Mul`, `Add`) read `inputs[0]` and
-    /// `inputs[1]`, both matching the output shape. Col-tiling never
-    /// reorders a computation, so always bit-exact vs the whole op.
-    Elementwise(EwKind),
-    /// Fused SwiGLU activation: `out[j] = silu(gate[j]) * up[j]`.
-    /// `inputs[0]` = gate, `inputs[1]` = up, both `[out_rows, out_cols]`.
-    /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
-    /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
-    /// `Silu` + `Mul` are fused into this one node *before scheduling* (so
-    /// the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
-    SiluMul,
-    /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
-    /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
-    /// `inputs[1]` = weight `[1, cols]`. The per-row reduction is kept
-    /// whole (single node) so it is bit-exact vs `cpu_golden::rmsnorm`;
-    /// rms-norm is cheap and hides in the matvec shadow, so there is no
-    /// reason to split its reduction.
-    RmsNorm { eps: f32 },
-    /// NeoX-pairing rotary embedding over `[rows, heads * head_dim]`.
-    /// `inputs[0]` = x, `inputs[1]` = cos row `[1, >=head_dim]`,
-    /// `inputs[2]` = sin row — the new token's position, pre-sliced.
-    /// Pairs `(d, d + half)`; matches `cpu_golden::rope`/`rope_append`'s
-    /// rotation. Shape-preserving, so bit-exact vs the reference.
-    RopeRotate { head_dim: u32 },
-    /// The K-side `rope_append` for the GPU megakernel: rotate K (NeoX) **and**
-    /// write the rotated K + un-rotated V into the paged KV cache, so the
-    /// downstream attention reads the new token from the cache like the oracle
-    /// non-mega path (Tier-B exact). `inputs[0]` = K, `inputs[1]` = cos,
-    /// `inputs[2]` = sin, `inputs[3]` = V. The host eval is **rotation only**
-    /// (identical to [`SubOp::RopeRotate`]): the abstract dataflow model keeps
-    /// the new K as an edge into attention (decision #4), so `inputs[3]` (V)
-    /// and the cache write are GPU-only — V is carried for the schedule edge
-    /// (the cache write consumes it) and so the serializer can bind it. `layer`
-    /// names the KV-cache layer the serializer routes the cache operands to.
-    RopeAppend { head_dim: u32, layer: u32 },
-    /// Decode attention. `inputs[0]` = Q `[Mq, num_q_heads * head_dim]`;
-    /// the remaining inputs are alternating `(K_seg, V_seg)`, each
-    /// `[seg_len, num_kv_heads * head_dim]`, concatenated along the KV
-    /// axis in input order. The **fused** decode passes the prefix cache
-    /// as a read-only `Source` segment and the just-rotated new token as
-    /// a `Sub` segment — so the new K/V is an internal dataflow edge, not
-    /// a cache round-trip. Whole-KV (single node) matches
-    /// `cpu_golden::attention_decode` bit-exact; KV-block subtiling +
-    /// online-softmax combine comes later (within-tol, the gemm pattern).
-    AttnDecode {
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        scale: f32,
-    },
-}
-
-/// Elementwise op kind. Numerics mirror `cpu_golden` exactly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EwKind {
-    /// `x / (1 + e^-x)`.
-    Silu,
-    /// `a * b`.
-    Mul,
-    /// `a + b`.
-    Add,
 }
 
 /// A subtile node: one unit of work the wavefront schedule places on a

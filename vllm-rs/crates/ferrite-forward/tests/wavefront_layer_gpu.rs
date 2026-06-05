@@ -2170,7 +2170,7 @@ fn wavefront_player_rope_append_bit_exact() {
 fn wavefront_serialized_qmv_chain_bit_exact() {
     use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
     use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
-    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::subtile_ir::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
     use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
@@ -2393,7 +2393,7 @@ fn wavefront_serialized_qmv_chain_bit_exact() {
 fn wavefront_serialized_qmv_chain_cross_worker_bit_exact() {
     use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
     use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
-    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::subtile_ir::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
     use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
@@ -2722,7 +2722,7 @@ fn silu_mul_whole_into(
 fn wavefront_serialized_mlp_block_bit_exact() {
     use ferrite_wavefront::lower::{InputRef, LoweredOp, LoweringInput, OpDesc, fuse_silu_mul};
     use ferrite_wavefront::mega::{Geometry, SourceDesc, serialize};
-    use ferrite_wavefront::region::lower_region;
+    use ferrite_wavefront::subtile_ir::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
     use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};

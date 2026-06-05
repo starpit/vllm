@@ -522,6 +522,37 @@ pub enum ValidationError {
     },
     /// `Compute` references a node id not present in the SubtileIR.
     UnknownNode { node: SubtileId },
+    /// A SubtileIR node was `Compute`d more than once across the tape.
+    DuplicateCompute { node: SubtileId },
+    /// A SubtileIR node has no `Compute` instruction in the tape (every
+    /// op-output node must be computed exactly once).
+    MissingCompute { node: SubtileId },
+    /// On `worker`, two adjacent `Compute` instructions appear in
+    /// non-ascending `SubtileId` order — the per-worker subset must be
+    /// a topological order of that worker's assigned nodes.
+    TopoOrderViolation {
+        worker: u32,
+        prev_node: SubtileId,
+        next_node: SubtileId,
+    },
+    /// A second `OpenLoop` started while another was still open
+    /// (no nesting allowed at this layer).
+    NestedLoop { outer_var: u32, inner_var: u32 },
+    /// A `CloseLoop` appeared with no matching `OpenLoop`.
+    UnmatchedCloseLoop { close_var: u32 },
+    /// `OpenLoop` and matching `CloseLoop` disagree on `var`.
+    MismatchedLoopVar { open_var: u32, close_var: u32 },
+    /// `OpenLoop` and matching `CloseLoop` disagree on `worker`.
+    MismatchedLoopWorker {
+        var: u32,
+        open_worker: u32,
+        close_worker: u32,
+    },
+    /// Tape ended with a still-open loop.
+    UnclosedLoop { var: u32 },
+    /// `Signal` or `Wait` appeared between an `OpenLoop` and its
+    /// matching `CloseLoop` (would reorder vs the iteration count).
+    SyncInsideLoop { var: u32, barrier: u32 },
 }
 
 /// Runtime validator. Discharges the invariant classes the typestate
@@ -543,6 +574,8 @@ pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm>(
     check_node_refs(tape, graph, &mut errors);
     check_signal_wait_pairs(tape, &mut errors);
     check_deadlock_cycle(tape, &mut errors);
+    check_compute_wellformed(tape, graph, &mut errors);
+    check_loop_balance(tape, &mut errors);
     check_data_race(tape, graph, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -674,59 +707,172 @@ fn check_data_race<F: crate::subtile_ir::RopeForm>(
     graph: &crate::subtile_ir::SubtileIR<F>,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Skeleton: for each tensor written by some worker and read by
-    // another, the reader's tape must contain a Wait *before* its first
-    // read whose matching Signal is *after* the writer's last write on
-    // the producer side. Without the lowering walker emitting these
-    // pairs (commit 5), we don't yet have ground truth — so the
-    // skeleton check is conservative: report a race only when ANY
-    // cross-worker write→read exists with NO cross-worker barrier
-    // active at all in the tape.
-    let mut writer_workers: BTreeMap<TensorId, Vec<u32>> = BTreeMap::new();
-    let mut reader_workers: BTreeMap<TensorId, Vec<u32>> = BTreeMap::new();
-    let n_nodes = graph.nodes.len() as u32;
-    for instr in &tape.instrs {
+    // For every cross-worker (producer, consumer) edge in the SubtileIR's
+    // region-overlap predecessor graph, verify the tape contains a
+    // matching Signal/Wait pair. Specifically: there must exist a barrier
+    // B such that
+    //   - some Signal(B) is on worker_of[producer] at instr index > the
+    //     producer's Compute index, AND
+    //   - some Wait(B) is on worker_of[consumer] at instr index < the
+    //     consumer's Compute index.
+    // The per-worker program order on each side gives the sequencing;
+    // the Signal/Wait pair establishes the cross-worker happens-before.
+    // No fence needed at this layer — the visibility primitive (fence
+    // vs mbar handshake) is picked at TkTape lowering.
+    let preds = crate::subtile_ir::predecessors(graph);
+    let n = graph.nodes.len();
+
+    // Locate the (first) Compute for each node.
+    let mut compute_at: Vec<Option<(usize, u32)>> = vec![None; n]; // (instr_idx, worker_id)
+    for (i, instr) in tape.instrs.iter().enumerate() {
         if let Instr::Compute { worker, node } = instr
-            && node.0 < n_nodes
+            && (node.0 as usize) < n
+            && compute_at[node.0 as usize].is_none()
         {
-            let n = &graph.nodes[node.0 as usize];
-            writer_workers
-                .entry(n.output.tensor)
-                .or_default()
-                .push(worker.id);
-            for inp in &n.inputs {
-                reader_workers
-                    .entry(inp.tensor)
-                    .or_default()
-                    .push(worker.id);
-            }
+            compute_at[node.0 as usize] = Some((i, worker.id));
         }
     }
-    let any_signal_wait = tape
-        .instrs
-        .iter()
-        .any(|i| matches!(i, Instr::Signal { .. } | Instr::Wait { .. }));
-    if any_signal_wait {
-        // Real per-tensor edge analysis lives in commit 5b. Until then,
-        // having ANY signal/wait covers the basic case.
-        return;
+
+    // Bucket Signal/Wait by barrier id.
+    let mut signals_by_b: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new(); // (worker, idx)
+    let mut waits_by_b: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
+    for (i, instr) in tape.instrs.iter().enumerate() {
+        match instr {
+            Instr::Signal { worker, barrier } => signals_by_b
+                .entry(barrier.id)
+                .or_default()
+                .push((worker.id, i)),
+            Instr::Wait { worker, barrier } => waits_by_b
+                .entry(barrier.id)
+                .or_default()
+                .push((worker.id, i)),
+            _ => {}
+        }
     }
-    for (t, writers) in &writer_workers {
-        let readers = match reader_workers.get(t) {
-            Some(r) => r,
-            None => continue,
+
+    let mut reported: BTreeMap<(TensorId, u32, u32), ()> = BTreeMap::new();
+    for (cid, plist) in preds.iter().enumerate() {
+        let (ic, wc) = match compute_at[cid] {
+            Some(x) => x,
+            None => continue, // missing-compute reported separately
         };
-        for &w in writers {
-            for &r in readers {
-                if w != r {
+        for prod in plist {
+            let pid = prod.0 as usize;
+            let (ip, wp) = match compute_at[pid] {
+                Some(x) => x,
+                None => continue,
+            };
+            if wp == wc {
+                continue;
+            }
+            // Find a barrier whose Signal is on wp post-ip AND Wait is on wc pre-ic.
+            let covered = signals_by_b.iter().any(|(b, sigs)| {
+                let post_p = sigs.iter().any(|(w, idx)| *w == wp && *idx > ip);
+                if !post_p {
+                    return false;
+                }
+                waits_by_b
+                    .get(b)
+                    .map(|waits| waits.iter().any(|(w, idx)| *w == wc && *idx < ic))
+                    .unwrap_or(false)
+            });
+            if !covered {
+                let key = (graph.nodes[pid].output.tensor, wp, wc);
+                if reported.insert(key, ()).is_none() {
                     errors.push(ValidationError::DataRace {
-                        tensor: *t,
-                        writer_worker: w,
-                        reader_worker: r,
+                        tensor: key.0,
+                        writer_worker: wp,
+                        reader_worker: wc,
                     });
                 }
             }
         }
+    }
+}
+
+fn check_compute_wellformed<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+    errors: &mut Vec<ValidationError>,
+) {
+    // (a) Each SubtileIR node is Compute'd exactly once.
+    // (b) Per-worker, the Compute id sequence is strictly ascending.
+    let n = graph.nodes.len();
+    let mut emit_count: Vec<u32> = vec![0; n];
+    let mut last_per_worker: BTreeMap<u32, SubtileId> = BTreeMap::new();
+    for instr in &tape.instrs {
+        if let Instr::Compute { worker, node } = instr
+            && (node.0 as usize) < n
+        {
+            emit_count[node.0 as usize] += 1;
+            if let Some(prev) = last_per_worker.get(&worker.id).copied() {
+                if node.0 <= prev.0 {
+                    errors.push(ValidationError::TopoOrderViolation {
+                        worker: worker.id,
+                        prev_node: prev,
+                        next_node: *node,
+                    });
+                }
+            }
+            last_per_worker.insert(worker.id, *node);
+        }
+    }
+    for (i, &c) in emit_count.iter().enumerate() {
+        let nid = SubtileId(i as u32);
+        if c == 0 {
+            errors.push(ValidationError::MissingCompute { node: nid });
+        } else if c > 1 {
+            errors.push(ValidationError::DuplicateCompute { node: nid });
+        }
+    }
+}
+
+fn check_loop_balance(tape: &SubtileTape, errors: &mut Vec<ValidationError>) {
+    // No nesting; every OpenLoop matches exactly one CloseLoop (same
+    // var, same worker); no Signal/Wait between an Open and its Close.
+    let mut open: Option<(u32, u32)> = None; // (var, worker)
+    for instr in &tape.instrs {
+        match instr {
+            Instr::OpenLoop { worker, var, .. } => {
+                if let Some((outer_var, _)) = open {
+                    errors.push(ValidationError::NestedLoop {
+                        outer_var,
+                        inner_var: var.id,
+                    });
+                }
+                open = Some((var.id, worker.id));
+            }
+            Instr::CloseLoop { worker, var } => match open {
+                None => errors.push(ValidationError::UnmatchedCloseLoop { close_var: var.id }),
+                Some((open_var, open_worker)) => {
+                    if open_var != var.id {
+                        errors.push(ValidationError::MismatchedLoopVar {
+                            open_var,
+                            close_var: var.id,
+                        });
+                    } else if open_worker != worker.id {
+                        errors.push(ValidationError::MismatchedLoopWorker {
+                            var: var.id,
+                            open_worker,
+                            close_worker: worker.id,
+                        });
+                    }
+                    open = None;
+                }
+            },
+            Instr::Signal { barrier, .. } | Instr::Wait { barrier, .. } => {
+                if let Some((var, _)) = open {
+                    errors.push(ValidationError::SyncInsideLoop {
+                        var,
+                        barrier: barrier.id,
+                    });
+                }
+            }
+            Instr::Compute { .. } => {}
+        }
+    }
+    if let Some((var, _)) = open {
+        errors.push(ValidationError::UnclosedLoop { var });
     }
 }
 
@@ -1252,6 +1398,310 @@ mod tests {
         let tape = lower_dag_to_tape(&g, 1, 4);
         assert_eq!(tape.num_loop_vars, 2);
         assert_eq!(tape.num_runtime_bounds, 2);
+    }
+
+    // ── validate_subtile_tape full-impl tests (commit 5b) ───────────
+
+    /// lower_dag_to_tape's output validates clean (positive control:
+    /// the walker emits Signal/Wait pairs for every cross-worker edge,
+    /// so no DataRace fires).
+    #[test]
+    fn lower_output_validates_clean_on_join_shape() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 8 },
+            TensorShape { rows: 1, cols: 12 },
+        ];
+        let consumer = SubtileNode {
+            id: SubtileId(2),
+            op: SubOp::Elementwise(EwKind::Add),
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId(1),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(2),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(4, 4),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: TensorId(3),
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: Range::new(8, 4),
+                },
+            },
+        };
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes: vec![
+                silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+                silu_node(1, TensorId(0), Range::new(0, 4), TensorId(2), Range::new(4, 4)),
+                consumer,
+            ],
+            result: TensorId(3),
+        };
+        let tape = lower_dag_to_tape(&g, 3, 4);
+        assert_eq!(validate_subtile_tape(&tape, &g), Ok(()));
+    }
+
+    /// Cross-worker write→read with NO matching Signal/Wait pair flags
+    /// DataRace. (Hand-built tape that strips the sync edges.)
+    #[test]
+    fn validator_flags_unguarded_cross_worker_read() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 8 },
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes: vec![
+                silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+                silu_node(1, TensorId(1), Range::new(0, 4), TensorId(2), Range::new(4, 4)),
+            ],
+            result: TensorId(2),
+        };
+        // Hand-build a tape: producer on w0, consumer on w1, NO Signal/Wait.
+        let mut b = TapeBuilder::new(2);
+        let w0 = b.worker(0);
+        let w1 = b.worker(1);
+        b.compute(w0, SubtileId(0)).compute(w1, SubtileId(1));
+        let tape = b.finish();
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                ValidationError::DataRace { writer_worker: 0, reader_worker: 1, .. }
+            )),
+            "want DataRace(0→1), got {err:?}"
+        );
+    }
+
+    /// Per-worker Compute id order violated → TopoOrderViolation.
+    #[test]
+    fn validator_flags_per_worker_topo_violation() {
+        // Build a 2-node SubtileIR; emit Computes in descending id
+        // order on one worker. Single-node graphs can't trigger the
+        // adjacent-id check.
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes: vec![
+                silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+                silu_node(1, TensorId(1), Range::new(0, 4), TensorId(2), Range::new(0, 4)),
+            ],
+            result: TensorId(2),
+        };
+        let mut b = TapeBuilder::new(1);
+        let w0 = b.worker(0);
+        b.compute(w0, SubtileId(1)).compute(w0, SubtileId(0));
+        let tape = b.finish();
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                ValidationError::TopoOrderViolation { worker: 0, .. }
+            )),
+            "want TopoOrderViolation, got {err:?}"
+        );
+    }
+
+    /// MissingCompute fires for a SubtileIR node never Compute'd.
+    #[test]
+    fn validator_flags_missing_compute() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+            TensorShape { rows: 1, cols: 4 },
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes: vec![
+                silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+                silu_node(1, TensorId(1), Range::new(0, 4), TensorId(2), Range::new(0, 4)),
+            ],
+            result: TensorId(2),
+        };
+        let mut b = TapeBuilder::new(1);
+        let w0 = b.worker(0);
+        b.compute(w0, SubtileId(0)); // node 1 never Computed
+        let tape = b.finish();
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.contains(&ValidationError::MissingCompute { node: SubtileId(1) }),
+            "want MissingCompute(1), got {err:?}"
+        );
+    }
+
+    /// DuplicateCompute fires if a node is Compute'd more than once.
+    #[test]
+    fn validator_flags_duplicate_compute() {
+        let g = tiny_graph();
+        let mut b = TapeBuilder::new(1);
+        let w0 = b.worker(0);
+        b.compute(w0, SubtileId(0)).compute(w0, SubtileId(0));
+        let tape = b.finish();
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.contains(&ValidationError::DuplicateCompute { node: SubtileId(0) }),
+            "want DuplicateCompute(0), got {err:?}"
+        );
+    }
+
+    /// Hand-built tape with an OpenLoop and no CloseLoop → UnclosedLoop.
+    /// The TapeBuilder typestate prevents this at compile time, but the
+    /// validator defends against direct Vec<Instr> mutation.
+    #[test]
+    fn validator_flags_unclosed_loop() {
+        let g = tiny_graph();
+        let tape = SubtileTape {
+            instrs: vec![
+                Instr::OpenLoop {
+                    worker: WorkerId {
+                        id: 0,
+                        _seal: sealed::Seal(()),
+                    },
+                    var: LoopVarId {
+                        id: 0,
+                        _seal: sealed::Seal(()),
+                    },
+                    bound: LoopBound::Const(4),
+                },
+                Instr::Compute {
+                    worker: WorkerId {
+                        id: 0,
+                        _seal: sealed::Seal(()),
+                    },
+                    node: SubtileId(0),
+                },
+                // no CloseLoop
+            ],
+            num_workers: 1,
+            num_barriers: 0,
+            num_loop_vars: 1,
+            num_runtime_bounds: 0,
+        };
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.contains(&ValidationError::UnclosedLoop { var: 0 }),
+            "want UnclosedLoop, got {err:?}"
+        );
+    }
+
+    /// CloseLoop on a different LoopVarId than the matching OpenLoop →
+    /// MismatchedLoopVar.
+    #[test]
+    fn validator_flags_mismatched_loop_var() {
+        let g = tiny_graph();
+        let mk_w = || WorkerId {
+            id: 0,
+            _seal: sealed::Seal(()),
+        };
+        let mk_var = |id| LoopVarId {
+            id,
+            _seal: sealed::Seal(()),
+        };
+        let tape = SubtileTape {
+            instrs: vec![
+                Instr::OpenLoop {
+                    worker: mk_w(),
+                    var: mk_var(0),
+                    bound: LoopBound::Const(4),
+                },
+                Instr::Compute {
+                    worker: mk_w(),
+                    node: SubtileId(0),
+                },
+                Instr::CloseLoop {
+                    worker: mk_w(),
+                    var: mk_var(99),
+                },
+            ],
+            num_workers: 1,
+            num_barriers: 0,
+            num_loop_vars: 100,
+            num_runtime_bounds: 0,
+        };
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                ValidationError::MismatchedLoopVar { open_var: 0, close_var: 99 }
+            )),
+            "want MismatchedLoopVar, got {err:?}"
+        );
+    }
+
+    /// Hand-built Signal between OpenLoop and CloseLoop → SyncInsideLoop.
+    #[test]
+    fn validator_flags_sync_inside_loop() {
+        let g = tiny_graph();
+        let mk_w = |id| WorkerId {
+            id,
+            _seal: sealed::Seal(()),
+        };
+        let mk_var = LoopVarId {
+            id: 0,
+            _seal: sealed::Seal(()),
+        };
+        let mk_bar = BarrierId {
+            id: 0,
+            _seal: sealed::Seal(()),
+        };
+        let tape = SubtileTape {
+            instrs: vec![
+                Instr::OpenLoop {
+                    worker: mk_w(0),
+                    var: mk_var,
+                    bound: LoopBound::Const(4),
+                },
+                Instr::Signal {
+                    worker: mk_w(0),
+                    barrier: mk_bar,
+                },
+                Instr::Wait {
+                    worker: mk_w(1),
+                    barrier: mk_bar,
+                },
+                Instr::Compute {
+                    worker: mk_w(0),
+                    node: SubtileId(0),
+                },
+                Instr::CloseLoop {
+                    worker: mk_w(0),
+                    var: mk_var,
+                },
+            ],
+            num_workers: 2,
+            num_barriers: 1,
+            num_loop_vars: 1,
+            num_runtime_bounds: 0,
+        };
+        let err = validate_subtile_tape(&tape, &g).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(
+                e,
+                ValidationError::SyncInsideLoop { var: 0, barrier: 0 }
+            )),
+            "want SyncInsideLoop, got {err:?}"
+        );
     }
 
     #[test]

@@ -93,13 +93,24 @@ mod tk20 {
         m: u32,
         n: u32,
         k: u32,
-        accum_zero: bool,
+        accum: crate::tk_tape::AccumKind,
     ) -> String {
-        let accum = if accum_zero { "ZERO" } else { "ACCUMULATE" };
+        // Single-token sealed-enum dispatch (same shape as
+        // barrier_name / rope_form_str / rope_side_str — keeps
+        // tk20 helpers as pure string templates).
+        let accum_tok = accum_str(accum);
         format!(
-            "kittens::ops::gemm_m1<{accum}>(page_buf[{out_page}], page_buf[{lhs_page}], \
+            "kittens::ops::gemm_m1<{accum_tok}>(page_buf[{out_page}], page_buf[{lhs_page}], \
              a{rhs_arg_idx}, {rhs_byte_off}, {m}u, {n}u, {k}u);"
         )
+    }
+
+    fn accum_str(a: crate::tk_tape::AccumKind) -> &'static str {
+        use crate::tk_tape::AccumKind;
+        match a {
+            AccumKind::Zero => "ZERO",
+            AccumKind::Accumulate => "ACCUMULATE",
+        }
     }
 
     pub fn silu_mul(gate_page: u8, up_page: u8, out_page: u8, cols: u32) -> String {
@@ -273,8 +284,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let _ = writeln!(out, "{s}");
         }
         Instr::GemmM1 { lhs_page, rhs_tensor, rhs_byte_off, out_page, m, n, k, accum, role: _ } => {
-            let zero = matches!(accum, crate::tk_tape::AccumKind::Zero);
-            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, *k, zero);
+            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, *k, *accum);
             let _ = writeln!(out, "{s}");
         }
         Instr::SiluMul { gate_page, up_page, out_page, cols, role: _ } => {

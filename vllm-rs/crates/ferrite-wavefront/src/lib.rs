@@ -29,6 +29,7 @@ pub mod routing;
 pub mod scheduler;
 pub mod subtile;
 pub mod subtile_ir;
+pub mod subtile_tape;
 pub mod metal_tape;
 pub mod tape;
 pub mod tk_lower;

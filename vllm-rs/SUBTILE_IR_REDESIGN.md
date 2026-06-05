@@ -125,6 +125,12 @@ fallbacks added, no `_ =>` match arms added.
    instrs, sealed handles, `validate_subtile_tape`, `play` skeleton.
    Sealed `BarrierId` (Wait/Signal share by construction).
    Compile-fail tests for orphan handles, mismatched barrier ids.
+   **Constraint inventory + policy defaults (keep-in-smem,
+   chain-local placement, coarse-loops-only) live in
+   [`SUBTILE_TAPE_CONSTRAINTS.md`](SUBTILE_TAPE_CONSTRAINTS.md) —
+   the source of truth for what every DAG edge must surface as.
+   Anything the walker (commit 5) needs that isn't there yet
+   gets added there first, never as a one-off in lowering code.**
 
 4. **Move typed witnesses onto SubtileIR DAG nodes.** `KvCacheLayout`,
    `KvCacheProducer`, `RopeForm` (const-generic phantom),

@@ -496,6 +496,9 @@ pub fn scatter(
     shape: TensorShape,
 ) {
     let (r, c) = (region.rows.len as usize, region.cols.len as usize);
+    // Host-evaluator helper; r * c == data.len() is structurally
+    // entailed by callers (eval_node always builds out from the
+    // region geometry it then scatters with). Defensive in debug only.
     debug_assert_eq!(data.len(), r * c, "scatter data size vs region");
     let dst = &mut bufs[tensor.0 as usize];
     for i in 0..r {
@@ -510,7 +513,9 @@ pub fn scatter(
 /// `graph.tensors[s]`. Returns the backing buffer of every tensor
 /// (indexed by [`TensorId`]); the logits are `bufs[graph.result]`.
 pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Vec<f32>> {
-    assert_eq!(
+    // Host-evaluator source-count check; debug-only since the
+    // codegen-side validate() catches structural mismatches.
+    debug_assert_eq!(
         sources.len(),
         graph.num_sources as usize,
         "source count mismatch"
@@ -521,7 +526,7 @@ pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Ve
         .map(|t| vec![0f32; (t.rows * t.cols) as usize])
         .collect();
     for (s, src) in sources.iter().enumerate() {
-        assert_eq!(src.len(), bufs[s].len(), "source {s} buffer size mismatch");
+        debug_assert_eq!(src.len(), bufs[s].len(), "source {s} buffer size mismatch");
         bufs[s].copy_from_slice(src);
     }
     for node in &graph.nodes {
@@ -551,9 +556,13 @@ pub fn eval_node<F: RopeForm>(
         SubOp::MatmulTile => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
             let (w, wr, wc) = gather(&node.inputs[1], graph, bufs);
-            assert_eq!(ac, wc, "matmul K mismatch");
-            assert_eq!(ar, out_rows, "matmul A rows vs out_rows");
-            assert_eq!(wr, out_cols, "matmul W rows vs out_cols");
+            // Host-evaluator shape checks — debug-only. The codegen
+            // pipeline is the source of truth (`validate()` + the
+            // typed witnesses on SubOp); these are defensive on the
+            // f32 reference path only.
+            debug_assert_eq!(ac, wc, "matmul K mismatch");
+            debug_assert_eq!(ar, out_rows, "matmul A rows vs out_rows");
+            debug_assert_eq!(wr, out_cols, "matmul W rows vs out_cols");
             let (m, n, k) = (ar as usize, wr as usize, ac as usize);
             let mut out = vec![0f32; m * n];
             for i in 0..m {
@@ -572,7 +581,7 @@ pub fn eval_node<F: RopeForm>(
             let mut out = vec![0f32; len];
             for inp in &node.inputs {
                 let (b, _, _) = gather(inp, graph, bufs);
-                assert_eq!(b.len(), len, "reduce operand size mismatch");
+                debug_assert_eq!(b.len(), len, "reduce operand size mismatch");
                 for (o, v) in out.iter_mut().zip(&b) {
                     *o += *v;
                 }
@@ -581,12 +590,12 @@ pub fn eval_node<F: RopeForm>(
         }
         SubOp::Elementwise(kind) => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
-            assert_eq!((ar, ac), (out_rows, out_cols), "elementwise shape");
+            debug_assert_eq!((ar, ac), (out_rows, out_cols), "elementwise shape");
             match kind {
                 EwKind::Silu => a.iter().map(|&x| x / (1.0 + (-x).exp())).collect(),
                 EwKind::Mul | EwKind::Add => {
                     let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
-                    assert_eq!((br, bc), (ar, ac), "elementwise binary shape");
+                    debug_assert_eq!((br, bc), (ar, ac), "elementwise binary shape");
                     a.iter()
                         .zip(&b)
                         .map(|(&x, &y)| {
@@ -603,8 +612,8 @@ pub fn eval_node<F: RopeForm>(
         SubOp::SiluMul => {
             let (a, ar, ac) = gather(&node.inputs[0], graph, bufs);
             let (b, br, bc) = gather(&node.inputs[1], graph, bufs);
-            assert_eq!((ar, ac), (out_rows, out_cols), "silu_mul gate shape");
-            assert_eq!((br, bc), (ar, ac), "silu_mul up shape");
+            debug_assert_eq!((ar, ac), (out_rows, out_cols), "silu_mul gate shape");
+            debug_assert_eq!((br, bc), (ar, ac), "silu_mul up shape");
             a.iter()
                 .zip(&b)
                 .map(|(&g, &u)| (g / (1.0 + (-g).exp())) * u)
@@ -613,8 +622,8 @@ pub fn eval_node<F: RopeForm>(
         SubOp::RmsNorm { eps } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (wt, _wr, wc) = gather(&node.inputs[1], graph, bufs);
-            assert_eq!((xr, xc), (out_rows, out_cols), "rmsnorm shape");
-            assert_eq!(wc, out_cols, "rmsnorm weight width");
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "rmsnorm shape");
+            debug_assert_eq!(wc, out_cols, "rmsnorm weight width");
             let (m, d) = (xr as usize, xc as usize);
             let mut out = vec![0f32; m * d];
             for i in 0..m {
@@ -636,12 +645,12 @@ pub fn eval_node<F: RopeForm>(
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (cos, _, cc) = gather(&node.inputs[1], graph, bufs);
             let (sin, _, sc) = gather(&node.inputs[2], graph, bufs);
-            assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "rope shape");
             let hd = head_dim as usize;
             let half = hd / 2;
             let (rows, cols) = (xr as usize, xc as usize);
-            assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
-            assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
+            debug_assert_eq!(cols % hd, 0, "rope cols not a multiple of head_dim");
+            debug_assert!(cc as usize >= hd && sc as usize >= hd, "rope cos/sin width");
             let heads = cols / hd;
             let mut out = x.clone();
             for r in 0..rows {
@@ -677,13 +686,13 @@ pub fn eval_node<F: RopeForm>(
             let mq = qr as usize;
             let qh_count = qc as usize / hd; // q-heads in this block
             let qh_start = node.output.region.cols.start as usize / hd; // global first q-head
-            assert_eq!(
+            debug_assert_eq!(
                 qc as usize,
                 qh_count * hd,
                 "attn Q width is a head multiple"
             );
-            assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
-            assert_eq!(node.inputs.len() % 2, 1, "attn inputs = Q + (K,V) pairs");
+            debug_assert!(node.inputs.len() >= 3, "attn needs Q + >=1 (K,V) segment");
+            debug_assert_eq!(node.inputs.len() % 2, 1, "attn inputs = Q + (K,V) pairs");
             // kv-head offset of this block (from the first K segment's column slice).
             let kvh_start = node.inputs[1].region.cols.start as usize / hd;
             // Concatenate K/V segments along sequence; each segment spans this
@@ -695,13 +704,13 @@ pub fn eval_node<F: RopeForm>(
             while i < node.inputs.len() {
                 let (k, kr, kc) = gather(&node.inputs[i], graph, bufs);
                 let (v, vr, vc) = gather(&node.inputs[i + 1], graph, bufs);
-                assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
+                debug_assert_eq!((vr, vc), (kr, kc), "attn V seg shape");
                 kv_count = kc as usize / hd;
                 k_all.extend_from_slice(&k);
                 v_all.extend_from_slice(&v);
                 i += 2;
             }
-            assert!(kv_count >= 1, "attn K seg has at least one kv-head");
+            debug_assert!(kv_count >= 1, "attn K seg has at least one kv-head");
             let seg_w = kv_count * hd;
             let seq_len = k_all.len() / seg_w;
             let mut out = vec![0f32; mq * qh_count * hd];

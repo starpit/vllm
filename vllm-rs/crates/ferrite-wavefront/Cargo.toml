@@ -6,14 +6,6 @@ license.workspace = true
 
 [lib]
 
-[[bin]]
-name = "tk_emit_decode"
-path = "src/bin/tk_emit_decode.rs"
-
-[[bin]]
-name = "tk_emit_rmsnorm"
-path = "src/bin/tk_emit_rmsnorm.rs"
-
 [features]
 default = []
 # `cuda` enables the FFI binding to the orchestrator's emitted
@@ -44,7 +36,7 @@ dirs = "6"
 # dev-dependencies so this crate's normal graph has NO edge to
 # ferrite-forward: that lets `ferrite-forward` depend on this crate (the
 # GPU subtile Executor lives in its metal interpreter and consumes
-# `subtile_ir`) without a cycle. Cargo permits the dev-only back-edge.
+# `metal_tape`) without a cycle. Cargo permits the dev-only back-edge.
 # ferrite-forward builds backend-agnostic here (no cuda/metal feature),
 # so the tests stay host-runnable on any platform.
 ferrite-forward = { path = "../ferrite-forward" }

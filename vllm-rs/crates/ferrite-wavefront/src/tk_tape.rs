@@ -1,80 +1,122 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `TkTape` — the flat instruction tape that backs the dumb tape player.
+//! `tk_tape` — the flat instruction tape that backs the dumb tape player.
 //!
-//! Per `SUBTILE_IR_REDESIGN.md` the contract is:
+//! This is the **drop-in replacement for `TkInstr` in `tk_warp_ir.rs`**,
+//! per `SUBTILE_IR_REDESIGN.md` §2: every operation the megakernel
+//! performs at runtime — TMA loads/stores, barrier inits/waits/arrives,
+//! every fence (`commit_group`, `wait_group`, `threadfence`,
+//! `__syncthreads`), persistent-state declarations, loops, kernel-arg
+//! declarations, every compute body — is one [`Instr`] in this tape.
 //!
-//! - Every operation the megakernel performs at runtime is an
-//!   [`Instr`] in this tape: TMA loads, TMA stores, barrier
-//!   inits/waits/arrives, every fence (`commit_group`, `wait_group`,
-//!   `threadfence`, `__syncthreads`), persistent-state declarations,
-//!   loops, kernel-arg declarations, kernel entry, kernel exit, every
-//!   compute body. If the kernel runs it, an `Instr` encodes it.
+//! The walker (`tk_lower.rs`) reads `LoweredOp` nodes and pushes
+//! `Instr`s. The dumb player (`tk_player.rs`) is a single `match` over
+//! [`Instr`] kinds, ≤5 lines per arm, no ambient state.
 //!
-//! - Tape generation (the walker in `tk_lower.rs`) reads `LoweredOp`
-//!   nodes and pushes `Instr`s. The walker cannot decide "I will
-//!   insert a fence here" — a [`Instr::Fence`] is already a node
-//!   in the input IR by the time the walker runs.
-//!
-//! - The tape player ([`crate::tk_player`]) is dumb transcription:
-//!   one `match` arm per [`Instr`] kind, each ≤5 lines of
-//!   `format!()` whose placeholders are filled from fields on the
-//!   instruction. No ambient-state lookups. No formula computation.
-//!
-//! Phase 0 lands the empty scaffold. Subsequent phases fill in
-//! variants as migration proceeds.
+//! "Fence" / "drain" is NOT one Instr — it is a SEQUENCE of primitive
+//! Instrs (`Syncthreads`, `CommitGroup`, `WaitGroup`, `Threadfence`,
+//! `Syncthreads`). The walker enumerates the sequence; one one-line
+//! arm per primitive.
 
 #![allow(dead_code)]
 
-use crate::subtile_ir::BufId;
+use std::marker::PhantomData;
 
-/// The flat instruction tape — produced by the walker, consumed by
-/// the dumb player.
-///
-/// A multi-step CUDA sequence (e.g. a "fence") is a SEQUENCE of
-/// primitive Instrs in `instrs`, never one Instr that expands into
-/// many lines. Same goes for the kernel-end drain: the walker pushes
-/// the drain's primitive Instrs at the tail of `instrs`.
-#[derive(Debug, Default)]
+use crate::metal_tape::BufId;
+use crate::tk_lower::{KvCacheLayout, KvCacheProducer};
+
+// ── Sealed RopeForm trait (NeoX vs Interleaved) ─────────────────────
+//
+// Mirrors the const-generic shipped earlier; redefined inline now that
+// the old tk_codegen.rs is gone.
+
+mod rope_form_seal {
+    pub trait Sealed {}
+}
+
+pub trait RopeForm: rope_form_seal::Sealed {
+    const PAIR_LO_EXPR: &'static str;
+    const PAIR_HI_EXPR: &'static str;
+    const NAME: &'static str;
+}
+
+pub struct NeoX;
+impl rope_form_seal::Sealed for NeoX {}
+impl RopeForm for NeoX {
+    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + __lane";
+    const PAIR_HI_EXPR: &'static str = "__i_lo + __half";
+    const NAME: &'static str = "NeoX";
+}
+
+pub struct Interleaved;
+impl rope_form_seal::Sealed for Interleaved {}
+impl RopeForm for Interleaved {
+    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + 2u * __lane";
+    const PAIR_HI_EXPR: &'static str = "__i_lo + 1u";
+    const NAME: &'static str = "Interleaved";
+}
+
+// ── Substrate constants (re-exported from tk_warp_ir for now) ───────
+
+pub const NUM_PAGES: u32 = 13;
+pub const PAGE_SIZE: u32 = 16384;
+pub const SCRATCH_BYTES: u32 = 1024;
+pub const NUM_CONSUMER_WARPS: u8 = 16;
+pub const NUM_SERVICE_WARPS: u8 = 4;
+pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
+
+// ── The tape ────────────────────────────────────────────────────────
+
+/// One persistent-CTA tape — produced by the walker, consumed by the
+/// dumb player. Each Instr maps 1:1 to a TK 2.0 / CUDA primitive call.
+#[derive(Debug, Default, Clone)]
 pub struct TkTape {
-    /// Kernel-arg declarations in ABI order. Order is the C++
-    /// kernel signature's parameter order; the dispatcher's runtime
-    /// `bufs[]` and `u32_args[]` follow this.
+    /// Kernel-arg declarations in ABI order. The C++ kernel signature
+    /// is built from this; the dispatcher's runtime `bufs[]` /
+    /// `u32_args[]` indices follow this order.
     pub kernel_args: Vec<KernelArg>,
 
-    /// Persistent declarations emitted at function-scope before the
-    /// instruction stream. Replaces `TkProgram::prelude: String`.
+    /// Persistent-state declarations emitted at function-scope before
+    /// the instruction stream. Replaces the freeform
+    /// `TkProgram::prelude: String` with one typed decl per entry.
     pub prelude: Vec<PreludeDecl>,
 
-    /// The instruction stream — flat, role-gated per Instr.
+    /// The instruction stream — flat, role-gated per-Instr. Multi-step
+    /// CUDA sequences (cross-op fence, kernel-end drain) are SEQUENCES
+    /// of primitive Instrs in this Vec, never a single fat Instr.
     pub instrs: Vec<Instr>,
 }
 
-// ── kernel-arg declarations ───────────────────────────────────────
+// ── kernel-arg declarations ─────────────────────────────────────────
 
-/// One kernel-arg declaration. Drives the C++ kernel signature
-/// parameter list and the dispatcher's `bufs[]` / `u32_args[]`
-/// indices.
 #[derive(Debug, Clone)]
 pub struct KernelArg {
     pub name: KernelArgName,
     pub ty: KernelArgTy,
 }
 
+/// Stable kernel-side identifier. Sealed at the variant layer so a
+/// lowering can't pass an arbitrary `String` — the only path to a name
+/// is through one of these variants whose canonical text matches the
+/// runtime expectations of the dispatcher (paris invariant
+/// `u32-args-name-matches-runtime-string`).
 #[derive(Debug, Clone)]
 pub enum KernelArgName {
-    /// Stable identifier baked into the kernel signature.
     Fixed(&'static str),
 }
 
 #[derive(Debug, Clone)]
 pub enum KernelArgTy {
-    /// `uint32_t` runtime arg sourced from a typed per-call value.
+    /// `uint32_t` runtime arg. `source` ties this u32 to a typed
+    /// per-call value built by the dispatcher.
     U32 { source: U32Source },
-    /// Pointer to a typed buffer (weights / activations / kv cache /
+    /// Pointer to a typed buffer (weight / activation / kv cache /
     /// cos-sin cache).
     BufPtr(BufId),
 }
 
+/// Sealed source of a runtime u32 — there is one variant per kernel
+/// u32 ZST in `tk_warp_ir` (`NumKvPagesSym`, `DecodePositionSym`,
+/// `DecodeSlotSym`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum U32Source {
     NumKvPages,
@@ -85,14 +127,15 @@ pub enum U32Source {
 /// Index into [`TkTape::kernel_args`]. The Instr stream references
 /// kernel args by id, never by name string — name resolution lives
 /// in the player.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KernelArgRef(pub u16);
 
-// ── prelude declarations ──────────────────────────────────────────
+// ── prelude declarations ────────────────────────────────────────────
 
 /// One persistent-state declaration emitted before the instruction
 /// stream. Replaces the freeform `TkProgram::prelude: String` —
-/// every persistent state is typed.
+/// every persistent state is typed and owned by exactly one
+/// ComputeBody emit (so an orphan decl is a build-time check).
 #[derive(Debug, Clone)]
 pub enum PreludeDecl {
     /// Per-warp `float[len]` — e.g. softmax `__l_sum`.
@@ -108,84 +151,122 @@ pub enum PreludeDecl {
         cols: u32,
         owner: ComputeBodyOwner,
     },
-    /// `void* page_buf[NUM_PAGES]` aliasing.
-    SmemTilePtr {
-        name: PreludeName,
-        page: PageId,
-    },
+    /// `void* page_buf[NUM_PAGES]` aliasing for a specific page slot.
+    SmemTilePtr { name: PreludeName, page: PageId },
+    /// Alias a kernel-arg identifier so the body can reference a
+    /// stable name regardless of ABI position.
+    KernelArgAlias { name: PreludeName, arg: KernelArgRef },
 }
 
-/// Sealed name for a prelude decl. Constructed only via the
-/// tape-builder API (Phase 5+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PreludeName(pub u32);
 
-/// Identifier for the [`Instr::Compute`] body that owns this
-/// prelude decl. Connecting decl ↔ body at type level prevents
-/// orphan decls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Identifier for the [`Instr::Compute`] body that owns a prelude
+/// decl. Connecting decl ↔ body at type level prevents orphan decls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComputeBodyOwner(pub u32);
 
-// ── instruction stream ────────────────────────────────────────────
+// ── instruction stream — REPLACES TkInstr ENTIRELY ──────────────────
 
 /// One instruction the kernel executes. Each variant maps 1:1 to a
-/// TK 2.0 / CUDA primitive call. Phase 0 lands the variant list as
-/// a stub; subsequent phases populate fields per
-/// `SUBTILE_IR_REDESIGN.md` §2.2.
+/// TK 2.0 / CUDA primitive call; ComputeBody variants alone expand to
+/// a fixed `&'static str` template with field-substitution by the
+/// dumb player.
 #[derive(Debug, Clone)]
 pub enum Instr {
-    /// `__syncthreads()` (or scoped variant).
-    Syncthreads { scope: SyncScope },
+    // ── Sync primitives — every variant carries a WarpRole so the
+    //    player has zero ambient lookups.
+
+    /// `__syncthreads()` (or scoped variant). The CTA-scope and the
+    /// `kittens::group<N>::sync()` group-scope variants are distinct.
+    Syncthreads { scope: SyncScope, role: WarpRole },
 
     /// `__threadfence()` / `__threadfence_block()` /
     /// `__threadfence_system()`.
-    Threadfence { scope: FenceScope },
+    Threadfence { scope: FenceScope, role: WarpRole },
 
     /// `kittens::group<1>::tma::store_commit_group()`.
-    CommitGroup,
+    CommitGroup { kind: CommitKind, role: WarpRole },
 
-    /// `kittens::group<1>::tma::store_async_wait<N>()`.
-    WaitGroup { n: u32 },
+    /// `kittens::group<1>::tma::store_async_wait<N>()`. `n=0` drains
+    /// all groups.
+    WaitGroup { kind: CommitKind, n: u32, role: WarpRole },
 
-    /// `mbarrier.init` for a named barrier.
-    BarrierInit { id: BarrierId, count: u32 },
+    // ── Page barriers — TK 2.0 mbarrier handshake ────────────────
 
-    /// `mbarrier.try_wait_parity` / `kittens::wait` on a barrier
-    /// with a typed parity.
-    BarrierWait {
-        id: BarrierId,
+    /// `mbarrier.init` for a named page barrier. `count` is the
+    /// expected arrival count.
+    BarrierInit {
+        page_id: PageId,
+        kind: PageBarrier,
+        count: u32,
+    },
+
+    /// Wait on `page_<kind>[page_id]` at the captured `parity`.
+    PageBarrierWait {
+        page_id: PageId,
+        kind: PageBarrier,
         parity: ParityExpr,
         role: WarpRole,
     },
 
-    /// `mbarrier.arrive` on a barrier from a warp role.
-    BarrierArrive { id: BarrierId, role: WarpRole },
+    /// `kittens::group<1>::arrive(<barrier>[page_id])`.
+    PageBarrierArrive {
+        page_id: PageId,
+        kind: PageBarrier,
+        role: WarpRole,
+    },
+
+    /// `if ((parity_var & 1u) == 0u) {
+    /// kittens::group<1>::arrive(<barrier>[page_id]); }`. Used by
+    /// the parity-correction phantom round after a runtime-iter-count
+    /// for_loop.
+    ArriveIfRuntimeEven {
+        page_id: PageId,
+        kind: PageBarrier,
+        parity_var: KernelArgRef,
+        role: WarpRole,
+    },
+
+    // ── Memory ops ───────────────────────────────────────────────
 
     /// `kittens::group<1>::tma::expect_bytes` + `tma::load_async`.
     LoadAsync(LoadSpec),
 
-    /// `kittens::group<1>::tma::store_async` (+ optional inline
-    /// commit/wait per [`StoreCommitStrategy`]).
+    /// `kittens::group<1>::tma::store_async` (raw-bulk).
     StoreAsync(StoreSpec),
 
-    /// One ComputeBody emit — body_id keys a sealed CUDA template;
-    /// fields on the variant fill placeholders.
-    Compute {
-        body_id: ComputeBodyId,
+    /// Typed-descriptor TMA store — `tma::store_async<NORMAL>(arg<dst>,
+    /// ...)`. Pushed by the orchestrator's descriptor-rewrite pass for
+    /// buffers declared in `EmitOpts::descriptor_layouts`.
+    StoreAsyncTyped {
+        dst_page: PageId,
+        dst_buf: BufId,
+        tile_type: TileType,
         role: WarpRole,
     },
 
-    /// `for (uint var = 0; var < count; ++var) { body... }`. Body
-    /// is inlined into the tape (no shared-body indirection per
-    /// SUBTILE_IR_REDESIGN.md Q3).
+    // ── Compute — body keys a sealed template; fields fill placeholders.
+
+    /// One ComputeBody emit — `body` is a sealed enum with one variant
+    /// per architectural primitive; each variant carries every field
+    /// its CUDA template needs.
+    Compute {
+        body: ComputeBody,
+        role: WarpRole,
+    },
+
+    // ── Control flow — only here, never implicit.
+
+    /// `for (uint var = 0; var < count; ++var) { body... }`.
     ForLoop {
         var: LoopVarId,
-        count: KernelArgRef,
+        count: LoopCount,
         body: Vec<Instr>,
     },
 }
 
-// ── instruction field types ───────────────────────────────────────
+// ── instruction field types ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncScope {
@@ -206,7 +287,16 @@ pub enum FenceScope {
     System,
 }
 
+/// `commit_group` / `wait_group` come in TK 2.0's bulk-store flavour
+/// (TMA store async) and the legacy non-bulk flavour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitKind {
+    BulkStore,
+    NonBulk,
+}
+
+/// Which warp role inside the persistent CTA owns an instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WarpRole {
     Loader,
     Storer,
@@ -218,28 +308,38 @@ pub enum WarpRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u8);
 
+/// Which TK 2.0 mbarrier of a page slot a wait/arrive talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BarrierId(pub u32);
+pub enum PageBarrier {
+    Ready,
+    Done,
+    Consumed,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LoopVarId(pub u32);
 
+/// Sealed identifier for a piece of online-softmax recurrence state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SoftmaxStateId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopCount {
+    Const(u32),
+    KernelArg(KernelArgRef),
+}
+
 /// Static (compile-time) or runtime parity for a barrier wait.
-/// Static is a u8 baked at tape-build time; LoopParity is the
-/// `(loop_var & 1)` expression for in-loop waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParityExpr {
     Static(u8),
-    LoopParity(LoopVarId),
+    LoopParity { var: LoopVarId, start: u8 },
 }
 
 /// Byte-offset expression for TMA load/store source/dest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteOffsetExpr {
-    /// Constant byte offset baked at tape-build time.
     Const(u64),
-    /// `base + var * stride` — for in-loop TMA loads of paged K/V
-    /// cache.
     LinearLoop {
         var: LoopVarId,
         stride: u64,
@@ -247,33 +347,381 @@ pub enum ByteOffsetExpr {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileShape {
+    pub rows: u32,
+    pub cols: u32,
+    pub elem_bytes: u32,
+}
+
+/// Sealed CUDA tile-type spelling for [`Instr::StoreAsyncTyped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileType(String);
+
+impl TileType {
+    pub(crate) fn from_layout(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub dst_page: PageId,
     pub src_buf: BufId,
-    pub src_byte_off: ByteOffsetExpr,
-    pub bytes: u32,
+    pub byte_off: ByteOffsetExpr,
+    pub tile: TileShape,
     pub role: WarpRole,
-    pub barrier: BarrierId,
+    /// Which page barrier `expect_bytes` arms.
+    pub barrier_page: PageId,
 }
 
 #[derive(Debug, Clone)]
 pub struct StoreSpec {
     pub src_page: PageId,
     pub dst_buf: BufId,
-    pub dst_byte_off: ByteOffsetExpr,
-    pub bytes: u32,
+    pub byte_off: ByteOffsetExpr,
+    pub tile: TileShape,
     pub role: WarpRole,
 }
 
-/// Sealed identifier for one ComputeBody template. Each variant
-/// maps to a fixed `&'static str` CUDA template in
-/// [`crate::tk_player`]; field substitution is mechanical.
-///
-/// Phase 0: enum stub. Phases 5+ populate variants as compute
-/// bodies migrate from `tk_codegen.rs`'s body-string functions.
+// ── ComputeBody — sealed templates, fully fielded ───────────────────
+
+/// One architectural compute primitive.
+#[derive(Debug, Clone)]
+pub enum ComputeBody {
+    /// Float-32 RMSNorm over a tile. `eps_bits` is the f32 bit pattern.
+    RmsNorm {
+        src_page: PageId,
+        dst_page: PageId,
+        gain_buf: BufId,
+        rows: u32,
+        cols: u32,
+        eps_bits: u32,
+    },
+
+    /// Single-row GEMM (m=1) — output is `[1, n]`.
+    GemmM1 {
+        lhs_page: PageId,
+        rhs_buf: BufId,
+        rhs_byte_off: ByteOffsetExpr,
+        out_page: PageId,
+        m: u32,
+        n: u32,
+        k: u32,
+        accum: AccumKind,
+    },
+
+    /// `out = silu(gate) * up` — fused SwiGLU.
+    SiluMul {
+        gate_page: PageId,
+        up_page: PageId,
+        out_page: PageId,
+        cols: u32,
+    },
+
+    /// `out = a + b` — residual add.
+    ResidualAdd {
+        a_page: PageId,
+        b_page: PageId,
+        out_page: PageId,
+        cols: u32,
+    },
+
+    /// RoPE rotation. The `RopeFormTag` variant is constructed via
+    /// `RopeFormTag::from_form::<F>()` so a Q-side / K-side mismatch
+    /// is a compile error upstream.
+    RopeRotate {
+        src_page: PageId,
+        dst_page: PageId,
+        cos_sin_buf: BufId,
+        position: KernelArgRef,
+        kv_layout: KvLayoutId,
+        head_dim: u32,
+        num_heads: u32,
+        form: RopeFormTag,
+        side: RopeSide,
+    },
+
+    /// Initialise the online-softmax recurrence.
+    AttnDecodeInit {
+        state: SoftmaxStateId,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
+
+    /// One iteration of `S = Q · Kᵀ * scale` followed by online softmax.
+    AttnDecodeQkt {
+        state: SoftmaxStateId,
+        q_page: PageId,
+        k_page: PageId,
+        scale_bits: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
+
+    /// `O += P · V` — second half of one online-softmax iteration.
+    AttnDecodeSv {
+        state: SoftmaxStateId,
+        v_page: PageId,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+    },
+
+    /// `O / l_sum` and write to `out_page`. Closes the recurrence.
+    AttnDecodeFinalise {
+        state: SoftmaxStateId,
+        out_page: PageId,
+        num_q_heads: u32,
+        head_dim: u32,
+    },
+
+    /// Inert marker the orchestrator emits at the start of an op
+    /// when `EmitOpts::debug_handshake` is on.
+    DebugOpBeginMarker { op_index: u32 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ComputeBodyId {
-    /// Placeholder — concrete body variants land in later phases.
-    Placeholder,
+pub enum AccumKind {
+    Zero,
+    Accumulate,
+}
+
+/// Erased tag mirroring the `RopeForm` trait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeFormTag {
+    NeoX,
+    Interleaved,
+}
+
+impl RopeFormTag {
+    pub(crate) fn from_form<F: RopeForm>() -> Self {
+        if F::NAME == NeoX::NAME {
+            RopeFormTag::NeoX
+        } else if F::NAME == Interleaved::NAME {
+            RopeFormTag::Interleaved
+        } else {
+            unreachable!("RopeForm sealed: NAME must be NeoX or Interleaved")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RopeSide {
+    Q,
+    K,
+}
+
+/// Index into the tape's `Vec<KvLayoutEntry>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KvLayoutId(pub u32);
+
+// ── Sealed constructors ─────────────────────────────────────────────
+
+impl Instr {
+    pub(crate) fn syncthreads_cta(role: WarpRole) -> Self {
+        Self::Syncthreads { scope: SyncScope::Cta, role }
+    }
+
+    pub(crate) fn syncthreads_group(role: WarpRole, n: u32) -> Self {
+        Self::Syncthreads { scope: SyncScope::GroupOf(n), role }
+    }
+
+    pub(crate) fn threadfence_device(role: WarpRole) -> Self {
+        Self::Threadfence { scope: FenceScope::Device, role }
+    }
+
+    pub(crate) fn commit_bulk(role: WarpRole) -> Self {
+        Self::CommitGroup { kind: CommitKind::BulkStore, role }
+    }
+
+    pub(crate) fn wait_bulk(role: WarpRole, n: u32) -> Self {
+        Self::WaitGroup { kind: CommitKind::BulkStore, n, role }
+    }
+
+    pub(crate) fn wait_static(
+        page: PageId,
+        kind: PageBarrier,
+        parity: u8,
+        role: WarpRole,
+    ) -> Self {
+        Self::PageBarrierWait {
+            page_id: page,
+            kind,
+            parity: ParityExpr::Static(parity),
+            role,
+        }
+    }
+
+    pub(crate) fn wait_loop(
+        page: PageId,
+        kind: PageBarrier,
+        var: LoopVarId,
+        start_parity: u8,
+        role: WarpRole,
+    ) -> Self {
+        Self::PageBarrierWait {
+            page_id: page,
+            kind,
+            parity: ParityExpr::LoopParity {
+                var,
+                start: start_parity & 1,
+            },
+            role,
+        }
+    }
+
+    pub(crate) fn arrive(page: PageId, kind: PageBarrier, role: WarpRole) -> Self {
+        Self::PageBarrierArrive { page_id: page, kind, role }
+    }
+
+    pub(crate) fn store_async_typed(
+        dst_page: PageId,
+        dst_buf: BufId,
+        tile_type_str: impl Into<String>,
+        role: WarpRole,
+    ) -> Self {
+        Self::StoreAsyncTyped {
+            dst_page,
+            dst_buf,
+            tile_type: TileType::from_layout(tile_type_str),
+            role,
+        }
+    }
+
+    pub(crate) fn rope_rotate<F: RopeForm>(
+        src_page: PageId,
+        dst_page: PageId,
+        cos_sin_buf: BufId,
+        position: KernelArgRef,
+        kv_layout: KvLayoutId,
+        head_dim: u32,
+        num_heads: u32,
+        side: RopeSide,
+        role: WarpRole,
+    ) -> Self {
+        Self::Compute {
+            body: ComputeBody::RopeRotate {
+                src_page,
+                dst_page,
+                cos_sin_buf,
+                position,
+                kv_layout,
+                head_dim,
+                num_heads,
+                form: RopeFormTag::from_form::<F>(),
+                side,
+            },
+            role,
+        }
+    }
+}
+
+// ── Witness handles surfacing tape-side dataflow ────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLayoutEntry {
+    pub layout: KvCacheLayout,
+}
+
+impl KvLayoutEntry {
+    pub fn row_bytes(&self) -> u64 {
+        self.layout.row_bytes()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnDataflow {
+    pub k_producer: KvCacheProducer,
+    pub v_producer: KvCacheProducer,
+}
+
+// ── Tape-builder helpers ────────────────────────────────────────────
+
+impl TkTape {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push_kernel_arg(&mut self, arg: KernelArg) -> KernelArgRef {
+        let idx = self.kernel_args.len() as u16;
+        self.kernel_args.push(arg);
+        KernelArgRef(idx)
+    }
+
+    pub fn push_prelude(&mut self, decl: PreludeDecl) {
+        self.prelude.push(decl);
+    }
+
+    pub fn push(&mut self, instr: Instr) {
+        self.instrs.push(instr);
+    }
+
+    /// Append the cross-op gmem-fence as a 5-Instr atomic sequence.
+    pub(crate) fn emit_cross_op_gmem_fence(&mut self) {
+        let role = WarpRole::All;
+        self.instrs.push(Instr::syncthreads_cta(role));
+        self.instrs.push(Instr::commit_bulk(role));
+        self.instrs.push(Instr::wait_bulk(role, 0));
+        self.instrs.push(Instr::threadfence_device(role));
+        self.instrs.push(Instr::syncthreads_cta(role));
+    }
+
+    pub fn emit_kernel_end_drain(&mut self) {
+        self.emit_cross_op_gmem_fence();
+    }
+}
+
+#[doc(hidden)]
+pub struct _RopeFormBridge<F: RopeForm>(PhantomData<F>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fence_is_five_primitive_instrs() {
+        let mut tape = TkTape::new();
+        tape.emit_cross_op_gmem_fence();
+        assert_eq!(tape.instrs.len(), 5);
+        assert!(matches!(tape.instrs[0], Instr::Syncthreads { .. }));
+        assert!(matches!(tape.instrs[1], Instr::CommitGroup { .. }));
+        assert!(matches!(tape.instrs[2], Instr::WaitGroup { n: 0, .. }));
+        assert!(matches!(tape.instrs[3], Instr::Threadfence { .. }));
+        assert!(matches!(tape.instrs[4], Instr::Syncthreads { .. }));
+    }
+
+    #[test]
+    fn parity_loop_carries_start() {
+        let var = LoopVarId(0);
+        let w = Instr::wait_loop(PageId(2), PageBarrier::Ready, var, 1, WarpRole::AllConsumers);
+        match w {
+            Instr::PageBarrierWait { parity: ParityExpr::LoopParity { var: v, start }, .. } => {
+                assert_eq!(v, var);
+                assert_eq!(start, 1);
+            }
+            _ => panic!("expected loop-parity wait"),
+        }
+    }
+
+    #[test]
+    fn kernel_arg_ref_is_index() {
+        let mut tape = TkTape::new();
+        let r0 = tape.push_kernel_arg(KernelArg {
+            name: KernelArgName::Fixed("__num_kv_pages"),
+            ty: KernelArgTy::U32 { source: U32Source::NumKvPages },
+        });
+        let r1 = tape.push_kernel_arg(KernelArg {
+            name: KernelArgName::Fixed("__decode_position"),
+            ty: KernelArgTy::U32 { source: U32Source::DecodePosition },
+        });
+        assert_eq!(r0, KernelArgRef(0));
+        assert_eq!(r1, KernelArgRef(1));
+        assert_eq!(tape.kernel_args.len(), 2);
+    }
 }

@@ -525,7 +525,7 @@ mod tests {
     use crate::region::{eval_dag, lower_region, predecessors, result_buffer, validate};
     use crate::region_schedule::{TapeInstr, play, schedule_from_assignment};
     use crate::subtile::SourceShape;
-    use crate::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+    use crate::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);

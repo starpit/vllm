@@ -2173,7 +2173,7 @@ fn wavefront_serialized_qmv_chain_bit_exact() {
     use ferrite_wavefront::region::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
-    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+    use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
     let Some(md) = detect_device() else {
         eprintln!("[skip] no Metal device");
@@ -2396,7 +2396,7 @@ fn wavefront_serialized_qmv_chain_cross_worker_bit_exact() {
     use ferrite_wavefront::region::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
-    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+    use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
     let Some(md) = detect_device() else {
         eprintln!("[skip] no Metal device");
@@ -2725,7 +2725,7 @@ fn wavefront_serialized_mlp_block_bit_exact() {
     use ferrite_wavefront::region::lower_region;
     use ferrite_wavefront::region_schedule::partition_roundrobin;
     use ferrite_wavefront::subtile::SourceShape;
-    use ferrite_wavefront::subtile_ir::{BufferRef, WeightBundle, WeightLoc, WeightRole};
+    use ferrite_wavefront::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
 
     let Some(md) = detect_device() else {
         eprintln!("[skip] no Metal device");

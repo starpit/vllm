@@ -71,7 +71,7 @@ pub mod interpreter;
 #[cfg(feature = "metal")]
 pub mod wavefront {
     pub use ferrite_wavefront::mega::{MegaProgram, OperandSlot};
-    pub use ferrite_wavefront::subtile_ir::{
+    pub use ferrite_wavefront::metal_tape::{
         BufId, BufferRef, InputKind, WeightBundle, WeightLoc, WeightRole,
     };
 }

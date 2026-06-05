@@ -292,75 +292,7 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
     out
 }
 
-/// Synthesize the kernel arg signature for an orchestrator output.
-///
-/// Buffer-id convention (see `tk_orchestrate`):
-///   `BufId(0..n_sources)`         — external inputs.
-///   `BufId(n_sources..n_sources+n_ops)` — per-op output staging buffers.
-///
-/// Production wiring will derive types and names from the macro-side
-/// `BufferRef` table; this helper just emits one `__nv_bfloat16*` per
-/// buffer and a single `__num_kv_pages` runtime arg if any AttnDecode op
-/// is present.
-pub fn orchestrator_kernel_args(
-    input: &LoweringInput,
-    n_bufs: u32,
-) -> crate::tk_codegen::KernelArgs {
-    use crate::tk_codegen::{KernelArg, KernelArgs};
-    let n_sources = input.sources.len() as u32;
-    let mut bufs = Vec::with_capacity(n_bufs as usize);
-    for i in 0..n_sources {
-        // E.12: `const` qualifier dropped from source kernel-arg
-        // pointers. Most sources are read-only (weights, prefix
-        // activations) but `PrefixK` / `PrefixV` source slots are
-        // write-targets for RopeAppend's paged-cache writes
-        // (`tma::store_async(buf{idx} + slot * row_bytes, ...)`).
-        // Keeping `const` here would make `reinterpret_cast<char*>`
-        // an nvcc error ("cannot cast away const"). Reads still
-        // typecheck against non-const pointers.
-        bufs.push(KernelArg {
-            ty: "__nv_bfloat16* __restrict__".into(),
-            name: format!("src{i}"),
-        });
-    }
-    for i in 0..(n_bufs - n_sources) {
-        bufs.push(KernelArg {
-            ty: "__nv_bfloat16* __restrict__".into(),
-            name: format!("op{i}_out"),
-        });
-    }
-    let mut u32_args = vec![];
-    if input
-        .ops
-        .iter()
-        .any(|d| matches!(d.op, LoweredOp::AttnDecode { .. }))
-    {
-        u32_args.push("__num_kv_pages".into());
-    }
-    // Runtime decode position — the rope arms read this to compute the
-    // per-row cos/sin TMA offset (`__decode_position * row_bytes`).
-    // Passed as a host-side u32 (the dispatcher D2H copies
-    // `ctx.positions[0]` once per dispatch). Registered whenever any
-    // op rotates; AttnDecode alone doesn't need it (its position is
-    // implicit in the prefix-K/V cache rows the kernel reads).
-    if input
-        .ops
-        .iter()
-        .any(|d| matches!(d.op, LoweredOp::RopeRotate { .. } | LoweredOp::RopeAppend { .. }))
-    {
-        u32_args.push("__decode_position".into());
-    }
-    // Runtime decode slot — the new token's absolute paged-cache slot
-    // index for the K/V cache writes emitted by RopeAppend's storer.
-    // Source: `ctx.slot_mapping[0]` (D2H copy, I64 → u32). Registered
-    // whenever any op is RopeAppend; pure RopeRotate (Q-side, no
-    // cache write) doesn't need it.
-    if input
-        .ops
-        .iter()
-        .any(|d| matches!(d.op, LoweredOp::RopeAppend { .. }))
-    {
-        u32_args.push("__decode_slot".into());
-    }
-    KernelArgs { bufs, u32_args }
-}
+// `orchestrator_kernel_args` was removed alongside the OLD
+// substrate; the new tape-build path constructs kernel args directly
+// via `tk_tape::KernelArg` / `KernelArgRef` / `KernelArgTy` /
+// `U32Source`. The walker rewrite owns this surface now.

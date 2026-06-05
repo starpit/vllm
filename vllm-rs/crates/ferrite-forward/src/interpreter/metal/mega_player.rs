@@ -11,7 +11,7 @@
 //! (`feedback_subtile_ir_trivial_player`):
 //!
 //!   1. [`resolve_mega_buffers`] — turn each neutral
-//!      [`ferrite_wavefront::subtile_ir::BufferRef`] into a concrete
+//!      [`ferrite_wavefront::metal_tape::BufferRef`] into a concrete
 //!      `(MTLBuffer, base)`: weights via [`resolve_weight`], runtime inputs +
 //!      the paged KV cache via [`RuntimeBindings`], and arena slots freshly
 //!      allocated and sized by [`MegaProgram::arena_bytes`]. This is exactly
@@ -48,7 +48,7 @@ use ferrite_metal_kernels::quantized::{DequantDtype, ScaleDtype};
 use ferrite_metal_kernels::residency::MetalResidencySet;
 use ferrite_metal_kernels::specialized_pipeline_cache::PipelineKey;
 use ferrite_wavefront::mega::MegaProgram;
-use ferrite_wavefront::subtile_ir::{BufferRef, InputKind, WeightBundle, WeightRole};
+use ferrite_wavefront::metal_tape::{BufferRef, InputKind, WeightBundle, WeightRole};
 
 use super::__re::{Buffer, CommandQueue, ComputePipelineState, Device};
 use super::ids::LayerId;

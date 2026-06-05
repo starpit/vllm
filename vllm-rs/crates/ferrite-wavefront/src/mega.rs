@@ -30,7 +30,7 @@
 //! or a runtime input). The Metal backend resolves these to
 //! `(MTLBuffer, base_offset)` exactly like
 //! `interpreter/metal/subtile_player.rs::resolve_buffers` already does for
-//! the per-dispatch [`crate::subtile_ir`] path, then `operands[i] =
+//! the per-dispatch [`crate::metal_tape`] path, then `operands[i] =
 //! gpuAddress(buffers[slot.buffer]) + base + slot.byte_offset`.
 //!
 //! # Backend neutrality (locked)
@@ -39,7 +39,7 @@
 //! MSL `wavefront_player` and a future CUDA `.cu` interpreter are parallel
 //! consumers of the *same* tape/shape/operand encoding; only `BufId →
 //! pointer` resolution and the flag primitive are per-target. This module
-//! reuses [`crate::subtile_ir`]'s neutral [`BufferRef`] / [`WeightLoc`] /
+//! reuses [`crate::metal_tape`]'s neutral [`BufferRef`] / [`WeightLoc`] /
 //! [`InputKind`] vocabulary and its qmv byte-stride helpers
 //! ([`packed_weight_row_bytes`] / [`affine_scale_row_bytes`]) so the two
 //! IRs cannot drift on the linchpin offset math.
@@ -84,7 +84,7 @@ use std::collections::{HashMap, HashSet};
 use crate::region::{RegionGraph, SubtileNode, TensorId, TensorRegion, predecessors};
 use crate::region_schedule::{Schedule, TapeInstr};
 use crate::subtile::{EwKind, SubOp, SubtileId};
-use crate::subtile_ir::{
+use crate::metal_tape::{
     BufId, BufferRef, InputKind, WeightBundle, affine_scale_row_bytes, packed_weight_row_bytes,
 };
 
@@ -1050,7 +1050,7 @@ impl<'a> Ser<'a> {
     }
 
     /// Intern a [`BufferRef`] with its element width, returning a deduped
-    /// [`BufId`] (mirrors `SubtileIrBuilder::buffer`).
+    /// [`BufId`] (mirrors `MetalTapeBuilder::buffer`).
     fn intern(&mut self, b: BufferRef, elem: u32) -> BufId {
         if let Some(i) = self.buffers.iter().position(|x| *x == b) {
             return BufId(i as u32);
@@ -1851,7 +1851,7 @@ mod tests {
     use crate::region::{SubtileNode, lower_region};
     use crate::region_schedule::{ScheduleParams, partition_roundrobin, schedule_wavefront};
     use crate::subtile::SourceShape;
-    use crate::subtile_ir::{WeightBundle, WeightLoc, WeightRole};
+    use crate::metal_tape::{WeightBundle, WeightLoc, WeightRole};
 
     const ACT_ELEM: u32 = 2;
     fn geom() -> Geometry {
@@ -1924,7 +1924,7 @@ mod tests {
 
     /// A single wide qmv N-block-tiled: each block's w/scales/biases/y
     /// operands carry `r * row_stride` and x stays whole — the exact
-    /// offset math `subtile_ir::tile_qmv` proved, now through the region
+    /// offset math `metal_tape::tile_qmv` proved, now through the region
     /// graph. Equal-width blocks share one shape class.
     #[test]
     fn qmv_nblock_offsets_and_dedup() {

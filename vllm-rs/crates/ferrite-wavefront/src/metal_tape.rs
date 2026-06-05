@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `SubtileIr` — the fully-resolved, compile-time-safe instruction tape
+//! `MetalTape` — the fully-resolved, compile-time-safe instruction tape
 //! the GPU subtile player executes.
 //!
 //! # The law (see `feedback_subtile_ir_trivial_player`)
@@ -15,14 +15,14 @@
 //!
 //! # Shape
 //!
-//! - [`SubtileIr::buffers`] — the logical operands ([`BufferRef`]): a
+//! - [`MetalTape::buffers`] — the logical operands ([`BufferRef`]): a
 //!   model weight tensor, an arena activation slot, a scratch buffer, or
 //!   a runtime input. Resolved to a concrete GPU buffer + base offset
 //!   **once** at player setup, never per-instruction.
-//! - [`SubtileIr::pipelines`] — kernel specializations ([`PipelineSpec`]:
+//! - [`MetalTape::pipelines`] — kernel specializations ([`PipelineSpec`]:
 //!   library + symbol + function constants). Resolved to a compute
 //!   pipeline state **once** at setup.
-//! - [`SubtileIr::tape`] — the [`SubtileInstr`] stream. A `Run` carries a
+//! - [`MetalTape::tape`] — the [`SubtileInstr`] stream. A `Run` carries a
 //!   fully-resolved [`Dispatch`]; `Wait`/`Signal` carry a [`FlagId`].
 //!   **Dependencies are instructions** — the player does no hazard
 //!   analysis.
@@ -39,7 +39,7 @@
 //! # Backend independence
 //!
 //! This module is host-pure and names no GPU API. It is the backend
-//! **ISA**: a per-backend *compiler* lowers a forward into a [`SubtileIr`]
+//! **ISA**: a per-backend *compiler* lowers a forward into a [`MetalTape`]
 //! (picking kernels, tiling, offsets, grids, sync) and a per-backend
 //! [`Executor`] replays it. [`play`] is the one shared, trivial driver.
 //! The Metal backend is the first consumer; a CUDA backend would add a
@@ -58,11 +58,11 @@ use crate::subtile::{Range, Region};
 
 // ── Handles ─────────────────────────────────────────────────────────
 
-/// Index into [`SubtileIr::buffers`].
+/// Index into [`MetalTape::buffers`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufId(pub u32);
 
-/// Index into [`SubtileIr::pipelines`].
+/// Index into [`MetalTape::pipelines`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PipeId(pub u32);
 
@@ -142,7 +142,7 @@ pub enum InputKind {
     NumTokens,
 }
 
-/// What a logical buffer in [`SubtileIr::buffers`] is bound to. The metal
+/// What a logical buffer in [`MetalTape::buffers`] is bound to. The metal
 /// `Executor` resolves each of these to a `(MTLBuffer, base_offset)`
 /// once, at setup (weights via the per-arch `WeightAccessors`, arena
 /// slots from the worker arena, etc.).
@@ -448,7 +448,7 @@ pub enum SubtileInstr {
 /// The subtile instruction tape plus the buffer / pipeline tables it
 /// references and the terminal buffer the logits land in.
 #[derive(Clone, Debug)]
-pub struct SubtileIr {
+pub struct MetalTape {
     pub buffers: Vec<BufferRef>,
     /// Element width (bytes) of each buffer, parallel to `buffers`. Lets
     /// the executor turn a `RegionRef`'s column extent into a byte extent
@@ -479,7 +479,7 @@ pub trait Executor {
 /// instruction, each forwarding the already-resolved payload to the
 /// `Executor`. Any cleverness is a bug — it belongs in the lowering that
 /// produced `ir`.
-pub fn play(ir: &SubtileIr, exec: &mut impl Executor) {
+pub fn play(ir: &MetalTape, exec: &mut impl Executor) {
     for instr in &ir.tape {
         match instr {
             SubtileInstr::Run(d) => exec.run(d.op, d.pipeline, &d.bindings, d.grid),
@@ -536,7 +536,7 @@ fn cols_covered(read: Region, writes: &[Region]) -> bool {
 /// columns) — caught here at compile time instead of as GPU garbage.
 /// Reads of weights / inputs / scratch are external (always defined) and
 /// skip the check. Returns the instruction count.
-pub fn validate(ir: &SubtileIr) -> Result<usize, String> {
+pub fn validate(ir: &MetalTape) -> Result<usize, String> {
     let n_buf = ir.buffers.len() as u32;
     let n_pipe = ir.pipelines.len() as u32;
     if ir.elem_bytes.len() != ir.buffers.len() {
@@ -790,7 +790,7 @@ pub fn tile_qmv(
 
 // ── Backend-agnostic IR construction ───────────────────────────────
 
-/// Accumulates a [`SubtileIr`] while interning its buffer + pipeline
+/// Accumulates a [`MetalTape`] while interning its buffer + pipeline
 /// tables (so equal `BufferRef`s / `PipelineSpec`s collapse to one
 /// entry). A per-backend compiler drives it: resolve operands to
 /// [`BufId`]s via [`buffer`](Self::buffer), append dispatches (whole ops
@@ -800,7 +800,7 @@ pub fn tile_qmv(
 /// the Metal and (future) CUDA compilers share it; only the content they
 /// feed in differs.
 #[derive(Default)]
-pub struct SubtileIrBuilder {
+pub struct MetalTapeBuilder {
     buffers: Vec<BufferRef>,
     elem_bytes: Vec<u32>,
     pipelines: PipelineInterner,
@@ -808,7 +808,7 @@ pub struct SubtileIrBuilder {
     num_flags: u32,
 }
 
-impl SubtileIrBuilder {
+impl MetalTapeBuilder {
     /// Intern a logical buffer with its element width (bytes), returning
     /// its (deduped) [`BufId`].
     pub fn buffer(&mut self, b: BufferRef, elem_bytes: u32) -> BufId {
@@ -881,8 +881,8 @@ impl SubtileIrBuilder {
     }
 
     /// Seal the IR. `terminal` is the buffer holding the forward result.
-    pub fn finish(self, terminal: BufId) -> SubtileIr {
-        SubtileIr {
+    pub fn finish(self, terminal: BufId) -> MetalTape {
+        MetalTape {
             buffers: self.buffers,
             elem_bytes: self.elem_bytes,
             pipelines: self.pipelines.specs,
@@ -932,7 +932,7 @@ mod tests {
     /// a VALID dataflow (the two blocks tile y's 8 columns; the consumer
     /// reads the whole y, covered) that validates and whose play() trace
     /// is exactly the tape in order.
-    fn sample_ir() -> SubtileIr {
+    fn sample_ir() -> MetalTape {
         let wl = WeightLoc {
             layer: 0,
             bucket: 0,
@@ -999,7 +999,7 @@ mod tests {
                 out: RegionRef::rows_cols(z, 1, 0, 8),
             },
         );
-        SubtileIr {
+        MetalTape {
             buffers,
             elem_bytes,
             pipelines,
@@ -1292,7 +1292,7 @@ mod tests {
     #[test]
     fn validate_rejects_read_before_write() {
         // An op reads arena slot `a` that NO prior op wrote → use-before-def.
-        let ir = SubtileIr {
+        let ir = MetalTape {
             buffers: vec![BufferRef::ArenaSlot(0), BufferRef::ArenaSlot(1)],
             elem_bytes: vec![2, 2],
             pipelines: vec![pipe("rms")],
@@ -1317,7 +1317,7 @@ mod tests {
         let x = BufId(0); // external input
         let y = BufId(1);
         let z = BufId(2);
-        let ir = SubtileIr {
+        let ir = MetalTape {
             buffers: vec![
                 BufferRef::Input(InputKind::InputIds),
                 BufferRef::ArenaSlot(1),
@@ -1353,7 +1353,7 @@ mod tests {
     #[test]
     fn validate_accepts_full_coverage() {
         let (x, y, z) = (BufId(0), BufId(1), BufId(2));
-        let ir = SubtileIr {
+        let ir = MetalTape {
             buffers: vec![
                 BufferRef::Input(InputKind::InputIds),
                 BufferRef::ArenaSlot(1),
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn builder_interns_dedups_and_finishes() {
-        let mut b = SubtileIrBuilder::default();
+        let mut b = MetalTapeBuilder::default();
         let wl = WeightLoc {
             layer: 0,
             bucket: 0,

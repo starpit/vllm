@@ -55,7 +55,7 @@ ferrite-vision = { path = "../ferrite-vision", optional = true }
 # the workspace; let cargo handle it via the feature flag and let
 # downstream callers gate their consuming code.
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
-# The subtile-wavefront IR (`subtile_ir`): host-pure, no backend deps.
+# The subtile-wavefront IR (`metal_tape`): host-pure, no backend deps.
 # Consumed by the metal interpreter's GPU subtile Executor, so it's
 # optional + pulled in by `metal`. (ferrite-wavefront dev-depends on
 # ferrite-forward for cpu_golden in its tests; that back-edge is dev-only

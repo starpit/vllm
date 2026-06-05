@@ -6076,85 +6076,14 @@ fn dump_wavefront_mega(
     let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
     let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
 
-    // Probe: try lowering the full-forward `LoweringInput` through the
-    // CUDA orchestrator (`tk_orchestrate::lower_to_tk`). Surfaces what
-    // the orchestrator can / cannot handle at Llama-3.2-1B scale; logs
-    // success or panic location so the next slice (per-op lowering
-    // gaps) is concrete. Best-effort; never gates the build.
-    if std::env::var_os("FERRITE_WAVEFRONT_CUDA_PROBE").is_some() {
-        let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ferrite_wavefront::tk_orchestrate::lower_to_tk(&fused)
-        }));
-        match probe {
-            Ok((prog, n_bufs)) => {
-                eprintln!(
-                    "[wavefront-cuda-probe] {stem}: lower_to_tk OK — {} TkInstrs, {} bufs",
-                    prog.instrs.len(),
-                    n_bufs,
-                );
-                // Emit the kernel `.cu` source to the cudaforge cache so
-                // `ferrite-cuda-builder`'s `build_megakernels` picks it up
-                // on the next build. Per-canonical kernel name keeps
-                // multiple arches' kernels from colliding.
-                let kernel_name = format!(
-                    "tk_decode_full_{}",
-                    stem.replace('-', "_").replace('.', "_")
-                );
-                let args = ferrite_wavefront::fixtures::orchestrator_kernel_args(&fused, n_bufs);
-                // Step C.3 — descriptor-TMA opt-in. Default off
-                // (env var unset) returns an empty map and the emit is
-                // byte-identical to the legacy raw-bulk path. With
-                // `FERRITE_NEW_TMA_TENSOR=1` set, the orchestrator
-                // selects rmsnorm output buffers for typed `kittens::gl<>`
-                // descriptor TMA → SASS `UTMASTG.4D`.
-                let descriptor_layouts =
-                    ferrite_wavefront::tk_orchestrate::descriptor_layouts(&fused);
-                // Runtime diagnostic: TK_EMIT_DEBUG_HANDSHAKE=1 wraps
-                // every wait/arrive/load_async/store_async with lane-0-
-                // gated printfs tagged by warp+page+kind+phase. The
-                // last printed line before the hang is the wait that
-                // never completes — names the deadlock's barrier.
-                let debug_handshake = std::env::var_os("TK_EMIT_DEBUG_HANDSHAKE").is_some();
-                let opts = ferrite_wavefront::tk_codegen::EmitOpts {
-                    descriptor_layouts,
-                    debug_handshake,
-                    ..Default::default()
-                };
-                let src = ferrite_wavefront::tk_codegen::emit_kernel_with_opts(
-                    &kernel_name, &args, &prog, &opts,
-                );
-                let cache_dir = std::path::PathBuf::from(
-                    std::env::var("HOME").unwrap_or_else(|_| ".".into()),
-                )
-                .join(".cache/cudaforge/megakernels");
-                if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-                    eprintln!(
-                        "[wavefront-cuda-probe] {stem}: mkdir cache failed — {e}"
-                    );
-                } else {
-                    let path = cache_dir.join(format!("{kernel_name}.cu"));
-                    match std::fs::write(&path, &src) {
-                        Ok(()) => eprintln!(
-                            "[wavefront-cuda-probe] {stem}: wrote {} ({} bytes)",
-                            path.display(),
-                            src.len(),
-                        ),
-                        Err(e) => eprintln!(
-                            "[wavefront-cuda-probe] {stem}: write failed — {e}"
-                        ),
-                    }
-                }
-            }
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "<non-string panic>".to_string());
-                eprintln!("[wavefront-cuda-probe] {stem}: lower_to_tk PANICKED — {msg}");
-            }
-        }
-    }
+    // Wavefront CUDA emit DELETED — old TkProgram/Tk20Call substrate is
+    // gone (nuked along with tk_codegen.rs / tk_orchestrate.rs /
+    // tk_warp_ir.rs). The new walker (TkTape-pushing) + tk_player
+    // emit path lives in `ferrite_wavefront::tk_player`; this probe
+    // gets re-wired once the walker is back. Until then the probe
+    // silently does nothing — the macro's ferrite-side surface is
+    // unaffected.
+    let _ = &fused;
 
     let (descs, report) =
         to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
@@ -6908,10 +6837,10 @@ fn source_recipe_entry_to_tokens(e: &SourceRecipeEntryRepr) -> TokenStream {
     }
 }
 
-/// One [`ferrite_wavefront::subtile_ir::BufferRef`] as a typed Rust literal
+/// One [`ferrite_wavefront::metal_tape::BufferRef`] as a typed Rust literal
 /// (bare paths — the builder `use`s the variants).
-fn buffer_ref_to_tokens(b: &ferrite_wavefront::subtile_ir::BufferRef) -> TokenStream {
-    use ferrite_wavefront::subtile_ir::BufferRef;
+fn buffer_ref_to_tokens(b: &ferrite_wavefront::metal_tape::BufferRef) -> TokenStream {
+    use ferrite_wavefront::metal_tape::BufferRef;
     match b {
         BufferRef::Weight { bundle, role, loc } => {
             let bundle = weight_bundle_to_tokens(*bundle);
@@ -6935,8 +6864,8 @@ fn buffer_ref_to_tokens(b: &ferrite_wavefront::subtile_ir::BufferRef) -> TokenSt
     }
 }
 
-fn weight_bundle_to_tokens(b: ferrite_wavefront::subtile_ir::WeightBundle) -> TokenStream {
-    use ferrite_wavefront::subtile_ir::WeightBundle;
+fn weight_bundle_to_tokens(b: ferrite_wavefront::metal_tape::WeightBundle) -> TokenStream {
+    use ferrite_wavefront::metal_tape::WeightBundle;
     match b {
         WeightBundle::RmsNorm => quote! { WeightBundle::RmsNorm },
         WeightBundle::Embedding => quote! { WeightBundle::Embedding },
@@ -6946,8 +6875,8 @@ fn weight_bundle_to_tokens(b: ferrite_wavefront::subtile_ir::WeightBundle) -> To
     }
 }
 
-fn weight_role_to_tokens(r: ferrite_wavefront::subtile_ir::WeightRole) -> TokenStream {
-    use ferrite_wavefront::subtile_ir::WeightRole;
+fn weight_role_to_tokens(r: ferrite_wavefront::metal_tape::WeightRole) -> TokenStream {
+    use ferrite_wavefront::metal_tape::WeightRole;
     match r {
         WeightRole::Weight => quote! { WeightRole::Weight },
         WeightRole::Bias => quote! { WeightRole::Bias },
@@ -6957,8 +6886,8 @@ fn weight_role_to_tokens(r: ferrite_wavefront::subtile_ir::WeightRole) -> TokenS
     }
 }
 
-fn input_kind_to_tokens(k: ferrite_wavefront::subtile_ir::InputKind) -> TokenStream {
-    use ferrite_wavefront::subtile_ir::InputKind;
+fn input_kind_to_tokens(k: ferrite_wavefront::metal_tape::InputKind) -> TokenStream {
+    use ferrite_wavefront::metal_tape::InputKind;
     match k {
         InputKind::InputIds => quote! { InputKind::InputIds },
         InputKind::Positions => quote! { InputKind::Positions },

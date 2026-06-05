@@ -891,7 +891,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     .operands
                     .get(out_idx)
                     .map(|o| match prog.buffers[o.buffer.0 as usize] {
-                        ferrite_wavefront::subtile_ir::BufferRef::ArenaSlot(s) => s as i64,
+                        ferrite_wavefront::metal_tape::BufferRef::ArenaSlot(s) => s as i64,
                         _ => -1,
                     })
                     .unwrap_or(-2);

@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use crate::subtile_ir::{SubtileId, SubtileIR, TensorId};
+use crate::subtile_ir::{SubtileId, TensorId};
 
 // ── Sealed handles ──────────────────────────────────────────────────
 
@@ -377,6 +377,122 @@ impl TapeBuilder<state::InsideLoop> {
     }
 }
 
+// ── Lowering: SubtileIR → SubtileTape ───────────────────────────────
+
+/// Lower a [`crate::subtile_ir::SubtileIR`] DAG to a linear
+/// [`SubtileTape`] in one deterministic pass. Plan §4 commit 5:
+///
+/// 1. **Validate** the SubtileIR's structural invariants
+///    (`crate::subtile_ir::validate`).
+/// 2. **Assign workers** with the slice-index rule (chain-local
+///    placement, per `SUBTILE_TAPE_CONSTRAINTS.md` §6): worker
+///    `(node.output.region.cols.start / unit) % num_workers`. The
+///    decode chains preserve column slices, so this co-locates
+///    `q→rope→attn→o-partial` and `gate/up→silu·mul→down-partial`
+///    on one worker.
+/// 3. **Topo-emit** in ascending `SubtileId` order. For each node:
+///    - For every cross-worker producer, emit a `Wait` for that
+///      producer's barrier (deduped per consumer).
+///    - Emit the `Compute`. `SubOp::AttnDecode` wraps in an
+///      `OpenLoop`/`CloseLoop` over a runtime-bounded count (the
+///      KV-sweep over `seq_len` pages — bound is a fresh
+///      [`RuntimeBoundId`]).
+///    - If the node has any cross-worker consumer, emit a `Signal`
+///      on the producer's worker.
+///
+/// **No `Route`, no `Fence`, no memory-class decisions** —
+/// SubtileTape is target-agnostic. The conservative all-gmem
+/// expansion (TMA store + fence + LoadAsync + PageBarrierWait) is
+/// `lower_tape_to_tk`'s job; the shmem-promotion / fence-elimination
+/// optimizations are TkTape passes (plan §4 commit 6.5).
+///
+/// `unit` is the column-tiling granularity the graph was lowered at
+/// (typically `head_dim`, so head-structured ops and column-tiled
+/// ops align). `unit == 0` is treated as `1`.
+///
+/// The returned `SubtileTape` has been validated against `graph` via
+/// [`validate_subtile_tape`]; callers can assume well-formedness.
+pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
+    graph: &crate::subtile_ir::SubtileIR<F>,
+    num_workers: u32,
+    unit: u32,
+) -> SubtileTape {
+    use crate::subtile_ir::{SubOp, predecessors, validate};
+
+    validate(graph).expect("lower_dag_to_tape: invalid SubtileIR");
+    let n = graph.nodes.len();
+    let p = num_workers.max(1);
+    let u = unit.max(1);
+
+    let worker_of: Vec<u32> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.output.region.cols.start / u) % p)
+        .collect();
+
+    let preds = predecessors(graph);
+
+    // A producer needs a barrier iff some consumer lives on another worker.
+    let mut needs_signal = vec![false; n];
+    for (cid, plist) in preds.iter().enumerate() {
+        let cw = worker_of[cid];
+        for prod in plist {
+            if worker_of[prod.0 as usize] != cw {
+                needs_signal[prod.0 as usize] = true;
+            }
+        }
+    }
+
+    let mut builder = TapeBuilder::new(p);
+    let mut barrier_of: Vec<Option<BarrierId>> = vec![None; n];
+    for (i, &needs) in needs_signal.iter().enumerate() {
+        if needs {
+            barrier_of[i] = Some(builder.alloc_barrier());
+        }
+    }
+
+    for node in &graph.nodes {
+        let id = node.id.0 as usize;
+        let w_idx = worker_of[id];
+        let w = builder.worker(w_idx);
+
+        // Wait for each distinct cross-worker producer's barrier.
+        let mut waited: Vec<u32> = Vec::new();
+        for prod in &preds[id] {
+            let pid = prod.0 as usize;
+            if worker_of[pid] != w_idx {
+                let bar = barrier_of[pid]
+                    .expect("cross-worker producer must have an allocated barrier");
+                if !waited.contains(&bar.index()) {
+                    waited.push(bar.index());
+                    builder.wait(w, bar);
+                }
+            }
+        }
+
+        // Emit the Compute. AttnDecode wraps in a runtime-bounded loop —
+        // the KV sweep over seq_len pages (a runtime quantity at decode).
+        if matches!(node.op, SubOp::AttnDecode { .. }) {
+            let rb = builder.alloc_runtime_bound();
+            let (mut inside, _var) = builder.open_loop(w, LoopBound::Runtime(rb));
+            inside.compute(w, node.id);
+            builder = inside.close_loop();
+        } else {
+            builder.compute(w, node.id);
+        }
+
+        // Signal once if any cross-worker consumer needs it.
+        if let Some(bar) = barrier_of[id] {
+            builder.signal(w, bar);
+        }
+    }
+
+    let tape = builder.finish();
+    validate_subtile_tape(&tape, graph)
+        .expect("lower_dag_to_tape: produced invalid SubtileTape");
+    tape
+}
+
 // ── Runtime validator ───────────────────────────────────────────────
 
 /// One class of runtime-detectable invariant violation. The compile-
@@ -419,9 +535,9 @@ pub enum ValidationError {
 ///
 /// **Not** a fence-correctness check. SubtileTape doesn't name fences;
 /// fence-before-arrive is a TkTape invariant (`validate_tk_tape`).
-pub fn validate_subtile_tape(
+pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm>(
     tape: &SubtileTape,
-    graph: &SubtileIR,
+    graph: &crate::subtile_ir::SubtileIR<F>,
 ) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_node_refs(tape, graph, &mut errors);
@@ -435,7 +551,11 @@ pub fn validate_subtile_tape(
     }
 }
 
-fn check_node_refs(tape: &SubtileTape, graph: &SubtileIR, errors: &mut Vec<ValidationError>) {
+fn check_node_refs<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+    errors: &mut Vec<ValidationError>,
+) {
     let n_nodes = graph.nodes.len() as u32;
     for instr in &tape.instrs {
         if let Instr::Compute { node, .. } = instr
@@ -549,7 +669,11 @@ fn dfs_cycle(
     None
 }
 
-fn check_data_race(tape: &SubtileTape, graph: &SubtileIR, errors: &mut Vec<ValidationError>) {
+fn check_data_race<F: crate::subtile_ir::RopeForm>(
+    tape: &SubtileTape,
+    graph: &crate::subtile_ir::SubtileIR<F>,
+    errors: &mut Vec<ValidationError>,
+) {
     // Skeleton: for each tensor written by some worker and read by
     // another, the reader's tape must contain a Wait *before* its first
     // read whose matching Signal is *after* the writer's last write on
@@ -644,7 +768,8 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
 mod tests {
     use super::*;
     use crate::subtile_ir::{
-        EwKind, Range, Region, SubOp, SubtileNode, TensorId, TensorRegion, TensorShape,
+        EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp,
+        SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape,
     };
 
     /// A minimal SubtileIR: source[1,4] → silu → result[1,4].
@@ -788,7 +913,7 @@ mod tests {
 
     #[test]
     fn loop_open_close_round_trips() {
-        let mut b = TapeBuilder::new(1);
+        let b = TapeBuilder::new(1);
         let w0 = b.worker(0);
         let (mut inside, _var) = b.open_loop(w0, LoopBound::Const(8));
         inside.compute(w0, SubtileId(0));
@@ -809,6 +934,323 @@ mod tests {
         assert_eq!(r0.index(), 0);
         assert_eq!(r1.index(), 1);
         let tape = b.finish();
+        assert_eq!(tape.num_runtime_bounds, 2);
+    }
+
+    // ── lower_dag_to_tape tests (commit 5) ──────────────────────────
+
+    fn silu_node(id: u32, in_t: TensorId, in_cols: Range, out_t: TensorId, out_cols: Range)
+        -> SubtileNode<NeoX>
+    {
+        SubtileNode {
+            id: SubtileId(id),
+            op: SubOp::Elementwise(EwKind::Silu),
+            inputs: vec![TensorRegion {
+                tensor: in_t,
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: in_cols,
+                },
+            }],
+            output: TensorRegion {
+                tensor: out_t,
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: out_cols,
+                },
+            },
+        }
+    }
+
+    /// Three Silu nodes chained on one worker: no Signal/Wait, three
+    /// Computes in id order.
+    #[test]
+    fn lower_chain_single_worker_emits_no_sync() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 }, // source
+            TensorShape { rows: 1, cols: 4 }, // op-out 0
+            TensorShape { rows: 1, cols: 4 }, // op-out 1
+            TensorShape { rows: 1, cols: 4 }, // op-out 2
+        ];
+        let nodes = vec![
+            silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+            silu_node(1, TensorId(1), Range::new(0, 4), TensorId(2), Range::new(0, 4)),
+            silu_node(2, TensorId(2), Range::new(0, 4), TensorId(3), Range::new(0, 4)),
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes,
+            result: TensorId(3),
+        };
+        let tape = lower_dag_to_tape(&g, 1, 4);
+        assert_eq!(tape.num_workers, 1);
+        assert_eq!(tape.num_barriers, 0);
+        assert_eq!(tape.instrs.len(), 3);
+        for (i, instr) in tape.instrs.iter().enumerate() {
+            match instr {
+                Instr::Compute { worker, node } => {
+                    assert_eq!(worker.index(), 0);
+                    assert_eq!(node.0, i as u32);
+                }
+                _ => panic!("chain expected pure Compute stream, got {instr:?} at {i}"),
+            }
+        }
+    }
+
+    /// Producer on worker 0 read by one same-worker consumer AND one
+    /// cross-worker consumer: ONE Signal (single barrier covers both
+    /// reads), ONE Wait on the cross-worker consumer.
+    #[test]
+    fn lower_fork_emits_single_signal_for_multiple_consumers() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 }, // 0 source
+            TensorShape { rows: 1, cols: 4 }, // 1 producer output (cols [0,4))
+            TensorShape { rows: 1, cols: 4 }, // 2 same-worker consumer output (cols [0,4))
+            TensorShape { rows: 1, cols: 8 }, // 3 cross-worker consumer output (cols [4,8))
+        ];
+        let nodes = vec![
+            silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+            silu_node(1, TensorId(1), Range::new(0, 4), TensorId(2), Range::new(0, 4)),
+            silu_node(2, TensorId(1), Range::new(0, 4), TensorId(3), Range::new(4, 4)),
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes,
+            result: TensorId(3),
+        };
+        // unit=4, num_workers=2:
+        //   node 0 cols.start=0 → worker 0
+        //   node 1 cols.start=0 → worker 0  (same-worker consumer)
+        //   node 2 cols.start=4 → worker 1  (cross-worker consumer)
+        let tape = lower_dag_to_tape(&g, 2, 4);
+        assert_eq!(tape.num_barriers, 1, "one producer → one barrier");
+        let signals: Vec<_> = tape
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Signal { worker, barrier } => Some((worker.index(), barrier.index())),
+                _ => None,
+            })
+            .collect();
+        let waits: Vec<_> = tape
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Wait { worker, barrier } => Some((worker.index(), barrier.index())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signals, vec![(0, 0)], "one Signal on producer worker");
+        assert_eq!(waits, vec![(1, 0)], "one Wait on cross-worker consumer");
+    }
+
+    /// Two producers on different workers, one consumer joining both.
+    /// Each cross-worker producer signals; consumer emits two Waits.
+    #[test]
+    fn lower_join_emits_one_wait_per_cross_worker_producer() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 },  // 0 source
+            TensorShape { rows: 1, cols: 4 },  // 1 prod-A output (cols [0,4))
+            TensorShape { rows: 1, cols: 8 },  // 2 prod-B output (cols [4,8))
+            TensorShape { rows: 1, cols: 12 }, // 3 consumer output (cols [8,12))
+        ];
+        // Consumer reads BOTH producers' outputs (Add: arity 2).
+        let consumer = SubtileNode {
+            id: SubtileId(2),
+            op: SubOp::Elementwise(EwKind::Add),
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId(1),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(2),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(4, 4),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: TensorId(3),
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: Range::new(8, 4),
+                },
+            },
+        };
+        let nodes = vec![
+            silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4)),
+            silu_node(1, TensorId(0), Range::new(0, 4), TensorId(2), Range::new(4, 4)),
+            consumer,
+        ];
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 1,
+            nodes,
+            result: TensorId(3),
+        };
+        // unit=4, num_workers=3:
+        //   node 0 → worker 0; node 1 → worker 1; node 2 → worker 2.
+        let tape = lower_dag_to_tape(&g, 3, 4);
+        assert_eq!(tape.num_barriers, 2, "two cross-worker producers");
+        let waits_on_w2: Vec<_> = tape
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Wait { worker, barrier } if worker.index() == 2 => Some(barrier.index()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits_on_w2.len(), 2, "consumer waits on both producers");
+        // Each barrier signaled exactly once.
+        for b in 0..tape.num_barriers {
+            let sigs = tape
+                .instrs
+                .iter()
+                .filter(|i| matches!(i, Instr::Signal { barrier, .. } if barrier.index() == b))
+                .count();
+            assert_eq!(sigs, 1, "barrier {b} signaled exactly once");
+        }
+    }
+
+    /// AttnDecode wraps in OpenLoop + Compute + CloseLoop with a
+    /// runtime-bounded count (the KV-sweep over seq_len pages).
+    #[test]
+    fn lower_attn_decode_wraps_in_runtime_loop() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 }, // 0 Q (source)
+            TensorShape { rows: 4, cols: 4 }, // 1 K (source, prefix)
+            TensorShape { rows: 4, cols: 4 }, // 2 V (source, prefix)
+            TensorShape { rows: 1, cols: 4 }, // 3 attn output
+        ];
+        let attn = SubtileNode {
+            id: SubtileId(0),
+            op: SubOp::AttnDecode {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+                scale: 0.5,
+                layout: KvCacheLayout::for_cache_tensor(TensorId(1), 1, 4),
+                producer: KvCacheProducer::pre_populated_ext(),
+                softmax_state: SoftmaxStateId::new(0),
+            },
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId(0),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(1),
+                    region: Region {
+                        rows: Range::new(0, 4),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(2),
+                    region: Region {
+                        rows: Range::new(0, 4),
+                        cols: Range::new(0, 4),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: TensorId(3),
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: Range::new(0, 4),
+                },
+            },
+        };
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes: vec![attn],
+            result: TensorId(3),
+        };
+        let tape = lower_dag_to_tape(&g, 1, 4);
+        assert_eq!(tape.num_loop_vars, 1, "one AttnDecode → one loop var");
+        assert_eq!(tape.num_runtime_bounds, 1, "one AttnDecode → one runtime bound");
+        // The shape is OpenLoop + Compute + CloseLoop — three instrs.
+        assert_eq!(tape.instrs.len(), 3);
+        assert!(matches!(
+            tape.instrs[0],
+            Instr::OpenLoop { bound: LoopBound::Runtime(_), .. }
+        ));
+        assert!(matches!(tape.instrs[1], Instr::Compute { .. }));
+        assert!(matches!(tape.instrs[2], Instr::CloseLoop { .. }));
+    }
+
+    /// Two AttnDecode nodes → two runtime bounds, two loop vars (each
+    /// AttnDecode gets its own KV-sweep).
+    #[test]
+    fn lower_two_attn_decodes_each_get_own_runtime_loop() {
+        let tensors = vec![
+            TensorShape { rows: 1, cols: 4 }, // 0 Q
+            TensorShape { rows: 4, cols: 4 }, // 1 K
+            TensorShape { rows: 4, cols: 4 }, // 2 V
+            TensorShape { rows: 1, cols: 4 }, // 3 attn-A out
+            TensorShape { rows: 1, cols: 4 }, // 4 attn-B out
+        ];
+        let mk_attn = |id: u32, out_t: TensorId, sm: u32| SubtileNode {
+            id: SubtileId(id),
+            op: SubOp::AttnDecode {
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 4,
+                scale: 0.5,
+                layout: KvCacheLayout::for_cache_tensor(TensorId(1), 1, 4),
+                producer: KvCacheProducer::pre_populated_ext(),
+                softmax_state: SoftmaxStateId::new(sm),
+            },
+            inputs: vec![
+                TensorRegion {
+                    tensor: TensorId(0),
+                    region: Region {
+                        rows: Range::new(0, 1),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(1),
+                    region: Region {
+                        rows: Range::new(0, 4),
+                        cols: Range::new(0, 4),
+                    },
+                },
+                TensorRegion {
+                    tensor: TensorId(2),
+                    region: Region {
+                        rows: Range::new(0, 4),
+                        cols: Range::new(0, 4),
+                    },
+                },
+            ],
+            output: TensorRegion {
+                tensor: out_t,
+                region: Region {
+                    rows: Range::new(0, 1),
+                    cols: Range::new(0, 4),
+                },
+            },
+        };
+        let g: SubtileIR<NeoX> = SubtileIR {
+            tensors,
+            num_sources: 3,
+            nodes: vec![mk_attn(0, TensorId(3), 0), mk_attn(1, TensorId(4), 1)],
+            result: TensorId(4),
+        };
+        let tape = lower_dag_to_tape(&g, 1, 4);
+        assert_eq!(tape.num_loop_vars, 2);
         assert_eq!(tape.num_runtime_bounds, 2);
     }
 

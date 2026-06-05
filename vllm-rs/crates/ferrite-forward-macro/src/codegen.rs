@@ -6181,6 +6181,18 @@ fn emit_canonical_params_impl(
         .unwrap_or(q_size);
     let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
+    // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
+    // (`vocab_size` bound). Used by the generic `Instruction::Gemm` arm
+    // to identify lm_head and apply the last-token-per-seq narrow
+    // before the GEMM. 0 → not set, the runtime falls back to the
+    // legacy `n > INTERMEDIATE_SIZE` heuristic.
+    let vocab_size_for_const: usize = model
+        .bounds
+        .get("vocab_size")
+        .copied()
+        .map(|v| v as usize)
+        .unwrap_or(0);
+    let vocab_size_lit = proc_macro2::Literal::usize_unsuffixed(vocab_size_for_const);
     let kv_lora_rank_lit = proc_macro2::Literal::usize_unsuffixed(kv_lora_rank);
     let qk_nope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_nope_head_dim);
     let qk_rope_head_dim_lit = proc_macro2::Literal::usize_unsuffixed(qk_rope_head_dim);
@@ -6334,6 +6346,7 @@ fn emit_canonical_params_impl(
             const Q_SIZE: usize = #q_size_lit;
             const KV_SIZE: usize = #kv_size_lit;
             const HIDDEN_SIZE: usize = #hidden_size_lit;
+            const VOCAB_SIZE: usize = #vocab_size_lit;
             const INTERMEDIATE_SIZE: usize = #intermediate_size_lit;
             const ATTN_SCALE: f32 = #attn_scale_lit;
             const ATTN_SOFTCAP: f32 = #attn_softcap_lit;

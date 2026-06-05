@@ -44,6 +44,15 @@ liveness analysis, not of the target. Only **slot-physical-realization**
 discharges the hazard, page lifecycle, parity) is target-specific. So
 slots belong at SubtileTape; their realization at TkTape.
 
+## Source identifiers
+
+SubtileTape `Instr` references node identity by `subtile_ir::SubtileId`
+and slot identity by tape-local `SlotId` only. There is no second
+buffer namespace (no `BufId`); the `metal_tape::BufId` namespace is a
+v1 carcass surviving only in the §10-deletion files. The TkTape
+lowering (commit 6) similarly preserves `subtile_ir::TensorId` for
+source identifiers — one identifier per layer, no aliasing tables.
+
 ## What does NOT live here
 
 - **Workers / CTAs / threadgroups / warp roles.** SubtileTape carries

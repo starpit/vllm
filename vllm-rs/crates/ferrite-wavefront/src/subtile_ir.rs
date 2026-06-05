@@ -38,6 +38,8 @@
 
 #![allow(dead_code)]
 
+use std::marker::PhantomData;
+
 // ── Identifiers & geometry ─────────────────────────────────────────
 
 /// Dense index into a [`SubtileIR::nodes`] vector. The DAG is
@@ -76,70 +78,6 @@ pub struct Region {
 pub struct SourceShape {
     pub rows: u32,
     pub cols: u32,
-}
-
-// ── Sub-operations (shared by both granularities) ──────────────────
-
-/// The sub-operation a node performs. Every variant has a
-/// `cpu_golden`-backed host evaluation in [`eval_node`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SubOp {
-    /// Matmul output tile over one K-chunk:
-    /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
-    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
-    /// (W is row-major `[N, K]`, read transposed). Output is the dense
-    /// partial `[mr.len, nr.len]` contributed by this K-chunk.
-    MatmulTile,
-    /// Elementwise sum of equal-shaped inputs — the split-K combine. All
-    /// inputs and the output are `[out_rows, out_cols]`.
-    SumReduce,
-    /// Shape-preserving elementwise op over a tile. Unary (`Silu`) reads
-    /// `inputs[0]`; binary (`Mul`, `Add`) read `inputs[0]` and
-    /// `inputs[1]`, both matching the output shape. Col-tiling never
-    /// reorders a computation, so always bit-exact vs the whole op.
-    Elementwise(EwKind),
-    /// Fused SwiGLU activation: `out[j] = silu(gate[j]) * up[j]`.
-    /// `inputs[0]` = gate, `inputs[1]` = up, both `[out_rows, out_cols]`.
-    /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
-    /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
-    /// `Silu` + `Mul` are fused into this one node *before scheduling* (so
-    /// the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
-    SiluMul,
-    /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
-    /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
-    /// `inputs[1]` = weight `[1, cols]`. The per-row reduction is kept
-    /// whole (single node) so it is bit-exact vs `cpu_golden::rmsnorm`;
-    /// rms-norm is cheap and hides in the matvec shadow, so there is no
-    /// reason to split its reduction.
-    RmsNorm { eps: f32 },
-    /// NeoX-pairing rotary embedding over `[rows, heads * head_dim]`.
-    /// `inputs[0]` = x, `inputs[1]` = cos row `[1, >=head_dim]`,
-    /// `inputs[2]` = sin row — the new token's position, pre-sliced.
-    /// Pairs `(d, d + half)`; matches `cpu_golden::rope`/`rope_append`'s
-    /// rotation. Shape-preserving, so bit-exact vs the reference.
-    RopeRotate { head_dim: u32 },
-    /// The K-side `rope_append` for the GPU megakernel: rotate K (NeoX)
-    /// **and** write the rotated K + un-rotated V into the paged KV
-    /// cache, so the downstream attention reads the new token from the
-    /// cache like the oracle non-mega path (Tier-B exact). The host eval
-    /// is **rotation only** (identical to [`SubOp::RopeRotate`]); V and
-    /// the cache write are GPU-only — V is carried for the schedule edge
-    /// and so the serializer can bind it. `layer` names the KV-cache
-    /// layer the serializer routes the cache operands to.
-    RopeAppend { head_dim: u32, layer: u32 },
-    /// Decode attention. `inputs[0]` = Q `[Mq, num_q_heads * head_dim]`;
-    /// the remaining inputs are alternating `(K_seg, V_seg)`, each
-    /// `[seg_len, num_kv_heads * head_dim]`, concatenated along the KV
-    /// axis in input order. The **fused** decode passes the prefix cache
-    /// as a read-only segment and the just-rotated new token as the
-    /// dataflow segment — so the new K/V is an internal edge, not a
-    /// cache round-trip.
-    AttnDecode {
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-        scale: f32,
-    },
 }
 
 /// Elementwise op kind. Numerics mirror `cpu_golden` exactly.
@@ -186,6 +124,305 @@ pub struct TensorRegion {
     pub region: Region,
 }
 
+// ── Typed witnesses on SubtileIR DAG nodes ─────────────────────────
+//
+// Each witness encodes one IR-level invariant. Producer / consumer
+// ops carry the SAME witness *value* by construction (single source of
+// truth), or — in the case of [`RopeForm`] — share the SAME
+// `F: RopeForm` const-generic *type* on the entire IR (so mixing
+// NeoX/Interleaved in one forward is a compile error, not a runtime
+// surprise).
+
+#[doc(hidden)]
+pub mod sealed {
+    /// Sealing token — inner `()` is `pub(super)` so external code
+    /// cannot construct a `Seal` value. Carried by every type that
+    /// must be constructable only inside `subtile_ir`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub struct Seal(pub(super) ());
+}
+
+/// **`RopeForm`** — sealed marker trait selecting the rotary pairing
+/// form. Llama-3.2 uses [`NeoX`]; some other architectures use
+/// [`Interleaved`]. Encoded as a const-generic phantom on
+/// [`SubtileIR<F>`] / [`SubtileNode<F>`] / [`SubOp<F>`] so a single
+/// forward's rope nodes ALL share the same form by construction —
+/// mixing NeoX and Interleaved in one IR is a compile error.
+///
+/// ```compile_fail
+/// // Mixing NeoX and Interleaved in one IR is rejected at the type
+/// // level: SubtileIR<NeoX>::nodes is Vec<SubtileNode<NeoX>>, so a
+/// // SubtileNode<Interleaved> won't fit in it. No need for a runtime
+/// // check; the const generic enforces it.
+/// use ferrite_wavefront::subtile_ir::{
+///     Interleaved, NeoX, SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion,
+///     Region, Range,
+/// };
+/// use std::marker::PhantomData;
+/// let interleaved_node = SubtileNode::<Interleaved> {
+///     id: SubtileId(0),
+///     op: SubOp::<Interleaved>::RopeRotate {
+///         head_dim: 4,
+///         _form: PhantomData,
+///     },
+///     inputs: vec![],
+///     output: TensorRegion {
+///         tensor: TensorId(0),
+///         region: Region { rows: Range::new(0, 1), cols: Range::new(0, 4) },
+///     },
+/// };
+/// let _ir: SubtileIR<NeoX> = SubtileIR {
+///     tensors: vec![],
+///     num_sources: 0,
+///     nodes: vec![interleaved_node], // type mismatch
+///     result: TensorId(0),
+/// };
+/// ```
+pub trait RopeForm:
+    rope_form_seal::Sealed + Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + 'static
+{
+    /// Erased tag for runtime introspection (printing, unit tests).
+    const TAG: RopeFormTag;
+}
+
+/// NeoX rope: pairs `(d, d + half)` per head. Llama-3.2 invariant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NeoX {}
+
+/// Interleaved rope: pairs `(2k, 2k + 1)` per head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Interleaved {}
+
+#[doc(hidden)]
+pub mod rope_form_seal {
+    pub trait Sealed {}
+    impl Sealed for super::NeoX {}
+    impl Sealed for super::Interleaved {}
+}
+
+impl RopeForm for NeoX {
+    const TAG: RopeFormTag = RopeFormTag::NeoX;
+}
+impl RopeForm for Interleaved {
+    const TAG: RopeFormTag = RopeFormTag::Interleaved;
+}
+
+/// Erased rope-form tag for runtime use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RopeFormTag {
+    NeoX,
+    Interleaved,
+}
+
+/// **`KvCacheLayout`** — sealed witness naming the K-cache (or V-cache)
+/// tensor a single forward reads from / writes to. The orchestrator
+/// builds ONE per cache tensor; `RopeAppend`'s write and `AttnDecode`'s
+/// read both reach for the SAME instance, making layout drift between
+/// producer and consumer structurally impossible.
+///
+/// Constructable only via [`KvCacheLayout::for_cache_tensor`] — sealed.
+///
+/// ```compile_fail
+/// // Sealed: external code cannot construct a KvCacheLayout via the
+/// // struct literal because the `_seal: sealed::Seal` field is
+/// // private and Seal's only inner field is pub(super)-restricted.
+/// // The only path is `KvCacheLayout::for_cache_tensor(...)`, which
+/// // makes layout drift (a divergent producer / consumer fabrication)
+/// // structurally impossible.
+/// use ferrite_wavefront::subtile_ir::{KvCacheLayout, TensorId};
+/// let _ = KvCacheLayout {
+///     cache_tensor: TensorId(0),
+///     num_kv_heads: 2,
+///     head_dim: 4,
+/// };
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KvCacheLayout {
+    cache_tensor: TensorId,
+    num_kv_heads: u32,
+    head_dim: u32,
+    _seal: sealed::Seal,
+}
+
+impl KvCacheLayout {
+    /// Sealed constructor binding `cache_tensor` into the witness.
+    pub const fn for_cache_tensor(
+        cache_tensor: TensorId,
+        num_kv_heads: u32,
+        head_dim: u32,
+    ) -> Self {
+        Self {
+            cache_tensor,
+            num_kv_heads,
+            head_dim,
+            _seal: sealed::Seal(()),
+        }
+    }
+
+    pub const fn cache_tensor(&self) -> TensorId {
+        self.cache_tensor
+    }
+    pub const fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads
+    }
+    pub const fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+    /// Per-token K (or V) row width in elements.
+    pub const fn row_elements(&self) -> u32 {
+        self.num_kv_heads * self.head_dim
+    }
+}
+
+/// **`KvCacheProducer`** — sealed enum naming HOW the K (or V) cache
+/// that an [`SubOp::AttnDecode`] reads got populated. The variants are
+/// sealed (constructable only via [`KvCacheProducer::from_rope_append`]
+/// / [`KvCacheProducer::pre_populated_ext`]) and the enum is
+/// `#[non_exhaustive]` so external `match`es must include a wildcard
+/// arm — preventing the silent `_ =>` regression on a future variant.
+///
+/// ```compile_fail
+/// // External match without a wildcard is rejected: the enum is
+/// // #[non_exhaustive], so the compiler forces a `_ =>` arm. That
+/// // makes adding a new variant a soft-fail (existing matchers route
+/// // it to the wildcard) rather than a silent miscompile of the kind
+/// // a non-exhaustive enum without `non_exhaustive` would suffer.
+/// use ferrite_wavefront::subtile_ir::KvCacheProducer;
+/// fn name(p: KvCacheProducer) -> &'static str {
+///     match p {
+///         KvCacheProducer::SameForwardRopeAppend { .. } => "rope_append",
+///         KvCacheProducer::PrePopulatedExt { .. } => "ext",
+///     }
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KvCacheProducer {
+    /// The cache was written by a `SubOp::RopeAppend` earlier in this
+    /// same forward (the producer is `nodes[producer_node_idx]`).
+    SameForwardRopeAppend {
+        producer_node_idx: u32,
+        #[doc(hidden)]
+        _seal: sealed::Seal,
+    },
+    /// The cache is pre-populated by an out-of-band per-op forward and
+    /// is read-only inside this megakernel.
+    PrePopulatedExt {
+        #[doc(hidden)]
+        _seal: sealed::Seal,
+    },
+}
+
+impl KvCacheProducer {
+    pub const fn from_rope_append(producer_node_idx: u32) -> Self {
+        Self::SameForwardRopeAppend {
+            producer_node_idx,
+            _seal: sealed::Seal(()),
+        }
+    }
+
+    pub const fn pre_populated_ext() -> Self {
+        Self::PrePopulatedExt {
+            _seal: sealed::Seal(()),
+        }
+    }
+}
+
+/// **`SoftmaxStateId`** — opaque identifier for the per-AttnDecode
+/// online-softmax accumulator (`m`, `l`, `o`). The lowering walker
+/// allocates one per AttnDecode; the TkTape lowering binds it to the
+/// concrete register set at emit time. Constructable only inside this
+/// crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SoftmaxStateId {
+    id: u32,
+    _seal: sealed::Seal,
+}
+
+impl SoftmaxStateId {
+    pub(crate) const fn new(id: u32) -> Self {
+        Self {
+            id,
+            _seal: sealed::Seal(()),
+        }
+    }
+    pub const fn index(&self) -> u32 {
+        self.id
+    }
+}
+
+// ── Sub-operations ─────────────────────────────────────────────────
+
+/// The sub-operation a node performs. Generic over `F: RopeForm`
+/// (default [`NeoX`]) so a SubtileIR's rope nodes share the same
+/// pairing form by construction.
+///
+/// Every variant has a `cpu_golden`-backed host evaluation in
+/// [`eval_node`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SubOp<F: RopeForm = NeoX> {
+    /// Matmul output tile over one K-chunk:
+    /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
+    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
+    /// (W is row-major `[N, K]`, read transposed). Output is the dense
+    /// partial `[mr.len, nr.len]` contributed by this K-chunk.
+    MatmulTile,
+    /// Elementwise sum of equal-shaped inputs — the split-K combine. All
+    /// inputs and the output are `[out_rows, out_cols]`.
+    SumReduce,
+    /// Shape-preserving elementwise op over a tile. Unary (`Silu`) reads
+    /// `inputs[0]`; binary (`Mul`, `Add`) read `inputs[0]` and
+    /// `inputs[1]`, both matching the output shape. Col-tiling never
+    /// reorders a computation, so always bit-exact vs the whole op.
+    Elementwise(EwKind),
+    /// Fused SwiGLU activation: `out[j] = silu(gate[j]) * up[j]`.
+    /// `inputs[0]` = gate, `inputs[1]` = up, both `[out_rows, out_cols]`.
+    /// Matches `cpu_golden::fused_gate_up_silu_mul`. The GPU has only a
+    /// *fused* `silu_mul` arm (no standalone silu), so the MLP's separate
+    /// `Silu` + `Mul` are fused into this one node *before scheduling*
+    /// (so the pair lands on one worker); see `crate::lower::fuse_silu_mul`.
+    SiluMul,
+    /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
+    /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
+    /// `inputs[1]` = weight `[1, cols]`.
+    RmsNorm { eps: f32 },
+    /// Rotary embedding over `[rows, heads * head_dim]` in the
+    /// `F: RopeForm` pairing. `inputs[0]` = x, `inputs[1]` = cos row,
+    /// `inputs[2]` = sin row.
+    RopeRotate {
+        head_dim: u32,
+        #[doc(hidden)]
+        _form: PhantomData<F>,
+    },
+    /// The K-side `rope_append`: rotate K in the `F: RopeForm` pairing
+    /// **and** write the rotated K + un-rotated V into the paged KV
+    /// cache (the cache identity is bound by `layout`). The host eval is
+    /// **rotation only** (identical to [`SubOp::RopeRotate`]); V and the
+    /// cache write are GPU-only.
+    RopeAppend {
+        head_dim: u32,
+        layer: u32,
+        layout: KvCacheLayout,
+        #[doc(hidden)]
+        _form: PhantomData<F>,
+    },
+    /// Decode attention. `inputs[0]` = Q `[Mq, num_q_heads * head_dim]`;
+    /// the remaining inputs are alternating `(K_seg, V_seg)` pairs.
+    /// `layout` names the K-cache (single source of truth shared with
+    /// the producing `RopeAppend`); `producer` names how that cache got
+    /// populated; `softmax_state` is the per-AttnDecode online-softmax
+    /// accumulator id.
+    AttnDecode {
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        scale: f32,
+        layout: KvCacheLayout,
+        producer: KvCacheProducer,
+        softmax_state: SoftmaxStateId,
+    },
+}
+
 // ── Nodes & graph ──────────────────────────────────────────────────
 
 /// One unit of work: reads `inputs` (regions of tensors), computes its
@@ -194,40 +431,50 @@ pub struct TensorRegion {
 /// `[output.region.rows.len, output.region.cols.len]` buffer that is
 /// scattered into the output tensor.
 #[derive(Clone, Debug)]
-pub struct SubtileNode {
+pub struct SubtileNode<F: RopeForm = NeoX> {
     pub id: SubtileId,
-    pub op: SubOp,
+    pub op: SubOp<F>,
     pub inputs: Vec<TensorRegion>,
     pub output: TensorRegion,
 }
 
 /// The canonical wavefront SubtileIR — a tensor-region SSA dataflow
-/// graph. Nodes are topologically ordered: every node that reads an
-/// op-output region is preceded by the nodes that write the overlapping
-/// region (so a single pass over `nodes` is a valid evaluation order).
+/// graph in the `F: RopeForm` pairing. Nodes are topologically ordered:
+/// every node that reads an op-output region is preceded by the nodes
+/// that write the overlapping region (so a single pass over `nodes` is
+/// a valid evaluation order).
 #[derive(Clone, Debug)]
-pub struct SubtileIR {
+pub struct SubtileIR<F: RopeForm = NeoX> {
     pub tensors: Vec<TensorShape>,
     /// `tensors[0..num_sources]` are leaf sources.
     pub num_sources: u32,
-    pub nodes: Vec<SubtileNode>,
+    pub nodes: Vec<SubtileNode<F>>,
     /// The tensor whose buffer is the forward result (logits).
     pub result: TensorId,
 }
 
-impl SubtileIR {
+impl<F: RopeForm> SubtileIR<F> {
     pub fn shape(&self, t: TensorId) -> TensorShape {
         self.tensors[t.0 as usize]
     }
     fn is_source(&self, t: TensorId) -> bool {
         t.0 < self.num_sources
     }
+    /// The rope form of this IR. All rope nodes use this pairing by
+    /// construction (the const generic guarantees it).
+    pub const fn rope_form(&self) -> RopeFormTag {
+        F::TAG
+    }
 }
 
 // ── Host evaluation ────────────────────────────────────────────────
 
 /// Gather a tensor region into a dense row-major `(buf, rows, cols)`.
-fn gather(tr: &TensorRegion, graph: &SubtileIR, bufs: &[Vec<f32>]) -> (Vec<f32>, u32, u32) {
+fn gather<F: RopeForm>(
+    tr: &TensorRegion,
+    graph: &SubtileIR<F>,
+    bufs: &[Vec<f32>],
+) -> (Vec<f32>, u32, u32) {
     let shape = graph.shape(tr.tensor);
     let src = &bufs[tr.tensor.0 as usize];
     let (r, c) = (tr.region.rows.len, tr.region.cols.len);
@@ -262,7 +509,7 @@ pub fn scatter(
 /// buffer for source tensor `s` (`s < num_sources`), matching
 /// `graph.tensors[s]`. Returns the backing buffer of every tensor
 /// (indexed by [`TensorId`]); the logits are `bufs[graph.result]`.
-pub fn eval_dag(graph: &SubtileIR, sources: &[&[f32]]) -> Vec<Vec<f32>> {
+pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     assert_eq!(
         sources.len(),
         graph.num_sources as usize,
@@ -293,7 +540,11 @@ pub fn eval_dag(graph: &SubtileIR, sources: &[&[f32]]) -> Vec<Vec<f32>> {
 
 /// Compute one node's dense `[out_rows, out_cols]` output. Per-op
 /// arithmetic mirrors `cpu_golden`.
-pub fn eval_node(node: &SubtileNode, graph: &SubtileIR, bufs: &[Vec<f32>]) -> Vec<f32> {
+pub fn eval_node<F: RopeForm>(
+    node: &SubtileNode<F>,
+    graph: &SubtileIR<F>,
+    bufs: &[Vec<f32>],
+) -> Vec<f32> {
     let out_rows = node.output.region.rows.len;
     let out_cols = node.output.region.cols.len;
     match node.op {
@@ -378,7 +629,10 @@ pub fn eval_node(node: &SubtileNode, graph: &SubtileIR, bufs: &[Vec<f32>]) -> Ve
         }
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
-        SubOp::RopeRotate { head_dim } | SubOp::RopeAppend { head_dim, .. } => {
+        SubOp::RopeRotate { head_dim, _form: _ }
+        | SubOp::RopeAppend {
+            head_dim, _form: _, ..
+        } => {
             let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
             let (cos, _, cc) = gather(&node.inputs[1], graph, bufs);
             let (sin, _, sc) = gather(&node.inputs[2], graph, bufs);
@@ -409,6 +663,7 @@ pub fn eval_node(node: &SubtileNode, graph: &SubtileIR, bufs: &[Vec<f32>]) -> Ve
             num_kv_heads,
             head_dim,
             scale,
+            ..
         } => {
             // Head-block aware: this node computes a contiguous q-head range,
             // derived from the OUTPUT region (its column slice), and reads the
@@ -489,7 +744,7 @@ pub fn eval_node(node: &SubtileNode, graph: &SubtileIR, bufs: &[Vec<f32>]) -> Ve
 }
 
 /// The forward result buffer (logits) — `bufs[graph.result]`.
-pub fn result_buffer<'a>(graph: &SubtileIR, bufs: &'a [Vec<f32>]) -> &'a [f32] {
+pub fn result_buffer<'a, F: RopeForm>(graph: &SubtileIR<F>, bufs: &'a [Vec<f32>]) -> &'a [f32] {
     &bufs[graph.result.0 as usize]
 }
 
@@ -507,7 +762,7 @@ fn regions_overlap(a: Region, b: Region) -> bool {
 /// overlaps one of this node's input reads on the same op-output tensor.
 /// Reads of leaf sources contribute no dependency. This is the edge set
 /// the wavefront scheduler turns into cross-worker `Wait`/`Signal`.
-pub fn predecessors(graph: &SubtileIR) -> Vec<Vec<SubtileId>> {
+pub fn predecessors<F: RopeForm>(graph: &SubtileIR<F>) -> Vec<Vec<SubtileId>> {
     // writers[t] = (node_id, out_region) for each op-output tensor, in id order.
     let mut writers: Vec<Vec<(u32, Region)>> = vec![Vec::new(); graph.tensors.len()];
     let mut preds: Vec<Vec<SubtileId>> = Vec::with_capacity(graph.nodes.len());
@@ -537,7 +792,7 @@ pub fn predecessors(graph: &SubtileIR) -> Vec<Vec<SubtileId>> {
 /// op arity, and that every op-output read is covered by writers with a
 /// strictly smaller id (acyclic + assembled-before-read). Returns the
 /// node count on success.
-pub fn validate(graph: &SubtileIR) -> Result<usize, String> {
+pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
     let n_tensors = graph.tensors.len() as u32;
     if graph.num_sources > n_tensors {
         return Err(format!(
@@ -681,7 +936,13 @@ pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, in0_cols: u32) -> u32 {
 /// `nb >= n` ⇒ a single block (coarse, equivalent to v1). Source tensors
 /// mirror `input.sources`; op-output tensor `i` is
 /// `TensorId(num_sources + i)`.
-pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR {
+/// Lower a flat [`crate::lower::LoweringInput`] to a `SubtileIR<NeoX>`.
+/// Llama-3.2 uses NeoX rotary; Interleaved-form lowerings (other
+/// architectures) construct `SubtileIR<Interleaved>` directly. Mixing
+/// forms in one IR is impossible by construction (the IR's rope nodes
+/// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
+/// Interleaved-form rope node).
+pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR<NeoX> {
     use crate::lower::{InputRef, LoweredOp};
     let num_sources = input.sources.len() as u32;
     let mut tensors: Vec<TensorShape> = input
@@ -694,7 +955,13 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR {
         .collect();
     let mut op_tensor: Vec<TensorId> = Vec::with_capacity(input.ops.len());
     let mut op_cols: Vec<u32> = Vec::with_capacity(input.ops.len());
-    let mut nodes: Vec<SubtileNode> = Vec::new();
+    let mut nodes: Vec<SubtileNode<NeoX>> = Vec::new();
+    // RopeAppend node id keyed by the K-cache TensorId it writes — used
+    // to compute `KvCacheProducer` for any AttnDecode that reads the
+    // same cache later in the forward.
+    let mut k_cache_producer_node: std::collections::HashMap<TensorId, u32> =
+        std::collections::HashMap::new();
+    let mut next_softmax_state: u32 = 0;
 
     // Resolve an InputRef to (tensor id, shape).
     let resolve = |r: InputRef,
@@ -767,27 +1034,72 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR {
                 }
             }
             other => {
-                let subop = match other {
+                // Populate per-variant typed witnesses. RopeAppend's
+                // KvCacheLayout is keyed on its `K_cache` input
+                // (desc.inputs[4] per the validate-arity contract);
+                // AttnDecode's KvCacheLayout/KvCacheProducer are keyed
+                // on its prefix-K input (desc.inputs[1] in the fused
+                // decode shape).
+                let subop: SubOp<NeoX> = match other {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
                     LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
                     LoweredOp::SiluMul => SubOp::SiluMul,
                     LoweredOp::Add => SubOp::Elementwise(EwKind::Add),
-                    LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate { head_dim },
+                    LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate {
+                        head_dim,
+                        _form: PhantomData,
+                    },
                     LoweredOp::RopeAppend { head_dim, layer } => {
-                        SubOp::RopeAppend { head_dim, layer }
+                        // K-cache TensorId comes from desc.inputs[4]
+                        // (the validate arity-6 contract); for legacy
+                        // 4-input fixtures (K, cos, sin, V only) fall
+                        // back to the K input's own tensor — the layout
+                        // witness is consulted only when the producer/
+                        // consumer pair is end-to-end (RopeAppend +
+                        // AttnDecode), so the sentinel never escapes.
+                        let k_cache_t = if desc.inputs.len() > 4 {
+                            resolve(desc.inputs[4], &op_tensor, &op_cols, &tensors).0
+                        } else {
+                            in0_t
+                        };
+                        let num_kv_heads = (in0_cols / head_dim.max(1)).max(1);
+                        let layout =
+                            KvCacheLayout::for_cache_tensor(k_cache_t, num_kv_heads, head_dim);
+                        k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
+                        SubOp::RopeAppend {
+                            head_dim,
+                            layer,
+                            layout,
+                            _form: PhantomData,
+                        }
                     }
                     LoweredOp::AttnDecode {
                         num_q_heads,
                         num_kv_heads,
                         head_dim,
                         scale,
-                    } => SubOp::AttnDecode {
-                        num_q_heads,
-                        num_kv_heads,
-                        head_dim,
-                        scale,
-                    },
+                    } => {
+                        let (prefix_k_t, _, _) =
+                            resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+                        let layout =
+                            KvCacheLayout::for_cache_tensor(prefix_k_t, num_kv_heads, head_dim);
+                        let producer = match k_cache_producer_node.get(&prefix_k_t) {
+                            Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
+                            None => KvCacheProducer::pre_populated_ext(),
+                        };
+                        let softmax_state = SoftmaxStateId::new(next_softmax_state);
+                        next_softmax_state += 1;
+                        SubOp::AttnDecode {
+                            num_q_heads,
+                            num_kv_heads,
+                            head_dim,
+                            scale,
+                            layout,
+                            producer,
+                            softmax_state,
+                        }
+                    }
                     LoweredOp::Gemm { .. } => unreachable!("gemm handled above"),
                 };
                 // A pure elementwise op (silu/mul/add/silu·mul) is tiled by the
@@ -896,7 +1208,7 @@ mod tests {
                 TensorShape { rows: m, cols: n }, // 2: out
             ];
             let out_t = TensorId(2);
-            let mut nodes = Vec::new();
+            let mut nodes: Vec<SubtileNode> = Vec::new();
             let mut start = 0u32;
             while start < n {
                 let len = nb.min(n - start);
@@ -1196,7 +1508,7 @@ mod tests {
             TensorShape { rows: 1, cols: 4 }, // 0 source
             TensorShape { rows: 1, cols: 4 }, // 1 op output (never written)
         ];
-        let bad = SubtileIR {
+        let bad: SubtileIR = SubtileIR {
             tensors,
             num_sources: 1,
             nodes: vec![SubtileNode {

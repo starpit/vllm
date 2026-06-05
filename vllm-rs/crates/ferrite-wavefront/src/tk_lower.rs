@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
-//! `tk_lower` — surviving typed witnesses from the SubtileIR redesign.
+//! `tk_lower` — TK-tape-side reflections of the SubtileIR typed
+//! witnesses, holding the BufId binding the SubtileIR layer doesn't
+//! have.
 //!
-//! After the OLD-substrate nuke, this file holds only the two witnesses
-//! the new tape-build path needs: [`KvCacheLayout`] (single source of
-//! K/V offset math, paris invariant
-//! `kv-cache-write-slot-offset-correctness`) and [`KvCacheProducer`]
-//! (typed dataflow edge from RopeAppend → AttnDecode, paris invariant
-//! `kv-cache-producer-typed-edge`).
+//! **Canonical witnesses live in [`crate::subtile_ir`]** (per plan §4
+//! commit 4):
+//!   - [`crate::subtile_ir::KvCacheLayout`] — TensorId-keyed,
+//!     target-agnostic.
+//!   - [`crate::subtile_ir::KvCacheProducer`] — sealed,
+//!     `#[non_exhaustive]`, target-agnostic.
 //!
-//! The 14 `lower_*` walker fns + their Op input structs that previously
-//! lived here now belong to the new walker (TODO).
+//! The two TK-flavored copies in this file ([`KvCacheLayout`] +
+//! [`KvCacheProducer`]) carry the BufId binding the TkTape needs and
+//! are slated for replacement by a single `lower_tape_to_tk` mapping
+//! in plan §4 commit 6 (TensorId → BufId at lowering time). Until
+//! then, this file stays for tk_tape.rs's existing imports.
 
 use crate::metal_tape::BufId;
 

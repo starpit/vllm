@@ -1348,8 +1348,10 @@ impl<'a> Ser<'a> {
         match node.op {
             SubOp::MatmulTile => self.emit_qmv(node),
             SubOp::RmsNorm { eps } => self.emit_rmsnorm(node, eps),
-            SubOp::RopeRotate { head_dim } => self.emit_rope(node, head_dim),
-            SubOp::RopeAppend { head_dim, layer } => self.emit_rope_append(node, head_dim, layer),
+            SubOp::RopeRotate { head_dim, .. } => self.emit_rope(node, head_dim),
+            SubOp::RopeAppend {
+                head_dim, layer, ..
+            } => self.emit_rope_append(node, head_dim, layer),
             SubOp::SiluMul => self.emit_silu_mul(node),
             SubOp::Elementwise(EwKind::Add) => self.emit_add(node),
             SubOp::AttnDecode {
@@ -1357,6 +1359,7 @@ impl<'a> Ser<'a> {
                 num_kv_heads,
                 head_dim,
                 scale,
+                ..
             } => self.emit_attn(node, num_q_heads, num_kv_heads, head_dim, scale),
             SubOp::Elementwise(EwKind::Silu) => Err(SerializeError::UnsupportedOp {
                 id: node.id.0,

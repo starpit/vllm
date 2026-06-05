@@ -30,10 +30,14 @@
 //! way: bit-exact for head/column tiling; within-tol where split-K reassociates
 //! the reduction (PLAN Tier A′).
 
+use std::collections::HashMap;
+use std::marker::PhantomData;
+
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
 use crate::subtile_ir::{
-    EwKind, Range, Region, SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion,
-    TensorShape, head_blocks, n_blocks, op_out_cols,
+    EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp, SubtileId,
+    SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape, head_blocks, n_blocks,
+    op_out_cols,
 };
 
 /// Lower a decode `LoweringInput` to its tensor-parallel partition: the
@@ -50,7 +54,7 @@ pub fn lower_partitioned(
     head_dim: u32,
     mlp_unit: u32,
     p: u32,
-) -> (SubtileIR, Vec<u32>) {
+) -> (SubtileIR<NeoX>, Vec<u32>) {
     /// One op's output: partitioned (a single tensor written by per-block
     /// nodes) or replicated (P per-worker whole copies — a consumer on worker
     /// `w` reads copy `w`, so the backbone is local to every worker).
@@ -88,7 +92,9 @@ pub fn lower_partitioned(
             cols: s.cols,
         })
         .collect();
-    let mut nodes: Vec<SubtileNode> = Vec::new();
+    let mut nodes: Vec<SubtileNode<NeoX>> = Vec::new();
+    let mut k_cache_producer_node: HashMap<TensorId, u32> = HashMap::new();
+    let mut next_softmax_state: u32 = 0;
     let mut owner: Vec<u32> = Vec::new();
     let mut op_out: Vec<OpOut> = Vec::with_capacity(input.ops.len());
     let mut op_cols: Vec<u32> = Vec::with_capacity(input.ops.len());
@@ -299,11 +305,26 @@ pub fn lower_partitioned(
                 scale,
             } => {
                 let gqa = num_q_heads / num_kv_heads.max(1);
-                let subop = SubOp::AttnDecode {
+                // Resolve the prefix-K input (desc.inputs[1]) to its
+                // TensorId; the witness binds the cache identity, the
+                // producer (if any rope_append wrote it earlier in the
+                // same forward), and the softmax state id.
+                let (prefix_k_t, _, _) = resolve(desc.inputs[1], 0, &op_out, &op_cols, &tensors);
+                let layout = KvCacheLayout::for_cache_tensor(prefix_k_t, num_kv_heads, hd);
+                let producer = match k_cache_producer_node.get(&prefix_k_t) {
+                    Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
+                    None => KvCacheProducer::pre_populated_ext(),
+                };
+                let softmax_state = SoftmaxStateId::new(next_softmax_state);
+                next_softmax_state += 1;
+                let subop: SubOp<NeoX> = SubOp::AttnDecode {
                     num_q_heads,
                     num_kv_heads,
                     head_dim: hd,
                     scale,
+                    layout,
+                    producer,
+                    softmax_state,
                 };
                 let out_t = TensorId(tensors.len() as u32);
                 tensors.push(TensorShape {
@@ -356,15 +377,35 @@ pub fn lower_partitioned(
                 this_out = OpOut::Part(out_t);
             }
             other => {
-                let subop = match other {
+                let subop: SubOp<NeoX> = match other {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
                     LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
                     LoweredOp::SiluMul => SubOp::SiluMul,
                     LoweredOp::Add => SubOp::Elementwise(EwKind::Add),
-                    LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate { head_dim },
+                    LoweredOp::RopeRotate { head_dim } => SubOp::RopeRotate {
+                        head_dim,
+                        _form: PhantomData,
+                    },
                     LoweredOp::RopeAppend { head_dim, layer } => {
-                        SubOp::RopeAppend { head_dim, layer }
+                        // See lower_region — fall back to the K input's
+                        // tensor when the LoweringInput omits the
+                        // K_cache slot (legacy 4-input shape).
+                        let k_cache_t = if desc.inputs.len() > 4 {
+                            resolve(desc.inputs[4], 0, &op_out, &op_cols, &tensors).0
+                        } else {
+                            resolve(desc.inputs[0], 0, &op_out, &op_cols, &tensors).0
+                        };
+                        let num_kv_heads = (in0_cols / head_dim.max(1)).max(1);
+                        let layout =
+                            KvCacheLayout::for_cache_tensor(k_cache_t, num_kv_heads, head_dim);
+                        k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
+                        SubOp::RopeAppend {
+                            head_dim,
+                            layer,
+                            layout,
+                            _form: PhantomData,
+                        }
                     }
                     LoweredOp::Gemm { .. } | LoweredOp::AttnDecode { .. } => {
                         unreachable!("handled above")

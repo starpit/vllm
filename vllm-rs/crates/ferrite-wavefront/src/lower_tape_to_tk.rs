@@ -57,7 +57,8 @@ use crate::tk_tape::{
     AccumKind, ByteOffsetExpr, CommitKind, FenceScope, Instr, KernelArg, KernelArgName,
     KernelArgRef, KernelArgTy, KvLayoutEntry, KvLayoutId, LoadSpec, LoopCount,
     LoopVarId as TkLoopVarId, PageBarrier, PageId, ParityExpr, RopeFormTag, RopeSide,
-    SoftmaxStateId as TkSoftmaxStateId, StoreSpec, SyncScope, TileShape, TkTape, U32Source, WarpRole,
+    SoftmaxStateId as TkSoftmaxStateId, StoreSpec, SyncScope, TileShape, TkTape, U32Source,
+    WarpRole, validate_tk_tape,
 };
 
 // ── BF16 element width ──────────────────────────────────────────────
@@ -308,6 +309,8 @@ pub fn lower_tape_to_tk<F: RopeForm>(
          (would have been caught by validate_subtile_tape)"
     );
     out.instrs = top;
+    validate_tk_tape(&out)
+        .expect("lower_tape_to_tk: produced invalid TkTape (commit 6b post-condition)");
     out
 }
 

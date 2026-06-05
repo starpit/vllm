@@ -1011,7 +1011,8 @@ mod tests {
             nodes: vec![silu_node(0, TensorId(0), Range::new(0, 4), TensorId(1), Range::new(0, 4))],
             result: TensorId(1),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         let tk = lower_tape_to_tk(&tape, &g);
         // Header: LoadAsync (external), SiluMul, StoreAsync, CommitGroup,
         // Threadfence, PageBarrierArrive. Tail drain: 5 instrs.
@@ -1060,7 +1061,8 @@ mod tests {
             ],
             result: TensorId(2),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         let tk = lower_tape_to_tk(&tape, &g);
         // Two SiluMul Instrs (one per node).
         let n_silu = tk
@@ -1129,7 +1131,8 @@ mod tests {
             ],
             result: TensorId(3),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         let tk = lower_tape_to_tk(&tape, &g);
         assert!(!tk.instrs.is_empty());
     }

@@ -794,13 +794,47 @@ pub fn predecessors<F: RopeForm>(graph: &SubtileIR<F>) -> Vec<Vec<SubtileId>> {
     preds
 }
 
-// ── Structural validation ──────────────────────────────────────────
+// ── Structural validation + ValidatedGraph<F> witness ──────────────
+
+/// Sealed proof that a [`SubtileIR<F>`] passed [`validate`]. The only
+/// way to obtain one is [`ValidatedGraph::new`] — internally calls
+/// [`validate`] and on success wraps the borrow with a sealed marker.
+/// Downstream lowerings (`lower_dag_to_tape`) take
+/// `&ValidatedGraph<F>` and can elide their own runtime
+/// validate-and-expect, so structural-precondition violations become
+/// "no value to consume" type errors rather than runtime panics
+/// (per `feedback_compile_time_or_garbage` and §5 K5).
+pub struct ValidatedGraph<'g, F: RopeForm> {
+    inner: &'g SubtileIR<F>,
+    _seal: sealed::Seal,
+}
+
+impl<'g, F: RopeForm> ValidatedGraph<'g, F> {
+    /// Validate `graph` and produce the sealed witness. Returns the
+    /// validation error string verbatim on failure.
+    pub fn new(graph: &'g SubtileIR<F>) -> Result<Self, String> {
+        validate(graph)?;
+        Ok(Self {
+            inner: graph,
+            _seal: sealed::Seal(()),
+        })
+    }
+
+    /// Borrow the underlying graph. Consumers cannot fabricate a
+    /// `ValidatedGraph` without going through [`Self::new`], so this
+    /// borrow is proof-carrying.
+    pub fn graph(&self) -> &'g SubtileIR<F> {
+        self.inner
+    }
+}
 
 /// Check the graph's invariants without evaluating: dense ids, in-range
 /// tensors, in-bounds regions, op-output (not source) write targets,
 /// op arity, and that every op-output read is covered by writers with a
 /// strictly smaller id (acyclic + assembled-before-read). Returns the
-/// node count on success.
+/// node count on success. Prefer [`ValidatedGraph::new`] in the
+/// wavefront lowerings (the typed witness elides downstream runtime
+/// gates).
 pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
     let n_tensors = graph.tensors.len() as u32;
     if graph.num_sources > n_tensors {

@@ -821,11 +821,14 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
 /// The returned `SubtileTape` has been validated against `graph` via
 /// [`validate_subtile_tape`]; callers can assume well-formedness.
 pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
-    graph: &crate::subtile_ir::SubtileIR<F>,
+    valid: &crate::subtile_ir::ValidatedGraph<'_, F>,
 ) -> SubtileTape {
-    use crate::subtile_ir::{SubOp, predecessors, validate};
+    use crate::subtile_ir::{SubOp, predecessors};
 
-    validate(graph).expect("lower_dag_to_tape: invalid SubtileIR");
+    // The ValidatedGraph<F> sealed witness discharges the structural-
+    // precondition gate at the type level; per §5 K5 we no longer ship
+    // a runtime validate(graph).expect here.
+    let graph = valid.graph();
 
     let preds = predecessors(graph);
     // For each node, count of yet-to-be-emitted consumers — when the
@@ -1507,7 +1510,8 @@ mod tests {
             nodes,
             result: TensorId(3),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         // Each node: 1 alloc + 1 compute + 1 free (after last consumer)
         // The chain has 3 nodes and the result-slot is freed at end.
         assert_eq!(tape.num_slots, 3);
@@ -1589,7 +1593,8 @@ mod tests {
             nodes: vec![attn],
             result: TensorId(3),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         assert_eq!(tape.num_loop_vars, 1);
         assert_eq!(tape.num_runtime_bounds, 1);
         assert_eq!(tape.num_slots, 1);
@@ -1652,7 +1657,8 @@ mod tests {
             ],
             result: TensorId(4),
         };
-        let tape = lower_dag_to_tape(&g);
+        let valid = crate::subtile_ir::ValidatedGraph::new(&g).unwrap();
+        let tape = lower_dag_to_tape(&valid);
         assert_eq!(tape.num_slots, 4);
         // Validator already ran. silu(0)'s slot has two consumers
         // (silu(1) and silu(2)); it must be freed AFTER silu(2)'s

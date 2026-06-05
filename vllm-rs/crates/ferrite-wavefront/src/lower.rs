@@ -35,7 +35,14 @@ pub enum InputRef {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoweredOp {
     /// `out[M, n] = act[M, k] @ W[n, k]^T`. Inputs: `[act, weight]`.
-    Gemm { n: u32, k: u32 },
+    /// `k` is derived from the activation's column count at lowering
+    /// time — it is not a separate field. (Carrying `k` separately
+    /// would require a runtime `assert_eq!(in0_cols, k, …)` to defend
+    /// against producer/consumer drift; per
+    /// `feedback_compile_time_or_garbage` and §5 K5, that proof lives
+    /// either on the producing op's column witness or as a structural
+    /// derivation — never as a runtime assert.)
+    Gemm { n: u32 },
     /// `out[M, d] = rmsnorm(x, weight, eps)`. Inputs: `[x, weight]`.
     RmsNorm { eps: f32 },
     /// `silu(x)`. Input: `[x]`. Shape-preserving.

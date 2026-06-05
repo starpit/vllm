@@ -217,7 +217,21 @@ pub struct SubtileTape {
 // ── TapeBuilder<S> typestate ────────────────────────────────────────
 
 /// Compile-time state markers for [`TapeBuilder<S>`].
+///
+/// Each marker implements [`BuilderState`], whose associated `Loop` type
+/// names the loop-context payload that state carries:
+///
+/// - `Outside::Loop = ()` — no loop in flight, no payload.
+/// - `InsideLoop::Loop = LoopVarId` — exactly one loop in flight, the
+///   `LoopVarId` that opened it.
+///
+/// This shape lifts the loop-context invariant from a runtime
+/// `Option<LoopVarId>` into the type system: `close_loop` reads
+/// `self.cur_loop: LoopVarId` directly with no unwrap, because the
+/// `InsideLoop` marker structurally cannot be constructed without one.
 pub mod state {
+    use super::{BuilderState, LoopVarId};
+
     /// No `OpenLoop` is in flight. `alloc_slot` / `free_slot` /
     /// `open_loop` / `finish` are only available here.
     #[derive(Debug)]
@@ -226,6 +240,27 @@ pub mod state {
     /// hazard primitives (`alloc_slot`, `free_slot`) are not.
     #[derive(Debug)]
     pub enum InsideLoop {}
+
+    impl BuilderState for Outside {
+        type Loop = ();
+    }
+    impl BuilderState for InsideLoop {
+        type Loop = LoopVarId;
+    }
+}
+
+/// Sealed marker trait for [`TapeBuilder`]'s typestate parameter `S`.
+/// `Loop` names the loop-context payload that state carries; see the
+/// [`state`] module docs.
+pub trait BuilderState: builder_state_seal::Sealed {
+    /// Loop-context payload — `()` outside any loop, `LoopVarId` inside.
+    type Loop: std::fmt::Debug;
+}
+
+mod builder_state_seal {
+    pub trait Sealed {}
+    impl Sealed for super::state::Outside {}
+    impl Sealed for super::state::InsideLoop {}
 }
 
 /// Typestate-tracked builder. The `S` parameter is one of
@@ -256,13 +291,15 @@ pub mod state {
 /// let (mut inside, _var) = b.open_loop(LoopBound::Const(8));
 /// let _h = inside.alloc_slot();
 /// ```
-pub struct TapeBuilder<S = state::Outside> {
+pub struct TapeBuilder<S: BuilderState = state::Outside> {
     instrs: Vec<Instr>,
     next_slot: u32,
     next_loop_var: u32,
     next_runtime_bound: u32,
-    /// `Some(var)` while an OpenLoop is in flight.
-    cur_loop: Option<LoopVarId>,
+    /// Loop-context payload of state `S`. `()` on `Outside`,
+    /// `LoopVarId` on `InsideLoop`. Per-state, not `Option<…>` — the
+    /// typestate parameter structurally encodes presence.
+    cur_loop: S::Loop,
     /// `PhantomData<fn() -> S>` keeps the builder `Send + Sync` without
     /// implying `S: Send` / `S: Sync`.
     _state: PhantomData<fn() -> S>,
@@ -281,7 +318,7 @@ impl TapeBuilder<state::Outside> {
             next_slot: 0,
             next_loop_var: 0,
             next_runtime_bound: 0,
-            cur_loop: None,
+            cur_loop: (),
             _state: PhantomData,
         }
     }
@@ -336,7 +373,7 @@ impl TapeBuilder<state::Outside> {
             next_slot: self.next_slot,
             next_loop_var: self.next_loop_var,
             next_runtime_bound: self.next_runtime_bound,
-            cur_loop: Some(var),
+            cur_loop: var,
             _state: PhantomData,
         };
         (inside, var)
@@ -407,18 +444,18 @@ impl TapeBuilder<state::InsideLoop> {
     }
 
     /// Close the active loop. Returns a builder back in the `Outside`
-    /// state — `finish` is available again.
+    /// state — `finish` is available again. `cur_loop: LoopVarId` is
+    /// read directly: the `InsideLoop` state structurally cannot exist
+    /// without a `LoopVarId`.
     pub fn close_loop(mut self) -> TapeBuilder<state::Outside> {
-        let var = self
-            .cur_loop
-            .expect("InsideLoop without cur_loop (typestate invariant violated)");
+        let var = self.cur_loop;
         self.instrs.push(Instr::CloseLoop { var });
         TapeBuilder::<state::Outside> {
             instrs: self.instrs,
             next_slot: self.next_slot,
             next_loop_var: self.next_loop_var,
             next_runtime_bound: self.next_runtime_bound,
-            cur_loop: None,
+            cur_loop: (),
             _state: PhantomData,
         }
     }

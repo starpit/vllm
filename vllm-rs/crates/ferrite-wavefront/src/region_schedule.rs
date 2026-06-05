@@ -395,7 +395,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: n1, k },
+                    op: LoweredOp::Gemm { n: n1 },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
@@ -405,7 +405,7 @@ mod tests {
                     inputs: vec![InputRef::Op(0)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: n2, k: n1 },
+                    op: LoweredOp::Gemm { n: n2 },
                     m: 1,
                     inputs: vec![InputRef::Op(1), InputRef::Ext(2)],
                 },
@@ -555,7 +555,7 @@ mod tests {
                 SourceShape { rows: 120, cols: 8 },
             ],
             ops: vec![OpDesc {
-                op: LoweredOp::Gemm { n: 120, k: 8 },
+                op: LoweredOp::Gemm { n: 120 },
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             }],

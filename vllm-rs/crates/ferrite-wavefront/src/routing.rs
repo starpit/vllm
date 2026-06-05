@@ -408,7 +408,7 @@ mod tests {
                 },
                 // 1: q_gemm(rmsnorm, q_w)
                 OpDesc {
-                    op: LoweredOp::Gemm { n: 2048, k: 2048 },
+                    op: LoweredOp::Gemm { n: 2048 },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
                 },

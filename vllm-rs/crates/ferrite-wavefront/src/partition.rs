@@ -140,8 +140,8 @@ pub fn lower_partitioned(
         let this_out: OpOut;
 
         match desc.op {
-            LoweredOp::Gemm { n, k } => {
-                assert_eq!(in0_cols, k, "gemm activation cols must equal k");
+            LoweredOp::Gemm { n } => {
+                let k = in0_cols;
                 let (w_t, _, _) = resolve(desc.inputs[1], 0, &op_out, &op_cols, &tensors);
                 // A GEMM whose activation is a partitioned op output reduces
                 // over the partition axis ⇒ split-K (o_proj over heads, down
@@ -639,17 +639,17 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: qdim, k: h },
+                    op: LoweredOp::Gemm { n: qdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(3)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(4)],
                 },
@@ -680,7 +680,7 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: qdim },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Op(6), InputRef::Ext(9)],
                 },
@@ -695,7 +695,7 @@ mod tests {
                     inputs: vec![InputRef::Op(8), InputRef::Ext(10)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: i, k: h },
+                    op: LoweredOp::Gemm { n: i },
                     m: 1,
                     inputs: vec![InputRef::Op(9), InputRef::Ext(11)],
                 },
@@ -705,7 +705,7 @@ mod tests {
                     inputs: vec![InputRef::Op(10)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: i, k: h },
+                    op: LoweredOp::Gemm { n: i },
                     m: 1,
                     inputs: vec![InputRef::Op(9), InputRef::Ext(12)],
                 },
@@ -715,7 +715,7 @@ mod tests {
                     inputs: vec![InputRef::Op(11), InputRef::Op(12)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: i },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Op(13), InputRef::Ext(13)],
                 },

@@ -54,7 +54,7 @@ pub fn one_layer_input() -> LoweringInput {
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             },
             OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
+                op: LoweredOp::Gemm { n: h },
                 m: 1,
                 inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
             },
@@ -76,7 +76,7 @@ pub fn one_layer_input() -> LoweringInput {
                 inputs: vec![InputRef::Op(2), InputRef::Ext(7), InputRef::Ext(8)],
             },
             OpDesc {
-                op: LoweredOp::Gemm { n: h, k: h },
+                op: LoweredOp::Gemm { n: h },
                 m: 1,
                 inputs: vec![InputRef::Op(3), InputRef::Ext(9)],
             },
@@ -91,12 +91,12 @@ pub fn one_layer_input() -> LoweringInput {
                 inputs: vec![InputRef::Op(5), InputRef::Ext(10)],
             },
             OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
+                op: LoweredOp::Gemm { n: i },
                 m: 1,
                 inputs: vec![InputRef::Op(6), InputRef::Ext(11)],
             },
             OpDesc {
-                op: LoweredOp::Gemm { n: i, k: h },
+                op: LoweredOp::Gemm { n: i },
                 m: 1,
                 inputs: vec![InputRef::Op(6), InputRef::Ext(12)],
             },
@@ -106,7 +106,7 @@ pub fn one_layer_input() -> LoweringInput {
                 inputs: vec![InputRef::Op(7), InputRef::Op(8)],
             },
             OpDesc {
-                op: LoweredOp::Gemm { n: h, k: i },
+                op: LoweredOp::Gemm { n: h },
                 m: 1,
                 inputs: vec![InputRef::Op(9), InputRef::Ext(13)],
             },
@@ -235,7 +235,7 @@ pub fn gemm_m1_only_input() -> LoweringInput {
             SourceShape { rows: n, cols: k }, // 1  w
         ],
         ops: vec![OpDesc {
-            op: LoweredOp::Gemm { n, k },
+            op: LoweredOp::Gemm { n },
             m: 1,
             inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
         }],
@@ -278,7 +278,7 @@ pub fn buf_byte_sizes(input: &LoweringInput) -> Vec<usize> {
             | LoweredOp::RopeAppend { .. }
             | LoweredOp::Silu
             | LoweredOp::Mul => shape_for(desc.inputs[0], &op_shapes, &input.sources).1,
-            LoweredOp::Gemm { n, .. } => n,
+            LoweredOp::Gemm { n } => n,
             LoweredOp::AttnDecode {
                 num_q_heads,
                 head_dim,

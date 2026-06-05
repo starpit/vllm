@@ -1938,7 +1938,7 @@ mod tests {
                 SourceShape { rows: n, cols: k },
             ],
             ops: vec![OpDesc {
-                op: LoweredOp::Gemm { n, k },
+                op: LoweredOp::Gemm { n },
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             }],
@@ -2001,12 +2001,12 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: n0, k: k0 },
+                    op: LoweredOp::Gemm { n: n0 },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: n1, k: n0 },
+                    op: LoweredOp::Gemm { n: n1 },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
                 },
@@ -2082,7 +2082,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: h },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
@@ -2188,17 +2188,17 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: qdim, k: h },
+                    op: LoweredOp::Gemm { n: qdim },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(3)],
                 },
@@ -2312,17 +2312,17 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: qdim, k: h },
+                    op: LoweredOp::Gemm { n: qdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(3)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(4)],
                 },
@@ -2353,7 +2353,7 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: qdim },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Op(6), InputRef::Ext(9)],
                 },
@@ -2495,8 +2495,8 @@ mod tests {
         let (qdim, kvdim) = (hq * hd, hkv * hd);
         let eps = 1e-5f32;
         let scale = 1.0f32 / (hd as f32).sqrt();
-        let g = |n: u32, k: u32, a: usize, w: usize| OpDesc {
-            op: LoweredOp::Gemm { n, k },
+        let g = |n: u32, _k: u32, a: usize, w: usize| OpDesc {
+            op: LoweredOp::Gemm { n },
             m: 1,
             inputs: vec![InputRef::Op(a), InputRef::Ext(w)],
         };
@@ -2702,12 +2702,12 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(2)],
                 },
@@ -2808,7 +2808,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n: 8, k: 8 },
+                    op: LoweredOp::Gemm { n: 8 },
                     m: 1,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
@@ -2898,7 +2898,7 @@ mod tests {
                 SourceShape { rows: n, cols: k },
             ],
             ops: vec![OpDesc {
-                op: LoweredOp::Gemm { n, k },
+                op: LoweredOp::Gemm { n },
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             }],
@@ -2933,7 +2933,7 @@ mod tests {
                 SourceShape { rows: n, cols: k },
             ],
             ops: vec![OpDesc {
-                op: LoweredOp::Gemm { n, k },
+                op: LoweredOp::Gemm { n },
                 m: 1,
                 inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
             }],

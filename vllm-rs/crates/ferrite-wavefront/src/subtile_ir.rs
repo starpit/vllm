@@ -912,7 +912,7 @@ pub fn head_blocks(total: u32, nb: u32, head_dim: u32) -> Vec<Range> {
 pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, in0_cols: u32) -> u32 {
     use crate::lower::LoweredOp;
     match op {
-        LoweredOp::Gemm { n, .. } => n,
+        LoweredOp::Gemm { n } => n,
         LoweredOp::AttnDecode {
             num_q_heads,
             head_dim,
@@ -998,8 +998,11 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: u32) -> SubtileIR<N
         });
 
         match desc.op {
-            LoweredOp::Gemm { n, k } => {
-                assert_eq!(in0_cols, k, "gemm activation cols must equal k");
+            LoweredOp::Gemm { n } => {
+                // k is structurally derived from the activation's
+                // column count — it is not a separate field. See
+                // LoweredOp::Gemm doc.
+                let k = in0_cols;
                 let (w_t, _wr, _wc) = resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
                 let act = TensorRegion {
                     tensor: in0_t,
@@ -1360,17 +1363,17 @@ mod tests {
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: qdim, k: h },
+                    op: LoweredOp::Gemm { n: qdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(2)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(3)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: kvdim, k: h },
+                    op: LoweredOp::Gemm { n: kvdim },
                     m: 1,
                     inputs: vec![InputRef::Op(0), InputRef::Ext(4)],
                 },
@@ -1401,7 +1404,7 @@ mod tests {
                     ],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: qdim },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Op(6), InputRef::Ext(9)],
                 },
@@ -1416,7 +1419,7 @@ mod tests {
                     inputs: vec![InputRef::Op(8), InputRef::Ext(10)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: i, k: h },
+                    op: LoweredOp::Gemm { n: i },
                     m: 1,
                     inputs: vec![InputRef::Op(9), InputRef::Ext(11)],
                 },
@@ -1426,7 +1429,7 @@ mod tests {
                     inputs: vec![InputRef::Op(10)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: i, k: h },
+                    op: LoweredOp::Gemm { n: i },
                     m: 1,
                     inputs: vec![InputRef::Op(9), InputRef::Ext(12)],
                 },
@@ -1436,7 +1439,7 @@ mod tests {
                     inputs: vec![InputRef::Op(11), InputRef::Op(12)],
                 },
                 OpDesc {
-                    op: LoweredOp::Gemm { n: h, k: i },
+                    op: LoweredOp::Gemm { n: h },
                     m: 1,
                     inputs: vec![InputRef::Op(13), InputRef::Ext(13)],
                 },
@@ -1477,7 +1480,7 @@ mod tests {
             ],
             ops: vec![
                 OpDesc {
-                    op: LoweredOp::Gemm { n, k },
+                    op: LoweredOp::Gemm { n },
                     m,
                     inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
                 },

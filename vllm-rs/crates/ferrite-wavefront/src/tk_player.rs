@@ -52,33 +52,22 @@ mod tk20 {
         format!("kittens::group<1>::arrive(&{barrier}[{page}]);")
     }
 
-    /// `tma::load_async` + `expect_bytes` for one page.
-    pub fn tma_load_async(
-        dst_page: u8,
-        src_arg_idx: u32,
-        byte_off: &str,
-        rows: u32,
-        cols: u32,
-        elem_bytes: u32,
-        barrier_page: u8,
-    ) -> String {
+    /// `tma::load_async` + `expect_bytes` for one page. Takes the
+    /// LoadSpec by reference so the caller arm collapses to one
+    /// writeln per Instr (per plan §4 step 8 ≤5-line budget).
+    pub fn tma_load_async(spec: &crate::tk_tape::LoadSpec) -> String {
         format!(
-            "kittens::group<1>::tma::load_async(page_buf[{dst_page}], a{src_arg_idx}, {byte_off}, \
-             {rows}u, {cols}u, {elem_bytes}u, &page_ready[{barrier_page}]);"
+            "kittens::group<1>::tma::load_async(page_buf[{}], a{}, {}, {}u, {}u, {}u, &page_ready[{}]);",
+            spec.dst_page.0, spec.src_tensor.0, spec.byte_off.as_str(),
+            spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes, spec.barrier_page.0,
         )
     }
 
-    pub fn tma_store_async(
-        src_page: u8,
-        dst_arg_idx: u32,
-        byte_off: &str,
-        rows: u32,
-        cols: u32,
-        elem_bytes: u32,
-    ) -> String {
+    pub fn tma_store_async(spec: &crate::tk_tape::StoreSpec) -> String {
         format!(
-            "kittens::group<1>::tma::store_async(a{dst_arg_idx}, page_buf[{src_page}], \
-             {byte_off}, {rows}u, {cols}u, {elem_bytes}u);"
+            "kittens::group<1>::tma::store_async(a{}, page_buf[{}], {}, {}u, {}u, {}u);",
+            spec.dst_tensor.0, spec.src_page.0, spec.byte_off.as_str(),
+            spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes,
         )
     }
 
@@ -270,27 +259,10 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let _ = writeln!(out, "{}", tk20::arrive_if_runtime_even(barrier_name(*kind), page_id.0, parity_var.0 as u32));
         }
         Instr::LoadAsync(spec) => {
-            let s = tk20::tma_load_async(
-                spec.dst_page.0,
-                spec.src_tensor.0,
-                spec.byte_off.as_str(),
-                spec.tile.rows,
-                spec.tile.cols,
-                spec.tile.elem_bytes,
-                spec.barrier_page.0,
-            );
-            let _ = writeln!(out, "{s}");
+            let _ = writeln!(out, "{}", tk20::tma_load_async(spec));
         }
         Instr::StoreAsync(spec) => {
-            let s = tk20::tma_store_async(
-                spec.src_page.0,
-                spec.dst_tensor.0,
-                spec.byte_off.as_str(),
-                spec.tile.rows,
-                spec.tile.cols,
-                spec.tile.elem_bytes,
-            );
-            let _ = writeln!(out, "{s}");
+            let _ = writeln!(out, "{}", tk20::tma_store_async(spec));
         }
         Instr::StoreAsyncTyped { dst_page, dst_tensor, tile_type, role: _ } => {
             let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());

@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Linear, target-agnostic **SubtileTape** — every SubtileIR DAG edge
-//! becomes an explicit `Compute` / `Signal` / `Wait` / `Fence` / `Route`
-//! / `OpenLoop` / `CloseLoop` instruction.
+//! becomes an explicit `Compute` / `Signal` / `Wait` / `OpenLoop` /
+//! `CloseLoop` instruction.
+//!
+//! **No smem, no gmem, no fence, no page, no parity.** Memory-tier
+//! decisions and visibility primitives are TkTape concerns (target-
+//! specific); see `SUBTILE_IR_REDESIGN.md` §4 commit 6.5 for the
+//! optimizer pass pipeline that picks them. SubtileTape carries DAG
+//! facts only.
 //!
 //! Sealed handles + a typestate [`TapeBuilder<S>`] make orphan handles,
 //! mismatched-id Wait/Signal pairs, and unmatched loop brackets
 //! **structurally impossible** at compile time. The runtime
-//! [`validate_subtile_tape`] catches the rest (deadlock cycles, data
-//! races, missing fences, orphan signal/wait).
+//! [`validate_subtile_tape`] catches the rest (orphan signal/wait,
+//! deadlock cycles, cross-worker data races).
 //!
 //! This commit ships the IR + typestate + validator skeleton (plan §4
-//! commit 3, additive — no consumers). The SubtileIR → SubtileTape
-//! lowering walker (`lower_dag_to_tape`) lands in plan §4 commit 5;
-//! the production validator + dataflow-aware play follow in commit 5b.
+//! commit 3 + 3.b scrub, additive — no consumers). The SubtileIR →
+//! SubtileTape lowering walker (`lower_dag_to_tape`) lands in plan §4
+//! commit 5; the production validator follows in commit 5b.
 //!
-//! **Source of truth** for the constraint set + policy defaults
-//! (keep-in-smem first, chain-local placement, coarse-loops-only):
+//! **Source of truth** for the constraint set + policy defaults:
 //! [`vllm-rs/SUBTILE_TAPE_CONSTRAINTS.md`]. New constraints go there
 //! before they go in code.
 
@@ -109,26 +114,6 @@ impl RuntimeBoundId {
     }
 }
 
-// ── Memory routing classification ───────────────────────────────────
-
-/// What memory class a producer's output lives in. Set by
-/// [`Instr::Route`] per producer node; the validator + the TK lowering
-/// both consult it.
-///
-/// **Default policy (per `SUBTILE_TAPE_CONSTRAINTS.md` §6):** every
-/// producer output is `Shmem` unless the routing analysis returned
-/// `External` for it. Gmem is the *fallback*, not the default — every
-/// gmem path on a producer that could have been shmem-carried is a
-/// bandwidth round-trip the megakernel pays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MemoryClass {
-    /// Stays in shared memory; a single consumer carries the producer's
-    /// smem page forward via mbar handshake.
-    Shmem,
-    /// Drained to global memory; consumers TMA-load it back.
-    Gmem,
-}
-
 // ── Loop bound ──────────────────────────────────────────────────────
 
 /// Iteration count of an [`Instr::OpenLoop`].
@@ -146,6 +131,10 @@ pub enum LoopBound {
 /// One tape instruction. Workers are interleaved in a single linear
 /// stream; the per-worker subset is recovered by filtering on `worker`.
 /// The per-worker subset is in program order.
+///
+/// SubtileTape is target-agnostic: there is no `Fence`, no `Route`,
+/// no memory class. Memory-tier decisions and visibility primitives
+/// are TkTape's job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instr {
     /// Compute the named SubtileIR node on `worker`. The node's input /
@@ -153,26 +142,15 @@ pub enum Instr {
     /// only names the node identity.
     Compute { worker: WorkerId, node: SubtileId },
     /// Set one-shot `barrier` on `worker` (producer side of a cross-
-    /// worker edge).
+    /// worker edge). The visibility primitive that backs this signal
+    /// (fence, mbar, …) is picked at TkTape lowering.
     Signal { worker: WorkerId, barrier: BarrierId },
     /// Block on one-shot `barrier` on `worker` (consumer side).
     Wait { worker: WorkerId, barrier: BarrierId },
-    /// Memory-hazard fence on `worker`. Required between a producer's
-    /// `Signal` and any cross-worker consumer's `Wait` when the edge
-    /// crossed gmem (the producer's [`Instr::Route`] class is
-    /// [`MemoryClass::Gmem`]). The TK lowering picks the actual
-    /// primitive (threadfence_device, etc.).
-    Fence { worker: WorkerId },
-    /// Routes the output of `node` through `class`. **Per producer
-    /// output** (one Route per Compute, not per consumer): the
-    /// producer's physical output buffer is one piece of memory all
-    /// consumers see.
-    Route { node: SubtileId, class: MemoryClass },
     /// Open a runtime-bounded loop on `worker` over `bound` iterations
-    /// (the AttnDecode KV-sweep). Body holds Computes + Fences + Routes;
-    /// no nested loops, no Signal/Wait inside (would reorder vs the
-    /// iteration count). The matching [`Instr::CloseLoop`] takes the
-    /// same `var`.
+    /// (the AttnDecode KV-sweep). Body holds Computes only; no nested
+    /// loops, no Signal/Wait inside (would reorder vs the iteration
+    /// count). The matching [`Instr::CloseLoop`] takes the same `var`.
     OpenLoop {
         worker: WorkerId,
         var: LoopVarId,
@@ -182,18 +160,15 @@ pub enum Instr {
 }
 
 impl Instr {
-    /// The worker this instruction runs on, if any. `Route` is per-
-    /// producer-output, so it doesn't have its own worker tag (it
-    /// follows from the matching `Compute`).
-    pub fn worker(&self) -> Option<WorkerId> {
+    /// The worker this instruction runs on. Every SubtileTape Instr
+    /// is worker-tagged; the per-worker subset is recovered by filter.
+    pub fn worker(&self) -> WorkerId {
         match self {
             Instr::Compute { worker, .. }
             | Instr::Signal { worker, .. }
             | Instr::Wait { worker, .. }
-            | Instr::Fence { worker }
             | Instr::OpenLoop { worker, .. }
-            | Instr::CloseLoop { worker, .. } => Some(*worker),
-            Instr::Route { .. } => None,
+            | Instr::CloseLoop { worker, .. } => *worker,
         }
     }
 }
@@ -220,9 +195,9 @@ pub mod state {
     /// `alloc_barrier`) and `finish` are only available here.
     #[derive(Debug)]
     pub enum Outside {}
-    /// An `OpenLoop` is in flight. Body operations (`compute`, `fence`,
-    /// `route`) and `close_loop` are available here; cross-worker sync
-    /// is forbidden (would reorder vs the iteration count).
+    /// An `OpenLoop` is in flight. Body operation (`compute`) and
+    /// `close_loop` are available here; cross-worker sync is forbidden
+    /// (would reorder vs the iteration count).
     #[derive(Debug)]
     pub enum InsideLoop {}
 }
@@ -335,16 +310,6 @@ impl TapeBuilder<state::Outside> {
         self
     }
 
-    pub fn fence(&mut self, worker: WorkerId) -> &mut Self {
-        self.instrs.push(Instr::Fence { worker });
-        self
-    }
-
-    pub fn route(&mut self, node: SubtileId, class: MemoryClass) -> &mut Self {
-        self.instrs.push(Instr::Route { node, class });
-        self
-    }
-
     /// Open a runtime-bounded loop. Returns a builder in `InsideLoop`
     /// state plus a fresh [`LoopVarId`] for the matching `close_loop`.
     pub fn open_loop(
@@ -393,16 +358,6 @@ impl TapeBuilder<state::InsideLoop> {
         self
     }
 
-    pub fn fence(&mut self, worker: WorkerId) -> &mut Self {
-        self.instrs.push(Instr::Fence { worker });
-        self
-    }
-
-    pub fn route(&mut self, node: SubtileId, class: MemoryClass) -> &mut Self {
-        self.instrs.push(Instr::Route { node, class });
-        self
-    }
-
     /// Close the active loop. Returns a builder back in the `Outside`
     /// state — `signal`/`wait`/`finish` are available again.
     pub fn close_loop(mut self) -> TapeBuilder<state::Outside> {
@@ -440,16 +395,10 @@ pub enum ValidationError {
     /// Cross-worker dependency cycle (every worker waiting on someone
     /// else's signal that never fires).
     DeadlockCycle { workers: Vec<u32> },
-    /// Cross-worker (Signal, Wait) pair whose producer wrote through
-    /// gmem (Route.class == Gmem) lacks a `Fence` between producer
-    /// `Compute` and `Signal`.
-    MissingFence {
-        producer_worker: u32,
-        consumer_worker: u32,
-        barrier: u32,
-    },
     /// A tensor with cross-worker write→read where the reader worker
-    /// has no `Wait`/`Fence` covering the writer's update.
+    /// has no `Wait` covering the writer's update. (Visibility primitive
+    /// — fence vs mbar — is picked at TkTape; this layer's data-race
+    /// check is sync-edge-based, target-agnostic.)
     DataRace {
         tensor: TensorId,
         writer_worker: u32,
@@ -457,33 +406,27 @@ pub enum ValidationError {
     },
     /// `Compute` references a node id not present in the SubtileIR.
     UnknownNode { node: SubtileId },
-    /// `Route` has no matching `Compute` for the same `node` on any
-    /// worker.
-    OrphanRoute { node: SubtileId },
-    /// A node was `Compute`d but never `Route`d (every producer output
-    /// must declare its memory class).
-    UnroutedCompute { node: SubtileId },
 }
 
-/// Runtime validator. Discharges the four invariant classes the
-/// typestate cannot see (per `SUBTILE_TAPE_CONSTRAINTS.md` §4):
-/// orphan signal/wait, deadlock cycle, missing fence, data race —
-/// plus a couple of basic well-formedness checks (unknown nodes,
-/// orphan routes).
+/// Runtime validator. Discharges the invariant classes the typestate
+/// cannot see (per `SUBTILE_TAPE_CONSTRAINTS.md` §4): orphan
+/// signal/wait, deadlock cycle, cross-worker data race — plus
+/// well-formedness (unknown node refs).
 ///
-/// **Skeleton-grade for commit 3.** Each individual check is the
-/// minimal sound check; the production-grade implementations land
-/// with the lowering walker in plan §4 commit 5b.
+/// **Skeleton-grade for commit 3.b.** Each individual check is the
+/// minimal sound check; the production-grade per-tensor data-race
+/// timeline lands with the lowering walker in plan §4 commit 5b.
+///
+/// **Not** a fence-correctness check. SubtileTape doesn't name fences;
+/// fence-before-arrive is a TkTape invariant (`validate_tk_tape`).
 pub fn validate_subtile_tape(
     tape: &SubtileTape,
     graph: &SubtileIR,
 ) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_node_refs(tape, graph, &mut errors);
-    check_routes(tape, &mut errors);
     check_signal_wait_pairs(tape, &mut errors);
     check_deadlock_cycle(tape, &mut errors);
-    check_missing_fence(tape, &mut errors);
     check_data_race(tape, graph, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -495,38 +438,10 @@ pub fn validate_subtile_tape(
 fn check_node_refs(tape: &SubtileTape, graph: &SubtileIR, errors: &mut Vec<ValidationError>) {
     let n_nodes = graph.nodes.len() as u32;
     for instr in &tape.instrs {
-        let node = match instr {
-            Instr::Compute { node, .. } | Instr::Route { node, .. } => *node,
-            _ => continue,
-        };
-        if node.0 >= n_nodes {
-            errors.push(ValidationError::UnknownNode { node });
-        }
-    }
-}
-
-fn check_routes(tape: &SubtileTape, errors: &mut Vec<ValidationError>) {
-    let mut computed: BTreeMap<SubtileId, ()> = BTreeMap::new();
-    let mut routed: BTreeMap<SubtileId, ()> = BTreeMap::new();
-    for instr in &tape.instrs {
-        match instr {
-            Instr::Compute { node, .. } => {
-                computed.insert(*node, ());
-            }
-            Instr::Route { node, .. } => {
-                routed.insert(*node, ());
-            }
-            _ => {}
-        }
-    }
-    for node in routed.keys() {
-        if !computed.contains_key(node) {
-            errors.push(ValidationError::OrphanRoute { node: *node });
-        }
-    }
-    for node in computed.keys() {
-        if !routed.contains_key(node) {
-            errors.push(ValidationError::UnroutedCompute { node: *node });
+        if let Instr::Compute { node, .. } = instr
+            && node.0 >= n_nodes
+        {
+            errors.push(ValidationError::UnknownNode { node: *node });
         }
     }
 }
@@ -634,69 +549,6 @@ fn dfs_cycle(
     None
 }
 
-fn check_missing_fence(tape: &SubtileTape, errors: &mut Vec<ValidationError>) {
-    // For each cross-worker barrier, scan EVERY prior Compute on the
-    // producer worker (not just the most recent). If ANY of them was
-    // Routed Gmem, there must be a Fence on the producer worker
-    // somewhere between that Compute and the Signal — otherwise the
-    // gmem write may not be visible to the consumer.
-    let mut route_class: BTreeMap<SubtileId, MemoryClass> = BTreeMap::new();
-    for instr in &tape.instrs {
-        if let Instr::Route { node, class } = instr {
-            route_class.insert(*node, *class);
-        }
-    }
-    let mut signal_at: BTreeMap<u32, (usize, u32)> = BTreeMap::new(); // barrier → (idx, worker)
-    let mut wait_worker: BTreeMap<u32, u32> = BTreeMap::new(); // barrier → consumer worker
-    for (i, instr) in tape.instrs.iter().enumerate() {
-        match instr {
-            Instr::Signal { worker, barrier } => {
-                signal_at.insert(barrier.id, (i, worker.id));
-            }
-            Instr::Wait { worker, barrier } => {
-                wait_worker.insert(barrier.id, worker.id);
-            }
-            _ => {}
-        }
-    }
-    for (b, (sig_idx, prod_w)) in &signal_at {
-        let cons_w = match wait_worker.get(b) {
-            Some(w) if *w != *prod_w => *w,
-            _ => continue,
-        };
-        // Walk all instructions before the Signal on the producer worker
-        // in order; track whether the most-recent Fence covers every
-        // Gmem-routed Compute that follows it. If any Gmem Compute lands
-        // after the latest Fence (or before any Fence), the hazard is
-        // unguarded — report MissingFence.
-        let mut latest_fence_idx: Option<usize> = None;
-        let mut hazard_idx: Option<usize> = None;
-        for (j, instr) in tape.instrs[..*sig_idx].iter().enumerate() {
-            match instr {
-                Instr::Fence { worker } if worker.id == *prod_w => {
-                    latest_fence_idx = Some(j);
-                    hazard_idx = None;
-                }
-                Instr::Compute { worker, node } if worker.id == *prod_w => {
-                    if route_class.get(node).copied() == Some(MemoryClass::Gmem)
-                        && latest_fence_idx.is_none_or(|fi| fi < j)
-                    {
-                        hazard_idx = Some(j);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if hazard_idx.is_some() {
-            errors.push(ValidationError::MissingFence {
-                producer_worker: *prod_w,
-                consumer_worker: cons_w,
-                barrier: *b,
-            });
-        }
-    }
-}
-
 fn check_data_race(tape: &SubtileTape, graph: &SubtileIR, errors: &mut Vec<ValidationError>) {
     // Skeleton: for each tensor written by some worker and read by
     // another, the reader's tape must contain a Wait *before* its first
@@ -765,7 +617,6 @@ pub enum PlayStep {
     Computed(SubtileId),
     Signaled(u32),
     Waited(u32),
-    Fenced(u32),
     LoopOpened(u32),
     LoopClosed(u32),
 }
@@ -777,14 +628,12 @@ pub enum PlayStep {
 pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
     tape.instrs
         .iter()
-        .filter_map(|i| match i {
-            Instr::Compute { node, .. } => Some(PlayStep::Computed(*node)),
-            Instr::Signal { barrier, .. } => Some(PlayStep::Signaled(barrier.id)),
-            Instr::Wait { barrier, .. } => Some(PlayStep::Waited(barrier.id)),
-            Instr::Fence { worker } => Some(PlayStep::Fenced(worker.id)),
-            Instr::OpenLoop { var, .. } => Some(PlayStep::LoopOpened(var.id)),
-            Instr::CloseLoop { var, .. } => Some(PlayStep::LoopClosed(var.id)),
-            Instr::Route { .. } => None,
+        .map(|i| match i {
+            Instr::Compute { node, .. } => PlayStep::Computed(*node),
+            Instr::Signal { barrier, .. } => PlayStep::Signaled(barrier.id),
+            Instr::Wait { barrier, .. } => PlayStep::Waited(barrier.id),
+            Instr::OpenLoop { var, .. } => PlayStep::LoopOpened(var.id),
+            Instr::CloseLoop { var, .. } => PlayStep::LoopClosed(var.id),
         })
         .collect()
 }
@@ -834,10 +683,10 @@ mod tests {
     fn build_finish_round_trips() {
         let mut b = TapeBuilder::new(2);
         let w0 = b.worker(0);
-        b.compute(w0, SubtileId(0)).route(SubtileId(0), MemoryClass::Shmem);
+        b.compute(w0, SubtileId(0));
         let tape = b.finish();
         assert_eq!(tape.num_workers, 2);
-        assert_eq!(tape.instrs.len(), 2);
+        assert_eq!(tape.instrs.len(), 1);
     }
 
     #[test]
@@ -845,41 +694,9 @@ mod tests {
         let g = tiny_graph();
         let mut b = TapeBuilder::new(1);
         let w0 = b.worker(0);
-        b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Shmem);
-        let tape = b.finish();
-        assert_eq!(validate_subtile_tape(&tape, &g), Ok(()));
-    }
-
-    #[test]
-    fn validator_flags_unrouted_compute() {
-        let g = tiny_graph();
-        let mut b = TapeBuilder::new(1);
-        let w0 = b.worker(0);
         b.compute(w0, SubtileId(0));
         let tape = b.finish();
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.contains(&ValidationError::UnroutedCompute {
-                node: SubtileId(0),
-            }),
-            "want UnroutedCompute, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_orphan_route() {
-        let g = tiny_graph();
-        let mut b = TapeBuilder::new(1);
-        b.route(SubtileId(0), MemoryClass::Shmem);
-        let tape = b.finish();
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.contains(&ValidationError::OrphanRoute {
-                node: SubtileId(0),
-            }),
-            "want OrphanRoute, got {err:?}"
-        );
+        assert_eq!(validate_subtile_tape(&tape, &g), Ok(()));
     }
 
     #[test]
@@ -887,8 +704,7 @@ mod tests {
         let g = tiny_graph();
         let mut b = TapeBuilder::new(1);
         let w0 = b.worker(0);
-        b.compute(w0, SubtileId(99))
-            .route(SubtileId(99), MemoryClass::Shmem);
+        b.compute(w0, SubtileId(99));
         let tape = b.finish();
         let err = validate_subtile_tape(&tape, &g).unwrap_err();
         assert!(
@@ -906,7 +722,6 @@ mod tests {
         let solo_signal = b.alloc_barrier();
         let solo_wait = b.alloc_barrier();
         b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Shmem)
             .signal(w0, solo_signal) // never waited
             .wait(w1, solo_wait); // never signaled
         let tape = b.finish();
@@ -935,7 +750,6 @@ mod tests {
         let w1 = b.worker(1);
         let bar = b.alloc_barrier();
         b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Shmem)
             .signal(w0, bar)
             .signal(w0, bar) // one-shot violation
             .wait(w1, bar);
@@ -960,7 +774,6 @@ mod tests {
         let b0 = b.alloc_barrier(); // signaled by w1, waited by w0
         let b1 = b.alloc_barrier(); // signaled by w0, waited by w1
         b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Shmem)
             .signal(w0, b1)
             .wait(w0, b0)
             .signal(w1, b0)
@@ -974,130 +787,11 @@ mod tests {
     }
 
     #[test]
-    fn validator_flags_missing_gmem_fence() {
-        // w0 Computes node 0, Routes Gmem, Signals; w1 Waits — but no
-        // Fence on w0 between Compute and Signal.
-        let g = tiny_graph();
-        let mut b = TapeBuilder::new(2);
-        let w0 = b.worker(0);
-        let w1 = b.worker(1);
-        let bar = b.alloc_barrier();
-        b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Gmem)
-            .signal(w0, bar)
-            .wait(w1, bar);
-        let tape = b.finish();
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(
-                e,
-                ValidationError::MissingFence { producer_worker: 0, consumer_worker: 1, .. }
-            )),
-            "want MissingFence(0→1), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_unfenced_gmem_when_later_compute_is_shmem() {
-        // Earlier Gmem-routed Compute followed by Shmem-routed Compute on
-        // the same worker, then Signal — the Gmem hazard must still be
-        // flagged. (Previous skeleton checked only the most-recent
-        // Compute and silently passed.) Build a tiny graph with TWO
-        // op-output nodes so this scenario is structurally possible.
-        let g = {
-            let tensors = vec![
-                TensorShape { rows: 1, cols: 4 },
-                TensorShape { rows: 1, cols: 4 },
-                TensorShape { rows: 1, cols: 4 },
-            ];
-            let nodes = vec![
-                SubtileNode {
-                    id: SubtileId(0),
-                    op: SubOp::Elementwise(EwKind::Silu),
-                    inputs: vec![TensorRegion {
-                        tensor: TensorId(0),
-                        region: Region {
-                            rows: Range::new(0, 1),
-                            cols: Range::new(0, 4),
-                        },
-                    }],
-                    output: TensorRegion {
-                        tensor: TensorId(1),
-                        region: Region {
-                            rows: Range::new(0, 1),
-                            cols: Range::new(0, 4),
-                        },
-                    },
-                },
-                SubtileNode {
-                    id: SubtileId(1),
-                    op: SubOp::Elementwise(EwKind::Silu),
-                    inputs: vec![TensorRegion {
-                        tensor: TensorId(1),
-                        region: Region {
-                            rows: Range::new(0, 1),
-                            cols: Range::new(0, 4),
-                        },
-                    }],
-                    output: TensorRegion {
-                        tensor: TensorId(2),
-                        region: Region {
-                            rows: Range::new(0, 1),
-                            cols: Range::new(0, 4),
-                        },
-                    },
-                },
-            ];
-            SubtileIR {
-                tensors,
-                num_sources: 1,
-                nodes,
-                result: TensorId(2),
-            }
-        };
-        let mut b = TapeBuilder::new(2);
-        let w0 = b.worker(0);
-        let w1 = b.worker(1);
-        let bar = b.alloc_barrier();
-        b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Gmem) // hazard, no fence
-            .compute(w0, SubtileId(1))
-            .route(SubtileId(1), MemoryClass::Shmem)
-            .signal(w0, bar)
-            .wait(w1, bar);
-        let tape = b.finish();
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(
-                e,
-                ValidationError::MissingFence { producer_worker: 0, consumer_worker: 1, .. }
-            )),
-            "earlier Gmem hazard must be detected even when the latest Compute is Shmem; got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_accepts_gmem_with_fence() {
-        let g = tiny_graph();
-        let mut b = TapeBuilder::new(2);
-        let w0 = b.worker(0);
-        let w1 = b.worker(1);
-        let bar = b.alloc_barrier();
-        b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Gmem)
-            .fence(w0)
-            .signal(w0, bar)
-            .wait(w1, bar);
-        let tape = b.finish();
-        assert_eq!(validate_subtile_tape(&tape, &g), Ok(()));
-    }
-
-    #[test]
     fn loop_open_close_round_trips() {
         let mut b = TapeBuilder::new(1);
         let w0 = b.worker(0);
         let (mut inside, _var) = b.open_loop(w0, LoopBound::Const(8));
-        inside.compute(w0, SubtileId(0)).fence(w0);
+        inside.compute(w0, SubtileId(0));
         let outer = inside.close_loop();
         let tape = outer.finish();
         assert_eq!(tape.num_loop_vars, 1);
@@ -1119,18 +813,21 @@ mod tests {
     }
 
     #[test]
-    fn play_skeleton_filters_routes() {
-        let mut b = TapeBuilder::new(1);
+    fn play_skeleton_round_trips_every_instr() {
+        let mut b = TapeBuilder::new(2);
         let w0 = b.worker(0);
-        b.compute(w0, SubtileId(0))
-            .route(SubtileId(0), MemoryClass::Shmem)
-            .fence(w0);
+        let w1 = b.worker(1);
+        let bar = b.alloc_barrier();
+        b.compute(w0, SubtileId(0)).signal(w0, bar).wait(w1, bar);
         let tape = b.finish();
         let steps = play_skeleton(&tape);
-        // Compute(0) + Fence(0); Route is internal-only.
         assert_eq!(
             steps,
-            vec![PlayStep::Computed(SubtileId(0)), PlayStep::Fenced(0),]
+            vec![
+                PlayStep::Computed(SubtileId(0)),
+                PlayStep::Signaled(bar.index()),
+                PlayStep::Waited(bar.index()),
+            ]
         );
     }
 }

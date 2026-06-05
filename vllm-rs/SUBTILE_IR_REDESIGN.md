@@ -21,9 +21,22 @@ TkTape  /  MetalTape  /  …
 GPU
 ```
 
-Two lowerings (`lower_dag_to_tape`, `lower_tape_to_tk`); two validators
-(one per tape); one trivial player per target. **Compile-time safety
+Two **syntax-directed** lowerings (`lower_dag_to_tape`,
+`lower_tape_to_tk`); a pipeline of **`TkTape → TkTape` optimizer
+passes** (shmem promotion, fence narrowing, page coalescing, …); two
+validators (one per tape; the TkTape validator runs after lowering and
+after every pass); one trivial player per target. **Compile-time safety
 at every layer** — all wirings are proof-carrying typed witnesses.
+
+**The load-bearing invariant: TkTape is always executable.** The output
+of `lower_tape_to_tk` is a complete, validator-green tape that runs
+correctly (conservative all-gmem routing). Every optimizer pass is a
+strict performance rewrite — disabling any pass yields a kernel that
+is correct, only slower. Whether an edge can live in shmem is a
+target-specific question (smem capacity, mbar slot count,
+NUM_CONSUMER_WARPS, page-lifetime windows), so the analysis lives at
+TkTape — not at the target-agnostic SubtileTape, and not at lowering
+time. We are a compiler.
 
 ## 1. Naming
 
@@ -58,7 +71,7 @@ Witness placement (per layer):
 | `RopeForm` | const generic on `SubOp::Rope*` | const generic on tape's rope op | const generic on `ComputeBody::RopeRotate`'s template |
 | `SoftmaxState<Phase>` | id on `SubOp::AttnDecode` | typestate threaded through `lower_tape_to_tk`'s emit of init/qkt/sv/finalise | template field-substitution |
 | `BarrierId` | n/a (DAG has no barriers) | sealed; `Wait(B)` and `Signal(B)` share the same id by construction | sealed; PageBarrier kind layered on top |
-| `Phase` (parity) | n/a | const-generic typestate carried by `PageHandle<P>` | propagates; `complete_round_with_parity_correction` returns `PageHandleAfterRuntimeLoop` |
+| `Phase` (parity) | n/a | n/a (SubtileTape is target-agnostic; phase is a TK concept) | const-generic split `Instr` variants (e.g. `CarryForwardWaitP0` carries `PhaseW<0>`, `CarryForwardWaitP1` carries `PhaseW<1>`); the runtime→const dispatch happens once at the optimizer pass's `match` site, never as a `u8` field on a single Instr |
 
 ## 3. The validator stretch
 
@@ -83,30 +96,63 @@ barrier-id matching, cross-worker deadlock cycles).
 
 Two validators, mirroring the two tapes:
 
-- **`validate_subtile_tape(&SubtileTape)`** — target-agnostic checks:
-  - **Deadlock cycle**: build worker × barrier digraph; cycle =
-    every worker waiting on someone else's signal that never fires.
-  - **Data race**: per-buffer `(reader_workers, writer_workers,
-    fence_position)`. Reader without fence after another worker's
-    latest write = race.
-  - **Missing fence**: gmem-crossing edge with no `Fence` between
-    producer's `Signal` and consumer's `Wait` = error.
-  - **Orphan signal/wait**: every `BarrierId` allocated must have ≥1
-    `Signal` and ≥1 `Wait`.
-- **`validate_tk_tape(&TkTape)`** — TK-specific checks:
-  - Every `LoadAsync` has a matching `PageBarrierWait { Ready }`
-    downstream.
-  - Every page slot's `Consumed → Ready → Done → Consumed` cycle
-    closes (no orphan transitions).
-  - Phase parity matches across loop iterations
-    (start_parity carried correctly; phantom-round arrives present).
+- **`validate_subtile_tape(&SubtileTape, &SubtileIR)`** —
+  target-agnostic, sync-graph + DAG-shape only. No fence checks (fence
+  is a target primitive; SubtileTape doesn't name it). No memory-class
+  checks (shmem/gmem don't exist at this layer).
+  - **Orphan signal/wait**: every `BarrierId` has ≥1 `Signal` and ≥1
+    `Wait`; one-shot signals fire at most once.
+  - **Deadlock cycle**: build worker × barrier digraph; cycle = every
+    worker waiting on someone else's signal that never fires.
+  - **Cross-worker data race**: per-tensor read on worker `Wc` of a
+    region written by worker `Wp ≠ Wc` must be preceded by a
+    `Wait`/`Signal` pair edge `Wp → Wc`. (No fence required at this
+    layer; the visibility primitive is whatever the TkTape lowering
+    picks.)
+  - **Compute well-formedness**: every `Compute` names an in-range
+    `SubtileId`; per-worker subset is a topological order of that
+    worker's assigned nodes.
+  - **Loop balance**: every `OpenLoop` has a matching `CloseLoop`
+    on the same worker with the same `LoopVarId`; no cross-worker
+    sync inside a loop.
+- **`validate_tk_tape(&TkTape)`** — TK-specific. Runs **after lowering
+  and again after every optimizer pass**. Each pass declares the
+  postcondition it must preserve; the validator is the conjunction.
+  - **Fence-before-arrive** (the missing-fence check, but at the layer
+    where fence is a real concept): for every Gmem-routed cross-worker
+    edge, between the producer's last `StoreAsync` to the edge's
+    buffer and the matching `PageBarrierArrive`, there is a
+    `FenceDevice` (or stricter scope as required by the consumer's
+    reach).
+  - **LoadAsync ↔ PageBarrierWait{Ready}** matched downstream.
+  - **Page-cycle closure**: every page slot's
+    `Consumed → Ready → Done → Consumed` cycle closes — no orphan
+    transitions.
+  - **Phase parity**: `start_parity` propagated correctly across loop
+    iterations; phantom-round arrives present where required.
+  - **Edge closure**: every shmem-promoted edge has exactly one
+    matching arrive/wait on the same page at the same const-generic
+    `Phase`.
+  - **Pass postconditions**: each optimizer pass adds its own
+    invariant to the assertion set (e.g. shmem-promotion guarantees
+    `consumer_count == 1` and "no other edge aliases this `(buf,
+    offset)` on the producer worker"; fence-elimination guarantees
+    every dropped fence had no unprotected `StoreAsync` reaching its
+    arrive).
 
-Both validators run as `assert!` at the exit of their building fn —
+Both validators run as `assert!` at the exit of their producing fn —
 invalid tape never escapes; consumer fns can assume validity.
 
-**Kill criterion**: if either validator finds an invariant the
-typestate-builder *should* have caught at compile time, push the
-invariant up into the type system; don't keep it as runtime check.
+**Kill criterion (push invariants up to types):** if either validator
+finds an invariant the typestate-builder *should* have caught at
+compile time, push the invariant up into the type system; don't keep
+it as runtime check.
+
+**Kill criterion (no lowering-time analysis):** if an optimizer pass
+needs a fact `lower_tape_to_tk` doesn't trivially expose, the fact
+moves onto the IR (typed field on the relevant Instr or edge record)
+or into a prior pass's postcondition — never into the lowering. The
+lowering stays O(n) syntax-directed.
 
 ## 4. Staged plan (12 commits, each buildable, each green)
 
@@ -139,23 +185,69 @@ fallbacks added, no `_ =>` match arms added.
    between producer and consumer; mixed `NeoX`/`Interleaved` in one
    forward; non-exhaustive `KvCacheProducer` match.
 
+3.b **Scrub target-leaky concepts from SubtileTape.** Delete
+   `Instr::Fence`, `Instr::Route`, `MemoryClass`, and any `Route`-class
+   field on `Signal`/`Wait`. SubtileTape carries DAG facts only
+   (Compute, Signal, Wait, OpenLoop, CloseLoop). Tests for those
+   variants delete or move down to TkTape goldens. Companion edits in
+   `SUBTILE_TAPE_CONSTRAINTS.md`: strike rows 3 (memory routing) + 4
+   (memory hazard / fence) from the constraint inventory; strike the
+   "keep activations in shared memory" policy default (it's a TkTape
+   pass policy, not a SubtileTape rule). The `subtile_tape.rs` module
+   header documents: "no smem, no gmem, no fence, no page, no parity".
+
 5. **Implement `lower_dag_to_tape(&SubtileIR) -> SubtileTape`.**
    Single deterministic fn: validate → assign workers → topo → emit.
-   Cross-worker `Operand::Sub` → `Signal`/`Wait`; gmem-crossing →
-   `Fence`; runtime-bounded loop only for `AttnDecode`'s KV sweep.
-   Returns a `TapeBuilder<EndState>` that gates the call to `validate`.
-   Unit tests: chain, fork, join, attn, runtime loop.
+   Cross-worker `Operand::Sub` → `Signal`/`Wait`; runtime-bounded loop
+   only for `AttnDecode`'s KV sweep. **No `Fence`, no `Route`** —
+   target-agnostic, target-agnostic, target-agnostic. Returns a
+   `TapeBuilder<EndState>` that gates the call to `validate`. Unit
+   tests: chain, fork, join, attn, runtime loop.
 
-5b. **`validate_subtile_tape`** — full impl + tests for the four
-    error classes above. Runs at `lower_dag_to_tape`'s exit.
+5b. **`validate_subtile_tape`** — full impl + tests. Orphan
+    signal/wait, deadlock cycle, cross-worker data race (sync-edge
+    based, fence-free), compute well-formedness, loop balance. Runs
+    at `lower_dag_to_tape`'s exit.
 
-6. **Implement `lower_tape_to_tk(&SubtileTape) -> TkTape`.** Fixed
-   table-driven translation. `SoftmaxState<Phase>` typestate enforced
-   (Sv-before-Qkt = no impl). `KvCacheProducer` consumed via
-   exhaustive match. `RopeForm` const-generic threaded through.
+6. **Implement `lower_tape_to_tk(&SubtileTape) -> TkTape`.** Trivial
+   syntax-directed translation. **Always-executable invariant: the
+   output is a complete, validator-green tape that runs correctly.**
+   Conservative all-gmem routing for every cross-worker edge: TMA
+   store + `FenceDevice` + `LoadAsync` + `PageBarrierWait{Ready}`.
+   Page/buffer allocation lives here (full-tape liveness available).
+   `SoftmaxState<Phase>` typestate enforced (Sv-before-Qkt = no impl).
+   `KvCacheProducer` consumed via exhaustive match. `RopeForm`
+   const-generic threaded through. **No analysis, no lookahead, no
+   shmem decisions** — those are the optimizer's job.
 
-6b. **`validate_tk_tape`** — full impl + tests. Page-cycle closure,
-    phase parity, `LoadAsync`↔`PageBarrierWait{Ready}` matching.
+6b. **`validate_tk_tape`** — full impl + tests. Fence-before-arrive
+    on every Gmem-routed cross-worker edge, `LoadAsync` ↔
+    `PageBarrierWait{Ready}` matching, page-cycle closure, phase
+    parity, edge closure. Runs after lowering AND after every
+    optimizer pass.
+
+6.5. **`TkTape → TkTape` optimizer passes.** Ordered pipeline; each
+    pass is a strict performance rewrite that preserves all post-pass
+    invariants. Lands as one or more commits; the floor is shmem
+    promotion (the headline optimization the redesign exists for).
+    Each pass declares: input precondition, output postcondition,
+    target-knowledge consumed (smem capacity, mbar slot count,
+    NUM_CONSUMER_WARPS, page-lifetime windows, parity allocator
+    state), and idempotency. Headline passes:
+    - **`promote_shmem_carry_forward`** — rewrite a single-consumer
+      Gmem edge to a cross-IType mbar handshake on a shared smem
+      page (skip TMA store + skip TMA load). Phase parity flows
+      through const-generic `CarryForwardWaitP{0,1}` Instr variants;
+      runtime→const dispatch happens once at the pass's `match` site.
+    - **`narrow_fence_scope`** — `FenceDevice` → `FenceBlock` when no
+      cross-CTA reader exists (single-CTA persistent kernels: always).
+    - **`eliminate_dead_fences`** — drop a fence whose every reachable
+      Gmem `StoreAsync` already has another fence between it and the
+      next arrive.
+    - **`coalesce_pages`**, **`barrier_init_hoist`**, parity-aware
+      reorderings — added as the working perf knobs require them.
+    Disabling any single pass yields a kernel that is correct, only
+    slower (per kill criterion K6).
 
 7. **Wire `to_wavefront.rs` to build `SubtileIR` directly.** Delete
    `lower.rs::LoweringInput` + `LoweredOp` (~1100 lines). The
@@ -189,19 +281,36 @@ fallbacks added, no `_ =>` match arms added.
 
 Revert the entire stack to commit `5206d10d49` if **any** of:
 
-- Step 6's `lower_tape_to_tk` for `AttnDecode` cannot be expressed as
-  a fixed instruction sequence and needs a backend-aware analysis
-  pass (e.g. peeking `WarpRole` to choose barriers). SubtileTape is
-  missing a primitive — re-design, not patch.
-- Step 8's `play` requires any arm > 5 lines OR any conditional
-  beyond `match` on instr kind. Tape was wrong.
-- Step 9's Paris-decode bug does not surface as a *compile error*
-  in the new typed-witness pipeline. Witnesses placed wrong.
-- Step 10's surface area has not net-shrunk by ≥1500 LOC vs
-  `5206d10d49`. This was a rename party, not a redesign.
-- Either validator (5b, 6b) finds a class of error the typestate
-  builder *should* have caught at compile time. Push the invariant
-  up; don't ship it as runtime check.
+- **K1 (trivial player).** Step 8's `play` requires any arm > 5 lines
+  OR any conditional beyond `match` on instr kind, OR any arm
+  containing more than one TK 2.0 call. The optimization that motivated
+  the cleverness should have been a TkTape pass.
+- **K2 (target-agnostic SubtileTape).** `subtile_tape.rs` source
+  contains any of `smem`, `gmem`, `Route`, `Fence`, `Page`, `Phase`,
+  `parity`. Mechanically grep-checkable. SubtileTape leaks GPU memory
+  hierarchy → re-design, not patch.
+- **K3 (always-executable TkTape).** `lower_tape_to_tk`'s output is
+  not a runnable, validator-green tape. Optimizer passes are *strict
+  performance* rewrites; if a pass is required for correctness, the
+  conservative lowering was wrong.
+- **K4 (no lowering-time analysis).** `lower_tape_to_tk` does any
+  cross-Instr analysis (page-liveness window, consumer-count walk,
+  parity allocator state). Lowering is O(n) syntax-directed; analysis
+  belongs in passes.
+- **K5 (compile-time witnesses).** Either validator (5b, 6b) finds a
+  class of error the typestate builder *should* have caught at
+  compile time. Per `feedback_compile_time_or_garbage`: push the
+  invariant up to a typed witness / sealed proof / const-generic
+  with `where`-clause; don't ship as runtime check.
+- **K6 (every pass is strict optimization).** Disabling any single
+  optimizer pass post-lowering does not yield a kernel that is
+  correct (only slower). The pass is doing correctness work that
+  belongs at lowering or in a typed witness.
+- **K7 (Paris compile error).** Step 9's Paris-decode bug does not
+  surface as a *compile error* in the new typed-witness pipeline.
+  Witnesses placed wrong.
+- **K8 (net-surface).** Step 10's surface area has not net-shrunk by
+  ≥1500 LOC vs `5206d10d49`. This was a rename party, not a redesign.
 
 ## 6. What this plan does NOT cover
 
@@ -221,11 +330,13 @@ Revert the entire stack to commit `5206d10d49` if **any** of:
 |---|---|---|
 | `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` ~1400 LOC |
 | `subtile_ir.rs` (Metal-flavored) | 1471 LOC | renamed `metal_tape.rs`, dead arms deleted (~900 LOC) |
-| `subtile_tape.rs` | 0 LOC | new ~600 LOC |
+| `subtile_tape.rs` | 0 LOC | new ~500 LOC (smaller after 3.b scrub: no Route/Fence/MemoryClass) |
 | `lower.rs` (`LoweringInput`/`LoweredOp`) | 1105 LOC | DELETED |
 | `tape.rs` | 391 LOC | DELETED |
-| `tk_tape.rs` | 727 LOC | unchanged |
-| `tk_player.rs` | 248 LOC | grows to ~600 LOC (full emit) |
+| `tk_tape.rs` | 727 LOC | grows ~+200 LOC (split fence Instrs, edge records, post-promote variants) |
+| `tk_player.rs` | 248 LOC | grows to ~600 LOC (full emit, ≤5 lines/arm) |
 | `tk_lower.rs` | 114 LOC | DELETED (witnesses fold into SubtileIR) |
+| `lower_tape_to_tk` (commit 6, conservative) | 0 LOC | new ~400 LOC |
+| Optimizer passes (commit 6.5.*) | 0 LOC | new ~700 LOC across the headline passes |
 | Validators (5b, 6b) | 0 LOC | new ~300 LOC each |
-| **Total** | **~6500 LOC** | **~4400 LOC** (net -2100) |
+| **Total** | **~6500 LOC** | **~4900 LOC** (net -1600; meets K8 ≥1500) |

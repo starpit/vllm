@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{ByteOffsetExpr, Instr, TkTape};
+use crate::tk_tape::{Instr, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 mod tk20 {
@@ -211,15 +211,6 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
     }
 }
 
-fn byte_off_str(b: ByteOffsetExpr) -> String {
-    match b {
-        ByteOffsetExpr::Const(c) => format!("{c}u"),
-        ByteOffsetExpr::LinearLoop { var, stride, base } => {
-            format!("({base}u + v{} * {stride}u)", var.0)
-        }
-    }
-}
-
 fn rope_form_str(form: crate::tk_tape::RopeFormTag) -> &'static str {
     use crate::tk_tape::RopeFormTag;
     match form {
@@ -282,7 +273,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let s = tk20::tma_load_async(
                 spec.dst_page.0,
                 spec.src_tensor.0,
-                &byte_off_str(spec.byte_off),
+                spec.byte_off.as_str(),
                 spec.tile.rows,
                 spec.tile.cols,
                 spec.tile.elem_bytes,
@@ -294,7 +285,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let s = tk20::tma_store_async(
                 spec.src_page.0,
                 spec.dst_tensor.0,
-                &byte_off_str(spec.byte_off),
+                spec.byte_off.as_str(),
                 spec.tile.rows,
                 spec.tile.cols,
                 spec.tile.elem_bytes,
@@ -311,7 +302,7 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         }
         Instr::GemmM1 { lhs_page, rhs_tensor, rhs_byte_off, out_page, m, n, k, accum, role: _ } => {
             let zero = matches!(accum, crate::tk_tape::AccumKind::Zero);
-            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, &byte_off_str(*rhs_byte_off), out_page.0, *m, *n, *k, zero);
+            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, *k, zero);
             let _ = writeln!(out, "{s}");
         }
         Instr::SiluMul { gate_page, up_page, out_page, cols, role: _ } => {

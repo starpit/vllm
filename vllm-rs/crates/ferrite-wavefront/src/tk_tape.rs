@@ -286,7 +286,7 @@ pub enum Instr {
     GemmM1 {
         lhs_page: PageId,
         rhs_tensor: TensorId,
-        rhs_byte_off: ByteOffsetExpr,
+        rhs_byte_off: ByteOffset,
         out_page: PageId,
         m: u32,
         n: u32,
@@ -428,15 +428,26 @@ pub struct SoftmaxStateId(pub u32);
 // / PageBarrierWaitLoop { var, start } per plan §3 step 8 — one Instr per
 // architectural primitive, no inner-match dispatch in the player.
 
-/// Byte-offset expression for TMA load/store source/dest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ByteOffsetExpr {
-    Const(u64),
-    LinearLoop {
-        var: LoopVarId,
-        stride: u64,
-        base: u64,
-    },
+/// Byte-offset expression for TMA load/store source/dest. Stored as
+/// a pre-computed CUDA expression string, baked at tape-build time
+/// so the player emits literally — no inner-match dispatch / no
+/// emit-time arithmetic. Sealed: only the per-target lowering can
+/// construct one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteOffset(String);
+
+impl ByteOffset {
+    /// Constant byte offset: `<c>u`.
+    pub fn from_const(c: u64) -> Self {
+        Self(format!("{c}u"))
+    }
+    /// Loop-linear byte offset: `(<base>u + v<var> * <stride>u)`.
+    pub fn linear_loop(var: LoopVarId, stride: u64, base: u64) -> Self {
+        Self(format!("({base}u + v{} * {stride}u)", var.0))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,7 +474,7 @@ impl TileType {
 pub struct LoadSpec {
     pub dst_page: PageId,
     pub src_tensor: TensorId,
-    pub byte_off: ByteOffsetExpr,
+    pub byte_off: ByteOffset,
     pub tile: TileShape,
     pub role: WarpRole,
     /// Which page barrier `expect_bytes` arms.
@@ -474,7 +485,7 @@ pub struct LoadSpec {
 pub struct StoreSpec {
     pub src_page: PageId,
     pub dst_tensor: TensorId,
-    pub byte_off: ByteOffsetExpr,
+    pub byte_off: ByteOffset,
     pub tile: TileShape,
     pub role: WarpRole,
 }
@@ -821,7 +832,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffsetExpr::Const(0),
+                    byte_off: ByteOffset::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
@@ -843,7 +854,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffsetExpr::Const(0),
+                    byte_off: ByteOffset::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),

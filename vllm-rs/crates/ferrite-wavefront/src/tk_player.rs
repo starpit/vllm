@@ -393,6 +393,12 @@ mod tk20 {
         format!("kittens::group<{group_n}>::copy(rv_{dst}, rv_{src});")
     }
 
+    /// `kittens::group<N>::mul_row(rt_dst, rt_src, rv_row_values)` —
+    /// `ops/group/register/tile/maps.cuh:764`.
+    pub fn rt_mul_row(group_n: u32, dst: u16, src: u16, row_vec: u16) -> String {
+        format!("kittens::group<{group_n}>::mul_row(rt_{dst}, rt_{src}, rv_{row_vec});")
+    }
+
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
     pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
@@ -937,6 +943,9 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         }
         Instr::RegVecCopy { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}", tk20::rv_copy(width.n(), dst.0, src.0));
+        }
+        Instr::RegTileMulRow { src, row_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_mul_row(width.n(), dst.0, src.0, row_vec.0));
         }
         Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",

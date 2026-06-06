@@ -1234,14 +1234,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             state.push(Instr::reg_vec_exp2(rv_alpha, rv_alpha, W16, R));
             // l *= alpha
             state.push(Instr::reg_vec_mul(rv_l, rv_alpha, rv_l, W16, R));
-            // o *= alpha (per-row scaling)
-            // Note: rv_alpha is length 128 (matching rt_o.rows=128),
-            // so this is a row-broadcast multiply via rt_mul_row.
-            // We don't have an Instr::RegTileMulRow yet — adding this
-            // is a follow-up. For now, the alpha rescale of o is a
-            // KNOWN GAP (correct only when seq_len ≤ chunk_size, i.e.
-            // the loop runs once).
-            // TODO: add RegTileMulRow Instr + emit alpha rescale.
+            // o *= alpha (per-row rescale)
+            //
+            // RegTileMulRow: rv_alpha (length 128 == rt_o.rows) is
+            // broadcast across cols of each row. Without this rescale,
+            // the online softmax accumulator was correct only for
+            // seq_len ≤ chunk_size; this Instr makes multi-chunk
+            // decode numerically correct.
+            state.push(Instr::reg_tile_mul_row(rt_o, rv_alpha, rt_o, W16, R));
             // S -= m  (sub_row)
             state.push(Instr::reg_tile_sub_row(rt_s, rv_m, rt_s, W16, R));
             // P = exp2(S) (in fp32)

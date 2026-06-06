@@ -689,6 +689,19 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    /// `kittens::group<N>::mul_row(rt_dst, rt_src, rv_row_values)` —
+    /// `ops/group/register/tile/maps.cuh:764`. Multiply each row of
+    /// `src` by the corresponding scalar in `row_values` (length =
+    /// src.rows). Used by AttnDecode_Qkt to apply alpha rescale to
+    /// rt_o per row across iterations of online softmax.
+    RegTileMulRow {
+        src: RegTileSlot,
+        row_vec: RegVecSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::load(rv, sv)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
@@ -2956,6 +2969,35 @@ impl Instr {
         }
     }
 
+    /// Construct [`Instr::RegTileMulRow`]. Per-row scalar multiply
+    /// of a register tile by a register vec; vec.LEN unifies with
+    /// tile.ROWS at the type level.
+    pub(crate) fn reg_tile_mul_row<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        row_vec: RegVecId<ROWS, T, RV>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileMulRow {
+            src: src.slot(),
+            row_vec: row_vec.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     /// Construct [`Instr::StoreRegTileSubTileToShmem`] — inverse of
     /// `load_shmem_subtile_to_reg`. Same const-generic guards.
     pub(crate) fn store_reg_tile_subtile_to_shmem<
@@ -3677,6 +3719,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::RegVecMul { .. }
             | Instr::RegTileCopyConvert { .. }
             | Instr::RegVecCopy { .. }
+            | Instr::RegTileMulRow { .. }
             | Instr::LoadVecSmemToReg { .. }
             | Instr::StoreRegVecToShmem { .. }
             | Instr::RegTileNeg { .. }

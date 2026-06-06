@@ -723,9 +723,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rt_denom: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_result: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            // Smem↔reg moves require ST::rows == GROUP_WARPS * RT::rows.
+            // ROWS-equal pair (typed witness on the constructor) forces
+            // GROUP_WARPS=1 — sealed via `WarpLoadWidth` impl'd only for
+            // `GroupWidth<1>`. Per `feedback_ff_subtile_compile_time_inviolable`.
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
             // 1: rt_x = load(src_page)
-            state.push(Instr::load_shmem_to_reg(src, rt_x, W, R));
+            state.push(Instr::load_shmem_to_reg(src, rt_x, WL, R));
             // 2: rt_neg = neg(rt_x)
             state.push(Instr::reg_tile_neg(rt_x, rt_neg, W, R));
             // 3: rt_exp = exp(rt_neg)
@@ -735,7 +740,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 5: rt_result = rt_x / rt_denom
             state.push(Instr::reg_tile_div(rt_x, rt_denom, rt_result, W, R));
             // 6: store(dst_page, rt_result)
-            state.push(Instr::store_reg_tile_to_shmem(rt_result, dst, W, R));
+            state.push(Instr::store_reg_tile_to_shmem(rt_result, dst, WL, R));
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RmsNorm { eps } => {
@@ -774,6 +779,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
             // Temp pages
             let x_sq_page = state.alloc_temp_page();
@@ -812,11 +818,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 W,
             ));
             // 5: rv_var = load(var)
-            state.push(Instr::load_vec_smem_to_reg(var_vec, rv_var, W, R));
+            state.push(Instr::load_vec_smem_to_reg(var_vec, rv_var, WL, R));
             // 6: rv_inv = rsqrt(rv_var)
             state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, W, R));
             // 7: inv_rms = store(rv_inv)
-            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_vec, W, R));
+            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_vec, WL, R));
             // 8: x_norm = x * inv_rms (per-row broadcast)
             //    write into dst (clobber x is OK; we reuse dst as
             //    the running tile through the gamma multiply too).
@@ -865,6 +871,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
 
             // Mint the 6 register tiles + 2 register vecs the
@@ -880,17 +887,17 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
 
             // 1: rt_q_even = q[:, 0:32]
-            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 0, Bf16, RowLayout>(
-                q_full, rt_q_even, W, R,
+            state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 0, Bf16, RowLayout>(
+                q_full, rt_q_even, WL, R,
             ));
             // 2: rt_q_odd = q[:, 32:64]
-            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
-                q_full, rt_q_odd, W, R,
+            state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 1, Bf16, RowLayout>(
+                q_full, rt_q_odd, WL, R,
             ));
             // 3: rv_cos = load(cos_vec)
-            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, W, R));
+            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, WL, R));
             // 4: rv_sin = load(sin_vec)
-            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, W, R));
+            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, WL, R));
             // 5: rt_a = q_even * cos
             state.push(Instr::reg_tile_mul_col(rt_q_even, rv_cos, rt_a, W, R));
             // 6: rt_b = q_odd * sin
@@ -904,12 +911,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 10: rt_c = rt_c + rt_d  (out_odd  = q_even*sin + q_odd*cos)
             state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
             // 11: dst[:, 0:32] = rt_a
-            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
-                rt_a, dst_full, W, R,
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 0, Bf16, RowLayout>(
+                rt_a, dst_full, WL, R,
             ));
             // 12: dst[:, 32:64] = rt_c
-            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 1, Bf16, RowLayout>(
-                rt_c, dst_full, W, R,
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 1, Bf16, RowLayout>(
+                rt_c, dst_full, WL, R,
             ));
 
             emit_store_and_arrive(state, &node.output, dst_page);
@@ -1049,6 +1056,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
 
             // Mint registers (same shape as step 7 RopeRotate)
@@ -1062,25 +1070,25 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
 
             // Rotation (12 Instrs, identical algorithm to step 7)
-            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 0, Bf16, RowLayout>(
-                k_full, rt_k_even, W, R,
+            state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 0, Bf16, RowLayout>(
+                k_full, rt_k_even, WL, R,
             ));
-            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
-                k_full, rt_k_odd, W, R,
+            state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 1, Bf16, RowLayout>(
+                k_full, rt_k_odd, WL, R,
             ));
-            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, W, R));
-            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, W, R));
+            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, WL, R));
+            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, WL, R));
             state.push(Instr::reg_tile_mul_col(rt_k_even, rv_cos, rt_a, W, R));
             state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_sin, rt_b, W, R));
             state.push(Instr::reg_tile_mul_col(rt_k_even, rv_sin, rt_c, W, R));
             state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_cos, rt_d, W, R));
             state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, W, R));
             state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
-            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
-                rt_a, dst_full, W, R,
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 0, Bf16, RowLayout>(
+                rt_a, dst_full, WL, R,
             ));
-            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 1, Bf16, RowLayout>(
-                rt_c, dst_full, W, R,
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 1, Bf16, RowLayout>(
+                rt_c, dst_full, WL, R,
             ));
 
             // Cache writes at runtime decode position.

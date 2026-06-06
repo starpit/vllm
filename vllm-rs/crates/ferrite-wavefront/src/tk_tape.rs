@@ -1178,6 +1178,39 @@ pub trait ComputeWidth: group_width_sealed::Sealed {}
 impl ComputeWidth for GroupWidth<4> {}
 impl ComputeWidth for GroupWidth<16> {}
 
+/// Sealed marker for shared↔register move primitives whose TK 2.0
+/// implementation requires `ST::rows == GROUP_WARPS * RT::rows`.
+///
+/// `kittens::group<N>::load(RT &dst, const ST &src)` (and its store
+/// sibling, plus the sub-tile + register-vec analogues) static-asserts
+/// `ST::rows / RT::rows == GROUP_WARPS` at
+/// `third_party/thunderkittens/include/ops/group/memory/tile/shared_to_register.cuh:17`.
+/// All current ferrite-wavefront load/store sites pair an `SmemTileId<ROWS,...>`
+/// with a `RegTileId<ROWS,...>` of the SAME `ROWS` — i.e. `ST::rows == RT::rows`,
+/// which forces `GROUP_WARPS = 1`. Until row-sharded loads are needed,
+/// the only valid width is `GroupWidth<1>`.
+///
+/// Why a sibling trait, not just `ComputeWidth`: `ComputeWidth` is the
+/// witness for collective compute primitives (`mul_row`, `row_max_acc`,
+/// `softmax`, ...) that legitimately use `<4>` warpgroup or `<16>` all-
+/// consumers widths. The smem↔reg moves have a different constraint
+/// (the row-ratio gate above), so they need a distinct sealed trait
+/// to prevent the `ComputeWidth` widths from accidentally landing here.
+///
+/// ```
+/// use ferrite_wavefront::tk_tape::GroupWidth;
+/// fn _wants_warp<W: ferrite_wavefront::tk_tape::WarpLoadWidth>(_: W) {}
+/// _wants_warp(GroupWidth::<1>::PER_WARP);
+/// ```
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::GroupWidth;
+/// fn _wants_warp<W: ferrite_wavefront::tk_tape::WarpLoadWidth>(_: W) {}
+/// _wants_warp(GroupWidth::<16>::ALL_CONSUMERS); // E0277: not WarpLoadWidth
+/// ```
+pub trait WarpLoadWidth: group_width_sealed::Sealed {}
+impl WarpLoadWidth for GroupWidth<1> {}
+
 /// Runtime carrier for the const-generic `GroupWidth<N>` after type
 /// erasure into [`Instr`]. Field is `pub(crate)` (sealed); the only
 /// public constructor is [`GroupWidth::tag`], which requires the
@@ -2486,7 +2519,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::LoadShmemToReg {
             src: src.page(),
@@ -2509,7 +2542,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::StoreRegTileToShmem {
             src: src.slot(),
@@ -2541,7 +2574,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         const {
             assert!(
@@ -3083,7 +3116,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         const {
             assert!(
@@ -3117,7 +3150,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::LoadVecSmemToReg {
             src: src.page(),
@@ -3139,7 +3172,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::StoreRegVecToShmem {
             src: src.slot(),

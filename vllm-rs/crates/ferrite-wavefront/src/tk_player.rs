@@ -49,7 +49,12 @@ mod tk20 {
     }
 
     pub fn mbarrier_arrive(barrier: &str, page: u8) -> String {
-        format!("kittens::group<1>::arrive(&{barrier}[{page}]);")
+        // TK 2.0 `arrive(semaphore& sem)` — pass an lvalue reference, not a
+        // pointer. `page_ready[N]` is a `kittens::semaphore` array element
+        // (lvalue), so the bare expression binds to `semaphore&`. Prior
+        // `&` produced a `semaphore*` and tripped overload resolution.
+        // Per `third_party/thunderkittens/include/ops/group/util/sync.cuh:69`.
+        format!("kittens::group<1>::arrive({barrier}[{page}]);")
     }
 
     /// Format a [`ByteOffsetExpr`] as a CUDA arithmetic expression at
@@ -543,7 +548,7 @@ mod tk20 {
     pub fn arrive_if_runtime_even(barrier: &str, page: u8, parity_arg_idx: u32) -> String {
         format!(
             "if ((a{parity_arg_idx} & 1u) == 0u) {{ \
-             kittens::group<1>::arrive(&{barrier}[{page}]); }}"
+             kittens::group<1>::arrive({barrier}[{page}]); }}"
         )
     }
 
@@ -1156,7 +1161,7 @@ mod tests {
             kind: crate::tk_tape::PageBarrier::Done,
             role: WarpRole::Storer,
         });
-        assert_eq!(s, "kittens::group<1>::arrive(&page_done[0]);\n");
+        assert_eq!(s, "kittens::group<1>::arrive(page_done[0]);\n");
     }
 
     // NUKED: silu_mul_arm_one_call — tested the invented Instr::SiluMul
@@ -1326,10 +1331,10 @@ mod tests {
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let src = SmemTileId::<16, 128, Bf16>::from_page(PageId(3));
             tape.push(Instr::load_shmem_to_reg(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::load(rt_2, page_buf[3]);\n");
+        assert_eq!(s, "kittens::group<1>::load(rt_2, page_buf[3]);\n");
     }
 
     // ── WGMMA / MatmulTile player tests (step 9) ──────────────────
@@ -1417,13 +1422,13 @@ mod tests {
         let s = emit_with_rt_arena(|tape| {
             let dst: RegTileId<128, 32, Bf16, RowLayout> = tape.mint_reg_tile();
             let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(4));
-            tape.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            tape.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 1, Bf16, RowLayout>(
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
         assert_eq!(
             s,
-            "kittens::group<16>::load(rt_2, page_buf[4].template subtile<32>(1));\n",
+            "kittens::group<1>::load(rt_2, page_buf[4].template subtile<32>(1));\n",
         );
     }
 
@@ -1435,13 +1440,13 @@ mod tests {
         let s = emit_with_rt_arena(|tape| {
             let src: RegTileId<128, 32, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(7));
-            tape.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            tape.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 0, Bf16, RowLayout>(
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
         assert_eq!(
             s,
-            "kittens::group<16>::store(page_buf[7].template subtile<32>(0), rt_2);\n",
+            "kittens::group<1>::store(page_buf[7].template subtile<32>(0), rt_2);\n",
         );
     }
 
@@ -1452,10 +1457,10 @@ mod tests {
             let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst = SmemTileId::<16, 128, Bf16>::from_page(PageId(7));
             tape.push(Instr::store_reg_tile_to_shmem(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::store(page_buf[7], rt_2);\n");
+        assert_eq!(s, "kittens::group<1>::store(page_buf[7], rt_2);\n");
     }
 
     #[test]

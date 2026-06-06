@@ -2160,6 +2160,33 @@ impl LoadSpec {
             barrier_page,
         }
     }
+
+    /// Construct a [`LoadSpec`] from a RUNTIME tile shape — used by
+    /// `emit_external_load` where the shape comes from the upstream
+    /// `TensorRegion` (which varies per source: 1×N for vectors,
+    /// 128×128 for projection weights, etc.).
+    ///
+    /// The const-generic typed gate at [`Self::new`] is appropriate
+    /// when the lowerer KNOWS the shape (compute Instr arms); at the
+    /// external-load boundary the shape is runtime data driven by
+    /// the SubtileIR's tensor regions.
+    pub(crate) fn new_runtime_shape(
+        dst_page: PageId,
+        src_tensor: TensorId,
+        byte_off: ByteOffsetExpr,
+        tile: TileShape,
+        role: LoaderRole,
+        barrier_page: PageId,
+    ) -> Self {
+        Self {
+            dst_page,
+            src_tensor,
+            byte_off,
+            tile,
+            role: role.to_warp_role(),
+            barrier_page,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2186,6 +2213,23 @@ impl StoreSpec {
             dst_tensor,
             byte_off,
             tile: tile.shape(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Runtime-shape store, parallel to [`LoadSpec::new_runtime_shape`].
+    pub(crate) fn new_runtime_shape(
+        src_page: PageId,
+        dst_tensor: TensorId,
+        byte_off: ByteOffsetExpr,
+        tile: TileShape,
+        role: StorerRole,
+    ) -> Self {
+        Self {
+            src_page,
+            dst_tensor,
+            byte_off,
+            tile,
             role: role.to_warp_role(),
         }
     }

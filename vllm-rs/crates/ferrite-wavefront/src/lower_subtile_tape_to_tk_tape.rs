@@ -1351,14 +1351,15 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     inp: &TensorRegion,
     dst_page: PageId,
 ) {
-    use crate::tk_tape::{Bf16, SmemTileSpec};
-    // Typed-witness mint: the substrate's uniform 128×128 bf16 page
-    // pool is the type-level invariant. `from_shape` debug_asserts the
-    // runtime shape matches; const-generics propagate to LoadSpec.
-    // Per `feedback_ff_subtile_compile_time_inviolable`.
-    let tile = SmemTileSpec::<128, 128, Bf16>::from_shape(region_tile_shape(inp));
+    // External loads use runtime shape — `inp.region` carries the
+    // SubtileIR's tensor-region slice (1×N for vectors, 128×128 for
+    // tile weights, etc.). The typed `LoadSpec::new<R,C,T>` gate is
+    // appropriate when the lowerer KNOWS the shape (compute Instrs);
+    // at the external-load boundary the shape is genuinely runtime
+    // data. Per `feedback_no_speculative_witnesses`.
+    let tile = region_tile_shape(inp);
     let byte_off = region_byte_offset(state.graph, inp);
-    state.push(Instr::LoadAsync(LoadSpec::new(
+    state.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
         dst_page,
         inp.tensor,
         byte_off,
@@ -1373,10 +1374,12 @@ fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
     out: &TensorRegion,
     dst_page: PageId,
 ) {
-    use crate::tk_tape::{Bf16, SmemTileSpec};
-    let tile = SmemTileSpec::<128, 128, Bf16>::from_shape(region_tile_shape(out));
+    // Runtime-shape store; output region's shape is driven by the
+    // upstream SubtileIR. See `emit_external_load` for the same
+    // const-generic-vs-runtime-shape rationale.
+    let tile = region_tile_shape(out);
     let byte_off = region_byte_offset(state.graph, out);
-    state.push(Instr::StoreAsync(StoreSpec::new(
+    state.push(Instr::StoreAsync(StoreSpec::new_runtime_shape(
         dst_page,
         out.tensor,
         byte_off,

@@ -80,10 +80,17 @@ shape, applied uniformly.
 Sealed newtypes throughout: `SubtileId`, `TensorId`, `SlotId`,
 `SlotHandle` (move-only), `SlotWritten` (move-only), `LoopVarId`,
 `RuntimeBoundId`, `KernelArgRef`, `SoftmaxStateId`, `KvLayoutId`,
-`PageId`. Construction only via crate-private builders. (`BufId`
-from the v1 metal_tape namespace is dead at the TkTape layer; it
-survives only in the §10-deletion carcasses pending their own
-removal.)
+`PageId`. Each newtype carries a private inner field
+(`pub(crate) u32` or `_seal: sealed::Seal(pub(super) ())`) so
+struct-literal construction by external code is rejected by rustc;
+the only path to a value is the type's builder/constructor (e.g.
+`TapeBuilder::alloc_slot`, `TkTape::push_kernel_arg`). Builders
+are `pub fn` so external compile-fail doctests (and any future
+external consumer) can exercise the move-only typestate proofs;
+the seal is at the value level, not the function-visibility level.
+(`BufId` from the v1 metal_tape namespace is dead at the TkTape
+layer; it survives only in the §10-deletion carcasses pending
+their own removal.)
 
 Witness placement (per layer):
 
@@ -456,13 +463,13 @@ Revert the entire stack to commit `5206d10d49` if **any** of:
 
 ## 7. Net surface delta (target)
 
-Snapshot updated for HEAD post-audit-`w95ad4bpn` (Parity sealed enum + GemmK witness):
+Snapshot updated for HEAD post-audit-`wtbma9ju8` (K5 BLOCKER fix + K2 grep + GemmK witness + Parity sealed enum). LOC values are `wc -l` snapshots — re-run `wc -l crates/ferrite-wavefront/src/*.rs` whenever this table is edited so future drift is caught at plan-edit time.
 
 | Layer | Before | Now (snapshot) | After (target) |
 |---|---|---|---|
 | `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` (1696 LOC) | folded ~1400 LOC |
 | `subtile_ir.rs` (Metal-flavored, v1) | 1471 LOC | scrubbed to `metal_tape.rs` (153 LOC carcass; MetalTape type deleted in commit 10, leaf types kept for callers) | further-cut to ~50 LOC once leaf-type callers migrate |
-| `subtile_tape.rs` | 0 LOC | 1734 LOC (slot-lifecycle + validate_subtile_tape landed; tests dominate) | ~600 LOC after the §10 cleanup |
+| `subtile_tape.rs` | 0 LOC | 1375 LOC (slot-lifecycle typestate + 5-variant validate_subtile_tape; K5 BLOCKER fix `99589320b0` cut −476 LOC of typestate-redundant validator code; tests dominate the rest) | ~600 LOC after the §10 cleanup |
 | `lower.rs` (`LoweringInput`/`LoweredOp`) | 1105 LOC | 213 LOC (much already cut) | DELETED |
 | `tape.rs` | 391 LOC | DELETED ✓ | DELETED |
 | `tk_tape.rs` | 727 LOC | 1128 LOC (parity-split Wait variants, KvLayoutId table, KvCacheShape const-generic K, GemmK typed witness, validate_tk_tape) | grows for §6.5 pass postcondition checks (closure / parity / edge-pairing) |

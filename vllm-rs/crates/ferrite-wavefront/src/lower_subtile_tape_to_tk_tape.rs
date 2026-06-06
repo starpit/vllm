@@ -461,10 +461,66 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             ));
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::Elementwise(EwKind::Add) => {
+            // Same compile-time witnesses as the Mul arm; only the
+            // emitted TK 2.0 primitive differs (`group<N>::add` vs
+            // `group<N>::mul`).
+            use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            state.push(Instr::sh_tile_add(
+                lhs,
+                rhs,
+                dst,
+                GroupWidth::<16>::ALL_CONSUMERS,
+            ));
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
+        SubOp::SumReduce => {
+            // SumReduce over N inputs: chain N-1 ShTileAdd Instrs.
+            // Per SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts":
+            // SumReduce reuses ShTileAdd; no new Instr variant.
+            //
+            // Sequence (for N reads):
+            //   ShTileAdd(dst, reads[0], reads[1])   // dst = r0+r1
+            //   ShTileAdd(dst, dst,      reads[2])   // dst += r2
+            //   ...
+            //   ShTileAdd(dst, dst,      reads[N-1]) // dst += rN-1
+            //
+            // TK 2.0 `add(T &dst, const T &lhs, const U &rhs)` allows
+            // `dst` aliasing `lhs` (lhs is `const T&` to the same).
+            assert!(
+                reads.len() >= 2,
+                "SumReduce expects ≥2 inputs (got {}); N=1 lowers to a copy, not yet supported",
+                reads.len(),
+            );
+            use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            // First add: dst = reads[0] + reads[1]
+            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            state.push(Instr::sh_tile_add(
+                r0,
+                r1,
+                dst,
+                GroupWidth::<16>::ALL_CONSUMERS,
+            ));
+            // Subsequent adds: dst += reads[i]
+            for r_i in &reads[2..] {
+                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(*r_i));
+                state.push(Instr::sh_tile_add(
+                    dst,
+                    rhs,
+                    dst,
+                    GroupWidth::<16>::ALL_CONSUMERS,
+                ));
+            }
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         SubOp::MatmulTile
-        | SubOp::SumReduce
-        | SubOp::Elementwise(_)
         | SubOp::SiluMul
+        | SubOp::Elementwise(EwKind::Silu)
         | SubOp::RmsNorm { .. }
         | SubOp::RopeRotate { .. }
         | SubOp::RopeAppend { .. }

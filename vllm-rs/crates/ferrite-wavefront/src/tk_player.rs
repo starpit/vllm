@@ -108,6 +108,16 @@ mod tk20 {
         )
     }
 
+    /// `kittens::group<N>::add(dst, lhs, rhs)` —
+    /// `ops/group/shared/tile/maps.cuh:280` (binary tile+tile add,
+    /// included into struct group<N> via `shared/shared.cuh` per
+    /// `ops/group/group.cuh:45`). Used by ShTileAdd.
+    pub fn st_add(group_n: u32, dst: u8, lhs: u8, rhs: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::add(page_buf[{dst}], page_buf[{lhs}], page_buf[{rhs}]);"
+        )
+    }
+
     pub fn tma_store_async_typed(
         src_page: u8,
         dst_arg_idx: u32,
@@ -400,6 +410,9 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::ShTileMul { lhs, rhs, dst, width } => {
             let _ = writeln!(out, "{}", tk20::st_mul(width.n(), dst.0, lhs.0, rhs.0));
         }
+        Instr::ShTileAdd { lhs, rhs, dst, width } => {
+            let _ = writeln!(out, "{}", tk20::st_add(width.n(), dst.0, lhs.0, rhs.0));
+        }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
         }
@@ -606,6 +619,27 @@ mod tests {
             s,
             "kittens::group<1>::tma::store_async_typed<\
              kittens::st_bf<128, 128>>(a7, page_buf[5]);\n",
+        );
+    }
+
+    /// `Instr::ShTileAdd` mirrors ShTileMul, emits `kittens::group<N>::add`
+    /// from `ops/group/shared/tile/maps.cuh:280`. Used by
+    /// SubOp::Elementwise(Add) and SumReduce.
+    #[test]
+    fn sh_tile_add_emits_real_tk20_call() {
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(4));
+        let rhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(5));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(6));
+        let s = emit(Instr::sh_tile_add(
+            lhs,
+            rhs,
+            dst,
+            GroupWidth::<16>::ALL_CONSUMERS,
+        ));
+        assert_eq!(
+            s,
+            "kittens::group<16>::add(page_buf[6], page_buf[4], page_buf[5]);\n",
         );
     }
 

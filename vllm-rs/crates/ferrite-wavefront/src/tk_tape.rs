@@ -320,6 +320,24 @@ pub enum Instr {
         width: GroupWidthTag,
     },
 
+    /// Pairwise add two shared tiles into a third — TK 2.0 primitive
+    /// `kittens::group<N>::add(dst, lhs, rhs)` at
+    /// `ops/group/shared/tile/maps.cuh:280` (binary tile+tile add,
+    /// included into struct group<N> via `shared/shared.cuh` per
+    /// `ops/group/group.cuh:45`). Used by SubOp::Elementwise(Add) and
+    /// SubOp::SumReduce (chained N-1 times for N inputs).
+    ///
+    /// Same compile-time gates as [`Instr::ShTileMul`]: `width` is
+    /// constructed only via [`GroupWidth<N>: ComputeWidth`], and the
+    /// constructor takes `SmemTileId<ROWS, COLS, T>` operands so a
+    /// shape/dtype mismatch is rustc E0308.
+    ShTileAdd {
+        lhs: PageId,
+        rhs: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+    },
+
     /// Inert marker the orchestrator emits at the start of an op
     /// when `EmitOpts::debug_handshake` is on.
     DebugOpBeginMarker { op_index: u32 },
@@ -1129,6 +1147,28 @@ impl Instr {
         }
     }
 
+    /// Construct a [`Instr::ShTileAdd`] from typed inputs. Same
+    /// compile-time gates as [`Instr::sh_tile_mul`]: the `where
+    /// GroupWidth<N>: ComputeWidth` bound restricts N to compute-
+    /// eligible widths, and the const-generic shape unification across
+    /// `lhs/rhs/dst` is rustc-checked.
+    pub(crate) fn sh_tile_add<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        lhs: SmemTileId<ROWS, COLS, T>,
+        rhs: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileAdd {
+            lhs: lhs.page(),
+            rhs: rhs.page(),
+            dst: dst.page(),
+            width: width.tag(),
+        }
+    }
+
     /// Construct a [`Instr::StoreAsyncTyped`] from a typed source
     /// tile witness. `src` is a [`SmemTileId<ROWS, COLS, T>`] —
     /// `ROWS`, `COLS`, and `T::NAME` are propagated into the emitted
@@ -1375,7 +1415,9 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             }
             // Compute Instrs are pure within-page work; they do not
             // change cross-page barrier or store state.
-            Instr::ShTileMul { .. } | Instr::DebugOpBeginMarker { .. } => {}
+            Instr::ShTileMul { .. }
+            | Instr::ShTileAdd { .. }
+            | Instr::DebugOpBeginMarker { .. } => {}
         }
     }
 }

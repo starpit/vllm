@@ -248,6 +248,57 @@ mod tk20 {
         )
     }
 
+    // ── MatmulTile / WGMMA emit helpers (step 9) ──────────────────
+
+    /// `kittens::group<1>::tma::expect_bytes(page_done[page], bytes)` —
+    /// `ops/group/util/tma.cuh:18`. Used by MatmulTile to arm the
+    /// barrier with a known transaction byte count derived from
+    /// the typed shape+dtype.
+    pub fn tma_expect_bytes(barrier_page: u8, bytes: u32) -> String {
+        format!(
+            "kittens::group<1>::tma::expect_bytes(page_done[{barrier_page}], {bytes}u);"
+        )
+    }
+
+    /// `kittens::group<N>::zero(rt_<dst>)` —
+    /// `ops/group/register/tile/maps.cuh:422`.
+    pub fn rt_zero(group_n: u32, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::zero(rt_{dst_slot});")
+    }
+
+    /// `kittens::group<4>::mma_fence(rt_<d>)` —
+    /// `ops/group/mma/warpgroup.cuh:23`.
+    pub fn wgmma_mma_fence(d_slot: u16) -> String {
+        format!("kittens::group<4>::mma_fence(rt_{d_slot});")
+    }
+
+    /// `kittens::group<4>::mma_AB<decltype(rt_<d>), decltype(...).a,
+    /// decltype(...).b, fence, accumulate>(rt_<d>, page_buf[a], page_buf[b])`
+    /// — `ops/group/mma/warpgroup.cuh:192`. The `decltype` inference
+    /// pattern keeps emit independent of the kernel's specific
+    /// register-tile / shared-tile types (those are statically known
+    /// from the rt_<id> / page_buf decls).
+    pub fn wgmma_mma_ab_smem_smem(
+        d_slot: u16,
+        a_page: u8,
+        b_page: u8,
+        fence: u8,
+        accumulate: u8,
+    ) -> String {
+        format!(
+            "kittens::group<4>::mma_AB<decltype(rt_{d_slot}), \
+             std::decay_t<decltype(page_buf[{a_page}])>, \
+             std::decay_t<decltype(page_buf[{b_page}])>, \
+             {fence}, {accumulate}>(rt_{d_slot}, page_buf[{a_page}], page_buf[{b_page}]);"
+        )
+    }
+
+    /// `kittens::group<4>::mma_async_wait<N>()` —
+    /// `ops/group/mma/warpgroup.cuh:91`.
+    pub fn wgmma_mma_async_wait(n: u32) -> String {
+        format!("kittens::group<4>::mma_async_wait<{n}>();")
+    }
+
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
     pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
@@ -729,6 +780,22 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
                 tk20::store_reg_tile_subtile_to_shmem(
                     width.n(), src.0, dst.0, *subtile_cols, *subtile_idx));
         }
+        Instr::TmaExpect { barrier_page, bytes, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::tma_expect_bytes(barrier_page.0, *bytes));
+        }
+        Instr::InitRtZero { dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_zero(width.n(), dst.0));
+        }
+        Instr::WgmmaFenceAcc { d, width: _, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::wgmma_mma_fence(d.0));
+        }
+        Instr::WgmmaMmaAB_SmemSmem { a_page, b_page, d, fence, accumulate, width: _, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::wgmma_mma_ab_smem_smem(d.0, a_page.0, b_page.0, *fence, *accumulate));
+        }
+        Instr::WgmmaAsyncWait { n, width: _, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::wgmma_mma_async_wait(*n));
+        }
         Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",
                 tk20::load_smem_to_reg_vec(width.n(), src.0, dst.0));
@@ -1112,6 +1179,80 @@ mod tests {
             ));
         });
         assert_eq!(s, "kittens::group<16>::load(rt_2, page_buf[3]);\n");
+    }
+
+    // ── WGMMA / MatmulTile player tests (step 9) ──────────────────
+
+    #[test]
+    fn tma_expect_emits_typed_byte_count() {
+        use crate::tk_tape::{Bf16, LoaderRole, PageId, SmemTileSpec, TileShape};
+        // For SmemTileSpec<128, 128, Bf16>: 128*128*2 = 32768 bytes
+        let spec = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+            rows: 128, cols: 128, elem_bytes: 2,
+        });
+        let mut tape = TkTape::default();
+        tape.push(Instr::tma_expect(PageId(5), spec, LoaderRole));
+        let mut s = String::new();
+        for instr in &tape.instrs {
+            emit_instr(&mut s, &tape, instr);
+        }
+        assert_eq!(s, "kittens::group<1>::tma::expect_bytes(page_done[5], 32768u);\n");
+    }
+
+    #[test]
+    fn init_rt_zero_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let dst: RegTileId<128, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::init_rt_zero(dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole));
+        });
+        assert_eq!(s, "kittens::group<16>::zero(rt_2);\n");
+    }
+
+    #[test]
+    fn wgmma_fence_acc_emits_real_tk20_call() {
+        use crate::tk_tape::{Fp32, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let d: RegTileId<128, 128, Fp32, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::wgmma_fence_acc(d, GroupWidth::<4>::WARPGROUP));
+        });
+        assert_eq!(s, "kittens::group<4>::mma_fence(rt_2);\n");
+    }
+
+    #[test]
+    fn wgmma_mma_ab_smem_smem_emits_real_tk20_call() {
+        use crate::tk_tape::{
+            AccReset, Bf16, FenceExternal, Fp32, GroupWidth, PageId,
+            RegTileId, RowLayout, SmemTileId,
+        };
+        let s = emit_with_rt_arena(|tape| {
+            let d: RegTileId<128, 128, Fp32, RowLayout> = tape.mint_reg_tile();
+            let a = SmemTileId::<128, 128, Bf16>::from_page(PageId(3));
+            let b = SmemTileId::<128, 128, Bf16>::from_page(PageId(4));
+            tape.push(Instr::wgmma_mma_ab_smem_smem(
+                d, a, b, FenceExternal, AccReset, GroupWidth::<4>::WARPGROUP,
+            ));
+        });
+        // FenceExternal::KIND=0, AccReset::KIND=0
+        assert_eq!(
+            s,
+            "kittens::group<4>::mma_AB<decltype(rt_2), \
+             std::decay_t<decltype(page_buf[3])>, \
+             std::decay_t<decltype(page_buf[4])>, \
+             0, 0>(rt_2, page_buf[3], page_buf[4]);\n",
+        );
+    }
+
+    #[test]
+    fn wgmma_async_wait_emits_real_tk20_call() {
+        use crate::tk_tape::GroupWidth;
+        let mut tape = TkTape::default();
+        tape.push(Instr::wgmma_async_wait(0, GroupWidth::<4>::WARPGROUP));
+        let mut s = String::new();
+        for instr in &tape.instrs {
+            emit_instr(&mut s, &tape, instr);
+        }
+        assert_eq!(s, "kittens::group<4>::mma_async_wait<0>();\n");
     }
 
     /// `Instr::LoadShmemSubTileToReg` emits the TK 2.0 column-block

@@ -458,6 +458,66 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    // ── MatmulTile / WGMMA Instrs (step 9) ────────────────────────
+    //
+    // Per SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts" line 17,
+    // MatmulTile decomposes into 8 Instrs. The WGMMA path is
+    // warpgroup-only (GroupWidth<4>); the typed constructors enforce.
+
+    /// `kittens::group<1>::tma::expect_bytes(page_<barrier>[barrier_page],
+    /// bytes)` — `ops/group/util/tma.cuh:18`. Sets the expected
+    /// transaction byte count on a page mbarrier before issuing the
+    /// TMA load that arms it. The byte count is derived from the
+    /// shape/dtype at construction.
+    TmaExpect {
+        barrier_page: PageId,
+        bytes: u32,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::zero(rt_dst)` —
+    /// `ops/group/register/tile/maps.cuh:422`. Initialise a register
+    /// tile to zero. Used by MatmulTile to reset the accumulator.
+    InitRtZero {
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<4>::mma_fence(rt_d)` —
+    /// `ops/group/mma/warpgroup.cuh:23`. Fence on the WGMMA
+    /// accumulator before the first `mma_AB`. Required when the
+    /// `mma_AB` Instr is constructed with [`FenceExternal`].
+    WgmmaFenceAcc {
+        d: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<4>::mma_AB<D, A, B, FENCE, ACC>(d, a, b)` —
+    /// `ops/group/mma/warpgroup.cuh:192` (smem-smem-rt overload).
+    /// `FENCE` and `ACC` are template-bool params — runtime values
+    /// here are the `KIND` const recovered from the typed witnesses
+    /// `FencePolicy` / `AccPolicy`.
+    WgmmaMmaAB_SmemSmem {
+        a_page: PageId,
+        b_page: PageId,
+        d: RegTileSlot,
+        fence: u8,
+        accumulate: u8,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<4>::mma_async_wait<N>()` —
+    /// `ops/group/mma/warpgroup.cuh:91`. Stall until the number of
+    /// in-flight committed WGMMA groups is ≤ N.
+    WgmmaAsyncWait {
+        n: u32,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::load(rv, sv)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
@@ -775,6 +835,64 @@ impl RoleWitness for AllWarpsRole {
     }
 }
 
+// ── Sealed `AccPolicy` and `FencePolicy` for WGMMA template params ──
+//
+// Per SUBTILE_TK20_DECOMP.md §"New typed-witness types" line 44:
+// `mma_AB<D, A, B, fence, accumulate>` takes two const ints. Each
+// int has 0/1 semantics with a clear name, so we lift to sealed
+// type-level policies. `KIND` const recovers 0/1 for emit.
+
+mod acc_policy_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed accumulator-policy marker for WGMMA Instrs. `Reset` overwrites
+/// the accumulator; `Accumulate` adds into the existing value. Maps
+/// 1:1 to TK 2.0's `mma_AB<D, A, B, fence, accumulate>` template
+/// boolean (line 139 / 192 of `ops/group/mma/warpgroup.cuh`).
+pub trait AccPolicy: acc_policy_sealed::Sealed + Copy {
+    const KIND: u32;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AccReset;
+impl acc_policy_sealed::Sealed for AccReset {}
+impl AccPolicy for AccReset {
+    const KIND: u32 = 0;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AccAccumulate;
+impl acc_policy_sealed::Sealed for AccAccumulate {}
+impl AccPolicy for AccAccumulate {
+    const KIND: u32 = 1;
+}
+
+mod fence_policy_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed fence-policy marker. `External` means a separate
+/// `WgmmaFenceAcc` Instr was emitted before this `mma_AB`; `Internal`
+/// means the `mma_AB` template body emits its own `mma_fence(d)`.
+pub trait FencePolicy: fence_policy_sealed::Sealed + Copy {
+    const KIND: u32;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FenceExternal;
+impl fence_policy_sealed::Sealed for FenceExternal {}
+impl FencePolicy for FenceExternal {
+    const KIND: u32 = 0;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FenceInternal;
+impl fence_policy_sealed::Sealed for FenceInternal {}
+impl FencePolicy for FenceInternal {
+    const KIND: u32 = 1;
+}
+
 // ── Sealed const-generic `GroupWidth<N>` + `ComputeWidth` marker ────
 //
 // Per `feedback_ff_subtile_compile_time_inviolable`: every numeric
@@ -952,8 +1070,7 @@ pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
     fn tag() -> TileDtypeTag;
 }
 
-/// `kittens::bf16` — Hopper bfloat16. The only dtype currently bound
-/// to a page in the substrate. Aliased as `kittens::st_bf<…>`.
+/// `kittens::bf16` — Hopper bfloat16. Aliased as `kittens::st_bf<…>`.
 #[derive(Clone, Copy, Debug)]
 pub struct Bf16;
 impl tile_dtype_sealed::Sealed for Bf16 {}
@@ -963,6 +1080,21 @@ impl TileDtype for Bf16 {
     const ELEM_BYTES: u32 = 2;
     fn tag() -> TileDtypeTag {
         TileDtypeTag::Bf16
+    }
+}
+
+/// `float` — fp32. Used by WGMMA accumulator (`mma_AB<D, A, B>` where
+/// D is rt<float, ...>, A/B are rt<bf16, ...> / st<bf16, ...>).
+/// Aliased as `kittens::st_fl<…>`.
+#[derive(Clone, Copy, Debug)]
+pub struct Fp32;
+impl tile_dtype_sealed::Sealed for Fp32 {}
+impl TileDtype for Fp32 {
+    const ST_ALIAS_SUFFIX: &'static str = "fl";
+    const SCALAR_NAME: &'static str = "float";
+    const ELEM_BYTES: u32 = 4;
+    fn tag() -> TileDtypeTag {
+        TileDtypeTag::Fp32
     }
 }
 
@@ -1257,11 +1389,11 @@ pub struct TileShape {
 
 /// Runtime sealed dtype tag. The `TileDtype` trait's `tag()` method
 /// is the only construction path; external types cannot satisfy
-/// `TileDtype` (sealed via `tile_dtype_sealed::Sealed`). Single
-/// variant today (`Bf16`); add variants as new dtypes land.
+/// `TileDtype` (sealed via `tile_dtype_sealed::Sealed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TileDtypeTag {
     Bf16,
+    Fp32,
 }
 
 impl TileDtypeTag {
@@ -1271,6 +1403,7 @@ impl TileDtypeTag {
     pub const fn st_alias_suffix(&self) -> &'static str {
         match self {
             Self::Bf16 => Bf16::ST_ALIAS_SUFFIX,
+            Self::Fp32 => Fp32::ST_ALIAS_SUFFIX,
         }
     }
     /// Underlying scalar type — `kittens::<name>` for scalar
@@ -1278,11 +1411,13 @@ impl TileDtypeTag {
     pub const fn scalar_name(&self) -> &'static str {
         match self {
             Self::Bf16 => Bf16::SCALAR_NAME,
+            Self::Fp32 => Fp32::SCALAR_NAME,
         }
     }
     pub const fn elem_bytes(&self) -> u32 {
         match self {
             Self::Bf16 => Bf16::ELEM_BYTES,
+            Self::Fp32 => Fp32::ELEM_BYTES,
         }
     }
 }
@@ -2015,6 +2150,107 @@ impl Instr {
         }
     }
 
+    // ── MatmulTile / WGMMA constructors (step 9) ─────────────────
+
+    /// Construct [`Instr::TmaExpect`] from a typed shape+dtype
+    /// witness so byte-count derives from `ROWS * COLS * T::ELEM_BYTES`
+    /// — caller cannot pass a mismatched runtime byte count.
+    pub(crate) fn tma_expect<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        barrier_page: PageId,
+        _shape_witness: SmemTileSpec<ROWS, COLS, T>,
+        role: LoaderRole,
+    ) -> Self {
+        Self::TmaExpect {
+            barrier_page,
+            bytes: (ROWS * COLS) as u32 * T::ELEM_BYTES,
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::InitRtZero`].
+    pub(crate) fn init_rt_zero<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::InitRtZero {
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::WgmmaFenceAcc`]. Width must be GroupWidth<4>
+    /// (warpgroup) — WGMMA is warpgroup-only.
+    pub(crate) fn wgmma_fence_acc<
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        d: RegTileId<ROWS, COLS, T, L>,
+        _width: GroupWidth<4>,
+    ) -> Self {
+        Self::WgmmaFenceAcc {
+            d: d.slot(),
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
+    /// Construct [`Instr::WgmmaMmaAB_SmemSmem`].
+    /// `D[M, N] = A[M, K] @ B[K, N]` — K unifies between A and B at
+    /// the type level (rustc enforces). D is the register accumulator;
+    /// its shape (M, N) and dtype/layout are propagated from typed
+    /// witnesses. `_fence` and `_accumulate` are sealed policy
+    /// witnesses (FencePolicy / AccPolicy); their const KIND erases
+    /// to runtime u8 for emit (TK 2.0 template booleans).
+    pub(crate) fn wgmma_mma_ab_smem_smem<
+        const M: usize,
+        const K: usize,
+        const N: usize,
+        T_AB: TileDtype,
+        T_D: TileDtype,
+        L: RegTileLayout,
+        F: FencePolicy,
+        AC: AccPolicy,
+    >(
+        d: RegTileId<M, N, T_D, L>,
+        a: SmemTileId<M, K, T_AB>,
+        b: SmemTileId<K, N, T_AB>,
+        _fence: F,
+        _accumulate: AC,
+        _width: GroupWidth<4>,
+    ) -> Self {
+        Self::WgmmaMmaAB_SmemSmem {
+            a_page: a.page(),
+            b_page: b.page(),
+            d: d.slot(),
+            fence: F::KIND as u8,
+            accumulate: AC::KIND as u8,
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
+    /// Construct [`Instr::WgmmaAsyncWait`].
+    pub(crate) fn wgmma_async_wait(n: u32, _width: GroupWidth<4>) -> Self {
+        Self::WgmmaAsyncWait {
+            n,
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
     /// Construct [`Instr::StoreRegTileSubTileToShmem`] — inverse of
     /// `load_shmem_subtile_to_reg`. Same const-generic guards.
     pub(crate) fn store_reg_tile_subtile_to_shmem<
@@ -2716,6 +2952,11 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::StoreRegTileToShmem { .. }
             | Instr::LoadShmemSubTileToReg { .. }
             | Instr::StoreRegTileSubTileToShmem { .. }
+            | Instr::TmaExpect { .. }
+            | Instr::InitRtZero { .. }
+            | Instr::WgmmaFenceAcc { .. }
+            | Instr::WgmmaMmaAB_SmemSmem { .. }
+            | Instr::WgmmaAsyncWait { .. }
             | Instr::LoadVecSmemToReg { .. }
             | Instr::StoreRegVecToShmem { .. }
             | Instr::RegTileNeg { .. }

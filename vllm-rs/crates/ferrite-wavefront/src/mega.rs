@@ -441,8 +441,8 @@ pub enum EmitMode {
 /// [`MegaProgram`] with the default ([`EmitMode::Pipelined`]) layout. `sources`
 /// is parallel to `graph.tensors[0..num_sources]`; `geom` supplies the element
 /// width and the attention paged-cache geometry the abstract graph omits.
-pub fn serialize(
-    graph: &SubtileIR,
+pub fn serialize<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    graph: &SubtileIR<F, K>,
     schedule: &Schedule,
     sources: &[SourceDesc],
     geom: Geometry,
@@ -451,8 +451,8 @@ pub fn serialize(
 }
 
 /// As [`serialize`], choosing the worker-tape [`EmitMode`].
-pub fn serialize_mode(
-    graph: &SubtileIR,
+pub fn serialize_mode<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    graph: &SubtileIR<F, K>,
     schedule: &Schedule,
     sources: &[SourceDesc],
     geom: Geometry,
@@ -663,8 +663,8 @@ pub fn serialize_mode(
 /// hand off, so their publish barrier splits consecutive computes — that is the
 /// cost the tranche path trades against.) `worker.tape` is `[Wait* Compute
 /// Signal?]` in ascending id; emitted verbatim.
-fn emit_worker_pipelined(
-    ser: &mut Ser,
+fn emit_worker_pipelined<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    ser: &mut Ser<F, K>,
     wi: u32,
     worker: &crate::region_schedule::Worker,
     preds: &[Vec<SubtileId>],
@@ -724,8 +724,8 @@ fn emit_worker_pipelined(
 /// because a level-L tranche signals only `> L` consumers and waits only `< L`
 /// producers — no wait cycle.
 #[allow(clippy::too_many_arguments)]
-fn emit_worker_tranches(
-    ser: &mut Ser,
+fn emit_worker_tranches<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    ser: &mut Ser<F, K>,
     wi: u32,
     worker: &crate::region_schedule::Worker,
     preds: &[Vec<SubtileId>],
@@ -968,7 +968,7 @@ fn pack_simdgroup_ranges(
 /// `Compute(id)` in worker `w`'s tape means node `id` runs on worker `w`.
 /// The handoff planner needs the assignment the scheduler chose; the
 /// [`Schedule`] only exposes the per-worker instruction streams, so rebuild it.
-fn reconstruct_worker_of(graph: &SubtileIR, schedule: &Schedule) -> Vec<u32> {
+fn reconstruct_worker_of<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(graph: &SubtileIR<F, K>, schedule: &Schedule) -> Vec<u32> {
     let mut worker_of = vec![0u32; graph.nodes.len()];
     for (wi, worker) in schedule.workers.iter().enumerate() {
         for instr in &worker.tape {
@@ -998,8 +998,8 @@ struct Handoff {
 
 /// Mutable serializer state: the interned buffer / shape tables, the
 /// operand list, the tensor→arena-slot map, and the cross-worker handoff plan.
-struct Ser<'a> {
-    graph: &'a SubtileIR,
+struct Ser<'a, F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape> {
+    graph: &'a SubtileIR<F, K>,
     sources: &'a [SourceDesc],
     geom: Geometry,
     num_sources: u32,
@@ -1020,8 +1020,8 @@ struct Ser<'a> {
     acquired: HashMap<TensorId, u32>,
 }
 
-impl<'a> Ser<'a> {
-    fn new(graph: &'a SubtileIR, sources: &'a [SourceDesc], geom: Geometry) -> Self {
+impl<'a, F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape> Ser<'a, F, K> {
+    fn new(graph: &'a SubtileIR<F, K>, sources: &'a [SourceDesc], geom: Geometry) -> Self {
         Self {
             graph,
             sources,
@@ -1228,7 +1228,7 @@ impl<'a> Ser<'a> {
     /// edge). All ops read every input as an operand EXCEPT attention, whose
     /// new K/V (and the prefix K/V sources) are the paged cache, not arena
     /// reads — only its q (input 0) is an arena operand.
-    fn reads_as_operand(&self, node: &SubtileNode, t: TensorId) -> bool {
+    fn reads_as_operand(&self, node: &SubtileNode<F, K>, t: TensorId) -> bool {
         match node.op {
             SubOp::AttnDecode { .. } => node.inputs.first().map(|i| i.tensor) == Some(t),
             _ => node.inputs.iter().any(|i| i.tensor == t),
@@ -1243,7 +1243,7 @@ impl<'a> Ser<'a> {
     /// has already `Wait`ed on every cross-worker producer's flag.
     fn emit_acquires(
         &mut self,
-        node: &SubtileNode,
+        node: &SubtileNode<F, K>,
         wi: u32,
         tape: &mut Vec<[u32; 4]>,
     ) -> Result<usize, SerializeError> {
@@ -1299,7 +1299,7 @@ impl<'a> Ser<'a> {
     /// Whether this node's output tensor crosses workers — i.e. `emit_publish`
     /// will emit a PUBLISH for it (so the caller knows to fence the producer
     /// Compute → PUBLISH read).
-    fn produces_handoff(&self, node: &SubtileNode) -> bool {
+    fn produces_handoff(&self, node: &SubtileNode<F, K>) -> bool {
         self.handoff.contains_key(&node.output.tensor)
     }
 
@@ -1310,7 +1310,7 @@ impl<'a> Ser<'a> {
     /// n_pairs)` (the stripe offsets ride in the pointers).
     fn emit_publish(
         &mut self,
-        node: &SubtileNode,
+        node: &SubtileNode<F, K>,
         tape: &mut Vec<[u32; 4]>,
     ) -> Result<(), SerializeError> {
         let t = node.output.tensor;
@@ -1344,7 +1344,7 @@ impl<'a> Ser<'a> {
     }
 
     /// Emit one compute node → `(shape_class, operand_base)`.
-    fn emit_compute(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+    fn emit_compute(&mut self, node: &SubtileNode<F, K>) -> Result<(u32, u32), SerializeError> {
         match node.op {
             SubOp::MatmulTile => self.emit_qmv(node),
             SubOp::RmsNorm { eps } => self.emit_rmsnorm(node, eps),
@@ -1379,7 +1379,7 @@ impl<'a> Ser<'a> {
     /// A cross-worker partial is read from this worker's ACQUIREd private copy
     /// (the `read_operand` redirect), so the arm just adds the operands it is
     /// handed; `eval_node`'s `SumReduce` is the bit-exact reference.
-    fn emit_sum_reduce(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+    fn emit_sum_reduce(&mut self, node: &SubtileNode<F, K>) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let n = node.output.region.cols.len;
         let mut slots = Vec::with_capacity(node.inputs.len() + 1);
@@ -1404,7 +1404,7 @@ impl<'a> Ser<'a> {
     ///     w/scales/biases carry the within-row K-offset `kb.start` (group-
     ///     aligned). A split-K partial writes to ARENA + is PUBLISHed (the
     ///     coherent fuse only applies to single-reduction N-block outputs).
-    fn emit_qmv(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+    fn emit_qmv(&mut self, node: &SubtileNode<F, K>) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let act = &node.inputs[0];
         let wtr = &node.inputs[1];
@@ -1529,7 +1529,7 @@ impl<'a> Ser<'a> {
     /// Whether a `MatmulTile` is a split-K partial — its weight reads a K-window
     /// narrower than the full weight row. Such a qmv carries `row_vec`, writes
     /// to arena, and is PUBLISHed (vs the coherent fuse for N-block outputs).
-    fn qmv_is_split_k(&self, node: &SubtileNode) -> bool {
+    fn qmv_is_split_k(&self, node: &SubtileNode<F, K>) -> bool {
         matches!(node.op, SubOp::MatmulTile)
             && node.inputs.len() >= 2
             && self.graph.shape(node.inputs[1].tensor).cols != node.inputs[1].region.cols.len
@@ -1539,7 +1539,7 @@ impl<'a> Ser<'a> {
     /// An N-block matmul handoff wrote the coherent slot directly (QMV_COH) →
     /// NO publish; everything else with a cross-worker output (rope/silu/add,
     /// and split-K matmul partials, which write arena) publishes from arena.
-    fn needs_publish(&self, node: &SubtileNode) -> bool {
+    fn needs_publish(&self, node: &SubtileNode<F, K>) -> bool {
         // Publish iff it crosses workers AND it is not an N-block matmul (the
         // only kind that fused into the coherent slot via QMV_COH). A split-K
         // matmul partial and any non-matmul op write arena ⇒ they publish.
@@ -1550,7 +1550,7 @@ impl<'a> Ser<'a> {
 
     /// RMSNORM: operands `[out, in, weight]`; shape `(RMSNORM, hidden,
     /// eps_bits)`. The gain is a `Dense` source.
-    fn emit_rmsnorm(&mut self, node: &SubtileNode, eps: f32) -> Result<(u32, u32), SerializeError> {
+    fn emit_rmsnorm(&mut self, node: &SubtileNode<F, K>, eps: f32) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let out = self.write_operand(&node.output, id)?;
         let inp = self.read_operand(&node.inputs[0], id)?;
@@ -1572,7 +1572,7 @@ impl<'a> Ser<'a> {
     /// row at `+ rot_dim/2`, derived in the arm.)
     fn emit_rope(
         &mut self,
-        node: &SubtileNode,
+        node: &SubtileNode<F, K>,
         head_dim: u32,
     ) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
@@ -1645,7 +1645,7 @@ impl<'a> Ser<'a> {
     /// cache operands. Full rope (`rot_dim == head_dim`), matching `RopeRotate`.
     fn emit_rope_append(
         &mut self,
-        node: &SubtileNode,
+        node: &SubtileNode<F, K>,
         head_dim: u32,
         layer: u32,
     ) -> Result<(u32, u32), SerializeError> {
@@ -1707,7 +1707,7 @@ impl<'a> Ser<'a> {
 
     /// SILU_MUL: operands `[out, gate, up]`; shape `(SILU_MUL, n)`. The
     /// fused SwiGLU `out = silu(gate) * up`.
-    fn emit_silu_mul(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+    fn emit_silu_mul(&mut self, node: &SubtileNode<F, K>) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let out = self.write_operand(&node.output, id)?;
         let gate = self.read_operand(&node.inputs[0], id)?;
@@ -1719,7 +1719,7 @@ impl<'a> Ser<'a> {
     }
 
     /// ADD: operands `[out, a, b]`; shape `(ADD, n)`. Residual add.
-    fn emit_add(&mut self, node: &SubtileNode) -> Result<(u32, u32), SerializeError> {
+    fn emit_add(&mut self, node: &SubtileNode<F, K>) -> Result<(u32, u32), SerializeError> {
         let id = node.id.0;
         let out = self.write_operand(&node.output, id)?;
         let a = self.read_operand(&node.inputs[0], id)?;
@@ -1743,7 +1743,7 @@ impl<'a> Ser<'a> {
     /// slice), so the arm loops local heads and maps `qh_start + local` → kv.
     fn emit_attn(
         &mut self,
-        node: &SubtileNode,
+        node: &SubtileNode<F, K>,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -1854,7 +1854,7 @@ mod tests {
     use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
     use crate::metal_tape::{WeightBundle, WeightLoc, WeightRole};
     use crate::region_schedule::{ScheduleParams, partition_roundrobin, schedule_wavefront};
-    use crate::subtile_ir::{SourceShape, SubtileNode, lower_region};
+    use crate::subtile_ir::{SourceShape, SubtileNode, TestShape2x4, lower_region};
 
     const ACT_ELEM: u32 = 2;
     fn geom() -> Geometry {
@@ -1864,7 +1864,7 @@ mod tests {
             max_blocks: 4,
         }
     }
-    fn cost_area(node: &SubtileNode) -> f64 {
+    fn cost_area<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(node: &SubtileNode<F, K>) -> f64 {
         (node.output.region.rows.len * node.output.region.cols.len) as f64
     }
     fn wloc(op_idx: u32) -> WeightLoc {
@@ -1945,7 +1945,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
         assert_eq!(g.nodes.len(), 4, "ceil(128/32) blocks");
         let s = partition_roundrobin(&g, 1); // all blocks on worker 0, ascending id
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
@@ -2014,7 +2014,7 @@ mod tests {
             result: 1,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1), qweight(2)];
-        let g = lower_region(&input, std::num::NonZeroU32::new(64).unwrap()); // n0=128 → 2 blocks of 64
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(64).unwrap()); // n0=128 → 2 blocks of 64
 
         // P=1: a single worker reads its own arena writes → no handoff.
         let p1 = serialize(&g, &partition_roundrobin(&g, 1), &sources, geom()).expect("p1");
@@ -2100,7 +2100,7 @@ mod tests {
             dense(2, WeightBundle::CosSin),
             dense(3, WeightBundle::CosSin),
         ];
-        let g = lower_region(&input, std::num::NonZeroU32::new(h).unwrap()); // 1 qmv block + 1 rope
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(h).unwrap()); // 1 qmv block + 1 rope
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2229,7 +2229,7 @@ mod tests {
             SourceDesc::PrefixK { layer },
             SourceDesc::PrefixV { layer },
         ];
-        let g = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap()); // coarse: 1 block each
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(1000).unwrap()); // coarse: 1 block each
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2384,7 +2384,7 @@ mod tests {
     fn attn_subchain_structure_and_flags() {
         let (input, sources) = attn_subchain();
         let nb = 8u32; // qdim 16→2, kvdim 8→1, h 16→2 blocks
-        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
         // 1 rms + 2 q + 1 k + 1 v + 1 rope + 1 rope + 1 attn + 2 o + 2 add = 12
         // (the residual add is elementwise ⇒ tiled by nb like the GEMMs; rope/
         // attn stay whole in lower_region — head-tiling lives in lower_partitioned).
@@ -2464,7 +2464,7 @@ mod tests {
     #[test]
     fn byte_serialization_sizes() {
         let (input, sources) = attn_subchain();
-        let g = lower_region(&input, std::num::NonZeroU32::new(8).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(8).unwrap());
         let s = schedule_wavefront(
             &g,
             cost_area,
@@ -2628,7 +2628,7 @@ mod tests {
         let (input, sources) = full_layer();
         let fused = fuse_silu_mul(&input);
         // Coarse (one block per gemm) gives a clean op histogram.
-        let g = lower_region(&fused, std::num::NonZeroU32::new(1000).unwrap());
+        let g = lower_region::<TestShape2x4>(&fused, std::num::NonZeroU32::new(1000).unwrap());
         // 15 ops after fusion, coarse ⇒ 15 nodes.
         assert_eq!(g.nodes.len(), 15);
         for p in [1u32, 4, 10] {
@@ -2664,7 +2664,7 @@ mod tests {
             assert_eq!(hist.get(&op_kind::ADD), Some(&2), "two residual adds");
         }
         // N-block tiling still serializes (more qmv blocks, same op set).
-        let gt = lower_region(&fused, std::num::NonZeroU32::new(8).unwrap());
+        let gt = lower_region::<TestShape2x4>(&fused, std::num::NonZeroU32::new(8).unwrap());
         let st = schedule_wavefront(
             &gt,
             cost_area,
@@ -2734,7 +2734,7 @@ mod tests {
             dense(3, WeightBundle::CosSin),
             dense(4, WeightBundle::CosSin),
         ];
-        let g = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(1000).unwrap());
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
 
@@ -2821,7 +2821,7 @@ mod tests {
             result: 1,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, std::num::NonZeroU32::new(8).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(8).unwrap());
         let s = partition_roundrobin(&g, 1);
         let err = serialize(&g, &s, &sources, geom()).unwrap_err();
         assert!(
@@ -2905,7 +2905,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
         let s = partition_roundrobin(&g, 1); // all 4 blocks on worker 0
         // Tranche mode groups the 4 independent blocks into one packed tranche.
         let prog = serialize_mode(&g, &s, &sources, geom(), EmitMode::Tranche).expect("serialize");
@@ -2940,7 +2940,7 @@ mod tests {
             result: 0,
         };
         let sources = vec![dense(0, WeightBundle::Embedding), qweight(1)];
-        let g = lower_region(&input, std::num::NonZeroU32::new(64).unwrap()); // nb ≥ n ⇒ one block
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(64).unwrap()); // nb ≥ n ⇒ one block
         let s = partition_roundrobin(&g, 1);
         let prog = serialize(&g, &s, &sources, geom()).expect("serialize");
         assert_eq!(prog.tape.len(), 1);

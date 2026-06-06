@@ -47,8 +47,8 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 
 use crate::subtile_ir::{
-    KvCacheLayout, KvCacheProducer, RopeForm, SoftmaxStateId, SubOp, SubtileId, SubtileIR,
-    SubtileNode, TensorId, TensorRegion,
+    KvCacheLayout, KvCacheProducer, KvCacheShape, RopeForm, SoftmaxStateId, SubOp, SubtileId,
+    SubtileIR, SubtileNode, TensorId, TensorRegion,
 };
 use crate::subtile_tape::{
     Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
@@ -85,8 +85,8 @@ const ALL_ROLE: WarpRole = WarpRole::All;
 // ── Lowering state ──────────────────────────────────────────────────
 
 /// Mutable state carried through the syntax-directed walk.
-struct LoweringState<'g, F: RopeForm> {
-    graph: &'g SubtileIR<F>,
+struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
+    graph: &'g SubtileIR<F, K>,
     /// Top-level instruction stack. `lower_*` helpers push to whichever
     /// slot is on top (the outermost is `tape.instrs`; an open
     /// `OpenLoop` pushes a new buffer; `CloseLoop` pops and wraps as
@@ -134,8 +134,8 @@ struct LoweringState<'g, F: RopeForm> {
     active_loop_stack: Vec<u32>,
 }
 
-impl<'g, F: RopeForm> LoweringState<'g, F> {
-    fn new(graph: &'g SubtileIR<F>) -> Self {
+impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
+    fn new(graph: &'g SubtileIR<F, K>) -> Self {
         Self {
             graph,
             instr_stack: vec![Vec::new()],
@@ -227,13 +227,13 @@ impl<'g, F: RopeForm> LoweringState<'g, F> {
         v
     }
 
-    fn intern_kv_layout(&mut self, layout: KvCacheLayout) -> KvLayoutId {
+    fn intern_kv_layout(&mut self, layout: KvCacheLayout<K>) -> KvLayoutId {
         let key = layout.cache_tensor();
         if let Some(id) = self.kv_layout_index.get(&key) {
             return *id;
         }
         let id = KvLayoutId(self.kv_layouts.len() as u32);
-        self.kv_layouts.push(KvLayoutEntry { layout });
+        self.kv_layouts.push(KvLayoutEntry::from_witness(layout));
         self.kv_layout_index.insert(key, id);
         id
     }
@@ -255,9 +255,9 @@ impl<'g, F: RopeForm> LoweringState<'g, F> {
 /// from) to a [`TkTape`]. Conservative all-gmem routing; no analysis;
 /// validator-green by construction (the dedicated `validate_tk_tape`
 /// runs at commit 6b's exit).
-pub fn lower_tape_to_tk<F: RopeForm>(
+pub fn lower_tape_to_tk<F: RopeForm, K: KvCacheShape>(
     tape: &SubtileTape,
-    graph: &SubtileIR<F>,
+    graph: &SubtileIR<F, K>,
 ) -> TkTape {
     let mut state = LoweringState::new(graph);
 
@@ -322,7 +322,7 @@ pub fn lower_tape_to_tk<F: RopeForm>(
 // pass in commit 6+). The slot's PageId is now reachable via
 // `state.page_of(slot)`.
 
-fn lower_alloc_slot<F: RopeForm>(state: &mut LoweringState<F>, slot: SlotId) {
+fn lower_alloc_slot<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>, slot: SlotId) {
     state.alloc_page(slot);
 }
 
@@ -332,14 +332,14 @@ fn lower_alloc_slot<F: RopeForm>(state: &mut LoweringState<F>, slot: SlotId) {
 // Optimizer passes that promote a slot to shmem will add explicit
 // `PageBarrierArrive{Consumed}` here.
 
-fn lower_free_slot<F: RopeForm>(state: &mut LoweringState<F>, slot: SlotId) {
+fn lower_free_slot<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>, slot: SlotId) {
     state.release_page(slot);
 }
 
 // ── SubtileTape::OpenLoop / CloseLoop ───────────────────────────────
 
-fn lower_open_loop<F: RopeForm>(
-    state: &mut LoweringState<F>,
+fn lower_open_loop<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
     var: STLoopVarId,
     bound: LoopBound,
 ) {
@@ -359,7 +359,7 @@ fn lower_open_loop<F: RopeForm>(
     state.active_loop_stack.push(var.index());
 }
 
-fn lower_close_loop<F: RopeForm>(state: &mut LoweringState<F>, var: STLoopVarId) {
+fn lower_close_loop<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>, var: STLoopVarId) {
     let popped = state
         .active_loop_stack
         .pop()
@@ -389,7 +389,7 @@ fn lower_close_loop<F: RopeForm>(state: &mut LoweringState<F>, var: STLoopVarId)
     }
 }
 
-fn apply_post_loop<F: RopeForm>(state: &mut LoweringState<F>, action: PostLoopAction) {
+fn apply_post_loop<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>, action: PostLoopAction) {
     match action {
         PostLoopAction::Finalise {
             state: smx,
@@ -412,8 +412,8 @@ fn apply_post_loop<F: RopeForm>(state: &mut LoweringState<F>, action: PostLoopAc
 
 // ── SubtileTape::Compute — the SubOp dispatch ───────────────────────
 
-fn lower_compute<F: RopeForm>(
-    state: &mut LoweringState<F>,
+fn lower_compute<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
     node_id: SubtileId,
     writes: SlotId,
     reads: &[SlotId],
@@ -477,7 +477,7 @@ fn lower_compute<F: RopeForm>(
         SubOp::SiluMul => emit_silu_mul(state, node, dst_page, reads),
         SubOp::RmsNorm { eps } => emit_rmsnorm(state, node, *eps, dst_page, reads),
         SubOp::RopeRotate { head_dim, _form: _ } => {
-            emit_rope_rotate::<F>(state, node, *head_dim, dst_page, reads, RopeSide::Q);
+            emit_rope_rotate::<F, K>(state, node, *head_dim, dst_page, reads, RopeSide::Q);
         }
         SubOp::RopeAppend {
             head_dim,
@@ -485,7 +485,7 @@ fn lower_compute<F: RopeForm>(
             layout,
             _form: _,
         } => {
-            emit_rope_append::<F>(state, node, *head_dim, *layout, dst_page, reads);
+            emit_rope_append::<F, K>(state, node, *head_dim, *layout, dst_page, reads);
         }
         SubOp::AttnDecode {
             num_q_heads,
@@ -531,7 +531,7 @@ fn region_tile_shape(tr: &TensorRegion) -> TileShape {
     }
 }
 
-fn region_byte_offset<F: RopeForm>(graph: &SubtileIR<F>, tr: &TensorRegion) -> ByteOffset {
+fn region_byte_offset<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, tr: &TensorRegion) -> ByteOffset {
     // Linear row-major offset: (rows.start * cols_total + cols.start) * elem_bytes.
     let shape = graph.tensors[tr.tensor.0 as usize];
     let off = ((tr.region.rows.start as u64) * (shape.cols as u64)
@@ -540,8 +540,8 @@ fn region_byte_offset<F: RopeForm>(graph: &SubtileIR<F>, tr: &TensorRegion) -> B
     ByteOffset::from_const(off)
 }
 
-fn emit_external_load<F: RopeForm>(
-    state: &mut LoweringState<F>,
+fn emit_external_load<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
     inp: &TensorRegion,
     dst_page: PageId,
 ) {
@@ -557,8 +557,8 @@ fn emit_external_load<F: RopeForm>(
     }));
 }
 
-fn emit_store_and_arrive<F: RopeForm>(
-    state: &mut LoweringState<F>,
+fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
     out: &TensorRegion,
     dst_page: PageId,
 ) {
@@ -580,9 +580,9 @@ fn emit_store_and_arrive<F: RopeForm>(
     });
 }
 
-fn emit_matmul_tile<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_matmul_tile<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     dst_page: PageId,
 ) {
     let m = node.output.region.rows.len;
@@ -605,9 +605,9 @@ fn emit_matmul_tile<F: RopeForm>(
     });
 }
 
-fn emit_sum_reduce<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_sum_reduce<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     dst_page: PageId,
     reads: &[SlotId],
 ) {
@@ -633,9 +633,9 @@ fn emit_sum_reduce<F: RopeForm>(
     }
 }
 
-fn emit_elementwise<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_elementwise<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     kind: crate::subtile_ir::EwKind,
     dst_page: PageId,
     reads: &[SlotId],
@@ -686,9 +686,9 @@ fn emit_elementwise<F: RopeForm>(
     let _ = node;
 }
 
-fn emit_silu_mul<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_silu_mul<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     dst_page: PageId,
     reads: &[SlotId],
 ) {
@@ -704,9 +704,9 @@ fn emit_silu_mul<F: RopeForm>(
     });
 }
 
-fn emit_rmsnorm<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_rmsnorm<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     eps: f32,
     dst_page: PageId,
     reads: &[SlotId],
@@ -726,9 +726,9 @@ fn emit_rmsnorm<F: RopeForm>(
     });
 }
 
-fn emit_rope_rotate<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_rope_rotate<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     head_dim: u32,
     dst_page: PageId,
     reads: &[SlotId],
@@ -747,7 +747,7 @@ fn emit_rope_rotate<F: RopeForm>(
     // tensor's shape — the IR doesn't carry one for Q-side rotate.
     let qk_layout = synthesize_q_layout(state, node, head_dim);
     let kv_layout = state.intern_kv_layout(qk_layout);
-    state.push(rope_rotate_instr::<F>(
+    state.push(rope_rotate_instr::<F, K>(
         src_page,
         dst_page,
         cos_sin_tensor,
@@ -759,11 +759,11 @@ fn emit_rope_rotate<F: RopeForm>(
     ));
 }
 
-fn emit_rope_append<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_rope_append<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     head_dim: u32,
-    layout: KvCacheLayout,
+    layout: KvCacheLayout<K>,
     dst_page: PageId,
     reads: &[SlotId],
 ) {
@@ -773,7 +773,7 @@ fn emit_rope_append<F: RopeForm>(
     let cos_sin_tensor = node.inputs[1].tensor;
     let src_page = page_of_nth(state, reads, 0, dst_page);
     let kv_layout = state.intern_kv_layout(layout);
-    state.push(rope_rotate_instr::<F>(
+    state.push(rope_rotate_instr::<F, K>(
         src_page,
         dst_page,
         cos_sin_tensor,
@@ -786,14 +786,14 @@ fn emit_rope_append<F: RopeForm>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_attn_decode<F: RopeForm>(
-    state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn emit_attn_decode<F: RopeForm, K: KvCacheShape>(
+    state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     num_q_heads: u32,
     num_kv_heads: u32,
     head_dim: u32,
     scale: f32,
-    layout: KvCacheLayout,
+    layout: KvCacheLayout<K>,
     producer: KvCacheProducer,
     softmax_state: SoftmaxStateId,
     dst_page: PageId,
@@ -914,16 +914,16 @@ fn emit_attn_decode<F: RopeForm>(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-fn page_of_first<F: RopeForm>(
-    state: &LoweringState<F>,
+fn page_of_first<F: RopeForm, K: KvCacheShape>(
+    state: &LoweringState<F, K>,
     reads: &[SlotId],
     fallback: PageId,
 ) -> PageId {
     reads.first().map(|s| state.page_of(*s)).unwrap_or(fallback)
 }
 
-fn page_of_nth<F: RopeForm>(
-    state: &LoweringState<F>,
+fn page_of_nth<F: RopeForm, K: KvCacheShape>(
+    state: &LoweringState<F, K>,
     reads: &[SlotId],
     n: usize,
     fallback: PageId,
@@ -931,16 +931,21 @@ fn page_of_nth<F: RopeForm>(
     reads.get(n).map(|s| state.page_of(*s)).unwrap_or(fallback)
 }
 
-fn synthesize_q_layout<F: RopeForm>(
-    _state: &mut LoweringState<F>,
-    node: &SubtileNode<F>,
+fn synthesize_q_layout<F: RopeForm, K: KvCacheShape>(
+    _state: &mut LoweringState<F, K>,
+    node: &SubtileNode<F, K>,
     head_dim: u32,
-) -> KvCacheLayout {
+) -> KvCacheLayout<K> {
     // For Q-side RopeRotate the layout is synthetic — the rotated
-    // tensor is itself the cache descriptor for offset math.
+    // tensor is itself the cache descriptor for offset math. K7 gate
+    // (see partition.rs / subtile_ir.rs RopeAppend sites): the
+    // synthetic layout's numeric dims must match `K`'s associated
+    // consts. Past the gate the witness type carries the proof.
     let cols = node.output.region.cols.len;
     let num_heads = if head_dim == 0 { 1 } else { cols / head_dim };
-    KvCacheLayout::for_cache_tensor(node.output.tensor, num_heads, head_dim)
+    assert_eq!(num_heads, K::NUM_KV_HEADS);
+    assert_eq!(head_dim, K::HEAD_DIM);
+    KvCacheLayout::<K>::for_cache_tensor(node.output.tensor)
 }
 
 /// Build the const-generic-split `Instr::RopeRotate{NeoX,Interleaved}`
@@ -949,7 +954,7 @@ fn synthesize_q_layout<F: RopeForm>(
 /// dispatch site; downstream Instrs cannot mix forms by value because
 /// the variant identity itself is the witness.
 #[allow(clippy::too_many_arguments)]
-fn rope_rotate_instr<F: RopeForm>(
+fn rope_rotate_instr<F: RopeForm, K: KvCacheShape>(
     src_page: PageId,
     dst_page: PageId,
     cos_sin_tensor: TensorId,
@@ -986,7 +991,7 @@ fn rope_rotate_instr<F: RopeForm>(
     }
 }
 
-fn drain<F: RopeForm>(state: &mut LoweringState<F>) {
+fn drain<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>) {
     state.push(Instr::SyncthreadsCta { role: ALL_ROLE });
     state.push(Instr::CommitGroupBulk { role: ALL_ROLE });
     state.push(Instr::WaitGroupBulk { n: 0, role: ALL_ROLE });
@@ -1007,7 +1012,7 @@ enum PostLoopAction {
     },
 }
 
-fn active_loop_var<F: RopeForm>(state: &LoweringState<F>) -> Option<u32> {
+fn active_loop_var<F: RopeForm, K: KvCacheShape>(state: &LoweringState<F, K>) -> Option<u32> {
     state.active_loop_stack.last().copied()
 }
 

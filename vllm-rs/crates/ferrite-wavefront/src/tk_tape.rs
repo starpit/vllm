@@ -29,7 +29,7 @@
 
 use std::marker::PhantomData;
 
-use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, TensorId};
+use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, KvCacheShape, TensorId};
 
 // ── Sealed RopeForm trait (NeoX vs Interleaved) ─────────────────────
 
@@ -705,14 +705,38 @@ impl Instr {
 
 // ── Witness handles surfacing tape-side dataflow ────────────────────
 
+/// Erased KvCacheLayout for the TkTape interned table. The IR-level
+/// `KvCacheLayout<K>` carries its numeric proof at the type level via
+/// `K: KvCacheShape` (per K7); by the time we reach TkTape the proof
+/// is discharged and the lowering records the erased numeric values
+/// for emit. Constructable only via [`KvLayoutEntry::from_witness`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvLayoutEntry {
-    pub layout: KvCacheLayout,
+    cache_tensor: TensorId,
+    num_kv_heads: u32,
+    head_dim: u32,
 }
 
 impl KvLayoutEntry {
+    /// Build from a typed `KvCacheLayout<K>` witness — the K7 gate
+    /// proves the numeric values at the type level upstream; this
+    /// function records them as runtime fields for the player to emit.
+    pub fn from_witness<K: KvCacheShape>(layout: KvCacheLayout<K>) -> Self {
+        Self {
+            cache_tensor: layout.cache_tensor(),
+            num_kv_heads: K::NUM_KV_HEADS,
+            head_dim: K::HEAD_DIM,
+        }
+    }
+
     pub fn cache_tensor(&self) -> TensorId {
-        self.layout.cache_tensor()
+        self.cache_tensor
+    }
+    pub fn num_kv_heads(&self) -> u32 {
+        self.num_kv_heads
+    }
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
     }
 }
 

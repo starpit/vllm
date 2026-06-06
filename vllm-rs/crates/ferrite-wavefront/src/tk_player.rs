@@ -358,8 +358,8 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
             let _ = writeln!(
                 out,
                 "        {{{}u, {}u}},",
-                entry.layout.num_kv_heads(),
-                entry.layout.head_dim(),
+                entry.num_kv_heads(),
+                entry.head_dim(),
             );
         }
     }

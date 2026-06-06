@@ -100,8 +100,8 @@ pub struct ScheduleMetrics {
 /// and every worker emits in ascending-id order, so a producer's `Signal`
 /// always precedes — across the whole emission — the point any consumer could
 /// block on it. The scheduler therefore only has to choose a good `worker_of`.
-pub fn schedule_from_assignment(
-    graph: &SubtileIR,
+pub fn schedule_from_assignment<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    graph: &SubtileIR<F, K>,
     preds: &[Vec<SubtileId>],
     worker_of: &[u32],
     num_workers: usize,
@@ -163,7 +163,7 @@ pub fn schedule_from_assignment(
 
 /// Round-robin partition (node `i` → worker `i % p`) — a test fixture; the
 /// real assignment is [`schedule_wavefront`].
-pub fn partition_roundrobin(graph: &SubtileIR, p: u32) -> Schedule {
+pub fn partition_roundrobin<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(graph: &SubtileIR<F, K>, p: u32) -> Schedule {
     let p = p.max(1) as usize;
     let preds = predecessors(graph);
     let worker_of: Vec<u32> = (0..graph.nodes.len()).map(|i| (i % p) as u32).collect();
@@ -178,9 +178,9 @@ pub fn partition_roundrobin(graph: &SubtileIR, p: u32) -> Schedule {
 /// per-worker compute (P1) against cross-worker edges (P2). Cost is injected
 /// (`Fn(&SubtileNode) -> f64` in µs) so this crate stays decoupled from the
 /// target's cost tables; the metal compiler supplies the real `cost_us`.
-pub fn schedule_wavefront(
-    graph: &SubtileIR,
-    cost: impl Fn(&SubtileNode) -> f64,
+pub fn schedule_wavefront<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    graph: &SubtileIR<F, K>,
+    cost: impl Fn(&SubtileNode<F, K>) -> f64,
     params: ScheduleParams,
 ) -> Schedule {
     let preds = predecessors(graph);
@@ -229,7 +229,7 @@ pub fn schedule_wavefront(
 /// Cross-worker edges survive only at the genuine joins — the o_proj/down
 /// reductions and the rmsnorm broadcast — which the split-K + replication
 /// transforms remove ([`crate::partition`]).
-pub fn assign_owners_slice_index(graph: &SubtileIR, unit: u32, num_workers: u32) -> Vec<u32> {
+pub fn assign_owners_slice_index<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(graph: &SubtileIR<F, K>, unit: u32, num_workers: u32) -> Vec<u32> {
     let p = num_workers.max(1);
     let unit = unit.max(1);
     graph
@@ -240,17 +240,17 @@ pub fn assign_owners_slice_index(graph: &SubtileIR, unit: u32, num_workers: u32)
 }
 
 /// Build a [`Schedule`] from the slice-index owner assignment.
-pub fn schedule_slice_index(graph: &SubtileIR, unit: u32, num_workers: u32) -> Schedule {
+pub fn schedule_slice_index<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(graph: &SubtileIR<F, K>, unit: u32, num_workers: u32) -> Schedule {
     let preds = predecessors(graph);
     let worker_of = assign_owners_slice_index(graph, unit, num_workers);
     schedule_from_assignment(graph, &preds, &worker_of, num_workers.max(1) as usize)
 }
 
 /// Read P1 / P2 / total off a schedule under the given cost model.
-pub fn measure(
-    graph: &SubtileIR,
+pub fn measure<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    graph: &SubtileIR<F, K>,
     schedule: &Schedule,
-    cost: impl Fn(&SubtileNode) -> f64,
+    cost: impl Fn(&SubtileNode<F, K>) -> f64,
 ) -> ScheduleMetrics {
     let mut stack = vec![0f64; schedule.workers.len()];
     let mut edge_cut = 0u32;
@@ -278,7 +278,7 @@ pub fn measure(
 /// deadlock (a missing `Signal` or cyclic `Wait`s) and on any node computed
 /// before a producer it reads (a missing `Wait` edge) — the bugs host-first
 /// is meant to catch.
-pub fn play(graph: &SubtileIR, schedule: &Schedule, sources: &[&[f32]]) -> Vec<Vec<f32>> {
+pub fn play<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(graph: &SubtileIR<F, K>, schedule: &Schedule, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     assert_eq!(
         sources.len(),
         graph.num_sources as usize,
@@ -364,7 +364,7 @@ pub fn play(graph: &SubtileIR, schedule: &Schedule, sources: &[&[f32]]) -> Vec<V
 mod tests {
     use super::*;
     use crate::lower::{InputRef, LoweredOp, LoweringInput, OpDesc};
-    use crate::subtile_ir::{SourceShape, lower_region, result_buffer};
+    use crate::subtile_ir::{SourceShape, TestShape2x4, lower_region, result_buffer};
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
@@ -415,7 +415,7 @@ mod tests {
         (input, vec![act, w1, w2])
     }
 
-    fn cost_area(node: &SubtileNode) -> f64 {
+    fn cost_area<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(node: &SubtileNode<F, K>) -> f64 {
         (node.output.region.rows.len * node.output.region.cols.len) as f64
     }
 
@@ -428,7 +428,7 @@ mod tests {
         let (input, data) = chain_input(24, 16, 20);
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         for nb in [4u32, 8, 1000] {
-            let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+            let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
             let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
             for p in [1u32, 2, 4, 10] {
                 let s = schedule_wavefront(
@@ -472,7 +472,7 @@ mod tests {
         let (input, data) = chain_input(24, 16, 20);
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         let nb = 4u32;
-        let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
         let want = result_buffer(&g, &crate::subtile_ir::eval_dag(&g, &srcs)).to_vec();
         // gemm1 → 4 blocks (ids 0..4, cols 0,4,8,12); silu → 4 tiles (ids 4..8,
         // same cols); gemm2 → 5 blocks reading whole silu.
@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn flag_invariants() {
         let (input, _) = chain_input(24, 16, 20);
-        let g = lower_region(&input, std::num::NonZeroU32::new(4).unwrap()); // n-block so producers split
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(4).unwrap()); // n-block so producers split
 
         let s1 = partition_roundrobin(&g, 1);
         assert_eq!(s1.num_flags, 0, "p=1 → no cross-worker edges");
@@ -561,7 +561,7 @@ mod tests {
             }],
             result: 0,
         };
-        let g = lower_region(&input, std::num::NonZeroU32::new(4).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(4).unwrap());
         assert_eq!(g.nodes.len(), 30, "ceil(120/4) blocks");
         let s = schedule_wavefront(
             &g,

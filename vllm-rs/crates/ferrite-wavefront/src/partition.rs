@@ -35,9 +35,9 @@ use std::marker::PhantomData;
 
 use crate::lower::{InputRef, LoweredOp, LoweringInput};
 use crate::subtile_ir::{
-    EwKind, KvCacheLayout, KvCacheProducer, NeoX, Range, Region, SoftmaxStateId, SubOp, SubtileId,
-    SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape, head_blocks, n_blocks,
-    op_out_cols,
+    EwKind, KvCacheLayout, KvCacheProducer, KvCacheShape, NeoX, Range, Region, SoftmaxStateId,
+    SubOp, SubtileId, SubtileIR, SubtileNode, TensorId, TensorRegion, TensorShape, head_blocks,
+    n_blocks, op_out_cols,
 };
 
 /// Lower a decode `LoweringInput` to its tensor-parallel partition: the
@@ -49,12 +49,12 @@ use crate::subtile_ir::{
 /// Everything else is N-block / head-tile / column-tile; rmsnorm/add stay whole
 /// (replicated by [`replicate_whole_ops`]). Returns `(graph, owner)` for
 /// [`crate::region_schedule::schedule_from_assignment`].
-pub fn lower_partitioned(
+pub fn lower_partitioned<K: KvCacheShape>(
     input: &LoweringInput,
     head_dim: u32,
     mlp_unit: u32,
     p: u32,
-) -> (SubtileIR<NeoX>, Vec<u32>) {
+) -> (SubtileIR<NeoX, K>, Vec<u32>) {
     /// One op's output: partitioned (a single tensor written by per-block
     /// nodes) or replicated (P per-worker whole copies — a consumer on worker
     /// `w` reads copy `w`, so the backbone is local to every worker).
@@ -102,7 +102,7 @@ pub fn lower_partitioned(
             cols: s.cols,
         })
         .collect();
-    let mut nodes: Vec<SubtileNode<NeoX>> = Vec::new();
+    let mut nodes: Vec<SubtileNode<NeoX, K>> = Vec::new();
     let mut k_cache_producer_node: HashMap<TensorId, u32> = HashMap::new();
     let mut next_softmax_state: u32 = 0;
     let mut owner: Vec<u32> = Vec::new();
@@ -220,7 +220,7 @@ pub fn lower_partitioned(
                         by_worker[w as usize].push(pt);
                     }
                     let sum_node =
-                        |nodes: &mut Vec<SubtileNode>, ins: &[TensorId], out: TensorId| {
+                        |nodes: &mut Vec<SubtileNode<NeoX, K>>, ins: &[TensorId], out: TensorId| {
                             let id = SubtileId(nodes.len() as u32);
                             nodes.push(SubtileNode {
                                 id,
@@ -331,14 +331,22 @@ pub fn lower_partitioned(
                 // producer (if any rope_append wrote it earlier in the
                 // same forward), and the softmax state id.
                 let (prefix_k_t, _, _) = resolve(desc.inputs[1], 0, &op_out, &op_cols, &tensors);
-                let layout = KvCacheLayout::for_cache_tensor(prefix_k_t, num_kv_heads, hd);
+                // K-side runtime gate (per K7 + feedback_end_to_end_compile_time_proofs):
+                // assert that orchestrator-supplied num_kv_heads/head_dim
+                // match `LlamaShape8x64`'s associated consts. Past this
+                // gate the witness is type-typed; producer/consumer
+                // drift between KvCacheLayout<K1> and KvCacheLayout<K2>
+                // is a rustc `mismatched types` error.
+                assert_eq!(num_kv_heads, K::NUM_KV_HEADS);
+                assert_eq!(hd, K::HEAD_DIM);
+                let layout = KvCacheLayout::<K>::for_cache_tensor(prefix_k_t);
                 let producer = match k_cache_producer_node.get(&prefix_k_t) {
                     Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
                     None => KvCacheProducer::pre_populated_ext(),
                 };
                 let softmax_state = SoftmaxStateId::new(next_softmax_state);
                 next_softmax_state += 1;
-                let subop: SubOp<NeoX> = SubOp::AttnDecode {
+                let subop: SubOp<NeoX, K> = SubOp::AttnDecode {
                     num_q_heads,
                     num_kv_heads,
                     head_dim: hd,
@@ -399,7 +407,7 @@ pub fn lower_partitioned(
                 this_out = OpOut::Part(out_t);
             }
             other => {
-                let subop: SubOp<NeoX> = match other {
+                let subop: SubOp<NeoX, K> = match other {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
                     LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
@@ -419,8 +427,11 @@ pub fn lower_partitioned(
                             resolve(desc.inputs[0], 0, &op_out, &op_cols, &tensors).0
                         };
                         let num_kv_heads = (in0_cols / head_dim.max(1)).max(1);
+                        // K7 runtime gate (see AttnDecode site for rationale).
+                        assert_eq!(num_kv_heads, K::NUM_KV_HEADS);
+                        assert_eq!(head_dim, K::HEAD_DIM);
                         let layout =
-                            KvCacheLayout::for_cache_tensor(k_cache_t, num_kv_heads, head_dim);
+                            KvCacheLayout::<K>::for_cache_tensor(k_cache_t);
                         k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                         SubOp::RopeAppend {
                             head_dim,
@@ -590,7 +601,7 @@ mod tests {
     use crate::metal_tape::{BufferRef, WeightBundle, WeightLoc, WeightRole};
     use crate::region_schedule::{TapeInstr, play, schedule_from_assignment};
     use crate::subtile_ir::{
-        SourceShape, eval_dag, lower_region, predecessors, result_buffer, validate,
+        SourceShape, TestShape2x4, eval_dag, lower_region, predecessors, result_buffer, validate,
     };
 
     fn rng_fill(n: usize, seed: u64) -> Vec<f32> {
@@ -764,11 +775,11 @@ mod tests {
         let (input, data, hd) = decode_layer();
         let srcs: Vec<&[f32]> = data.iter().map(|v| v.as_slice()).collect();
         // Bit-exact reference (N-block, single reduction per output).
-        let gref = lower_region(&input, std::num::NonZeroU32::new(1000).unwrap());
+        let gref = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(1000).unwrap());
         let want = result_buffer(&gref, &eval_dag(&gref, &srcs)).to_vec();
 
         for p in [1u32, 2, 4, 8, 10] {
-            let (g, owner) = lower_partitioned(&input, hd, hd, p);
+            let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
             assert!(validate(&g).is_ok(), "partitioned graph valid (p={p})");
             assert_eq!(owner.len(), g.nodes.len());
             assert!(owner.iter().all(|&w| w < p), "owners in range (p={p})");
@@ -809,7 +820,7 @@ mod tests {
     fn reductions_are_split_k_and_centralized() {
         let p = 4u32;
         let (input, _data, hd) = decode_layer();
-        let (g, owner) = lower_partitioned(&input, hd, hd, p);
+        let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
         let global_reduces: Vec<usize> = g
             .nodes
             .iter()
@@ -838,7 +849,7 @@ mod tests {
     fn whole_ops_are_replicated_per_worker() {
         let p = 4u32;
         let (input, _data, hd) = decode_layer();
-        let (g, owner) = lower_partitioned(&input, hd, hd, p);
+        let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
         // 2 rmsnorm + 2 add = 4 whole-ops → 4·P copies, balanced one per worker.
         let rms = g
             .nodes
@@ -871,7 +882,7 @@ mod tests {
     fn q_head_chain_is_local() {
         let (input, _data, hd) = decode_layer();
         let p = 4u32;
-        let (g, owner) = lower_partitioned(&input, hd, hd, p);
+        let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
         // For every attn node, the matching q-rope / o-partial nodes (same
         // q-head columns) share its owner. Find attn nodes and their column.
         let preds = predecessors(&g);
@@ -929,7 +940,7 @@ mod tests {
     fn cross_worker_edges_only_at_genuine_joins() {
         for p in [2u32, 4, 8, 10] {
             let (input, _data, hd) = decode_layer();
-            let (g, owner) = lower_partitioned(&input, hd, hd, p);
+            let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
             let preds = predecessors(&g);
             let mut cross = 0u32;
             for (cid, ps) in preds.iter().enumerate() {
@@ -1034,7 +1045,7 @@ mod tests {
             i[0] == 0 && prog.shapes[i[1] as usize][0] == op
         };
         for p in [1u32, 2, 4] {
-            let (g, owner) = lower_partitioned(&input, hd, hd, p);
+            let (g, owner) = lower_partitioned::<TestShape2x4>(&input, hd, hd, p);
             let preds = predecessors(&g);
             let sched = schedule_from_assignment(&g, &preds, &owner, p as usize);
             let prog = serialize(&g, &sched, &sources, geom)

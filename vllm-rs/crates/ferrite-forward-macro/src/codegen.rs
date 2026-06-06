@@ -6090,7 +6090,9 @@ fn dump_wavefront_mega(
         // mega-side rg/sched + the ferrite-runtime build are separate
         // paths that don't share an nb knob).
         let nb = NonZeroU32::new(256).expect("256 != 0");
-        let rg = ferrite_wavefront::subtile_ir::lower_region(&fused, nb);
+        let rg = ferrite_wavefront::subtile_ir::lower_region::<
+            ferrite_wavefront::subtile_ir::LlamaShape8x64,
+        >(&fused, nb);
         match ferrite_wavefront::subtile_ir::ValidatedGraph::new(&rg) {
             Ok(valid) => {
                 let subtile_tape = ferrite_wavefront::subtile_tape::lower_dag_to_tape(&valid);
@@ -6179,12 +6181,9 @@ fn dump_wavefront_mega(
         // (measured ~7.3ms COMPUTE_ONLY at 256 vs ~7.9ms at head_dim=64), but
         // too coarse leaves cores idle (unit=512 = 8.3ms, unit=1024 = 8.8ms).
         let mlp_unit = env_u32("FERRITE_WAVEFRONT_MLP_UNIT", head_dim);
-        let (g, owner) = ferrite_wavefront::partition::lower_partitioned(
-            &fused,
-            head_dim,
-            mlp_unit,
-            num_workers,
-        );
+        let (g, owner) = ferrite_wavefront::partition::lower_partitioned::<
+            ferrite_wavefront::subtile_ir::LlamaShape8x64,
+        >(&fused, head_dim, mlp_unit, num_workers);
         let preds = ferrite_wavefront::subtile_ir::predecessors(&g);
         let sched = ferrite_wavefront::region_schedule::schedule_from_assignment(
             &g,

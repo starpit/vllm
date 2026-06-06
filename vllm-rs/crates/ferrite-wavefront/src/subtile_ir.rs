@@ -218,6 +218,73 @@ pub enum RopeFormTag {
     Interleaved,
 }
 
+// ── KvCacheShape sealed trait ────────────────────────────────────────
+//
+// Per plan §5 K7 + memory/feedback_end_to_end_compile_time_proofs (both
+// INVIOLABLE): KvCacheLayout's discriminating dimensions
+// (`num_kv_heads`, `head_dim`) MUST propagate as Rust const generics
+// with `where`-clauses end-to-end so a producer/consumer layout drift
+// (e.g. RopeAppend writes `num_kv_heads=8` while AttnDecode reads
+// `num_kv_heads=4` on the same `cache_tensor`) is a `mismatched types`
+// rustc error, not a runtime divergence.
+//
+// `KvCacheShape` is a sealed marker trait whose impls carry the const
+// numeric values. `KvCacheLayout<K>` is generic over a shape; SubOp /
+// SubtileNode / SubtileIR thread `K: KvCacheShape` so producer-side
+// `RopeAppend.layout: KvCacheLayout<K>` and consumer-side
+// `AttnDecode.layout: KvCacheLayout<K>` must literally unify.
+
+pub mod kv_shape_seal {
+    pub trait Sealed {}
+}
+
+/// Sealed marker trait carrying the K/V cache layout's numeric proof
+/// (per-token `num_kv_heads * head_dim` row width) at the type level.
+///
+/// Two `KvCacheLayout<K1>` and `KvCacheLayout<K2>` with `K1 != K2` are
+/// distinct Rust types — passing one where the other is expected is a
+/// rustc error. This is the K7 compile-time witness.
+pub trait KvCacheShape:
+    kv_shape_seal::Sealed + Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + 'static
+{
+    const NUM_KV_HEADS: u32;
+    const HEAD_DIM: u32;
+    /// Per-token K (or V) row width in elements.
+    const ROW_ELEMENTS: u32 = Self::NUM_KV_HEADS * Self::HEAD_DIM;
+}
+
+/// Llama-3.2-1B's K/V cache shape: 8 KV heads × 64 head_dim. The
+/// default for `KvCacheLayout<K>` and the `K` parameter on
+/// `SubOp` / `SubtileNode` / `SubtileIR`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LlamaShape8x64 {}
+impl kv_shape_seal::Sealed for LlamaShape8x64 {}
+impl KvCacheShape for LlamaShape8x64 {
+    const NUM_KV_HEADS: u32 = 8;
+    const HEAD_DIM: u32 = 64;
+}
+
+/// Test-only K/V cache shape: 1 KV head × 4 head_dim. Used by unit
+/// tests that need a small synthetic graph without dragging in a
+/// real Llama-sized tensor footprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TestShape1x4 {}
+impl kv_shape_seal::Sealed for TestShape1x4 {}
+impl KvCacheShape for TestShape1x4 {
+    const NUM_KV_HEADS: u32 = 1;
+    const HEAD_DIM: u32 = 4;
+}
+
+/// Test-only K/V cache shape: 2 KV heads × 4 head_dim. Used by the
+/// partition / mega tests' `decode_layer` fixture (hkv=2, hd=4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TestShape2x4 {}
+impl kv_shape_seal::Sealed for TestShape2x4 {}
+impl KvCacheShape for TestShape2x4 {
+    const NUM_KV_HEADS: u32 = 2;
+    const HEAD_DIM: u32 = 4;
+}
+
 /// **`KvCacheLayout`** — sealed witness naming the K-cache (or V-cache)
 /// tensor a single forward reads from / writes to. The orchestrator
 /// builds ONE per cache tensor; `RopeAppend`'s write and `AttnDecode`'s
@@ -228,37 +295,51 @@ pub enum RopeFormTag {
 ///
 /// ```compile_fail
 /// // Sealed: external code cannot construct a KvCacheLayout via the
-/// // struct literal because the `_seal: sealed::Seal` field is
-/// // private and Seal's only inner field is pub(super)-restricted.
-/// // The only path is `KvCacheLayout::for_cache_tensor(...)`, which
-/// // makes layout drift (a divergent producer / consumer fabrication)
-/// // structurally impossible.
-/// use ferrite_wavefront::subtile_ir::{KvCacheLayout, TensorId};
-/// let _ = KvCacheLayout {
+/// // struct literal because the `_seal: sealed::Seal` and `_shape`
+/// // fields are private. The only path is
+/// // `KvCacheLayout::<K>::for_cache_tensor(...)`, which makes layout
+/// // drift (a divergent producer / consumer fabrication) structurally
+/// // impossible — and producer/consumer numeric drift between
+/// // different K's is itself a `mismatched types` rustc error.
+/// use ferrite_wavefront::subtile_ir::{KvCacheLayout, TensorId, LlamaShape8x64};
+/// let _ = KvCacheLayout::<LlamaShape8x64> {
 ///     cache_tensor: TensorId(0),
-///     num_kv_heads: 2,
-///     head_dim: 4,
+///     _shape: std::marker::PhantomData,
 /// };
 /// ```
+/// `KvCacheLayout<K>` — sealed value-typed witness whose numeric
+/// dimensions live at the TYPE level via `K: KvCacheShape`. Two
+/// `KvCacheLayout<K1>` and `KvCacheLayout<K2>` with `K1 != K2` are
+/// distinct Rust types — producer-side `RopeAppend.layout:
+/// KvCacheLayout<K>` and consumer-side `AttnDecode.layout:
+/// KvCacheLayout<K>` must literally unify (per K7 / plan §5 line 394).
+///
+/// ```compile_fail
+/// // K7 type-level guard: a KvCacheLayout<TestShape1x4> cannot be
+/// // passed where a KvCacheLayout<LlamaShape8x64> is expected. This
+/// // is the Paris-decode bug surfacing as a Rust type error.
+/// use ferrite_wavefront::subtile_ir::{
+///     KvCacheLayout, LlamaShape8x64, TensorId, TestShape1x4,
+/// };
+/// fn want_llama(_: KvCacheLayout<LlamaShape8x64>) {}
+/// let drift = KvCacheLayout::<TestShape1x4>::for_cache_tensor(TensorId(0));
+/// want_llama(drift); // expected `KvCacheLayout<LlamaShape8x64>`,
+///                    // found `KvCacheLayout<TestShape1x4>`
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct KvCacheLayout {
+pub struct KvCacheLayout<K: KvCacheShape = LlamaShape8x64> {
     cache_tensor: TensorId,
-    num_kv_heads: u32,
-    head_dim: u32,
+    _shape: std::marker::PhantomData<K>,
     _seal: sealed::Seal,
 }
 
-impl KvCacheLayout {
-    /// Sealed constructor binding `cache_tensor` into the witness.
-    pub const fn for_cache_tensor(
-        cache_tensor: TensorId,
-        num_kv_heads: u32,
-        head_dim: u32,
-    ) -> Self {
+impl<K: KvCacheShape> KvCacheLayout<K> {
+    /// Sealed constructor binding `cache_tensor` into the witness;
+    /// `num_kv_heads` and `head_dim` come from `K`'s associated consts.
+    pub const fn for_cache_tensor(cache_tensor: TensorId) -> Self {
         Self {
             cache_tensor,
-            num_kv_heads,
-            head_dim,
+            _shape: std::marker::PhantomData,
             _seal: sealed::Seal(()),
         }
     }
@@ -266,15 +347,18 @@ impl KvCacheLayout {
     pub const fn cache_tensor(&self) -> TensorId {
         self.cache_tensor
     }
+    #[inline]
     pub const fn num_kv_heads(&self) -> u32 {
-        self.num_kv_heads
+        K::NUM_KV_HEADS
     }
+    #[inline]
     pub const fn head_dim(&self) -> u32 {
-        self.head_dim
+        K::HEAD_DIM
     }
     /// Per-token K (or V) row width in elements.
+    #[inline]
     pub const fn row_elements(&self) -> u32 {
-        self.num_kv_heads * self.head_dim
+        K::ROW_ELEMENTS
     }
 }
 
@@ -364,7 +448,7 @@ impl SoftmaxStateId {
 /// Every variant has a `cpu_golden`-backed host evaluation in
 /// [`eval_node`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SubOp<F: RopeForm = NeoX> {
+pub enum SubOp<F: RopeForm = NeoX, K: KvCacheShape = LlamaShape8x64> {
     /// Matmul output tile over one K-chunk:
     /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
     /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
@@ -407,7 +491,7 @@ pub enum SubOp<F: RopeForm = NeoX> {
     RopeAppend {
         head_dim: u32,
         layer: u32,
-        layout: KvCacheLayout,
+        layout: KvCacheLayout<K>,
         #[doc(hidden)]
         _form: PhantomData<F>,
     },
@@ -422,7 +506,7 @@ pub enum SubOp<F: RopeForm = NeoX> {
         num_kv_heads: u32,
         head_dim: u32,
         scale: f32,
-        layout: KvCacheLayout,
+        layout: KvCacheLayout<K>,
         producer: KvCacheProducer,
         softmax_state: SoftmaxStateId,
     },
@@ -436,9 +520,9 @@ pub enum SubOp<F: RopeForm = NeoX> {
 /// `[output.region.rows.len, output.region.cols.len]` buffer that is
 /// scattered into the output tensor.
 #[derive(Clone, Debug)]
-pub struct SubtileNode<F: RopeForm = NeoX> {
+pub struct SubtileNode<F: RopeForm = NeoX, K: KvCacheShape = LlamaShape8x64> {
     pub id: SubtileId,
-    pub op: SubOp<F>,
+    pub op: SubOp<F, K>,
     pub inputs: Vec<TensorRegion>,
     pub output: TensorRegion,
 }
@@ -449,16 +533,16 @@ pub struct SubtileNode<F: RopeForm = NeoX> {
 /// that write the overlapping region (so a single pass over `nodes` is
 /// a valid evaluation order).
 #[derive(Clone, Debug)]
-pub struct SubtileIR<F: RopeForm = NeoX> {
+pub struct SubtileIR<F: RopeForm = NeoX, K: KvCacheShape = LlamaShape8x64> {
     pub tensors: Vec<TensorShape>,
     /// `tensors[0..num_sources]` are leaf sources.
     pub num_sources: u32,
-    pub nodes: Vec<SubtileNode<F>>,
+    pub nodes: Vec<SubtileNode<F, K>>,
     /// The tensor whose buffer is the forward result (logits).
     pub result: TensorId,
 }
 
-impl<F: RopeForm> SubtileIR<F> {
+impl<F: RopeForm, K: KvCacheShape> SubtileIR<F, K> {
     pub fn shape(&self, t: TensorId) -> TensorShape {
         self.tensors[t.0 as usize]
     }
@@ -475,9 +559,9 @@ impl<F: RopeForm> SubtileIR<F> {
 // ── Host evaluation ────────────────────────────────────────────────
 
 /// Gather a tensor region into a dense row-major `(buf, rows, cols)`.
-fn gather<F: RopeForm>(
+fn gather<F: RopeForm, K: KvCacheShape>(
     tr: &TensorRegion,
-    graph: &SubtileIR<F>,
+    graph: &SubtileIR<F, K>,
     bufs: &[Vec<f32>],
 ) -> (Vec<f32>, u32, u32) {
     let shape = graph.shape(tr.tensor);
@@ -517,7 +601,7 @@ pub fn scatter(
 /// buffer for source tensor `s` (`s < num_sources`), matching
 /// `graph.tensors[s]`. Returns the backing buffer of every tensor
 /// (indexed by [`TensorId`]); the logits are `bufs[graph.result]`.
-pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Vec<f32>> {
+pub fn eval_dag<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, sources: &[&[f32]]) -> Vec<Vec<f32>> {
     // Host-evaluator source-count check; debug-only since the
     // codegen-side validate() catches structural mismatches.
     debug_assert_eq!(
@@ -550,9 +634,9 @@ pub fn eval_dag<F: RopeForm>(graph: &SubtileIR<F>, sources: &[&[f32]]) -> Vec<Ve
 
 /// Compute one node's dense `[out_rows, out_cols]` output. Per-op
 /// arithmetic mirrors `cpu_golden`.
-pub fn eval_node<F: RopeForm>(
-    node: &SubtileNode<F>,
-    graph: &SubtileIR<F>,
+pub fn eval_node<F: RopeForm, K: KvCacheShape>(
+    node: &SubtileNode<F, K>,
+    graph: &SubtileIR<F, K>,
     bufs: &[Vec<f32>],
 ) -> Vec<f32> {
     let out_rows = node.output.region.rows.len;
@@ -758,7 +842,7 @@ pub fn eval_node<F: RopeForm>(
 }
 
 /// The forward result buffer (logits) — `bufs[graph.result]`.
-pub fn result_buffer<'a, F: RopeForm>(graph: &SubtileIR<F>, bufs: &'a [Vec<f32>]) -> &'a [f32] {
+pub fn result_buffer<'a, F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, bufs: &'a [Vec<f32>]) -> &'a [f32] {
     &bufs[graph.result.0 as usize]
 }
 
@@ -777,7 +861,7 @@ fn regions_overlap(a: Region, b: Region) -> bool {
 /// Reads of leaf sources contribute no dependency. This is the edge set
 /// the per-target lowering turns into cross-execution-unit
 /// synchronization (whatever primitive the target prefers).
-pub fn predecessors<F: RopeForm>(graph: &SubtileIR<F>) -> Vec<Vec<SubtileId>> {
+pub fn predecessors<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>) -> Vec<Vec<SubtileId>> {
     // writers[t] = (node_id, out_region) for each op-output tensor, in id order.
     let mut writers: Vec<Vec<(u32, Region)>> = vec![Vec::new(); graph.tensors.len()];
     let mut preds: Vec<Vec<SubtileId>> = Vec::with_capacity(graph.nodes.len());
@@ -810,15 +894,15 @@ pub fn predecessors<F: RopeForm>(graph: &SubtileIR<F>) -> Vec<Vec<SubtileId>> {
 /// validate-and-expect, so structural-precondition violations become
 /// "no value to consume" type errors rather than runtime panics
 /// (per `feedback_compile_time_or_garbage` and §5 K5).
-pub struct ValidatedGraph<'g, F: RopeForm> {
-    inner: &'g SubtileIR<F>,
+pub struct ValidatedGraph<'g, F: RopeForm, K: KvCacheShape = LlamaShape8x64> {
+    inner: &'g SubtileIR<F, K>,
     _seal: sealed::Seal,
 }
 
-impl<'g, F: RopeForm> ValidatedGraph<'g, F> {
+impl<'g, F: RopeForm, K: KvCacheShape> ValidatedGraph<'g, F, K> {
     /// Validate `graph` and produce the sealed witness. Returns the
     /// validation error string verbatim on failure.
-    pub fn new(graph: &'g SubtileIR<F>) -> Result<Self, String> {
+    pub fn new(graph: &'g SubtileIR<F, K>) -> Result<Self, String> {
         validate(graph)?;
         Ok(Self {
             inner: graph,
@@ -829,7 +913,7 @@ impl<'g, F: RopeForm> ValidatedGraph<'g, F> {
     /// Borrow the underlying graph. Consumers cannot fabricate a
     /// `ValidatedGraph` without going through [`Self::new`], so this
     /// borrow is proof-carrying.
-    pub fn graph(&self) -> &'g SubtileIR<F> {
+    pub fn graph(&self) -> &'g SubtileIR<F, K> {
         self.inner
     }
 }
@@ -841,7 +925,7 @@ impl<'g, F: RopeForm> ValidatedGraph<'g, F> {
 /// node count on success. Prefer [`ValidatedGraph::new`] in the
 /// wavefront lowerings (the typed witness elides downstream runtime
 /// gates).
-pub fn validate<F: RopeForm>(graph: &SubtileIR<F>) -> Result<usize, String> {
+pub fn validate<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>) -> Result<usize, String> {
     let n_tensors = graph.tensors.len() as u32;
     if graph.num_sources > n_tensors {
         return Err(format!(
@@ -1006,7 +1090,7 @@ pub(crate) fn op_out_cols(op: crate::lower::LoweredOp, in0_cols: u32) -> u32 {
 /// forms in one IR is impossible by construction (the IR's rope nodes
 /// carry `PhantomData<F>`, so a SubtileIR<NeoX> cannot hold an
 /// Interleaved-form rope node).
-pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU32) -> SubtileIR<NeoX> {
+pub fn lower_region<K: KvCacheShape>(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU32) -> SubtileIR<NeoX, K> {
     use crate::lower::{InputRef, LoweredOp};
     let num_sources = input.sources.len() as u32;
     let mut tensors: Vec<TensorShape> = input
@@ -1019,7 +1103,7 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU3
         .collect();
     let mut op_tensor: Vec<TensorId> = Vec::with_capacity(input.ops.len());
     let mut op_cols: Vec<u32> = Vec::with_capacity(input.ops.len());
-    let mut nodes: Vec<SubtileNode<NeoX>> = Vec::new();
+    let mut nodes: Vec<SubtileNode<NeoX, K>> = Vec::new();
     // RopeAppend node id keyed by the K-cache TensorId it writes — used
     // to compute `KvCacheProducer` for any AttnDecode that reads the
     // same cache later in the forward.
@@ -1107,7 +1191,7 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU3
                 // AttnDecode's KvCacheLayout/KvCacheProducer are keyed
                 // on its prefix-K input (desc.inputs[1] in the fused
                 // decode shape).
-                let subop: SubOp<NeoX> = match other {
+                let subop: SubOp<NeoX, K> = match other {
                     LoweredOp::RmsNorm { eps } => SubOp::RmsNorm { eps },
                     LoweredOp::Silu => SubOp::Elementwise(EwKind::Silu),
                     LoweredOp::Mul => SubOp::Elementwise(EwKind::Mul),
@@ -1131,8 +1215,14 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU3
                             in0_t
                         };
                         let num_kv_heads = (in0_cols / head_dim.max(1)).max(1);
+                        // K7 runtime gate: orchestrator's runtime
+                        // num_kv_heads/head_dim must match
+                        // `LlamaShape8x64`'s associated consts. Past
+                        // this gate the witness type carries the proof.
+                        assert_eq!(num_kv_heads, K::NUM_KV_HEADS);
+                        assert_eq!(head_dim, K::HEAD_DIM);
                         let layout =
-                            KvCacheLayout::for_cache_tensor(k_cache_t, num_kv_heads, head_dim);
+                            KvCacheLayout::<K>::for_cache_tensor(k_cache_t);
                         k_cache_producer_node.insert(k_cache_t, nodes.len() as u32);
                         SubOp::RopeAppend {
                             head_dim,
@@ -1149,8 +1239,10 @@ pub fn lower_region(input: &crate::lower::LoweringInput, nb: std::num::NonZeroU3
                     } => {
                         let (prefix_k_t, _, _) =
                             resolve(desc.inputs[1], &op_tensor, &op_cols, &tensors);
+                        assert_eq!(num_kv_heads, K::NUM_KV_HEADS);
+                        assert_eq!(head_dim, K::HEAD_DIM);
                         let layout =
-                            KvCacheLayout::for_cache_tensor(prefix_k_t, num_kv_heads, head_dim);
+                            KvCacheLayout::<K>::for_cache_tensor(prefix_k_t);
                         let producer = match k_cache_producer_node.get(&prefix_k_t) {
                             Some(&node_idx) => KvCacheProducer::from_rope_append(node_idx),
                             None => KvCacheProducer::pre_populated_ext(),
@@ -1522,7 +1614,7 @@ mod tests {
         ];
 
         for nb in [4u32, 8, 1000] {
-            let g = lower_region(&input, std::num::NonZeroU32::new(nb).unwrap());
+            let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(nb).unwrap());
             assert!(validate(&g).is_ok(), "valid layer nb={nb}");
             let bufs = eval_dag(&g, &srcs);
             assert_eq!(
@@ -1557,7 +1649,7 @@ mod tests {
             ],
             result: 1,
         };
-        let g = lower_region(&input, std::num::NonZeroU32::new(2).unwrap());
+        let g = lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(2).unwrap());
         let preds = predecessors(&g);
         // 3 matmul blocks (0,1,2) + 3 silu tiles (3,4,5).
         assert_eq!(g.nodes.len(), 6);

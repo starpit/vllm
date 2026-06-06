@@ -552,9 +552,9 @@ enum SlotState {
 ///    the SubtileIR predecessor set of `node`. The slots being read
 ///    are the slots most-recently written by the predecessors; missing
 ///    or extra reads = `EdgeMismatch`.
-pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm>(
+pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
     tape: &SubtileTape,
-    graph: &crate::subtile_ir::SubtileIR<F>,
+    graph: &crate::subtile_ir::SubtileIR<F, K>,
 ) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
     check_node_refs(tape, graph, &mut errors);
@@ -568,9 +568,9 @@ pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm>(
     }
 }
 
-fn check_node_refs<F: crate::subtile_ir::RopeForm>(
+fn check_node_refs<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
     tape: &SubtileTape,
-    graph: &crate::subtile_ir::SubtileIR<F>,
+    graph: &crate::subtile_ir::SubtileIR<F, K>,
     errors: &mut Vec<ValidationError>,
 ) {
     let n_nodes = graph.nodes.len() as u32;
@@ -583,9 +583,9 @@ fn check_node_refs<F: crate::subtile_ir::RopeForm>(
     }
 }
 
-fn check_compute_wellformed<F: crate::subtile_ir::RopeForm>(
+fn check_compute_wellformed<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
     tape: &SubtileTape,
-    graph: &crate::subtile_ir::SubtileIR<F>,
+    graph: &crate::subtile_ir::SubtileIR<F, K>,
     errors: &mut Vec<ValidationError>,
 ) {
     let n = graph.nodes.len();
@@ -652,9 +652,9 @@ fn check_loop_balance(tape: &SubtileTape, errors: &mut Vec<ValidationError>) {
     }
 }
 
-fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
+fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
     tape: &SubtileTape,
-    graph: &crate::subtile_ir::SubtileIR<F>,
+    graph: &crate::subtile_ir::SubtileIR<F, K>,
     errors: &mut Vec<ValidationError>,
 ) {
     let preds = crate::subtile_ir::predecessors(graph);
@@ -820,8 +820,8 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm>(
 ///
 /// The returned `SubtileTape` has been validated against `graph` via
 /// [`validate_subtile_tape`]; callers can assume well-formedness.
-pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm>(
-    valid: &crate::subtile_ir::ValidatedGraph<'_, F>,
+pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+    valid: &crate::subtile_ir::ValidatedGraph<'_, F, K>,
 ) -> SubtileTape {
     use crate::subtile_ir::{SubOp, predecessors};
 
@@ -1562,14 +1562,15 @@ mod tests {
             TensorShape { rows: 4, cols: 4 },
             TensorShape { rows: 1, cols: 4 },
         ];
-        let attn = SubtileNode {
+        use crate::subtile_ir::TestShape1x4;
+        let attn: SubtileNode<NeoX, TestShape1x4> = SubtileNode {
             id: SubtileId(0),
             op: SubOp::AttnDecode {
                 num_q_heads: 1,
                 num_kv_heads: 1,
                 head_dim: 4,
                 scale: 0.5,
-                layout: KvCacheLayout::for_cache_tensor(TensorId(1), 1, 4),
+                layout: KvCacheLayout::<TestShape1x4>::for_cache_tensor(TensorId(1)),
                 producer: KvCacheProducer::pre_populated_ext(),
                 softmax_state: SoftmaxStateId::new(0),
             },
@@ -1604,7 +1605,7 @@ mod tests {
                 },
             },
         };
-        let g: SubtileIR<NeoX> = SubtileIR {
+        let g: SubtileIR<NeoX, TestShape1x4> = SubtileIR {
             tensors,
             num_sources: 3,
             nodes: vec![attn],

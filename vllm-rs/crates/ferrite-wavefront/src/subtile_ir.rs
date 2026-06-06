@@ -450,10 +450,11 @@ impl SoftmaxStateId {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SubOp<F: RopeForm = NeoX, K: KvCacheShape = LlamaShape8x64> {
     /// Matmul output tile over one K-chunk:
-    /// `out[i, j] = Σ_l A[i, l] · W[j, l]`.
-    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[nr, kr]`
-    /// (W is row-major `[N, K]`, read transposed). Output is the dense
-    /// partial `[mr.len, nr.len]` contributed by this K-chunk.
+    /// `out[i, j] = Σ_l A[i, l] · W[l, j]`.
+    /// `inputs[0]` = A slice `[mr, kr]`; `inputs[1]` = W slice `[kr, nr]`
+    /// (W is row-major `[K, N]` per the FUF convention `gemm(x:
+    /// [..., K], w: [K, N])`). Output is the dense partial
+    /// `[mr.len, nr.len]` contributed by this K-chunk.
     MatmulTile,
     /// Elementwise sum of equal-shaped inputs — the split-K combine. All
     /// inputs and the output are `[out_rows, out_cols]`.
@@ -648,17 +649,19 @@ pub fn eval_node<F: RopeForm, K: KvCacheShape>(
             // Host-evaluator shape checks — debug-only. The codegen
             // pipeline is the source of truth (`validate()` + the
             // typed witnesses on SubOp); these are defensive on the
-            // f32 reference path only.
-            debug_assert_eq!(ac, wc, "matmul K mismatch");
+            // f32 reference path only. W is `[K, N]` per the FUF
+            // convention (see `SubOp::MatmulTile` doc).
+            debug_assert_eq!(ac, wr, "matmul K mismatch");
             debug_assert_eq!(ar, out_rows, "matmul A rows vs out_rows");
-            debug_assert_eq!(wr, out_cols, "matmul W rows vs out_cols");
-            let (m, n, k) = (ar as usize, wr as usize, ac as usize);
+            debug_assert_eq!(wc, out_cols, "matmul W cols vs out_cols");
+            let (m, n, k) = (ar as usize, wc as usize, ac as usize);
             let mut out = vec![0f32; m * n];
             for i in 0..m {
                 for j in 0..n {
                     let mut sum = 0f32;
                     for l in 0..k {
-                        sum += a[i * k + l] * w[j * k + l];
+                        // W is [K, N] row-major: w[l * N + j].
+                        sum += a[i * k + l] * w[l * n + j];
                     }
                     out[i * n + j] = sum;
                 }
@@ -1166,11 +1169,15 @@ pub fn lower_region<K: KvCacheShape>(input: &crate::lower::LoweringInput, nb: st
                         op: SubOp::MatmulTile,
                         inputs: vec![
                             act,
+                            // W is row-major [K, N] per FUF
+                            // `gemm(x: [..., K], w: [K, N])`. The
+                            // n-block selects an N-slice of W; we
+                            // read all K rows of that N-slice.
                             TensorRegion {
                                 tensor: w_t,
                                 region: Region {
-                                    rows: blk,
-                                    cols: Range::new(0, k),
+                                    rows: Range::new(0, k),
+                                    cols: blk,
                                 },
                             },
                         ],
@@ -1351,21 +1358,32 @@ mod tests {
 
     /// N-block-tiled GEMM is bit-exact vs `cpu_golden::gemm` (disjoint
     /// output columns, same per-output reduction order). Built by hand at
-    /// the IR level: source 0 = act [m,k], source 1 = W [n,k], one
-    /// op-output tensor [m,n] written by `ceil(n/nb)` MatmulTile blocks.
+    /// the IR level: source 0 = act [m,k], source 1 = W [k,n] (FUF
+    /// convention; `cpu_golden::gemm` uses [n,k], so we transpose
+    /// before calling it). Output tensor [m,n] is written by
+    /// `ceil(n/nb)` MatmulTile blocks.
     #[test]
     fn gemm_nblock_bit_exact_vs_cpu_golden() {
         let (m, n, k) = (1u32, 130, 257);
         let act = rng_fill((m * k) as usize, 1);
-        let w = rng_fill((n * k) as usize, 2);
+        // W bytes laid out as [K, N] row-major (FUF convention).
+        let w_kn = rng_fill((k * n) as usize, 2);
+        // cpu_golden expects [N, K] row-major; transpose for the
+        // reference call.
+        let mut w_nk = vec![0f32; (n * k) as usize];
+        for i in 0..k as usize {
+            for j in 0..n as usize {
+                w_nk[j * k as usize + i] = w_kn[i * n as usize + j];
+            }
+        }
         let mut want = vec![0f32; (m * n) as usize];
-        cpu_golden::gemm(&act, &w, &mut want, m as usize, k as usize, n as usize);
+        cpu_golden::gemm(&act, &w_nk, &mut want, m as usize, k as usize, n as usize);
 
         for nb in [16u32, 48, 64, 130, 256] {
             let tensors = vec![
-                TensorShape { rows: m, cols: k }, // 0: act
-                TensorShape { rows: n, cols: k }, // 1: W
-                TensorShape { rows: m, cols: n }, // 2: out
+                TensorShape { rows: m, cols: k }, // 0: act [m,k]
+                TensorShape { rows: k, cols: n }, // 1: W [k,n] (FUF)
+                TensorShape { rows: m, cols: n }, // 2: out [m,n]
             ];
             let out_t = TensorId(2);
             let mut nodes: Vec<SubtileNode> = Vec::new();
@@ -1384,11 +1402,12 @@ mod tests {
                                 cols: Range::new(0, k),
                             },
                         },
+                        // W is [K, N]; n-block selects N-cols.
                         TensorRegion {
                             tensor: TensorId(1),
                             region: Region {
-                                rows: Range::new(start, len),
-                                cols: Range::new(0, k),
+                                rows: Range::new(0, k),
+                                cols: Range::new(start, len),
                             },
                         },
                     ],
@@ -1409,7 +1428,7 @@ mod tests {
                 result: out_t,
             };
             assert!(validate(&g).is_ok(), "valid nb={nb}");
-            let bufs = eval_dag(&g, &[&act, &w]);
+            let bufs = eval_dag(&g, &[&act, &w_kn]);
             assert_eq!(result_buffer(&g, &bufs), &want[..], "nb={nb} bit-exact");
         }
     }
@@ -1449,14 +1468,32 @@ mod tests {
             qdim as usize,
             kvdim as usize,
         );
+        // Weight bytes generated as [K=h, N=*] (FUF convention). Reference
+        // `cpu_golden::gemm` expects [N, K]; transpose before each call.
+        fn transpose_kn(w_kn: &[f32], k: usize, n: usize) -> Vec<f32> {
+            let mut out = vec![0f32; n * k];
+            for i in 0..k {
+                for j in 0..n {
+                    out[j * k + i] = w_kn[i * n + j];
+                }
+            }
+            out
+        }
+        let wq_nk = transpose_kn(&wq, hs, qd);
+        let wk_nk = transpose_kn(&wk, hs, kvd);
+        let wv_nk = transpose_kn(&wv, hs, kvd);
+        let wo_nk = transpose_kn(&wo, qd, hs);
+        let wgate_nk = transpose_kn(&wgate, hs, is);
+        let wup_nk = transpose_kn(&wup, hs, is);
+        let wdown_nk = transpose_kn(&wdown, is, hs);
         let mut xn = vec![0f32; hs];
         cpu_golden::rmsnorm(&res_in, &in_ln, &mut xn, eps);
         let mut q = vec![0f32; qd];
-        cpu_golden::gemm(&xn, &wq, &mut q, 1, hs, qd);
+        cpu_golden::gemm(&xn, &wq_nk, &mut q, 1, hs, qd);
         let mut k = vec![0f32; kvd];
-        cpu_golden::gemm(&xn, &wk, &mut k, 1, hs, kvd);
+        cpu_golden::gemm(&xn, &wk_nk, &mut k, 1, hs, kvd);
         let mut v = vec![0f32; kvd];
-        cpu_golden::gemm(&xn, &wv, &mut v, 1, hs, kvd);
+        cpu_golden::gemm(&xn, &wv_nk, &mut v, 1, hs, kvd);
         let mut q_rot = vec![0f32; qd];
         cpu_golden::rope(&q, &cos, &sin, &[0i32], 1, hqs, hds, &mut q_rot);
         let mut k_rot = vec![0f32; kvd];
@@ -1478,40 +1515,45 @@ mod tests {
             scale,
         );
         let mut o = vec![0f32; hs];
-        cpu_golden::gemm(&attn, &wo, &mut o, 1, qd, hs);
+        cpu_golden::gemm(&attn, &wo_nk, &mut o, 1, qd, hs);
         let mut res_mid = vec![0f32; hs];
         cpu_golden::add(&o, &res_in, &mut res_mid);
         let mut xn2 = vec![0f32; hs];
         cpu_golden::rmsnorm(&res_mid, &post_ln, &mut xn2, eps);
         let mut gate = vec![0f32; is];
-        cpu_golden::gemm(&xn2, &wgate, &mut gate, 1, hs, is);
+        cpu_golden::gemm(&xn2, &wgate_nk, &mut gate, 1, hs, is);
         let mut up = vec![0f32; is];
-        cpu_golden::gemm(&xn2, &wup, &mut up, 1, hs, is);
+        cpu_golden::gemm(&xn2, &wup_nk, &mut up, 1, hs, is);
         let mut act = vec![0f32; is];
         cpu_golden::fused_gate_up_silu_mul(&gate, &up, &mut act);
         let mut down = vec![0f32; hs];
-        cpu_golden::gemm(&act, &wdown, &mut down, 1, is, hs);
+        cpu_golden::gemm(&act, &wdown_nk, &mut down, 1, is, hs);
         let mut want = vec![0f32; hs];
         cpu_golden::add(&down, &res_mid, &mut want);
 
         // Same layer as a LoweringInput (sources 0..=13).
         let ss = |rows: u32, cols: u32| SourceShape { rows, cols };
+        // Weights stored as [K, N] per FUF; q-proj is [h, qdim],
+        // k/v-proj [h, kvdim], o-proj [qdim, h], MLP gate/up [h, i],
+        // down [i, h]. The weight bytes (`wq`, `wk`, etc.) are
+        // generated at length `K*N` either way; the eval just reads
+        // them with stride N over K rows now.
         let input = crate::lower::LoweringInput {
             sources: vec![
                 ss(1, h),
                 ss(1, h),
-                ss(qdim, h),
-                ss(kvdim, h),
-                ss(kvdim, h),
-                ss(1, hd),
-                ss(1, hd),
-                ss(l, kvdim),
-                ss(l, kvdim),
                 ss(h, qdim),
+                ss(h, kvdim),
+                ss(h, kvdim),
+                ss(1, hd),
+                ss(1, hd),
+                ss(l, kvdim),
+                ss(l, kvdim),
+                ss(qdim, h),
                 ss(1, h),
-                ss(i, h),
-                ss(i, h),
                 ss(h, i),
+                ss(h, i),
+                ss(i, h),
             ],
             ops: vec![
                 OpDesc {

@@ -203,11 +203,13 @@ pub fn lower_partitioned<K: KvCacheShape>(
                                         cols: *kb,
                                     },
                                 },
+                                // W is `[K, N]` per FUF; split-K
+                                // reads a K-chunk (kb) of all N cols.
                                 TensorRegion {
                                     tensor: w_t,
                                     region: Region {
-                                        rows: Range::new(0, n),
-                                        cols: *kb,
+                                        rows: *kb,
+                                        cols: Range::new(0, n),
                                     },
                                 },
                             ],
@@ -297,11 +299,13 @@ pub fn lower_partitioned<K: KvCacheShape>(
                                         cols: Range::new(0, k),
                                     },
                                 },
+                                // W is `[K, N]` per FUF; the n-block
+                                // selects N-cols, all K rows are read.
                                 TensorRegion {
                                     tensor: w_t,
                                     region: Region {
-                                        rows: blk,
-                                        cols: Range::new(0, k),
+                                        rows: Range::new(0, k),
+                                        cols: blk,
                                     },
                                 },
                             ],
@@ -652,21 +656,24 @@ mod tests {
         ];
         let ss = |rows: u32, cols: u32| SourceShape { rows, cols };
         let input = LoweringInput {
+            // Weights stored as `[K, N]` per FUF `gemm(x: [..., K],
+            // w: [K, N])`: q-proj is `[h, qdim]`, k/v-proj `[h, kvdim]`,
+            // o-proj `[qdim, h]`, MLP gate/up `[h, i]`, down `[i, h]`.
             sources: vec![
                 ss(1, h),
                 ss(1, h),
-                ss(qdim, h),
-                ss(kvdim, h),
-                ss(kvdim, h),
-                ss(1, hd),
-                ss(1, hd),
-                ss(l, kvdim),
-                ss(l, kvdim),
                 ss(h, qdim),
+                ss(h, kvdim),
+                ss(h, kvdim),
+                ss(1, hd),
+                ss(1, hd),
+                ss(l, kvdim),
+                ss(l, kvdim),
+                ss(qdim, h),
                 ss(1, h),
-                ss(i, h),
-                ss(i, h),
                 ss(h, i),
+                ss(h, i),
+                ss(i, h),
             ],
             ops: vec![
                 OpDesc {

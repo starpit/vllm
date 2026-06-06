@@ -385,13 +385,14 @@ mod tests {
     /// consumer flags (block-spread + whole-output join), not just balance.
     fn chain_input(k: u32, n1: u32, n2: u32) -> (LoweringInput, Vec<Vec<f32>>) {
         let act = rng_fill(k as usize, 1);
-        let w1 = rng_fill((n1 * k) as usize, 2);
-        let w2 = rng_fill((n2 * n1) as usize, 3);
+        let w1 = rng_fill((k * n1) as usize, 2);
+        let w2 = rng_fill((n1 * n2) as usize, 3);
         let input = LoweringInput {
+            // Weights stored [K, N] per FUF convention.
             sources: vec![
                 SourceShape { rows: 1, cols: k },   // 0: act
-                SourceShape { rows: n1, cols: k },  // 1: W1 [n1,k]
-                SourceShape { rows: n2, cols: n1 }, // 2: W2 [n2,n1]
+                SourceShape { rows: k, cols: n1 },  // 1: W1 [k,n1]
+                SourceShape { rows: n1, cols: n2 }, // 2: W2 [n1,n2]
             ],
             ops: vec![
                 OpDesc {
@@ -546,13 +547,14 @@ mod tests {
     /// the busiest worker's stack is far below the single-worker total.
     #[test]
     fn wide_matmul_spreads_across_workers() {
-        // act[1,8] @ W[120,8] with nb=4 → 30 independent blocks, no edges.
+        // act[1,8] @ W[8,120] with nb=4 → 30 independent blocks, no edges.
+        // Weight stored [K=8, N=120] per FUF convention.
         let act = rng_fill(8, 10);
-        let w = rng_fill(120 * 8, 11);
+        let w = rng_fill(8 * 120, 11);
         let input = LoweringInput {
             sources: vec![
                 SourceShape { rows: 1, cols: 8 },
-                SourceShape { rows: 120, cols: 8 },
+                SourceShape { rows: 8, cols: 120 },
             ],
             ops: vec![OpDesc {
                 op: LoweredOp::Gemm { n: 120 },

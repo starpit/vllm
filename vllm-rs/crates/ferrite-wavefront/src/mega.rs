@@ -1527,12 +1527,14 @@ impl<'a, F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape> Ser
     }
 
     /// Whether a `MatmulTile` is a split-K partial — its weight reads a K-window
-    /// narrower than the full weight row. Such a qmv carries `row_vec`, writes
-    /// to arena, and is PUBLISHed (vs the coherent fuse for N-block outputs).
+    /// narrower than the full weight column. Per FUF convention W is `[K, N]`,
+    /// so K lives at `region.rows`; the full K range is `tensor.rows`. A
+    /// narrower K-slice means split-K. Such a qmv carries `row_vec`, writes to
+    /// arena, and is PUBLISHed (vs the coherent fuse for N-block outputs).
     fn qmv_is_split_k(&self, node: &SubtileNode<F, K>) -> bool {
         matches!(node.op, SubOp::MatmulTile)
             && node.inputs.len() >= 2
-            && self.graph.shape(node.inputs[1].tensor).cols != node.inputs[1].region.cols.len
+            && self.graph.shape(node.inputs[1].tensor).rows != node.inputs[1].region.rows.len
     }
 
     /// Whether this node's cross-worker output must be PUBLISHed from arena.
@@ -1993,11 +1995,12 @@ mod tests {
     #[test]
     fn cross_worker_qmv_chain_emits_publish_acquire() {
         let (k0, n0, n1) = (512u32, 128u32, 128u32); // k1 == n0
+        // Weights stored [K, N] per FUF: W1=[k0,n0], W2=[n0,n1].
         let input = LoweringInput {
             sources: vec![
                 SourceShape { rows: 1, cols: k0 },
-                SourceShape { rows: n0, cols: k0 },
-                SourceShape { rows: n1, cols: n0 },
+                SourceShape { rows: k0, cols: n0 },
+                SourceShape { rows: n0, cols: n1 },
             ],
             ops: vec![
                 OpDesc {

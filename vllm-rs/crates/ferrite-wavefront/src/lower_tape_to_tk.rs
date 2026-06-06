@@ -104,8 +104,15 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// `decode_position` kernel-arg slot for RopeRotate / RopeAppend,
     /// lazily minted on first rotary.
     position_arg: Option<KernelArgRef>,
-    /// Fresh PageId allocator. Conservative 1:1 with SlotId.
+    /// Page-id allocator. `next_page` is the next-fresh id minted
+    /// only if `free_pages` is empty; `release_page` pushes onto
+    /// `free_pages` so recycled ids are popped before fresh ones.
+    /// The high-water mark is bounded by the maximum live-slot count
+    /// (not the cumulative slot count); for Llama-3.2-1B at nb=256
+    /// with the conservative all-gmem path, this stays well below
+    /// `NUM_PAGES`.
     next_page: u8,
+    free_pages: Vec<PageId>,
     /// Slot id → PageId.
     slot_to_page: BTreeMap<u32, PageId>,
     /// Fresh LoopVarId allocator (TkTape side).
@@ -143,6 +150,7 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             seq_len_arg: None,
             position_arg: None,
             next_page: 0,
+            free_pages: Vec::new(),
             slot_to_page: BTreeMap::new(),
             next_loop_var: 0,
             kv_layouts: Vec::new(),
@@ -165,11 +173,16 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
     }
 
     fn alloc_page(&mut self, slot: SlotId) -> PageId {
-        let p = PageId(self.next_page);
-        self.next_page = self
-            .next_page
-            .checked_add(1)
-            .expect("PageId overflow (>=256 slots in one tape — exceeds NUM_PAGES)");
+        let p = if let Some(reused) = self.free_pages.pop() {
+            reused
+        } else {
+            let p = PageId(self.next_page);
+            self.next_page = self.next_page.checked_add(1).expect(
+                "PageId overflow (>=256 concurrent live slots in one tape \
+                 — exceeds NUM_PAGES; tape needs slot-coalescing pass before lowering)",
+            );
+            p
+        };
         self.slot_to_page.insert(slot.index(), p);
         p
     }
@@ -183,7 +196,9 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
     }
 
     fn release_page(&mut self, slot: SlotId) {
-        self.slot_to_page.remove(&slot.index());
+        if let Some(p) = self.slot_to_page.remove(&slot.index()) {
+            self.free_pages.push(p);
+        }
     }
 
     fn intern_kernel_arg(&mut self, arg: KernelArg) -> KernelArgRef {
@@ -593,16 +608,17 @@ fn emit_matmul_tile<F: RopeForm, K: KvCacheShape>(
 ) {
     let m = node.output.region.rows.len;
     let n = node.output.region.cols.len;
-    // GemmK typed witness: assert input[0].cols == input[1].cols
-    // at construction time. ValidatedGraph<F, K> guarantees the
-    // SubtileNode passed `validate`'s structural arity check, but
-    // the K-equality check is the GEMM-specific witness — fail-fast
-    // here rather than miswire k downstream.
+    // GemmK typed witness: A is `[m, K]` (input[0]); W is `[K, N]`
+    // (input[1]) per FUF convention. K-equality lives at A's cols
+    // == W's rows. ValidatedGraph<F, K> already passed `validate`'s
+    // structural arity check, but the K-equality check is the
+    // GEMM-specific witness — fail-fast here rather than miswire k
+    // downstream.
     let k = crate::tk_tape::GemmK::derive(
         node.inputs[0].region.cols.len,
-        node.inputs[1].region.cols.len,
+        node.inputs[1].region.rows.len,
     )
-    .expect("GEMM K-equality: ValidatedGraph should have ensured matched cols");
+    .expect("GEMM K-equality: ValidatedGraph should have ensured matched cols/rows");
     // input[0] = activation, input[1] = weight (per LoweredOp::Gemm).
     let lhs_page = dst_page; // shared via expect_bytes; refined by optimizer
     let rhs_tensor = node.inputs[1].tensor;
@@ -938,14 +954,14 @@ fn synthesize_q_layout<F: RopeForm, K: KvCacheShape>(
     head_dim: u32,
 ) -> KvCacheLayout<K> {
     // For Q-side RopeRotate the layout is synthetic — the rotated
-    // tensor is itself the cache descriptor for offset math. K7 gate
-    // (see partition.rs / subtile_ir.rs RopeAppend sites): the
-    // synthetic layout's numeric dims must match `K`'s associated
-    // consts. Past the gate the witness type carries the proof.
-    let cols = node.output.region.cols.len;
-    let num_heads = if head_dim == 0 { 1 } else { cols / head_dim };
-    assert_eq!(num_heads, K::NUM_KV_HEADS);
+    // Q-tensor is its own descriptor for offset math; it does NOT
+    // address the K-cache. Q-side rotation only needs head_dim
+    // (for the rotation pairing); num_q_heads is read off the
+    // tensor shape. We don't equate num_q_heads to `K::NUM_KV_HEADS`
+    // (Llama has num_q_heads=32 but num_kv_heads=8 — they differ
+    // under GQA). Only head_dim must match `K::HEAD_DIM`.
     assert_eq!(head_dim, K::HEAD_DIM);
+    let _ = node;
     KvCacheLayout::<K>::for_cache_tensor(node.output.tensor)
 }
 

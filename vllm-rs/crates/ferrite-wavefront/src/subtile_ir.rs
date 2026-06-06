@@ -249,40 +249,58 @@ pub trait KvCacheShape:
 {
     const NUM_KV_HEADS: u32;
     const HEAD_DIM: u32;
+    /// Maximum cache position (context length). Lowering computes
+    /// per-layer base byte offsets from this constant. Different
+    /// context lengths require different `KvCacheShape` impls.
+    const MAX_POSITION: u32;
+    /// Bytes per cache element. bf16 = 2 (the default; override for
+    /// fp16/fp32 caches when those land).
+    const ELEM_BYTES: u32 = 2;
     /// Per-token K (or V) row width in elements.
     const ROW_ELEMENTS: u32 = Self::NUM_KV_HEADS * Self::HEAD_DIM;
+    /// Bytes per row (one cache slot at one layer): `ROW_ELEMENTS *
+    /// ELEM_BYTES`. Used as the per-position stride for KV cache
+    /// writes / reads.
+    const ROW_BYTES: u64 = (Self::ROW_ELEMENTS as u64) * (Self::ELEM_BYTES as u64);
+    /// Bytes per layer: `MAX_POSITION * ROW_BYTES`. Used to compute
+    /// layer-base byte offsets at lowering.
+    const LAYER_BYTES: u64 = (Self::MAX_POSITION as u64) * Self::ROW_BYTES;
 }
 
-/// Llama-3.2-1B's K/V cache shape: 8 KV heads × 64 head_dim. The
-/// default for `KvCacheLayout<K>` and the `K` parameter on
-/// `SubOp` / `SubtileNode` / `SubtileIR`.
+/// Llama-3.2-1B's K/V cache shape: 8 KV heads × 64 head_dim,
+/// MAX_POSITION=4096 (a representative default; multi-context
+/// deployments mint a separate KvCacheShape impl per context length).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LlamaShape8x64 {}
 impl kv_shape_seal::Sealed for LlamaShape8x64 {}
 impl KvCacheShape for LlamaShape8x64 {
     const NUM_KV_HEADS: u32 = 8;
     const HEAD_DIM: u32 = 64;
+    const MAX_POSITION: u32 = 4096;
 }
 
-/// Test-only K/V cache shape: 1 KV head × 4 head_dim. Used by unit
-/// tests that need a small synthetic graph without dragging in a
-/// real Llama-sized tensor footprint.
+/// Test-only K/V cache shape: 1 KV head × 4 head_dim, max_pos=16.
+/// Used by unit tests that need a small synthetic graph without
+/// dragging in a real Llama-sized tensor footprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TestShape1x4 {}
 impl kv_shape_seal::Sealed for TestShape1x4 {}
 impl KvCacheShape for TestShape1x4 {
     const NUM_KV_HEADS: u32 = 1;
     const HEAD_DIM: u32 = 4;
+    const MAX_POSITION: u32 = 16;
 }
 
-/// Test-only K/V cache shape: 2 KV heads × 4 head_dim. Used by the
-/// partition / mega tests' `decode_layer` fixture (hkv=2, hd=4).
+/// Test-only K/V cache shape: 2 KV heads × 4 head_dim, max_pos=16.
+/// Used by the partition / mega tests' `decode_layer` fixture
+/// (hkv=2, hd=4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TestShape2x4 {}
 impl kv_shape_seal::Sealed for TestShape2x4 {}
 impl KvCacheShape for TestShape2x4 {
     const NUM_KV_HEADS: u32 = 2;
     const HEAD_DIM: u32 = 4;
+    const MAX_POSITION: u32 = 16;
 }
 
 /// **`KvCacheLayout`** — sealed witness naming the K-cache (or V-cache)
@@ -328,24 +346,46 @@ impl KvCacheShape for TestShape2x4 {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KvCacheLayout<K: KvCacheShape = LlamaShape8x64> {
+    /// K-side cache tensor (rotated K is written here).
     cache_tensor: TensorId,
+    /// V-side cache tensor (un-rotated V is written here). Often a
+    /// separate tensor; some layouts use the same tensor as K with
+    /// different layer-base offsets.
+    v_cache_tensor: TensorId,
     _shape: std::marker::PhantomData<K>,
     _seal: sealed::Seal,
 }
 
 impl<K: KvCacheShape> KvCacheLayout<K> {
-    /// Sealed constructor binding `cache_tensor` into the witness;
-    /// `num_kv_heads` and `head_dim` come from `K`'s associated consts.
-    pub const fn for_cache_tensor(cache_tensor: TensorId) -> Self {
+    /// Sealed constructor binding both K and V cache tensors into
+    /// the witness; per-axis numerics come from `K`'s associated consts.
+    pub const fn for_cache_tensors(
+        k_cache_tensor: TensorId,
+        v_cache_tensor: TensorId,
+    ) -> Self {
         Self {
-            cache_tensor,
+            cache_tensor: k_cache_tensor,
+            v_cache_tensor,
             _shape: std::marker::PhantomData,
             _seal: sealed::Seal(()),
         }
     }
 
+    /// Convenience: K and V on the SAME tensor (legacy / unified
+    /// cache). Equivalent to `for_cache_tensors(t, t)`. Production
+    /// code should prefer `for_cache_tensors` with distinct K/V
+    /// TensorIds.
+    pub const fn for_cache_tensor(cache_tensor: TensorId) -> Self {
+        Self::for_cache_tensors(cache_tensor, cache_tensor)
+    }
+
+    /// K-side cache tensor.
     pub const fn cache_tensor(&self) -> TensorId {
         self.cache_tensor
+    }
+    /// V-side cache tensor.
+    pub const fn v_cache_tensor(&self) -> TensorId {
+        self.v_cache_tensor
     }
     #[inline]
     pub const fn num_kv_heads(&self) -> u32 {
@@ -359,6 +399,26 @@ impl<K: KvCacheShape> KvCacheLayout<K> {
     #[inline]
     pub const fn row_elements(&self) -> u32 {
         K::ROW_ELEMENTS
+    }
+    /// Maximum cache position (context length).
+    #[inline]
+    pub const fn max_position(&self) -> u32 {
+        K::MAX_POSITION
+    }
+    /// Per-position stride in bytes (= ROW_ELEMENTS × ELEM_BYTES).
+    /// Used as the const-generic stride for
+    /// [`crate::tk_tape::ByteOffsetExpr::RuntimePosition`] writes
+    /// to the KV cache.
+    #[inline]
+    pub const fn row_bytes(&self) -> u64 {
+        K::ROW_BYTES
+    }
+    /// Per-layer byte offset: `layer × MAX_POSITION × ROW_BYTES`.
+    /// Used as the `base` of [`crate::tk_tape::ByteOffsetExpr::RuntimePosition`]
+    /// when writing layer L's KV cache slot at runtime position p.
+    #[inline]
+    pub const fn layer_base_bytes(&self, layer: u32) -> u64 {
+        (layer as u64) * K::LAYER_BYTES
     }
 }
 

@@ -1515,6 +1515,30 @@ impl ByteOffsetExpr {
             base,
         }
     }
+
+    /// Construct [`Self::RuntimePosition`] for a KV cache write at
+    /// runtime position. Stride is derived from the typed
+    /// [`crate::subtile_ir::KvCacheLayout<K>`] witness's
+    /// `K::ROW_BYTES` const. Layer base is `layer × K::LAYER_BYTES`.
+    ///
+    /// Preferred over the generic `runtime_position::<STRIDE>` for KV
+    /// cache writes — the K type parameter is the single source of
+    /// truth for the cache layout, so wrong-stride is structurally
+    /// impossible (caller would have to mismatch K, which is a
+    /// separate compile-time error per the K7 lift).
+    ///
+    /// Stable Rust prevents `runtime_position::<{ K::ROW_BYTES }>`
+    /// (`generic_const_exprs` is unstable); this fn is the workaround.
+    pub fn kv_cache_runtime_position<K: crate::subtile_ir::KvCacheShape>(
+        arg: KernelArgRef,
+        layer: u32,
+    ) -> Self {
+        Self::RuntimePosition {
+            arg,
+            stride_bytes: K::ROW_BYTES,
+            base: ByteOffset::new((layer as u64) * K::LAYER_BYTES),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

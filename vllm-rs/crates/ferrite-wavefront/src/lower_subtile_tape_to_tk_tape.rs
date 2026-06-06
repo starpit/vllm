@@ -942,9 +942,120 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::RopeAppend { head_dim, layer, layout, _form: _ } => {
+            // RopeAppend (step 10): rotate K (NeoX) + write rotated K
+            // and un-rotated V into the paged KV cache at the runtime
+            // decode position. Plan §"Per-SubOp Instr counts" line 26
+            // (14 Instrs aggregate; 12 rotation + 2 cache writes).
+            //
+            // F: RopeForm const-generic dispatches NeoX vs Interleaved.
+            // Llama-3.2-1B uses NeoX with head_dim=64.
+            use crate::subtile_ir::RopeFormTag;
+            assert_eq!(
+                F::TAG,
+                RopeFormTag::NeoX,
+                "RopeAppend Interleaved form is plan step 8, not yet landed",
+            );
+            assert_eq!(
+                *head_dim, 64,
+                "RopeAppend: only head_dim=64 (Llama-3.2-1B) supported \
+                 today; got head_dim={}",
+                head_dim,
+            );
+
+            // reads = [K, cos, sin, V, ...] (arity 6 — last 2 are
+            // typically cache handles propagated via `layout` not via
+            // input slots).
+            use crate::tk_tape::{
+                AllConsumersRole, Bf16, ByteOffset, ByteOffsetExpr,
+                ByteStride, GroupWidth, NaiveLayout, PerPositionStep,
+                RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
+                StoreSpec, TileShape, WarpRole,
+            };
+            let k_page = state.page_of(reads[0]);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[1]));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[2]));
+            let v_page = state.page_of(reads[3]);
+            let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
+            let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const R: AllConsumersRole = AllConsumersRole;
+
+            // Mint registers (same shape as step 7 RopeRotate)
+            let rt_k_even: RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_k_odd:  RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_a:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_b:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_c:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_d:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rv_cos: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+            let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+
+            // Rotation (12 Instrs, identical algorithm to step 7)
+            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 0, Bf16, RowLayout>(
+                k_full, rt_k_even, W, R,
+            ));
+            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
+                k_full, rt_k_odd, W, R,
+            ));
+            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, W, R));
+            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_cos, rt_a, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_sin, rt_b, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_sin, rt_c, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_cos, rt_d, W, R));
+            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, W, R));
+            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
+                rt_a, dst_full, W, R,
+            ));
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 1, Bf16, RowLayout>(
+                rt_c, dst_full, W, R,
+            ));
+
+            // Cache writes at runtime decode position.
+            //
+            // `ByteOffsetExpr::kv_cache_runtime_position::<K>(arg, layer)`
+            // derives stride from K::ROW_BYTES and base from
+            // `layer × K::LAYER_BYTES`. The K type parameter is the
+            // single source of truth for the cache layout — wrong K
+            // is rustc E0308 at the layout-witness binding (K7 lift).
+            //
+            // (Stable Rust forbids `runtime_position::<{ K::ROW_BYTES }>`
+            // because `generic_const_exprs` is unstable; the K-witnessed
+            // method is the workaround.)
+            let pos_arg = state.position();
+
+            // K-cache write: rotated K (dst_page) → K cache at slot[p].
+            state.push(Instr::StoreAsync(StoreSpec {
+                src_page: dst_page,
+                dst_tensor: layout.cache_tensor(),
+                byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
+                tile: TileShape {
+                    rows: 128,
+                    cols: 128,
+                    elem_bytes: 2,
+                },
+                role: WarpRole::Storer,
+            }));
+
+            // V-cache write: un-rotated V (v_page) → V cache at slot[p].
+            state.push(Instr::StoreAsync(StoreSpec {
+                src_page: v_page,
+                dst_tensor: layout.v_cache_tensor(),
+                byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
+                tile: TileShape {
+                    rows: 128,
+                    cols: 128,
+                    elem_bytes: 2,
+                },
+                role: WarpRole::Storer,
+            }));
+
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         #[allow(unreachable_patterns)]
         SubOp::MatmulTile
-        | SubOp::RopeAppend { .. }
         | SubOp::AttnDecode { .. } => {
             panic!(
                 "lower_compute: arch op {:?} has no TK 2.0 primitive expansion yet; \

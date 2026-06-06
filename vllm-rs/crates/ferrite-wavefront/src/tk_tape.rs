@@ -677,6 +677,18 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    /// `kittens::group<N>::copy(rv_dst, rv_src)` —
+    /// `ops/group/register/vec/maps.cuh:177`. Register-vec copy.
+    /// Used by AttnDecode_Qkt to save `m_old` before the row-max-acc
+    /// update so alpha = exp2(m_old - m_new) can be computed for
+    /// online-softmax rescaling.
+    RegVecCopy {
+        src: RegVecSlot,
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::load(rv, sv)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
@@ -2922,6 +2934,28 @@ impl Instr {
         }
     }
 
+    pub(crate) fn reg_vec_copy<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        src: RegVecId<LEN, T, RV>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegVecCopy {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     /// Construct [`Instr::StoreRegTileSubTileToShmem`] — inverse of
     /// `load_shmem_subtile_to_reg`. Same const-generic guards.
     pub(crate) fn store_reg_tile_subtile_to_shmem<
@@ -3642,6 +3676,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::RegVecExp2 { .. }
             | Instr::RegVecMul { .. }
             | Instr::RegTileCopyConvert { .. }
+            | Instr::RegVecCopy { .. }
             | Instr::LoadVecSmemToReg { .. }
             | Instr::StoreRegVecToShmem { .. }
             | Instr::RegTileNeg { .. }

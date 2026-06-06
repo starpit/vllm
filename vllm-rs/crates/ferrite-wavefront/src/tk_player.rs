@@ -389,6 +389,9 @@ mod tk20 {
     pub fn rt_copy_convert(group_n: u32, dst: u16, src: u16) -> String {
         format!("kittens::group<{group_n}>::copy(rt_{dst}, rt_{src});")
     }
+    pub fn rv_copy(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::copy(rv_{dst}, rv_{src});")
+    }
 
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
@@ -931,6 +934,9 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         }
         Instr::RegTileCopyConvert { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}", tk20::rt_copy_convert(width.n(), dst.0, src.0));
+        }
+        Instr::RegVecCopy { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_copy(width.n(), dst.0, src.0));
         }
         Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",

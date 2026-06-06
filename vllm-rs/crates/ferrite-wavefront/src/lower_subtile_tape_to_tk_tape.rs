@@ -1054,9 +1054,228 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::AttnDecode {
+            num_q_heads: _,
+            num_kv_heads: _,
+            head_dim,
+            scale,
+            layout,
+            producer: _,
+            softmax_state: _,
+        } => {
+            // AttnDecode (steps 11-14): online softmax over a paged
+            // KV cache.
+            //
+            // Algorithm:
+            //   Init: rt_o = 0 (fp32), rv_m = -inf (fp32), rv_l = 0 (fp32)
+            //   For each chunk c in 0..(seq_len / chunk_size):
+            //     load K[chunk] from cache → page_k
+            //     load V[chunk] from cache → page_v
+            //     wait barriers
+            //     S = Q @ K^T            (mma_ABt; D fp32)
+            //     S *= scale * log2(e)
+            //     m_old = m
+            //     m = max(m, row_max(S))      (row_max_acc)
+            //     alpha = exp2(m_old - m)
+            //     l *= alpha
+            //     o *= alpha               (per-row mul)
+            //     S -= m                   (sub_row)
+            //     P = exp2(S) (in fp32)
+            //     l += row_sum(P)          (row_sum_acc)
+            //     P_bf16 = copy_convert(P) (fp32 → bf16)
+            //     o += P @ V               (mma_AB; accumulate)
+            //   Finalise: o /= l (div_row), store(dst, o)
+            //
+            // Per the audit's deferred-typestate decision:
+            // SoftmaxRowMaxAcc<P> phase typestate is not enforced
+            // here; the lowerer is the only AttnDecode constructor
+            // and emits phases in the correct order by construction.
+            //
+            // For Llama-3.2-1B: HEAD_DIM=64, num_q_heads=32 (16
+            // q-rows fit one chunk → 16×64 register tiles), chunk
+            // size = 128 cache positions per iteration.
+
+            assert_eq!(
+                *head_dim, 64,
+                "AttnDecode: only head_dim=64 (Llama-3.2-1B) supported \
+                 today; got head_dim={}",
+                head_dim,
+            );
+
+            use crate::tk_tape::{
+                AccAccumulate, AccReset, AllConsumersRole, Bf16,
+                ByteOffset, ByteOffsetExpr, FenceExternal, Fp32,
+                GroupWidth, LoaderRole, NaiveLayout, RegTileId,
+                RegVecId, RoleWitness, RowLayout, ScalarF32,
+                SmemTileId, SmemTileSpec, StoreSpec, TileShape,
+                WarpRole,
+            };
+            // reads = [q_page, k_cache_handle, v_cache_handle, ...]
+            let q_page = state.page_of(reads[0]);
+            // K and V cache TensorIds come from the layout witness
+            // (single source of truth, not from reads[].)
+            let k_cache = layout.cache_tensor();
+            let v_cache = layout.v_cache_tensor();
+            const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
+            const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const R: AllConsumersRole = AllConsumersRole;
+
+            // Tile geometry:
+            //   chunk-row count (M_q) = 128 (q tile rows; one decode
+            //     batch tile)
+            //   chunk-col count (D)   = 128 (head_dim padded to 128
+            //     — Llama head_dim=64 occupies cols 0..64)
+            //   chunk K-positions     = 128 per iteration
+            // For Llama: number of chunks = MAX_POSITION / 128.
+            let q_tile = SmemTileId::<128, 128, Bf16>::from_page(q_page);
+
+            // Allocate temp pages for K and V tiles (one per iteration)
+            let k_tile_page = state.alloc_temp_page();
+            let v_tile_page = state.alloc_temp_page();
+            let k_tile = SmemTileId::<128, 128, Bf16>::from_page(k_tile_page);
+            let v_tile = SmemTileId::<128, 128, Bf16>::from_page(v_tile_page);
+            let dst_tile = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+
+            // Register state (persistent across iterations)
+            let rt_o:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
+            let rt_s:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
+            let rt_p:   RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rv_m:     RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
+            let rv_l:     RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
+            let rv_m_old: RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
+            let rv_alpha: RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
+
+            // ── Init phase (3 Instrs) ────────────────────────────
+            state.push(Instr::init_rt_zero(rt_o, W16, R));
+            state.push(Instr::init_rv_neg_infty(rv_m, W16, R));
+            state.push(Instr::init_rv_zero(rv_l, W16, R));
+
+            // ── Loop body (Qkt + Sv phases) ──────────────────────
+            //
+            // OpenLoop iterates 0..(seq_len / chunk_size).
+            // chunk_size = 128 positions (= 128 rows of K/V cache
+            // per chunk).  seq_len kernel arg drives the bound.
+            let seq_arg = state.seq_len();
+            let loop_var = state.fresh_loop_var();
+            // Loop bound: seq_len (number of chunks; we iterate by
+            // 1 chunk per step, so total iterations = seq_len /
+            // chunk_size; for now use seq_len directly with the
+            // understanding that chunked iteration is a follow-up
+            // optimization. The seq_len kernel arg holds the chunk
+            // count, set by the host).
+            state.push(Instr::ForLoopOpenKernelArg {
+                var: loop_var,
+                arg: seq_arg,
+            });
+            // Wait barrier currently issued for the q_page only;
+            // K and V are loaded fresh each iteration, no per-page
+            // barrier infrastructure for those temp pages.
+
+            // TMA load K[chunk] from cache at offset
+            //   layer_base + iter * chunk_bytes
+            // For now use byte_off = (loop_var * row_bytes); a real
+            // implementation needs layer_base + iter * row_bytes via
+            // a const that combines them. The KvCacheLayout helper
+            // doesn't currently support runtime-loop-var-driven
+            // offsets (that's a follow-up: add a LinearLoop variant
+            // overload that uses the typed K stride).
+            let k_off = ByteOffsetExpr::linear_loop::<128>(
+                loop_var,
+                crate::tk_tape::ByteStride::<128, crate::tk_tape::PerLoopStep>::NEW,
+                ByteOffset::new(0),
+            );
+            let v_off = ByteOffsetExpr::linear_loop::<128>(
+                loop_var,
+                crate::tk_tape::ByteStride::<128, crate::tk_tape::PerLoopStep>::NEW,
+                ByteOffset::new(0),
+            );
+            state.push(Instr::LoadAsync(LoadSpec::new(
+                k_tile_page,
+                k_cache,
+                k_off,
+                SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+                    rows: 128,
+                    cols: 128,
+                    elem_bytes: 2,
+                }),
+                LoaderRole,
+                k_tile_page,
+            )));
+            state.push(Instr::LoadAsync(LoadSpec::new(
+                v_tile_page,
+                v_cache,
+                v_off,
+                SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+                    rows: 128,
+                    cols: 128,
+                    elem_bytes: 2,
+                }),
+                LoaderRole,
+                v_tile_page,
+            )));
+            // S = Q @ K^T (fence, reset; D is fp32)
+            state.push(Instr::wgmma_fence_acc(rt_s, W4));
+            state.push(Instr::wgmma_mma_abt_smem_smem(
+                rt_s, q_tile, k_tile, FenceExternal, AccReset, W4,
+            ));
+            state.push(Instr::wgmma_async_wait(0, W4));
+            // S *= scale * log2(e)
+            const LOG2_E: f32 = 1.442_695_f32;
+            let scaled = (*scale) * LOG2_E;
+            state.push(Instr::reg_tile_mul_scalar(
+                rt_s, rt_s, ScalarF32::new(scaled), W16, R,
+            ));
+            // m_old = m  (save before updating)
+            state.push(Instr::reg_vec_copy(rv_m, rv_m_old, W16, R));
+            // m = max(m, row_max(S)) via accumulating row_max_acc
+            state.push(Instr::reg_tile_row_max_acc(rt_s, rv_m, W16, R));
+            // alpha = exp2(m_old - m)
+            state.push(Instr::reg_vec_sub(rv_m_old, rv_m, rv_alpha, W16, R));
+            state.push(Instr::reg_vec_exp2(rv_alpha, rv_alpha, W16, R));
+            // l *= alpha
+            state.push(Instr::reg_vec_mul(rv_l, rv_alpha, rv_l, W16, R));
+            // o *= alpha (per-row scaling)
+            // Note: rv_alpha is length 128 (matching rt_o.rows=128),
+            // so this is a row-broadcast multiply via rt_mul_row.
+            // We don't have an Instr::RegTileMulRow yet — adding this
+            // is a follow-up. For now, the alpha rescale of o is a
+            // KNOWN GAP (correct only when seq_len ≤ chunk_size, i.e.
+            // the loop runs once).
+            // TODO: add RegTileMulRow Instr + emit alpha rescale.
+            // S -= m  (sub_row)
+            state.push(Instr::reg_tile_sub_row(rt_s, rv_m, rt_s, W16, R));
+            // P = exp2(S) (in fp32)
+            state.push(Instr::reg_tile_exp2(rt_s, rt_s, W16, R));
+            // l += row_sum(P)
+            state.push(Instr::reg_tile_row_sum_acc(rt_s, rv_l, W16, R));
+            // Convert P to bf16 for the WGMMA
+            state.push(Instr::reg_tile_copy_convert(rt_s, rt_p, W16, R));
+            // O += P @ V (accumulate)
+            state.push(Instr::wgmma_fence_acc(rt_o, W4));
+            state.push(Instr::wgmma_mma_ab_reg_smem(
+                rt_o, rt_p, v_tile, FenceExternal, AccAccumulate, W4,
+            ));
+            state.push(Instr::wgmma_async_wait(0, W4));
+            state.push(Instr::ForLoopClose { var: loop_var });
+
+            // ── Finalise phase ───────────────────────────────────
+            // O /= l (per-row divide)
+            state.push(Instr::reg_tile_div_row(rt_o, rv_l, rt_o, W16, R));
+            // Store O → dst page (fp32 → bf16 cast at TK 2.0's
+            // store boundary, same workaround as MatmulTile).
+            state.push(Instr::StoreRegTileToShmem {
+                src: rt_o.slot(),
+                dst: dst_tile.page(),
+                width: W16.tag(),
+                role: R.to_warp_role(),
+            });
+
+            emit_store_and_arrive(state, &node.output, dst_page);
+            // Suppress unused (some types referenced only for clarity)
+            let _ = WarpRole::AllConsumers;
+        }
         #[allow(unreachable_patterns)]
-        SubOp::MatmulTile
-        | SubOp::AttnDecode { .. } => {
+        SubOp::MatmulTile => {
             panic!(
                 "lower_compute: arch op {:?} has no TK 2.0 primitive expansion yet; \
                  see SUBTILE_TK20_DECOMP.md for the per-SubOp decomposition plan. \

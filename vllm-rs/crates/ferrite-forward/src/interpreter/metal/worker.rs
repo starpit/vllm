@@ -627,6 +627,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         // `Dispatch→Dispatch` barrier wherever the flag fires.
         let mut ts_idx: usize = 0;
         let count_barriers = std::env::var_os("FERRITE_METAL_COUNT_BARRIERS").is_some();
+        // FERRITE_METAL_FORCE_BARRIERS=1 — diagnosis: barrier after
+        // EVERY dispatch regardless of the macro hazard analysis. If a
+        // garbage output becomes coherent under this, the tape is
+        // missing a barrier (latent race; scheduling-dependent).
+        let force_barriers = std::env::var_os("FERRITE_METAL_FORCE_BARRIERS").is_some();
         let mut total_dispatches: usize = 0;
         let mut total_barriers: usize = 0;
         // Flat dispatch index across all steps. Counts EVERY dispatch
@@ -652,7 +657,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // buffer (commit + host wait = stronger ordering), and
                 // a leading barrier on an empty encoder is something
                 // the production path never emits.
-                let mut need_barrier = *need_barrier;
+                let mut need_barrier = *need_barrier || force_barriers;
                 if let Some(r) = &range {
                     if !r.contains(&this_idx) {
                         continue;
@@ -737,6 +742,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     ts_idx += 1;
                 }
                 enc.setArgumentTable(Some(table));
+                let verify_cmd = std::env::var("FERRITE_VERIFY_DISPATCH_CMD")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok());
+                if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some()
+                    && (this_idx < 3 || verify_cmd == Some(this_idx))
+                {
+                    eprintln!(
+                        "[verify-dispatch] cmd{this_idx} tg=({},{},{}) tpt=({},{},{})",
+                        tg_scaled.width, tg_scaled.height, tg_scaled.depth,
+                        tpt.width, tpt.height, tpt.depth
+                    );
+                }
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);
             }
         }
@@ -1538,12 +1555,32 @@ fn resolve_weight<W: crate::CanonicalParams + crate::WeightAccessors>(
             }
         }
     };
-    allocator
+    let resolved = allocator
         .buffer_for(tensor.raw_ptr())
         .ok_or(WorkerError::WeightLookupFailed {
             reason: "weight pointer not in any MetalAllocator arena \
                      — was it loaded through this allocator?",
-        })
+        });
+    // FERRITE_VERIFY_BINDINGS=1 — binding attestation: print what this
+    // weight binding actually resolves to and the first bytes the GPU
+    // will read there (UMA: contents()+offset IS the GPU view).
+    if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some()
+        && let Ok((buf, off)) = &resolved
+    {
+        use objc2_metal::MTLBuffer as _;
+        let base = buf.contents().as_ptr() as *const u8;
+        // SAFETY: offset within the buffer by construction of buffer_for.
+        let head = unsafe { std::slice::from_raw_parts(base.add(*off as usize), 16) };
+        let nz = head.iter().filter(|&&b| b != 0).count();
+        eprintln!(
+            "[verify-bindings] kind={kind:?} which={which:?} layer={layer:?} -> buf_len={} off={} head_nonzero={}/16 head={:02x?}",
+            buf.length(),
+            off,
+            nz,
+            &head[..8]
+        );
+    }
+    resolved
 }
 
 /// Resolve every binding on `cmd` to (buffer, offset, binding-index).
@@ -1619,11 +1656,21 @@ fn resolve_bindings<W: CanonicalParams>(
             Binding::Runtime {
                 kind,
                 binding_index,
-            } => (
-                runtime.buffer_for(*kind).clone(),
-                0u64,
-                *binding_index as u64,
-            ),
+            } => {
+                let buf = runtime.buffer_for(*kind).clone();
+                // FERRITE_VERIFY_BINDINGS=1 — print InputIds contents at
+                // resolve time (garbage ids => OOB embed gathers => the
+                // silent all-zero-output class).
+                if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some()
+                    && matches!(kind, super::lowered::RuntimeBindingKind::InputIds)
+                {
+                    use objc2_metal::MTLBuffer as _;
+                    let p = buf.contents().as_ptr() as *const u32;
+                    let head = unsafe { std::slice::from_raw_parts(p, 20) };
+                    eprintln!("[verify-bindings] InputIds head: {head:?}");
+                }
+                (buf, 0u64, *binding_index as u64)
+            }
             Binding::Scratch { binding_index } => {
                 let scratch = splitk_scratch.ok_or(WorkerError::ScratchBufferMissing {
                     bucket_index,

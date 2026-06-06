@@ -31,7 +31,8 @@ use std::ptr::NonNull;
 use ferrite_metal_kernels::device::detect_device;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLDevice, MTLResourceOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
+    MTLResourceOptions,
 };
 
 const GIB: usize = 1024 * 1024 * 1024;
@@ -388,4 +389,340 @@ unsafe fn mmap_libc(
     offset: i64,
 ) -> *mut std::ffi::c_void {
     mmap(addr, length, prot, flags, fd, offset)
+}
+
+/// COMPUTE-kernel sibling of the blit probe: a trivial kernel reads 32
+/// bytes from the big buffer bound at `setBuffer:offset:` and copies
+/// them to a small dst. Blit engines and compute address translation
+/// are different hardware paths — the 2026-06-06 Qwen3.5-MoE failure
+/// (embed weights at offset 2.87 GiB reading as ZEROS from a compute
+/// kernel while CPU/UMA sees correct bytes, macOS 26.5.1) reproduces
+/// only on the compute path. Offsets probe the 2^31 and 4 GiB
+/// boundaries.
+#[test]
+fn shared_buffer_compute_read_at_large_offsets() {
+    let mdev = detect_device().expect("detect_device");
+    let device = &mdev.device;
+    let queue = device.newCommandQueue().expect("newCommandQueue");
+
+    let big_len: usize = 5 * GIB + 256 * 1024 * 1024;
+    if (device.maxBufferLength() as usize) < big_len {
+        eprintln!("skipping: maxBufferLength too small");
+        return;
+    }
+    let big = device
+        .newBufferWithLength_options(big_len, MTLResourceOptions::StorageModeShared)
+        .expect("big buffer");
+    let dst = device
+        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+        .expect("dst buffer");
+
+    const MSL: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void copy32(device const uchar* src [[buffer(0)]],
+                           device uchar* dst        [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i < 32) { dst[i] = src[i]; }
+        }
+    "#;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let lib = device
+        .newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(MSL), Some(&opts))
+        .expect("compile probe lib");
+    let func = lib
+        .newFunctionWithName(&objc2_foundation::NSString::from_str("copy32"))
+        .expect("copy32 fn");
+    let pso = device
+        .newComputePipelineStateWithFunction_error(&func)
+        .expect("pso");
+
+    // 1 GiB (control), 2.5 GiB (> 2^31), 4.7 GiB (> 4 GiB).
+    let offsets: [usize; 3] = [GIB, 2 * GIB + GIB / 2, 4 * GIB + 700 * 1024 * 1024];
+    let base = big.contents().as_ptr() as *mut u8;
+    for (k, &off) in offsets.iter().enumerate() {
+        let pat: Vec<u8> = (0..32).map(|i| (0xA0 + k as u8) ^ (i as u8)).collect();
+        unsafe { std::ptr::copy_nonoverlapping(pat.as_ptr(), base.add(off), 32) };
+    }
+
+    let mut failures = Vec::new();
+    for (k, &off) in offsets.iter().enumerate() {
+        unsafe { std::ptr::write_bytes(dst.contents().as_ptr() as *mut u8, 0, 64) };
+        let cb = queue.commandBuffer().expect("cb");
+        let enc = cb.computeCommandEncoder().expect("enc");
+        enc.setComputePipelineState(&pso);
+        unsafe {
+            enc.setBuffer_offset_atIndex(Some(&big), off, 0);
+            enc.setBuffer_offset_atIndex(Some(&dst), 0, 1);
+        }
+        enc.dispatchThreads_threadsPerThreadgroup(
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.commit();
+        unsafe { cb.waitUntilCompleted() };
+
+        let got = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
+        let want: Vec<u8> = (0..32).map(|i| (0xA0 + k as u8) ^ (i as u8)).collect();
+        let ok = got == want.as_slice();
+        eprintln!(
+            "compute read at offset {:.2} GiB: {} (got[0..8]={:02x?})",
+            off as f64 / GIB as f64,
+            if ok { "OK" } else { "CORRUPT" },
+            &got[..8]
+        );
+        if !ok {
+            failures.push(off);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "compute reads corrupted at offsets: {failures:?}"
+    );
+}
+
+/// MTL4 argument-table sibling: bind the big buffer's huge offset via
+/// `gpuAddress() + off` + `setAddress:atIndex:` — the EXACT production
+/// binding mechanism (`interpreter/metal/mtl4.rs`). The MTL3
+/// `setBuffer:offset:` compute probe above passes on macOS 26.5.1; if
+/// THIS one corrupts, the regression is the MTL4 bindless path.
+#[test]
+fn shared_buffer_mtl4_gpuaddress_read_at_large_offsets() {
+    use objc2_metal::{
+        MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+        MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLSharedEvent,
+    };
+    let mdev = detect_device().expect("detect_device");
+    let device = &mdev.device;
+    let Some(queue4) = device.newMTL4CommandQueue() else {
+        eprintln!("skipping: no MTL4");
+        return;
+    };
+
+    let big_len: usize = 5 * GIB + 256 * 1024 * 1024;
+    if (device.maxBufferLength() as usize) < big_len {
+        eprintln!("skipping: maxBufferLength too small");
+        return;
+    }
+    let big = device
+        .newBufferWithLength_options(big_len, MTLResourceOptions::StorageModeShared)
+        .expect("big buffer");
+    let dst = device
+        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+        .expect("dst buffer");
+
+    const MSL: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void copy32(device const uchar* src [[buffer(0)]],
+                           device uchar* dst        [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i < 32) { dst[i] = src[i]; }
+        }
+    "#;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let lib = device
+        .newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(MSL), Some(&opts))
+        .expect("compile probe lib");
+    let func = lib
+        .newFunctionWithName(&objc2_foundation::NSString::from_str("copy32"))
+        .expect("copy32 fn");
+    let pso = device
+        .newComputePipelineStateWithFunction_error(&func)
+        .expect("pso");
+
+    let offsets: [usize; 3] = [GIB, 2 * GIB + GIB / 2, 4 * GIB + 700 * 1024 * 1024];
+    let base = big.contents().as_ptr() as *mut u8;
+    for (k, &off) in offsets.iter().enumerate() {
+        let pat: Vec<u8> = (0..32).map(|i| (0xC0 + k as u8) ^ (i as u8)).collect();
+        unsafe { std::ptr::copy_nonoverlapping(pat.as_ptr(), base.add(off), 32) };
+    }
+
+    // Residency: MTL4 requires explicit residency for address-bound
+    // buffers — mirror production (residency set attached to the CB).
+    let res = ferrite_metal_kernels::residency::MetalResidencySet::new(device);
+    res.insert(&big);
+    res.insert(&dst);
+    res.commit();
+
+    let mut failures = Vec::new();
+    for (k, &off) in offsets.iter().enumerate() {
+        unsafe { std::ptr::write_bytes(dst.contents().as_ptr() as *mut u8, 0, 64) };
+
+        let desc = MTL4ArgumentTableDescriptor::new();
+        desc.setMaxBufferBindCount(2);
+        let table = device
+            .newArgumentTableWithDescriptor_error(&desc)
+            .expect("argument table");
+        unsafe {
+            table.setAddress_atIndex(big.gpuAddress() + off as u64, 0);
+            table.setAddress_atIndex(dst.gpuAddress(), 1);
+        }
+
+        // Mirror the production CB lifecycle (pool.rs run path):
+        // begin(allocator) → attach residency → encode → end → commit
+        // → signalEvent → host wait.
+        let alloc4 = device
+            .newCommandAllocator()
+            .expect("MTL4 command allocator");
+        let event = device.newSharedEvent().expect("shared event");
+        let cb = device.newCommandBuffer().expect("mtl4 command buffer");
+        cb.beginCommandBufferWithAllocator(&alloc4);
+        let cb_ptr: *mut objc2::runtime::AnyObject = objc2::rc::Retained::as_ptr(&cb)
+            as *const objc2::runtime::AnyObject
+            as *mut objc2::runtime::AnyObject;
+        unsafe { res.attach_to_mtl4_command_buffer(cb_ptr) };
+        let enc = cb.computeCommandEncoder().expect("mtl4 encoder");
+        enc.setComputePipelineState(&pso);
+        enc.setArgumentTable(Some(&table));
+        enc.dispatchThreads_threadsPerThreadgroup(
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let cb_protocol: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommandBuffer> = &cb;
+        let cb_nn = std::ptr::NonNull::from(cb_protocol);
+        let mut cb_array = [cb_nn];
+        unsafe { queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1) };
+        queue4.signalEvent_value(objc2::runtime::ProtocolObject::from_ref(&*event), 1);
+        assert!(
+            event.waitUntilSignaledValue_timeoutMS(1, 30_000),
+            "MTL4 probe CB timed out"
+        );
+
+        let got = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
+        let want: Vec<u8> = (0..32).map(|i| (0xC0 + k as u8) ^ (i as u8)).collect();
+        let ok = got == want.as_slice();
+        eprintln!(
+            "MTL4 gpuAddress read at offset {:.2} GiB: {} (got[0..8]={:02x?})",
+            off as f64 / GIB as f64,
+            if ok { "OK" } else { "CORRUPT" },
+            &got[..8]
+        );
+        if !ok {
+            failures.push(off);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "MTL4 gpuAddress reads corrupted at offsets: {failures:?}"
+    );
+}
+
+/// Pressure sibling of the MTL4 probe: same gpuAddress+offset compute
+/// read, but with ~20 GiB of residency-committed ballast resident —
+/// the actual Qwen3.5-MoE-35B condition (4x ~4.9 GiB shards + arenas;
+/// its embed reads at offset 2.87 GiB and returns zeros on macOS
+/// 26.5.1 while every host-side check passes).
+#[test]
+fn shared_buffer_mtl4_read_under_residency_pressure() {
+    use objc2_metal::{
+        MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+        MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLSharedEvent,
+    };
+    let mdev = detect_device().expect("detect_device");
+    let device = &mdev.device;
+    let Some(queue4) = device.newMTL4CommandQueue() else {
+        eprintln!("skipping: no MTL4");
+        return;
+    };
+
+    let shard_len: usize = 4 * GIB + 940 * 1024 * 1024; // ~4.92 GiB, shard-like
+    let res = ferrite_metal_kernels::residency::MetalResidencySet::new(device);
+    let mut shards = Vec::new();
+    for i in 0..4 {
+        let Some(b) =
+            device.newBufferWithLength_options(shard_len, MTLResourceOptions::StorageModeShared)
+        else {
+            eprintln!("skipping: shard {i} alloc failed");
+            return;
+        };
+        res.insert(&b);
+        shards.push(b);
+    }
+    let dst = device
+        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+        .expect("dst");
+    res.insert(&dst);
+    res.commit();
+
+    const MSL: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void copy32(device const uchar* src [[buffer(0)]],
+                           device uchar* dst        [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i < 32) { dst[i] = src[i]; }
+        }
+    "#;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let lib = device
+        .newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(MSL), Some(&opts))
+        .expect("lib");
+    let func = lib
+        .newFunctionWithName(&objc2_foundation::NSString::from_str("copy32"))
+        .expect("fn");
+    let pso = device
+        .newComputePipelineStateWithFunction_error(&func)
+        .expect("pso");
+
+    // The production failure point: 2.87 GiB into shard 0; also touch
+    // every shard to fault broad residency like a real load does.
+    let embed_off: usize = 3_081_934_880 & !63;
+    for (i, b) in shards.iter().enumerate() {
+        let base = b.contents().as_ptr() as *mut u8;
+        let pat: Vec<u8> = (0..32).map(|j| (0xD0 + i as u8) ^ (j as u8)).collect();
+        unsafe { std::ptr::copy_nonoverlapping(pat.as_ptr(), base.add(embed_off), 32) };
+    }
+
+    let alloc4 = device.newCommandAllocator().expect("alloc4");
+    let event = device.newSharedEvent().expect("event");
+    let mut failures = Vec::new();
+    for (i, b) in shards.iter().enumerate() {
+        unsafe { std::ptr::write_bytes(dst.contents().as_ptr() as *mut u8, 0, 64) };
+        let desc = MTL4ArgumentTableDescriptor::new();
+        desc.setMaxBufferBindCount(2);
+        let table = device
+            .newArgumentTableWithDescriptor_error(&desc)
+            .expect("table");
+        unsafe {
+            table.setAddress_atIndex(b.gpuAddress() + embed_off as u64, 0);
+            table.setAddress_atIndex(dst.gpuAddress(), 1);
+        }
+        let cb = device.newCommandBuffer().expect("cb");
+        cb.beginCommandBufferWithAllocator(&alloc4);
+        let cb_ptr: *mut objc2::runtime::AnyObject = objc2::rc::Retained::as_ptr(&cb)
+            as *const objc2::runtime::AnyObject
+            as *mut objc2::runtime::AnyObject;
+        unsafe { res.attach_to_mtl4_command_buffer(cb_ptr) };
+        let enc = cb.computeCommandEncoder().expect("enc");
+        enc.setComputePipelineState(&pso);
+        enc.setArgumentTable(Some(&table));
+        enc.dispatchThreads_threadsPerThreadgroup(
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+        );
+        enc.endEncoding();
+        cb.endCommandBuffer();
+        let cb_protocol: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommandBuffer> = &cb;
+        let mut cb_array = [std::ptr::NonNull::from(cb_protocol)];
+        unsafe { queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1) };
+        queue4.signalEvent_value(objc2::runtime::ProtocolObject::from_ref(&*event), (i + 1) as u64);
+        assert!(event.waitUntilSignaledValue_timeoutMS((i + 1) as u64, 30_000));
+
+        let got = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
+        let want: Vec<u8> = (0..32).map(|j| (0xD0 + i as u8) ^ (j as u8)).collect();
+        let ok = got == want.as_slice();
+        eprintln!(
+            "shard{i} @2.87GiB under ~20GiB residency: {} (got[0..8]={:02x?})",
+            if ok { "OK" } else { "CORRUPT" },
+            &got[..8]
+        );
+        if !ok {
+            failures.push(i);
+        }
+    }
+    assert!(failures.is_empty(), "corrupt shards: {failures:?}");
 }

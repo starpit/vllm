@@ -502,7 +502,73 @@ impl MetalAllocator {
             });
         }
 
+        // FERRITE_VERIFY_WEIGHTS=1 — weight attestation: read every
+        // tensor BACK from the destination GPU buffer and compare
+        // against the mmap source bytes (head/middle/tail windows).
+        // Catches the silent-zero / partial-copy / paging corruption
+        // class at load time with a named tensor instead of degenerate
+        // logits at serve time. UMA: `contents()` readback IS the
+        // GPU-visible memory.
+        if std::env::var_os("FERRITE_VERIFY_WEIGHTS").is_some() {
+            let mut bad = 0usize;
+            for (i, t) in tensors.iter().enumerate() {
+                if t.len == 0 {
+                    continue;
+                }
+                let mut mismatch = false;
+                let mut all_zero = true;
+                for (w_off, w_len) in [
+                    (0usize, t.len.min(4096)),
+                    (t.len / 2 & !63, t.len.saturating_sub(t.len / 2 & !63).min(4096)),
+                    (t.len.saturating_sub(4096), t.len.min(4096)),
+                ] {
+                    if w_len == 0 {
+                        continue;
+                    }
+                    // SAFETY: both ranges proven in-bounds by construction
+                    // above; copies for this tensor completed synchronously.
+                    let src =
+                        unsafe { std::slice::from_raw_parts((src_base_usize + t.src_offset + w_off) as *const u8, w_len) };
+                    let dst =
+                        unsafe { std::slice::from_raw_parts((dst_base_usize + t.dst_offset + w_off) as *const u8, w_len) };
+                    if src != dst {
+                        mismatch = true;
+                    }
+                    if dst.iter().any(|&b| b != 0) {
+                        all_zero = false;
+                    }
+                }
+                if mismatch {
+                    bad += 1;
+                    eprintln!(
+                        "[verify-weights] MISMATCH tensor #{i} src_off={} len={} dst_off={} all_zero_windows={}",
+                        t.src_offset, t.len, t.dst_offset, all_zero
+                    );
+                }
+            }
+            eprintln!(
+                "[verify-weights] {}: {} tensors checked, {} corrupted",
+                path.display(),
+                tensors.len(),
+                bad
+            );
+        }
+
         self.residency.insert(&dst_buffer);
+
+        if std::env::var_os("FERRITE_VERIFY_WEIGHTS").is_some() {
+            let total: usize = {
+                let mm = self.mmaps.lock().expect("mmaps");
+                mm.iter().map(|r| r.aligned_capacity).sum::<usize>() + aligned_capacity
+            };
+            eprintln!(
+                "[verify-weights] +region {} aligned_capacity={:.2} GiB (regions total {:.2} GiB, device currentAllocatedSize={:.2} GiB)",
+                path.display(),
+                aligned_capacity as f64 / (1 << 30) as f64,
+                total as f64 / (1 << 30) as f64,
+                self.device.currentAllocatedSize() as f64 / (1 << 30) as f64,
+            );
+        }
 
         self.mmaps
             .lock()

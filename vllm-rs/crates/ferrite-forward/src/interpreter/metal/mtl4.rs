@@ -16,6 +16,12 @@ use ::objc2::rc::Retained;
 use ::objc2::runtime::ProtocolObject;
 use ::objc2_metal::{MTL4ArgumentTable, MTLBuffer};
 
+/// Diagnostic stash (FERRITE_VERIFY_BINDINGS): cmd0's first weight
+/// binding, for live GPU-read probes in `maybe_run_dump_pass`.
+/// (objc pointer as usize, byte offset). The buffer is kept alive
+/// for the process lifetime by the allocator's MmapRegion.
+pub static VERIFY_FIRST_WEIGHT: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+
 use super::__re::{ComputePipelineState, Device, MTL4ArgumentTableDescriptor, MTLDevice, MTLSize};
 use super::worker::BucketStep;
 
@@ -112,6 +118,22 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                         // `set_buffer_offset_atIndex` does the
                         // equivalent under the hood.
                         let addr = buf.gpuAddress() + *off;
+                        if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some()
+                            && tables.len() < 2
+                        {
+                            eprintln!(
+                                "[verify-table] cmd{} idx{} addr={:#x} (base={:#x} off={})",
+                                tables.len(),
+                                idx,
+                                addr,
+                                buf.gpuAddress(),
+                                off
+                            );
+                            if tables.is_empty() && *idx == 0 {
+                                let p = ::objc2::rc::Retained::as_ptr(buf) as usize;
+                                let _ = VERIFY_FIRST_WEIGHT.set((p, *off));
+                            }
+                        }
                         unsafe {
                             table.setAddress_atIndex(addr, *idx as usize);
                         }

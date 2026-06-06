@@ -518,8 +518,39 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             }
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::SiluMul => {
+            // SiluMul: out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
+            //
+            // Decomposition (5 Instrs per SUBTILE_TK20_DECOMP.md
+            // §"Per-SubOp Instr counts" line 19). Aliases dst_page
+            // as the SiLU work-tile across steps 1-4 — TK 2.0
+            // bin_map is element-local so dst aliasing src is safe
+            // (each thread reads then writes its own element).
+            //
+            //   reads[0] = gate, reads[1] = up
+            //   step 1: ShTileMulScalar(dst, gate, -1.0)   // dst = -gate
+            //   step 2: ShTileExp     (dst, dst)            // dst = exp(-gate)
+            //   step 3: ShTileAddScalar(dst, dst, 1.0)      // dst = 1 + exp(-gate)
+            //   step 4: ShTileDiv     (dst, gate, dst)      // dst = silu(gate)
+            //   step 5: ShTileMul     (dst, dst, up)        // dst = silu(gate) * up
+            use crate::tk_tape::{Bf16, GroupWidth, ScalarF32, SmemTileId};
+            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let up = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            // step 1
+            state.push(Instr::sh_tile_mul_scalar(gate, dst, ScalarF32::new(-1.0), W));
+            // step 2
+            state.push(Instr::sh_tile_exp(dst, dst, W));
+            // step 3
+            state.push(Instr::sh_tile_add_scalar(dst, dst, ScalarF32::new(1.0), W));
+            // step 4
+            state.push(Instr::sh_tile_div(gate, dst, dst, W));
+            // step 5
+            state.push(Instr::sh_tile_mul(dst, up, dst, W));
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         SubOp::MatmulTile
-        | SubOp::SiluMul
         | SubOp::Elementwise(EwKind::Silu)
         | SubOp::RmsNorm { .. }
         | SubOp::RopeRotate { .. }

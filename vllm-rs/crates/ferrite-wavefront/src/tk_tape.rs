@@ -338,6 +338,56 @@ pub enum Instr {
         width: GroupWidthTag,
     },
 
+    /// Pairwise divide — TK 2.0 primitive `kittens::group<N>::div(dst,
+    /// lhs, rhs)` at `ops/group/shared/tile/maps.cuh:319`. Used by
+    /// SiluMul (the sigmoid denominator: `gate / (1 + exp(-gate))`).
+    /// Same compile-time gates as ShTileMul/ShTileAdd.
+    ShTileDiv {
+        lhs: PageId,
+        rhs: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+    },
+
+    /// Element-wise exp — TK 2.0 primitive `kittens::group<N>::exp(dst,
+    /// src)` at `ops/group/shared/tile/maps.cuh:172` (unary, applies
+    /// `base_ops::exp` element-wise). Used by SiluMul. Same width
+    /// gating as ShTileMul; only one source operand.
+    ShTileExp {
+        src: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+    },
+
+    /// Tile × scalar multiply — TK 2.0 primitive `kittens::group<N>::mul`
+    /// at `ops/group/shared/tile/maps.cuh:306` with `U = T::dtype`
+    /// (the scalar overload of `bin_map<base_ops::mul, T>` at
+    /// `maps.cuh:38`). Used by SiluMul (`-gate` via scale=-1).
+    ///
+    /// `dtype` carries the page's dtype (sealed [`TileDtypeTag`]) so
+    /// the player emits the literal as `kittens::<dtype>(scalar)`
+    /// — wrong dtype mismatch is unrepresentable at construction
+    /// because the typed constructor derives `dtype` from
+    /// `T: TileDtype`'s `tag()` impl.
+    ShTileMulScalar {
+        lhs: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+    },
+
+    /// Tile + scalar — TK 2.0 primitive `kittens::group<N>::add` at
+    /// `maps.cuh:280` (scalar overload via `bin_map<base_ops::sum, T>`
+    /// at `maps.cuh:38`). Used by SiluMul (`1 + exp(-gate)`).
+    ShTileAddScalar {
+        lhs: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+    },
+
     /// Inert marker the orchestrator emits at the start of an op
     /// when `EmitOpts::debug_handshake` is on.
     DebugOpBeginMarker { op_index: u32 },
@@ -643,8 +693,15 @@ mod tile_dtype_sealed {
 /// `Bf16::ST_ALIAS_SUFFIX = "bf"`, not `"bf16"`.
 pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
     /// Suffix for the `kittens::st_<suffix><ROWS, COLS>` template
-    /// alias defined in `types/shared/st.cuh:313`.
+    /// alias defined in `types/shared/st.cuh:313`. The alias hides
+    /// the underlying scalar (`st_bf` aliases `st<bf16, ...>`).
     const ST_ALIAS_SUFFIX: &'static str;
+    /// Underlying scalar type name — `kittens::<name>`. Used by
+    /// scalar-literal emit (`*MulScalar` / `*AddScalar`). The alias
+    /// hides the scalar so this is a separate constant from
+    /// [`Self::ST_ALIAS_SUFFIX`] (e.g. `Bf16: SUFFIX = "bf",
+    /// SCALAR_NAME = "bf16"`).
+    const SCALAR_NAME: &'static str;
     /// Bytes per element. Used by [`SmemTileSpec`] to recover the
     /// runtime `elem_bytes` value for emit (TMA descriptor sizing,
     /// `expect_bytes` arithmetic) without storing it as a separate
@@ -663,6 +720,7 @@ pub struct Bf16;
 impl tile_dtype_sealed::Sealed for Bf16 {}
 impl TileDtype for Bf16 {
     const ST_ALIAS_SUFFIX: &'static str = "bf";
+    const SCALAR_NAME: &'static str = "bf16";
     const ELEM_BYTES: u32 = 2;
     fn tag() -> TileDtypeTag {
         TileDtypeTag::Bf16
@@ -933,6 +991,13 @@ impl TileDtypeTag {
             Self::Bf16 => Bf16::ST_ALIAS_SUFFIX,
         }
     }
+    /// Underlying scalar type — `kittens::<name>` for scalar
+    /// literals in `*MulScalar` / `*AddScalar` emit.
+    pub const fn scalar_name(&self) -> &'static str {
+        match self {
+            Self::Bf16 => Bf16::SCALAR_NAME,
+        }
+    }
     pub const fn elem_bytes(&self) -> u32 {
         match self {
             Self::Bf16 => Bf16::ELEM_BYTES,
@@ -952,6 +1017,31 @@ pub struct TileTypeSpec {
     pub rows: u32,
     pub cols: u32,
     pub dtype: TileDtypeTag,
+}
+
+/// Inlined immediate scalar carried by *AddScalar / *MulScalar Instrs.
+/// Per SUBTILE_TK20_DECOMP.md §"New typed-witness types" line 42:
+/// the codegen emits a literal in the TK 2.0 call (e.g.
+/// `kittens::bf16(-1.0f)`). The wrapper is a sealed newtype (the
+/// inner field is `pub(crate)`) so external code cannot fabricate
+/// scalar immediates that would silently splice into emitted CUDA.
+/// Per `feedback_ff_subtile_compile_time_inviolable`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScalarF32(pub(crate) f32);
+
+impl ScalarF32 {
+    /// Construct a scalar immediate. Used by lowering paths that
+    /// know the value at SubtileTape -> TkTape lowering time
+    /// (e.g. SiluMul's -1.0 / 1.0 immediates).
+    pub(crate) const fn new(value: f32) -> Self {
+        Self(value)
+    }
+
+    /// Recover the f32 value for emit. Player formats with
+    /// `format!("{value:.6}f")` or similar — see player.
+    pub const fn value(&self) -> f32 {
+        self.0
+    }
 }
 
 /// TMA-load arguments. Fields are `pub` for player read-access; the
@@ -1165,6 +1255,82 @@ impl Instr {
             lhs: lhs.page(),
             rhs: rhs.page(),
             dst: dst.page(),
+            width: width.tag(),
+        }
+    }
+
+    /// Construct a [`Instr::ShTileDiv`] — same compile-time gates as
+    /// `sh_tile_mul` / `sh_tile_add`.
+    pub(crate) fn sh_tile_div<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        lhs: SmemTileId<ROWS, COLS, T>,
+        rhs: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileDiv {
+            lhs: lhs.page(),
+            rhs: rhs.page(),
+            dst: dst.page(),
+            width: width.tag(),
+        }
+    }
+
+    /// Construct a [`Instr::ShTileExp`] (unary). Same compile-time
+    /// gates with one source.
+    pub(crate) fn sh_tile_exp<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileExp {
+            src: src.page(),
+            dst: dst.page(),
+            width: width.tag(),
+        }
+    }
+
+    /// Construct a [`Instr::ShTileMulScalar`]. The dtype is derived
+    /// from the typed `T: TileDtype` parameter via `T::tag()`, so
+    /// caller cannot pass a mismatched scalar dtype literal.
+    pub(crate) fn sh_tile_mul_scalar<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        lhs: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        scalar: ScalarF32,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileMulScalar {
+            lhs: lhs.page(),
+            dst: dst.page(),
+            scalar,
+            dtype: T::tag(),
+            width: width.tag(),
+        }
+    }
+
+    /// Construct a [`Instr::ShTileAddScalar`] — see `sh_tile_mul_scalar`.
+    pub(crate) fn sh_tile_add_scalar<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        lhs: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        scalar: ScalarF32,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileAddScalar {
+            lhs: lhs.page(),
+            dst: dst.page(),
+            scalar,
+            dtype: T::tag(),
             width: width.tag(),
         }
     }
@@ -1417,6 +1583,10 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             // change cross-page barrier or store state.
             Instr::ShTileMul { .. }
             | Instr::ShTileAdd { .. }
+            | Instr::ShTileDiv { .. }
+            | Instr::ShTileExp { .. }
+            | Instr::ShTileMulScalar { .. }
+            | Instr::ShTileAddScalar { .. }
             | Instr::DebugOpBeginMarker { .. } => {}
         }
     }

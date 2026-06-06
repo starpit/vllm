@@ -118,6 +118,56 @@ mod tk20 {
         )
     }
 
+    /// `kittens::group<N>::div(dst, lhs, rhs)` —
+    /// `ops/group/shared/tile/maps.cuh:319`. Used by ShTileDiv.
+    pub fn st_div(group_n: u32, dst: u8, lhs: u8, rhs: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::div(page_buf[{dst}], page_buf[{lhs}], page_buf[{rhs}]);"
+        )
+    }
+
+    /// `kittens::group<N>::exp(dst, src)` —
+    /// `ops/group/shared/tile/maps.cuh:172` (unary, applies
+    /// `base_ops::exp` element-wise). Used by ShTileExp.
+    pub fn st_exp(group_n: u32, dst: u8, src: u8) -> String {
+        format!("kittens::group<{group_n}>::exp(page_buf[{dst}], page_buf[{src}]);")
+    }
+
+    /// `kittens::group<N>::mul(dst, lhs, kittens::<dtype>(scalar))`
+    /// — scalar overload of binary `mul` per
+    /// `ops/group/shared/tile/maps.cuh:306` + `bin_map<op, T>(T &dst,
+    /// const T &src, const typename T::dtype &param)` at line 38.
+    /// Used by ShTileMulScalar.
+    pub fn st_mul_scalar(
+        group_n: u32,
+        dst: u8,
+        lhs: u8,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::mul(page_buf[{dst}], page_buf[{lhs}], \
+             kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+
+    /// `kittens::group<N>::add(dst, lhs, kittens::<dtype>(scalar))`.
+    /// Used by ShTileAddScalar.
+    pub fn st_add_scalar(
+        group_n: u32,
+        dst: u8,
+        lhs: u8,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::add(page_buf[{dst}], page_buf[{lhs}], \
+             kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+
     pub fn tma_store_async_typed(
         src_page: u8,
         dst_arg_idx: u32,
@@ -413,6 +463,20 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::ShTileAdd { lhs, rhs, dst, width } => {
             let _ = writeln!(out, "{}", tk20::st_add(width.n(), dst.0, lhs.0, rhs.0));
         }
+        Instr::ShTileDiv { lhs, rhs, dst, width } => {
+            let _ = writeln!(out, "{}", tk20::st_div(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::ShTileExp { src, dst, width } => {
+            let _ = writeln!(out, "{}", tk20::st_exp(width.n(), dst.0, src.0));
+        }
+        Instr::ShTileMulScalar { lhs, dst, scalar, dtype, width } => {
+            let _ = writeln!(out, "{}",
+                tk20::st_mul_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
+        }
+        Instr::ShTileAddScalar { lhs, dst, scalar, dtype, width } => {
+            let _ = writeln!(out, "{}",
+                tk20::st_add_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
+        }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
         }
@@ -640,6 +704,77 @@ mod tests {
         assert_eq!(
             s,
             "kittens::group<16>::add(page_buf[6], page_buf[4], page_buf[5]);\n",
+        );
+    }
+
+    /// `Instr::ShTileDiv` emits `kittens::group<N>::div` from
+    /// `ops/group/shared/tile/maps.cuh:319`. Used by SiluMul.
+    #[test]
+    fn sh_tile_div_emits_real_tk20_call() {
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(7));
+        let rhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(8));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(9));
+        let s = emit(Instr::sh_tile_div(
+            lhs,
+            rhs,
+            dst,
+            GroupWidth::<16>::ALL_CONSUMERS,
+        ));
+        assert_eq!(
+            s,
+            "kittens::group<16>::div(page_buf[9], page_buf[7], page_buf[8]);\n",
+        );
+    }
+
+    /// `Instr::ShTileExp` emits the unary exp.
+    #[test]
+    fn sh_tile_exp_emits_real_tk20_call() {
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, SmemTileId};
+        let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(2));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(3));
+        let s = emit(Instr::sh_tile_exp(src, dst, GroupWidth::<16>::ALL_CONSUMERS));
+        assert_eq!(
+            s,
+            "kittens::group<16>::exp(page_buf[3], page_buf[2]);\n",
+        );
+    }
+
+    /// `Instr::ShTileMulScalar` emits the scalar overload with the
+    /// dtype-tagged literal `kittens::bf16(<value>f)` derived from
+    /// `T::tag()`.
+    #[test]
+    fn sh_tile_mul_scalar_emits_typed_scalar_literal() {
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, ScalarF32, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(0));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(1));
+        let s = emit(Instr::sh_tile_mul_scalar(
+            lhs,
+            dst,
+            ScalarF32::new(-1.0),
+            GroupWidth::<16>::ALL_CONSUMERS,
+        ));
+        assert_eq!(
+            s,
+            "kittens::group<16>::mul(page_buf[1], page_buf[0], kittens::bf16(-1f));\n",
+        );
+    }
+
+    /// `Instr::ShTileAddScalar` mirrors mul_scalar with `add`.
+    #[test]
+    fn sh_tile_add_scalar_emits_typed_scalar_literal() {
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, ScalarF32, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(4));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(5));
+        let s = emit(Instr::sh_tile_add_scalar(
+            lhs,
+            dst,
+            ScalarF32::new(1.0),
+            GroupWidth::<16>::ALL_CONSUMERS,
+        ));
+        assert_eq!(
+            s,
+            "kittens::group<16>::add(page_buf[5], page_buf[4], kittens::bf16(1f));\n",
         );
     }
 

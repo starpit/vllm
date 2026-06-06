@@ -235,22 +235,37 @@ pub enum Instr {
         count: u32,
     },
 
-    /// Wait on `page_<kind>[page_id]` at a static parity (compile-time
-    /// known 0 or 1). Per plan §3 step 8: one Instr per architectural
-    /// primitive, no inner-match dispatch in the player.
-    PageBarrierWaitStatic {
+    /// Wait on `page_<kind>[page_id]` at compile-time parity 0. Per
+    /// plan §2 row "Phase (parity)": const-generic split variants on
+    /// TkTape, never as a u8 field. Sibling variant:
+    /// [`Instr::PageBarrierWaitStaticP1`] for parity 1.
+    PageBarrierWaitStaticP0 {
         page_id: PageId,
         kind: PageBarrier,
-        parity: u8,
         role: WarpRole,
     },
-    /// Wait on `page_<kind>[page_id]` at a runtime loop-carried parity:
-    /// `(v<var> + start) & 1u`.
-    PageBarrierWaitLoop {
+    /// Wait on `page_<kind>[page_id]` at compile-time parity 1.
+    PageBarrierWaitStaticP1 {
+        page_id: PageId,
+        kind: PageBarrier,
+        role: WarpRole,
+    },
+
+    /// Wait on `page_<kind>[page_id]` at loop-carried parity
+    /// `(v<var> + 0) & 1u`. Per plan §2 row "Phase (parity)": split
+    /// per start-parity rather than carrying `start: u8` as a field.
+    PageBarrierWaitLoopStart0 {
         page_id: PageId,
         kind: PageBarrier,
         var: LoopVarId,
-        start: u8,
+        role: WarpRole,
+    },
+    /// Wait on `page_<kind>[page_id]` at loop-carried parity
+    /// `(v<var> + 1) & 1u`.
+    PageBarrierWaitLoopStart1 {
+        page_id: PageId,
+        kind: PageBarrier,
+        var: LoopVarId,
         role: WarpRole,
     },
 
@@ -579,15 +594,24 @@ impl Instr {
         Self::WaitGroupBulk { n, role }
     }
 
+    /// Per plan §2 row "Phase (parity)": runtime→const dispatch
+    /// happens here, once at the constructor's `match` site. Each
+    /// arm produces a const-generic split variant; the Instr never
+    /// carries `parity` as a u8 field.
     pub(crate) fn wait_static(
         page: PageId,
         kind: PageBarrier,
         parity: u8,
         role: WarpRole,
     ) -> Self {
-        Self::PageBarrierWaitStatic { page_id: page, kind, parity, role }
+        match parity & 1 {
+            0 => Self::PageBarrierWaitStaticP0 { page_id: page, kind, role },
+            1 => Self::PageBarrierWaitStaticP1 { page_id: page, kind, role },
+            _ => unreachable!("parity & 1 is 0 or 1"),
+        }
     }
 
+    /// As [`Instr::wait_static`] but for runtime loop-carried parity.
     pub(crate) fn wait_loop(
         page: PageId,
         kind: PageBarrier,
@@ -595,12 +619,10 @@ impl Instr {
         start_parity: u8,
         role: WarpRole,
     ) -> Self {
-        Self::PageBarrierWaitLoop {
-            page_id: page,
-            kind,
-            var,
-            start: start_parity & 1,
-            role,
+        match start_parity & 1 {
+            0 => Self::PageBarrierWaitLoopStart0 { page_id: page, kind, var, role },
+            1 => Self::PageBarrierWaitLoopStart1 { page_id: page, kind, var, role },
+            _ => unreachable!("start_parity & 1 is 0 or 1"),
         }
     }
 
@@ -791,11 +813,16 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
                 }
             }
             Instr::PageBarrierArrive { .. } => {}
-            Instr::PageBarrierWaitStatic { page_id, kind: PageBarrier::Ready, .. }
-            | Instr::PageBarrierWaitLoop { page_id, kind: PageBarrier::Ready, .. } => {
+            Instr::PageBarrierWaitStaticP0 { page_id, kind: PageBarrier::Ready, .. }
+            | Instr::PageBarrierWaitStaticP1 { page_id, kind: PageBarrier::Ready, .. }
+            | Instr::PageBarrierWaitLoopStart0 { page_id, kind: PageBarrier::Ready, .. }
+            | Instr::PageBarrierWaitLoopStart1 { page_id, kind: PageBarrier::Ready, .. } => {
                 state.armed_load.remove(&page_id.0);
             }
-            Instr::PageBarrierWaitStatic { .. } | Instr::PageBarrierWaitLoop { .. } => {}
+            Instr::PageBarrierWaitStaticP0 { .. }
+            | Instr::PageBarrierWaitStaticP1 { .. }
+            | Instr::PageBarrierWaitLoopStart0 { .. }
+            | Instr::PageBarrierWaitLoopStart1 { .. } => {}
             Instr::ArriveIfRuntimeEven { .. } => {}
             Instr::BarrierInit { .. } => {}
             Instr::SyncthreadsCta { .. } | Instr::SyncthreadsGroup { .. } => {}
@@ -842,12 +869,13 @@ mod tests {
     fn parity_loop_carries_start() {
         let var = LoopVarId(0);
         let w = Instr::wait_loop(PageId(2), PageBarrier::Ready, var, 1, WarpRole::AllConsumers);
+        // Plan §2: parity is a const-generic split variant, not a u8
+        // field. start_parity=1 produces PageBarrierWaitLoopStart1.
         match w {
-            Instr::PageBarrierWaitLoop { var: v, start, .. } => {
+            Instr::PageBarrierWaitLoopStart1 { var: v, .. } => {
                 assert_eq!(v, var);
-                assert_eq!(start, 1);
             }
-            _ => panic!("expected loop-parity wait"),
+            _ => panic!("expected loop-parity wait Start1"),
         }
     }
 

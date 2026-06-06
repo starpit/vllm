@@ -457,12 +457,20 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::BarrierInit { page_id, kind, count } => {
             let _ = writeln!(out, "{}", tk20::mbarrier_init(barrier_name(*kind), page_id.0, *count));
         }
-        Instr::PageBarrierWaitStatic { page_id, kind, parity, role: _ } => {
-            let s = tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, *parity);
+        Instr::PageBarrierWaitStaticP0 { page_id, kind, role: _ } => {
+            let s = tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, 0);
             let _ = writeln!(out, "{s}");
         }
-        Instr::PageBarrierWaitLoop { page_id, kind, var, start, role: _ } => {
-            let s = tk20::mbarrier_wait_loop(barrier_name(*kind), page_id.0, var.0, *start);
+        Instr::PageBarrierWaitStaticP1 { page_id, kind, role: _ } => {
+            let s = tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, 1);
+            let _ = writeln!(out, "{s}");
+        }
+        Instr::PageBarrierWaitLoopStart0 { page_id, kind, var, role: _ } => {
+            let s = tk20::mbarrier_wait_loop(barrier_name(*kind), page_id.0, var.0, 0);
+            let _ = writeln!(out, "{s}");
+        }
+        Instr::PageBarrierWaitLoopStart1 { page_id, kind, var, role: _ } => {
+            let s = tk20::mbarrier_wait_loop(barrier_name(*kind), page_id.0, var.0, 1);
             let _ = writeln!(out, "{s}");
         }
         Instr::PageBarrierArrive { page_id, kind, role: _ } => {
@@ -649,10 +657,9 @@ mod tests {
 
     #[test]
     fn page_barrier_wait_static_emits_wait() {
-        let s = emit(Instr::PageBarrierWaitStatic {
+        let s = emit(Instr::PageBarrierWaitStaticP1 {
             page_id: crate::tk_tape::PageId(2),
             kind: crate::tk_tape::PageBarrier::Ready,
-            parity: 1,
             role: WarpRole::AllConsumers,
         });
         assert_eq!(s, "kittens::mbarrier::wait(&page_ready[2], 1);\n");

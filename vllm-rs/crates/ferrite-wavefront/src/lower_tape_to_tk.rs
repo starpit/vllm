@@ -446,10 +446,14 @@ fn lower_compute<F: RopeForm>(
     // page).
     for r in reads {
         let p = state.page_of(*r);
-        state.push(Instr::PageBarrierWaitStatic {
+        // Conservative all-gmem path uses parity 0 — emit the const-
+        // generic split variant directly (per plan §2 row "Phase
+        // (parity)": runtime→const dispatch happens once at the
+        // pass's match site; here that site is implicit because the
+        // lowering already knows it's parity 0).
+        state.push(Instr::PageBarrierWaitStaticP0 {
             page_id: p,
             kind: PageBarrier::Ready,
-            parity: 0,
             role: COMPUTE_ROLE,
         });
     }
@@ -1099,8 +1103,10 @@ mod tests {
             .iter()
             .filter(|i| matches!(
                 i,
-                Instr::PageBarrierWaitStatic { kind: PageBarrier::Ready, .. }
-                    | Instr::PageBarrierWaitLoop { kind: PageBarrier::Ready, .. }
+                Instr::PageBarrierWaitStaticP0 { kind: PageBarrier::Ready, .. }
+                    | Instr::PageBarrierWaitStaticP1 { kind: PageBarrier::Ready, .. }
+                    | Instr::PageBarrierWaitLoopStart0 { kind: PageBarrier::Ready, .. }
+                    | Instr::PageBarrierWaitLoopStart1 { kind: PageBarrier::Ready, .. }
             ))
             .count();
         assert_eq!(n_wait, 1, "one DAG edge → one Ready wait, got: {:?}", tk.instrs);

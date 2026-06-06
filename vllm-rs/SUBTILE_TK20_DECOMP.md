@@ -97,17 +97,19 @@ pub fn lower_subtile_tape_to_tk_tape(
 13. **`AttnDecode_Sv`** (1 Instr + the prerequisite `RegTileCopyConvert` from Open Question 5). Unblocks the full decode path.
 14. **`AttnDecode_Finalise`** (2 Instrs). Wraps the loop with `RegTileDivRow` + `StoreRegTileToShmem`.
 
-## Blocking open questions (need answers before steps 5+)
+## Resolved design decisions
 
-1. **`RegTileId` / `RegVecId` lifetime model**: SSA-with-last-use vs arena-named with explicit `Drop`. Blocks ALL register-resident SubOps (Silu, RoPE*, AttnDecode_*). Recommendation: SSA per Instr-output, lowerer proves liveness; mandatory before lowering AttnDecode_Init.
-2. **rsqrt over a shared vector in TK 2.0**: header inventory only lists rsqrt as rt/rv unary (`common/base_ops.cuh:219`). Direct grep needed before lowering RmsNorm. If no sv-rsqrt exists, RmsNorm permanently splits step 6 into LoadVecSmemToReg + RegVecRsqrt + StoreRegVecToShmem (already in the decomposition).
-3. **`ApplyLambdaKind` closure-body emission**: need named `__device__` functor structs in `ferrite_codegen_runtime` so `tk_player.rs` never inlines `format!("[](...){...}")`. Blocks `RopeRotateInterleaved` + `RopeAppend`.
-4. **WGMMA decode-path m == 1**: A.M_dim must equal 4*TILE_ROW_DIM at `warpgroup.cuh:199`. Blocks AttnDecode_Qkt and MatmulTile decode. Decision: pad act_smem to 4 tile rows in `PagePool` (preferred) vs route m==1 through warp-scope `mma_AB` at `warp.cuh:583` (forces a new Instr variant).
-5. **P_block dtype on AttnDecode_Sv**: mma_AB requires `A.T == B.T` (bf16). Softmax produces fp32 P; need a separate `RegTileCopyConvert` Instr (mapping to `ops/group/register/tile/conversions.cuh`) inserted between Qkt and Sv. **Add as a 47th variant before lowering AttnDecode_Sv.**
-6. **`Coord4 / CoordExpr::RuntimeRow`** support: required by RopeAppend (cos/sin row = p). Without it, RopeAppend lowering cannot produce a TmaLoadVec at runtime row. Blocks RopeAppend.
-7. **`block_table` indirect lookup for kv-slot coord in RopeAppend**: TK 2.0 has no primitive for indirect-coord TMA. Either (a) host precomputes kv_slot_coord per token and passes it as a Coord4 array baked into the descriptor, or (b) we add a non-TK `ScalarLoadFromGmem` Instr (which would be NOT a TK 2.0 primitive — violates inviolable rule 2). **Must be resolved with the orchestrator before RopeAppend goes live.**
-8. **Softmax accumulator binding across SubOp boundaries**: `SoftmaxRowMaxAcc<P>` / `SoftmaxRowSumAcc<P>` typestate must survive `lower_dag_to_tape`'s chain split. Confirm `SubtileTape` exposes a chain-state slot we can attach the typestate cursor to; if not, add `SoftmaxAccumulatorBinding` to `SubtileTape` as a sealed field.
-9. **Inlined `ScalarF32` vs `ScalarSlotId`**: locking in ScalarF32-only blocks any future runtime-variable scalar (e.g. dynamic ALiBi slope). Low risk, but record the decision.
+1. **Lifetime model: SSA**. Every Instr that produces a `RegTileId` / `RegVecId` mints a fresh id; the lowerer walks the tape forward proving last-use. Llama compute is acyclic per-op; arena+Drop adds an Instr type for no flexibility win.
+2. **rsqrt for register-vec**: use `kittens::group<N>::unary_op<kittens::base_ops::rsqrt, RvType>(dst, src)` from `ops/group/register/vec/maps.cuh:16` (generic unary-op template) + `common/base_ops.cuh:218` (the rsqrt op struct). No shared-vec rsqrt exists — RmsNorm permanently routes its rsqrt step through register-vec. The Instr is `RegVecUnaryRsqrt { src: RegVecId, dst: RegVecId, role: WarpRole }`.
+3. **`ApplyLambdaKind`: named `__device__` functor structs** in a new `ferrite_codegen_runtime/include/tk_apply_kinds.cuh` header we ship alongside the codegen. Each `ApplyLambdaKind` variant maps 1:1 to a struct with a `static __device__ inline T op(const T& src, const T& partner)` method. `tk_player.rs` emits `kittens::group<N>::apply<ApplyKind::RopeRotatePair>(dst, src, partner_smem)`. No inline closure bodies in the player.
+4. **WGMMA m==1: pad `act_smem` to 4 tile rows in `PagePool`**. One row of padding waste vs a parallel warp-scope mma Instr variant — padding keeps a single MMA path through MatmulTile and AttnDecode_Qkt.
+5. **P_block dtype on AttnDecode_Sv**: add `RegTileCopyConvert { src: RegTileId, dst: RegTileId, role: WarpRole }` Instr (47th variant) mapping to `kittens::group<N>::copy` in `ops/group/register/tile/conversions.cuh`. Inserted between Qkt and Sv to convert fp32 P → bf16. Non-negotiable: mma_AB requires A.T == B.T.
+6. **`CoordExpr::RuntimeRow`**: yes. Required by RopeAppend (cos/sin row = position p). The same `decode_position` kernel-arg slot RopeRotate already mints serves as the runtime row.
+7. **`block_table` indirect lookup**: orchestrator (host) precomputes the kv-slot Coord4 per token before launch and passes it as a kernel arg. The TMA descriptor stays static (one descriptor per cache layer); the Coord4 read at the call site comes from a kernel-arg slot. No non-TK `ScalarLoadFromGmem` Instr — that would violate inviolable rule 2.
+8. **`SoftmaxAccumulatorBinding`** lives in `lower_subtile_tape_to_tk_tape`'s `LoweringState` across the OpenLoop body. Per-AttnDecode-loop binding is a lowering concern, not a SubtileTape field. The `SoftmaxRowMaxAcc<P>` / `SoftmaxRowSumAcc<P>` typestate cursors are owned by `LoweringState::softmax_cursor: Option<SoftmaxAccumulatorBinding>` set on `SubOp::AttnDecode` entry, threaded through OpenLoop body, consumed at CloseLoop's `Finalise`-deferred drain.
+9. **`ScalarF32` only**. Add `ScalarSlotId` when something actually needs runtime-variable scalars; YAGNI.
+
+The 47-variant Instr set including `RegVecUnaryRsqrt` (generic unary-op pattern) and `RegTileCopyConvert` (fp32→bf16 for AttnDecode_Sv) is now closed. Implementation can proceed.
 
 ## Status (2026-06-06)
 

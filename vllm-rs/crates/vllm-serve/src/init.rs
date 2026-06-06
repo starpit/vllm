@@ -217,6 +217,23 @@ fn should_use_mlx(device: &str) -> bool {
     matches!(device, "auto" | "metal")
 }
 
+/// `num_hidden_layers`, falling through to the nested `text_config`
+/// (verbatim VL-wrapper configs — Qwen3.5 family) so the startup log
+/// doesn't claim "num_layers=1".
+fn resolve_num_layers(hf_config: &HfModelConfig) -> usize {
+    hf_config
+        .num_hidden_layers
+        .or_else(|| {
+            hf_config
+                .extra
+                .get("text_config")
+                .and_then(|t| t.get("num_hidden_layers"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        })
+        .unwrap_or(1)
+}
+
 /// Resolve the full set of stop-on-generate token IDs the engine
 /// should honor, merging three HuggingFace conventions:
 ///
@@ -1010,7 +1027,7 @@ fn initialize_core(
         .max_model_len
         .or(hf_config.max_position_embeddings)
         .unwrap_or(4096);
-    let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+    let num_layers = resolve_num_layers(&hf_config);
 
     info!(
         "Model: {}, max_model_len={}, num_layers={}",
@@ -2203,7 +2220,7 @@ fn initialize_stack_tp_pp(
                 .max_model_len
                 .or(hf_config.max_position_embeddings)
                 .unwrap_or(4096);
-            let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+            let num_layers = resolve_num_layers(&hf_config);
 
             info!(
                 "Model: {}, max_model_len={}, num_layers={}, tp={}, pp={}",
@@ -2572,7 +2589,7 @@ fn initialize_stack_tp(
             .max_model_len
             .or(hf_config.max_position_embeddings)
             .unwrap_or(4096);
-        let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+        let num_layers = resolve_num_layers(&hf_config);
 
         info!(
             "Model: {}, max_model_len={}, num_layers={}, tp={}",
@@ -3356,7 +3373,7 @@ fn compute_num_blocks(
     _gpu_memory_utilization: f64,
     kv_cache_dtype: &str,
 ) -> usize {
-    let num_layers = hf_config.num_hidden_layers.unwrap_or(1);
+    let num_layers = resolve_num_layers(&hf_config);
     let num_kv_heads = hf_config.num_kv_heads().unwrap_or(0);
     let head_dim = hf_config.head_dim().unwrap_or(0);
 

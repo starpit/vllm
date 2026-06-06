@@ -29,6 +29,124 @@ struct MetalArena {
 unsafe impl Send for MetalArena {}
 unsafe impl Sync for MetalArena {}
 
+/// `$HOME/.cache`, honoring `XDG_CACHE_HOME`. Falls back to /tmp when
+/// HOME is unset (CI sandboxes).
+fn dirs_cache_base() -> std::path::PathBuf {
+    if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(x);
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        return std::path::PathBuf::from(h).join(".cache");
+    }
+    std::path::PathBuf::from("/tmp")
+}
+
+/// Fast non-cryptographic content hash over a byte region —
+/// u64-chunked FNV-1a variant (~RAM-bandwidth in release). Integrity
+/// bit for the aligned sidecar: computed during the build write,
+/// re-verified in the background after every cache-hit launch.
+fn content_hash64(base: *const u8, len: usize) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01B3;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let words = len / 8;
+    // SAFETY: caller guarantees `base..base+len` readable.
+    let w = unsafe { std::slice::from_raw_parts(base as *const u64, words) };
+    for &x in w {
+        h = (h ^ x).wrapping_mul(PRIME);
+    }
+    let tail = unsafe { std::slice::from_raw_parts(base.add(words * 8), len - words * 8) };
+    for &b in tail {
+        h = (h ^ b as u64).wrapping_mul(PRIME);
+    }
+    h
+}
+
+/// Latch flipped by the executor once model load + warmup complete.
+/// Background sidecar writers wait on it so the one-time cache build
+/// never contends with the load itself (observed: writers racing the
+/// realign-copy turned an 8-9.5 s miss launch into 18.6 s — three I/O
+/// streams + ~19 GiB of dirtied page cache on a 32 GiB box).
+static WEIGHTS_LOAD_COMPLETE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called by the worker after warmup. Idempotent.
+pub fn signal_weights_load_complete() {
+    WEIGHTS_LOAD_COMPLETE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Bump when the packed layout rule changes (MIN_BIND_ALIGN, packing
+/// order, …) — invalidates every existing sidecar.
+const ALIGNED_CACHE_LAYOUT_VERSION: u32 = 1;
+
+/// Identity + validity data for one shard's aligned sidecar.
+#[derive(Clone, Debug)]
+struct AlignedCacheMeta {
+    src_size: u64,
+    src_mtime_ns: u128,
+    aligned_capacity: usize,
+    /// `~/.cache/ferrite/aligned-v1/<hash>-<shard>.bin`
+    bin: std::path::PathBuf,
+    /// `content_hash64` of the aligned blob, filled by the builder.
+    content_hash: std::cell::Cell<u64>,
+}
+
+impl AlignedCacheMeta {
+    fn cache_bin_path(&self) -> std::path::PathBuf {
+        self.bin.clone()
+    }
+    fn meta_json_path(&self) -> std::path::PathBuf {
+        self.bin.with_extension("meta.json")
+    }
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"layout_version\":{},\"src_size\":{},\"src_mtime_ns\":{},\"aligned_capacity\":{},\"content_hash\":{}}}",
+            ALIGNED_CACHE_LAYOUT_VERSION,
+            self.src_size,
+            self.src_mtime_ns,
+            self.aligned_capacity,
+            self.content_hash.get(),
+        )
+    }
+    /// The expected blob hash from the on-disk meta (None for metas
+    /// written before the integrity bit existed — treated as invalid
+    /// by `is_valid_on_disk`).
+    fn disk_content_hash(&self) -> Option<u64> {
+        let j: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(self.meta_json_path()).ok()?).ok()?;
+        j.get("content_hash").and_then(|v| v.as_u64())
+    }
+    /// True iff bin + meta exist and match this source + layout.
+    fn is_valid_on_disk(&self) -> bool {
+        let Ok(meta_str) = std::fs::read_to_string(self.meta_json_path()) else {
+            return false;
+        };
+        let Ok(j) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
+            return false;
+        };
+        let ok = j.get("layout_version").and_then(|v| v.as_u64())
+            == Some(ALIGNED_CACHE_LAYOUT_VERSION as u64)
+            && j.get("src_size").and_then(|v| v.as_u64()) == Some(self.src_size)
+            && j.get("src_mtime_ns").and_then(|v| v.as_u128_lossy()) == Some(self.src_mtime_ns)
+            && j.get("aligned_capacity").and_then(|v| v.as_u64())
+                == Some(self.aligned_capacity as u64)
+            && j.get("content_hash").and_then(|v| v.as_u64()).is_some();
+        ok && std::fs::metadata(&self.bin)
+            .map(|m| m.len() as usize == self.aligned_capacity)
+            .unwrap_or(false)
+    }
+}
+
+/// `as_u128` polyfill — serde_json numbers cap at u64/f64; mtime_ns is
+/// stored as a JSON number that fits u64 in practice (year 2554).
+trait U128Lossy {
+    fn as_u128_lossy(&self) -> Option<u128>;
+}
+impl U128Lossy for serde_json::Value {
+    fn as_u128_lossy(&self) -> Option<u128> {
+        self.as_u64().map(|v| v as u128)
+    }
+}
+
 /// Per-tensor record stored in the parent `MmapRegion`. Each tensor's
 /// bytes live at `aligned_buffer.contents() + dst_offset` (the
 /// `dst_offset` is 16-aligned by construction so kernel bindings
@@ -112,6 +230,10 @@ struct MmapRegion {
     /// `alloc_and_copy_host`.
     tensors: Vec<MmapTensor>,
     _mmap: Arc<memmap2::Mmap>,
+    /// When the region is served from the aligned sidecar cache,
+    /// `aligned_buffer` is a bytesNoCopy wrap of THIS mapping —
+    /// keep it alive for the buffer's lifetime.
+    _cache_mmap: Option<Arc<memmap2::Mmap>>,
 }
 
 unsafe impl Send for MmapRegion {}
@@ -396,6 +518,469 @@ impl MetalAllocator {
             .saturating_mul(Self::MIN_BIND_ALIGN)
             .max(Self::MIN_BIND_ALIGN);
 
+        // ── Aligned sidecar cache (zero-copy relaunch) ────────────────
+        //
+        // The realign-copy below is a pure function of (source file,
+        // packing layout). Persist its output once, then on later
+        // launches mmap the cached aligned blob and wrap it as a
+        // bytesNoCopy MTLBuffer — no copy, single memory copy total
+        // (the file pages ARE the buffer; load-time footprint halves).
+        // Measured on Qwen3.5-35B (18.99 GiB): warm relaunch pays only
+        // the residency wiring (~3.3-3.7 s) instead of the ~8 s copy.
+        //
+        // Validity: source (size, mtime_ns) + layout version +
+        // aligned_capacity, stored in a sidecar .meta.json. The
+        // FERRITE_VERIFY_WEIGHTS attestation additionally compares
+        // cache bytes against source bytes per tensor when enabled.
+        //
+        // FERRITE_ALIGNED_CACHE=0 disables both the read and the
+        // build path (per-user request: always env-escapable).
+        let cache_enabled = std::env::var("FERRITE_ALIGNED_CACHE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off"))
+            .unwrap_or(true);
+        let meta = Self::aligned_cache_meta(path, aligned_capacity);
+        let cache_file = meta
+            .as_ref()
+            .filter(|_| cache_enabled)
+            .map(|m| m.cache_bin_path());
+        if let (Some(cf), Some(m)) = (cache_file.as_ref(), meta.as_ref())
+            && m.is_valid_on_disk()
+        {
+            match Self::register_from_aligned_cache(
+                self,
+                cf,
+                base,
+                len,
+                aligned_capacity,
+                &packed,
+                mmap,
+                m.disk_content_hash(),
+            ) {
+                Ok(()) => {
+                    tracing::info!(
+                        "aligned-cache HIT: {} served zero-copy from {}",
+                        path.display(),
+                        cf.display()
+                    );
+                    return Ok(());
+                }
+                Err((e, mmap_back)) => {
+                    tracing::warn!(
+                        "aligned-cache: rejected {} ({e}); deleting and falling back to copy",
+                        cf.display()
+                    );
+                    // Self-heal: a cache that fails to map or fails the
+                    // integrity check must not be retried forever.
+                    if let Some(m) = meta.as_ref() {
+                        let _ = std::fs::remove_file(m.meta_json_path());
+                    }
+                    let _ = std::fs::remove_file(cf);
+                    return self.register_mmap_copy_path(
+                        path,
+                        mmap_back,
+                        base,
+                        len,
+                        packed,
+                        aligned_capacity,
+                        meta,
+                        cache_enabled,
+                    );
+                }
+            }
+        }
+        self.register_mmap_copy_path(
+            path,
+            mmap,
+            base,
+            len,
+            packed,
+            aligned_capacity,
+            meta,
+            cache_enabled,
+        )
+    }
+
+    /// Compute the sidecar identity for `path`, or None when source
+    /// metadata is unavailable. mtime_ns truncates to u64 range (fine
+    /// until year 2554); cache dir is created lazily by the writer.
+    fn aligned_cache_meta(path: &Path, aligned_capacity: usize) -> Option<AlignedCacheMeta> {
+        let md = std::fs::metadata(path).ok()?;
+        let mtime = md.modified().ok()?;
+        let src_mtime_ns = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+            & (u64::MAX as u128);
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        canon.hash(&mut h);
+        let dir = dirs_cache_base().join("ferrite").join("aligned-v1");
+        let stem = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shard".into());
+        let bin = dir.join(format!("{:016x}-{stem}.bin", h.finish()));
+        Some(AlignedCacheMeta {
+            src_size: md.len(),
+            src_mtime_ns,
+            aligned_capacity,
+            bin,
+            content_hash: std::cell::Cell::new(0),
+        })
+    }
+
+    /// Cache-hit path: mmap the aligned sidecar and wrap it as a
+    /// bytesNoCopy MTLBuffer — no copy; the file pages are the
+    /// buffer. On failure returns the source mmap back so the caller
+    /// can fall through to the copy path.
+    #[allow(clippy::result_large_err)]
+    fn register_from_aligned_cache(
+        &self,
+        cache_bin: &Path,
+        base: *const u8,
+        len: usize,
+        aligned_capacity: usize,
+        packed: &[(usize, usize, usize)],
+        mmap: Arc<memmap2::Mmap>,
+        expected_hash: Option<u64>,
+    ) -> std::result::Result<(), (anyhow::Error, Arc<memmap2::Mmap>)> {
+        let file = match std::fs::File::open(cache_bin) {
+            Ok(f) => f,
+            Err(e) => return Err((e.into(), mmap)),
+        };
+        let cache_mmap = match unsafe { memmap2::Mmap::map(&file) } {
+            Ok(m) => Arc::new(m),
+            Err(e) => return Err((e.into(), mmap)),
+        };
+        if cache_mmap.len() != aligned_capacity {
+            return Err((
+                anyhow::anyhow!(
+                    "sidecar size {} != expected aligned_capacity {}",
+                    cache_mmap.len(),
+                    aligned_capacity
+                ),
+                mmap,
+            ));
+        }
+        let page: usize = 16384;
+        let rounded = aligned_capacity.div_ceil(page) * page;
+        let ptr = cache_mmap.as_ptr() as *mut std::ffi::c_void;
+        let Some(nn) = std::ptr::NonNull::new(ptr) else {
+            return Err((anyhow::anyhow!("null mmap base"), mmap));
+        };
+        let Some(buffer) = (unsafe {
+            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
+                nn,
+                rounded,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }) else {
+            return Err((anyhow::anyhow!("newBufferWithBytesNoCopy returned nil"), mmap));
+        };
+        self.residency.insert(&buffer);
+
+        let tensors: Vec<MmapTensor> = packed
+            .iter()
+            .map(|&(src_off, sz, dst_off)| MmapTensor {
+                src_offset: src_off,
+                len: sz,
+                dst_offset: dst_off,
+                // Bytes are already on disk — every tensor is ready.
+                ready: Arc::new(TensorReady::new(0)),
+            })
+            .collect();
+
+        // ALWAYS-ON integrity bit: spot-check the head window (4 KiB)
+        // of every tensor against the SOURCE bytes before serving from
+        // the sidecar (~8 MiB of scattered source reads). Catches torn
+        // writes, truncation surviving the size check, and
+        // wrong-file/bit-rot with high probability; mismatch is
+        // self-healing — the caller falls back to the copy path and
+        // deletes the bad cache. The full 3-window attestation stays
+        // under FERRITE_VERIFY_WEIGHTS.
+        {
+            let src_base = base as usize;
+            let dst_base = cache_mmap.as_ptr() as usize;
+            for (i, t) in tensors.iter().enumerate() {
+                let w = t.len.min(4096);
+                if w == 0 {
+                    continue;
+                }
+                let a = unsafe {
+                    std::slice::from_raw_parts((src_base + t.src_offset) as *const u8, w)
+                };
+                let b = unsafe {
+                    std::slice::from_raw_parts((dst_base + t.dst_offset) as *const u8, w)
+                };
+                if a != b {
+                    return Err((
+                        anyhow::anyhow!(
+                            "sidecar integrity check failed at tensor #{i} \
+                             (src_off={}, dst_off={}) — torn or stale cache",
+                            t.src_offset,
+                            t.dst_offset
+                        ),
+                        mmap,
+                    ));
+                }
+            }
+        }
+
+        // FERRITE_VERIFY_WEIGHTS attestation works on the cache path
+        // too: compare sidecar bytes vs SOURCE bytes per tensor
+        // (faults source pages — diagnostic only).
+        if std::env::var_os("FERRITE_VERIFY_WEIGHTS").is_some() {
+            let mut bad = 0usize;
+            let src_base = base as usize;
+            let dst_base = cache_mmap.as_ptr() as usize;
+            for (i, t) in tensors.iter().enumerate() {
+                if t.len == 0 {
+                    continue;
+                }
+                for (w_off, w_len) in [
+                    (0usize, t.len.min(4096)),
+                    (t.len / 2 & !63, t.len.saturating_sub(t.len / 2 & !63).min(4096)),
+                    (t.len.saturating_sub(4096), t.len.min(4096)),
+                ] {
+                    if w_len == 0 {
+                        continue;
+                    }
+                    let a = unsafe {
+                        std::slice::from_raw_parts((src_base + t.src_offset + w_off) as *const u8, w_len)
+                    };
+                    let b = unsafe {
+                        std::slice::from_raw_parts((dst_base + t.dst_offset + w_off) as *const u8, w_len)
+                    };
+                    if a != b {
+                        bad += 1;
+                        eprintln!("[verify-weights] sidecar MISMATCH tensor #{i}");
+                        break;
+                    }
+                }
+            }
+            eprintln!(
+                "[verify-weights] sidecar {}: {} tensors checked, {} corrupted",
+                cache_bin.display(),
+                tensors.len(),
+                bad
+            );
+        }
+
+        // Integrity bit (full coverage): the head-window spot-check
+        // above misses corruption away from tensor heads (proven by a
+        // byte-flip test at +2.5 GB). Verify the FULL blob against the
+        // build-time content hash in the BACKGROUND — zero startup
+        // cost; runs after the load-complete latch so it never
+        // contends with launch. On mismatch the process ABORTS loudly
+        // (it is already serving from these pages — continuing means
+        // silently corrupt weights, this week's nightmare class) and
+        // deletes the cache so relaunch self-heals via the copy path.
+        if let Some(expected) = expected_hash {
+            let hash_base = cache_mmap.as_ptr() as usize;
+            let hash_len = aligned_capacity;
+            let bin = cache_bin.to_path_buf();
+            let meta_json = bin.with_extension("meta.json");
+            std::thread::spawn(move || {
+                let t_wait = std::time::Instant::now();
+                while !WEIGHTS_LOAD_COMPLETE.load(std::sync::atomic::Ordering::Acquire)
+                    && t_wait.elapsed() < std::time::Duration::from_secs(180)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                let t0 = std::time::Instant::now();
+                let got = content_hash64(hash_base as *const u8, hash_len);
+                if got != expected {
+                    let _ = std::fs::remove_file(&meta_json);
+                    let _ = std::fs::remove_file(&bin);
+                    eprintln!(
+                        "FATAL: aligned-cache integrity verification FAILED for {} \
+                         (content_hash {got:#x} != recorded {expected:#x}). The cache has \
+                         been deleted; relaunch will rebuild it from the checkpoint. \
+                         Aborting rather than serve corrupt weights.",
+                        bin.display()
+                    );
+                    std::process::abort();
+                }
+                tracing::info!(
+                    "aligned-cache: background integrity verify OK for {} in {:?}",
+                    bin.display(),
+                    t0.elapsed()
+                );
+            });
+        }
+
+        let aligned_base = cache_mmap.as_ptr() as *mut u8;
+        self.mmaps
+            .lock()
+            .expect("MetalAllocator mmaps Mutex")
+            .push(MmapRegion {
+                base,
+                len,
+                aligned_buffer: buffer,
+                aligned_base,
+                aligned_capacity,
+                tensors,
+                _mmap: mmap,
+                _cache_mmap: Some(cache_mmap),
+            });
+        Ok(())
+    }
+
+    /// Background sidecar writer: temp file + atomic rename, meta json
+    /// last (a crash leaves an invalid/incomplete cache that the
+    /// validity check rejects). SAFETY: the aligned buffer lives in
+    /// `self.mmaps` for the process lifetime and weights are immutable
+    /// after the load copy completes.
+    fn spawn_aligned_cache_writer(
+        cache_bin: std::path::PathBuf,
+        aligned_base: usize,
+        len: usize,
+        meta: AlignedCacheMeta,
+    ) {
+        std::thread::spawn(move || {
+            // Stay out of the load's way: wait for warmup (bounded so
+            // short-lived tools still build their cache eventually).
+            let t_wait = std::time::Instant::now();
+            while !WEIGHTS_LOAD_COMPLETE.load(std::sync::atomic::Ordering::Acquire)
+                && t_wait.elapsed() < std::time::Duration::from_secs(180)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            let t0 = std::time::Instant::now();
+            if let Some(dir) = cache_bin.parent()
+                && let Err(e) = std::fs::create_dir_all(dir)
+            {
+                tracing::warn!("aligned-cache: create_dir_all failed: {e}");
+                return;
+            }
+            // Single-builder exclusion across PROCESSES: flock on a
+            // sidecar lock file. The kernel releases the lock on any
+            // process death (including SIGKILL), so there is no stale-
+            // lock protocol. A second `vllm` launched in parallel
+            // skips the build — the winner produces the cache, and the
+            // loser has already loaded via the copy path anyway
+            // (waiting would be strictly slower than the copy it
+            // already did).
+            let lock_path = cache_bin.with_extension("lock");
+            let Ok(lock_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+            else {
+                tracing::warn!("aligned-cache: cannot open lock file; skipping build");
+                return;
+            };
+            {
+                use std::os::fd::AsRawFd;
+                let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if rc != 0 {
+                    tracing::info!(
+                        "aligned-cache: another process is building {}; skipping",
+                        cache_bin.display()
+                    );
+                    return;
+                }
+            }
+            // Holding the lock: re-check (the other process may have
+            // finished the build while we waited on the latch) and
+            // sweep any orphaned tmp from a killed builder.
+            if meta.is_valid_on_disk() {
+                tracing::info!("aligned-cache: {} already built; skipping", cache_bin.display());
+                return;
+            }
+            // Pid-suffixed tmp: even if exclusion is ever bypassed,
+            // two builders can't truncate each other's stream; rename
+            // is atomic and both write identical bytes.
+            let tmp = cache_bin.with_extension(format!("tmp.{}", std::process::id()));
+            if let Some(dir) = cache_bin.parent()
+                && let Some(stem) = cache_bin.file_name().map(|f| f.to_string_lossy().into_owned())
+                && let Ok(rd) = std::fs::read_dir(dir)
+            {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(&stem.replace(".bin", "")) && name.contains(".tmp") {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+            let write = || -> std::io::Result<()> {
+                use std::io::Write;
+                let file = std::fs::File::create(&tmp)?;
+                // F_NOCACHE: don't dirty ~19 GiB of page cache for a
+                // write-once blob — keeps the source/weight pages (and
+                // everything else) resident.
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+                }
+                let mut f = std::io::BufWriter::with_capacity(8 << 20, file);
+                const CHUNK: usize = 64 << 20;
+                let mut off = 0usize;
+                while off < len {
+                    let n = (len - off).min(CHUNK);
+                    let s = unsafe {
+                        std::slice::from_raw_parts((aligned_base + off) as *const u8, n)
+                    };
+                    f.write_all(s)?;
+                    off += n;
+                }
+                f.flush()?;
+                f.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+                Ok(())
+            };
+            if let Err(e) = write() {
+                tracing::warn!("aligned-cache: build failed ({e}); removing temp");
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+            // Integrity bit: hash the blob we just wrote (from the
+            // in-memory buffer — RAM-bandwidth, no re-read) and stamp
+            // it into the meta. Verified in the background after every
+            // cache-hit launch.
+            meta.content_hash
+                .set(content_hash64(aligned_base as *const u8, len));
+            if let Err(e) = std::fs::rename(&tmp, &cache_bin) {
+                tracing::warn!("aligned-cache: rename failed: {e}");
+                let _ = std::fs::remove_file(&tmp);
+                return;
+            }
+            let meta_tmp = meta.meta_json_path().with_extension(format!("json.tmp.{}", std::process::id()));
+            if let Err(e) = std::fs::write(&meta_tmp, meta.to_json())
+                .and_then(|()| std::fs::rename(&meta_tmp, meta.meta_json_path()))
+            {
+                tracing::warn!("aligned-cache: meta write failed: {e}");
+                let _ = std::fs::remove_file(&meta_tmp);
+                return;
+            }
+            tracing::info!(
+                "aligned-cache: built {} ({:.2} GiB) in {:?} — next launch loads zero-copy",
+                cache_bin.display(),
+                len as f64 / (1 << 30) as f64,
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// The pre-sidecar `register_mmap` tail: allocate the aligned
+    /// buffer, copy every tensor into it (page-fault bound; WILLNEED
+    /// hinted), then optionally build the sidecar in the background.
+    #[allow(clippy::too_many_arguments)]
+    fn register_mmap_copy_path(
+        &self,
+        path: &Path,
+        mmap: Arc<memmap2::Mmap>,
+        base: *const u8,
+        len: usize,
+        packed: Vec<(usize, usize, usize)>,
+        aligned_capacity: usize,
+        meta: Option<AlignedCacheMeta>,
+        cache_enabled: bool,
+    ) -> Result<()> {
+
         let dst_buffer = self
             .device
             .newBufferWithLength_options(aligned_capacity, MTLResourceOptions::StorageModeShared)
@@ -423,7 +1008,7 @@ impl MetalAllocator {
                 aligned_base,
                 dst_buffer.length(),
                 max_buf,
-                tensors_src.len(),
+                packed.len(),
             );
         }
 
@@ -449,56 +1034,99 @@ impl MetalAllocator {
         // for the lifetime of every captured pointer.
         let src_base_usize = base as usize;
 
+        // Build per-tensor entries + a flat work-list of chunk copies.
+        //
+        // Userspace memcpy from the mmap'd safetensors region into the
+        // StorageModeShared MTLBuffer.
+        //
+        // Why not `pread`: on macOS, `pread` into the `contents()` of a
+        // large StorageModeShared MTLBuffer fails with EFAULT — the
+        // kernel can't DMA into GPU-mapped pages. Empirically this hits
+        // any shard above ~2 GiB; the standalone
+        // `large_buffer_offset_probe_test` confirmed userspace memcpy
+        // into the same buffer at 4.68 GiB offset DOES work.
+        //
+        // Why PARALLEL: the copy is page-fault bound — every source
+        // page is a cold file page the kernel reads from NVMe on
+        // first touch. A single thread faults sequentially at queue
+        // depth ~1 and measured 1.33 GiB/s (13.9 s for the 18.6 GiB
+        // Qwen3.5-35B). Scoped worker threads fault disjoint 16 MiB
+        // chunks concurrently, restoring NVMe queue depth. The old
+        // `rayon::spawn` version was removed over a 'static-capture
+        // lifetime puzzle; `std::thread::scope` borrows instead, so
+        // the buffer pointer never needs 'static.
+        //
+        // SAFETY: every chunk's dst is a disjoint range inside the
+        // freshly-allocated destination MTLBuffer (alive in this
+        // scope, moved into MmapRegion below); src points into the
+        // mmap'd file region (Arc'd into MmapRegion's `_mmap`). No
+        // two chunks overlap.
         let mut tensors: Vec<MmapTensor> = Vec::with_capacity(packed.len());
+        // (src_off, dst_off, len, per-tensor ready handle)
+        let mut chunk_jobs: Vec<(usize, usize, usize, Arc<TensorReady>)> = Vec::new();
         for (src_off, sz, dst_off) in packed {
             let n_chunks = if sz == 0 { 0 } else { sz.div_ceil(READ_CHUNK) };
             let ready = Arc::new(TensorReady::new(n_chunks));
             for chunk_idx in 0..n_chunks {
                 let off_in_tensor = chunk_idx * READ_CHUNK;
                 let chunk_sz = (sz - off_in_tensor).min(READ_CHUNK);
-                let chunk_src = src_off + off_in_tensor;
-                let chunk_dst = dst_off + off_in_tensor;
-                let ready_w = Arc::clone(&ready);
-                // Userspace memcpy from the mmap'd safetensors region
-                // into the StorageModeShared MTLBuffer.
-                //
-                // Why not `pread`: on macOS, `pread` into the
-                // `contents()` of a large StorageModeShared MTLBuffer
-                // fails with EFAULT — the kernel can't DMA into
-                // GPU-mapped pages. Empirically this hits any shard
-                // above ~2 GiB (3B-4bit 1.8 GiB works, 8B-4bit 4.2 GiB
-                // fails). The standalone `large_buffer_offset_probe_test`
-                // confirmed userspace memcpy into the same buffer at
-                // 4.68 GiB offset DOES work.
-                //
-                // Done synchronously instead of via `rayon::spawn` to
-                // avoid the lifetime puzzle of capturing the destination
-                // buffer's contents pointer in a 'static closure: the
-                // MTLBuffer is created here and moved into MmapRegion
-                // below, so a spawned task's address is only valid
-                // after MmapRegion is pushed into self.mmaps. memcpy
-                // is bandwidth-bound (kernel page-fault-in from mmap +
-                // cache fill); the extra parallelism rayon gave the
-                // old pread path mattered for kernel-side I/O
-                // dispatch, not for the actual byte movement.
-                //
-                // SAFETY: dst points to `chunk_sz` bytes inside the
-                // freshly-allocated destination MTLBuffer (alive in
-                // this scope, about to be moved into MmapRegion). src
-                // points to the mmap'd safetensors file region (Arc'd
-                // into MmapRegion's `_mmap`).
-                let dst = (dst_base_usize + chunk_dst) as *mut u8;
-                let src = (src_base_usize + chunk_src) as *const u8;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src, dst, chunk_sz);
-                }
-                ready_w.signal_chunk();
+                chunk_jobs.push((
+                    src_off + off_in_tensor,
+                    dst_off + off_in_tensor,
+                    chunk_sz,
+                    Arc::clone(&ready),
+                ));
             }
             tensors.push(MmapTensor {
                 src_offset: src_off,
                 len: sz,
                 dst_offset: dst_off,
                 ready,
+            });
+        }
+        {
+            // Async readahead for the whole source mapping before the
+            // copy loop touches it. Measured on Qwen3.5-35B (18.6 GiB,
+            // 4 shards): baseline sequential copy 13.9 s; with
+            // MADV_WILLNEED 7.4 s — the kernel streams file pages in
+            // ahead of the copier instead of demand-faulting at queue
+            // depth 1. (`GpuWeights::from_dir` issues the same hint
+            // per shard at mmap time, so later shards prefetch while
+            // earlier ones copy.) FERRITE_LOAD_NO_WILLNEED=1 disables
+            // for diagnosis.
+            if std::env::var_os("FERRITE_LOAD_NO_WILLNEED").is_none() {
+                unsafe {
+                    libc::madvise(base as *mut libc::c_void, len, libc::MADV_WILLNEED);
+                }
+            }
+            // Default 1 worker: the copy is page-fault bound and macOS
+            // serializes fault handling on the VM object lock — extra
+            // threads measured NEUTRAL-to-WORSE (2w: 27 s, 4w: 22 s,
+            // 8w: 14.5 s vs 1w+WILLNEED: 7.4 s, 4w+WILLNEED: 9.7 s).
+            // FERRITE_LOAD_WORKERS=N overrides for re-measurement on
+            // future OS/hardware.
+            let n_workers = std::env::var("FERRITE_LOAD_WORKERS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let jobs = &chunk_jobs;
+            std::thread::scope(|scope| {
+                for _ in 0..n_workers {
+                    scope.spawn(|| loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((chunk_src, chunk_dst, chunk_sz, ready)) = jobs.get(i) else {
+                            break;
+                        };
+                        let dst = (dst_base_usize + chunk_dst) as *mut u8;
+                        let src = (src_base_usize + chunk_src) as *const u8;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(src, dst, *chunk_sz);
+                        }
+                        ready.signal_chunk();
+                    });
+                }
             });
         }
 
@@ -570,6 +1198,12 @@ impl MetalAllocator {
             );
         }
 
+        let cache_path = if cache_enabled {
+            meta.as_ref().map(|m| m.cache_bin_path())
+        } else {
+            None
+        };
+        let aligned_base_for_writer = aligned_base as usize;
         self.mmaps
             .lock()
             .expect("MetalAllocator mmaps Mutex")
@@ -581,7 +1215,15 @@ impl MetalAllocator {
                 aligned_capacity,
                 tensors,
                 _mmap: mmap,
+                _cache_mmap: None,
             });
+
+        // Build the sidecar in the background so the NEXT launch takes
+        // the zero-copy path. Weights are immutable post-copy, so the
+        // writer reads a stable buffer.
+        if let (Some(cp), Some(m)) = (cache_path, meta) {
+            Self::spawn_aligned_cache_writer(cp, aligned_base_for_writer, aligned_capacity, m);
+        }
         Ok(())
     }
 

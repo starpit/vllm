@@ -169,11 +169,14 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
     // with header parsing and subsequent shard loads, and the H2D
     // copy that follows reads from the mmap pages.
     //
-    // Metal skips this: macOS's MADV_WILLNEED is **synchronous** for
-    // large ranges (measured 152ms for a 5GB shard, vs 30µs for the
-    // mmap itself). MLX doesn't call it either; the kernel's own
-    // demand-paging handles first-touch on the gate_up pack memcpy
-    // and shader bindings without measurable cost.
+    // Metal skips THIS site deliberately (re-measured 2026-06-06):
+    // hinting all four shards up-front (18.6 GiB on Qwen3.5-35B)
+    // overshoots free RAM while the destination buffers grow — later
+    // shards' readahead gets evicted before their copy and from_dir
+    // came out at ~13 s. The just-in-time per-shard WILLNEED in
+    // `MetalAllocator::register_mmap` (working set ≈ one shard)
+    // measures 7.4 s vs 13.9 s unhinted. MADV_SEQUENTIAL drop-behind
+    // also conflicts with the copy-after-parse access pattern.
     let _t_madv = std::time::Instant::now();
     #[cfg(all(unix, feature = "cuda"))]
     unsafe {

@@ -10512,6 +10512,12 @@ impl Worker for FerriteWorker {
     fn compile_or_warm_up_model(&mut self) -> ExecutorResult<()> {
         // Metal pipelines are JIT-compiled lazily via the MetalWorkerPool's
         // function-constant cache; no eager warmup needed for Step 2.
+        //
+        // Release the aligned-sidecar cache writers: load + KV init are
+        // done, so the one-time background build no longer contends
+        // with the realign-copy's page-ins (the contention turned an
+        // 8-9.5 s miss launch into 18.6 s).
+        ferrite_cuda_core::metal_allocator::signal_weights_load_complete();
         Ok(())
     }
 

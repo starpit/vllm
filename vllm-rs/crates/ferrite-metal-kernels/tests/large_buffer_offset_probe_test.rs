@@ -726,3 +726,276 @@ fn shared_buffer_mtl4_read_under_residency_pressure() {
     }
     assert!(failures.is_empty(), "corrupt shards: {failures:?}");
 }
+
+/// Throughput A/B for the loader's realign-copy: GPU blit from a
+/// bytesNoCopy file-backed staging buffer vs CPU memcpy with
+/// madvise(WILLNEED) — interleaved across the shards of a real
+/// checkpoint so page-cache state can't favor one arm.
+///
+///   FERRITE_PROBE_DIR=<snapshot dir> cargo test --release \
+///     -p ferrite-metal-kernels --test large_buffer_offset_probe_test \
+///     blit_vs_memcpy -- --nocapture
+#[test]
+fn blit_vs_memcpy_shard_throughput() {
+    let Some(dir) = std::env::var_os("FERRITE_PROBE_DIR") else {
+        eprintln!("skipping: set FERRITE_PROBE_DIR to a snapshot dir");
+        return;
+    };
+    let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    shards.sort();
+    assert!(!shards.is_empty());
+
+    let mdev = detect_device().expect("detect_device");
+    let device = &mdev.device;
+    let queue = device.newCommandQueue().expect("queue");
+    let page: usize = 16384;
+
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+        fn munmap(addr: *mut c_void, len: usize) -> i32;
+    }
+
+    for (i, path) in shards.iter().enumerate() {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).expect("open shard");
+        let len = file.metadata().unwrap().len() as usize;
+        let base = unsafe { mmap(std::ptr::null_mut(), len, 0x01, 0x0002, file.as_raw_fd(), 0) };
+        assert!(base as isize != -1, "mmap failed");
+
+        let dst = device
+            .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+            .expect("dst alloc");
+        let t0 = std::time::Instant::now();
+        let mode = if i % 2 == 0 { "gpu-blit" } else { "cpu-memcpy" };
+        if i % 2 == 0 {
+            let rounded = (len + page - 1) & !(page - 1);
+            let src = unsafe {
+                device
+                    .newBufferWithBytesNoCopy_length_options_deallocator(
+                        NonNull::new(base).unwrap(),
+                        rounded,
+                        MTLResourceOptions::StorageModeShared,
+                        None,
+                    )
+                    .expect("noCopy wrap")
+            };
+            let cb = queue.commandBuffer().unwrap();
+            let blit = cb.blitCommandEncoder().unwrap();
+            const CHUNK: usize = 2 * GIB;
+            let mut off = 0usize;
+            while off < len {
+                let n = (len - off).min(CHUNK);
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        &src, off, &dst, off, n,
+                    );
+                }
+                off += n;
+            }
+            blit.endEncoding();
+            cb.commit();
+            unsafe { cb.waitUntilCompleted() };
+        } else {
+            unsafe { madvise(base, len, 3 /* MADV_WILLNEED */) };
+            let d = dst.contents().as_ptr() as *mut u8;
+            unsafe { std::ptr::copy_nonoverlapping(base as *const u8, d, len) };
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        // integrity spot-check: 32 bytes at an odd interior offset
+        let probe_off = (len / 3) | 7;
+        let s = unsafe { std::slice::from_raw_parts((base as *const u8).add(probe_off), 32) };
+        let g = unsafe {
+            std::slice::from_raw_parts((dst.contents().as_ptr() as *const u8).add(probe_off), 32)
+        };
+        assert_eq!(s, g, "copy mismatch in {mode}");
+        eprintln!(
+            "{mode:<10} {:>6.2} GiB in {dt:6.2}s = {:5.2} GiB/s  ({})",
+            len as f64 / GIB as f64,
+            len as f64 / GIB as f64 / dt,
+            path.file_name().unwrap().to_string_lossy()
+        );
+        unsafe { munmap(base, len) };
+    }
+}
+
+/// Phase-1 risk probe for the aligned-sidecar zero-copy loader: wrap
+/// ALL shards of a real checkpoint (~19 GiB) as file-backed
+/// bytesNoCopy buffers, insert into an MTL4 residency set, and time
+/// wrap / commit / first GPU dispatch / steady-state dispatch. The
+/// open question is whether macOS 26.5.1 wires that much file-backed
+/// memory (a) correctly and (b) at what cost.
+///
+///   FERRITE_PROBE_DIR=<snapshot dir> cargo test --release ... nocopy_residency_wiring -- --nocapture
+#[test]
+fn nocopy_residency_wiring_at_scale() {
+    use objc2_metal::{
+        MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer,
+        MTL4CommandEncoder, MTL4CommandQueue, MTL4ComputeCommandEncoder, MTLSharedEvent,
+    };
+    let Some(dir) = std::env::var_os("FERRITE_PROBE_DIR") else {
+        eprintln!("skipping: set FERRITE_PROBE_DIR");
+        return;
+    };
+    let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    shards.sort();
+    assert!(!shards.is_empty());
+
+    let mdev = detect_device().expect("detect_device");
+    let device = &mdev.device;
+    let Some(queue4) = device.newMTL4CommandQueue() else {
+        eprintln!("skipping: no MTL4");
+        return;
+    };
+    let page: usize = 16384;
+    extern "C" {
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+    }
+
+    // Wrap every shard.
+    let t_wrap = std::time::Instant::now();
+    let mut bufs = Vec::new();
+    let mut total = 0usize;
+    for path in &shards {
+        use std::os::fd::AsRawFd;
+        let file = std::fs::File::open(path).expect("open");
+        let len = file.metadata().unwrap().len() as usize;
+        let base = unsafe { mmap(std::ptr::null_mut(), len, 0x01, 0x0002, file.as_raw_fd(), 0) };
+        assert!(base as isize != -1);
+        let rounded = (len + page - 1) & !(page - 1);
+        let buf = unsafe {
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    NonNull::new(base).unwrap(),
+                    rounded,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+                .expect("noCopy wrap")
+        };
+        total += len;
+        bufs.push((buf, len));
+        std::mem::forget(file); // keep fd+mapping alive for the probe
+    }
+    eprintln!(
+        "wrap: {} shards / {:.2} GiB in {:?}",
+        bufs.len(),
+        total as f64 / GIB as f64,
+        t_wrap.elapsed()
+    );
+
+    // Residency set insert + commit.
+    let res = ferrite_metal_kernels::residency::MetalResidencySet::new(device);
+    let t_ins = std::time::Instant::now();
+    for (b, _) in &bufs {
+        res.insert(b);
+    }
+    eprintln!("insert: {:?}", t_ins.elapsed());
+    let t_commit = std::time::Instant::now();
+    res.commit();
+    eprintln!("residency commit: {:?}", t_commit.elapsed());
+
+    // Compute read probe: copy32 from a deep offset of every shard.
+    const MSL: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void copy32(device const uchar* src [[buffer(0)]],
+                           device uchar* dst        [[buffer(1)]],
+                           uint i [[thread_position_in_grid]]) {
+            if (i < 32) { dst[i] = src[i]; }
+        }
+    "#;
+    let opts = objc2_metal::MTLCompileOptions::new();
+    let lib = device
+        .newLibraryWithSource_options_error(&objc2_foundation::NSString::from_str(MSL), Some(&opts))
+        .expect("lib");
+    let func = lib
+        .newFunctionWithName(&objc2_foundation::NSString::from_str("copy32"))
+        .expect("fn");
+    let pso = device
+        .newComputePipelineStateWithFunction_error(&func)
+        .expect("pso");
+    let dst = device
+        .newBufferWithLength_options(4096, MTLResourceOptions::StorageModeShared)
+        .expect("dst");
+    res.insert(&dst);
+    res.commit();
+
+    let alloc4 = device.newCommandAllocator().expect("alloc4");
+    let event = device.newSharedEvent().expect("event");
+    let mut sig = 0u64;
+    for round in 0..2 {
+        let t_round = std::time::Instant::now();
+        for (k, (b, len)) in bufs.iter().enumerate() {
+            let off = ((len * 2 / 3) & !63) as u64;
+            let desc = MTL4ArgumentTableDescriptor::new();
+            desc.setMaxBufferBindCount(2);
+            let table = device
+                .newArgumentTableWithDescriptor_error(&desc)
+                .expect("table");
+            unsafe {
+                table.setAddress_atIndex(b.gpuAddress() + off, 0);
+                table.setAddress_atIndex(dst.gpuAddress(), 1);
+            }
+            let cb = device.newCommandBuffer().expect("cb");
+            cb.beginCommandBufferWithAllocator(&alloc4);
+            let cb_ptr: *mut objc2::runtime::AnyObject = objc2::rc::Retained::as_ptr(&cb)
+                as *const objc2::runtime::AnyObject
+                as *mut objc2::runtime::AnyObject;
+            unsafe { res.attach_to_mtl4_command_buffer(cb_ptr) };
+            let enc = cb.computeCommandEncoder().expect("enc");
+            enc.setComputePipelineState(&pso);
+            enc.setArgumentTable(Some(&table));
+            enc.dispatchThreads_threadsPerThreadgroup(
+                objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+                objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            );
+            enc.endEncoding();
+            cb.endCommandBuffer();
+            let cbp: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommandBuffer> = &cb;
+            let mut arr = [std::ptr::NonNull::from(cbp)];
+            unsafe { queue4.commit_count(std::ptr::NonNull::from(&mut arr[0]), 1) };
+            sig += 1;
+            queue4.signalEvent_value(objc2::runtime::ProtocolObject::from_ref(&*event), sig);
+            assert!(event.waitUntilSignaledValue_timeoutMS(sig, 120_000), "timeout");
+            // integrity: GPU bytes == CPU mmap bytes at same offset
+            let g = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
+            let c = unsafe {
+                std::slice::from_raw_parts(
+                    (b.contents().as_ptr() as *const u8).add(off as usize),
+                    32,
+                )
+            };
+            assert_eq!(g, c, "shard {k} GPU/CPU mismatch");
+        }
+        eprintln!(
+            "round {round} ({}): all-shard dispatch+wait {:?}",
+            if round == 0 { "first touch" } else { "steady" },
+            t_round.elapsed()
+        );
+    }
+}

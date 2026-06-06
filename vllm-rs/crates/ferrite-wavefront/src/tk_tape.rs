@@ -581,6 +581,16 @@ pub enum RopeSide {
     K,
 }
 
+/// Phase parity for `Instr::wait_static` / `Instr::wait_loop`
+/// constructors. Per plan §2 row "Phase (parity)": parity is a
+/// sealed enum, never a `u8` field; this enum makes the constructor
+/// `match` exhaustive without a `_ =>` wildcard (plan §4 line 200).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parity {
+    P0,
+    P1,
+}
+
 /// Index into the tape's `Vec<KvLayoutEntry>`.
 /// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -612,17 +622,19 @@ impl Instr {
     /// Per plan §2 row "Phase (parity)": runtime→const dispatch
     /// happens here, once at the constructor's `match` site. Each
     /// arm produces a const-generic split variant; the Instr never
-    /// carries `parity` as a u8 field.
+    /// carries `parity` as a u8 field. Per plan §4 lines 199-200
+    /// (no `_ =>` arms, no `unwrap_or_else`): the `parity` parameter
+    /// is the sealed [`Parity`] enum so `match` is exhaustive
+    /// without a wildcard arm.
     pub(crate) fn wait_static(
         page: PageId,
         kind: PageBarrier,
-        parity: u8,
+        parity: Parity,
         role: WarpRole,
     ) -> Self {
-        match parity & 1 {
-            0 => Self::PageBarrierWaitStaticP0 { page_id: page, kind, role },
-            1 => Self::PageBarrierWaitStaticP1 { page_id: page, kind, role },
-            _ => unreachable!("parity & 1 is 0 or 1"),
+        match parity {
+            Parity::P0 => Self::PageBarrierWaitStaticP0 { page_id: page, kind, role },
+            Parity::P1 => Self::PageBarrierWaitStaticP1 { page_id: page, kind, role },
         }
     }
 
@@ -631,13 +643,12 @@ impl Instr {
         page: PageId,
         kind: PageBarrier,
         var: LoopVarId,
-        start_parity: u8,
+        start_parity: Parity,
         role: WarpRole,
     ) -> Self {
-        match start_parity & 1 {
-            0 => Self::PageBarrierWaitLoopStart0 { page_id: page, kind, var, role },
-            1 => Self::PageBarrierWaitLoopStart1 { page_id: page, kind, var, role },
-            _ => unreachable!("start_parity & 1 is 0 or 1"),
+        match start_parity {
+            Parity::P0 => Self::PageBarrierWaitLoopStart0 { page_id: page, kind, var, role },
+            Parity::P1 => Self::PageBarrierWaitLoopStart1 { page_id: page, kind, var, role },
         }
     }
 
@@ -940,15 +951,14 @@ mod tests {
     #[test]
     fn parity_loop_carries_start() {
         let var = LoopVarId(0);
-        let w = Instr::wait_loop(PageId(2), PageBarrier::Ready, var, 1, WarpRole::AllConsumers);
+        let w = Instr::wait_loop(PageId(2), PageBarrier::Ready, var, Parity::P1, WarpRole::AllConsumers);
         // Plan §2: parity is a const-generic split variant, not a u8
-        // field. start_parity=1 produces PageBarrierWaitLoopStart1.
-        match w {
-            Instr::PageBarrierWaitLoopStart1 { var: v, .. } => {
-                assert_eq!(v, var);
-            }
-            _ => panic!("expected loop-parity wait Start1"),
-        }
+        // field. start_parity=Parity::P1 produces PageBarrierWaitLoopStart1.
+        // Plan §4 line 200: no `_ =>` arms — assert via matches!.
+        assert!(
+            matches!(w, Instr::PageBarrierWaitLoopStart1 { var: v, .. } if v == var),
+            "expected loop-parity wait Start1 with var={var:?}, got {w:?}",
+        );
     }
 
     #[test]

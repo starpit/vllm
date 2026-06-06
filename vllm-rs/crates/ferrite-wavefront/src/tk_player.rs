@@ -96,8 +96,10 @@ mod tk20 {
         accum: crate::tk_tape::AccumKind,
     ) -> String {
         // Single-token sealed-enum dispatch (same shape as
-        // barrier_name / rope_form_str / rope_side_str — keeps
-        // tk20 helpers as pure string templates).
+        // barrier_name / rope_side_str — keeps tk20 helpers as
+        // pure string templates). Note: rope form is encoded by
+        // variant identity (Instr::RopeRotate{NeoX,Interleaved})
+        // rather than via a translator helper.
         let accum_tok = accum_str(accum);
         format!(
             "kittens::ops::gemm_m1<{accum_tok}>(page_buf[{out_page}], page_buf[{lhs_page}], \

@@ -74,7 +74,7 @@ time. We are a compiler.
 ## 2. Compile-time safety contract
 
 Every step lands typed witnesses. The pattern is the existing
-SoftmaxState<Phase> / RopeForm / KvCacheLayout / KvCacheProducer
+SoftmaxStateId (runtime id; phase ordering procedural via `pending_post_loop` in `lower_tape_to_tk`. The `SoftmaxState<Phase>` typestate is deferred future work — see §6 deferral list) / RopeForm / KvCacheLayout / KvCacheProducer
 shape, applied uniformly.
 
 Sealed newtypes throughout: `SubtileId`, `TensorId`, `SlotId`,
@@ -92,7 +92,7 @@ Witness placement (per layer):
 | `KvCacheLayout` | field on `SubOp::RopeAppend`, `SubOp::AttnDecode` (single instance per K-cache `TensorId`; both reach for same value) | n/a (SubtileTape carries no per-Compute fields beyond `SubtileId`; lowering looks up the witness on the SubtileIR node) | propagates; consumer reads via single-source method |
 | `KvCacheProducer` | field on `SubOp::AttnDecode` | n/a (same reason) | exhaustive match in lowering, no `_ =>` arm |
 | `RopeForm` | type-level (sealed `RopeForm` trait, threaded as `SubOp<F: RopeForm>` / `SubtileNode<F>` / `SubtileIR<F>`; `SubOp::Rope*` carries `PhantomData<F>`) | n/a (carried by the SubtileIR `<F>`) | flat variant-identity split: `Instr::RopeRotateNeoX` / `Instr::RopeRotateInterleaved` — never a runtime `RopeFormTag` field; the `Instr::rope_rotate::<F>` constructor matches once on `F::TAG` to pick the variant. A Q/K-side mismatch between rope nodes is a wrong-variant Rust type error |
-| `SoftmaxState<Phase>` | id on `SubOp::AttnDecode` | n/a (one `Compute` for AttnDecode; the 4-phase split is the lowering's job) | typestate threaded through `lower_tape_to_tk`'s emit of `Instr::AttnDecodeInit` → loop[`Qkt`/`Sv`] → `Instr::AttnDecodeFinalise`; flat Instr variants, no `ComputeBody` indirection |
+| `SoftmaxStateId` | id on `SubOp::AttnDecode` | n/a (one `Compute` for AttnDecode; the 4-phase split is the lowering's job) | sealed runtime id field on `Instr::AttnDecodeInit/Qkt/Sv/Finalise`; ordering is enforced procedurally by `emit_attn_decode`'s syntax-directed walk (`pending_post_loop` queue), NOT by typestate. The `SoftmaxState<Phase>` typestate (Sv-before-Qkt = no impl) was originally specced here but is deferred to a future commit that lifts the ordering proof to the type system. Today `feedback_compile_time_or_garbage` is unmet for this witness only. |
 | `SlotHandle` / `SlotWritten` | n/a | move-only typestate proofs of slot-write-once and read-after-write; consumed by `compute_to` / `free_slot` | n/a (TkTape uses `PageId`-on-mbarrier handshake for slot realization) |
 | `LoopVarId` | n/a | sealed; `OpenLoop(v)` and matching `CloseLoop(v)` share the same id by construction | sealed; carries through to `Instr::ForLoop` |
 | `Phase` (parity) | n/a | n/a | const-generic split `Instr` variants on TkTape; runtime→const dispatch at the optimizer pass's `match` site, never as a `u8` field |
@@ -285,30 +285,53 @@ fallbacks added, no `_ =>` match arms added.
     versions in `subtile_ir.rs`). Aligns TkTape with §0's "we are a
     compiler" stance. (Landed: `56413bdf6f`.)
 
-6. **Implement `lower_tape_to_tk(&SubtileTape, &SubtileIR<F>) ->
+6. **Implement `lower_tape_to_tk(&SubtileTape, &SubtileIR<F, K>) ->
    TkTape`.** Trivial syntax-directed translation. **Always-executable
    invariant: the output is a complete, validator-green tape that
    runs correctly.** Slot mapping: each `SlotId` becomes a `PageId`
-   on a conservative all-gmem path — `Compute` write surfaces as
-   `StoreAsync` + `FenceDevice` + `PageBarrierArrive{Done}`; consumer
-   reads surface as `PageBarrierWait{Ready}` + `LoadAsync`; `FreeSlot`
-   recycles the page id. `SubOp::AttnDecode` lowers to four flat
-   `Instr` variants — `Instr::AttnDecodeInit` (outside loop) → loop[
+   on a conservative all-gmem path. The conservative-path edge
+   protocol is split:
+   - **Producer write**: `StoreAsync` + `CommitGroupBulk` +
+     `ThreadfenceDevice` + `PageBarrierArrive{Done}`. The
+     `CommitGroupBulk` lands the in-flight TMA stores before the
+     fence publishes them.
+   - **Consumer read of a slot edge**: `PageBarrierWait{Ready}` only.
+     The producer's `StoreAsync` to the page IS the data path on
+     this all-gmem lowering; a redundant `LoadAsync` would be
+     busywork. (The shmem-promotion pass at §6.5 will rewrite slot
+     edges to `Wait{Ready}` + `LoadAsync` once it runs.)
+   - **External (source-tensor) read**: `LoadAsync` only (no
+     preceding `Wait` — the dst page is freshly allocated).
+   - **`FreeSlot`**: recycles the page id.
+
+   `SubOp::AttnDecode` lowers to four flat `Instr` variants —
+   `Instr::AttnDecodeInit` (outside loop) → loop[
    `Instr::AttnDecodeQkt`, `Instr::AttnDecodeSv` ] →
    `Instr::AttnDecodeFinalise` — with the SubtileTape OpenLoop/
-   CloseLoop pair becoming the inner `Instr::ForLoop`. The
-   `SoftmaxState<Phase>` typestate threads through these four emits
-   (Sv-before-Qkt = no impl). `KvCacheProducer` consumed via
-   exhaustive match. `RopeForm` const-generic threaded through.
-   `KvCacheLayout` resolved by TensorId on the SubtileIR node.
+   CloseLoop pair becoming the inner `Instr::ForLoop`. Phase
+   ordering (Init→Qkt→Sv→Finalise) is enforced procedurally by
+   `emit_attn_decode`'s syntax-directed walk; the
+   `SoftmaxState<Phase>` typestate originally specced here is
+   deferred (see §2 row note). `KvCacheProducer` consumed via
+   exhaustive match. `RopeForm` is threaded as `<F: RopeForm>` and
+   produces a flat variant-identity split at the `Instr` boundary
+   (`RopeRotateNeoX` / `RopeRotateInterleaved`). `KvCacheLayout<K>`
+   propagates via the tape's interned `kv_layouts` table; consumer
+   Instrs (RopeRotate*, AttnDecode*) carry only `kv_layout:
+   KvLayoutId` and read `head_dim` / `num_kv_heads` via the
+   single-source method `tape.kv_layout(id)`.
    **No analysis, no lookahead, no shmem decisions** — those are the
    optimizer's job.
 
-6b. **`validate_tk_tape`** — full impl + tests. Fence-before-arrive
-    on every Gmem-routed cross-worker edge, `LoadAsync` ↔
-    `PageBarrierWait{Ready}` matching, page-cycle closure, phase
-    parity, edge closure. Runs after lowering AND after every
-    optimizer pass.
+6b. **`validate_tk_tape`** — staged. Commit 6b lands the
+    fence-before-arrive check on every Gmem-routed cross-worker
+    edge (FenceDevice or stricter required; ThreadfenceBlock is
+    CTA-scope and rejected). The remaining checks —
+    `LoadAsync` ↔ `PageBarrierWait{Ready}` matching, page-cycle
+    closure, phase parity, edge closure — land in commit 6.5
+    alongside the optimizer passes that introduce the
+    pipelined/shmem-promoted edges they target. Runs after
+    lowering AND after every optimizer pass.
 
 6.5. **`TkTape → TkTape` optimizer passes.** Ordered pipeline; each
     pass is a strict performance rewrite that preserves all post-pass
@@ -338,10 +361,23 @@ fallbacks added, no `_ =>` match arms added.
    ferrite-forward macro now produces `SubtileIR` SSA in one pass.
    `partition.rs` re-targeted to consume `SubtileIR`.
 
-8. **`tk_player::play(&TkTape) -> String` becomes the single trivial
-   match.** Strip every `format!` from `tk_tape.rs`'s emit helpers.
-   Player is one `match` over `Instr`, every arm ≤5 lines, no `_`
-   arm. Pre-existing CUDA text byte-identical (golden test).
+8. **`tk_player::emit_kernel(name: &str, &TkTape) -> String` becomes
+   the single trivial match.** Public entry-point takes the kernel
+   name as a separate parameter (the FFI symbol the launcher binds
+   to). Player body is one `match` over `Instr`, every arm ≤5
+   lines, no `_` arm. The K1 kill criterion (trivial player) is
+   enforced by these structural rules.
+
+   Two carve-outs from the original "no `format!` outside player"
+   wording: (a) `tk_tape::ByteOffset::{from_const, linear_loop}`
+   bake CUDA byte-offset expressions at *tape-build* time (not
+   emit time) so the player emits literally — these are pre-baked
+   fields, not emit helpers. (b) The "byte-identical to pre-existing
+   CUDA text (golden test)" verification mechanism is deferred:
+   today the player has substring-equality and per-arm tests; a
+   checked-in `.cu.golden` snapshot will land alongside the §6.5
+   optimizer passes (which are the only thing that could change
+   the emitted text outside the IR shape).
 
 9. **End-to-end on H100.** Fuf → SubtileIR → SubtileTape → TkTape →
    nvcc → run on Llama-3.2-1B. **The Paris-decode bug must surface

@@ -70,7 +70,7 @@ Flat Instr enum (no nested ComputeBody, no LoopCount, no ParityExpr, no ByteOffs
 - One arm per Instr; ≤5 lines each.
 - All `kittens::*` strings live in the `tk20` sub-module.
 - No emit-time arithmetic — `byte_off.as_str()` and `tile_type.as_str()` are pre-baked at tape-build time.
-- Helpers (`barrier_name`, `rope_form_str`, `rope_side_str`, `tk20::accum_str`) are sealed-enum-to-`&'static str` translators only — no formula computation.
+- Helpers (`barrier_name`, `rope_side_str`, `tk20::accum_str`) are sealed-enum-to-`&'static str` translators only — no formula computation. Rope form is encoded by `Instr` variant identity (`RopeRotateNeoX` / `RopeRotateInterleaved`) instead of a translator helper.
 
 ### `lower_tape_to_tk` (`lower_tape_to_tk.rs`)
 Conservative all-gmem; no analysis, no lookahead, no shmem decisions (those are §6.5 optimizer-pass territory).

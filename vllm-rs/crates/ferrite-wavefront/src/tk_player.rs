@@ -302,6 +302,94 @@ mod tk20 {
         format!("kittens::group<4>::mma_async_wait<{n}>();")
     }
 
+    // ── AttnDecode chain emit helpers (steps 11-14) ───────────────
+
+    pub fn rv_neg_infty(group_n: u32, dst: u16) -> String {
+        format!("kittens::group<{group_n}>::neg_infty(rv_{dst});")
+    }
+    pub fn rv_zero(group_n: u32, dst: u16) -> String {
+        format!("kittens::group<{group_n}>::zero(rv_{dst});")
+    }
+    pub fn wgmma_mma_abt_smem_smem(
+        d_slot: u16,
+        a_page: u8,
+        b_page: u8,
+        fence: u8,
+        accumulate: u8,
+    ) -> String {
+        format!(
+            "kittens::group<4>::mma_ABt<decltype(rt_{d_slot}), \
+             std::decay_t<decltype(page_buf[{a_page}])>, \
+             std::decay_t<decltype(page_buf[{b_page}])>, \
+             {fence}, {accumulate}>(rt_{d_slot}, page_buf[{a_page}], page_buf[{b_page}]);"
+        )
+    }
+    pub fn wgmma_mma_ab_reg_smem(
+        d_slot: u16,
+        a_slot: u16,
+        b_page: u8,
+        fence: u8,
+        accumulate: u8,
+    ) -> String {
+        format!(
+            "kittens::group<4>::mma_AB<decltype(rt_{d_slot}), \
+             decltype(rt_{a_slot}), \
+             std::decay_t<decltype(page_buf[{b_page}])>, \
+             {fence}, {accumulate}>(rt_{d_slot}, rt_{a_slot}, page_buf[{b_page}]);"
+        )
+    }
+    pub fn rt_mul_scalar(
+        group_n: u32,
+        dst: u16,
+        lhs: u16,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::mul(rt_{dst}, rt_{lhs}, kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+    pub fn rt_row_max_acc(group_n: u32, acc: u16, src: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::row_max(rv_{acc}, rt_{src}, rv_{acc});"
+        )
+    }
+    pub fn rt_row_sum_acc(group_n: u32, acc: u16, src: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::row_sum(rv_{acc}, rt_{src}, rv_{acc});"
+        )
+    }
+    pub fn rt_sub_row(group_n: u32, dst: u16, src: u16, row_vec: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::sub_row(rt_{dst}, rt_{src}, rv_{row_vec});"
+        )
+    }
+    pub fn rt_exp2(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::exp2(rt_{dst}, rt_{src});")
+    }
+    pub fn rt_div_row(group_n: u32, dst: u16, src: u16, row_vec: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::div_row(rt_{dst}, rt_{src}, rv_{row_vec});"
+        )
+    }
+    pub fn rv_sub(group_n: u32, dst: u16, lhs: u16, rhs: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::sub(rv_{dst}, rv_{lhs}, rv_{rhs});"
+        )
+    }
+    pub fn rv_exp2(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::exp2(rv_{dst}, rv_{src});")
+    }
+    pub fn rv_mul(group_n: u32, dst: u16, lhs: u16, rhs: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::mul(rv_{dst}, rv_{lhs}, rv_{rhs});"
+        )
+    }
+    pub fn rt_copy_convert(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::copy(rt_{dst}, rt_{src});")
+    }
+
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
     pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
@@ -798,6 +886,51 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         }
         Instr::WgmmaAsyncWait { n, width: _, role: _ } => {
             let _ = writeln!(out, "{}", tk20::wgmma_mma_async_wait(*n));
+        }
+        Instr::InitRvNegInfty { dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_neg_infty(width.n(), dst.0));
+        }
+        Instr::InitRvZero { dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_zero(width.n(), dst.0));
+        }
+        Instr::WgmmaMmaABt_SmemSmem { a_page, b_page, d, fence, accumulate, width: _, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::wgmma_mma_abt_smem_smem(d.0, a_page.0, b_page.0, *fence, *accumulate));
+        }
+        Instr::WgmmaMmaAB_RegSmem { a, b_page, d, fence, accumulate, width: _, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::wgmma_mma_ab_reg_smem(d.0, a.0, b_page.0, *fence, *accumulate));
+        }
+        Instr::RegTileMulScalar { lhs, dst, scalar, dtype, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::rt_mul_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
+        }
+        Instr::RegTileRowMaxAcc { src, acc, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_row_max_acc(width.n(), acc.0, src.0));
+        }
+        Instr::RegTileRowSumAcc { src, acc, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_row_sum_acc(width.n(), acc.0, src.0));
+        }
+        Instr::RegTileSubRow { src, row_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_sub_row(width.n(), dst.0, src.0, row_vec.0));
+        }
+        Instr::RegTileExp2 { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_exp2(width.n(), dst.0, src.0));
+        }
+        Instr::RegTileDivRow { src, row_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_div_row(width.n(), dst.0, src.0, row_vec.0));
+        }
+        Instr::RegVecSub { lhs, rhs, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_sub(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::RegVecExp2 { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_exp2(width.n(), dst.0, src.0));
+        }
+        Instr::RegVecMul { lhs, rhs, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_mul(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::RegTileCopyConvert { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_copy_convert(width.n(), dst.0, src.0));
         }
         Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",

@@ -518,6 +518,165 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    // ── AttnDecode chain Instrs (steps 11-14) ────────────────────
+
+    /// `kittens::group<N>::neg_infty(rv_dst)` —
+    /// `ops/group/register/vec/maps.cuh:162`. Initialise a register
+    /// vector to negative infinity. Used by AttnDecode_Init for the
+    /// row-max accumulator (online softmax).
+    InitRvNegInfty {
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::zero(rv_dst)` —
+    /// `ops/group/register/vec/maps.cuh:132`. Initialise a register
+    /// vector to zero. Used by AttnDecode_Init for the row-sum
+    /// accumulator.
+    InitRvZero {
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<4>::mma_ABt<D, A, B, FENCE, ACC>(d, a, b)` —
+    /// `ops/group/mma/warpgroup.cuh:323`. WGMMA `D = A @ B^T`. Used
+    /// by AttnDecode_Qkt (Q @ K^T attention scores).
+    WgmmaMmaABt_SmemSmem {
+        a_page: PageId,
+        b_page: PageId,
+        d: RegTileSlot,
+        fence: u8,
+        accumulate: u8,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<4>::mma_AB<D, A, B, FENCE, ACC>(d, a, b)` —
+    /// `ops/group/mma/warpgroup.cuh:140` (rt-st-rt overload, A from
+    /// registers). Used by AttnDecode_Sv (P @ V where P comes from
+    /// the softmax in registers).
+    WgmmaMmaAB_RegSmem {
+        a: RegTileSlot,
+        b_page: PageId,
+        d: RegTileSlot,
+        fence: u8,
+        accumulate: u8,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul(rt_dst, rt_lhs, kittens::<dtype>(scalar))`
+    /// — scalar overload of register-tile mul at
+    /// `ops/group/register/tile/maps.cuh:708`. Used by AttnDecode_Qkt
+    /// (scale by `1/sqrt(d_head)` and `log2(e)`).
+    RegTileMulScalar {
+        lhs: RegTileSlot,
+        dst: RegTileSlot,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::row_max(rv_acc, rt_src, rv_acc)` —
+    /// `ops/group/register/tile/reductions.cuh:303` (accumulating
+    /// overload). Used by AttnDecode_Qkt online softmax.
+    RegTileRowMaxAcc {
+        src: RegTileSlot,
+        acc: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::row_sum(rv_acc, rt_src, rv_acc)` —
+    /// `ops/group/register/tile/reductions.cuh:329`.
+    RegTileRowSumAcc {
+        src: RegTileSlot,
+        acc: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::sub_row(rt_dst, rt_src, rv_row_values)` —
+    /// `ops/group/register/tile/maps.cuh:750`. Subtract row vector
+    /// (one scalar per row) from each row of `src`. Used by
+    /// AttnDecode_Qkt to subtract row-max before exp.
+    RegTileSubRow {
+        src: RegTileSlot,
+        row_vec: RegVecSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::exp2(rt_dst, rt_src)` —
+    /// `ops/group/register/tile/maps.cuh:482`. Element-wise exp2.
+    /// Used by AttnDecode_Qkt for online softmax.
+    RegTileExp2 {
+        src: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::div_row(rt_dst, rt_src, rv_row_values)` —
+    /// `ops/group/register/tile/maps.cuh:778`. Divide each row by the
+    /// corresponding scalar in `row_values`. Used by AttnDecode_Finalise
+    /// to normalize the output by the row-sum accumulator.
+    RegTileDivRow {
+        src: RegTileSlot,
+        row_vec: RegVecSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::sub(rv_dst, rv_lhs, rv_rhs)` —
+    /// `ops/group/register/vec/maps.cuh:346`. Element-wise sub on
+    /// register vectors. Used by AttnDecode_Qkt (m_i_new - m_i_old).
+    RegVecSub {
+        lhs: RegVecSlot,
+        rhs: RegVecSlot,
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::exp2(rv_dst, rv_src)` —
+    /// `ops/group/register/vec/maps.cuh:205`. Element-wise exp2 on
+    /// register vector. Used by AttnDecode_Qkt for the alpha
+    /// rescaling factor.
+    RegVecExp2 {
+        src: RegVecSlot,
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul(rv_dst, rv_lhs, rv_rhs)` —
+    /// `ops/group/register/vec/maps.cuh:359`. Element-wise mul.
+    /// Used by AttnDecode_Qkt to update the row-sum accumulator.
+    RegVecMul {
+        lhs: RegVecSlot,
+        rhs: RegVecSlot,
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::copy(rt_dst, rt_src)` —
+    /// `ops/group/register/tile/maps.cuh:627` (with type conversion).
+    /// Used by AttnDecode_Sv to convert the fp32 P_block to bf16
+    /// before the WGMMA P @ V (mma_AB requires A.T == B.T).
+    RegTileCopyConvert {
+        src: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::load(rv, sv)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
@@ -2412,6 +2571,357 @@ impl Instr {
         }
     }
 
+    // ── AttnDecode chain constructors (steps 11-14) ─────────────
+
+    pub(crate) fn init_rv_neg_infty<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::InitRvNegInfty {
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn init_rv_zero<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::InitRvZero {
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::WgmmaMmaABt_SmemSmem`]. Q @ K^T pattern:
+    /// D[M, N] = A[M, K] @ B[N, K]^T (B's stored layout has N rows,
+    /// K cols; transposed at the WGMMA op).
+    pub(crate) fn wgmma_mma_abt_smem_smem<
+        const M: usize,
+        const K: usize,
+        const N: usize,
+        T_AB: TileDtype,
+        T_D: TileDtype,
+        L: RegTileLayout,
+        F: FencePolicy,
+        AC: AccPolicy,
+    >(
+        d: RegTileId<M, N, T_D, L>,
+        a: SmemTileId<M, K, T_AB>,
+        b: SmemTileId<N, K, T_AB>,
+        _fence: F,
+        _accumulate: AC,
+        _width: GroupWidth<4>,
+    ) -> Self {
+        Self::WgmmaMmaABt_SmemSmem {
+            a_page: a.page(),
+            b_page: b.page(),
+            d: d.slot(),
+            fence: F::KIND as u8,
+            accumulate: AC::KIND as u8,
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
+    /// Construct [`Instr::WgmmaMmaAB_RegSmem`]. P @ V pattern:
+    /// D[M, N] = A[M, K] @ B[K, N], A in register tile.
+    pub(crate) fn wgmma_mma_ab_reg_smem<
+        const M: usize,
+        const K: usize,
+        const N: usize,
+        T_AB: TileDtype,
+        T_D: TileDtype,
+        L_A: RegTileLayout,
+        L_D: RegTileLayout,
+        F: FencePolicy,
+        AC: AccPolicy,
+    >(
+        d: RegTileId<M, N, T_D, L_D>,
+        a: RegTileId<M, K, T_AB, L_A>,
+        b: SmemTileId<K, N, T_AB>,
+        _fence: F,
+        _accumulate: AC,
+        _width: GroupWidth<4>,
+    ) -> Self {
+        Self::WgmmaMmaAB_RegSmem {
+            a: a.slot(),
+            b_page: b.page(),
+            d: d.slot(),
+            fence: F::KIND as u8,
+            accumulate: AC::KIND as u8,
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
+    pub(crate) fn reg_tile_mul_scalar<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        lhs: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        scalar: ScalarF32,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileMulScalar {
+            lhs: lhs.slot(),
+            dst: dst.slot(),
+            scalar,
+            dtype: T::tag(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_row_max_acc<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        acc: RegVecId<ROWS, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileRowMaxAcc {
+            src: src.slot(),
+            acc: acc.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_row_sum_acc<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        acc: RegVecId<ROWS, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileRowSumAcc {
+            src: src.slot(),
+            acc: acc.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_sub_row<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        row_vec: RegVecId<ROWS, T, RV>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileSubRow {
+            src: src.slot(),
+            row_vec: row_vec.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_exp2<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileExp2 {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_div_row<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        row_vec: RegVecId<ROWS, T, RV>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileDivRow {
+            src: src.slot(),
+            row_vec: row_vec.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_vec_sub<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        lhs: RegVecId<LEN, T, RV>,
+        rhs: RegVecId<LEN, T, RV>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegVecSub {
+            lhs: lhs.slot(),
+            rhs: rhs.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_vec_exp2<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        src: RegVecId<LEN, T, RV>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegVecExp2 {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_vec_mul<
+        const N: usize,
+        const LEN: usize,
+        T: TileDtype,
+        RV: RegVecLayout,
+    >(
+        lhs: RegVecId<LEN, T, RV>,
+        rhs: RegVecId<LEN, T, RV>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegVecMul {
+            lhs: lhs.slot(),
+            rhs: rhs.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::RegTileCopyConvert`]. Source and dest can
+    /// have DIFFERENT dtypes — TK 2.0's `copy` template handles the
+    /// conversion (e.g. fp32 → bf16 for the P_block in AttnDecode_Sv).
+    /// Shape and layout still unify between src and dst.
+    pub(crate) fn reg_tile_copy_convert<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T_SRC: TileDtype,
+        T_DST: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T_SRC, L>,
+        dst: RegTileId<ROWS, COLS, T_DST, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileCopyConvert {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     /// Construct [`Instr::StoreRegTileSubTileToShmem`] — inverse of
     /// `load_shmem_subtile_to_reg`. Same const-generic guards.
     pub(crate) fn store_reg_tile_subtile_to_shmem<
@@ -3115,9 +3625,23 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::StoreRegTileSubTileToShmem { .. }
             | Instr::TmaExpect { .. }
             | Instr::InitRtZero { .. }
+            | Instr::InitRvNegInfty { .. }
+            | Instr::InitRvZero { .. }
             | Instr::WgmmaFenceAcc { .. }
             | Instr::WgmmaMmaAB_SmemSmem { .. }
+            | Instr::WgmmaMmaABt_SmemSmem { .. }
+            | Instr::WgmmaMmaAB_RegSmem { .. }
             | Instr::WgmmaAsyncWait { .. }
+            | Instr::RegTileMulScalar { .. }
+            | Instr::RegTileRowMaxAcc { .. }
+            | Instr::RegTileRowSumAcc { .. }
+            | Instr::RegTileSubRow { .. }
+            | Instr::RegTileExp2 { .. }
+            | Instr::RegTileDivRow { .. }
+            | Instr::RegVecSub { .. }
+            | Instr::RegVecExp2 { .. }
+            | Instr::RegVecMul { .. }
+            | Instr::RegTileCopyConvert { .. }
             | Instr::LoadVecSmemToReg { .. }
             | Instr::StoreRegVecToShmem { .. }
             | Instr::RegTileNeg { .. }

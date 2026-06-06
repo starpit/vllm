@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, KvCacheShape, TensorId};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 // NUKED: RopeForm trait + NeoX / Interleaved markers + RopeFormTag
@@ -75,6 +76,22 @@ pub struct TkTape {
     /// witness "propagates; consumer reads via single-source method"
     /// — see [`TkTape::kv_layout`].
     pub kv_layouts: Vec<KvLayoutEntry>,
+
+    /// Register-tile SSA arena. Each entry records a [`RegTileSlot`]'s
+    /// runtime shape/dtype/layout for the kernel-preamble decl emit.
+    /// `BTreeMap` (not `HashMap`) for deterministic preamble emit
+    /// order = deterministic codegen output = stable goldens.
+    pub(crate) reg_tile_arena: BTreeMap<RegTileSlot, RegTileArenaEntry>,
+
+    /// Register-vec SSA arena. See [`Self::reg_tile_arena`].
+    pub(crate) reg_vec_arena: BTreeMap<RegVecSlot, RegVecArenaEntry>,
+
+    /// Next id minted by [`Self::mint_reg_tile`]; checked-add so
+    /// u16 overflow panics with a clear message.
+    pub(crate) next_reg_tile_slot: u16,
+
+    /// Next id minted by [`Self::mint_reg_vec`].
+    pub(crate) next_reg_vec_slot: u16,
 }
 
 impl TkTape {
@@ -386,6 +403,124 @@ pub enum Instr {
         scalar: ScalarF32,
         dtype: TileDtypeTag,
         width: GroupWidthTag,
+    },
+
+    // ── Register-tile / register-vec Instrs (commit A — shared by ≥2
+    // of steps 5/6/7). Each emits ONE TK 2.0 call. The slot ids are
+    // sealed (RegTileSlot, RegVecSlot); the typed witnesses live at
+    // the constructor signatures, where const-generics + sealed
+    // marker traits gate construction. The runtime entry shape /
+    // dtype / layout lives in TkTape::reg_tile_arena / reg_vec_arena
+    // (BTreeMap, deterministic preamble emit order).
+
+    /// `kittens::group<N>::load(rt, st)` —
+    /// `ops/group/memory/tile/shared_to_register.cuh:15`. Load a
+    /// shared tile into a register tile.
+    LoadShmemToReg {
+        src: PageId,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::store(st, rt)` —
+    /// `ops/group/memory/tile/shared_to_register.cuh:139`.
+    StoreRegTileToShmem {
+        src: RegTileSlot,
+        dst: PageId,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::load(rv, sv)` —
+    /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
+    /// shared vector into a register vector.
+    LoadVecSmemToReg {
+        src: PageId,
+        dst: RegVecSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::store(sv, rv)` —
+    /// `ops/group/memory/vec/shared_to_register.cuh:100`.
+    StoreRegVecToShmem {
+        src: RegVecSlot,
+        dst: PageId,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::neg(rt_dst, rt_src)` —
+    /// `ops/group/register/tile/maps.cuh:572`.
+    RegTileNeg {
+        src: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::exp(rt_dst, rt_src)` —
+    /// `ops/group/register/tile/maps.cuh:464`.
+    RegTileExp {
+        src: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::add(rt_dst, rt_lhs, rt_rhs)` —
+    /// `ops/group/register/tile/maps.cuh:681`. Element-wise add of
+    /// two register tiles.
+    RegTileAdd {
+        lhs: RegTileSlot,
+        rhs: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::sub(rt_dst, rt_lhs, rt_rhs)` —
+    /// `ops/group/register/tile/maps.cuh:695`.
+    RegTileSub {
+        lhs: RegTileSlot,
+        rhs: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::div(rt_dst, rt_lhs, rt_rhs)` —
+    /// `ops/group/register/tile/maps.cuh:722`.
+    RegTileDiv {
+        lhs: RegTileSlot,
+        rhs: RegTileSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul_col(rt_dst, rt_src, rv_col_values)` —
+    /// `ops/group/register/tile/maps.cuh:841`. Multiply each column
+    /// of `src` by the corresponding element of `col_vec`. Used by
+    /// RopeRotateNeoX (cos/sin column-broadcast).
+    RegTileMulCol {
+        src: RegTileSlot,
+        col_vec: RegVecSlot,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::add(rt_dst, rt_lhs, kittens::<dtype>(scalar))`
+    /// — scalar overload. Used by Silu (`1 + exp(-x)` in registers).
+    RegTileAddScalar {
+        lhs: RegTileSlot,
+        dst: RegTileSlot,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+        role: WarpRole,
     },
 
     /// Inert marker the orchestrator emits at the start of an op
@@ -1019,6 +1154,297 @@ pub struct TileTypeSpec {
     pub dtype: TileDtypeTag,
 }
 
+// ── Sealed register-tile / register-vec layouts ─────────────────────
+//
+// Per SUBTILE_TK20_DECOMP.md §"New typed-witness types" lines 38-39:
+// register tiles and register vectors carry their TK 2.0 layout
+// (rt_layout::row/col, rv_layout::ortho/align/naive) at the type
+// level so a layout-mismatch is rustc E0308 instead of an nvcc
+// instantiation error. Layout markers are unit structs sealed via
+// private modules; the runtime erasure (`*LayoutTag`) is also sealed
+// — only the typed `tag()` impls can mint one.
+
+mod rt_layout_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed marker trait for register-tile layouts. Implemented only
+/// for [`RowLayout`] and [`ColLayout`].
+pub trait RegTileLayout: rt_layout_sealed::Sealed + Copy {
+    /// Full TK 2.0 type path used in emitted CUDA, e.g.
+    /// `kittens::ducks::rt_layout::row`.
+    const LAYOUT_PATH: &'static str;
+    fn tag() -> RegTileLayoutTag;
+}
+
+/// `kittens::ducks::rt_layout::row` — orthogonal layout (each row
+/// owned by a distinct subset of warpgroup threads). The default for
+/// most TK 2.0 register-tile ops; required by `mma_AB`'s A operand.
+#[derive(Clone, Copy, Debug)]
+pub struct RowLayout;
+impl rt_layout_sealed::Sealed for RowLayout {}
+impl RegTileLayout for RowLayout {
+    const LAYOUT_PATH: &'static str = "kittens::ducks::rt_layout::row";
+    fn tag() -> RegTileLayoutTag {
+        RegTileLayoutTag::Row
+    }
+}
+
+/// `kittens::ducks::rt_layout::col` — column-major register layout;
+/// required by `mma_ABt`'s B operand.
+#[derive(Clone, Copy, Debug)]
+pub struct ColLayout;
+impl rt_layout_sealed::Sealed for ColLayout {}
+impl RegTileLayout for ColLayout {
+    const LAYOUT_PATH: &'static str = "kittens::ducks::rt_layout::col";
+    fn tag() -> RegTileLayoutTag {
+        RegTileLayoutTag::Col
+    }
+}
+
+/// Sealed runtime tag for [`RegTileLayout`] erasure on Instr fields.
+/// Only constructable via `RegTileLayout::tag()` (whose impls are
+/// crate-internal); external code cannot synthesize a variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegTileLayoutTag {
+    Row,
+    Col,
+}
+
+impl RegTileLayoutTag {
+    pub const fn layout_path(&self) -> &'static str {
+        match self {
+            Self::Row => RowLayout::LAYOUT_PATH,
+            Self::Col => ColLayout::LAYOUT_PATH,
+        }
+    }
+}
+
+mod rv_layout_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed marker trait for register-vec layouts. Implemented only
+/// for [`OrthoLayout`], [`AlignLayout`], [`NaiveLayout`].
+pub trait RegVecLayout: rv_layout_sealed::Sealed + Copy {
+    const LAYOUT_PATH: &'static str;
+    fn tag() -> RegVecLayoutTag;
+}
+
+/// `kittens::ducks::rv_layout::ortho` — orthogonal warp partition
+/// of the register vector.
+#[derive(Clone, Copy, Debug)]
+pub struct OrthoLayout;
+impl rv_layout_sealed::Sealed for OrthoLayout {}
+impl RegVecLayout for OrthoLayout {
+    const LAYOUT_PATH: &'static str = "kittens::ducks::rv_layout::ortho";
+    fn tag() -> RegVecLayoutTag {
+        RegVecLayoutTag::Ortho
+    }
+}
+
+/// `kittens::ducks::rv_layout::align` — aligned with rt_layout::row.
+#[derive(Clone, Copy, Debug)]
+pub struct AlignLayout;
+impl rv_layout_sealed::Sealed for AlignLayout {}
+impl RegVecLayout for AlignLayout {
+    const LAYOUT_PATH: &'static str = "kittens::ducks::rv_layout::align";
+    fn tag() -> RegVecLayoutTag {
+        RegVecLayoutTag::Align
+    }
+}
+
+/// `kittens::ducks::rv_layout::naive` — naive (one element per
+/// thread) layout. Used when full warp parallelism isn't required.
+#[derive(Clone, Copy, Debug)]
+pub struct NaiveLayout;
+impl rv_layout_sealed::Sealed for NaiveLayout {}
+impl RegVecLayout for NaiveLayout {
+    const LAYOUT_PATH: &'static str = "kittens::ducks::rv_layout::naive";
+    fn tag() -> RegVecLayoutTag {
+        RegVecLayoutTag::Naive
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegVecLayoutTag {
+    Ortho,
+    Align,
+    Naive,
+}
+
+impl RegVecLayoutTag {
+    pub const fn layout_path(&self) -> &'static str {
+        match self {
+            Self::Ortho => OrthoLayout::LAYOUT_PATH,
+            Self::Align => AlignLayout::LAYOUT_PATH,
+            Self::Naive => NaiveLayout::LAYOUT_PATH,
+        }
+    }
+}
+
+// ── Sealed register-tile / register-vec SSA handles ─────────────────
+//
+// Per SUBTILE_TK20_DECOMP.md §"Lifetime model: SSA": every Instr that
+// produces a register handle mints a fresh id; the player walks the
+// tape's `reg_tile_arena` / `reg_vec_arena` BTreeMaps in id-order to
+// emit the kernel-preamble decls (`kittens::rt_bf<R, C, layout> rt_N;`).
+//
+// The handle is a sealed phantom-typed wrapper around a u16 SSA slot
+// id. Const-generic shape (R, C / LEN), dtype (T: TileDtype), and
+// layout (L: RegTileLayout / RV: RegVecLayout) are propagated through
+// the handle's type — Instr constructors with mismatched const
+// generics across operands fail rustc unification.
+
+/// Sealed SSA slot id for register tiles. Inner u16 is `pub(crate)`
+/// — only crate-internal mint paths (`TkTape::mint_reg_tile`) can
+/// fabricate one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RegTileSlot(pub(crate) u16);
+
+/// Sealed SSA slot id for register vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RegVecSlot(pub(crate) u16);
+
+/// Typed register-tile handle. Const-generic shape (R, C), dtype
+/// (T: TileDtype, sealed), and layout (L: RegTileLayout, sealed).
+/// Two `RegTileId`s with different const generics are different Rust
+/// types; an Instr constructor that requires `(src, dst):
+/// (RegTileId<R,C,T,L>, RegTileId<R,C,T,L>)` rejects mismatch as
+/// rustc E0308.
+///
+/// # Compile-fail proof — layout mismatch (Row vs Col) rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, ColLayout, RegTileId,
+///     RegTileLayout, RowLayout, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype, L: RegTileLayout>(
+///     _a: RegTileId<R, C, T, L>,
+///     _b: RegTileId<R, C, T, L>,
+/// ) {}
+/// let a: RegTileId<16, 128, Bf16, RowLayout> = unreachable!();
+/// let b: RegTileId<16, 128, Bf16, ColLayout> = unreachable!();
+/// _all_same(a, b);  // ← rustc rejects: L = RowLayout vs ColLayout
+/// ```
+///
+/// # Compile-fail proof — shape mismatch (ROWS) rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, RegTileId, RegTileLayout,
+///     RowLayout, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype, L: RegTileLayout>(
+///     _a: RegTileId<R, C, T, L>,
+///     _b: RegTileId<R, C, T, L>,
+/// ) {}
+/// let a: RegTileId<16, 128, Bf16, RowLayout> = unreachable!();
+/// let b: RegTileId<32, 128, Bf16, RowLayout> = unreachable!();
+/// _all_same(a, b);  // ← rustc rejects: R=16 vs R=32
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegTileId<const R: usize, const C: usize, T: TileDtype, L: RegTileLayout> {
+    slot: RegTileSlot,
+    _marker: PhantomData<fn() -> (T, L)>,
+}
+
+impl<const R: usize, const C: usize, T: TileDtype, L: RegTileLayout> RegTileId<R, C, T, L> {
+    pub(crate) const fn from_slot(slot: RegTileSlot) -> Self {
+        Self {
+            slot,
+            _marker: PhantomData,
+        }
+    }
+    pub const fn slot(&self) -> RegTileSlot {
+        self.slot
+    }
+    pub const fn rows() -> usize {
+        R
+    }
+    pub const fn cols() -> usize {
+        C
+    }
+}
+
+/// Typed register-vec handle. Const-generic LEN, dtype, layout.
+///
+/// # Compile-fail proof — layout mismatch (Ortho vs Align) rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{AlignLayout, Bf16, OrthoLayout,
+///     RegVecId, RegVecLayout, TileDtype};
+/// fn _both<const LEN: usize, T: TileDtype, RV: RegVecLayout>(
+///     _a: RegVecId<LEN, T, RV>,
+///     _b: RegVecId<LEN, T, RV>,
+/// ) {}
+/// let a: RegVecId<128, Bf16, OrthoLayout> = unreachable!();
+/// let b: RegVecId<128, Bf16, AlignLayout> = unreachable!();
+/// _both(a, b);  // ← rustc rejects: RV mismatch
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegVecId<const LEN: usize, T: TileDtype, RV: RegVecLayout> {
+    slot: RegVecSlot,
+    _marker: PhantomData<fn() -> (T, RV)>,
+}
+
+impl<const LEN: usize, T: TileDtype, RV: RegVecLayout> RegVecId<LEN, T, RV> {
+    pub(crate) const fn from_slot(slot: RegVecSlot) -> Self {
+        Self {
+            slot,
+            _marker: PhantomData,
+        }
+    }
+    pub const fn slot(&self) -> RegVecSlot {
+        self.slot
+    }
+    pub const fn len() -> usize {
+        LEN
+    }
+}
+
+/// Sealed runtime entry recording a [`RegTileSlot`]'s shape/dtype/
+/// layout. Inner fields `pub(crate)`; player iterates the arena to
+/// emit kernel-preamble register-tile decls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegTileArenaEntry {
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+    pub(crate) dtype: TileDtypeTag,
+    pub(crate) layout: RegTileLayoutTag,
+}
+
+impl RegTileArenaEntry {
+    pub const fn rows(&self) -> u16 {
+        self.rows
+    }
+    pub const fn cols(&self) -> u16 {
+        self.cols
+    }
+    pub const fn dtype(&self) -> TileDtypeTag {
+        self.dtype
+    }
+    pub const fn layout(&self) -> RegTileLayoutTag {
+        self.layout
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegVecArenaEntry {
+    pub(crate) len: u16,
+    pub(crate) dtype: TileDtypeTag,
+    pub(crate) layout: RegVecLayoutTag,
+}
+
+impl RegVecArenaEntry {
+    pub const fn len(&self) -> u16 {
+        self.len
+    }
+    pub const fn dtype(&self) -> TileDtypeTag {
+        self.dtype
+    }
+    pub const fn layout(&self) -> RegVecLayoutTag {
+        self.layout
+    }
+}
+
 /// Inlined immediate scalar carried by *AddScalar / *MulScalar Instrs.
 /// Per SUBTILE_TK20_DECOMP.md §"New typed-witness types" line 42:
 /// the codegen emits a literal in the TK 2.0 call (e.g.
@@ -1335,6 +1761,287 @@ impl Instr {
         }
     }
 
+    // ── Register-tile / register-vec typed constructors ────────────
+    //
+    // Each constructor takes the typed RegTileId<R,C,T,L> /
+    // RegVecId<LEN,T,RV> witnesses; const-generic + sealed-marker
+    // unification across operands gates the call at rustc time.
+    // The variant stores the runtime RegTileSlot/RegVecSlot; the
+    // arena entries on TkTape carry the shape/dtype/layout for emit.
+
+    pub(crate) fn load_shmem_to_reg<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: SmemTileId<ROWS, COLS, T>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::LoadShmemToReg {
+            src: src.page(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn store_reg_tile_to_shmem<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::StoreRegTileToShmem {
+            src: src.slot(),
+            dst: dst.page(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn load_vec_smem_to_reg<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        const LEN: usize,
+        RV: RegVecLayout,
+    >(
+        // src is a shared-memory page that holds a vector; the
+        // typed witness is SmemTileId<ROWS, COLS, T> for now (the
+        // page substrate). LEN unifies via where-clause caller-side.
+        src: SmemTileId<ROWS, COLS, T>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::LoadVecSmemToReg {
+            src: src.page(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn store_reg_vec_to_shmem<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        const LEN: usize,
+        RV: RegVecLayout,
+    >(
+        src: RegVecId<LEN, T, RV>,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::StoreRegVecToShmem {
+            src: src.slot(),
+            dst: dst.page(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_neg<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileNeg {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_exp<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileExp {
+            src: src.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_add<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        lhs: RegTileId<ROWS, COLS, T, L>,
+        rhs: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileAdd {
+            lhs: lhs.slot(),
+            rhs: rhs.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_sub<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        lhs: RegTileId<ROWS, COLS, T, L>,
+        rhs: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileSub {
+            lhs: lhs.slot(),
+            rhs: rhs.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_div<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        lhs: RegTileId<ROWS, COLS, T, L>,
+        rhs: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileDiv {
+            lhs: lhs.slot(),
+            rhs: rhs.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// `kittens::group<N>::mul_col(dst, src, col_vec)` — the col-vec
+    /// LEN must equal the tile's COLS at the type level; constructor
+    /// where-bound enforces.
+    pub(crate) fn reg_tile_mul_col<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+        RV: RegVecLayout,
+    >(
+        src: RegTileId<ROWS, COLS, T, L>,
+        col_vec: RegVecId<COLS, T, RV>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileMulCol {
+            src: src.slot(),
+            col_vec: col_vec.slot(),
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn reg_tile_add_scalar<
+        const N: usize,
+        const ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        lhs: RegTileId<ROWS, COLS, T, L>,
+        dst: RegTileId<ROWS, COLS, T, L>,
+        scalar: ScalarF32,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegTileAddScalar {
+            lhs: lhs.slot(),
+            dst: dst.slot(),
+            scalar,
+            dtype: T::tag(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     /// Construct a [`Instr::StoreAsyncTyped`] from a typed source
     /// tile witness. `src` is a [`SmemTileId<ROWS, COLS, T>`] —
     /// `ROWS`, `COLS`, and `T::NAME` are propagated into the emitted
@@ -1431,6 +2138,62 @@ impl TkTape {
 
     pub fn push(&mut self, instr: Instr) {
         self.instrs.push(instr);
+    }
+
+    /// Mint a fresh [`RegTileId<R, C, T, L>`] SSA slot. Records the
+    /// runtime shape/dtype/layout in [`Self::reg_tile_arena`] for
+    /// kernel-preamble emit. Panics on u16 overflow with a clear
+    /// message — 65,535 register-tile slots per kernel is far
+    /// beyond any realistic megakernel.
+    pub(crate) fn mint_reg_tile<const R: usize, const C: usize, T: TileDtype, L: RegTileLayout>(
+        &mut self,
+    ) -> RegTileId<R, C, T, L> {
+        let slot = RegTileSlot(self.next_reg_tile_slot);
+        self.next_reg_tile_slot = self
+            .next_reg_tile_slot
+            .checked_add(1)
+            .expect("reg_tile slot overflow (>= 65536 register tiles in one kernel)");
+        self.reg_tile_arena.insert(
+            slot,
+            RegTileArenaEntry {
+                rows: R as u16,
+                cols: C as u16,
+                dtype: T::tag(),
+                layout: L::tag(),
+            },
+        );
+        RegTileId::from_slot(slot)
+    }
+
+    /// Mint a fresh [`RegVecId<LEN, T, RV>`] SSA slot. See
+    /// [`Self::mint_reg_tile`].
+    pub(crate) fn mint_reg_vec<const LEN: usize, T: TileDtype, RV: RegVecLayout>(
+        &mut self,
+    ) -> RegVecId<LEN, T, RV> {
+        let slot = RegVecSlot(self.next_reg_vec_slot);
+        self.next_reg_vec_slot = self
+            .next_reg_vec_slot
+            .checked_add(1)
+            .expect("reg_vec slot overflow (>= 65536 register vectors in one kernel)");
+        self.reg_vec_arena.insert(
+            slot,
+            RegVecArenaEntry {
+                len: LEN as u16,
+                dtype: T::tag(),
+                layout: RV::tag(),
+            },
+        );
+        RegVecId::from_slot(slot)
+    }
+
+    /// Read accessor for the register-tile arena (used by the player
+    /// to emit kernel-preamble decls in deterministic id order).
+    pub fn reg_tile_arena(&self) -> &BTreeMap<RegTileSlot, RegTileArenaEntry> {
+        &self.reg_tile_arena
+    }
+
+    pub fn reg_vec_arena(&self) -> &BTreeMap<RegVecSlot, RegVecArenaEntry> {
+        &self.reg_vec_arena
     }
 
     /// Append the cross-op gmem-fence as a 5-Instr atomic sequence.
@@ -1587,6 +2350,17 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::ShTileExp { .. }
             | Instr::ShTileMulScalar { .. }
             | Instr::ShTileAddScalar { .. }
+            | Instr::LoadShmemToReg { .. }
+            | Instr::StoreRegTileToShmem { .. }
+            | Instr::LoadVecSmemToReg { .. }
+            | Instr::StoreRegVecToShmem { .. }
+            | Instr::RegTileNeg { .. }
+            | Instr::RegTileExp { .. }
+            | Instr::RegTileAdd { .. }
+            | Instr::RegTileSub { .. }
+            | Instr::RegTileDiv { .. }
+            | Instr::RegTileMulCol { .. }
+            | Instr::RegTileAddScalar { .. }
             | Instr::DebugOpBeginMarker { .. } => {}
         }
     }
@@ -1630,6 +2404,10 @@ mod tests {
             kernel_args: vec![],
             prelude: vec![],
             kv_layouts: vec![],
+            reg_tile_arena: BTreeMap::new(),
+            reg_vec_arena: BTreeMap::new(),
+            next_reg_tile_slot: 0,
+            next_reg_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
@@ -1653,6 +2431,10 @@ mod tests {
             kernel_args: vec![],
             prelude: vec![],
             kv_layouts: vec![],
+            reg_tile_arena: BTreeMap::new(),
+            reg_vec_arena: BTreeMap::new(),
+            next_reg_tile_slot: 0,
+            next_reg_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
@@ -1688,6 +2470,10 @@ mod tests {
             kernel_args: vec![],
             prelude: vec![],
             kv_layouts: vec![],
+            reg_tile_arena: BTreeMap::new(),
+            reg_vec_arena: BTreeMap::new(),
+            next_reg_tile_slot: 0,
+            next_reg_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),

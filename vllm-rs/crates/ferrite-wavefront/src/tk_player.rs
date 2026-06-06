@@ -168,6 +168,112 @@ mod tk20 {
         )
     }
 
+    // ── Register-tile / register-vec emit helpers ─────────────────
+    //
+    // Each maps 1:1 to a TK 2.0 callable per its header citation.
+    // The register handles emit as `rt_<slot>` / `rv_<slot>`; the
+    // declarations live in the kernel preamble (see preamble walk
+    // in emit_kernel below).
+
+    /// `rt<kittens::<scalar>, R, C, layout> rt_<slot>;` — kernel
+    /// preamble decl for a register tile. Per
+    /// `feedback_dogfood_tk20_rust`, the layout token comes from
+    /// `RegTileLayoutTag::layout_path()`.
+    pub fn rt_decl(
+        slot: u16,
+        rows: u16,
+        cols: u16,
+        dtype: &crate::tk_tape::TileDtypeTag,
+        layout: &crate::tk_tape::RegTileLayoutTag,
+    ) -> String {
+        let scalar = dtype.scalar_name();
+        let lpath = layout.layout_path();
+        format!("    kittens::rt<kittens::{scalar}, {rows}, {cols}, {lpath}> rt_{slot};\n")
+    }
+
+    /// `rv<kittens::<scalar>, LEN, layout> rv_<slot>;` — preamble decl.
+    pub fn rv_decl(
+        slot: u16,
+        len: u16,
+        dtype: &crate::tk_tape::TileDtypeTag,
+        layout: &crate::tk_tape::RegVecLayoutTag,
+    ) -> String {
+        let scalar = dtype.scalar_name();
+        let lpath = layout.layout_path();
+        format!("    kittens::rv<kittens::{scalar}, {len}, {lpath}> rv_{slot};\n")
+    }
+
+    /// `kittens::group<N>::load(rt_dst, page_buf[src])` —
+    /// `ops/group/memory/tile/shared_to_register.cuh:15`.
+    pub fn load_shmem_to_reg_tile(group_n: u32, src_page: u8, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::load(rt_{dst_slot}, page_buf[{src_page}]);")
+    }
+
+    /// `kittens::group<N>::store(page_buf[dst], rt_src)` —
+    /// `ops/group/memory/tile/shared_to_register.cuh:139`.
+    pub fn store_reg_tile_to_shmem(group_n: u32, src_slot: u16, dst_page: u8) -> String {
+        format!("kittens::group<{group_n}>::store(page_buf[{dst_page}], rt_{src_slot});")
+    }
+
+    /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
+    /// `ops/group/memory/vec/shared_to_register.cuh:14`.
+    pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::load(rv_{dst_slot}, page_buf[{src_page}]);")
+    }
+
+    /// `kittens::group<N>::store(page_buf[dst], rv_src)` —
+    /// `ops/group/memory/vec/shared_to_register.cuh:100`.
+    pub fn store_reg_vec_to_shmem(group_n: u32, src_slot: u16, dst_page: u8) -> String {
+        format!("kittens::group<{group_n}>::store(page_buf[{dst_page}], rv_{src_slot});")
+    }
+
+    /// `kittens::group<N>::neg(rt_dst, rt_src)` — `register/tile/maps.cuh:572`.
+    pub fn rt_neg(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::neg(rt_{dst}, rt_{src});")
+    }
+
+    /// `kittens::group<N>::exp(rt_dst, rt_src)` — `register/tile/maps.cuh:464`.
+    pub fn rt_exp(group_n: u32, dst: u16, src: u16) -> String {
+        format!("kittens::group<{group_n}>::exp(rt_{dst}, rt_{src});")
+    }
+
+    /// `kittens::group<N>::add(rt_dst, rt_lhs, rt_rhs)` — `register/tile/maps.cuh:681`.
+    pub fn rt_add(group_n: u32, dst: u16, lhs: u16, rhs: u16) -> String {
+        format!("kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, rt_{rhs});")
+    }
+
+    /// `kittens::group<N>::sub(rt_dst, rt_lhs, rt_rhs)` — `register/tile/maps.cuh:695`.
+    pub fn rt_sub(group_n: u32, dst: u16, lhs: u16, rhs: u16) -> String {
+        format!("kittens::group<{group_n}>::sub(rt_{dst}, rt_{lhs}, rt_{rhs});")
+    }
+
+    /// `kittens::group<N>::div(rt_dst, rt_lhs, rt_rhs)` — `register/tile/maps.cuh:722`.
+    pub fn rt_div(group_n: u32, dst: u16, lhs: u16, rhs: u16) -> String {
+        format!("kittens::group<{group_n}>::div(rt_{dst}, rt_{lhs}, rt_{rhs});")
+    }
+
+    /// `kittens::group<N>::mul_col(rt_dst, rt_src, rv_col)` — `register/tile/maps.cuh:841`.
+    pub fn rt_mul_col(group_n: u32, dst: u16, src: u16, col_vec: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::mul_col(rt_{dst}, rt_{src}, rv_{col_vec});"
+        )
+    }
+
+    /// `kittens::group<N>::add(rt_dst, rt_lhs, kittens::<dtype>(scalar))` —
+    /// scalar overload of `register/tile/maps.cuh:681`.
+    pub fn rt_add_scalar(
+        group_n: u32,
+        dst: u16,
+        lhs: u16,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+
     pub fn tma_store_async_typed(
         src_page: u8,
         dst_arg_idx: u32,
@@ -330,6 +436,30 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     out.push_str("    (void)page_buf; (void)page_ready; (void)page_done;\n");
     out.push_str("    (void)page_consumed; (void)page_carry;\n");
 
+    // Register-tile / register-vec decls — walk the BTreeMap arenas
+    // in id-order so preamble emit is deterministic (= stable goldens).
+    // Per `feedback_dogfood_tk20_rust`: emit goes through tk20::*.
+    if !tape.reg_tile_arena().is_empty() || !tape.reg_vec_arena().is_empty() {
+        out.push_str("\n    // ── register-tile / register-vec decls ──\n");
+    }
+    for (slot, entry) in tape.reg_tile_arena() {
+        out.push_str(&tk20::rt_decl(
+            slot.0,
+            entry.rows(),
+            entry.cols(),
+            &entry.dtype(),
+            &entry.layout(),
+        ));
+    }
+    for (slot, entry) in tape.reg_vec_arena() {
+        out.push_str(&tk20::rv_decl(
+            slot.0,
+            entry.len(),
+            &entry.dtype(),
+            &entry.layout(),
+        ));
+    }
+
     out.push_str("\n    // ── tape body ──\n");
 
     for instr in &tape.instrs {
@@ -476,6 +606,45 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::ShTileAddScalar { lhs, dst, scalar, dtype, width } => {
             let _ = writeln!(out, "{}",
                 tk20::st_add_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
+        }
+        Instr::LoadShmemToReg { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::load_shmem_to_reg_tile(width.n(), src.0, dst.0));
+        }
+        Instr::StoreRegTileToShmem { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::store_reg_tile_to_shmem(width.n(), src.0, dst.0));
+        }
+        Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::load_smem_to_reg_vec(width.n(), src.0, dst.0));
+        }
+        Instr::StoreRegVecToShmem { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::store_reg_vec_to_shmem(width.n(), src.0, dst.0));
+        }
+        Instr::RegTileNeg { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_neg(width.n(), dst.0, src.0));
+        }
+        Instr::RegTileExp { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_exp(width.n(), dst.0, src.0));
+        }
+        Instr::RegTileAdd { lhs, rhs, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_add(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::RegTileSub { lhs, rhs, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_sub(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::RegTileDiv { lhs, rhs, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rt_div(width.n(), dst.0, lhs.0, rhs.0));
+        }
+        Instr::RegTileMulCol { src, col_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::rt_mul_col(width.n(), dst.0, src.0, col_vec.0));
+        }
+        Instr::RegTileAddScalar { lhs, dst, scalar, dtype, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::rt_add_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
         }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
@@ -776,6 +945,164 @@ mod tests {
             s,
             "kittens::group<16>::add(page_buf[5], page_buf[4], kittens::bf16(1f));\n",
         );
+    }
+
+    // ── Register-tile / register-vec emit tests (commit A) ────────
+
+    /// Helper that builds a tape with a single register-tile slot
+    /// minted in the arena, plus the given Instr. Used by the arm
+    /// tests below so the emitted body has a consistent rt_<id> id.
+    fn emit_with_rt_arena<F: FnOnce(&mut TkTape)>(f: F) -> String {
+        use crate::tk_tape::{Bf16, RegTileId, RowLayout};
+        let mut tape = TkTape::default();
+        // Mint two register tiles + one register vec so slots are stable.
+        let _: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+        let _: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+        f(&mut tape);
+        let mut out = String::new();
+        // Emit just the body Instrs (skip kernel-arg / preamble).
+        for instr in &tape.instrs {
+            emit_instr(&mut out, &tape, instr);
+        }
+        out
+    }
+
+    #[test]
+    fn load_shmem_to_reg_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, PageId, RegTileId, RowLayout, SmemTileId};
+        let s = emit_with_rt_arena(|tape| {
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let src = SmemTileId::<16, 128, Bf16>::from_page(PageId(3));
+            tape.push(Instr::load_shmem_to_reg(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::load(rt_2, page_buf[3]);\n");
+    }
+
+    #[test]
+    fn store_reg_tile_to_shmem_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, PageId, RegTileId, RowLayout, SmemTileId};
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst = SmemTileId::<16, 128, Bf16>::from_page(PageId(7));
+            tape.push(Instr::store_reg_tile_to_shmem(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::store(page_buf[7], rt_2);\n");
+    }
+
+    #[test]
+    fn reg_tile_neg_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::reg_tile_neg(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::neg(rt_3, rt_2);\n");
+    }
+
+    #[test]
+    fn reg_tile_exp_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::reg_tile_exp(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::exp(rt_3, rt_2);\n");
+    }
+
+    #[test]
+    fn reg_tile_add_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let lhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let rhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::reg_tile_add(
+                lhs, rhs, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::add(rt_4, rt_2, rt_3);\n");
+    }
+
+    #[test]
+    fn reg_tile_div_emits_real_tk20_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let lhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let rhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::reg_tile_div(
+                lhs, rhs, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::div(rt_4, rt_2, rt_3);\n");
+    }
+
+    #[test]
+    fn reg_tile_add_scalar_emits_typed_scalar_literal() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32};
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            tape.push(Instr::reg_tile_add_scalar(
+                src, dst, ScalarF32::new(1.0), GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::add(rt_3, rt_2, kittens::bf16(1f));\n");
+    }
+
+    #[test]
+    fn reg_tile_mul_col_emits_typed_call() {
+        use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, OrthoLayout, RegTileId, RegVecId, RowLayout};
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+            let col_vec: RegVecId<128, Bf16, OrthoLayout> = tape.mint_reg_vec();
+            tape.push(Instr::reg_tile_mul_col(
+                src, col_vec, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(s, "kittens::group<16>::mul_col(rt_3, rt_2, rv_0);\n");
+    }
+
+    /// Verify the kernel preamble emits register-tile decls in
+    /// deterministic id order (BTreeMap walk).
+    #[test]
+    fn emit_kernel_emits_register_tile_decls() {
+        use crate::tk_tape::{Bf16, RegTileId, RegVecId, RowLayout, OrthoLayout};
+        let mut tape = TkTape::default();
+        tape.kernel_args.push(crate::tk_tape::KernelArg {
+            name: crate::tk_tape::KernelArgName::Fixed("__num_kv_pages"),
+            ty: crate::tk_tape::KernelArgTy::U32 {
+                source: crate::tk_tape::U32Source::NumKvPages,
+            },
+        });
+        let _: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+        let _: RegTileId<32, 64, Bf16, RowLayout> = tape.mint_reg_tile();
+        let _: RegVecId<128, Bf16, OrthoLayout> = tape.mint_reg_vec();
+        let out = emit_kernel("tk_test", &tape);
+        // rt_0 first (id-order), rt_1 second
+        let rt0 = out
+            .find("kittens::rt<kittens::bf16, 16, 128, kittens::ducks::rt_layout::row> rt_0;")
+            .expect("rt_0 decl");
+        let rt1 = out
+            .find("kittens::rt<kittens::bf16, 32, 64, kittens::ducks::rt_layout::row> rt_1;")
+            .expect("rt_1 decl");
+        let rv0 = out
+            .find("kittens::rv<kittens::bf16, 128, kittens::ducks::rv_layout::ortho> rv_0;")
+            .expect("rv_0 decl");
+        assert!(rt0 < rt1);
+        // rv decls follow rt decls
+        assert!(rt1 < rv0);
     }
 
     /// Warpgroup-width construction (used later by mma_AB) also

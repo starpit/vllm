@@ -607,7 +607,7 @@ impl<F: RopeForm, K: KvCacheShape> SubtileIR<F, K> {
     pub fn shape(&self, t: TensorId) -> TensorShape {
         self.tensors[t.0 as usize]
     }
-    fn is_source(&self, t: TensorId) -> bool {
+    pub fn is_source(&self, t: TensorId) -> bool {
         t.0 < self.num_sources
     }
     /// The rope form of this IR. All rope nodes use this pairing by

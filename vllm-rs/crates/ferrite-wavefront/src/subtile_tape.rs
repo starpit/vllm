@@ -180,6 +180,54 @@ pub enum LoopBound {
 /// semantics. Every DAG edge surfaces as an explicit slot operation:
 /// `AllocSlot` mints, `Compute { writes, reads }` writes once + reads N,
 /// `FreeSlot` retires.
+/// One positional input to a `Compute` Instr. Either a previously-
+/// computed slot (`Computed(SlotId)`) or an external graph-source
+/// tensor region (`External { tensor, region }`) that wasn't produced
+/// by an upstream Compute.
+///
+/// Per the panic-RCA workflow (wpzaaucfk): the previous
+/// `reads: Vec<SlotId>` design dropped external sources because
+/// `predecessors()` skips graph-source tensors, so SubOps whose inputs
+/// are all external (e.g. RmsNorm at decoder layer 0, with x and gamma
+/// both external) reached `lower_compute` with an empty reads slice
+/// and panicked at `reads[0]`.
+///
+/// Now Compute carries the FULL positional input list — both
+/// computed-slot edges and external-source references — so each
+/// lower_compute arm sees `node.inputs[i]` resolved to either a
+/// page (Computed) or a tensor handle (External).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeInput {
+    /// The input was produced by an earlier `Compute` writing this slot.
+    Computed(SlotId),
+    /// The input is a leaf graph-source (model weight, cache handle,
+    /// pre-populated KV slot, etc.). Lowering side resolves the tensor
+    /// + region against the SubtileIR's source manifest.
+    External {
+        tensor: crate::subtile_ir::TensorId,
+        region: crate::subtile_ir::Region,
+    },
+}
+
+impl ComputeInput {
+    /// Extract the [`SlotId`] for a `Computed` input. Panics with a
+    /// named message for `External` inputs — used by lower_compute
+    /// arms that haven't yet been taught to handle external sources
+    /// (Phase A step 4+ replaces these calls with proper layout-
+    /// witnessed external-source resolution).
+    pub fn expect_computed_slot(&self, arm: &'static str, pos: usize) -> SlotId {
+        match self {
+            Self::Computed(slot) => *slot,
+            Self::External { tensor, region } => panic!(
+                "lower_compute {} input[{}] is External \
+                 (tensor={:?}, region={:?}); external-source resolution \
+                 is Phase A step 4+ of the panic-RCA plan",
+                arm, pos, tensor, region,
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instr {
     /// Mint a fresh slot id for a producer's output. Pairs (eventually)
@@ -187,13 +235,14 @@ pub enum Instr {
     /// [`Instr::FreeSlot`] retiring it.
     AllocSlot { slot: SlotId },
     /// Compute the named SubtileIR node, writing its output into `writes`
-    /// and reading from `reads`. The node's input/output regions live on
-    /// the SubtileIR; this instruction names node identity + the
-    /// dataflow edges that surface.
+    /// and reading from `inputs` (one per positional `node.inputs[i]`).
+    /// The node's input/output regions live on the SubtileIR; this
+    /// instruction names node identity + the FULL positional input
+    /// list (computed slots + external sources, see [`ComputeInput`]).
     Compute {
         node: SubtileId,
         writes: SlotId,
-        reads: Vec<SlotId>,
+        inputs: Vec<ComputeInput>,
     },
     /// Retire the named slot — the last consumer is done. Slot id
     /// returns to the pool (the per-target lowering may recycle).
@@ -459,18 +508,48 @@ impl TapeBuilder<state::Outside> {
 /// AttnDecode's body computes inside its KV-sweep loop, so the workload
 /// instruction must be reachable from both states. (The hazard
 /// primitives — `alloc_slot`, `free_slot` — stay Outside-only.)
+// Helper: same regions_overlap from subtile_ir but local-scope.
+fn regions_overlap_helper(a: crate::subtile_ir::Region, b: crate::subtile_ir::Region) -> bool {
+    a.rows.start < a.rows.end()
+        && b.rows.start < b.rows.end()
+        && a.cols.start < a.cols.end()
+        && b.cols.start < b.cols.end()
+        && (a.rows.start < b.rows.end() && b.rows.start < a.rows.end())
+        && (a.cols.start < b.cols.end() && b.cols.start < a.cols.end())
+}
+
+/// Caller-side input form for [`TapeBuilder::compute_to`]. Mirrors
+/// [`ComputeInput`] but borrows the `SlotWritten` for computed inputs
+/// (so the SlotWritten consumed-once seal stays intact).
+pub enum ComputeInputBuild<'a> {
+    Computed(&'a SlotWritten),
+    External {
+        tensor: crate::subtile_ir::TensorId,
+        region: crate::subtile_ir::Region,
+    },
+}
+
 fn push_compute(
     instrs: &mut Vec<Instr>,
     node: SubtileId,
     write: SlotHandle,
-    reads: &[&SlotWritten],
+    inputs: &[ComputeInputBuild<'_>],
 ) -> SlotWritten {
     let writes_id = write.slot;
-    let read_ids: Vec<SlotId> = reads.iter().map(|w| w.slot).collect();
+    let inputs_owned: Vec<ComputeInput> = inputs
+        .iter()
+        .map(|ci| match ci {
+            ComputeInputBuild::Computed(w) => ComputeInput::Computed(w.slot),
+            ComputeInputBuild::External { tensor, region } => ComputeInput::External {
+                tensor: *tensor,
+                region: *region,
+            },
+        })
+        .collect();
     instrs.push(Instr::Compute {
         node,
         writes: writes_id,
-        reads: read_ids,
+        inputs: inputs_owned,
     });
     SlotWritten {
         slot: writes_id,
@@ -480,16 +559,16 @@ fn push_compute(
 
 impl TapeBuilder<state::Outside> {
     /// Compute `node`, writing its output into `write` (consuming the
-    /// `SlotHandle`) and reading from `reads` (borrowing each
-    /// `SlotWritten`). Returns the `SlotWritten` token for downstream
-    /// consumers.
+    /// `SlotHandle`) and reading from `inputs` (positional list of
+    /// computed slots + external graph-source references). Returns the
+    /// `SlotWritten` token for downstream consumers.
     pub fn compute_to(
         &mut self,
         node: SubtileId,
         write: SlotHandle,
-        reads: &[&SlotWritten],
+        inputs: &[ComputeInputBuild<'_>],
     ) -> SlotWritten {
-        push_compute(&mut self.instrs, node, write, reads)
+        push_compute(&mut self.instrs, node, write, inputs)
     }
 }
 
@@ -500,9 +579,9 @@ impl TapeBuilder<state::InsideLoop> {
         &mut self,
         node: SubtileId,
         write: SlotHandle,
-        reads: &[&SlotWritten],
+        inputs: &[ComputeInputBuild<'_>],
     ) -> SlotWritten {
-        push_compute(&mut self.instrs, node, write, reads)
+        push_compute(&mut self.instrs, node, write, inputs)
     }
 
     /// Close the active loop. Returns a builder back in the `Outside`
@@ -662,11 +741,17 @@ fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvC
         match instr {
             Instr::AllocSlot { .. } | Instr::FreeSlot { .. } => {}
             Instr::OpenLoop { .. } | Instr::CloseLoop { .. } => {}
-            Instr::Compute { node, writes, reads } => {
+            Instr::Compute { node, writes, inputs } => {
                 writer_of.insert(writes.id, *node);
-                let read_writers: Vec<SubtileId> = reads
+                // Walk only Computed inputs for edge validation;
+                // External inputs reference graph-source tensors that
+                // have no producer node and contribute no DAG edge.
+                let read_writers: Vec<SubtileId> = inputs
                     .iter()
-                    .filter_map(|r| writer_of.get(&r.id).copied())
+                    .filter_map(|ci| match ci {
+                        ComputeInput::Computed(slot) => writer_of.get(&slot.id).copied(),
+                        ComputeInput::External { .. } => None,
+                    })
                     .collect();
                 let n_idx = node.0 as usize;
                 if n_idx < preds.len() {
@@ -745,33 +830,65 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::K
     // predecessor of node N has id < N and was inserted before N).
     let mut written: Vec<Option<SlotWritten>> = (0..graph.nodes.len()).map(|_| None).collect();
     let mut builder = TapeBuilder::new();
+    // For positional input plumbing: build a tensor->writer-node-id
+    // index so we can find the producer of each non-source input.
+    // Mirrors predecessors() but indexed by tensor instead of returning
+    // a flat node-id list — we need the per-input producer to keep
+    // positional order intact.
+    use crate::subtile_ir::Region;
+    let mut writers: Vec<Vec<(u32, Region)>> =
+        vec![Vec::new(); graph.tensors.len()];
     for node in &graph.nodes {
         let nid = node.id.0;
-        let pred_ids = &preds[nid as usize];
-        let mut pred_tokens: Vec<(u32, SlotWritten)> = Vec::with_capacity(pred_ids.len());
-        for p in pred_ids {
-            // SAFETY (algorithmic): preds[nid] lists predecessors of
-            // ascending-id node nid; each predecessor p has p.0 < nid
-            // and was written via `written[p.0] = Some(...)` on its
-            // own iteration (ascending walk). consumer_remaining
-            // re-inserts the token until last consumer — by the time
-            // we observe `None` here, the function would have already
-            // freed the slot, which would mean we're visiting node N
-            // after N's last consumer, which violates the topo order
-            // the SubtileIR's ascending-id invariant guarantees.
-            // Per plan §4 lines 199-200: no unwrap_or_else.
-            // The loop invariant (ascending topo + per-node
-            // consumer_remaining bookkeeping) guarantees the slot
-            // is live; .expect makes that explicit and panics with
-            // a fixed message rather than the rotted closure form.
-            let token = written[p.0 as usize].take().expect(
-                "lower_dag_to_tape: predecessor missing live SlotWritten \
-                 (consumer-count walk disagrees with predecessors list)",
-            );
-            pred_tokens.push((p.0, token));
+        // Track which producer SubtileId is needed per positional input
+        // (None = External / graph source).
+        let mut input_producer: Vec<Option<u32>> = Vec::with_capacity(node.inputs.len());
+        for inp in &node.inputs {
+            if graph.is_source(inp.tensor) {
+                input_producer.push(None);
+            } else {
+                let mut producer: Option<u32> = None;
+                for (wid, wreg) in &writers[inp.tensor.0 as usize] {
+                    if regions_overlap_helper(*wreg, inp.region) {
+                        producer = Some(*wid);
+                        break;
+                    }
+                }
+                input_producer.push(producer);
+            }
         }
-        let read_refs: Vec<&SlotWritten> =
-            pred_tokens.iter().map(|(_, w)| w).collect();
+        // Take SlotWritten tokens for each computed predecessor in
+        // positional order. The same producer can appear at multiple
+        // positions (rare); we re-take only on the LAST positional
+        // reference (consumer_remaining handles consumer accounting).
+        // For now: take once per unique producer; positional refs
+        // share via the resolved-token map.
+        let mut taken_tokens: BTreeMap<u32, SlotWritten> = BTreeMap::new();
+        for opt in &input_producer {
+            if let Some(pid) = opt {
+                if !taken_tokens.contains_key(pid) {
+                    let token = written[*pid as usize].take().expect(
+                        "lower_dag_to_tape: predecessor missing live SlotWritten \
+                         (consumer-count walk disagrees with positional inputs)",
+                    );
+                    taken_tokens.insert(*pid, token);
+                }
+            }
+        }
+        // Build the ComputeInputBuild list in positional order.
+        let inputs_built: Vec<ComputeInputBuild<'_>> = input_producer
+            .iter()
+            .zip(node.inputs.iter())
+            .map(|(opt, inp)| match opt {
+                Some(pid) => ComputeInputBuild::Computed(
+                    taken_tokens.get(pid).expect("token taken above"),
+                ),
+                None => ComputeInputBuild::External {
+                    tensor: inp.tensor,
+                    region: inp.region,
+                },
+            })
+            .collect();
 
         if matches!(node.op, SubOp::AttnDecode { .. }) {
             // Slot lifecycle for AttnDecode lives OUTSIDE the loop bracket;
@@ -779,17 +896,24 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::K
             let h = builder.alloc_slot();
             let rb = builder.alloc_runtime_bound();
             let (mut inside, _var) = builder.open_loop(LoopBound::Runtime(rb));
-            let w = inside.compute_to(node.id, h, &read_refs);
+            let w = inside.compute_to(node.id, h, &inputs_built);
             builder = inside.close_loop();
             written[nid as usize] = Some(w);
         } else {
             let h = builder.alloc_slot();
-            let w = builder.compute_to(node.id, h, &read_refs);
+            let w = builder.compute_to(node.id, h, &inputs_built);
             written[nid as usize] = Some(w);
         }
+        // Record this node as the writer of its output tensor (mirrors
+        // predecessors() so subsequent nodes can find their producers).
+        writers[node.output.tensor.0 as usize].push((nid, node.output.region));
 
         // Decrement each predecessor's consumer count; when zero, free.
-        for (pid, ptoken) in pred_tokens {
+        // (Iterates the taken_tokens map populated above for unique
+        // computed-input producers; multiple positional refs to the
+        // same producer count as a single consume here since we only
+        // took the token once.)
+        for (pid, ptoken) in taken_tokens {
             let remaining = &mut consumer_remaining[pid as usize];
             *remaining -= 1;
             if *remaining == 0 {
@@ -824,7 +948,7 @@ pub enum PlayStep {
     Computed {
         node: SubtileId,
         writes: SlotId,
-        reads: Vec<SlotId>,
+        inputs: Vec<ComputeInput>,
     },
     Freed(SlotId),
     LoopOpened(u32),
@@ -843,11 +967,11 @@ pub fn play_skeleton(tape: &SubtileTape) -> Vec<PlayStep> {
             Instr::Compute {
                 node,
                 writes,
-                reads,
+                inputs,
             } => PlayStep::Computed {
                 node: *node,
                 writes: *writes,
-                reads: reads.clone(),
+                inputs: inputs.clone(),
             },
             Instr::FreeSlot { slot } => PlayStep::Freed(*slot),
             Instr::OpenLoop { var, .. } => PlayStep::LoopOpened(var.id),
@@ -1024,7 +1148,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(99),
                     writes: mk_slot(0),
-                    reads: vec![],
+                    inputs: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],
@@ -1063,12 +1187,12 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    reads: vec![],
+                    inputs: vec![],
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    reads: vec![],
+                    inputs: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],
@@ -1093,12 +1217,12 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(1),
                     writes: mk_slot(1),
-                    reads: vec![],
+                    inputs: vec![],
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    reads: vec![],
+                    inputs: vec![],
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
                 Instr::FreeSlot { slot: mk_slot(1) },
@@ -1134,7 +1258,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    reads: vec![mk_slot(0)], // self-read names node 0 as a pred — bogus
+                    inputs: vec![ComputeInput::Computed(mk_slot(0))], // self-read names node 0 as a pred — bogus
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],

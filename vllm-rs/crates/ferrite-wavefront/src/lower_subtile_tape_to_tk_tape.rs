@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 
 use crate::subtile_ir::{KvCacheLayout, KvCacheShape, RopeForm, SoftmaxStateId, SubtileId, SubtileIR, TensorId, TensorRegion};
 use crate::subtile_tape::{
-    Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
+    ComputeInput, Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
 };
 use crate::tk_tape::{
     ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
@@ -360,9 +360,9 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
             STInstr::Compute {
                 node,
                 writes,
-                reads,
+                inputs,
             } => {
-                lower_compute(&mut state, *node, *writes, reads);
+                lower_compute(&mut state, *node, *writes, inputs);
             }
             STInstr::FreeSlot { slot } => {
                 lower_free_slot(&mut state, *slot);
@@ -487,23 +487,27 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     state: &mut LoweringState<F, K>,
     node_id: SubtileId,
     writes: SlotId,
-    reads: &[SlotId],
+    inputs: &[ComputeInput],
 ) {
     use crate::subtile_ir::{EwKind, SubOp};
 
     let node = &state.graph.nodes[node_id.0 as usize];
     let dst_page = state.page_of(writes);
 
-    // Wait on each predecessor slot's Ready barrier — the producer's
+    // Wait on each computed-input slot's Ready barrier — the producer's
     // StoreAsync + Arrive{Done} pairs with our Wait{Ready} on the
-    // same page. Conservative all-gmem path uses parity 0.
-    for r in reads {
-        let p = state.page_of(*r);
-        state.push(Instr::PageBarrierWaitStaticP0 {
-            page_id: p,
-            kind: PageBarrier::Ready,
-            role: COMPUTE_ROLE,
-        });
+    // same page. External inputs don't have a barrier (they're loaded
+    // ahead of time via emit_external_load).
+    // Conservative all-gmem path uses parity 0.
+    for ci in inputs {
+        if let ComputeInput::Computed(slot) = ci {
+            let p = state.page_of(*slot);
+            state.push(Instr::PageBarrierWaitStaticP0 {
+                page_id: p,
+                kind: PageBarrier::Ready,
+                role: COMPUTE_ROLE,
+            });
+        }
     }
 
     // External (source-tensor) loads: any input TensorRegion whose
@@ -524,11 +528,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     match &node.op {
         SubOp::Elementwise(EwKind::Mul) => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute Elementwise(Mul): expected 2 reads, got {} \
-                 (likely external-source SubOp inputs not yet plumbed via \
-                 lower_dag_to_tape; see Phase A step 2 of the panic-RCA plan)",
-                reads.len(),
+                inputs.len() >= 2,
+                "lower_compute Elementwise(Mul): expected 2 inputs, got {}",
+                inputs.len(),
             );
             // Two compile-time witnesses ride on this constructor:
             //   - `GroupWidth::<16>::ALL_CONSUMERS` — the `where
@@ -544,8 +546,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //     expected.
             // Per `feedback_ff_subtile_compile_time_inviolable`.
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let _ = COMPUTE_ROLE; // role-tag retained for future
                                   // walker-side gating.
@@ -559,16 +561,16 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::Elementwise(EwKind::Add) => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute Elementwise(Add): expected 2 reads, got {}",
-                reads.len(),
+                inputs.len() >= 2,
+                "lower_compute Elementwise(Add): expected 2 inputs, got {}",
+                inputs.len(),
             );
             // Same compile-time witnesses as the Mul arm; only the
             // emitted TK 2.0 primitive differs (`group<N>::add` vs
             // `group<N>::mul`).
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             state.push(Instr::sh_tile_add(
                 lhs,
@@ -580,10 +582,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::SumReduce => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute SumReduce: expected ≥2 reads, got {} \
+                inputs.len() >= 2,
+                "lower_compute SumReduce: expected ≥2 inputs, got {} \
                  (N=1 lowers to a copy, not yet supported)",
-                reads.len(),
+                inputs.len(),
             );
             // SumReduce over N inputs: chain N-1 ShTileAdd Instrs.
             // Per SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts":
@@ -598,15 +600,15 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // TK 2.0 `add(T &dst, const T &lhs, const U &rhs)` allows
             // `dst` aliasing `lhs` (lhs is `const T&` to the same).
             assert!(
-                reads.len() >= 2,
+                inputs.len() >= 2,
                 "SumReduce expects ≥2 inputs (got {}); N=1 lowers to a copy, not yet supported",
-                reads.len(),
+                inputs.len(),
             );
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             // First add: dst = reads[0] + reads[1]
-            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
             state.push(Instr::sh_tile_add(
                 r0,
                 r1,
@@ -614,8 +616,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 GroupWidth::<16>::ALL_CONSUMERS,
             ));
             // Subsequent adds: dst += reads[i]
-            for r_i in &reads[2..] {
-                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(*r_i));
+            for ci in &inputs[2..] {
+                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(ci.expect_computed_slot("SumReduce", 2)));
                 state.push(Instr::sh_tile_add(
                     dst,
                     rhs,
@@ -627,9 +629,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::SiluMul => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute SiluMul: expected 2 reads (gate, up), got {}",
-                reads.len(),
+                inputs.len() >= 2,
+                "lower_compute SiluMul: expected 2 inputs (gate, up), got {}",
+                inputs.len(),
             );
             // SiluMul: out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
             //
@@ -646,8 +648,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //   step 4: ShTileDiv     (dst, gate, dst)      // dst = silu(gate)
             //   step 5: ShTileMul     (dst, dst, up)        // dst = silu(gate) * up
             use crate::tk_tape::{Bf16, GroupWidth, ScalarF32, SmemTileId};
-            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let up = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let up = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             // step 1
@@ -664,9 +666,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::Elementwise(EwKind::Silu) => {
             assert!(
-                reads.len() >= 1,
+                inputs.len() >= 1,
                 "lower_compute Elementwise(Silu): expected 1 read, got {}",
-                reads.len(),
+                inputs.len(),
             );
             // Silu: out = x * sigmoid(x) = x / (1 + exp(-x))
             //
@@ -689,7 +691,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32, SmemTileId,
             };
-            let src = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let src = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let rt_x: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_neg: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
@@ -714,9 +716,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::RmsNorm { eps } => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute RmsNorm: expected 2 reads (x, gamma), got {}",
-                reads.len(),
+                inputs.len() >= 2,
+                "lower_compute RmsNorm: expected 2 inputs (x, gamma), got {}",
+                inputs.len(),
             );
             // RmsNorm: out[i,j] = x[i,j] * inv_rms[i] * gamma[j]
             //   inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
@@ -744,8 +746,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId,
             };
-            let x = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let gamma_page = state.page_of(reads[1]);
+            let x = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let gamma_page = state.page_of(inputs[1].expect_computed_slot("lower_compute", 1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             const R: AllConsumersRole = AllConsumersRole;
@@ -802,9 +804,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::RopeRotate { head_dim, _form: _ } => {
             assert!(
-                reads.len() >= 3,
-                "lower_compute RopeRotate: expected 3 reads (x, cos, sin), got {}",
-                reads.len(),
+                inputs.len() >= 3,
+                "lower_compute RopeRotate: expected 3 inputs (x, cos, sin), got {}",
+                inputs.len(),
             );
             // RopeRotateNeoX: split q at head_dim/2; rotate as
             //   out_even = q_even * cos - q_odd * sin
@@ -837,9 +839,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegTileId,
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
-            let q_page = state.page_of(reads[0]);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[1]));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[2]));
+            let q_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[2].expect_computed_slot("lower_compute", 2)));
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -894,9 +896,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::MatmulTile => {
             assert!(
-                reads.len() >= 2,
-                "lower_compute MatmulTile: expected 2 reads (a, b), got {}",
-                reads.len(),
+                inputs.len() >= 2,
+                "lower_compute MatmulTile: expected 2 inputs (a, b), got {}",
+                inputs.len(),
             );
             // MatmulTile: D[M, N] = A[M, K] @ B[K, N]
             //
@@ -927,8 +929,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AccReset, AllConsumersRole, Bf16, FenceExternal, Fp32,
                 GroupWidth, RegTileId, RoleWitness, RowLayout, SmemTileId,
             };
-            let a = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
-            let b = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let a = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let b = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -987,11 +989,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
         SubOp::RopeAppend { head_dim, layer, layout, _form: _ } => {
             assert!(
-                reads.len() >= 4,
-                "lower_compute RopeAppend: expected ≥4 reads (K, cos, sin, V), \
+                inputs.len() >= 4,
+                "lower_compute RopeAppend: expected ≥4 inputs (K, cos, sin, V), \
                  got {} (likely external-source SubOp inputs not plumbed via \
                  lower_dag_to_tape; see Phase A step 2 of the panic-RCA plan)",
-                reads.len(),
+                inputs.len(),
             );
             // RopeAppend (step 10): rotate K (NeoX) + write rotated K
             // and un-rotated V into the paged KV cache at the runtime
@@ -1022,10 +1024,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
                 StoreSpec, TileShape, WarpRole,
             };
-            let k_page = state.page_of(reads[0]);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[1]));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[2]));
-            let v_page = state.page_of(reads[3]);
+            let k_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[2].expect_computed_slot("lower_compute", 2)));
+            let v_page = state.page_of(inputs[3].expect_computed_slot("lower_compute", 3));
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1114,10 +1116,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             softmax_state: _,
         } => {
             assert!(
-                reads.len() >= 1,
+                inputs.len() >= 1,
                 "lower_compute AttnDecode: expected ≥1 read (q), got {} \
                  (cache TensorIds come from layout witness, not reads[1..])",
-                reads.len(),
+                inputs.len(),
             );
             // AttnDecode (steps 11-14): online softmax over a paged
             // KV cache.
@@ -1167,7 +1169,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 WarpRole,
             };
             // reads = [q_page, k_cache_handle, v_cache_handle, ...]
-            let q_page = state.page_of(reads[0]);
+            let q_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
             // K and V cache TensorIds come from the layout witness
             // (single source of truth, not from reads[].)
             let k_cache = layout.cache_tensor();

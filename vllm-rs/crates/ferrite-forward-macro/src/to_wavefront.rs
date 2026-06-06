@@ -539,7 +539,8 @@ pub fn lower_decode_to_wavefront(
                 )?;
                 let act = bx.input_at(tile, 0)?;
                 let w = bx.input_at(tile, 1)?;
-                let idx = bx.push_op(LoweredOp::Gemm { n, k }, vec![act, w]);
+                let _ = k; // k is now derived from in0_cols at lower-time
+                let idx = bx.push_op(LoweredOp::Gemm { n }, vec![act, w]);
                 bx.produced.insert((tile.0, 0), Producer::Op(idx));
                 result = Some(idx);
             }

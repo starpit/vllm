@@ -6069,14 +6069,65 @@ fn dump_wavefront_mega(
     let base_to_loc = to_wavefront::build_base_to_loc(backbone_slots, lm_head_slots, bb_bucket_id);
     let fused = ferrite_wavefront::lower::fuse_silu_mul(&lowered.input);
 
-    // Wavefront CUDA emit DELETED — old TkProgram/Tk20Call substrate is
-    // gone (nuked along with tk_codegen.rs / tk_orchestrate.rs /
-    // tk_warp_ir.rs). The new walker (TkTape-pushing) + tk_player
-    // emit path lives in `ferrite_wavefront::tk_player`; this probe
-    // gets re-wired once the walker is back. Until then the probe
-    // silently does nothing — the macro's ferrite-side surface is
-    // unaffected.
-    let _ = &fused;
+    // Wavefront CUDA emit, post-redesign substrate (commit 6+):
+    //   LoweringInput (fused) -> SubtileIR (lower_region)
+    //                         -> ValidatedGraph (typed witness)
+    //                         -> SubtileTape (lower_dag_to_tape)
+    //                         -> TkTape (lower_tape_to_tk)
+    //                         -> CUDA String (tk_player::emit_kernel)
+    // and write the .cu into ~/.cache/cudaforge/megakernels/ where
+    // ferrite-cuda-builder/build.rs picks it up and compiles it into
+    // libmegakernels.a. ferrite-wavefront/src/launcher.rs declares
+    // the FFI to the resulting launch_<kernel_name> symbol.
+    let kernel_name = format!(
+        "tk_decode_full_{}",
+        stem.replace('-', "_").replace('.', "_")
+    );
+    {
+        use std::num::NonZeroU32;
+        // nb=256 matches the FERRITE_WAVEFRONT_NB default below; the
+        // probe lowers a fixed-shape SubtileIR for the .cu emit (the
+        // mega-side rg/sched + the ferrite-runtime build are separate
+        // paths that don't share an nb knob).
+        let nb = NonZeroU32::new(256).expect("256 != 0");
+        let rg = ferrite_wavefront::subtile_ir::lower_region(&fused, nb);
+        match ferrite_wavefront::subtile_ir::ValidatedGraph::new(&rg) {
+            Ok(valid) => {
+                let subtile_tape = ferrite_wavefront::subtile_tape::lower_dag_to_tape(&valid);
+                let tk_tape = ferrite_wavefront::lower_tape_to_tk::lower_tape_to_tk(
+                    &subtile_tape,
+                    &rg,
+                );
+                let src = ferrite_wavefront::tk_player::emit_kernel(&tk_tape);
+                let cache_dir = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_else(|_| ".".into()),
+                )
+                .join(".cache/cudaforge/megakernels");
+                if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                    eprintln!(
+                        "[wavefront-cuda-probe] {stem}: mkdir cache failed — {e}"
+                    );
+                } else {
+                    let path = cache_dir.join(format!("{kernel_name}.cu"));
+                    match std::fs::write(&path, &src) {
+                        Ok(()) => eprintln!(
+                            "[wavefront-cuda-probe] {stem}: wrote {} ({} bytes)",
+                            path.display(),
+                            src.len(),
+                        ),
+                        Err(e) => eprintln!(
+                            "[wavefront-cuda-probe] {stem}: write failed — {e}"
+                        ),
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[wavefront-cuda-probe] {stem}: SubtileIR rejected by validate() — {e}"
+                );
+            }
+        }
+    }
 
     let (descs, report) =
         to_wavefront::build_source_descs(program, fuf, &fused, &lowered.bindings, &base_to_loc);
@@ -6143,7 +6194,9 @@ fn dump_wavefront_mega(
         );
         (g, sched)
     } else {
-        let rg = ferrite_wavefront::subtile_ir::lower_region(&fused, nb);
+        let nb_nz = std::num::NonZeroU32::new(nb)
+            .unwrap_or_else(|| std::num::NonZeroU32::new(1).expect("1 != 0"));
+        let rg = ferrite_wavefront::subtile_ir::lower_region(&fused, nb_nz);
         // PERF DIAG (droppable): cost a matmul block by its WEIGHT-READ bytes
         // (N_block × K) — the bandwidth-bound cost — instead of output area
         // (N_block), so the load-balancer doesn't leave workers idle at a join

@@ -1150,6 +1150,21 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             state.push(Instr::init_rv_neg_infty(rv_m, W16, R));
             state.push(Instr::init_rv_zero(rv_l, W16, R));
 
+            // BarrierInit for K and V tile pages: each iteration's
+            // TMA load arrives on the corresponding page_ready[*]
+            // mbarrier; a parity-alternating Wait per iteration
+            // pairs them. Count = 1 (one TMA load arrival per phase).
+            state.push(Instr::BarrierInit {
+                page_id: k_tile_page,
+                kind: PageBarrier::Ready,
+                count: 1,
+            });
+            state.push(Instr::BarrierInit {
+                page_id: v_tile_page,
+                kind: PageBarrier::Ready,
+                count: 1,
+            });
+
             // ── Loop body (Qkt + Sv phases) ──────────────────────
             //
             // OpenLoop iterates 0..(seq_len / chunk_size).
@@ -1184,15 +1199,30 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             const CHUNK_ROWS: usize = 128;
             let k_off = ByteOffsetExpr::kv_cache_chunk_loop::<CHUNK_ROWS, K>(loop_var, 0);
             let v_off = ByteOffsetExpr::kv_cache_chunk_loop::<CHUNK_ROWS, K>(loop_var, 0);
+
+            // TmaExpect per iteration — arms each barrier with the
+            // expected byte count derived from SmemTileSpec<R,C,T>
+            // (no runtime byte-count param; type system writes it).
+            // Per `feedback_tk20_tma_lane_gate`, the emit uses
+            // `kittens::group<1>::tma::*` (lane-0-gated).
+            let k_shape = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+                rows: 128,
+                cols: 128,
+                elem_bytes: 2,
+            });
+            let v_shape = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+                rows: 128,
+                cols: 128,
+                elem_bytes: 2,
+            });
+            state.push(Instr::tma_expect(k_tile_page, k_shape, LoaderRole));
+            state.push(Instr::tma_expect(v_tile_page, v_shape, LoaderRole));
+
             state.push(Instr::LoadAsync(LoadSpec::new(
                 k_tile_page,
                 k_cache,
                 k_off,
-                SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
-                    rows: 128,
-                    cols: 128,
-                    elem_bytes: 2,
-                }),
+                k_shape,
                 LoaderRole,
                 k_tile_page,
             )));
@@ -1200,14 +1230,30 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 v_tile_page,
                 v_cache,
                 v_off,
-                SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
-                    rows: 128,
-                    cols: 128,
-                    elem_bytes: 2,
-                }),
+                v_shape,
                 LoaderRole,
                 v_tile_page,
             )));
+
+            // Wait for TMA loads to complete. Parity alternates with
+            // loop_var (mbarrier::wait flips parity per phase, so
+            // loop iteration 0 waits on parity 0, iteration 1 on
+            // parity 1, etc.). Use the typed wait_loop constructor.
+            state.push(Instr::wait_loop(
+                k_tile_page,
+                PageBarrier::Ready,
+                loop_var,
+                crate::tk_tape::Parity::P0,
+                WarpRole::AllConsumers,
+            ));
+            state.push(Instr::wait_loop(
+                v_tile_page,
+                PageBarrier::Ready,
+                loop_var,
+                crate::tk_tape::Parity::P0,
+                WarpRole::AllConsumers,
+            ));
+
             // S = Q @ K^T (fence, reset; D is fp32)
             state.push(Instr::wgmma_fence_acc(rt_s, W4));
             state.push(Instr::wgmma_mma_abt_smem_smem(

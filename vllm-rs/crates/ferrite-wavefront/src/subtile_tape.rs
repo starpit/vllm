@@ -40,10 +40,10 @@
 //!
 //! ## What does NOT live here
 //!
-//! All target-specific concepts — execution-unit abstractions
-//! (per-target lowering decision), memory-tier classification
-//! (TkTape concept), visibility primitives (TkTape concept),
-//! pipeline-state tracking (TkTape concept). The IR-level witnesses
+//! Per plan §4 commit 3.b: **no smem, no gmem, no fence, no page,
+//! no parity** — all target-specific concepts (execution-unit
+//! abstractions, memory-tier classification, visibility primitives,
+//! pipeline-state tracking) belong on TkTape. The IR-level witnesses
 //! (`KvCacheLayout`, `KvCacheProducer`, `RopeForm`, online-softmax
 //! state) live on the SubtileIR `SubOp` variants; the lowering looks
 //! them up by `SubtileId`.
@@ -207,14 +207,31 @@ pub enum Instr {
 /// Linear, target-agnostic per-wavefront tape. Build via [`TapeBuilder`]
 /// then call [`validate_subtile_tape`] to discharge the runtime
 /// invariants the typestate cannot see.
+///
+/// Per plan §5 K5 + audit BLOCKER (`wewpteccb`): the `instrs` field is
+/// private. The ONLY constructors are [`TapeBuilder::finish`] and
+/// [`lower_dag_to_tape`] (both inside this module); external code
+/// reads through [`SubtileTape::instrs`]. This seals the typestate so
+/// the slot-lifecycle and loop-balance invariants the
+/// `TapeBuilder<S>` typestate already enforces at compile time
+/// cannot be bypassed by struct-literal construction.
 #[derive(Clone, Debug)]
 pub struct SubtileTape {
-    pub instrs: Vec<Instr>,
+    instrs: Vec<Instr>,
     /// High-water mark of allocated slot ids (`0..num_slots`). Live-slot
     /// count at any program point is recoverable by replay.
     pub num_slots: u32,
     pub num_loop_vars: u32,
     pub num_runtime_bounds: u32,
+}
+
+impl SubtileTape {
+    /// Read-only view of the instruction stream. Per K5: external code
+    /// reads through this accessor; construction is sealed to
+    /// [`TapeBuilder::finish`] + [`lower_dag_to_tape`].
+    pub fn instrs(&self) -> &[Instr] {
+        &self.instrs
+    }
 }
 
 // ── TapeBuilder<S> typestate ────────────────────────────────────────
@@ -293,6 +310,44 @@ mod builder_state_seal {
 /// let b = TapeBuilder::new();
 /// let (mut inside, _var) = b.open_loop(LoopBound::Const(8));
 /// let _h = inside.alloc_slot();
+/// ```
+///
+/// Hazard primitives — `SlotHandle` is move-only (non-Copy, non-Clone),
+/// so single-writer / read-before-write / read-after-free become
+/// use-after-move compile errors:
+///
+/// ```compile_fail
+/// // double-write: SlotHandle is consumed by the first compute_to.
+/// use ferrite_wavefront::subtile_ir::SubtileId;
+/// use ferrite_wavefront::subtile_tape::TapeBuilder;
+/// let mut b = TapeBuilder::new();
+/// let h = b.alloc_slot();
+/// let _w = b.compute_to(SubtileId(0), h, &[]);
+/// // h is moved; cannot use it again.
+/// let _w2 = b.compute_to(SubtileId(0), h, &[]);
+/// ```
+///
+/// ```compile_fail
+/// // read-before-write: only `&SlotWritten` is acceptable as a read.
+/// // `SlotHandle` cannot be borrowed where `&SlotWritten` is expected.
+/// use ferrite_wavefront::subtile_ir::SubtileId;
+/// use ferrite_wavefront::subtile_tape::TapeBuilder;
+/// let mut b = TapeBuilder::new();
+/// let h = b.alloc_slot();
+/// let _w = b.compute_to(SubtileId(0), b.alloc_slot(), &[&h]);
+/// ```
+///
+/// ```compile_fail
+/// // read-after-free: free_slot consumes SlotWritten; further reads
+/// // of the same token are use-after-move.
+/// use ferrite_wavefront::subtile_ir::SubtileId;
+/// use ferrite_wavefront::subtile_tape::TapeBuilder;
+/// let mut b = TapeBuilder::new();
+/// let h0 = b.alloc_slot();
+/// let w0 = b.compute_to(SubtileId(0), h0, &[]);
+/// b.free_slot(w0);
+/// let h1 = b.alloc_slot();
+/// let _w1 = b.compute_to(SubtileId(1), h1, &[&w0]);
 /// ```
 pub struct TapeBuilder<S: BuilderState = state::Outside> {
     instrs: Vec<Instr>,
@@ -466,11 +521,16 @@ impl TapeBuilder<state::InsideLoop> {
 
 // ── Runtime validator ───────────────────────────────────────────────
 
-/// One class of runtime-detectable invariant violation. The typestate
-/// already catches the structural ones (orphan loop brackets, reading
-/// an unwritten slot, double-free) at compile time when the builder is
-/// used. The runtime validator defends against hand-built tapes that
-/// bypass the typestate by mutating `instrs` directly.
+/// One class of runtime-detectable invariant violation.
+///
+/// Per plan §5 K5 + audit BLOCKER fix (`wewpteccb`): only relational
+/// (tape, SubtileIR) properties live here. The slot-lifecycle and
+/// loop-balance invariants are sealed at the type level via
+/// [`TapeBuilder<S>`]'s move-only `SlotHandle` / `SlotWritten` and
+/// `state::Outside` / `state::InsideLoop` typestate; with [`SubtileTape`]'s
+/// `instrs` field private, struct-literal construction is no longer
+/// possible and those checks would be unreachable, so they were
+/// removed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidationError {
     /// `Compute` references a node id not present in the SubtileIR.
@@ -487,32 +547,6 @@ pub enum ValidationError {
         prev_node: SubtileId,
         next_node: SubtileId,
     },
-    /// A second `OpenLoop` started while another was still open.
-    NestedLoop { outer_var: u32, inner_var: u32 },
-    /// A `CloseLoop` appeared with no matching `OpenLoop`.
-    UnmatchedCloseLoop { close_var: u32 },
-    /// `OpenLoop` and matching `CloseLoop` disagree on `var`.
-    MismatchedLoopVar { open_var: u32, close_var: u32 },
-    /// Tape ended with a still-open loop.
-    UnclosedLoop { var: u32 },
-    /// A `Compute` writes into a slot that was never `AllocSlot`'d.
-    WriteUnallocatedSlot { slot: u32, at: usize },
-    /// A `Compute` reads from a slot that was never written.
-    ReadBeforeWrite { slot: u32, at: usize },
-    /// A second `Compute` writes the same slot (single-writer violated).
-    DoubleWrite { slot: u32, at: usize },
-    /// A `Compute` or `FreeSlot` touches a slot already freed.
-    UseAfterFree { slot: u32, at: usize },
-    /// `FreeSlot` retires a slot that was never `AllocSlot`'d.
-    FreeUnallocatedSlot { slot: u32, at: usize },
-    /// A second `FreeSlot` retires the same slot (double-free).
-    DoubleFree { slot: u32, at: usize },
-    /// An `AllocSlot` mints an id outside `0..num_slots` (hand-built tape).
-    AllocSlotOutOfRange { slot: u32, at: usize, num_slots: u32 },
-    /// A `Compute` reads from / writes to a slot id outside `0..num_slots`.
-    SlotIdOutOfRange { slot: u32, at: usize, num_slots: u32 },
-    /// At end-of-tape, a slot is allocated but never freed (leak).
-    SlotNeverFreed { slot: u32 },
     /// A `Compute`'s reads on the SubtileIR DAG don't match its
     /// predecessor set — one DAG edge is missing from the slot-read
     /// list, or an extra read names a node that is not a predecessor.
@@ -523,32 +557,21 @@ pub enum ValidationError {
     },
 }
 
-/// Per-slot lifecycle state tracked by the validator.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlotState {
-    /// `AllocSlot` seen, no `Compute` has written it yet.
-    Allocated,
-    /// `Compute { writes }` seen; readers OK; `FreeSlot` not yet seen.
-    Written,
-    /// `FreeSlot` seen; further use is `UseAfterFree`.
-    Freed,
-}
-
-/// Runtime validator. Six checks:
+/// Runtime validator — relational (tape, SubtileIR) checks only.
+/// Per audit BLOCKER fix `wewpteccb`, slot-lifecycle and loop-balance
+/// were removed: with `SubtileTape::instrs` private, the
+/// `TapeBuilder<S>` typestate (move-only `SlotHandle` / `SlotWritten`,
+/// `state::Outside` / `state::InsideLoop`) is the sole construction
+/// path and discharges those at compile time.
+///
+/// Three checks remain:
 ///
 /// 1. **Compute well-formedness** — every SubtileIR node is `Compute`d
 ///    exactly once; no `Compute` references an out-of-range node.
 /// 2. **Topo order** — adjacent Computes appear in strictly ascending
 ///    `SubtileId` order (the SubtileIR is already ascending-id topo;
 ///    the tape is a valid linearization).
-/// 3. **Loop balance** — every `OpenLoop` matches a `CloseLoop` with
-///    the same `LoopVarId`; no nesting; no unclosed loops.
-/// 4. **Slot lifecycle** — every slot id transits Allocated → Written
-///    → Freed exactly once; no read-before-write; no use-after-free;
-///    no double-write; no double-free; no orphan allocs.
-/// 5. **Slot id range** — every slot id (`AllocSlot`/`Compute`/`FreeSlot`)
-///    falls in `0..num_slots`.
-/// 6. **Edge coverage** — every `Compute`'s `reads` equals (set-wise)
+/// 3. **Edge coverage** — every `Compute`'s `reads` equals (set-wise)
 ///    the SubtileIR predecessor set of `node`. The slots being read
 ///    are the slots most-recently written by the predecessors; missing
 ///    or extra reads = `EdgeMismatch`.
@@ -559,8 +582,7 @@ pub fn validate_subtile_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_i
     let mut errors = Vec::new();
     check_node_refs(tape, graph, &mut errors);
     check_compute_wellformed(tape, graph, &mut errors);
-    check_loop_balance(tape, &mut errors);
-    check_slot_lifecycle_and_edges(tape, graph, &mut errors);
+    check_edge_coverage(tape, graph, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -617,136 +639,36 @@ fn check_compute_wellformed<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir
     }
 }
 
-fn check_loop_balance(tape: &SubtileTape, errors: &mut Vec<ValidationError>) {
-    let mut open: Option<u32> = None;
-    for instr in &tape.instrs {
-        match instr {
-            Instr::OpenLoop { var, .. } => {
-                if let Some(outer_var) = open {
-                    errors.push(ValidationError::NestedLoop {
-                        outer_var,
-                        inner_var: var.id,
-                    });
-                }
-                open = Some(var.id);
-            }
-            Instr::CloseLoop { var } => match open {
-                None => errors.push(ValidationError::UnmatchedCloseLoop {
-                    close_var: var.id,
-                }),
-                Some(open_var) => {
-                    if open_var != var.id {
-                        errors.push(ValidationError::MismatchedLoopVar {
-                            open_var,
-                            close_var: var.id,
-                        });
-                    }
-                    open = None;
-                }
-            },
-            Instr::AllocSlot { .. } | Instr::FreeSlot { .. } | Instr::Compute { .. } => {}
-        }
-    }
-    if let Some(var) = open {
-        errors.push(ValidationError::UnclosedLoop { var });
-    }
-}
-
-fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
+/// Edge coverage — the only relational (tape, SubtileIR) hazard
+/// check that survives K5. Each `Compute`'s `reads` set must equal
+/// (set-wise) the predecessor set of its node in the SubtileIR; a
+/// missing or extra read is `EdgeMismatch`. Slot-lifecycle bookkeeping
+/// (which slot a node wrote, which slot a node reads) is enforced
+/// at compile time by `TapeBuilder<S>`'s move-only `SlotHandle` /
+/// `SlotWritten` typestate; here we only re-derive the writer-of
+/// each slot from the tape walk so we can compare reads to preds.
+fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape>(
     tape: &SubtileTape,
     graph: &crate::subtile_ir::SubtileIR<F, K>,
     errors: &mut Vec<ValidationError>,
 ) {
     let preds = crate::subtile_ir::predecessors(graph);
-    let n_slots = tape.num_slots;
-    let mut phase: BTreeMap<u32, SlotState> = BTreeMap::new();
-    // For each slot, the SubtileId of the node whose Compute wrote it
-    // (the slot's producer). Used to map a read-slot back to its
-    // predecessor for edge coverage.
     let mut writer_of: BTreeMap<u32, SubtileId> = BTreeMap::new();
-    let in_range = |s: u32| s < n_slots;
-    for (i, instr) in tape.instrs.iter().enumerate() {
+    for instr in &tape.instrs {
         match instr {
-            Instr::AllocSlot { slot } => {
-                let s = slot.id;
-                if !in_range(s) {
-                    errors.push(ValidationError::AllocSlotOutOfRange {
-                        slot: s,
-                        at: i,
-                        num_slots: n_slots,
-                    });
-                    continue;
-                }
-                phase.insert(s, SlotState::Allocated);
-            }
-            Instr::Compute {
-                node,
-                writes,
-                reads,
-            } => {
-                let w = writes.id;
-                if !in_range(w) {
-                    errors.push(ValidationError::SlotIdOutOfRange {
-                        slot: w,
-                        at: i,
-                        num_slots: n_slots,
-                    });
-                } else {
-                    match phase.get(&w).copied() {
-                        None => errors.push(ValidationError::WriteUnallocatedSlot {
-                            slot: w,
-                            at: i,
-                        }),
-                        Some(SlotState::Allocated) => {
-                            phase.insert(w, SlotState::Written);
-                            writer_of.insert(w, *node);
-                        }
-                        Some(SlotState::Written) => errors.push(ValidationError::DoubleWrite {
-                            slot: w,
-                            at: i,
-                        }),
-                        Some(SlotState::Freed) => errors.push(ValidationError::UseAfterFree {
-                            slot: w,
-                            at: i,
-                        }),
-                    }
-                }
-                let mut read_writers: Vec<SubtileId> = Vec::with_capacity(reads.len());
-                for r in reads {
-                    let s = r.id;
-                    if !in_range(s) {
-                        errors.push(ValidationError::SlotIdOutOfRange {
-                            slot: s,
-                            at: i,
-                            num_slots: n_slots,
-                        });
-                        continue;
-                    }
-                    match phase.get(&s).copied() {
-                        None | Some(SlotState::Allocated) => {
-                            errors.push(ValidationError::ReadBeforeWrite {
-                                slot: s,
-                                at: i,
-                            });
-                        }
-                        Some(SlotState::Freed) => {
-                            errors.push(ValidationError::UseAfterFree {
-                                slot: s,
-                                at: i,
-                            });
-                        }
-                        Some(SlotState::Written) => {
-                            if let Some(wn) = writer_of.get(&s).copied() {
-                                read_writers.push(wn);
-                            }
-                        }
-                    }
-                }
+            Instr::AllocSlot { .. } | Instr::FreeSlot { .. } => {}
+            Instr::OpenLoop { .. } | Instr::CloseLoop { .. } => {}
+            Instr::Compute { node, writes, reads } => {
+                writer_of.insert(writes.id, *node);
+                let read_writers: Vec<SubtileId> = reads
+                    .iter()
+                    .filter_map(|r| writer_of.get(&r.id).copied())
+                    .collect();
                 let n_idx = node.0 as usize;
                 if n_idx < preds.len() {
                     let mut expected = preds[n_idx].clone();
                     expected.sort();
-                    let mut actual = read_writers.clone();
+                    let mut actual = read_writers;
                     actual.sort();
                     actual.dedup();
                     if expected != actual {
@@ -758,39 +680,6 @@ fn check_slot_lifecycle_and_edges<F: crate::subtile_ir::RopeForm, K: crate::subt
                     }
                 }
             }
-            Instr::FreeSlot { slot } => {
-                let s = slot.id;
-                if !in_range(s) {
-                    errors.push(ValidationError::SlotIdOutOfRange {
-                        slot: s,
-                        at: i,
-                        num_slots: n_slots,
-                    });
-                    continue;
-                }
-                match phase.get(&s).copied() {
-                    None => errors.push(ValidationError::FreeUnallocatedSlot {
-                        slot: s,
-                        at: i,
-                    }),
-                    Some(SlotState::Allocated) => errors.push(ValidationError::ReadBeforeWrite {
-                        slot: s,
-                        at: i,
-                    }),
-                    Some(SlotState::Written) => {
-                        phase.insert(s, SlotState::Freed);
-                    }
-                    Some(SlotState::Freed) => {
-                        errors.push(ValidationError::DoubleFree { slot: s, at: i })
-                    }
-                }
-            }
-            Instr::OpenLoop { .. } | Instr::CloseLoop { .. } => {}
-        }
-    }
-    for (&s, &p) in &phase {
-        if !matches!(p, SlotState::Freed) {
-            errors.push(ValidationError::SlotNeverFreed { slot: s });
         }
     }
 }
@@ -1221,263 +1110,19 @@ mod tests {
         );
     }
 
-    // ── Validator: loop balance ───────────────────────────────────
-
-    #[test]
-    fn validator_flags_unclosed_loop() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::OpenLoop {
-                    var: mk_loop_var(0),
-                    bound: LoopBound::Const(4),
-                },
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                // no CloseLoop
-            ],
-            num_slots: 1,
-            num_loop_vars: 1,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.contains(&ValidationError::UnclosedLoop { var: 0 }),
-            "want UnclosedLoop, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_mismatched_loop_var() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::OpenLoop {
-                    var: mk_loop_var(0),
-                    bound: LoopBound::Const(4),
-                },
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                Instr::CloseLoop { var: mk_loop_var(99) },
-            ],
-            num_slots: 1,
-            num_loop_vars: 100,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(
-                e,
-                ValidationError::MismatchedLoopVar { open_var: 0, close_var: 99 }
-            )),
-            "want MismatchedLoopVar, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_unmatched_close_loop() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                Instr::CloseLoop { var: mk_loop_var(0) },
-            ],
-            num_slots: 1,
-            num_loop_vars: 1,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.contains(&ValidationError::UnmatchedCloseLoop { close_var: 0 }),
-            "want UnmatchedCloseLoop, got {err:?}"
-        );
-    }
-
-    // ── Validator: slot lifecycle ─────────────────────────────────
-
-    #[test]
-    fn validator_flags_write_unallocated_slot() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-            ],
-            num_slots: 1,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::WriteUnallocatedSlot { slot: 0, .. })),
-            "want WriteUnallocatedSlot(0), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_read_before_write() {
-        let g = chain_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::AllocSlot { slot: mk_slot(1) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![mk_slot(1)],
-                },
-                Instr::Compute {
-                    node: SubtileId(1),
-                    writes: mk_slot(1),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                Instr::FreeSlot { slot: mk_slot(1) },
-            ],
-            num_slots: 2,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::ReadBeforeWrite { slot: 1, .. })),
-            "want ReadBeforeWrite(1), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_double_write() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-            ],
-            num_slots: 1,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::DoubleWrite { slot: 0, .. })),
-            "want DoubleWrite(0), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_use_after_free() {
-        let g = chain_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                Instr::AllocSlot { slot: mk_slot(1) },
-                Instr::Compute {
-                    node: SubtileId(1),
-                    writes: mk_slot(1),
-                    reads: vec![mk_slot(0)],
-                },
-                Instr::FreeSlot { slot: mk_slot(1) },
-            ],
-            num_slots: 2,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::UseAfterFree { slot: 0, .. })),
-            "want UseAfterFree(0), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_double_free() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                Instr::FreeSlot { slot: mk_slot(0) },
-                Instr::FreeSlot { slot: mk_slot(0) },
-            ],
-            num_slots: 1,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::DoubleFree { slot: 0, .. })),
-            "want DoubleFree(0), got {err:?}"
-        );
-    }
-
-    #[test]
-    fn validator_flags_slot_never_freed() {
-        let g = tiny_graph();
-        let tape = SubtileTape {
-            instrs: vec![
-                Instr::AllocSlot { slot: mk_slot(0) },
-                Instr::Compute {
-                    node: SubtileId(0),
-                    writes: mk_slot(0),
-                    reads: vec![],
-                },
-                // no FreeSlot
-            ],
-            num_slots: 1,
-            num_loop_vars: 0,
-            num_runtime_bounds: 0,
-        };
-        let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        assert!(
-            err.iter().any(|e| matches!(e, ValidationError::SlotNeverFreed { slot: 0 })),
-            "want SlotNeverFreed(0), got {err:?}"
-        );
-    }
+    // ── Validator: edge coverage (relational only) ────────────────
+    //
+    // Loop-balance and slot-lifecycle tests were deleted per audit
+    // BLOCKER fix (`wewpteccb`): K5 + feedback_compile_time_or_garbage
+    // require those invariants live in the `TapeBuilder<S>` typestate,
+    // not in the runtime validator. With `SubtileTape::instrs` now
+    // private and the typestate-redundant ValidationError variants
+    // removed, those tests would be testing dead code.
 
     #[test]
     fn validator_flags_edge_mismatch_extra_read() {
         // tiny_graph: node 0's predecessors set is empty; if the tape
-        // claims a read, that's an edge mismatch.
+        // claims a read of node 0's own slot, that's an edge mismatch.
         let g = tiny_graph();
         let tape = SubtileTape {
             instrs: vec![
@@ -1485,7 +1130,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    reads: vec![mk_slot(0)], // self-read; bogus
+                    reads: vec![mk_slot(0)], // self-read names node 0 as a pred — bogus
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],
@@ -1494,17 +1139,9 @@ mod tests {
             num_runtime_bounds: 0,
         };
         let err = validate_subtile_tape(&tape, &g).unwrap_err();
-        // A self-read also trips DoubleWrite (writes seen first), so
-        // primarily check the edge / use-after-* family fires.
         assert!(
-            err.iter().any(|e| matches!(
-                e,
-                ValidationError::EdgeMismatch { .. }
-                    | ValidationError::DoubleWrite { .. }
-                    | ValidationError::UseAfterFree { .. }
-                    | ValidationError::ReadBeforeWrite { .. }
-            )),
-            "want some slot/edge error on self-read, got {err:?}"
+            err.iter().any(|e| matches!(e, ValidationError::EdgeMismatch { .. })),
+            "want EdgeMismatch on self-read, got {err:?}"
         );
     }
 

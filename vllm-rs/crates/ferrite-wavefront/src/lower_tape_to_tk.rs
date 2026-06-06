@@ -260,7 +260,7 @@ pub fn lower_tape_to_tk<F: RopeForm, K: KvCacheShape>(
 ) -> TkTape {
     let mut state = LoweringState::new(graph);
 
-    for instr in &tape.instrs {
+    for instr in tape.instrs() {
         match instr {
             STInstr::AllocSlot { slot } => {
                 lower_alloc_slot(&mut state, *slot);

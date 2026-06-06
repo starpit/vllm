@@ -35,7 +35,7 @@ What landed in this session:
 | `b6f2bfd380` | Drop GemmM1 accum if/else from tk20 helper |
 | `c260bd19b1` | §10 dead-arm scrub of metal_tape.rs (1471 → 153 LOC, -1318) |
 
-82 unit + 9 doctests green throughout.
+73 unit + 12 doctests green throughout (post audit `wewpteccb`: dropped 9 typestate-redundant runtime tests; added 3 hazard compile_fail doctests).
 
 ## Remaining work (all staged future commits)
 

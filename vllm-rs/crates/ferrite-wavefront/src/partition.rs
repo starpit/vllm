@@ -352,7 +352,8 @@ pub fn lower_partitioned(
                     rows: m,
                     cols: out_cols,
                 });
-                for blk in head_blocks(out_cols, chain_unit, hd) {
+                let hd_nz = NonZeroU32::new(hd).unwrap_or(NonZeroU32::MIN);
+                for blk in head_blocks(out_cols, chain_unit, hd_nz) {
                     let w = owner_of(blk.start, chain_unit);
                     let qh_start = blk.start / hd;
                     let qh_end = blk.end().div_ceil(hd);
@@ -506,7 +507,10 @@ pub fn lower_partitioned(
                         };
                         let blks = match cat {
                             Cat::Elem => n_blocks(out_cols, op_unit),
-                            Cat::Rope => head_blocks(out_cols, op_unit, hd),
+                            Cat::Rope => {
+                                let hd_nz = NonZeroU32::new(hd).unwrap_or(NonZeroU32::MIN);
+                                head_blocks(out_cols, op_unit, hd_nz)
+                            }
                             Cat::Whole => unreachable!(),
                         };
                         for blk in blks {

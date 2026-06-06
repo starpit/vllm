@@ -953,15 +953,17 @@ pub fn n_blocks(total: u32, block: std::num::NonZeroU32) -> Vec<Range> {
 /// attn chain partitions on head boundaries (and o_proj split-Ks on them).
 ///
 /// `nb: NonZeroU32` propagates the same termination witness as
-/// [`n_blocks`].
-pub fn head_blocks(total: u32, nb: std::num::NonZeroU32, head_dim: u32) -> Vec<Range> {
-    let hd = head_dim.max(1);
-    // `nb.get() / hd` may be zero (when nb < hd); `.max(1)` floors at one
-    // head; `* hd` is at least `hd >= 1`. So the product is always >= 1
-    // → NonZeroU32 by construction.
-    let heads_per_block = (nb.get() / hd).max(1);
-    let block = std::num::NonZeroU32::new(heads_per_block * hd)
-        .expect("heads_per_block * hd >= 1 by .max(1) above");
+/// [`n_blocks`]; `head_dim: NonZeroU32` makes the K5 termination
+/// invariant structural — `block: NonZeroU32` is constructed without
+/// any `.expect()`, since `NonZeroU32::saturating_mul` preserves
+/// nonzero by type.
+pub fn head_blocks(total: u32, nb: std::num::NonZeroU32, head_dim: std::num::NonZeroU32) -> Vec<Range> {
+    use std::num::NonZeroU32;
+    // `nb.get() / hd` may be zero (when nb < hd); fall back to one
+    // head — `NonZeroU32::new(...).unwrap_or(NonZeroU32::MIN)` is the
+    // canonical "floor at 1" idiom on a NonZeroU32-output path.
+    let heads_per_block = NonZeroU32::new(nb.get() / head_dim.get()).unwrap_or(NonZeroU32::MIN);
+    let block = heads_per_block.saturating_mul(head_dim);
     n_blocks(total, block)
 }
 

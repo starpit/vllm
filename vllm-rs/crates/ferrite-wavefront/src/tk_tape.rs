@@ -37,6 +37,7 @@ mod rope_form_seal {
     pub trait Sealed {}
 }
 
+
 pub trait RopeForm: rope_form_seal::Sealed {
     const PAIR_LO_EXPR: &'static str;
     const PAIR_HI_EXPR: &'static str;
@@ -132,8 +133,10 @@ pub enum U32Source {
 /// Index into [`TkTape::kernel_args`]. The Instr stream references
 /// kernel args by id, never by name string — name resolution lives
 /// in the player.
+/// Sealed per §2: inner field is `pub(crate)` — external code can
+/// neither construct nor read this id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KernelArgRef(pub u16);
+pub struct KernelArgRef(pub(crate) u16);
 
 // ── prelude declarations ────────────────────────────────────────────
 
@@ -163,13 +166,15 @@ pub enum PreludeDecl {
     KernelArgAlias { name: PreludeName, arg: KernelArgRef },
 }
 
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PreludeName(pub u32);
+pub struct PreludeName(pub(crate) u32);
 
 /// Identifier for the [`Instr`] compute that owns a prelude decl.
 /// Connecting decl ↔ body at type level prevents orphan decls.
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ComputeOwner(pub u32);
+pub struct ComputeOwner(pub(crate) u32);
 
 // ── instruction stream ──────────────────────────────────────────────
 
@@ -403,8 +408,9 @@ pub enum WarpRole {
     All,
 }
 
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PageId(pub u8);
+pub struct PageId(pub(crate) u8);
 
 /// Which TK 2.0 mbarrier of a page slot a wait/arrive talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -414,12 +420,14 @@ pub enum PageBarrier {
     Consumed,
 }
 
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LoopVarId(pub u32);
+pub struct LoopVarId(pub(crate) u32);
 
 /// Sealed identifier for a piece of online-softmax recurrence state.
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SoftmaxStateId(pub u32);
+pub struct SoftmaxStateId(pub(crate) u32);
 
 // LoopCount enum has been folded into ForLoopOpenConst { var, n } /
 // ForLoopOpenKernelArg { var, arg } per plan §3 step 8.
@@ -522,8 +530,9 @@ pub enum RopeSide {
 }
 
 /// Index into the tape's `Vec<KvLayoutEntry>`.
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KvLayoutId(pub u32);
+pub struct KvLayoutId(pub(crate) u32);
 
 // ── Sealed constructors ─────────────────────────────────────────────
 

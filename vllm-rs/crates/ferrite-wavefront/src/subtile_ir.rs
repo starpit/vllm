@@ -46,8 +46,11 @@ use std::marker::PhantomData;
 /// topologically ordered: every overlap-predecessor of a node has a
 /// smaller id (so a single pass over `nodes` is a valid evaluation
 /// order).
+/// Sealed per §2: the inner field is `pub(crate)`, so external code
+/// cannot construct or read this id outside the crate. Internal
+/// construction stays the cheap `SubtileId(N)` tuple form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SubtileId(pub u32);
+pub struct SubtileId(pub(crate) u32);
 
 /// Half-open range `[start, start + len)` along one axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,8 +99,9 @@ pub enum EwKind {
 /// Dense index into [`SubtileIR::tensors`]. Tensors `[0, num_sources)`
 /// are leaf sources bound at eval time; the rest are op outputs written
 /// by subtile nodes.
+/// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TensorId(pub u32);
+pub struct TensorId(pub(crate) u32);
 
 /// Logical shape of a tensor (row-major `[rows, cols]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

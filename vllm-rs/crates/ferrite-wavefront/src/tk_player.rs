@@ -405,8 +405,9 @@ mod tests {
 
     #[test]
     fn syncthreads_cta_matches_legacy() {
+        use crate::tk_tape::AllWarpsRole;
         assert_eq!(
-            emit(Instr::SyncthreadsCta { role: WarpRole::All }),
+            emit(Instr::syncthreads_cta(AllWarpsRole)),
             "__syncthreads();\n"
         );
     }
@@ -570,7 +571,7 @@ mod tests {
         use crate::subtile_ir::TensorId;
         use crate::tk_tape::{Bf16, PageId, SmemTileId};
         let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(5));
-        let s = emit(Instr::store_async_typed(src, TensorId(7), WarpRole::Storer));
+        let s = emit(Instr::store_async_typed(src, TensorId(7), crate::tk_tape::StorerRole));
         assert_eq!(
             s,
             "kittens::group<1>::tma::store_async_typed<\
@@ -610,7 +611,7 @@ mod tests {
                 source: crate::tk_tape::U32Source::NumKvPages,
             },
         });
-        tape.instrs.push(Instr::SyncthreadsCta { role: WarpRole::All });
+        tape.instrs.push(Instr::syncthreads_cta(crate::tk_tape::AllWarpsRole));
         let out = emit_kernel("tk_test", &tape);
         let sig = out.find("extern \"C\" __global__").expect("signature");
         let alias = out.find("auto a0 = __num_kv_pages;").expect("kernel-arg alias");

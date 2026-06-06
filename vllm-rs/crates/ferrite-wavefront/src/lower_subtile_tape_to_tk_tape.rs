@@ -73,8 +73,14 @@ const ELEM_BYTES: u32 = 2;
 // - Fences and sync run on `WarpRole::All`.
 // The optimizer pass `narrow_role` will refine these later.
 
-const LOAD_ROLE: WarpRole = WarpRole::Loader;
-const STORE_ROLE: WarpRole = WarpRole::Storer;
+// Typed role witnesses (sealed). Per
+// `feedback_ff_subtile_compile_time_inviolable`, role-constrained
+// Instr constructors take these directly so a wrong-role construction
+// is rustc E0308. The runtime `WarpRole::*` constants below are kept
+// for the Instr variants whose role is informational (threadfence_*,
+// commit_bulk, wait_bulk — CTA-level ops, role-agnostic in TK 2.0).
+const LOAD_ROLE: crate::tk_tape::LoaderRole = crate::tk_tape::LoaderRole;
+const STORE_ROLE: crate::tk_tape::StorerRole = crate::tk_tape::StorerRole;
 const COMPUTE_ROLE: WarpRole = WarpRole::AllConsumers;
 const ALL_ROLE: WarpRole = WarpRole::All;
 
@@ -529,18 +535,20 @@ fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
         tile,
         STORE_ROLE,
     )));
-    state.push(Instr::CommitGroupBulk { role: STORE_ROLE });
+    use crate::tk_tape::RoleWitness;
+    state.push(Instr::CommitGroupBulk { role: STORE_ROLE.to_warp_role() });
     state.push(Instr::ThreadfenceDevice { role: ALL_ROLE });
     state.push(Instr::PageBarrierArrive {
         page_id: dst_page,
         kind: PageBarrier::Done,
-        role: STORE_ROLE,
+        role: STORE_ROLE.to_warp_role(),
     });
 }
 fn drain<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>) {
-    state.push(Instr::SyncthreadsCta { role: ALL_ROLE });
+    use crate::tk_tape::AllWarpsRole;
+    state.push(Instr::syncthreads_cta(AllWarpsRole));
     state.push(Instr::CommitGroupBulk { role: ALL_ROLE });
     state.push(Instr::WaitGroupBulk { n: 0, role: ALL_ROLE });
     state.push(Instr::ThreadfenceDevice { role: ALL_ROLE });
-    state.push(Instr::SyncthreadsCta { role: ALL_ROLE });
+    state.push(Instr::syncthreads_cta(AllWarpsRole));
 }

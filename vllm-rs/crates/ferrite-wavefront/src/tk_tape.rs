@@ -345,6 +345,15 @@ pub enum Instr {
 // primitive, no inner-match dispatch in the player.
 
 /// Which warp role inside the persistent CTA owns an instruction.
+///
+/// Runtime tag form — kept on every Instr variant for player /
+/// validator inspection. The compile-time gate lives upstream at the
+/// per-Instr typed constructors via the [`RoleWitness`] sealed trait
+/// and its concrete impls ([`LoaderRole`], [`StorerRole`],
+/// [`ConsumerRole`], [`AllConsumersRole`], [`AllWarpsRole`]).
+/// Constructors that have a single legal role (e.g. [`LoadSpec::new`]
+/// — TMA load is loader-only) take the specific role-type directly,
+/// so a wrong-role construction is a Rust E0308.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WarpRole {
     Loader,
@@ -352,6 +361,111 @@ pub enum WarpRole {
     Consumer(u8),
     AllConsumers,
     All,
+}
+
+// ── Sealed typed role witnesses ─────────────────────────────────────
+//
+// Per `feedback_ff_subtile_compile_time_inviolable`: any Instr that
+// has a single legal role (TMA loads = loader, TMA stores = storer,
+// `__syncthreads()` = whole-CTA) must reject other roles at rustc
+// time. Free `WarpRole` enum on the constructor is a runtime gate.
+//
+// Each `*Role` struct is sealed (private constructor module gate);
+// `RoleWitness::to_warp_role()` is the documented type-erasure point
+// at construction. Only role-eligible Instr constructors take the
+// specific role-type; role-agnostic Instrs (threadfence_*, fences
+// driven by ANY warp) keep the runtime `WarpRole` for now.
+
+mod role_sealed {
+    pub trait Sealed {}
+}
+
+/// `LoaderRole` — single warp issuing TMA `load_async` from gmem
+/// into smem. Required by [`LoadSpec::new`]; passing any other role
+/// is a Rust compile error.
+#[derive(Debug, Clone, Copy)]
+pub struct LoaderRole;
+impl role_sealed::Sealed for LoaderRole {}
+
+/// `StorerRole` — single warp issuing TMA `store_async` and the
+/// matching `commit_group`/`store_async_wait`. Required by
+/// [`StoreSpec::new`], [`Instr::store_async_typed`].
+#[derive(Debug, Clone, Copy)]
+pub struct StorerRole;
+impl role_sealed::Sealed for StorerRole {}
+
+/// `ConsumerRole(u8)` — one of the consumer warps; the inner u8 is
+/// the consumer index inside the consumer set (0..NUM_CONSUMER_WARPS).
+#[derive(Debug, Clone, Copy)]
+pub struct ConsumerRole(pub u8);
+impl role_sealed::Sealed for ConsumerRole {}
+
+/// `AllConsumersRole` — the full NUM_CONSUMER_WARPS-wide consumer
+/// set, used when a Compute Instr runs warp-collectively across all
+/// consumers (`kittens::group<NUM_CONSUMER_WARPS>::*`).
+#[derive(Debug, Clone, Copy)]
+pub struct AllConsumersRole;
+impl role_sealed::Sealed for AllConsumersRole {}
+
+/// `AllWarpsRole` — the entire CTA (loader + storer + all
+/// consumers). Required by [`Instr::syncthreads_cta`] (`__syncthreads()`
+/// is whole-CTA).
+#[derive(Debug, Clone, Copy)]
+pub struct AllWarpsRole;
+impl role_sealed::Sealed for AllWarpsRole {}
+
+/// Sealed trait connecting a typed role-witness to its [`WarpRole`]
+/// erasure. Only the five typed roles in this module impl it —
+/// external types cannot satisfy `RoleWitness`.
+///
+/// # Compile-fail proof — non-storer rejected on a storer constructor
+///
+/// `Instr::syncthreads_cta` requires [`AllWarpsRole`]. Passing
+/// [`StorerRole`] is a rustc E0308 because the sealed concrete type
+/// is what the constructor signature names — there is no impl path
+/// across role types.
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Instr, StorerRole};
+/// // syncthreads_cta is `pub(crate)` so we use a generic helper to
+/// // surface the same E0308 from outside the crate.
+/// fn _wants_all_warps(_: ferrite_wavefront::tk_tape::AllWarpsRole) {}
+/// _wants_all_warps(StorerRole);
+/// ```
+///
+/// # Pass — typed-role constructor accepts the matching witness
+///
+/// ```
+/// use ferrite_wavefront::tk_tape::{AllWarpsRole, RoleWitness, WarpRole};
+/// assert!(matches!(AllWarpsRole.to_warp_role(), WarpRole::All));
+/// ```
+pub trait RoleWitness: role_sealed::Sealed + Copy {
+    fn to_warp_role(self) -> WarpRole;
+}
+impl RoleWitness for LoaderRole {
+    fn to_warp_role(self) -> WarpRole {
+        WarpRole::Loader
+    }
+}
+impl RoleWitness for StorerRole {
+    fn to_warp_role(self) -> WarpRole {
+        WarpRole::Storer
+    }
+}
+impl RoleWitness for ConsumerRole {
+    fn to_warp_role(self) -> WarpRole {
+        WarpRole::Consumer(self.0)
+    }
+}
+impl RoleWitness for AllConsumersRole {
+    fn to_warp_role(self) -> WarpRole {
+        WarpRole::AllConsumers
+    }
+}
+impl RoleWitness for AllWarpsRole {
+    fn to_warp_role(self) -> WarpRole {
+        WarpRole::All
+    }
 }
 
 // ── Sealed const-generic `GroupWidth<N>` + `ComputeWidth` marker ────
@@ -804,7 +918,7 @@ impl LoadSpec {
         src_tensor: TensorId,
         byte_off: ByteOffset,
         tile: SmemTileSpec<ROWS, COLS, T>,
-        role: WarpRole,
+        role: LoaderRole,
         barrier_page: PageId,
     ) -> Self {
         Self {
@@ -812,7 +926,7 @@ impl LoadSpec {
             src_tensor,
             byte_off,
             tile: tile.shape(),
-            role,
+            role: role.to_warp_role(),
             barrier_page,
         }
     }
@@ -835,14 +949,14 @@ impl StoreSpec {
         dst_tensor: TensorId,
         byte_off: ByteOffset,
         tile: SmemTileSpec<ROWS, COLS, T>,
-        role: WarpRole,
+        role: StorerRole,
     ) -> Self {
         Self {
             src_page,
             dst_tensor,
             byte_off,
             tile: tile.shape(),
-            role,
+            role: role.to_warp_role(),
         }
     }
 }
@@ -865,8 +979,15 @@ pub struct KvLayoutId(pub(crate) u32);
 // ── Sealed constructors ─────────────────────────────────────────────
 
 impl Instr {
-    pub(crate) fn syncthreads_cta(role: WarpRole) -> Self {
-        Self::SyncthreadsCta { role }
+    /// Construct [`Instr::SyncthreadsCta`] from a typed
+    /// [`AllWarpsRole`] witness. `__syncthreads()` is whole-CTA — any
+    /// other role is meaningless here, so the constructor refuses
+    /// non-`AllWarpsRole` at rustc time. Per
+    /// `feedback_ff_subtile_compile_time_inviolable`.
+    pub(crate) fn syncthreads_cta(role: AllWarpsRole) -> Self {
+        Self::SyncthreadsCta {
+            role: role.to_warp_role(),
+        }
     }
 
     /// Construct a [`Instr::SyncthreadsGroup`] from a typed
@@ -977,7 +1098,7 @@ impl Instr {
     pub(crate) fn store_async_typed<const ROWS: usize, const COLS: usize, T: TileDtype>(
         src: SmemTileId<ROWS, COLS, T>,
         dst_tensor: TensorId,
-        role: WarpRole,
+        role: StorerRole,
     ) -> Self {
         let tile_type = format!(
             "kittens::st_{}<{}, {}>",
@@ -989,7 +1110,7 @@ impl Instr {
             dst_page: src.page(),
             dst_tensor,
             tile_type: TileType::from_layout(tile_type),
-            role,
+            role: role.to_warp_role(),
         }
     }
 
@@ -1061,12 +1182,17 @@ impl TkTape {
 
     /// Append the cross-op gmem-fence as a 5-Instr atomic sequence.
     pub(crate) fn emit_cross_op_gmem_fence(&mut self) {
+        // syncthreads_cta is role-typed (AllWarpsRole — `__syncthreads()`
+        // is whole-CTA); commit_bulk / wait_bulk / threadfence_device
+        // remain WarpRole-tagged because their CUDA emit is
+        // role-agnostic (per-warp `kittens::group<1>::tma::*` and
+        // `__threadfence()`).
         let role = WarpRole::All;
-        self.instrs.push(Instr::syncthreads_cta(role));
+        self.instrs.push(Instr::syncthreads_cta(AllWarpsRole));
         self.instrs.push(Instr::commit_bulk(role));
         self.instrs.push(Instr::wait_bulk(role, 0));
         self.instrs.push(Instr::threadfence_device(role));
-        self.instrs.push(Instr::syncthreads_cta(role));
+        self.instrs.push(Instr::syncthreads_cta(AllWarpsRole));
     }
 
     pub fn emit_kernel_end_drain(&mut self) {

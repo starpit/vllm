@@ -428,14 +428,22 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // is implemented per SUBTILE_TK20_DECOMP.md.
     match &node.op {
         SubOp::Elementwise(EwKind::Mul) => {
+            // Compute width is the const-generic typed witness
+            // `GroupWidth::<16>::ALL_CONSUMERS`; the
+            // `where GroupWidth<N>: ComputeWidth` bound on
+            // `Instr::sh_tile_mul` rejects N=1 / N=20 at rustc time.
+            // Per `feedback_ff_subtile_compile_time_inviolable`.
             let lhs = state.page_of(reads[0]);
             let rhs = state.page_of(reads[1]);
-            state.push(Instr::ShTileMul {
+            let _ = COMPUTE_ROLE; // role-tag retained for future
+                                  // walker-side gating; emit-side N
+                                  // is the typed witness below.
+            state.push(Instr::sh_tile_mul(
                 lhs,
                 rhs,
-                dst: dst_page,
-                role: COMPUTE_ROLE,
-            });
+                dst_page,
+                crate::tk_tape::GroupWidth::<16>::ALL_CONSUMERS,
+            ));
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::MatmulTile

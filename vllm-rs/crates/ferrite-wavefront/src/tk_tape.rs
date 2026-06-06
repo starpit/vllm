@@ -28,6 +28,7 @@
 #![allow(dead_code)]
 
 use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, KvCacheShape, TensorId};
+use std::marker::PhantomData;
 
 // NUKED: RopeForm trait + NeoX / Interleaved markers + RopeFormTag
 // + GemmK witness + AccumKind + RopeSide + Instr::rope_rotate
@@ -300,11 +301,17 @@ pub enum Instr {
     /// primitive `kittens::group<N>::mul(dst, lhs, rhs)` at
     /// `ops/group/shared/tile/maps.cuh:306`. Used by SubOp::Elementwise(Mul)
     /// and (eventually) SiluMul / RmsNorm decompositions.
+    ///
+    /// `width` is a sealed [`GroupWidthTag`]; the only constructors
+    /// for it require a [`GroupWidth<N>`] where `GroupWidth<N>:
+    /// ComputeWidth` — that is, N ∈ {4, 16}. A wrong-width construction
+    /// (e.g. per-warp `GroupWidth::<1>`) is a Rust compile error,
+    /// per `feedback_ff_subtile_compile_time_inviolable`.
     ShTileMul {
         lhs: PageId,
         rhs: PageId,
         dst: PageId,
-        role: WarpRole,
+        width: GroupWidthTag,
     },
 
     /// Inert marker the orchestrator emits at the start of an op
@@ -339,6 +346,121 @@ pub enum WarpRole {
     Consumer(u8),
     AllConsumers,
     All,
+}
+
+// ── Sealed const-generic `GroupWidth<N>` + `ComputeWidth` marker ────
+//
+// Per `feedback_ff_subtile_compile_time_inviolable`: every numeric
+// proof the codegen relies on must propagate end-to-end as a Rust
+// const-generic with `where` clauses, NOT a runtime field. The
+// `kittens::group<N>::*` template parameter is one such proof.
+//
+// `GroupWidth<const N: usize>` is sealed (private constructor) — the
+// only way to get one is a constant in `{1, 4, 16, 20}`. Compute Instr
+// constructors then take `GroupWidth<N>` and bound it on
+// `ComputeWidth`, which is impl'd ONLY for the legal compute widths
+// (4 = warpgroup, 16 = AllConsumers). Constructing a Compute Instr
+// with `GroupWidth::<1>::PER_WARP` is a Rust compile error.
+
+mod group_width_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed const-generic carrier for the `kittens::group<N>` template
+/// parameter. The only way to get one is via the per-N associated
+/// constants below — `GroupWidth::<N>::*` for N ∈ {1, 4, 16, 20}.
+/// Construction of any other `N` is a compile error (no `Sealed` impl).
+#[derive(Debug, Clone, Copy)]
+pub struct GroupWidth<const N: usize>(PhantomData<()>);
+
+impl group_width_sealed::Sealed for GroupWidth<1> {}
+impl group_width_sealed::Sealed for GroupWidth<4> {}
+impl group_width_sealed::Sealed for GroupWidth<16> {}
+impl group_width_sealed::Sealed for GroupWidth<20> {}
+
+impl GroupWidth<1> {
+    /// Per-warp scope: `kittens::group<1>::*`. Used by Loader / Storer
+    /// / Consumer-per-warp Instrs (TMA, mbarrier, sync). NOT a
+    /// `ComputeWidth` — constructing `Instr::sh_tile_mul` with this
+    /// is a Rust compile error.
+    pub const PER_WARP: Self = Self(PhantomData);
+}
+impl GroupWidth<4> {
+    /// Warpgroup scope: `kittens::group<4>::*`. The Hopper WGMMA
+    /// width — required by `mma_AB`, `mma_ABt`. Implements
+    /// [`ComputeWidth`].
+    pub const WARPGROUP: Self = Self(PhantomData);
+}
+impl GroupWidth<16> {
+    /// All-consumers scope: `kittens::group<NUM_CONSUMER_WARPS>::*`.
+    /// The default Compute width — RmsNorm / SiluMul / Elementwise /
+    /// SumReduce all bind to this. Implements [`ComputeWidth`].
+    pub const ALL_CONSUMERS: Self = Self(PhantomData);
+}
+impl GroupWidth<20> {
+    /// Whole-CTA scope: `kittens::group<NUM_WARPS>::*`. Used by
+    /// CTA-wide sync / fence Instrs. NOT a `ComputeWidth`.
+    pub const ALL: Self = Self(PhantomData);
+}
+
+impl<const N: usize> GroupWidth<N>
+where
+    GroupWidth<N>: group_width_sealed::Sealed,
+{
+    /// Erase the const-generic into the runtime [`GroupWidthTag`] that
+    /// the Instr variant carries. The N is recovered as `tag.n()`
+    /// for codegen, but construction of the tag is gated by the
+    /// type-level `Sealed` bound.
+    pub const fn tag(self) -> GroupWidthTag {
+        GroupWidthTag(N as u8)
+    }
+}
+
+/// Sealed marker: implemented ONLY for compute-eligible group widths.
+/// `feedback_compile_time_or_garbage`: a wrong-width Compute Instr is
+/// a Rust compile error, never a runtime panic / debug_assert.
+///
+/// Compute width must be a warpgroup (`GroupWidth<4>`) or the entire
+/// AllConsumers set (`GroupWidth<16>`). Per-warp (`<1>`) and whole-CTA
+/// (`<20>`) are rejected at type level.
+///
+/// # Compile-fail proof — per-warp width rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{GroupWidth, Instr, PageId};
+/// // `Instr::sh_tile_mul` is `pub(crate)` — we use the public `Instr`
+/// // type and the public `GroupWidth` constants. Replace this with
+/// // any public Compute Instr constructor that takes `GroupWidth<N>:
+/// // ComputeWidth`. The point is: `GroupWidth<1>` cannot satisfy the
+/// // `ComputeWidth` bound — rustc rejects.
+/// fn _wants_compute<W: ferrite_wavefront::tk_tape::ComputeWidth>(_: W) {}
+/// _wants_compute(GroupWidth::<1>::PER_WARP);
+/// ```
+///
+/// # Pass — warpgroup width accepted
+///
+/// ```
+/// use ferrite_wavefront::tk_tape::GroupWidth;
+/// fn _wants_compute<W: ferrite_wavefront::tk_tape::ComputeWidth>(_: W) {}
+/// _wants_compute(GroupWidth::<4>::WARPGROUP);
+/// _wants_compute(GroupWidth::<16>::ALL_CONSUMERS);
+/// ```
+pub trait ComputeWidth: group_width_sealed::Sealed {}
+impl ComputeWidth for GroupWidth<4> {}
+impl ComputeWidth for GroupWidth<16> {}
+
+/// Runtime carrier for the const-generic `GroupWidth<N>` after type
+/// erasure into [`Instr`]. Field is `pub(crate)` (sealed); the only
+/// public constructor is [`GroupWidth::tag`], which requires the
+/// const-generic typed witness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GroupWidthTag(pub(crate) u8);
+
+impl GroupWidthTag {
+    /// The recovered `N` for `kittens::group<N>::*` emit.
+    pub const fn n(&self) -> u32 {
+        self.0 as u32
+    }
 }
 
 /// Sealed per §2: inner field is `pub(crate)`.
@@ -504,6 +626,24 @@ impl Instr {
 
     pub(crate) fn arrive(page: PageId, kind: PageBarrier, role: WarpRole) -> Self {
         Self::PageBarrierArrive { page_id: page, kind, role }
+    }
+
+    /// Construct a [`Instr::ShTileMul`] from typed inputs. The
+    /// `GroupWidth<N>` is the const-generic typed witness — the
+    /// `where GroupWidth<N>: ComputeWidth` bound restricts N to the
+    /// compute-eligible widths {4, 16}. Calling this with
+    /// `GroupWidth::<1>::PER_WARP` is a Rust compile error
+    /// (`the trait ComputeWidth is not implemented for GroupWidth<1>`).
+    pub(crate) fn sh_tile_mul<const N: usize>(
+        lhs: PageId,
+        rhs: PageId,
+        dst: PageId,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileMul { lhs, rhs, dst, width: width.tag() }
     }
 
     pub(crate) fn store_async_typed(

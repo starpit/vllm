@@ -138,24 +138,14 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
     }
 }
 
-/// Map a `WarpRole` to the `N` template parameter in
-/// `kittens::group<N>::*`. Loader / Storer / Consumer(_) are
-/// per-warp work (N=1); AllConsumers spans the consumer set
-/// (N=NUM_CONSUMER_WARPS); All spans the entire CTA (N=NUM_WARPS).
-/// Per the SUBTILE_TK20_DECOMP design's GroupWidth<N> note: this
-/// mapping is the runtime-derived form of what will become a sealed
-/// `GroupWidth<const N: usize>` once a SubOp lands that needs the
-/// const-generic check (warpgroup-only mma_AB rejecting an N=1 role
-/// at compile time). For ShTileMul (Llama Elementwise::Mul) the
-/// runtime form suffices.
-fn group_n_for(role: crate::tk_tape::WarpRole) -> u32 {
-    use crate::tk_tape::{NUM_CONSUMER_WARPS, NUM_WARPS, WarpRole};
-    match role {
-        WarpRole::Loader | WarpRole::Storer | WarpRole::Consumer(_) => 1,
-        WarpRole::AllConsumers => NUM_CONSUMER_WARPS as u32,
-        WarpRole::All => NUM_WARPS as u32,
-    }
-}
+// NUKED: `group_n_for(role: WarpRole) -> u32` runtime mapping — it
+// silently accepted `WarpRole::Loader` for compute Instrs and
+// emitted `kittens::group<1>::mul` (a single TMA warp doing
+// elementwise-mul, deadlock-adjacent). Replaced by sealed
+// `GroupWidth<const N>` + `ComputeWidth` marker in tk_tape.rs:
+// `Instr::sh_tile_mul(.., GroupWidth::<1>::PER_WARP)` is now a
+// Rust compile error. Per `feedback_ff_subtile_compile_time_inviolable`
+// + `feedback_end_to_end_compile_time_proofs`.
 
 /// Emit a full CUDA translation unit — `__global__` kernel + matching
 /// `extern "C" cudaError_t launch_<name>(void* const* bufs, const
@@ -377,9 +367,8 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());
             let _ = writeln!(out, "{s}");
         }
-        Instr::ShTileMul { lhs, rhs, dst, role } => {
-            let n = group_n_for(*role);
-            let _ = writeln!(out, "{}", tk20::st_mul(n, dst.0, lhs.0, rhs.0));
+        Instr::ShTileMul { lhs, rhs, dst, width } => {
+            let _ = writeln!(out, "{}", tk20::st_mul(width.n(), dst.0, lhs.0, rhs.0));
         }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
@@ -536,34 +525,37 @@ mod tests {
     /// `Instr::ShTileMul` emits one TK 2.0 call to
     /// `kittens::group<NUM_CONSUMER_WARPS>::mul(...)` from
     /// `ops/group/shared/tile/maps.cuh:306` — no invented helpers.
+    /// Constructed via the typed [`GroupWidth<16>::ALL_CONSUMERS`]
+    /// witness; the const-generic propagates to emit as `<16>`.
     #[test]
     fn sh_tile_mul_emits_real_tk20_call() {
-        let s = emit(Instr::ShTileMul {
-            lhs: crate::tk_tape::PageId(1),
-            rhs: crate::tk_tape::PageId(2),
-            dst: crate::tk_tape::PageId(3),
-            role: WarpRole::AllConsumers,
-        });
-        // 16 consumer warps in the substrate (NUM_CONSUMER_WARPS).
+        use crate::tk_tape::{GroupWidth, PageId};
+        let s = emit(Instr::sh_tile_mul(
+            PageId(1),
+            PageId(2),
+            PageId(3),
+            GroupWidth::<16>::ALL_CONSUMERS,
+        ));
         assert_eq!(
             s,
             "kittens::group<16>::mul(page_buf[3], page_buf[1], page_buf[2]);\n",
         );
     }
 
-    /// Per-warp role binds N=1 (Loader / Storer / Consumer(_) per
-    /// the group_n_for mapping).
+    /// Warpgroup-width construction (used later by mma_AB) also
+    /// type-checks and emits `<4>`. Same code path, different N.
     #[test]
-    fn sh_tile_mul_per_warp_role_emits_group_1() {
-        let s = emit(Instr::ShTileMul {
-            lhs: crate::tk_tape::PageId(0),
-            rhs: crate::tk_tape::PageId(1),
-            dst: crate::tk_tape::PageId(2),
-            role: WarpRole::Loader,
-        });
+    fn sh_tile_mul_warpgroup_width_emits_group_4() {
+        use crate::tk_tape::{GroupWidth, PageId};
+        let s = emit(Instr::sh_tile_mul(
+            PageId(0),
+            PageId(1),
+            PageId(2),
+            GroupWidth::<4>::WARPGROUP,
+        ));
         assert_eq!(
             s,
-            "kittens::group<1>::mul(page_buf[2], page_buf[0], page_buf[1]);\n",
+            "kittens::group<4>::mul(page_buf[2], page_buf[0], page_buf[1]);\n",
         );
     }
 

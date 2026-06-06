@@ -593,7 +593,16 @@ fn emit_matmul_tile<F: RopeForm, K: KvCacheShape>(
 ) {
     let m = node.output.region.rows.len;
     let n = node.output.region.cols.len;
-    let k = node.inputs[0].region.cols.len;
+    // GemmK typed witness: assert input[0].cols == input[1].cols
+    // at construction time. ValidatedGraph<F, K> guarantees the
+    // SubtileNode passed `validate`'s structural arity check, but
+    // the K-equality check is the GEMM-specific witness — fail-fast
+    // here rather than miswire k downstream.
+    let k = crate::tk_tape::GemmK::derive(
+        node.inputs[0].region.cols.len,
+        node.inputs[1].region.cols.len,
+    )
+    .expect("GEMM K-equality: ValidatedGraph should have ensured matched cols");
     // input[0] = activation, input[1] = weight (per LoweredOp::Gemm).
     let lhs_page = dst_page; // shared via expect_bytes; refined by optimizer
     let rhs_tensor = node.inputs[1].tensor;

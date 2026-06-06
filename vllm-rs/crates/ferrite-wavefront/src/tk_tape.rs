@@ -318,7 +318,9 @@ pub enum Instr {
         role: WarpRole,
     },
 
-    /// Single-row GEMM (m=1) — output is `[1, n]`.
+    /// Single-row GEMM (m=1) — output is `[1, n]`. `k` is the
+    /// sealed [`GemmK`] witness — constructable only via
+    /// [`GemmK::derive`] which asserts LHS-cols == RHS-cols.
     GemmM1 {
         lhs_page: PageId,
         rhs_tensor: TensorId,
@@ -326,7 +328,7 @@ pub enum Instr {
         out_page: PageId,
         m: u32,
         n: u32,
-        k: u32,
+        k: GemmK,
         accum: AccumKind,
         role: WarpRole,
     },
@@ -554,6 +556,57 @@ pub struct StoreSpec {
 pub enum AccumKind {
     Zero,
     Accumulate,
+}
+
+/// `GemmK` — sealed typed witness for the GEMM contraction dim.
+///
+/// Per `SUBTILE_TAPE_HANDOFF.md` line 95 + plan §2 "Compile-time-or-
+/// garbage" hard rule: GemmK MUST be derived from operand shapes,
+/// never accepted as a raw `u32`. The only constructor
+/// [`GemmK::derive`] takes the LHS activation's `cols` and the RHS
+/// weight slice's `cols` (per `SubOp::MatmulTile`'s "W slice
+/// `[nr, kr]`" doc) and asserts they agree before producing the
+/// witness — a K-mismatch becomes a constructor `Err` at lowering
+/// time, not a wrong-K kernel call at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmK {
+    pub(crate) val: u32,
+}
+
+impl GemmK {
+    /// Construct from the two K-bearing operand extents. Returns
+    /// `Err` if they disagree (per plan §3 "Validator stretch": the
+    /// witness discharges the GEMM K-equality structural check at
+    /// the type level).
+    pub fn derive(lhs_cols: u32, rhs_cols: u32) -> Result<Self, GemmKMismatch> {
+        if lhs_cols == rhs_cols {
+            Ok(Self { val: lhs_cols })
+        } else {
+            Err(GemmKMismatch { lhs_cols, rhs_cols })
+        }
+    }
+
+    /// The contraction dim's runtime value (for emit / runtime use).
+    #[inline]
+    pub fn get(self) -> u32 {
+        self.val
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GemmKMismatch {
+    pub lhs_cols: u32,
+    pub rhs_cols: u32,
+}
+
+impl std::fmt::Display for GemmKMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GEMM K-equality violated: lhs.cols={} != rhs.cols={}",
+            self.lhs_cols, self.rhs_cols,
+        )
+    }
 }
 
 /// Erased tag mirroring the `RopeForm` trait.
@@ -1009,6 +1062,23 @@ mod tests {
             err.iter().any(|e| matches!(e, TkValidationError::MissingFenceBeforeArrive { page: 0, .. })),
             "want MissingFenceBeforeArrive(0), got {err:?}"
         );
+    }
+
+    /// `GemmK::derive` accepts when LHS-cols == RHS-cols and rejects
+    /// when they disagree. Per plan §2 + handoff line 95: GemmK is
+    /// the typed witness that discharges GEMM K-equality at the type
+    /// level; raw u32 K parameters are forbidden.
+    #[test]
+    fn gemm_k_derive_accepts_match() {
+        let k = GemmK::derive(4096, 4096).expect("equal cols accepted");
+        assert_eq!(k.get(), 4096);
+    }
+
+    #[test]
+    fn gemm_k_derive_rejects_mismatch() {
+        let err = GemmK::derive(4096, 2048).unwrap_err();
+        assert_eq!(err.lhs_cols, 4096);
+        assert_eq!(err.rhs_cols, 2048);
     }
 
     /// Per plan §3.2 lines 156-161 + audit DRIFT #3: ThreadfenceBlock

@@ -447,19 +447,19 @@ Revert the entire stack to commit `5206d10d49` if **any** of:
 
 ## 7. Net surface delta (target)
 
-Snapshot as of commit `56413bdf6f` (post-nuke):
+Snapshot updated for HEAD post-audit-`w95ad4bpn` (Parity sealed enum + GemmK witness):
 
 | Layer | Before | Now (snapshot) | After (target) |
 |---|---|---|---|
-| `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` (1604 LOC) | folded ~1400 LOC |
+| `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` (1696 LOC) | folded ~1400 LOC |
 | `subtile_ir.rs` (Metal-flavored, v1) | 1471 LOC | scrubbed to `metal_tape.rs` (153 LOC carcass; MetalTape type deleted in commit 10, leaf types kept for callers) | further-cut to ~50 LOC once leaf-type callers migrate |
-| `subtile_tape.rs` | 0 LOC | 1725 LOC (slot-lifecycle + validate_subtile_tape landed; tests dominate) | ~600 LOC after the §10 cleanup |
+| `subtile_tape.rs` | 0 LOC | 1734 LOC (slot-lifecycle + validate_subtile_tape landed; tests dominate) | ~600 LOC after the §10 cleanup |
 | `lower.rs` (`LoweringInput`/`LoweredOp`) | 1105 LOC | 213 LOC (much already cut) | DELETED |
 | `tape.rs` | 391 LOC | DELETED ✓ | DELETED |
-| `tk_tape.rs` | 727 LOC | 960 LOC (parity-split Wait variants, KvLayoutId table, validate_tk_tape) | grows for §6.5 pass postcondition checks (closure / parity / edge-pairing) |
-| `tk_player.rs` | 248 LOC | 725 LOC (one ≤5-line tk20:: arm per Instr; emit_kernel host wrapper) | ~700 LOC once scaffolding `kittens::*` strings migrate to `tk20::*` helpers |
+| `tk_tape.rs` | 727 LOC | 1128 LOC (parity-split Wait variants, KvLayoutId table, KvCacheShape const-generic K, GemmK typed witness, validate_tk_tape) | grows for §6.5 pass postcondition checks (closure / parity / edge-pairing) |
+| `tk_player.rs` | 248 LOC | 758 LOC (one ≤5-line tk20:: arm per Instr; emit_kernel host wrapper; tape-resolved KvLayoutEntry consumer) | ~700 LOC once scaffolding `kittens::*` strings migrate to `tk20::*` helpers |
 | `tk_lower.rs` | 114 LOC | DELETED ✓ | DELETED |
-| `lower_tape_to_tk` (commit 6, conservative) | 0 LOC | 1166 LOC ✓ (4-phase AttnDecode split, KvLayout interning, conservative all-gmem routing) | trims as §6.5 pass postconditions land |
-| Optimizer passes (commit 6.5.*) | 0 LOC | 0 LOC | ~700 LOC across headline passes |
-| Validators (5b, 6b) | 0 LOC | 5b ✓ inline in subtile_tape.rs (~270 LOC); 6b ✓ inline in tk_tape.rs (~120 LOC, conservative checks; closure / parity / edge-pairing land alongside §6.5 passes) | ~300 LOC each at §6.5 land |
-| **Net status** | | -113 LOC (commit 56413bdf6f) on top of slot-lifecycle commits; carcasses pending §10 | net ≥ -1500 LOC (K8) |
+| `lower_tape_to_tk` (commit 6, conservative) | 0 LOC | 1192 LOC ✓ (4-phase AttnDecode split, KvLayout interning, K-shape threading, GemmK::derive call, conservative all-gmem routing) | trims as §6.5 pass postconditions land |
+| Optimizer passes (commit 6.5.*) | 0 LOC | 0 LOC (NOT-YET-IMPLEMENTED — sequenced after 6b) | ~700 LOC across headline passes |
+| Validators (5b, 6b) | 0 LOC | 5b ✓ inline in subtile_tape.rs (~270 LOC); 6b ✓ inline in tk_tape.rs (~150 LOC, conservative checks; closure / parity / edge-pairing land alongside §6.5 passes) | ~300 LOC each at §6.5 land |
+| **Net status** | | K8-target file set is currently +2.4k LOC vs Before (subtile_tape.rs/tk_tape.rs/tk_player.rs/lower_tape_to_tk.rs grew alongside the new substrate; carcasses mega.rs ~2949, launcher.rs ~1150, partition.rs ~1096, region_schedule.rs ~590 pending §10 deletions which would close the gap) | net ≥ -1500 LOC (K8) |

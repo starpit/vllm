@@ -35,7 +35,7 @@ What landed in this session:
 | `b6f2bfd380` | Drop GemmM1 accum if/else from tk20 helper |
 | `c260bd19b1` | §10 dead-arm scrub of metal_tape.rs (1471 → 153 LOC, -1318) |
 
-80 unit + 9 doctests green throughout.
+82 unit + 9 doctests green throughout.
 
 ## Remaining work (all staged future commits)
 

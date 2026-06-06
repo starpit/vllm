@@ -522,7 +522,7 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let _ = writeln!(out, "{s}");
         }
         Instr::GemmM1 { lhs_page, rhs_tensor, rhs_byte_off, out_page, m, n, k, accum, role: _ } => {
-            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, *k, *accum);
+            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, k.get(), *accum);
             let _ = writeln!(out, "{s}");
         }
         Instr::SiluMul { gate_page, up_page, out_page, cols, role: _ } => {

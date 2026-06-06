@@ -6085,11 +6085,12 @@ fn dump_wavefront_mega(
     );
     {
         use std::num::NonZeroU32;
-        // nb=256 matches the FERRITE_WAVEFRONT_NB default below; the
-        // probe lowers a fixed-shape SubtileIR for the .cu emit (the
-        // mega-side rg/sched + the ferrite-runtime build are separate
-        // paths that don't share an nb knob).
-        let nb = NonZeroU32::new(256).expect("256 != 0");
+        // The TkTape probe uses a coarse nb (one block per Gemm) so
+        // the conservative all-gmem lowering's max-live-slot stays
+        // under NUM_PAGES. Fine-grained nb (e.g. 256) is the §6.5
+        // optimizer-pass concern, not the substrate's. The mega-side
+        // rg/sched + ferrite-runtime build still tile finely.
+        let nb = NonZeroU32::new(u32::MAX).expect("u32::MAX != 0");
         let rg = ferrite_wavefront::subtile_ir::lower_region::<
             ferrite_wavefront::subtile_ir::LlamaShape8x64,
         >(&fused, nb);

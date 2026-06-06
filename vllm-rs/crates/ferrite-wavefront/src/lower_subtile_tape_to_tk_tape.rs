@@ -523,6 +523,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // is implemented per SUBTILE_TK20_DECOMP.md.
     match &node.op {
         SubOp::Elementwise(EwKind::Mul) => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute Elementwise(Mul): expected 2 reads, got {} \
+                 (likely external-source SubOp inputs not yet plumbed via \
+                 lower_dag_to_tape; see Phase A step 2 of the panic-RCA plan)",
+                reads.len(),
+            );
             // Two compile-time witnesses ride on this constructor:
             //   - `GroupWidth::<16>::ALL_CONSUMERS` — the `where
             //     GroupWidth<N>: ComputeWidth` bound rejects N=1 /
@@ -551,6 +558,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::Elementwise(EwKind::Add) => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute Elementwise(Add): expected 2 reads, got {}",
+                reads.len(),
+            );
             // Same compile-time witnesses as the Mul arm; only the
             // emitted TK 2.0 primitive differs (`group<N>::add` vs
             // `group<N>::mul`).
@@ -567,6 +579,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::SumReduce => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute SumReduce: expected ≥2 reads, got {} \
+                 (N=1 lowers to a copy, not yet supported)",
+                reads.len(),
+            );
             // SumReduce over N inputs: chain N-1 ShTileAdd Instrs.
             // Per SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts":
             // SumReduce reuses ShTileAdd; no new Instr variant.
@@ -608,6 +626,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::SiluMul => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute SiluMul: expected 2 reads (gate, up), got {}",
+                reads.len(),
+            );
             // SiluMul: out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
             //
             // Decomposition (5 Instrs per SUBTILE_TK20_DECOMP.md
@@ -640,6 +663,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::Elementwise(EwKind::Silu) => {
+            assert!(
+                reads.len() >= 1,
+                "lower_compute Elementwise(Silu): expected 1 read, got {}",
+                reads.len(),
+            );
             // Silu: out = x * sigmoid(x) = x / (1 + exp(-x))
             //
             // Step 6 (register-resident chain, 6 Instrs per
@@ -685,6 +713,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RmsNorm { eps } => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute RmsNorm: expected 2 reads (x, gamma), got {}",
+                reads.len(),
+            );
             // RmsNorm: out[i,j] = x[i,j] * inv_rms[i] * gamma[j]
             //   inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
             //
@@ -768,6 +801,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RopeRotate { head_dim, _form: _ } => {
+            assert!(
+                reads.len() >= 3,
+                "lower_compute RopeRotate: expected 3 reads (x, cos, sin), got {}",
+                reads.len(),
+            );
             // RopeRotateNeoX: split q at head_dim/2; rotate as
             //   out_even = q_even * cos - q_odd * sin
             //   out_odd  = q_even * sin + q_odd * cos
@@ -855,6 +893,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::MatmulTile => {
+            assert!(
+                reads.len() >= 2,
+                "lower_compute MatmulTile: expected 2 reads (a, b), got {}",
+                reads.len(),
+            );
             // MatmulTile: D[M, N] = A[M, K] @ B[K, N]
             //
             // Plan §"Per-SubOp Instr counts" line 17 (8 Instrs):
@@ -943,6 +986,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RopeAppend { head_dim, layer, layout, _form: _ } => {
+            assert!(
+                reads.len() >= 4,
+                "lower_compute RopeAppend: expected ≥4 reads (K, cos, sin, V), \
+                 got {} (likely external-source SubOp inputs not plumbed via \
+                 lower_dag_to_tape; see Phase A step 2 of the panic-RCA plan)",
+                reads.len(),
+            );
             // RopeAppend (step 10): rotate K (NeoX) + write rotated K
             // and un-rotated V into the paged KV cache at the runtime
             // decode position. Plan §"Per-SubOp Instr counts" line 26
@@ -1063,6 +1113,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             producer: _,
             softmax_state: _,
         } => {
+            assert!(
+                reads.len() >= 1,
+                "lower_compute AttnDecode: expected ≥1 read (q), got {} \
+                 (cache TensorIds come from layout witness, not reads[1..])",
+                reads.len(),
+            );
             // AttnDecode (steps 11-14): online softmax over a paged
             // KV cache.
             //

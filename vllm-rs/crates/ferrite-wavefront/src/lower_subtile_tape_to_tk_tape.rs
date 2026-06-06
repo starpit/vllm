@@ -248,6 +248,22 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
         p
     }
 
+    /// Allocate an unbound scratch page (no SlotId binding). Used by
+    /// SubOp lowerings that need temporary pages for intermediate
+    /// shared-vec / shared-tile state (e.g. RmsNorm's row_sum vec).
+    /// Caller is responsible for the page's lifetime.
+    fn alloc_temp_page(&mut self) -> PageId {
+        if let Some(reused) = self.free_pages.pop() {
+            reused
+        } else {
+            let p = PageId(self.next_page);
+            self.next_page = self.next_page.checked_add(1).expect(
+                "PageId overflow (>=256 concurrent live slots) on temp alloc",
+            );
+            p
+        }
+    }
+
     fn page_of(&self, slot: SlotId) -> PageId {
         *self
             .slot_to_page
@@ -668,8 +684,87 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             state.push(Instr::store_reg_tile_to_shmem(rt_result, dst, W, R));
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::RmsNorm { eps } => {
+            // RmsNorm: out[i,j] = x[i,j] * inv_rms[i] * gamma[j]
+            //   inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
+            //
+            // Plan §"Per-SubOp Instr counts" line 18 (10 Instrs):
+            //   1: ShTileMul          x_sq    = x * x          (square)
+            //   2: ShTileRowSum       sum_sq  = row_sum(x_sq)
+            //   3: ShVecMulScalar     mean_sq = sum_sq * (1/cols)
+            //   4: ShVecAddScalar     var     = mean_sq + eps
+            //   5: LoadVecSmemToReg   rv_var  = var
+            //   6: RegVecUnaryRsqrt   rv_inv  = rsqrt(rv_var)
+            //   7: StoreRegVecToShmem inv_rms = rv_inv
+            //   8: ShTileMulRow       x_norm  = x * inv_rms (per-row broadcast)
+            //   9: ShTileMulCol       out     = x_norm * gamma (per-col broadcast)
+            //
+            // reads[0] = x, reads[1] = gamma. Both pre-paged by the
+            // SubtileTape lowerer; this arm orchestrates the math
+            // and allocates temp pages for intermediates.
+            //
+            // Const generics: 128×128 Bf16 tile substrate, 128-element
+            // shared/register vec for inv_rms (length = ROWS = 128).
+            //
+            // SmemVecId<LEN, T> is not yet sealed — temp pages carry
+            // raw PageId. Mints will reify when SmemVecId lands.
+            use crate::tk_tape::{
+                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId,
+            };
+            let x = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let gamma_page = state.page_of(reads[1]);
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const R: AllConsumersRole = AllConsumersRole;
+            // Temp pages
+            let x_sq_page = state.alloc_temp_page();
+            let var_page = state.alloc_temp_page();
+            let inv_rms_page = state.alloc_temp_page();
+            let x_sq = SmemTileId::<128, 128, Bf16>::from_page(x_sq_page);
+            // Reg vec for rsqrt detour
+            let rv_var: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
+            let rv_inv: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
+            // SmemTileId witnesses for register-vec load/store
+            let var_tile = SmemTileId::<128, 128, Bf16>::from_page(var_page);
+            let inv_rms_tile = SmemTileId::<128, 128, Bf16>::from_page(inv_rms_page);
+
+            // 1: x_sq = x * x
+            state.push(Instr::sh_tile_mul(x, x, x_sq, W));
+            // 2: sum_sq = row_sum(x_sq)  (writes into var_page as a sv view)
+            state.push(Instr::sh_tile_row_sum(x_sq, var_page, W));
+            // 3: var = sum_sq * (1/COLS)
+            let inv_cols = 1.0_f32 / 128.0;
+            state.push(Instr::sh_vec_mul_scalar(
+                var_page,
+                var_page,
+                crate::tk_tape::ScalarF32::new(inv_cols),
+                Bf16,
+                W,
+            ));
+            // 4: var = var + eps
+            state.push(Instr::sh_vec_add_scalar(
+                var_page,
+                var_page,
+                crate::tk_tape::ScalarF32::new(*eps),
+                Bf16,
+                W,
+            ));
+            // 5: rv_var = load(var)
+            state.push(Instr::load_vec_smem_to_reg(var_tile, rv_var, W, R));
+            // 6: rv_inv = rsqrt(rv_var)
+            state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, W, R));
+            // 7: inv_rms = store(rv_inv)
+            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_tile, W, R));
+            // 8: x_norm = x * inv_rms (per-row broadcast)
+            //    write into dst (clobber x is OK; we reuse dst as
+            //    the running tile through the gamma multiply too).
+            state.push(Instr::sh_tile_mul_row(x, inv_rms_page, dst, W));
+            // 9: out = x_norm * gamma (per-col broadcast)
+            state.push(Instr::sh_tile_mul_col(dst, gamma_page, dst, W));
+
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         SubOp::MatmulTile
-        | SubOp::RmsNorm { .. }
         | SubOp::RopeRotate { .. }
         | SubOp::RopeAppend { .. }
         | SubOp::AttnDecode { .. } => {

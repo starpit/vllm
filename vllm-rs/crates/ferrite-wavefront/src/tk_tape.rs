@@ -523,6 +523,84 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    // ── RmsNorm-unique Instrs (commit B). The dst pages here are
+    // semantically shared-vec views onto a tile-shaped page; until
+    // SmemVecId<LEN,T> lands as a follow-up, the variants carry
+    // raw PageId. The constructors still propagate const-generic
+    // shape via the SmemTileId<R,C,T> witness on the source side.
+
+    /// `kittens::group<N>::row_sum(sv_dst, st_src)` —
+    /// `ops/group/shared/tile/reductions.cuh:97`. Reduce each row
+    /// of `src` to a scalar; the result vector has length = src.rows.
+    ShTileRowSum {
+        src: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul(sv_dst, sv_src, kittens::<dtype>(scalar))` —
+    /// scalar overload of `kittens::group<N>::mul` for shared vectors
+    /// (`ops/group/shared/vec/maps.cuh` mul + scalar bin_map). Used
+    /// by RmsNorm (scale the row-sum by `1/cols`).
+    ShVecMulScalar {
+        src: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::add(sv_dst, sv_src, kittens::<dtype>(scalar))` —
+    /// scalar overload, shared-vec. Used by RmsNorm (`+ eps`).
+    ShVecAddScalar {
+        src: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        dtype: TileDtypeTag,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::unary_op<kittens::base_ops::rsqrt, RvT>(rv_dst, rv_src)`
+    /// — `ops/group/register/vec/maps.cuh:17` + `common/base_ops.cuh:218`.
+    /// Reciprocal-sqrt on register vectors. Used by RmsNorm (no
+    /// shared-vec rsqrt exists in TK 2.0; rsqrt routes through
+    /// register-vec).
+    RegVecUnaryRsqrt {
+        src: RegVecSlot,
+        dst: RegVecSlot,
+        dtype: TileDtypeTag,
+        layout: RegVecLayoutTag,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul_row(st_dst, st_src, sv_row_values)` —
+    /// `ops/group/shared/tile/maps.cuh:361`. Multiply each row of
+    /// `src` by the corresponding scalar in `row_values` (length =
+    /// src.rows). Used by RmsNorm (apply `inv_rms` per-row).
+    ShTileMulRow {
+        src: PageId,
+        row_vec: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::mul_col(st_dst, st_src, sv_col_values)` —
+    /// `ops/group/shared/tile/maps.cuh:428`. Multiply each column
+    /// by the corresponding scalar in `col_values` (length =
+    /// src.cols). Used by RmsNorm (apply gamma per-column).
+    ShTileMulCol {
+        src: PageId,
+        col_vec: PageId,
+        dst: PageId,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// Inert marker the orchestrator emits at the start of an op
     /// when `EmitOpts::debug_handshake` is on.
     DebugOpBeginMarker { op_index: u32 },
@@ -1568,6 +1646,15 @@ impl Instr {
             role: role.to_warp_role(),
         }
     }
+}
+
+/// Default compute-role tag used inside scalar shared-vec
+/// constructors that don't take a typed role parameter (the only
+/// legal compute role today is AllConsumers; future expansion can
+/// type these the same way as ShTileMul/Add did).
+const COMPUTE_ROLE_TAG: WarpRole = WarpRole::AllConsumers;
+
+impl Instr {
 
     /// Construct a [`Instr::SyncthreadsGroup`] from a typed
     /// [`GroupWidth<N>`] witness. `N` is restricted to the sealed
@@ -2042,6 +2129,131 @@ impl Instr {
         }
     }
 
+    // ── RmsNorm-unique constructors (commit B) ───────────────────
+
+    /// Construct [`Instr::ShTileRowSum`] with typed src tile witness.
+    /// `dst` is a shared-vec view onto a page; until `SmemVecId<R,T>`
+    /// lands, dst is a raw `PageId`.
+    pub(crate) fn sh_tile_row_sum<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src: SmemTileId<ROWS, COLS, T>,
+        dst: PageId,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileRowSum {
+            src: src.page(),
+            dst,
+            width: width.tag(),
+            role: COMPUTE_ROLE_TAG,
+        }
+    }
+
+    /// Construct [`Instr::ShVecMulScalar`]. Source is a shared-vec
+    /// view (PageId today); dtype derived from caller's choice.
+    pub(crate) fn sh_vec_mul_scalar<const N: usize, T: TileDtype>(
+        src: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        _dtype_witness: T,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShVecMulScalar {
+            src,
+            dst,
+            scalar,
+            dtype: T::tag(),
+            width: width.tag(),
+            role: COMPUTE_ROLE_TAG,
+        }
+    }
+
+    /// Construct [`Instr::ShVecAddScalar`]. See `sh_vec_mul_scalar`.
+    pub(crate) fn sh_vec_add_scalar<const N: usize, T: TileDtype>(
+        src: PageId,
+        dst: PageId,
+        scalar: ScalarF32,
+        _dtype_witness: T,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShVecAddScalar {
+            src,
+            dst,
+            scalar,
+            dtype: T::tag(),
+            width: width.tag(),
+            role: COMPUTE_ROLE_TAG,
+        }
+    }
+
+    /// Construct [`Instr::RegVecUnaryRsqrt`] from typed RegVecId
+    /// witnesses. Src and dst must share `(LEN, T, RV)` const-generics.
+    pub(crate) fn reg_vec_unary_rsqrt<const N: usize, const LEN: usize, T: TileDtype, RV: RegVecLayout>(
+        src: RegVecId<LEN, T, RV>,
+        dst: RegVecId<LEN, T, RV>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::RegVecUnaryRsqrt {
+            src: src.slot(),
+            dst: dst.slot(),
+            dtype: T::tag(),
+            layout: RV::tag(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::ShTileMulRow`] with typed src/dst tile
+    /// witnesses (must share R, C, T). `row_vec` is a PageId to a
+    /// shared-vec view of length R.
+    pub(crate) fn sh_tile_mul_row<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src: SmemTileId<ROWS, COLS, T>,
+        row_vec: PageId,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileMulRow {
+            src: src.page(),
+            row_vec,
+            dst: dst.page(),
+            width: width.tag(),
+            role: COMPUTE_ROLE_TAG,
+        }
+    }
+
+    /// Construct [`Instr::ShTileMulCol`] — see `sh_tile_mul_row`.
+    pub(crate) fn sh_tile_mul_col<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src: SmemTileId<ROWS, COLS, T>,
+        col_vec: PageId,
+        dst: SmemTileId<ROWS, COLS, T>,
+        width: GroupWidth<N>,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        Self::ShTileMulCol {
+            src: src.page(),
+            col_vec,
+            dst: dst.page(),
+            width: width.tag(),
+            role: COMPUTE_ROLE_TAG,
+        }
+    }
+
     /// Construct a [`Instr::StoreAsyncTyped`] from a typed source
     /// tile witness. `src` is a [`SmemTileId<ROWS, COLS, T>`] —
     /// `ROWS`, `COLS`, and `T::NAME` are propagated into the emitted
@@ -2350,6 +2562,11 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::ShTileExp { .. }
             | Instr::ShTileMulScalar { .. }
             | Instr::ShTileAddScalar { .. }
+            | Instr::ShTileRowSum { .. }
+            | Instr::ShVecMulScalar { .. }
+            | Instr::ShVecAddScalar { .. }
+            | Instr::ShTileMulRow { .. }
+            | Instr::ShTileMulCol { .. }
             | Instr::LoadShmemToReg { .. }
             | Instr::StoreRegTileToShmem { .. }
             | Instr::LoadVecSmemToReg { .. }
@@ -2361,6 +2578,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::RegTileDiv { .. }
             | Instr::RegTileMulCol { .. }
             | Instr::RegTileAddScalar { .. }
+            | Instr::RegVecUnaryRsqrt { .. }
             | Instr::DebugOpBeginMarker { .. } => {}
         }
     }

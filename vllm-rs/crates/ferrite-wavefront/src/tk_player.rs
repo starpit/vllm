@@ -274,6 +274,77 @@ mod tk20 {
         )
     }
 
+    // ── RmsNorm-unique TK 2.0 emit helpers (commit B) ──────────────
+
+    /// `kittens::group<N>::row_sum(sv_dst, st_src)` —
+    /// `ops/group/shared/tile/reductions.cuh:97`. The dst page is
+    /// treated as a shared-vec view (until SmemVecId<R,T> lands).
+    pub fn st_row_sum(group_n: u32, dst_page: u8, src_page: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::row_sum(page_buf[{dst_page}], page_buf[{src_page}]);"
+        )
+    }
+
+    /// `kittens::group<N>::mul(sv_dst, sv_src, kittens::<dtype>(scalar))`
+    /// — scalar overload, shared-vec.
+    pub fn sv_mul_scalar(
+        group_n: u32,
+        dst_page: u8,
+        src_page: u8,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::mul(page_buf[{dst_page}], page_buf[{src_page}], \
+             kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+
+    /// `kittens::group<N>::add(sv_dst, sv_src, kittens::<dtype>(scalar))`
+    /// — scalar overload, shared-vec.
+    pub fn sv_add_scalar(
+        group_n: u32,
+        dst_page: u8,
+        src_page: u8,
+        scalar: f32,
+        dtype: &crate::tk_tape::TileDtypeTag,
+    ) -> String {
+        let scalar_ty = dtype.scalar_name();
+        format!(
+            "kittens::group<{group_n}>::add(page_buf[{dst_page}], page_buf[{src_page}], \
+             kittens::{scalar_ty}({scalar}f));"
+        )
+    }
+
+    /// `kittens::group<N>::unary_op<kittens::base_ops::rsqrt, RvT>(rv_dst, rv_src)` —
+    /// `ops/group/register/vec/maps.cuh:17` + `common/base_ops.cuh:218`.
+    /// The `RvT` template arg is the rv type — emitted via the kernel
+    /// preamble `decltype` since rv_<id> already declares it.
+    pub fn rv_unary_rsqrt(group_n: u32, dst: u16, src: u16) -> String {
+        format!(
+            "kittens::group<{group_n}>::unary_op<kittens::base_ops::rsqrt, decltype(rv_{dst})>(rv_{dst}, rv_{src});"
+        )
+    }
+
+    /// `kittens::group<N>::mul_row(st_dst, st_src, sv_row_values)` —
+    /// `ops/group/shared/tile/maps.cuh:361`.
+    pub fn st_mul_row(group_n: u32, dst_page: u8, src_page: u8, row_vec_page: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::mul_row(page_buf[{dst_page}], page_buf[{src_page}], \
+             page_buf[{row_vec_page}]);"
+        )
+    }
+
+    /// `kittens::group<N>::mul_col(st_dst, st_src, sv_col_values)` —
+    /// `ops/group/shared/tile/maps.cuh:428`.
+    pub fn st_mul_col(group_n: u32, dst_page: u8, src_page: u8, col_vec_page: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::mul_col(page_buf[{dst_page}], page_buf[{src_page}], \
+             page_buf[{col_vec_page}]);"
+        )
+    }
+
     pub fn tma_store_async_typed(
         src_page: u8,
         dst_arg_idx: u32,
@@ -645,6 +716,26 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::RegTileAddScalar { lhs, dst, scalar, dtype, width, role: _ } => {
             let _ = writeln!(out, "{}",
                 tk20::rt_add_scalar(width.n(), dst.0, lhs.0, scalar.value(), dtype));
+        }
+        Instr::ShTileRowSum { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::st_row_sum(width.n(), dst.0, src.0));
+        }
+        Instr::ShVecMulScalar { src, dst, scalar, dtype, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::sv_mul_scalar(width.n(), dst.0, src.0, scalar.value(), dtype));
+        }
+        Instr::ShVecAddScalar { src, dst, scalar, dtype, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::sv_add_scalar(width.n(), dst.0, src.0, scalar.value(), dtype));
+        }
+        Instr::RegVecUnaryRsqrt { src, dst, dtype: _, layout: _, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::rv_unary_rsqrt(width.n(), dst.0, src.0));
+        }
+        Instr::ShTileMulRow { src, row_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::st_mul_row(width.n(), dst.0, src.0, row_vec.0));
+        }
+        Instr::ShTileMulCol { src, col_vec, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::st_mul_col(width.n(), dst.0, src.0, col_vec.0));
         }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");

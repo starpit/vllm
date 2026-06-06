@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 
 use crate::subtile_ir::{KvCacheLayout, KvCacheShape, RopeForm, SoftmaxStateId, SubtileId, SubtileIR, TensorId, TensorRegion};
 use crate::subtile_tape::{
-    ComputeInput, Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
+    ComputeInput, ComputeInputs, Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
 };
 use crate::tk_tape::{
     ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
@@ -530,7 +530,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     state: &mut LoweringState<F, K>,
     node_id: SubtileId,
     writes: SlotId,
-    inputs: &[ComputeInput],
+    inputs: &ComputeInputs,
 ) {
     use crate::subtile_ir::{EwKind, SubOp};
 
@@ -542,7 +542,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // same page. External inputs don't have a barrier (they're loaded
     // ahead of time via emit_external_load).
     // Conservative all-gmem path uses parity 0.
-    for ci in inputs {
+    for ci in inputs.iter() {
         if let ComputeInput::Computed(slot) = ci {
             let p = state.page_of(*slot);
             state.push(Instr::PageBarrierWaitStaticP0 {
@@ -568,11 +568,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // is implemented per SUBTILE_TK20_DECOMP.md.
     match &node.op {
         SubOp::Elementwise(EwKind::Mul) => {
-            assert!(
-                inputs.len() >= 2,
-                "lower_compute Elementwise(Mul): expected 2 inputs, got {}",
-                inputs.len(),
-            );
+            // Compile-time arity: A2 destructures into a typed
+            // 2-array; `[in0, in1]` indexing is rustc-checked, no
+            // runtime bounds check.
+            let [in0, in1] = inputs.expect_a2("Elementwise(Mul)");
             // Two compile-time witnesses ride on this constructor:
             //   - `GroupWidth::<16>::ALL_CONSUMERS` — the `where
             //     GroupWidth<N>: ComputeWidth` bound rejects N=1 /
@@ -587,8 +586,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //     expected.
             // Per `feedback_ff_subtile_compile_time_inviolable`.
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let _ = COMPUTE_ROLE; // role-tag retained for future
                                   // walker-side gating.
@@ -601,17 +600,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::Elementwise(EwKind::Add) => {
-            assert!(
-                inputs.len() >= 2,
-                "lower_compute Elementwise(Add): expected 2 inputs, got {}",
-                inputs.len(),
-            );
+            let [in0, in1] = inputs.expect_a2("Elementwise(Add)");
             // Same compile-time witnesses as the Mul arm; only the
             // emitted TK 2.0 primitive differs (`group<N>::add` vs
             // `group<N>::mul`).
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             state.push(Instr::sh_tile_add(
                 lhs,
@@ -622,11 +617,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::SumReduce => {
+            // Variadic — N≥2 inputs chained as N-1 ShTileAdd.
+            let inputs_v = inputs.expect_variadic("SumReduce");
             assert!(
-                inputs.len() >= 2,
-                "lower_compute SumReduce: expected ≥2 inputs, got {} \
-                 (N=1 lowers to a copy, not yet supported)",
-                inputs.len(),
+                inputs_v.len() >= 2,
+                "SumReduce expects ≥2 inputs (got {}); N=1 lowers to a copy, not yet supported",
+                inputs_v.len(),
             );
             // SumReduce over N inputs: chain N-1 ShTileAdd Instrs.
             // Per SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts":
@@ -640,16 +636,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //
             // TK 2.0 `add(T &dst, const T &lhs, const U &rhs)` allows
             // `dst` aliasing `lhs` (lhs is `const T&` to the same).
-            assert!(
-                inputs.len() >= 2,
-                "SumReduce expects ≥2 inputs (got {}); N=1 lowers to a copy, not yet supported",
-                inputs.len(),
-            );
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             // First add: dst = reads[0] + reads[1]
-            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
-            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[0]));
+            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[1]));
             state.push(Instr::sh_tile_add(
                 r0,
                 r1,
@@ -657,7 +648,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 GroupWidth::<16>::ALL_CONSUMERS,
             ));
             // Subsequent adds: dst += reads[i]
-            for ci in &inputs[2..] {
+            for ci in &inputs_v[2..] {
                 let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(ci));
                 state.push(Instr::sh_tile_add(
                     dst,
@@ -669,11 +660,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::SiluMul => {
-            assert!(
-                inputs.len() >= 2,
-                "lower_compute SiluMul: expected 2 inputs (gate, up), got {}",
-                inputs.len(),
-            );
+            let [gate_in, up_in] = inputs.expect_a2("SiluMul");
             // SiluMul: out = silu(gate) * up = (gate / (1 + exp(-gate))) * up
             //
             // Decomposition (5 Instrs per SUBTILE_TK20_DECOMP.md
@@ -689,8 +676,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //   step 4: ShTileDiv     (dst, gate, dst)      // dst = silu(gate)
             //   step 5: ShTileMul     (dst, dst, up)        // dst = silu(gate) * up
             use crate::tk_tape::{Bf16, GroupWidth, ScalarF32, SmemTileId};
-            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
-            let up = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(gate_in));
+            let up = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(up_in));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             // step 1
@@ -706,11 +693,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::Elementwise(EwKind::Silu) => {
-            assert!(
-                inputs.len() >= 1,
-                "lower_compute Elementwise(Silu): expected 1 read, got {}",
-                inputs.len(),
-            );
+            let [in0] = inputs.expect_a1("Elementwise(Silu)");
             // Silu: out = x * sigmoid(x) = x / (1 + exp(-x))
             //
             // Step 6 (register-resident chain, 6 Instrs per
@@ -732,7 +715,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32, SmemTileId,
             };
-            let src = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let src = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let rt_x: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_neg: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
@@ -756,11 +739,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RmsNorm { eps } => {
-            assert!(
-                inputs.len() >= 2,
-                "lower_compute RmsNorm: expected 2 inputs (x, gamma), got {}",
-                inputs.len(),
-            );
+            let [x_in, gamma_in] = inputs.expect_a2("RmsNorm");
             // RmsNorm: out[i,j] = x[i,j] * inv_rms[i] * gamma[j]
             //   inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
             //
@@ -790,8 +769,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // Resolve each positional input to a page. Computed
             // inputs reuse their producer's page; External inputs
             // get a fresh temp page populated by an emit_external_load.
-            let x_page = state.resolve_input_page(&inputs[0]);
-            let gamma_page = state.resolve_input_page(&inputs[1]);
+            let x_page = state.resolve_input_page(x_in);
+            let gamma_page = state.resolve_input_page(gamma_in);
             let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -848,11 +827,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RopeRotate { head_dim, _form: _ } => {
-            assert!(
-                inputs.len() >= 3,
-                "lower_compute RopeRotate: expected 3 inputs (x, cos, sin), got {}",
-                inputs.len(),
-            );
+            let [q_in, cos_in, sin_in] = inputs.expect_a3("RopeRotate");
             // RopeRotateNeoX: split q at head_dim/2; rotate as
             //   out_even = q_even * cos - q_odd * sin
             //   out_odd  = q_even * sin + q_odd * cos
@@ -884,9 +859,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegTileId,
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
-            let q_page = state.resolve_input_page(&inputs[0]);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[2]));
+            let q_page = state.resolve_input_page(q_in);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(cos_in));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(sin_in));
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -940,11 +915,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::MatmulTile => {
-            assert!(
-                inputs.len() >= 2,
-                "lower_compute MatmulTile: expected 2 inputs (a, b), got {}",
-                inputs.len(),
-            );
+            let [a_in, b_in] = inputs.expect_a2("MatmulTile");
             // MatmulTile: D[M, N] = A[M, K] @ B[K, N]
             //
             // Plan §"Per-SubOp Instr counts" line 17 (8 Instrs):
@@ -974,8 +945,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AccReset, AllConsumersRole, Bf16, FenceExternal, Fp32,
                 GroupWidth, RegTileId, RoleWitness, RowLayout, SmemTileId,
             };
-            let a = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
-            let b = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let a = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(a_in));
+            let b = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(b_in));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1033,13 +1004,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RopeAppend { head_dim, layer, layout, _form: _ } => {
-            assert!(
-                inputs.len() >= 4,
-                "lower_compute RopeAppend: expected ≥4 inputs (K, cos, sin, V), \
-                 got {} (likely external-source SubOp inputs not plumbed via \
-                 lower_dag_to_tape; see Phase A step 2 of the panic-RCA plan)",
-                inputs.len(),
-            );
+            let [k_in, cos_in, sin_in, v_in] = inputs.expect_a4("RopeAppend");
             // RopeAppend (step 10): rotate K (NeoX) + write rotated K
             // and un-rotated V into the paged KV cache at the runtime
             // decode position. Plan §"Per-SubOp Instr counts" line 26
@@ -1069,10 +1034,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
                 StoreSpec, TileShape, WarpRole,
             };
-            let k_page = state.resolve_input_page(&inputs[0]);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[2]));
-            let v_page = state.resolve_input_page(&inputs[3]);
+            let k_page = state.resolve_input_page(k_in);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(cos_in));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(sin_in));
+            let v_page = state.resolve_input_page(v_in);
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1160,12 +1125,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             producer: _,
             softmax_state: _,
         } => {
-            assert!(
-                inputs.len() >= 1,
-                "lower_compute AttnDecode: expected ≥1 read (q), got {} \
-                 (cache TensorIds come from layout witness, not reads[1..])",
-                inputs.len(),
-            );
+            // AttnDecode arity at the SubOp level is 1 (q); K/V cache
+            // tensors propagate via the `layout` witness rather than
+            // graph inputs.
+            let [q_in] = inputs.expect_a1("AttnDecode");
             // AttnDecode (steps 11-14): online softmax over a paged
             // KV cache.
             //
@@ -1214,7 +1177,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 WarpRole,
             };
             // reads = [q_page, k_cache_handle, v_cache_handle, ...]
-            let q_page = state.resolve_input_page(&inputs[0]);
+            let q_page = state.resolve_input_page(q_in);
             // K and V cache TensorIds come from the layout witness
             // (single source of truth, not from reads[].)
             let k_cache = layout.cache_tensor();

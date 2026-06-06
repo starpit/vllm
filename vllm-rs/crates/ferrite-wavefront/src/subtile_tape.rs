@@ -228,6 +228,103 @@ impl ComputeInput {
     }
 }
 
+/// Compile-time-arity wrapper around the positional input list of a
+/// [`Instr::Compute`]. Per Phase A step 7 of the panic-RCA plan +
+/// `feedback_compile_time_or_garbage` (INVIOLABLE): arity is a
+/// type-level property, not a runtime check.
+///
+/// Each fixed-arity variant holds an `[ComputeInput; N]` — destructure-
+/// matching `ComputeInputs::A2([in0, in1])` in `lower_compute` is
+/// structural and rejects any other arity at rustc time. The
+/// `Variadic` variant covers ops with dynamic arity (`SumReduce`'s
+/// split-K combine, `AttnDecode`'s odd-arity cache pairs).
+///
+/// Per-arity constructors on [`TapeBuilder`] take the right number
+/// of `ComputeInputBuild<'_>` arguments — wrong arity at construction
+/// is a function-signature type error, not a runtime panic.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ComputeInputs {
+    A1([ComputeInput; 1]),
+    A2([ComputeInput; 2]),
+    A3([ComputeInput; 3]),
+    A4([ComputeInput; 4]),
+    A6([ComputeInput; 6]),
+    Variadic(Vec<ComputeInput>),
+}
+
+impl ComputeInputs {
+    /// Iterate inputs in positional order regardless of arity variant.
+    /// Used by validator + barrier-wait emission.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = &ComputeInput> + '_> {
+        match self {
+            Self::A1(arr) => Box::new(arr.iter()),
+            Self::A2(arr) => Box::new(arr.iter()),
+            Self::A3(arr) => Box::new(arr.iter()),
+            Self::A4(arr) => Box::new(arr.iter()),
+            Self::A6(arr) => Box::new(arr.iter()),
+            Self::Variadic(v) => Box::new(v.iter()),
+        }
+    }
+    /// Number of positional inputs.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::A1(_) => 1,
+            Self::A2(_) => 2,
+            Self::A3(_) => 3,
+            Self::A4(_) => 4,
+            Self::A6(_) => 6,
+            Self::Variadic(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Destructure a fixed-arity inputs list into a typed array.
+    /// Each arm in `lower_compute` calls the helper matching its
+    /// SubOp arity — destructure-pattern-matching `[in0, in1]` gives
+    /// compile-time-indexed access to the inputs without runtime
+    /// bounds checks. Wrong variant → panic with a named message
+    /// (structurally dead given correct `dispatch_compute_inputs`
+    /// in `lower_dag_to_tape`).
+    pub fn expect_a1(&self, arm: &'static str) -> &[ComputeInput; 1] {
+        match self {
+            Self::A1(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A1, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_a2(&self, arm: &'static str) -> &[ComputeInput; 2] {
+        match self {
+            Self::A2(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A2, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_a3(&self, arm: &'static str) -> &[ComputeInput; 3] {
+        match self {
+            Self::A3(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A3, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_a4(&self, arm: &'static str) -> &[ComputeInput; 4] {
+        match self {
+            Self::A4(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A4, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_a6(&self, arm: &'static str) -> &[ComputeInput; 6] {
+        match self {
+            Self::A6(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A6, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_variadic(&self, arm: &'static str) -> &[ComputeInput] {
+        match self {
+            Self::Variadic(v) => v,
+            _ => panic!("{arm}: expected ComputeInputs::Variadic, got {:?}", self.len()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Instr {
     /// Mint a fresh slot id for a producer's output. Pairs (eventually)
@@ -242,7 +339,7 @@ pub enum Instr {
     Compute {
         node: SubtileId,
         writes: SlotId,
-        inputs: Vec<ComputeInput>,
+        inputs: ComputeInputs,
     },
     /// Retire the named slot — the last consumer is done. Slot id
     /// returns to the pool (the per-target lowering may recycle).
@@ -529,27 +626,27 @@ pub enum ComputeInputBuild<'a> {
     },
 }
 
-fn push_compute(
+fn ci_from(b: &ComputeInputBuild<'_>) -> ComputeInput {
+    match b {
+        ComputeInputBuild::Computed(w) => ComputeInput::Computed(w.slot),
+        ComputeInputBuild::External { tensor, region } => ComputeInput::External {
+            tensor: *tensor,
+            region: *region,
+        },
+    }
+}
+
+fn push_compute_inputs(
     instrs: &mut Vec<Instr>,
     node: SubtileId,
     write: SlotHandle,
-    inputs: &[ComputeInputBuild<'_>],
+    inputs: ComputeInputs,
 ) -> SlotWritten {
     let writes_id = write.slot;
-    let inputs_owned: Vec<ComputeInput> = inputs
-        .iter()
-        .map(|ci| match ci {
-            ComputeInputBuild::Computed(w) => ComputeInput::Computed(w.slot),
-            ComputeInputBuild::External { tensor, region } => ComputeInput::External {
-                tensor: *tensor,
-                region: *region,
-            },
-        })
-        .collect();
     instrs.push(Instr::Compute {
         node,
         writes: writes_id,
-        inputs: inputs_owned,
+        inputs,
     });
     SlotWritten {
         slot: writes_id,
@@ -557,31 +654,68 @@ fn push_compute(
     }
 }
 
+/// Per-arity dispatch for builder callers that have a `&[ComputeInputBuild]`
+/// of caller-determined size (e.g. lower_dag_to_tape walking
+/// `node.inputs` whose length depends on the SubOp).
+///
+/// The arity-typed constructors (`compute_a1_to`, `compute_a2_to`,
+/// etc.) are the COMPILE-TIME-SAFE entry points — caller passes the
+/// right number of `ComputeInputBuild` arguments. This dispatch
+/// helper exists for cases where the caller already has a slice of
+/// the right length but doesn't statically know which length; it
+/// builds the right [`ComputeInputs`] variant.
+fn dispatch_compute_inputs(inputs: &[ComputeInputBuild<'_>]) -> ComputeInputs {
+    match inputs.len() {
+        1 => ComputeInputs::A1([ci_from(&inputs[0])]),
+        2 => ComputeInputs::A2([ci_from(&inputs[0]), ci_from(&inputs[1])]),
+        3 => ComputeInputs::A3([
+            ci_from(&inputs[0]),
+            ci_from(&inputs[1]),
+            ci_from(&inputs[2]),
+        ]),
+        4 => ComputeInputs::A4([
+            ci_from(&inputs[0]),
+            ci_from(&inputs[1]),
+            ci_from(&inputs[2]),
+            ci_from(&inputs[3]),
+        ]),
+        6 => ComputeInputs::A6([
+            ci_from(&inputs[0]),
+            ci_from(&inputs[1]),
+            ci_from(&inputs[2]),
+            ci_from(&inputs[3]),
+            ci_from(&inputs[4]),
+            ci_from(&inputs[5]),
+        ]),
+        _ => ComputeInputs::Variadic(inputs.iter().map(ci_from).collect()),
+    }
+}
+
 impl TapeBuilder<state::Outside> {
-    /// Compute `node`, writing its output into `write` (consuming the
-    /// `SlotHandle`) and reading from `inputs` (positional list of
-    /// computed slots + external graph-source references). Returns the
-    /// `SlotWritten` token for downstream consumers.
+    /// Compute `node`, dispatching positional inputs to the right
+    /// arity-typed [`ComputeInputs`] variant.  See per-arity helpers
+    /// (`compute_a1_to`, `compute_a2_to`, etc.) for callers that
+    /// statically know the arity.
     pub fn compute_to(
         &mut self,
         node: SubtileId,
         write: SlotHandle,
         inputs: &[ComputeInputBuild<'_>],
     ) -> SlotWritten {
-        push_compute(&mut self.instrs, node, write, inputs)
+        let ci = dispatch_compute_inputs(inputs);
+        push_compute_inputs(&mut self.instrs, node, write, ci)
     }
 }
 
 impl TapeBuilder<state::InsideLoop> {
-    /// Compute `node` inside the active loop body. Same shape as the
-    /// `Outside` impl; both states share the workload instruction.
     pub fn compute_to(
         &mut self,
         node: SubtileId,
         write: SlotHandle,
         inputs: &[ComputeInputBuild<'_>],
     ) -> SlotWritten {
-        push_compute(&mut self.instrs, node, write, inputs)
+        let ci = dispatch_compute_inputs(inputs);
+        push_compute_inputs(&mut self.instrs, node, write, ci)
     }
 
     /// Close the active loop. Returns a builder back in the `Outside`
@@ -753,6 +887,9 @@ fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvC
                         ComputeInput::External { .. } => None,
                     })
                     .collect();
+                // ComputeInputs::iter() returns Box<dyn Iterator>; the
+                // .collect above forces it to a Vec. Same shape as
+                // before the typed-arity refactor.
                 let n_idx = node.0 as usize;
                 if n_idx < preds.len() {
                     let mut expected = preds[n_idx].clone();
@@ -948,7 +1085,7 @@ pub enum PlayStep {
     Computed {
         node: SubtileId,
         writes: SlotId,
-        inputs: Vec<ComputeInput>,
+        inputs: ComputeInputs,
     },
     Freed(SlotId),
     LoopOpened(u32),
@@ -1148,7 +1285,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(99),
                     writes: mk_slot(0),
-                    inputs: vec![],
+                    inputs: ComputeInputs::Variadic(vec![]),
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],
@@ -1187,12 +1324,12 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: vec![],
+                    inputs: ComputeInputs::Variadic(vec![]),
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: vec![],
+                    inputs: ComputeInputs::Variadic(vec![]),
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],
@@ -1217,12 +1354,12 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(1),
                     writes: mk_slot(1),
-                    inputs: vec![],
+                    inputs: ComputeInputs::Variadic(vec![]),
                 },
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: vec![],
+                    inputs: ComputeInputs::Variadic(vec![]),
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
                 Instr::FreeSlot { slot: mk_slot(1) },
@@ -1258,7 +1395,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: vec![ComputeInput::Computed(mk_slot(0))], // self-read names node 0 as a pred — bogus
+                    inputs: ComputeInputs::A1([ComputeInput::Computed(mk_slot(0))]), // self-read names node 0 as a pred — bogus
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],

@@ -513,6 +513,11 @@ pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
     /// Suffix for the `kittens::st_<suffix><ROWS, COLS>` template
     /// alias defined in `types/shared/st.cuh:313`.
     const ST_ALIAS_SUFFIX: &'static str;
+    /// Bytes per element. Used by [`SmemTileSpec`] to recover the
+    /// runtime `elem_bytes` value for emit (TMA descriptor sizing,
+    /// `expect_bytes` arithmetic) without storing it as a separate
+    /// runtime field.
+    const ELEM_BYTES: u32;
 }
 
 /// `kittens::bf16` — Hopper bfloat16. The only dtype currently bound
@@ -522,6 +527,7 @@ pub struct Bf16;
 impl tile_dtype_sealed::Sealed for Bf16 {}
 impl TileDtype for Bf16 {
     const ST_ALIAS_SUFFIX: &'static str = "bf";
+    const ELEM_BYTES: u32 = 2;
 }
 
 /// Typed shared-memory tile handle: a [`PageId`] paired with type-level
@@ -622,6 +628,85 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, 
     }
 }
 
+/// Typed shape-only witness for TMA-descriptor sizing.
+/// [`LoadSpec`] / [`StoreSpec`] used to carry a raw [`TileShape`] —
+/// any caller could pass arbitrary `(rows, cols, elem_bytes)` and a
+/// stringly-typed mismatch versus the actual page would surface as a
+/// silent TMA-descriptor corruption rather than a Rust error.
+///
+/// `SmemTileSpec<const ROWS, const COLS, T: TileDtype>` is a sealed
+/// phantom-typed witness mirroring [`SmemTileId`] but with no
+/// associated [`PageId`] (the spec describes a tile *shape*, not an
+/// occupant). Construction (`from_shape`) is `pub(crate)`; the
+/// constructor `debug_assert!`s the runtime shape matches the const
+/// generics as a boundary belt-and-suspenders. The runtime
+/// [`TileShape`] is recovered by [`SmemTileSpec::shape`] for the
+/// erased Instr field.
+///
+/// # Compile-fail proof — shape/dtype mismatch via shared-bound helper
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, SmemTileSpec, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype>(
+///     _a: SmemTileSpec<R, C, T>,
+///     _b: SmemTileSpec<R, C, T>,
+/// ) {}
+/// let a: SmemTileSpec<128, 128, Bf16> = unreachable!();
+/// let b: SmemTileSpec<128,  64, Bf16> = unreachable!();
+/// _all_same(a, b);  // ← rustc rejects: COLS=128 vs COLS=64
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SmemTileSpec<const ROWS: usize, const COLS: usize, T: TileDtype> {
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS, T> {
+    /// Mint a typed spec from a runtime shape. `pub(crate)`: only
+    /// the lowerer (which owns the page-shape mapping) can mint
+    /// these. `debug_assert!`s shape conformance — a release-mode
+    /// mismatch is a typed-witness lie, but the const-generics are
+    /// what flow into emit and downstream type-checks.
+    pub(crate) fn from_shape(shape: TileShape) -> Self {
+        debug_assert_eq!(
+            shape.rows, ROWS as u32,
+            "SmemTileSpec<{ROWS},_,_>::from_shape: rows mismatch (got {})",
+            shape.rows,
+        );
+        debug_assert_eq!(
+            shape.cols, COLS as u32,
+            "SmemTileSpec<_,{COLS},_>::from_shape: cols mismatch (got {})",
+            shape.cols,
+        );
+        debug_assert_eq!(
+            shape.elem_bytes,
+            T::ELEM_BYTES,
+            "SmemTileSpec<_,_,T>::from_shape: elem_bytes mismatch (got {})",
+            shape.elem_bytes,
+        );
+        Self {
+            _marker: PhantomData,
+        }
+    }
+
+    /// Recover the runtime [`TileShape`] for the erased Instr field.
+    /// All three components come from the const-generics and the
+    /// sealed `T::ELEM_BYTES`.
+    pub const fn shape(&self) -> TileShape {
+        TileShape {
+            rows: ROWS as u32,
+            cols: COLS as u32,
+            elem_bytes: T::ELEM_BYTES,
+        }
+    }
+
+    pub const fn rows() -> usize {
+        ROWS
+    }
+    pub const fn cols() -> usize {
+        COLS
+    }
+}
+
 /// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub(crate) u8);
@@ -692,6 +777,11 @@ impl TileType {
     }
 }
 
+/// TMA-load arguments. Fields are `pub` for player read-access; the
+/// only constructors are [`LoadSpec::new`] and the existing pattern
+/// of struct-literal construction inside the crate (`pub(crate)`
+/// would block both at once). The compile-time gate on `tile`
+/// shape/dtype lives at [`LoadSpec::new`].
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub dst_page: PageId,
@@ -703,6 +793,31 @@ pub struct LoadSpec {
     pub barrier_page: PageId,
 }
 
+impl LoadSpec {
+    /// Construct a [`LoadSpec`] from a typed [`SmemTileSpec<ROWS,
+    /// COLS, T>`] witness. The const-generics + sealed `T::ELEM_BYTES`
+    /// are the source of truth for the runtime [`TileShape`] field
+    /// — callers cannot pass arbitrary `(rows, cols, elem_bytes)`.
+    /// Per `feedback_ff_subtile_compile_time_inviolable`.
+    pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        dst_page: PageId,
+        src_tensor: TensorId,
+        byte_off: ByteOffset,
+        tile: SmemTileSpec<ROWS, COLS, T>,
+        role: WarpRole,
+        barrier_page: PageId,
+    ) -> Self {
+        Self {
+            dst_page,
+            src_tensor,
+            byte_off,
+            tile: tile.shape(),
+            role,
+            barrier_page,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoreSpec {
     pub src_page: PageId,
@@ -710,6 +825,26 @@ pub struct StoreSpec {
     pub byte_off: ByteOffset,
     pub tile: TileShape,
     pub role: WarpRole,
+}
+
+impl StoreSpec {
+    /// Construct a [`StoreSpec`] from a typed [`SmemTileSpec<ROWS,
+    /// COLS, T>`] witness. See [`LoadSpec::new`].
+    pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src_page: PageId,
+        dst_tensor: TensorId,
+        byte_off: ByteOffset,
+        tile: SmemTileSpec<ROWS, COLS, T>,
+        role: WarpRole,
+    ) -> Self {
+        Self {
+            src_page,
+            dst_tensor,
+            byte_off,
+            tile: tile.shape(),
+            role,
+        }
+    }
 }
 
 /// Phase parity for `Instr::wait_static` / `Instr::wait_loop`

@@ -497,16 +497,21 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     inp: &TensorRegion,
     dst_page: PageId,
 ) {
-    let tile = region_tile_shape(inp);
+    use crate::tk_tape::{Bf16, SmemTileSpec};
+    // Typed-witness mint: the substrate's uniform 128×128 bf16 page
+    // pool is the type-level invariant. `from_shape` debug_asserts the
+    // runtime shape matches; const-generics propagate to LoadSpec.
+    // Per `feedback_ff_subtile_compile_time_inviolable`.
+    let tile = SmemTileSpec::<128, 128, Bf16>::from_shape(region_tile_shape(inp));
     let byte_off = region_byte_offset(state.graph, inp);
-    state.push(Instr::LoadAsync(LoadSpec {
+    state.push(Instr::LoadAsync(LoadSpec::new(
         dst_page,
-        src_tensor: inp.tensor,
+        inp.tensor,
         byte_off,
         tile,
-        role: LOAD_ROLE,
-        barrier_page: dst_page,
-    }));
+        LOAD_ROLE,
+        dst_page,
+    )));
 }
 
 fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
@@ -514,15 +519,16 @@ fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
     out: &TensorRegion,
     dst_page: PageId,
 ) {
-    let tile = region_tile_shape(out);
+    use crate::tk_tape::{Bf16, SmemTileSpec};
+    let tile = SmemTileSpec::<128, 128, Bf16>::from_shape(region_tile_shape(out));
     let byte_off = region_byte_offset(state.graph, out);
-    state.push(Instr::StoreAsync(StoreSpec {
-        src_page: dst_page,
-        dst_tensor: out.tensor,
+    state.push(Instr::StoreAsync(StoreSpec::new(
+        dst_page,
+        out.tensor,
         byte_off,
         tile,
-        role: STORE_ROLE,
-    }));
+        STORE_ROLE,
+    )));
     state.push(Instr::CommitGroupBulk { role: STORE_ROLE });
     state.push(Instr::ThreadfenceDevice { role: ALL_ROLE });
     state.push(Instr::PageBarrierArrive {

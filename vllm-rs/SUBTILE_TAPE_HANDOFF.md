@@ -50,7 +50,7 @@ What landed in this session:
 - `SlotHandle` (move-only) → `SlotWritten` (move-only) → free.
 - `SlotId`, `SlotHandle`, `SlotWritten`, `LoopVarId`, `RuntimeBoundId` all sealed via `sealed::Seal(pub(super) ())`.
 - `TapeBuilder<S>` typestate: `S::Loop` associated type (Outside = `()`, InsideLoop = `LoopVarId`) — no `Option`, no runtime `expect`.
-- `validate_subtile_tape` enforces: compute well-formedness, loop balance, slot lifecycle, slot id range, **edge coverage** (load-bearing — `Compute.reads`'s set-of-writers equals `predecessors()` set).
+- `validate_subtile_tape` enforces two relational (tape, SubtileIR) checks: compute well-formedness (UnknownNode / MissingCompute / DuplicateCompute / TopoOrderViolation) and **edge coverage** (load-bearing — `Compute.reads`'s set-of-writers equals `predecessors()` set; EdgeMismatch). Loop balance, slot lifecycle, and slot id range are sealed at compile time by `TapeBuilder<S>` typestate (move-only `SlotHandle`/`SlotWritten`, `state::Outside`/`state::InsideLoop`) plus the now-private `SubtileTape::instrs` field — see audit BLOCKER fix `wewpteccb` and the compile-fail doctests on `TapeBuilder`.
 - `lower_dag_to_tape(&ValidatedGraph<F>) -> SubtileTape` — the `ValidatedGraph` typed witness elides the runtime validate-the-IR gate at lowering entry.
 
 ### TkTape (`tk_tape.rs`)
@@ -89,7 +89,7 @@ Conservative all-gmem; no analysis, no lookahead, no shmem decisions (those are 
 ## Hard rules — DO NOT VIOLATE (still binding)
 
 - **Tape is a tape.** No side-tables on SubtileTape.
-- **Hazards explicit.** Slot lifecycle + EdgeMismatch validator.
+- **Hazards explicit.** Slot lifecycle sealed at compile time by `TapeBuilder<S>` typestate; runtime `EdgeMismatch` validator catches relational tape↔graph mismatches.
 - **Tape runs correctly, if slowly.** `validate_subtile_tape` + `validate_tk_tape` run at lowering exits.
 - **Player ≤5 lines per arm, one TK 2.0 call per arm.** No inner-match dispatch beyond sealed-enum-to-token. No emit-time arithmetic.
 - **Compile-time-or-garbage.** Typed witnesses (ValidatedGraph, NonZeroU32, S::Loop assoc, KvCacheLayout, GemmK-via-derivation, sealed Seal'd handles).

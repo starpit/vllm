@@ -109,34 +109,49 @@ compile-fail.
 ## Runtime validator
 
 `validate_subtile_tape(&tape, &graph) -> Result<(), Vec<ValidationError>>`
-runs six checks. Each is derivable from the instruction stream + the
-SubtileIR alone:
+runs three relational (tape, SubtileIR) checks. Per audit BLOCKER fix
+`wewpteccb` (K5 + `feedback_compile_time_or_garbage`): slot lifecycle,
+loop balance, and slot id range were removed from the runtime
+validator because they are sealed at compile time by `TapeBuilder<S>`
+typestate plus the now-private `SubtileTape::instrs` field — there is
+no construction path that bypasses the typestate, so the runtime
+checks would be unreachable.
 
 - **Compute well-formedness** — every SubtileIR node is `Compute`'d
   exactly once (`MissingCompute` / `DuplicateCompute`); no `Compute`
   references an out-of-range node id (`UnknownNode`); adjacent
   Computes appear in strictly ascending `SubtileId` order
   (`TopoOrderViolation`).
-- **Loop balance** — every `OpenLoop` matches a `CloseLoop` with the
-  same `LoopVarId`; no nesting (`NestedLoop`); no unclosed loops at
-  end-of-tape (`UnclosedLoop`); no `CloseLoop` without a matching
-  `OpenLoop` (`UnmatchedCloseLoop`); `OpenLoop` and `CloseLoop` agree
-  on `var` (`MismatchedLoopVar`).
-- **Slot lifecycle** — each slot transits Allocated → Written → Freed
-  exactly once: `WriteUnallocatedSlot`, `ReadBeforeWrite`,
-  `DoubleWrite`, `UseAfterFree`, `FreeUnallocatedSlot`, `DoubleFree`,
-  `SlotNeverFreed`.
-- **Slot id range** — every `AllocSlot` / `Compute.writes` /
-  `Compute.reads` / `FreeSlot` slot id is in `0..num_slots`
-  (`AllocSlotOutOfRange`, `SlotIdOutOfRange`).
 - **Edge coverage** — for every `Compute { node, reads }`, the
   set-of-writers of `reads` equals the SubtileIR predecessor set of
   `node` (`EdgeMismatch`). This is the load-bearing check that "every
   DAG edge is an explicit instruction."
 
-The TapeBuilder typestate prevents the lifecycle errors at compile time
-when the builder is used; the runtime validator defends against
-hand-built tapes that mutate `SubtileTape::instrs` directly.
+The `ValidationError` enum carries exactly five variants:
+`UnknownNode`, `MissingCompute`, `DuplicateCompute`,
+`TopoOrderViolation`, `EdgeMismatch`.
+
+## Compile-time guarantees (TapeBuilder typestate)
+
+The following invariants are sealed at the type level — there is no
+runtime check, and there cannot be one, because constructing a
+violation is a Rust type error:
+
+- **Slot lifecycle** — `SlotHandle` (Allocated, unwritten) is
+  move-only and consumed by `compute_to`; `SlotWritten` (written,
+  multi-reader) is move-only and consumed by `free_slot`. Single-
+  writer / read-before-write / double-write / use-after-free /
+  double-free / write-unallocated-slot become use-after-move
+  compile errors. See compile-fail doctests on `TapeBuilder`.
+- **Loop balance** — `TapeBuilder<state::Outside>` / `<state::InsideLoop>`
+  typestate makes nesting unrepresentable, `close_loop` callable
+  only inside a loop, `finish` callable only outside, and the
+  `LoopVarId` carried by `state::InsideLoop::Loop` makes
+  `MismatchedLoopVar` impossible.
+- **Slot id range** — `TapeBuilder::alloc_slot` mints sequential
+  ids and `num_slots = next_slot` at `finish`, so every minted
+  `SlotId` is by construction in `0..num_slots`. `SlotId` is sealed
+  (only constructable via `alloc_slot`).
 
 ## Design principles
 

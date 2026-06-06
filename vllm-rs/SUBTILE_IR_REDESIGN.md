@@ -131,25 +131,34 @@ Two validators, mirroring the two tapes:
 
 - **`validate_subtile_tape(&SubtileTape, &SubtileIR)`** — target-
   agnostic, IR-shape only. No worker, no barrier, no fence, no memory
-  class — none of those exist at this layer.
+  class — none of those exist at this layer. Per audit BLOCKER fix
+  `wewpteccb` (K5 + `feedback_compile_time_or_garbage`): the runtime
+  validator carries only relational (tape, SubtileIR) checks; slot
+  lifecycle, loop balance, and slot id range are sealed at compile
+  time by `TapeBuilder<S>`'s typestate (move-only `SlotHandle` /
+  `SlotWritten`, sealed `state::Outside` / `state::InsideLoop`)
+  combined with the now-private `SubtileTape::instrs` field, which
+  makes the only construction path go through the typestate.
+  Three runtime checks remain:
   - **Compute well-formedness**: every `Compute` names an in-range
     `SubtileId`; every SubtileIR node is `Compute`'d exactly once;
     adjacent Computes appear in strictly ascending `SubtileId` order
-    (the tape is a topological linearization of the DAG).
-  - **Loop balance**: every `OpenLoop` has a matching `CloseLoop`
-    with the same `LoopVarId`; no nesting; no unclosed loops.
-  - **Slot lifecycle**: each slot transits Allocated → Written →
-    Freed exactly once. Errors: `WriteUnallocatedSlot`,
-    `ReadBeforeWrite`, `DoubleWrite`, `UseAfterFree`,
-    `FreeUnallocatedSlot`, `DoubleFree`, `SlotNeverFreed`. The
-    typestate prevents these at compile time when the builder is used;
-    the validator backs against hand-built tapes that bypass it.
-  - **Slot id range**: every slot id is in `0..num_slots`.
+    (the tape is a topological linearization of the DAG). Errors:
+    `UnknownNode`, `MissingCompute`, `DuplicateCompute`,
+    `TopoOrderViolation`.
   - **Edge coverage** (load-bearing — this is what "every DAG edge
     is an explicit instruction" reduces to): for every
     `Compute { node, reads }`, the set-of-writers of `reads` equals
     the SubtileIR predecessor set of `node`. Mismatch =
     `EdgeMismatch`.
+
+  Slot lifecycle (Allocated → Written → Freed exactly once),
+  slot id range (`0..num_slots`), and loop balance (matched
+  `OpenLoop` / `CloseLoop`, no nesting, no unclosed) are all
+  unrepresentable at compile time and therefore not part of the
+  runtime `ValidationError` enum. See
+  `crates/ferrite-wavefront/src/subtile_tape.rs` (the `TapeBuilder`
+  module and its compile-fail doctests).
 - **`validate_tk_tape(&TkTape)`** — TK-specific. Runs **after lowering
   and again after every optimizer pass**. Each pass declares the
   postcondition it must preserve; the validator is the conjunction.

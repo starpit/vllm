@@ -40,13 +40,17 @@
 //!
 //! ## What does NOT live here
 //!
-//! Per plan §4 commit 3.b: **no smem, no gmem, no fence, no page,
-//! no parity** — all target-specific concepts (execution-unit
-//! abstractions, memory-tier classification, visibility primitives,
-//! pipeline-state tracking) belong on TkTape. The IR-level witnesses
-//! (`KvCacheLayout`, `KvCacheProducer`, `RopeForm`, online-softmax
-//! state) live on the SubtileIR `SubOp` variants; the lowering looks
-//! them up by `SubtileId`.
+//! Per plan §4 commit 3.b — see SUBTILE_TAPE_CONSTRAINTS.md for the
+//! canonical exclusion list. All target-specific concepts
+//! (execution-unit abstractions, memory-tier classification,
+//! visibility primitives, pipeline-state tracking) belong on TkTape.
+//! The IR-level witnesses (`KvCacheLayout`, `KvCacheProducer`,
+//! `RopeForm`, online-softmax state) live on the SubtileIR `SubOp`
+//! variants; the lowering looks them up by `SubtileId`.
+//!
+//! Plan §5 K2 is mechanically grep-checkable against this file: a
+//! grep for any of the forbidden target-specific tokens must return
+//! zero hits.
 //!
 //! For the canonical exclusion list see
 //! [`crate::subtile_ir`] and `SUBTILE_TAPE_CONSTRAINTS.md`. K2
@@ -700,7 +704,7 @@ fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvC
 ///    retires the predecessor's slot.
 ///
 /// `SubOp::AttnDecode` wraps in an `OpenLoop` / `CloseLoop` pair over
-/// a runtime-bounded count (the KV-sweep over `seq_len` pages); the
+/// a runtime-bounded count (the KV-sweep over `seq_len` blocks); the
 /// AttnDecode `Compute` lives inside the loop, the slot lifecycle
 /// (alloc / free) lives outside.
 ///

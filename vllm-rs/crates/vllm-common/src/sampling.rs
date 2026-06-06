@@ -684,3 +684,85 @@ mod tests {
         assert!(p.validate().is_ok());
     }
 }
+
+/// Model-recommended sampling defaults from `generation_config.json`.
+///
+/// Mirrors Python vLLM's `generation_config="auto"` behavior
+/// (`ModelConfig.get_diff_sampling_param`): the model repo's
+/// `generation_config.json` supplies DEFAULT values for the sampling
+/// fields below; a value the user sets explicitly on the request
+/// always wins. The key set matches Python vLLM exactly
+/// (`repetition_penalty`, `temperature`, `top_p`, `top_k`, `min_p`,
+/// `max_new_tokens`).
+///
+/// Why this exists: thinker models (Qwen3.5) ship
+/// `temperature 1.0 / top_k 20 / top_p 0.95` and degrade into
+/// endless repetition under the neutral defaults (greedy-adjacent
+/// full-vocab sampling). HF transformers and mlx-lm honor the file;
+/// a serving stack that ignores it produces different (worse) output
+/// from the same checkpoint.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GenerationDefaults {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+    pub max_new_tokens: Option<u32>,
+}
+
+impl GenerationDefaults {
+    /// Parse `<model_dir>/generation_config.json`. Missing file or
+    /// unparsable JSON ⇒ empty defaults (neutral behavior, identical
+    /// to Python vLLM when the repo ships no generation config).
+    pub fn from_model_dir(dir: &std::path::Path) -> Self {
+        let path = dir.join("generation_config.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Self::default();
+        };
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Self::default();
+        };
+        Self {
+            temperature: json.get("temperature").and_then(|v| v.as_f64()),
+            top_p: json.get("top_p").and_then(|v| v.as_f64()),
+            top_k: json.get("top_k").and_then(|v| v.as_i64()).map(|v| v as i32),
+            min_p: json.get("min_p").and_then(|v| v.as_f64()),
+            repetition_penalty: json.get("repetition_penalty").and_then(|v| v.as_f64()),
+            max_new_tokens: json
+                .get("max_new_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// [`SamplingParams::default`] overlaid with the model defaults —
+    /// the base every request starts from before explicit user values
+    /// are applied.
+    pub fn as_base(&self) -> SamplingParams {
+        let mut p = SamplingParams::default();
+        if let Some(t) = self.temperature {
+            p.temperature = t;
+        }
+        if let Some(t) = self.top_p {
+            p.top_p = t;
+        }
+        if let Some(t) = self.top_k {
+            p.top_k = t;
+        }
+        if let Some(t) = self.min_p {
+            p.min_p = t;
+        }
+        if let Some(t) = self.repetition_penalty {
+            p.repetition_penalty = t;
+        }
+        if let Some(t) = self.max_new_tokens {
+            p.max_tokens = Some(t);
+        }
+        p
+    }
+}

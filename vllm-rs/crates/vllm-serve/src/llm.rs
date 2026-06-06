@@ -357,6 +357,9 @@ pub struct LLM {
     model_name: String,
     max_model_len: usize,
     block_size: usize,
+    /// Model-recommended sampling defaults (`generation_config.json`),
+    /// Python vLLM `generation_config="auto"` parity.
+    generation_defaults: vllm_common::sampling::GenerationDefaults,
 }
 
 impl LLM {
@@ -386,12 +389,28 @@ impl LLM {
             model_name: stack.model_name,
             max_model_len: stack.max_model_len,
             block_size: stack.block_size,
+            generation_defaults: stack.generation_defaults,
         })
     }
 
     /// The model name / HuggingFace ID.
     pub fn model_name(&self) -> &str {
         &self.model_name
+    }
+
+    /// [`SamplingParams::default`] overlaid with the model's
+    /// `generation_config.json` recommendations — the base callers
+    /// should start from before applying explicit user choices
+    /// (matches HF transformers / mlx-lm / Python vLLM "auto").
+    pub fn default_sampling_params(&self) -> SamplingParams {
+        self.generation_defaults.as_base()
+    }
+
+    /// `generation_config.json::max_new_tokens` if the model ships one
+    /// (distinct from `SamplingParams::default().max_tokens`, which is
+    /// the OpenAI-conventional 16 and NOT a model recommendation).
+    pub fn generation_max_new_tokens(&self) -> Option<u32> {
+        self.generation_defaults.max_new_tokens
     }
 
     /// The maximum context length.
@@ -601,7 +620,7 @@ impl LLM {
         seal: bool,
         volatile: bool,
     ) -> Result<Vec<RequestOutput>> {
-        let params = params.unwrap_or_default();
+        let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
         params
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
@@ -882,7 +901,7 @@ impl LLM {
             .apply(&msg_values, true, None)
             .map_err(|e| anyhow::anyhow!("chat template render failed: {e}"))?;
 
-        let params = params.unwrap_or_default();
+        let params = params.unwrap_or_else(|| self.generation_defaults.as_base());
         params
             .validate()
             .map_err(|e| anyhow::anyhow!("invalid sampling params: {e}"))?;
@@ -891,6 +910,13 @@ impl LLM {
         let prompt_token_ids = self.tokenize_text(&prompt)?;
         let mut sp = params.clone();
         self.resolve_max_tokens(&mut sp, prompt_token_ids.len());
+        if std::env::var_os("VLLM_DEBUG_PARAMS").is_some() {
+            eprintln!(
+                "[debug-params] max_model_len={} prompt={} sp={sp:?}",
+                self.max_model_len,
+                prompt_token_ids.len()
+            );
+        }
 
         let request_id = format!("llm-chat-{}", uuid::Uuid::new_v4());
         self.client

@@ -234,6 +234,10 @@ pub struct AsyncEngine {
     reasoning_parser: Option<Arc<dyn ReasoningParser>>,
     /// Default extra kwargs for chat template rendering (e.g. `enable_thinking`).
     default_chat_template_kwargs: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Model-recommended sampling defaults from `generation_config.json`
+    /// (Python vLLM `generation_config="auto"` parity). Request fields
+    /// left unset fall back to these before the neutral defaults.
+    generation_defaults: vllm_common::sampling::GenerationDefaults,
     /// Whether async scheduling is enabled (overlap GPU execution with CPU scheduling).
     async_scheduling: bool,
     /// Set to `true` when the step loop is running; cleared on exit.
@@ -283,6 +287,7 @@ impl AsyncEngine {
             tool_parser: None,
             reasoning_parser: None,
             default_chat_template_kwargs: None,
+            generation_defaults: Default::default(),
             async_scheduling: false,
             step_loop_alive: Arc::new(AtomicBool::new(false)),
             #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
@@ -404,6 +409,12 @@ impl AsyncEngine {
     }
 
     /// Enable or disable async scheduling.
+    /// Install model-recommended sampling defaults
+    /// (`generation_config.json`). See `GenerationDefaults`.
+    pub fn set_generation_defaults(&mut self, d: vllm_common::sampling::GenerationDefaults) {
+        self.generation_defaults = d;
+    }
+
     pub fn set_async_scheduling(&mut self, enabled: bool) {
         self.async_scheduling = enabled;
     }
@@ -3136,13 +3147,20 @@ impl AsyncEngine {
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
 
+        // Unset request fields fall back to the model's
+        // generation_config.json defaults (Python vLLM
+        // `generation_config="auto"`), then to neutral.
+        let d = &self.generation_defaults;
         Ok(SamplingParams {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(0),
-            min_p: request.min_p.unwrap_or(0.0),
-            max_tokens,
-            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
+            temperature: request.temperature.or(d.temperature).unwrap_or(1.0),
+            top_p: request.top_p.or(d.top_p).unwrap_or(1.0),
+            top_k: request.top_k.or(d.top_k).unwrap_or(0),
+            min_p: request.min_p.or(d.min_p).unwrap_or(0.0),
+            max_tokens: max_tokens.or(d.max_new_tokens),
+            repetition_penalty: request
+                .repetition_penalty
+                .or(d.repetition_penalty)
+                .unwrap_or(1.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             seed: request.seed.map(|s| s as u64),
@@ -3182,13 +3200,17 @@ impl AsyncEngine {
         // Tokenize bad_words strings into token sequences.
         let bad_words_token_ids = self.tokenize_bad_words(&request.bad_words)?;
 
+        let d = &self.generation_defaults;
         Ok(SamplingParams {
-            temperature: request.temperature.unwrap_or(1.0),
-            top_p: request.top_p.unwrap_or(1.0),
-            top_k: request.top_k.unwrap_or(0),
-            min_p: request.min_p.unwrap_or(0.0),
-            max_tokens: request.max_tokens,
-            repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
+            temperature: request.temperature.or(d.temperature).unwrap_or(1.0),
+            top_p: request.top_p.or(d.top_p).unwrap_or(1.0),
+            top_k: request.top_k.or(d.top_k).unwrap_or(0),
+            min_p: request.min_p.or(d.min_p).unwrap_or(0.0),
+            max_tokens: request.max_tokens.or(d.max_new_tokens),
+            repetition_penalty: request
+                .repetition_penalty
+                .or(d.repetition_penalty)
+                .unwrap_or(1.0),
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             seed: request.seed.map(|s| s as u64),

@@ -152,12 +152,23 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     }
 
     // Match Python's `vllm chat`: omit max_tokens so the server resolves it
-    // to the full remaining context window, letting the model emit EOS naturally.
-    let params = Some(vllm_serve::llm::SamplingParams {
-        max_tokens: args.max_tokens,
-        temperature: args.temperature.unwrap_or(1.0),
-        ..Default::default()
-    });
+    // to the full remaining context window, letting the model emit EOS
+    // naturally. Base = the model's generation_config.json defaults
+    // (temperature/top_p/top_k/min_p/repetition_penalty — e.g. Qwen3.5
+    // thinkers ship 1.0/0.95/20 and loop endlessly without them);
+    // explicit CLI flags override.
+    let params = {
+        let mut p = llm.default_sampling_params();
+        // None => resolve to the full remaining window. Deliberately NOT
+        // `.or(p.max_tokens)`: the struct default is the OpenAI 16,
+        // which would silently cap chat at 16 tokens. Only an explicit
+        // model recommendation (generation_config max_new_tokens) wins.
+        p.max_tokens = args.max_tokens.or(llm.generation_max_new_tokens());
+        if let Some(t) = args.temperature {
+            p.temperature = t;
+        }
+        Some(p)
+    };
 
     // Non-interactive mode: --prompt (multi-turn) or --quick (single turn).
     let prompts: Vec<String> = if !args.prompt.is_empty() {

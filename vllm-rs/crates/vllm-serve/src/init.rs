@@ -203,6 +203,8 @@ pub struct InitializedSyncStack {
     pub max_model_len: usize,
     /// KV cache block size in tokens.
     pub block_size: usize,
+    /// Model-recommended sampling defaults (`generation_config.json`).
+    pub generation_defaults: vllm_common::sampling::GenerationDefaults,
 }
 
 /// True iff the device string selects the Apple-silicon metal path
@@ -1438,6 +1440,24 @@ fn initialize_core_tp(config: &VllmConfig) -> Result<InitializedCore> {
 ///
 /// Used by [`LLM`](crate::llm::LLM). Returns an [`InprocClient`] that the
 /// caller drives directly with `add_request()` + `get_output()`.
+/// Load + log the model's `generation_config.json` sampling defaults
+/// (Python vLLM `generation_config="auto"` parity).
+fn load_generation_defaults(
+    model_dir: Option<&std::path::Path>,
+) -> vllm_common::sampling::GenerationDefaults {
+    let d = model_dir
+        .map(vllm_common::sampling::GenerationDefaults::from_model_dir)
+        .unwrap_or_default();
+    if !d.is_empty() {
+        info!(
+            "Sampling defaults from generation_config.json: {:?} \
+             (request-level values override)",
+            d
+        );
+    }
+    d
+}
+
 pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack> {
     validate_speculative_decoding(config)?;
     let init_start = Instant::now();
@@ -1458,6 +1478,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         .model_dir
         .as_deref()
         .and_then(|dir| resolve_chat_template(config.chat_template.as_deref(), dir));
+    let generation_defaults = load_generation_defaults(core.model_dir.as_deref());
     Ok(InitializedSyncStack {
         client: core.client,
         tokenizer: core.tokenizer,
@@ -1465,6 +1486,7 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         model_name: core.model_name,
         max_model_len: core.max_model_len,
         block_size: config.block_size,
+        generation_defaults,
     })
 }
 
@@ -1547,6 +1569,7 @@ pub fn initialize_stack(
     };
 
     let mut engine = engine;
+    engine.set_generation_defaults(load_generation_defaults(core.model_dir.as_deref()));
     if !config.disable_async_scheduling && !spec_decode_requires_sync(config) {
         engine.set_async_scheduling(true);
     }
@@ -1873,6 +1896,7 @@ fn initialize_stack_multinode(
         };
 
         if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
+            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {
@@ -2399,6 +2423,7 @@ fn initialize_stack_tp_pp(
 
             if false {
                 // PP: sync scheduling forced
+                engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
                 engine.set_async_scheduling(true);
             }
             if config.runner == "pooling" {
@@ -2731,6 +2756,7 @@ fn initialize_stack_tp(
         };
 
         if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
+            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {
@@ -3080,6 +3106,7 @@ fn initialize_stack_external(
         };
 
         if (!config.disable_async_scheduling && !spec_decode_requires_sync(config)) {
+            engine.set_generation_defaults(load_generation_defaults(model_dir.as_deref()));
             engine.set_async_scheduling(true);
         }
         if config.runner == "pooling" {

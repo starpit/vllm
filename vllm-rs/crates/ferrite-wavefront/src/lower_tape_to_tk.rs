@@ -799,7 +799,19 @@ fn emit_attn_decode<F: RopeForm>(
     dst_page: PageId,
     reads: &[SlotId],
 ) {
-    let _ = (layout, producer);
+    // Per plan §2 line 88: KvCacheLayout propagates to TkTape via the
+    // tape's interned table — intern here so AttnDecodeInit carries
+    // the resolvable KvLayoutId.
+    let kv_layout_id = state.intern_kv_layout(layout);
+
+    // Per plan §2: KvCacheProducer is consumed by the lowering with an
+    // exhaustive match (no `_ =>` arm) — the witness then rides on
+    // the AttnDecodeInit Instr so downstream passes / the player can
+    // exhaustively re-match without reaching back into the SubtileIR.
+    match producer {
+        KvCacheProducer::SameForwardRopeAppend { .. } => {}
+        KvCacheProducer::PrePopulatedExt { .. } => {}
+    }
 
     let smx = state.intern_softmax_state(softmax_state);
 
@@ -841,6 +853,8 @@ fn emit_attn_decode<F: RopeForm>(
             num_q_heads,
             num_kv_heads,
             head_dim,
+            kv_layout: kv_layout_id,
+            producer,
             role: COMPUTE_ROLE,
         },
     );

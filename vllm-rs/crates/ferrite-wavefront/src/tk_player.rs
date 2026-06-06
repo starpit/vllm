@@ -499,7 +499,15 @@ fn emit_instr(out: &mut String, instr: &Instr) {
             let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, rope_form_str(*form), rope_side_str(*side));
             let _ = writeln!(out, "{s}");
         }
-        Instr::AttnDecodeInit { state, num_q_heads, num_kv_heads, head_dim, role: _ } => {
+        Instr::AttnDecodeInit {
+            state,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_layout: _,
+            producer: _,
+            role: _,
+        } => {
             let _ = writeln!(out, "{}", tk20::attn_decode_init(state.0, *num_q_heads, *num_kv_heads, *head_dim));
         }
         Instr::AttnDecodeQkt { state, q_page, k_page, scale_bits, num_q_heads, num_kv_heads, head_dim, role: _ } => {

@@ -350,12 +350,18 @@ pub enum Instr {
         role: WarpRole,
     },
 
-    /// Initialise the online-softmax recurrence.
+    /// Initialise the online-softmax recurrence. `kv_layout` carries
+    /// the K-cache layout witness (per plan §2 line 88; resolved
+    /// through [`TkTape::kv_layout`]); `producer` records how the
+    /// cache was populated (per plan §2: "exhaustive match in
+    /// lowering, no `_ =>` arm").
     AttnDecodeInit {
         state: SoftmaxStateId,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
+        kv_layout: KvLayoutId,
+        producer: KvCacheProducer,
         role: WarpRole,
     },
 

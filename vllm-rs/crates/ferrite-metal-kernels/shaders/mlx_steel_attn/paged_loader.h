@@ -193,6 +193,14 @@ struct PagedBlockLoaderT {
     logical_block += 1;
     src = resolve(logical_block);
   }
+
+  /* Jump to an arbitrary logical block — O(1) (one block-table read).
+   * Used by the sliding-window kernel to skip K/V tiles entirely
+   * older than the attention window. */
+  METAL_FUNC void seek(int lb) {
+    logical_block = lb;
+    src = resolve(lb);
+  }
 };
 
 template <

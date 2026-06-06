@@ -232,6 +232,11 @@ impl Atom for AddRmsNormAtom {
 #[derive(Clone, Debug)]
 pub struct AffineQmvAtom {
     pub group_size: u32,
+    /// Weight quantization width. The `mk_*` templates in
+    /// `metal_kittens.h` are bits-generic (4 and 8 both implemented);
+    /// this picks the instantiation. Gemma4's MLP projections are
+    /// 8-bit (`mlx-affine-b4-g64-mlp8`); everything else is 4.
+    pub bits: u32,
     /// Expression (in synthesized-kernel scope) for the local-head
     /// index — i.e. the row index within this atom's weight band.
     /// Defaults to `"__head"` when the atom consumes a globally
@@ -317,6 +322,7 @@ impl Atom for AffineQmvAtom {
         let t_act = ctx.t_act;
         let t_scale = ctx.t_scale;
         let gs = self.group_size;
+        let bits = self.bits;
         let local_head_expr = self.local_head_expr;
 
         // Bias epilogue: `__result[__row] += linear_bias[band_row]`
@@ -352,7 +358,7 @@ impl Atom for AffineQmvAtom {
             r#"
     // --- atom: AffineQmv (gs={gs}, local_head={local_head_expr}, has_linear_bias={has_lb}) ---
     {{
-        constexpr int __bits              = 4;
+        constexpr int __bits              = {bits};
         constexpr int __pack_factor       = mk_get_pack_factor<__bits, 32>();
         constexpr int __bytes_per_pack    = mk_get_bytes_per_pack<__bits, 32>();
         constexpr int __values_per_thread = __pack_factor * MK_PACKS_PER_THREAD;
@@ -429,6 +435,7 @@ impl Atom for AffineQmvAtom {
             t_act = t_act,
             t_scale = t_scale,
             gs = gs,
+            bits = bits,
             local_head_expr = local_head_expr,
             has_lb = self.has_linear_bias,
             x = x,
@@ -620,11 +627,24 @@ impl Atom for RopeAppendAtom {
     }
 }
 
+/// Gate activation for the fused act(gate)*up epilogue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MlpAct {
+    Silu,
+    /// `gelu_pytorch_tanh` with the fast-math clamp (tanh argument
+    /// clamped to ±15 — Metal fast tanh = (exp(2x)-1)/(exp(2x)+1)
+    /// → NaN past |x|≈44; tanh(15) rounds to exactly 1.0f, so the
+    /// clamp is bit-exact vs a saturating tanh). Mirrors
+    /// `silu_mul.metal::gelu_mul`.
+    Gelu,
+}
+
 /// SiluMul atom: reads two TG-memory float vectors (`gate_smem`,
 /// `up_smem`), each of length `__head_dim` (= TILE_N in the MLP
-/// pre-down synth kernel scope), computes `silu(g) * u` per element
-/// (`silu(g) = g / (1 + exp(-g))`), and writes the result as `T_act`
-/// to the device buffer `silu_mul_out` at row `__t`, tile-base
+/// pre-down synth kernel scope), computes `act(g) * u` per element
+/// (`act` = silu `g / (1 + exp(-g))` or clamped tanh-GELU, per
+/// [`MlpAct`]), and writes the result as `T_act` to the device
+/// buffer `silu_mul_out` at row `__t`, tile-base
 /// `__head * __head_dim`. The full output row width is
 /// `__intermediate` columns — kernel scope must declare it.
 ///
@@ -635,7 +655,15 @@ impl Atom for RopeAppendAtom {
 /// per-simdgroup write target, aliased here to `gate_smem` and
 /// `up_smem`).
 #[derive(Clone, Debug)]
-pub struct SiluMulAtom;
+pub struct SiluMulAtom {
+    pub act: MlpAct,
+}
+
+impl Default for SiluMulAtom {
+    fn default() -> Self {
+        Self { act: MlpAct::Silu }
+    }
+}
 
 impl Atom for SiluMulAtom {
     fn kind(&self) -> AtomKind {
@@ -685,6 +713,12 @@ impl Atom for SiluMulAtom {
         let out = &ctx.bound_outputs[0]; // silu_mul_out (device)
 
         let t_act = ctx.t_act;
+        let act_expr = match self.act {
+            MlpAct::Silu => "const float __sg = __gv / (1.0f + exp(-__gv));",
+            MlpAct::Gelu => {
+                "const float __inner = clamp(0.7978845608f * (__gv + 0.044715f * __gv * __gv * __gv), -15.0f, 15.0f);\n                const float __sg = 0.5f * __gv * (1.0f + tanh(__inner));"
+            }
+        };
 
         Some(format!(
             r#"
@@ -699,7 +733,7 @@ impl Atom for SiluMulAtom {
                 const uint __d  = __base_d + (uint)__r;
                 const float __gv = {g}[__d];
                 const float __uv = {u}[__d];
-                const float __sg = __gv / (1.0f + exp(-__gv));
+                {act_expr}
                 __out_row[__d] = {t_act}(__sg * __uv);
             }}
         }}
@@ -709,6 +743,7 @@ impl Atom for SiluMulAtom {
             g = g,
             u = u,
             out = out,
+            act_expr = act_expr,
         ))
     }
 }

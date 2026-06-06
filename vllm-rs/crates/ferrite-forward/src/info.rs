@@ -175,6 +175,59 @@ impl Instruction {
             Instruction::TanhSoftCap(in_slot, out_slot) => {
                 ("TanhSoftCap", vec![F::Slot(in_slot), F::Slot(out_slot)])
             }
+            Instruction::RmsNormUnit(in_slot, out_slot, hidden, m_mult) => (
+                "RmsNormUnit",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::ConstU32(hidden),
+                    F::ConstU32(m_mult),
+                ],
+            ),
+            Instruction::ScalarWeightMul(in_slot, out_slot, layer) => (
+                "ScalarWeightMul",
+                vec![
+                    F::Slot(in_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::LayerKind("RmsNorm"),
+                ],
+            ),
+            Instruction::RopeAppendNormed(
+                q_slot,
+                k_slot,
+                v_slot,
+                q_out_slot,
+                k_out_slot,
+                v_out_slot,
+                layer,
+                _interleaved,
+                is_global,
+            ) => (
+                "RopeAppendNormed",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(k_slot),
+                    F::Slot(v_slot),
+                    F::Slot(q_out_slot),
+                    F::Slot(k_out_slot),
+                    F::Slot(v_out_slot),
+                    F::Layer(layer),
+                    F::ConstU32(is_global as u32),
+                    F::LayerKind("RmsNorm"),
+                ],
+            ),
+            Instruction::NormAddScalarMul(delta_slot, residual_slot, out_slot, layer, hidden) => (
+                "NormAddScalarMul",
+                vec![
+                    F::Slot(delta_slot),
+                    F::Slot(residual_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::ConstU32(hidden),
+                    F::LayerKind("RmsNorm"),
+                ],
+            ),
             Instruction::FusedAddRmsNorm(in_slot, out_slot, layer, _hidden_size, _m_mult) => (
                 "FusedAddRmsNorm",
                 vec![
@@ -416,6 +469,15 @@ impl Instruction {
                     F::ConstBool(interleaved),
                 ],
             ),
+            Instruction::SlidingAttentionPrefillPaged(q_slot, out_slot, layer, interleaved) => (
+                "SlidingAttentionPrefillPaged",
+                vec![
+                    F::Slot(q_slot),
+                    F::Slot(out_slot),
+                    F::Layer(layer),
+                    F::ConstBool(interleaved),
+                ],
+            ),
             Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => (
                 "EncoderAttention",
                 vec![
@@ -555,6 +617,7 @@ impl Instruction {
                 v_out_slot,
                 layer,
                 interleaved,
+                is_global,
             ) => (
                 "RopeAppend",
                 vec![
@@ -567,6 +630,7 @@ impl Instruction {
                     F::Layer(layer),
                     F::RopeCosSin,
                     F::ConstBool(interleaved),
+                    F::ConstBool(is_global),
                 ],
             ),
             Instruction::MlaSplit(in_slot, kv_latent_slot, k_pe_slot) => (
@@ -1235,6 +1299,10 @@ impl Instruction {
                     F::Slot(out_slot),
                     F::ConstU32(width),
                 ],
+            ),
+            Instruction::GeluMul(gate_slot, up_slot, out_slot) => (
+                "GeluMul",
+                vec![F::Slot(gate_slot), F::Slot(up_slot), F::Slot(out_slot)],
             ),
             // Metal-only fused gather+dequant for `*-4bit` checkpoints
             // (P6). Variant is cfg-gated on `Instruction<W>` so the

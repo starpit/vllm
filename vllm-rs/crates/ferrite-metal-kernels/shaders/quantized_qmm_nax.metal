@@ -96,7 +96,7 @@ inline float nvfp4_decode(uint code) {
 //   group_size affine-quant group size (64 or 128 — gs=32 not
 //              supported here; the dispatcher falls back to Standard
 //              qmm_t for gs=32)
-//   bits       = 4
+//   bits       = 4 or 8
 //   aligned_N  N % 64 == 0 → skip N-tail handling
 //
 // Tile shape (matches MLX BM=BN=BK=64, WM=WN=2):
@@ -134,7 +134,11 @@ METAL_FUNC void qmm_t_nax_impl(
     uint  simd_lid,
     uint3 tgid)
 {
-    static_assert(bits == 4, "qmm_t_nax_impl: only bits=4 instantiated");
+    static_assert(bits == 4 || bits == 8,
+                  "qmm_t_nax_impl: bits in {4, 8} (8-bit = byte-per-element "
+                  "dequant in the W-loader; the NAX MMA runs on dequantized "
+                  "T_act values either way)");
+    static_assert(!nvfp4 || bits == 4, "NVFP4 is 4-bit by definition");
     // Affine NAX requires gs ∈ {64,128} (gs ≥ BK=64, one scale per
     // thread). NVFP4 is always gs=16 (< BK), handled by the per-byte
     // general scale index in the W-loader below.
@@ -160,15 +164,19 @@ METAL_FUNC void qmm_t_nax_impl(
     // BK_padded: pad for bank-conflict avoidance (BK + 16/sizeof(T) = 64+8=72)
     constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
 
-    // For bits=4: pack_factor=2 (2 int4 per byte), bytes_per_pack=1
-    constexpr int pack_factor    = 2;
+    // bits=4: pack_factor=2 (2 int4 per byte); bits=8: pack_factor=1
+    // (1 int8 per byte). bytes_per_pack=1 either way.
+    constexpr int pack_factor    = (bits == 4) ? 2 : 1;
     constexpr int bytes_per_pack = 1;
 
     // W-loader tile layout
-    //   BCOLS_PACKED = BK / pack_factor = 64/2 = 32
-    //   N_READS      = (BCOLS_PACKED × BN) / TGP = (32×64)/128 = 16
-    constexpr int BCOLS_PACKED = BK / pack_factor;   // 32
-    constexpr int N_READS      = (BCOLS_PACKED * BN) / TGP;  // 16
+    //   bits=4: BCOLS_PACKED = 64/2 = 32, N_READS = (32×64)/128 = 16
+    //   bits=8: BCOLS_PACKED = 64/1 = 64, N_READS = (64×64)/128 = 32
+    // Per-thread dequant element count is N_READS × pack_factor = 32
+    // in both cases; only the byte count read per thread doubles for
+    // bits=8 (8-bit weights are inherently 2× the bytes).
+    constexpr int BCOLS_PACKED = BK / pack_factor;
+    constexpr int N_READS      = (BCOLS_PACKED * BN) / TGP;
 
     // group_steps: how many BK steps between scale advances
     //   gs=64  → 1 (advance every step)
@@ -264,6 +272,16 @@ METAL_FUNC void qmm_t_nax_impl(
                             Ws_dst[i * pack_factor + 1] =
                                 scale * T_act(nvfp4_decode((uint(b) >> 4) & 0x0fu));
                         }
+                    } else if constexpr (bits == 8) {
+                        // 8-bit: one element per byte, no nibble split.
+                        // A thread's 32 bytes span K positions
+                        // [k+bj_w, k+bj_w+32) — within one scale group
+                        // (gs ≥ 64, bj_w ∈ {0, 32}).
+                        T_act scale = T_act(*Sc_row);
+                        T_act bias  = T_act(*Bs_row);
+                        for (int i = 0; i < N_READS; ++i) {
+                            Ws_dst[i] = scale * T_act(W_src[i]) + bias;
+                        }
                     } else {
                         T_act scale = T_act(*Sc_row);
                         T_act bias  = T_act(*Bs_row);
@@ -287,6 +305,12 @@ METAL_FUNC void qmm_t_nax_impl(
                                     scale * T_act(nvfp4_decode(b & 0x0fu));
                                 Ws_dst[i * pack_factor + 1] =
                                     scale * T_act(nvfp4_decode((uint(b) >> 4) & 0x0fu));
+                            }
+                        } else if constexpr (bits == 8) {
+                            T_act scale = T_act(*Sc_row);
+                            T_act bias  = T_act(*Bs_row);
+                            for (int i = 0; i < N_READS; ++i) {
+                                Ws_dst[i] = scale * T_act(W_src[i]) + bias;
                             }
                         } else {
                             T_act scale = T_act(*Sc_row);
@@ -406,7 +430,7 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // Instantiations — one symbol per (dtype, group_size, aligned_N).
 // Naming mirrors the non-NAX pattern with "nax" inserted after
 // "qmm_t_":
-//   affine_qmm_t_nax_<dtype>_s_<scale_dtype>_gs_<gs>_b_4_alN_<bool>_batch_0
+//   affine_qmm_t_nax_<dtype>_s_<scale_dtype>_gs_<gs>_b_<bits>_alN_<bool>_batch_0
 //
 // gs=32 deliberately not instantiated — the dispatcher routes gs=32
 // to Standard qmm_t (BK=64 violates QuantizedBlockLoader's
@@ -414,11 +438,11 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // different scale-indexing semantics and would need a separate path).
 // ─────────────────────────────────────────────────────────────────
 
-#define INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+#define INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
     template [[host_name(                                                                \
         "affine_qmm_t_nax_" #act_tag "_s_" #scale_tag "_gs_" #gs                       \
-        "_b_4_alN_" #aln_tag "_batch_0")]] [[kernel]] void                              \
-    affine_qmm_t_nax_kernel<act_type, scale_type, gs, 4, aln_val>(                     \
+        "_b_" #bits "_alN_" #aln_tag "_batch_0")]] [[kernel]] void                      \
+    affine_qmm_t_nax_kernel<act_type, scale_type, gs, bits, aln_val>(                  \
         const device uint32_t*   w        [[buffer(0)]],                                \
         const device scale_type* scales   [[buffer(1)]],                                \
         const device scale_type* biases   [[buffer(2)]],                                \
@@ -428,9 +452,9 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
         uint  simd_lid [[thread_index_in_simdgroup]],                                   \
         uint3 tgid     [[threadgroup_position_in_grid]]);
 
-#define INST_QMM_T_NAX_ALL(act_tag, act_type, scale_tag, scale_type, gs) \
-    INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, true,  true)  \
-    INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, false, false)
+#define INST_QMM_T_NAX_ALL(act_tag, act_type, scale_tag, scale_type, gs, bits) \
+    INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, true,  true)  \
+    INST_QMM_T_NAX(act_tag, act_type, scale_tag, scale_type, gs, bits, false, false)
 
 // T_scale is purely the dequant-read type for the per-group scales /
 // biases (`w = q*scale + bias`); it does not touch the NAX MMA, which
@@ -439,14 +463,79 @@ template <typename T_act, typename T_scale, int group_size, int bits, bool align
 // bf16-scale models (e.g. Qwen3) get NAX too, not just f16-scale ones
 // (e.g. Llama). The dispatcher picks the symbol by the model's scale
 // dtype; a missing instantiation would abort with a nil computeFunction.
-INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64)
-INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128)
-INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64)
-INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128)
-INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64)
-INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128)
-INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64)
-INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128)
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 4)
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 4)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 4)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128, 4)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64, 4)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128, 4)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 4)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 4)
+// 8-bit rows (Gemma4 mlp.{gate,up,down} at gs=64 bf16×bf16-scale in
+// production; f16×f16 for the parity tests; gs=128 + cross-dtype rows
+// for symmetry with the b4 set so no (model-dtype, gs) combo can hit
+// a nil computeFunction).
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,    64, 8)
+INST_QMM_T_NAX_ALL(f16,  half,   f16,  half,   128, 8)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,    64, 8)
+INST_QMM_T_NAX_ALL(bf16, bfloat, f16,  half,   128, 8)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat,  64, 8)
+INST_QMM_T_NAX_ALL(f16,  half,   bf16, bfloat, 128, 8)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat,  64, 8)
+INST_QMM_T_NAX_ALL(bf16, bfloat, bf16, bfloat, 128, 8)
+
+// ─────────────────────────────────────────────────────────────────
+// Buffer-dims variant: K/N/M as `const constant int&` buffer args
+// (5/6/7) exactly like MLX — NO function constants, so the pipeline
+// is built from the unspecialized function. The fn-const variants
+// above force a specialization recompile at pipeline creation; this
+// entry exists to A/B whether that specialization pass de-optimizes
+// MPP cooperative-tensor code (the fn-consts were for ICB
+// recordability, which was removed).
+// ─────────────────────────────────────────────────────────────────
+template <typename T_act, typename T_scale, int group_size, int bits, bool aligned_N>
+[[kernel]] void affine_qmm_t_nax_dims_kernel(
+    const device uint32_t*  w        [[buffer(0)]],
+    const device T_scale*   scales   [[buffer(1)]],
+    const device T_scale*   biases   [[buffer(2)]],
+    const device T_act*     x        [[buffer(3)]],
+    device T_act*           y        [[buffer(4)]],
+    const constant int&     K        [[buffer(5)]],
+    const constant int&     N        [[buffer(6)]],
+    const constant int&     M        [[buffer(7)]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]],
+    uint3 tgid     [[threadgroup_position_in_grid]])
+{
+    constexpr int BN = 64;
+    constexpr int BK = 64;
+    constexpr int BK_padded = BK + 16 / int(sizeof(T_act));
+    threadgroup T_act Ws[BN * BK_padded];
+    qmm_t_nax_impl<T_act, T_scale, group_size, bits, aligned_N>(
+        w, scales, biases, x, y, Ws,
+        K, N, M,
+        simd_gid, simd_lid, tgid);
+}
+
+#define INST_QMM_T_NAX_DIMS(act_tag, act_type, scale_tag, scale_type, gs, bits, aln_tag, aln_val) \
+    template [[host_name(                                                                \
+        "affine_qmm_t_nax_dims_" #act_tag "_s_" #scale_tag "_gs_" #gs                  \
+        "_b_" #bits "_alN_" #aln_tag "_batch_0")]] [[kernel]] void                      \
+    affine_qmm_t_nax_dims_kernel<act_type, scale_type, gs, bits, aln_val>(             \
+        const device uint32_t*   w        [[buffer(0)]],                                \
+        const device scale_type* scales   [[buffer(1)]],                                \
+        const device scale_type* biases   [[buffer(2)]],                                \
+        const device act_type*   x        [[buffer(3)]],                                \
+        device act_type*         y        [[buffer(4)]],                                \
+        const constant int&      K        [[buffer(5)]],                                \
+        const constant int&      N        [[buffer(6)]],                                \
+        const constant int&      M        [[buffer(7)]],                                \
+        uint  simd_gid [[simdgroup_index_in_threadgroup]],                              \
+        uint  simd_lid [[thread_index_in_simdgroup]],                                   \
+        uint3 tgid     [[threadgroup_position_in_grid]]);
+
+INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 8, true, true)
+INST_QMM_T_NAX_DIMS(bf16, bfloat, bf16, bfloat, 64, 4, true, true)
 
 // ─────────────────────────────────────────────────────────────────
 // nvfp4_qmm_t_nax — NVFP4 NAX prefill matmul

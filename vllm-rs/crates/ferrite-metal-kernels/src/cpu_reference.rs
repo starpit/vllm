@@ -188,6 +188,54 @@ fn affine_qmm_n_b4<TAct: HalfF, TScale: HalfF>(
     y
 }
 
+/// 8-bit sibling of [`affine_qmm_t_b4`]: `W` is `[N, K]` with ONE byte
+/// per element (`pack_factor = 1`), one (scale, bias) per group of
+/// `group_size` consecutive K-elements per row:
+/// `w = scale * byte + bias`. Mirrors MLX `quantized.h` bits=8 dequant.
+/// Also serves as the reference for the 8-bit qmv kernels (the small-M
+/// and large-M kernels differ in dispatch, not math). Gemma4-12B ships
+/// its MLP projections in this layout (8-bit g64).
+fn affine_qmm_t_b8<TAct: HalfF, TScale: HalfF>(
+    packed: &[u8],
+    scales: &[TScale],
+    biases: &[TScale],
+    x: &[TAct],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<TAct> {
+    assert_eq!(k % group_size, 0, "K must be a multiple of group_size");
+    assert_eq!(packed.len(), n * k);
+    assert_eq!(scales.len(), n * k / group_size);
+    assert_eq!(biases.len(), n * k / group_size);
+    assert_eq!(x.len(), m * k);
+
+    let groups_per_row = k / group_size;
+    let mut w = vec![TAct::ZERO; n * k];
+    for j in 0..n {
+        for kk in 0..k {
+            let group_idx = j * groups_per_row + kk / group_size;
+            // Match the kernel's in-register TScale → TAct cast.
+            let scale = TAct::from_f32(scales[group_idx].to_f32()).to_f32();
+            let bias = TAct::from_f32(biases[group_idx].to_f32()).to_f32();
+            let q = packed[j * k + kk] as f32;
+            w[j * k + kk] = TAct::from_f32(scale * q + bias);
+        }
+    }
+    let mut y = vec![TAct::ZERO; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc: f32 = 0.0;
+            for kk in 0..k {
+                acc += x[i * k + kk].to_f32() * w[j * k + kk].to_f32();
+            }
+            y[i * n + j] = TAct::from_f32(acc);
+        }
+    }
+    y
+}
+
 // ---- Concrete-dtype entry points ----------------------------------
 //
 // Post-P10b: the kernels' `TAct` and `TScale` template parameters are
@@ -293,4 +341,33 @@ pub use affine_qmm_n_b4_bf16 as affine_qvm_b4_bf16;
 pub use affine_qmm_n_b4_f16 as affine_qvm_b4_f16;
 pub use affine_qmm_t_b4_bf16 as affine_qmv_b4_bf16;
 pub use affine_qmm_t_b4_bf16_s_bf16 as affine_qmv_b4_bf16_s_bf16;
+
+pub fn affine_qmm_t_b8_f16(
+    packed: &[u8],
+    scales: &[half::f16],
+    biases: &[half::f16],
+    x: &[half::f16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<half::f16> {
+    affine_qmm_t_b8::<half::f16, half::f16>(packed, scales, biases, x, m, n, k, group_size)
+}
+
+pub fn affine_qmm_t_b8_bf16_s_bf16(
+    packed: &[u8],
+    scales: &[half::bf16],
+    biases: &[half::bf16],
+    x: &[half::bf16],
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Vec<half::bf16> {
+    affine_qmm_t_b8::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
+}
+
+pub use affine_qmm_t_b8_bf16_s_bf16 as affine_qmv_b8_bf16_s_bf16;
+pub use affine_qmm_t_b8_f16 as affine_qmv_b8_f16;
 pub use affine_qmm_t_b4_f16 as affine_qmv_b4_f16;

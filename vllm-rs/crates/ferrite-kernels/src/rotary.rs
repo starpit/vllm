@@ -480,6 +480,84 @@ impl RotaryCache {
         })
     }
 
+    /// "Proportional" partial rope (Gemma4 global-attention layers).
+    ///
+    /// Like [`Self::new_partial_from_gpuweights`] the cache is
+    /// `[max_pos, rotary_dim]` and only the first `rotary_dim` of
+    /// `head_dim` rotate — but the frequency exponent denominator is
+    /// the FULL `head_dim`, not `rotary_dim`:
+    ///
+    ///   `freq_i = 1 / theta^(2i / head_dim)`  for 2i < rotary_dim
+    ///
+    /// Faithful to mlx `ProportionalRoPE` (`rope_utils.py`):
+    /// `exponents = arange(0, rotated_dims, 2) / dims` with the
+    /// trailing freqs infinite (pass-through, which the ROT_DIM
+    /// kernel tail already implements). Gemma4 global layers:
+    /// head_dim 512, rotary_dim 128, theta 1e6.
+    ///
+    /// # Safety
+    /// Same as `new_partial_from_gpuweights`.
+    pub fn new_proportional_from_gpuweights(
+        weights: &mut GpuWeights,
+        head_dim: usize,
+        rotary_dim: usize,
+        max_pos: usize,
+        rope_theta: f64,
+        dtype: DType,
+    ) -> Result<Self> {
+        assert!(
+            rotary_dim <= head_dim,
+            "proportional rope: rotary_dim {rotary_dim} > head_dim {head_dim}"
+        );
+        let half = rotary_dim / 2;
+        let inv_freqs: Vec<f64> = (0..half)
+            // Denominator = head_dim (NOT rotary_dim) — the defining
+            // difference vs standard partial rope.
+            .map(|i| 1.0 / rope_theta.powf(2.0 * i as f64 / head_dim as f64))
+            .collect();
+
+        let mut cache = vec![0f32; max_pos * rotary_dim];
+        cache
+            .par_chunks_mut(rotary_dim)
+            .enumerate()
+            .for_each(|(pos, row)| {
+                for i in 0..half {
+                    let angle = pos as f64 * inv_freqs[i];
+                    row[i] = angle.cos() as f32;
+                    row[half + i] = angle.sin() as f32;
+                }
+            });
+
+        let cos_sin_cache = upload_via_gpuweights(weights, &cache, &[max_pos, rotary_dim], dtype)?;
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        let (cos_cache, sin_cache) = (
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
+            unsafe { ferrite_cuda_core::GpuTensor::new(std::ptr::null_mut(), &[0usize], dtype) },
+        );
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        let (cos_cache, sin_cache) = {
+            let mut cos_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            let mut sin_data: Vec<f32> = Vec::with_capacity(max_pos * half);
+            for p in 0..max_pos {
+                for i in 0..half {
+                    cos_data.push(cache[p * rotary_dim + i]);
+                    sin_data.push(cache[p * rotary_dim + half + i]);
+                }
+            }
+            let cos_cache = upload_via_gpuweights(weights, &cos_data, &[max_pos, half], dtype)?;
+            let sin_cache = upload_via_gpuweights(weights, &sin_data, &[max_pos, half], dtype)?;
+            (cos_cache, sin_cache)
+        };
+
+        Ok(Self {
+            cos_sin_cache,
+            cos_cache,
+            sin_cache,
+            head_dim,
+            mrope_section: None,
+        })
+    }
+
     /// Phi-3 / Phi-3.5 LongRoPE (su-scaling) variant of
     /// `new_from_stream`. Builds a unified `[max_pos, rotary_dim]` cache
     /// that selects `short_factor` below

@@ -178,7 +178,10 @@ inline float gelu_approx(float x) {
     const float sqrt_2_over_pi = 0.7978845608f;
     const float coeff = 0.044715f;
     float x3 = x * x * x;
-    float inner = sqrt_2_over_pi * (x + coeff * x3);
+    // Clamp: fast-math tanh = (exp(2x)-1)/(exp(2x)+1) → NaN once
+    // exp overflows (|inner| ≳ 44, i.e. any gate ≥ ~10.06). tanh(15)
+    // rounds to exactly 1.0f — bit-exact vs a saturating tanh.
+    float inner = clamp(sqrt_2_over_pi * (x + coeff * x3), -15.0f, 15.0f);
     return 0.5f * x * (1.0f + tanh(inner));
 }
 

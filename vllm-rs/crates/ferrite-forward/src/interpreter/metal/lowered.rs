@@ -38,6 +38,16 @@ pub enum KernelId {
     Embed,
     /// Standalone RMSNorm: `out = weight * x / sqrt(mean(x²) + eps)`.
     RmsNorm,
+    /// Unit-gain RMSNorm (no weight — mlx `RMSNormNoScale`, Gemma4
+    /// `v_norm`). Maps to `rmsnorm_unit_<dtype>_specialized` in
+    /// `rmsnorm.metallib`.
+    RmsNormUnit,
+    /// Multiply by a loaded `[1]`-shaped weight (Gemma4
+    /// `layer_scalar`). Maps to `scalar_weight_mul_<dtype>_specialized`
+    /// in `elementwise.metallib`.
+    ScalarWeightMul,
+    NormAddScalarMul,
+    RopeAppendNormed,
     /// Fused residual-add + RMSNorm: writes `residual += delta` and
     /// publishes `weight * residual / sqrt(mean(residual²) + eps)`.
     FusedAddRmsNorm,
@@ -89,6 +99,11 @@ pub enum KernelId {
     AttentionPrefillSdpaPaged,
     /// Pure scalar broadcast multiply: `out = x * scale`.
     ScalarMul,
+    /// Final logit softcapping: `out = cap * tanh(x / cap)` with the
+    /// cap baked from `W::FINAL_LOGIT_SOFTCAPPING` as function
+    /// constant 0 (Gemma2/Gemma4). Maps to
+    /// `tanh_soft_cap_{f16,bf16}_specialized` in `elementwise.metallib`.
+    TanhSoftCap,
     /// Elementwise residual add: `lhs += rhs`. Output is the lhs slot
     /// rebound (in-place semantics).
     Add,
@@ -159,6 +174,10 @@ pub enum KernelId {
     /// gate/up Linears are MLX-affine quantized (plan P12 branch
     /// (i)). Maps to `silu_mul_<dtype>` in `silu_mul.metallib`.
     SiluMul,
+    /// GELU (tanh approx) sibling of [`KernelId::SiluMul`] for the
+    /// decomposed GeGLU q-MLP path (Gemma2/3/4). Maps to
+    /// `gelu_mul_<dtype>` in `silu_mul.metallib`.
+    GeluMul,
     /// Qwen3.5 attention output gate `out = attn * sigmoid(gate)`. Maps
     /// to `gate_apply_<dtype>` in `gate_apply.metallib`.
     GateApply,

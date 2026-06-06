@@ -59,6 +59,13 @@ constant uint  ATTN_PAGED_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
 // `chunk_table[physical / BLOCKS_PER_CHUNK]` per block. See
 // `ferrite_fusion_synth::BLOCKS_PER_CHUNK`.
 constant uint  ATTN_PAGED_BLOCKS_PER_CHUNK   [[function_constant(6)]];
+// Sliding-window width (Gemma2/3/4 local layers): a query at absolute
+// position q attends keys k with 0 <= q - k < window. 0 disables the
+// window; the compiler folds every window branch away for
+// full-attention pipelines (the dispatcher always sets slot 7 — 0 for
+// full attention, W::SLIDING_WINDOW for the sliding prefill arm).
+// Same slot/semantics as `ATTN_WINDOW` in attention.metal.
+constant int   ATTN_PAGED_WINDOW             [[function_constant(7)]];
 
 // Debug toggle. When `ATTN_PAGED_DEBUG_MODE != 0`, the kernel replaces
 // its normal store path with a per-lane marker write so the bench can
@@ -322,6 +329,7 @@ void attention_paged(
   // prefix_len + q_block_base + q_tile_rows). Causal-mask cuts off
   // K positions > this Q's absolute row position; the kb upper
   // bound is the block containing the last masked-IN K position.
+  const int abs_q_min = int(prefix_len) + int(q_block_base);
   const int abs_q_max_excl =
       int(prefix_len) + int(q_block_base) + int(q_tile_rows);
   const int kv_blocks_total = int((kv_len + uint(BK) - 1u) / uint(BK));
@@ -330,14 +338,33 @@ void attention_paged(
   // First kb that needs causal masking. The Q tile's earliest
   // absolute row is `prefix_len + q_block_base`; any K position
   // strictly past that row is masked-out causally.
-  const int kb_min_causal = int(int(prefix_len) + int(q_block_base)) / BK;
+  const int kb_min_causal = abs_q_min / BK;
+  // Sliding window: the EARLIEST key any row of this Q tile attends
+  // is `abs_q_min - window + 1` (row q attends k iff 0 <= q - k <
+  // window, and abs_q_min is the tile's smallest q). K tiles entirely
+  // before that are skipped — this is what makes windowed prefill
+  // O(T·window) instead of O(T²). Branch folds away at window == 0.
+  int kb_start = 0;
+  if (ATTN_PAGED_WINDOW > 0) {
+    const int first_k = abs_q_min - ATTN_PAGED_WINDOW + 1;
+    if (first_k > 0) {
+      kb_start = first_k / BK;
+    }
+  }
   // Last kb that's a full BK-wide tile (the rest of kv_len fits
   // in this block partially).
   const int kv_aligned_blocks = int(kv_len / uint(BK));
   const uint kv_rem = kv_len % uint(BK);
 
+  // Fast-forward the paged loaders past the skipped tiles (O(1) —
+  // one block-table read each).
+  if (kb_start > 0) {
+    loader_k.seek(kb_start);
+    loader_v.seek(kb_start);
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int kb = kb_start; kb < kb_lim; kb++) {
     // Load K block from paged cache. The last block may be partial
     // if kv_len is not a multiple of BK; use load_safe to zero the
     // tail.
@@ -414,6 +441,35 @@ void attention_paged(
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
             if (row_pos < (col_pos + jj)) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
+          }
+        }
+      }
+    }
+
+    // Sliding-window mask: row q attends k iff q - k < window, so
+    // mask out k <= q - window. Only boundary tiles need it — a tile
+    // needs masking iff its OLDEST key can fall outside the YOUNGEST
+    // row's window (`abs_q_max_excl - 1 - kb*BK >= window`); fully
+    // out-of-window tiles were already skipped via `kb_start`. The
+    // whole block folds away for full-attention pipelines (window 0).
+    if (ATTN_PAGED_WINDOW > 0 &&
+        (abs_q_max_excl - 1 - kb * BK) >= ATTN_PAGED_WINDOW) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos = int(prefix_len) + int(q_block_base)
+                          + tm + sm + (i * stile_t::kFragRows);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            if ((row_pos - (col_pos + jj)) >= ATTN_PAGED_WINDOW) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }

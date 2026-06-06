@@ -177,6 +177,78 @@ impl From<RopeAppendBindingSet> for Vec<Binding> {
     }
 }
 
+// ── RopeAppendNormed (Gemma4 norm-prologue rope) ───────────────────
+
+/// Bindings for `KernelId::RopeAppendNormed`. Slots 0..7 mirror
+/// [`RopeAppendBindingSet`] except 1/2 bind the RAW (pre-norm) K/V
+/// inputs (read-only; the kernel writes K/V to the cache only);
+/// 8/9 = q/k norm gains (RmsNorm-kind weight sub-slots 0/1).
+pub struct RopeAppendNormedBindingSet {
+    pub q_out: ArenaSlotIdx,
+    pub k_in: ArenaSlotIdx,
+    pub v_in: ArenaSlotIdx,
+    pub cos_sin_locator: WeightLocator,
+    pub q_gains_locator: WeightLocator,
+    pub k_gains_locator: WeightLocator,
+    pub layer: LayerId,
+}
+
+impl From<RopeAppendNormedBindingSet> for Vec<Binding> {
+    fn from(s: RopeAppendNormedBindingSet) -> Vec<Binding> {
+        vec![
+            Binding::ArenaSlot {
+                slot: s.q_out.get(),
+                binding_index: 0,
+            },
+            Binding::ArenaSlot {
+                slot: s.k_in.get(),
+                binding_index: 1,
+            },
+            Binding::ArenaSlot {
+                slot: s.v_in.get(),
+                binding_index: 2,
+            },
+            Binding::Weight {
+                kind: WeightBundleKind::CosSin,
+                which: WeightTensor::Weight,
+                layer: s.layer,
+                locator: s.cos_sin_locator,
+                binding_index: 3,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::Positions,
+                binding_index: 4,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::SlotMapping,
+                binding_index: 5,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::KvCacheK { layer: s.layer },
+                binding_index: 6,
+            },
+            Binding::Runtime {
+                kind: RuntimeBindingKind::KvCacheV { layer: s.layer },
+                binding_index: 7,
+            },
+            Binding::Weight {
+                kind: WeightBundleKind::RmsNorm,
+                which: WeightTensor::Weight,
+                layer: s.layer,
+                locator: s.q_gains_locator,
+                binding_index: 8,
+            },
+            Binding::Weight {
+                kind: WeightBundleKind::RmsNorm,
+                which: WeightTensor::Weight,
+                layer: s.layer,
+                locator: s.k_gains_locator,
+                binding_index: 9,
+            },
+        ]
+    }
+}
+
 // ── FusedQkvRopeCache (dense BF16/F16) ─────────────────────────────
 
 /// Bindings for `KernelId::FusedQkvRopeCache`. Eight slots:

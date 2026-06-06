@@ -555,6 +555,31 @@ mod dispatcher {
             None
         }
 
+        /// Per-layer `kv_heads * head_dim` for hybrid-attention-geometry
+        /// arches whose sliding and global classes differ in dims
+        /// (Gemma4: sliding 8×256 = 2048 elems/token, global 1×512 =
+        /// 512). Drives per-layer KV pool sizing. The proc-macro emits
+        /// a per-arch override derived from the unrolled IR (which
+        /// layers carry `sliding_attention` vs `attention` tiles) and
+        /// the GLOBAL_* CanonicalParams; the default `None` keeps the
+        /// uniform pool layout (every same-dims arch, incl. Gemma2/3).
+        fn per_layer_kv_token_elems(&self) -> Option<Vec<usize>> {
+            None
+        }
+
+        /// Block-table row stride the metal kernels bake as a function
+        /// constant (`CanonicalParams::MAX_BLOCKS_PER_SEQ`). The metal
+        /// executor MUST pack host-side `block_table` rows at exactly
+        /// this stride — every kernel reads row `seq_idx` at
+        /// `block_table + seq_idx * stride`, so a host stride mismatch
+        /// corrupts every `seq_idx > 0` (single-seq runs mask it).
+        /// Default mirrors the `CanonicalParams` trait default (128);
+        /// the proc-macro emits a per-arch override for arches that
+        /// set the `max_blocks_per_seq` config key (Gemma4: 2048).
+        fn max_blocks_per_seq(&self) -> usize {
+            128
+        }
+
         /// # Safety
         /// All tensors in `ctx` must be valid GPU memory; `device`
         /// must be the live CUDA device. Same invariants as each

@@ -522,12 +522,15 @@ pub fn qmv_kernel_static_name(
     bits: u32,
     group_size: u32,
 ) -> &'static str {
-    debug_assert_eq!(bits, 4, "qmv_kernel_static_name: only bits=4 is wired");
-    let key = (kernel, dtype, scale_dtype, group_size);
+    debug_assert!(
+        matches!(bits, 4 | 8),
+        "qmv_kernel_static_name: only bits 4 and 8 are wired (got {bits})"
+    );
+    let key = (kernel, dtype, scale_dtype, group_size, bits);
     use std::collections::HashMap;
     use std::sync::OnceLock;
     static CACHE: OnceLock<
-        std::sync::Mutex<HashMap<(QmvKernel, DequantDtype, ScaleDtype, u32), &'static str>>,
+        std::sync::Mutex<HashMap<(QmvKernel, DequantDtype, ScaleDtype, u32, u32), &'static str>>,
     > = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut guard = cache.lock().expect("qmv_kernel_static_name cache poisoned");
@@ -551,13 +554,15 @@ pub fn qmv_kernel_static_name(
                      — only 64 and 128 instantiated"
                 );
             }
-            format!("affine_qmv_quad_{dtype_s}_s_{scale_s}_gs_{group_size}_b_4_d_{d}_batch_0")
+            format!(
+                "affine_qmv_quad_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_d_{d}_batch_0"
+            )
         }
         QmvKernel::Fast => {
-            format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_4_batch_0")
+            format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
         }
         QmvKernel::Generic => {
-            format!("affine_qmv_{dtype_s}_s_{scale_s}_gs_{group_size}_b_4_batch_0")
+            format!("affine_qmv_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")
         }
     };
     let leaked: &'static str = Box::leak(owned.into_boxed_str());
@@ -662,9 +667,9 @@ impl MetalAffineQmv {
         scale_dtype: ScaleDtype,
         encoder: &ComputeCommandEncoderRef,
     ) -> Result<(), MetalStreamError> {
-        if bits != 4 {
+        if !matches!(bits, 4 | 8) {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
-                "affine_qmv: only bits=4 is wired in P3, got bits={bits}"
+                "affine_qmv: only bits 4 and 8 are wired, got bits={bits}"
             )));
         }
         if !matches!(group_size, 32 | 64 | 128) {
@@ -1076,13 +1081,22 @@ pub fn qmm_t_kernel_static_name(
     group_size: u32,
     aligned_n: bool,
 ) -> &'static str {
-    debug_assert_eq!(bits, 4, "qmm_t_kernel_static_name: only bits=4 is wired");
+    debug_assert!(
+        matches!(bits, 4 | 8),
+        "qmm_t_kernel_static_name: only bits 4 and 8 are wired (got {bits})"
+    );
+    debug_assert!(
+        !(bits == 8 && matches!(kernel, QmmTKernel::SplitK { .. })),
+        "qmm_t_kernel_static_name: SplitK only instantiates bits=4 — \
+         the lowering arm must route 8-bit weights to Standard or Nax"
+    );
     let key = (
         std::mem::discriminant(&kernel),
         dtype,
         scale_dtype,
         group_size,
         aligned_n,
+        bits,
     );
     use std::collections::HashMap;
     use std::sync::OnceLock;
@@ -1092,6 +1106,7 @@ pub fn qmm_t_kernel_static_name(
         ScaleDtype,
         u32,
         bool,
+        u32,
     );
     static CACHE: OnceLock<std::sync::Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -1268,9 +1283,9 @@ impl MetalAffineQmmT {
         scale_dtype: ScaleDtype,
         encoder: &ComputeCommandEncoderRef,
     ) -> Result<QmmTKernel, MetalStreamError> {
-        if bits != 4 {
+        if !matches!(bits, 4 | 8) {
             return Err(MetalStreamError::ShaderCompilationFailed(format!(
-                "affine_qmm_t: only bits=4 is wired in P4, got bits={bits}"
+                "affine_qmm_t: only bits 4 and 8 are wired, got bits={bits}"
             )));
         }
         if !matches!(group_size, 32 | 64 | 128) {
@@ -1289,7 +1304,15 @@ impl MetalAffineQmmT {
             )));
         }
 
-        let kernel = pick_qmm_t_kernel(m, n, k, b, group_size, /*is_nax=*/ false);
+        // 8-bit weights: Standard or Nax (`_b_8_` instantiations exist
+        // for both); SplitK is b4-only. This dispatcher passes
+        // is_nax=false (production NAX routing lives in the lowering
+        // arm, which checks `is_nax_capable` on the live profile), so
+        // the b8 guard only needs to block SplitK.
+        let kernel = match pick_qmm_t_kernel(m, n, k, b, group_size, /*is_nax=*/ false) {
+            QmmTKernel::SplitK { .. } if bits == 8 => QmmTKernel::Standard,
+            k => k,
+        };
         self.execute_with_kernel(
             x,
             packed_w,

@@ -20,9 +20,9 @@
 use ferrite_metal_kernels::specialized_pipeline_cache::{ConstSlot, ConstantValue};
 
 use super::ids::{
-    AttnDebugMode, AttnScale, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
+    AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
     IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
-    NumKvHeads, NumQHeads, QSize, RmsNormEps, RotDim, SplitK,
+    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
 };
 
 // ── Embed (token gather) ───────────────────────────────────────────
@@ -69,6 +69,39 @@ impl From<RmsNormConstants> for Vec<ConstantValue> {
     }
 }
 
+// ── RopeAppendNormed ───────────────────────────────────────────────
+
+/// `KernelId::RopeAppendNormed` (`rope_append_normed_<act>_s_<scale>_
+/// specialized`). Slots 0..6 identical to [`RopeAppendConstants`];
+/// 7 = norm eps, 8 = norm gain offset (Gemma4 full gains -> 0.0).
+pub struct RopeAppendNormedConstants {
+    pub head_dim: HeadDim,
+    pub num_q_heads: NumQHeads,
+    pub num_kv_heads: NumKvHeads,
+    pub rot_dim: RotDim,
+    pub block_size: BlockSize,
+    pub blocks_per_chunk: BlocksPerChunk,
+    pub pair_off: RopePairOff,
+    pub rms_norm_eps: RmsNormEps,
+    pub weight_offset: f32,
+}
+
+impl From<RopeAppendNormedConstants> for Vec<ConstantValue> {
+    fn from(c: RopeAppendNormedConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
+            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
+            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
+            ConstantValue::uint(ConstSlot(3), c.rot_dim.get()),
+            ConstantValue::uint(ConstSlot(4), c.block_size.get()),
+            ConstantValue::uint(ConstSlot(5), c.blocks_per_chunk.get()),
+            ConstantValue::uint(ConstSlot(6), c.pair_off.get()),
+            ConstantValue::float(ConstSlot(7), c.rms_norm_eps.get()),
+            ConstantValue::float(ConstSlot(8), c.weight_offset),
+        ]
+    }
+}
+
 // ── RopeAppend ─────────────────────────────────────────────────────
 
 /// `KernelId::RopeAppend` (`rope_append_<dtype>_specialized`).
@@ -79,6 +112,9 @@ pub struct RopeAppendConstants {
     pub rot_dim: RotDim,
     pub block_size: BlockSize,
     pub blocks_per_chunk: BlocksPerChunk,
+    /// Rotation pairing offset (see [`RopePairOff`]): `rot_dim/2` for
+    /// standard NeoX; `head_dim/2` for Gemma4's proportional rope.
+    pub pair_off: RopePairOff,
 }
 
 impl From<RopeAppendConstants> for Vec<ConstantValue> {
@@ -90,6 +126,7 @@ impl From<RopeAppendConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(3), c.rot_dim.get()),
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.blocks_per_chunk.get()),
+            ConstantValue::uint(ConstSlot(6), c.pair_off.get()),
         ]
     }
 }
@@ -136,6 +173,10 @@ pub struct AttentionViaCacheConstants {
     pub block_size: BlockSize,
     pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
+    /// Sliding-window width (`ATTN_WINDOW`, slot 7). `0` = disabled
+    /// (full attention); the sliding lowering arm passes
+    /// `W::SLIDING_WINDOW`.
+    pub window: AttnWindow,
 }
 
 impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
@@ -148,6 +189,7 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
+            ConstantValue::int(ConstSlot(7), c.window.get()),
         ]
     }
 }
@@ -172,6 +214,11 @@ pub struct AttentionPrefillPagedConstants {
     pub block_size: BlockSize,
     pub max_blocks: MaxBlocksPerSeq,
     pub blocks_per_chunk: BlocksPerChunk,
+    /// Sliding-window width (`ATTN_WINDOW` / `ATTN_PAGED_WINDOW`,
+    /// slot 7). `0` = disabled. Read by BOTH the sdpa_vector paged
+    /// kernel and the steel paged kernel (which additionally SKIPS
+    /// K-tiles entirely older than the window — O(T·window) prefill).
+    pub window: AttnWindow,
     /// `Some(0)` for the steel kernel (production), `None` for the
     /// sdpa_vector kernel (declares no slot 99).
     pub debug_mode: Option<AttnDebugMode>,
@@ -187,6 +234,7 @@ impl From<AttentionPrefillPagedConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(4), c.block_size.get()),
             ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
             ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
+            ConstantValue::int(ConstSlot(7), c.window.get()),
         ];
         if let Some(dm) = c.debug_mode {
             v.push(ConstantValue::uint(ConstSlot(99), dm.get()));

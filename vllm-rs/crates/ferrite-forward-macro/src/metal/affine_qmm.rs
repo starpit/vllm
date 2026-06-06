@@ -179,12 +179,13 @@ impl Implementation for MetalAffineQmmImpl {
         // kernels until Phase 5 (mk_mma) lands.
         let tile = m.claimed_tiles[0];
         let node = fuf.get(tile);
-        let (group_size, _bits) = match weight_storage_of(node) {
+        let (group_size, bits) = match weight_storage_of(node) {
             Some(StorageFormat::Affine { group_size, bits }) => (*group_size, *bits),
             _ => return None,
         };
         Some(Box::new(crate::atom_lib::AffineQmvAtom {
             group_size,
+            bits,
             local_head_expr: "__head",
             // Singleton AffineQmm doesn't ride a bias inside the
             // atom — the standalone path emits a separate

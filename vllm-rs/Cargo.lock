@@ -2226,6 +2226,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-model-gemma4"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-forward-macro",
+ "ferrite-gguf",
+ "ferrite-kernels",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-model-granite"
 version = "0.1.0"
 dependencies = [
@@ -2436,6 +2449,7 @@ dependencies = [
  "ferrite-model-gemma2",
  "ferrite-model-gemma3",
  "ferrite-model-gemma3-mm",
+ "ferrite-model-gemma4",
  "ferrite-model-granite",
  "ferrite-model-llama",
  "ferrite-model-mistral",

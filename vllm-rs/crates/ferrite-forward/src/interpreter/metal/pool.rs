@@ -980,6 +980,293 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         if let Some(ts) = timing_state {
             ts.resolve_and_print(bucket_idx, num_tokens, &self.device);
         }
+        self.maybe_run_dump_pass(worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens)?;
+        Ok(())
+    }
+
+    /// Activation-dump replay (`FERRITE_DUMP_DIR`). After the real
+    /// forward has fully completed, re-encode the SAME baked tape in
+    /// segments — committing + host-waiting at each dump-point
+    /// command and reading its output arena slot before later
+    /// commands recycle the slot (post-hoc readback alone can't work:
+    /// the solver's slot coloring reuses arena slots across layers).
+    ///
+    /// The replay is value-identical to the forward that just ran:
+    /// the embed gather rewrites slot state from scratch in command
+    /// order, rope_append's paged-KV writes are idempotent for an
+    /// unchanged `slot_mapping`, and attention re-reads the same
+    /// cache rows (`seq_used_k` unchanged). Holds for stateless
+    /// decoder arches; recurrent-state arches (GDN) would need a
+    /// state snapshot first — not supported here.
+    ///
+    /// Env contract (all read per-forward; bake retains the sidecar
+    /// only when `FERRITE_DUMP_DIR` was set at pool build):
+    ///  - `FERRITE_DUMP_DIR`         output directory (created)
+    ///  - `FERRITE_DUMP_NUM_TOKENS`  REQUIRED: only forwards with
+    ///    exactly this num_tokens dump — filters warmup forwards and
+    ///    decode steps. No value ⇒ no dump.
+    ///  - `FERRITE_DUMP_KERNELS`     csv of `KernelId` Debug names;
+    ///    default "ScalarMul,ScalarWeightMul,RmsNorm,TanhSoftCap"
+    ///    (Gemma4 per-layer bisect: embed-scale, layer outputs,
+    ///    final norm, softcapped logits).
+    ///
+    /// Output: one raw `.bin` per arena binding of each dump-point
+    /// command (whole slot bytes, activation dtype) + `manifest.json`
+    /// describing every file. Diagnostic path — fs errors print and
+    /// skip, GPU errors propagate.
+    fn maybe_run_dump_pass(
+        &self,
+        worker: &MetalWorker<W>,
+        bucket_idx: usize,
+        num_tokens: usize,
+        num_seqs: u32,
+        has_spec_tokens: bool,
+    ) -> Result<(), ForwardError> {
+        let Some(dir) = std::env::var_os("FERRITE_DUMP_DIR") else {
+            return Ok(());
+        };
+        let Some(want) = std::env::var("FERRITE_DUMP_NUM_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        else {
+            return Ok(());
+        };
+        if num_tokens != want {
+            return Ok(());
+        }
+        let baking = &worker.bucket_bakings[bucket_idx];
+        let Some(dump_cmds) = baking.dump_cmds.as_ref() else {
+            return Ok(());
+        };
+        let kernels_csv = std::env::var("FERRITE_DUMP_KERNELS")
+            .unwrap_or_else(|_| "ScalarMul,ScalarWeightMul,RmsNorm,TanhSoftCap".to_string());
+        // "all" = dump every command's arena outputs (intra-layer op
+        // bisect). Optionally bounded by FERRITE_DUMP_CMD_RANGE
+        // "lo..hi" (flat command indices) to keep file volume sane.
+        let dump_all = kernels_csv == "all";
+        let cmd_range: Option<(usize, usize)> = std::env::var("FERRITE_DUMP_CMD_RANGE")
+            .ok()
+            .and_then(|v| {
+                let (lo, hi) = v.split_once("..")?;
+                Some((lo.parse().ok()?, hi.parse().ok()?))
+            });
+        let wanted: Vec<&str> = kernels_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let dir = std::path::PathBuf::from(dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("[dump] create_dir_all({}) failed: {e}", dir.display());
+            return Ok(());
+        }
+        let dtype = match W::METAL_DTYPE {
+            super::lowered::MetalDtype::F16 => "f16",
+            super::lowered::MetalDtype::Bf16 => "bf16",
+            super::lowered::MetalDtype::Int4 => "int4",
+        };
+        // Timing-only mode: skip all file IO and instead host-time each
+        // replay segment (CB commit + wait per segment = SERIALIZED
+        // execution), printing a per-kernel aggregate. This is the
+        // honest per-kernel profile — `FERRITE_METAL_DISPATCH_TIMING`'s
+        // in-CB timestamp deltas UNDERCOUNT badly under pipelined
+        // execution (timestamps don't wait for prior dispatches at
+        // `visibility=None`). Per-segment host-wait overhead is
+        // ~0.3-1 ms; subtract `count × ~0.5 ms` mentally for tiny
+        // kernels. Use with FERRITE_DUMP_KERNELS=all so each segment
+        // is a single dispatch.
+        let timing_only = std::env::var_os("FERRITE_DUMP_TIMING_ONLY").is_some();
+        let mut per_kernel: std::collections::HashMap<String, (usize, f64)> =
+            std::collections::HashMap::new();
+        let t0 = std::time::Instant::now();
+        let mut occ: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut entries: Vec<String> = Vec::new();
+        let mut start = 0usize;
+        for (idx, dc) in dump_cmds.iter().enumerate() {
+            let kname = format!("{:?}", dc.kernel);
+            if let Some((lo, hi)) = cmd_range
+                && (idx < lo || idx >= hi)
+            {
+                continue;
+            }
+            if !dump_all && !wanted.iter().any(|w| *w == kname) {
+                continue;
+            }
+            // A dump point whose runtime gate doesn't fire for this
+            // forward never ran — its output slot holds stale data.
+            if !super::worker::gate_matches(
+                dc.gate,
+                num_tokens as u32,
+                num_seqs,
+                has_spec_tokens,
+            ) {
+                continue;
+            }
+            let occ_i = {
+                let n = occ.entry(kname.clone()).or_insert(0);
+                let i = *n;
+                *n += 1;
+                i
+            };
+            // Replay commands [start, idx] then host-wait so the dump
+            // point's output is GPU-complete and not yet recycled.
+            let t_seg = std::time::Instant::now();
+            self.run_dump_segment(
+                worker,
+                bucket_idx,
+                num_tokens,
+                num_seqs,
+                has_spec_tokens,
+                start..idx + 1,
+            )?;
+            start = idx + 1;
+            if timing_only {
+                let ms = t_seg.elapsed().as_secs_f64() * 1e3;
+                let e = per_kernel.entry(kname).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += ms;
+                continue;
+            }
+            for (bind_idx, slot) in &dc.arena_slots {
+                let buf = &worker.arena[*slot as usize];
+                let len = buf.length();
+                let fname = format!(
+                    "cmd{idx:04}_{kname}_occ{occ_i:03}_b{bind_idx}_slot{slot}.bin"
+                );
+                // SAFETY: arena slots are StorageModeShared whole
+                // buffers; the segment's host wait completed, so the
+                // GPU is done writing this range.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len) };
+                if let Err(e) = std::fs::write(dir.join(&fname), bytes) {
+                    eprintln!("[dump] write {fname} failed: {e}");
+                    continue;
+                }
+                entries.push(format!(
+                    "{{\"file\":\"{fname}\",\"cmd_idx\":{idx},\"kernel\":\"{kname}\",\
+                     \"occurrence\":{occ_i},\"binding_index\":{bind_idx},\"slot\":{slot},\
+                     \"bytes\":{len},\"barrier\":{}}}",
+                    dc.barrier,
+                ));
+            }
+        }
+        if timing_only {
+            let mut rows: Vec<(&String, &(usize, f64))> = per_kernel.iter().collect();
+            rows.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+            let total: f64 = rows.iter().map(|(_, (_, ms))| ms).sum();
+            eprintln!(
+                "[dump-timing bucket={bucket_idx} num_tokens={num_tokens}] \
+                 serialized total {total:.1} ms ({} segments)",
+                per_kernel.values().map(|(c, _)| c).sum::<usize>(),
+            );
+            for (kname, (count, ms)) in rows {
+                eprintln!(
+                    "  {kname:28} count={count:4}  total={ms:9.2} ms ({:5.1}%)  avg={:.3} ms",
+                    100.0 * ms / total.max(1e-9),
+                    ms / (*count).max(1) as f64,
+                );
+            }
+            return Ok(());
+        }
+        let manifest = format!(
+            "{{\"num_tokens\":{num_tokens},\"bucket_m\":{},\"num_seqs\":{num_seqs},\
+             \"num_cmds\":{},\"dtype\":\"{dtype}\",\"entries\":[\n{}\n]}}\n",
+            baking.bucket_m,
+            dump_cmds.len(),
+            entries.join(",\n"),
+        );
+        if let Err(e) = std::fs::write(dir.join("manifest.json"), manifest) {
+            eprintln!("[dump] write manifest.json failed: {e}");
+        }
+        eprintln!(
+            "[dump] bucket={bucket_idx} num_tokens={num_tokens}: {} files -> {} in {:?}",
+            entries.len(),
+            dir.display(),
+            t0.elapsed(),
+        );
+        Ok(())
+    }
+
+    /// One activation-dump replay segment: encode flat dispatch
+    /// indices `range` of the bucket's baked tape on a fresh MTL4 CB,
+    /// commit, and host-wait. Mirrors `run_bucket_mtl4_with_tail`'s
+    /// CB machinery minus timing/tail.
+    fn run_dump_segment(
+        &self,
+        worker: &MetalWorker<W>,
+        bucket_idx: usize,
+        num_tokens: usize,
+        num_seqs: u32,
+        has_spec_tokens: bool,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), ForwardError> {
+        use objc2::runtime::AnyObject;
+        use std::ptr::NonNull;
+        let verbose = std::env::var_os("FERRITE_DUMP_VERBOSE").is_some();
+        if verbose {
+            eprintln!("[dump] segment {:?} encode...", range);
+        }
+        let cb = self
+            .device
+            .newCommandBuffer()
+            .expect("newCommandBuffer returned nil");
+        let (signal_value, queue_clone, event_clone) = {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
+            cb.beginCommandBufferWithAllocator(&mtl4.allocator);
+            let cb_ptr: *mut AnyObject =
+                ::objc2::rc::Retained::as_ptr(&cb) as *const AnyObject as *mut AnyObject;
+            unsafe {
+                self.allocator
+                    .residency()
+                    .attach_to_mtl4_command_buffer(cb_ptr);
+            }
+            let enc = cb
+                .computeCommandEncoder()
+                .expect("MTL4 computeCommandEncoder returned nil");
+            worker
+                .run_bucket_mtl4_range(
+                    bucket_idx,
+                    num_tokens as u32,
+                    num_seqs,
+                    has_spec_tokens,
+                    &enc,
+                    range.clone(),
+                )
+                .map_err(ForwardError::Worker)?;
+            enc.endEncoding();
+            cb.endCommandBuffer();
+            mtl4.signal_counter = mtl4.signal_counter.checked_add(1).expect("event overflow");
+            (
+                mtl4.signal_counter,
+                mtl4.queue.clone(),
+                mtl4.shared_event.clone(),
+            )
+        };
+        let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
+            &cb;
+        let mut cb_array = [NonNull::from(cb_protocol)];
+        unsafe {
+            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+        }
+        queue_clone.signalEvent_value(
+            ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
+            signal_value,
+        );
+        let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
+        if !ok {
+            eprintln!("[dump] segment {:?} TIMED OUT (60s)", range);
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        if verbose {
+            eprintln!("[dump] segment {:?} done", range);
+        }
+        {
+            let mut slot = self.mtl4.lock().expect("mtl4 mutex");
+            if let Some(mtl4) = slot.as_mut() {
+                mtl4.allocator.reset();
+            }
+        }
         Ok(())
     }
 

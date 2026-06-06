@@ -266,6 +266,17 @@ constant uint ROPE_BLOCK_SIZE   [[function_constant(4)]];
 // addresses with `block_id % BLOCKS_PER_CHUNK`. See
 // `ferrite_fusion_synth::BLOCKS_PER_CHUNK`.
 constant uint ROPE_BLOCKS_PER_CHUNK [[function_constant(5)]];
+// Rotation pairing offset: lane d < ROT_DIM/2 rotates the pair
+// (d, d + PAIR_OFF). Standard NeoX (full + HF partial rope) passes
+// ROT_DIM/2; Gemma4 proportional rope passes HEAD_DIM/2 (mlx
+// `ProportionalRoPE` rotates the first ROT_DIM/2 lanes of EACH head
+// half — pairs span the full head, not the rot window).
+constant uint ROPE_PAIR_OFF [[function_constant(6)]];
+
+// Norm-prologue fn-consts (rope_append_normed_* only; the plain
+// rope_append_* kernels never reference them).
+constant float ROPE_NORM_EPS      [[function_constant(7)]];
+constant float ROPE_NORM_W_OFFSET [[function_constant(8)]];
 
 kernel void rope_append_f16_specialized(
     device       half* q_inout      [[buffer(0)]],
@@ -298,14 +309,15 @@ kernel void rope_append_f16_specialized(
 
     // ── Q rotation (in-place) ────────────────────────────────────────
     const uint q_dim = num_q * head_dim;
+    const uint pair_off = ROPE_PAIR_OFF;
     device half* q_row = q_inout + t * q_dim + q_head * head_dim;
     if (d < half_dim) {
         const float c  = float(cos_row[d]);
         const float s  = float(sin_row[d]);
         const float x0 = float(q_row[d]);
-        const float x1 = float(q_row[half_dim + d]);
+        const float x1 = float(q_row[pair_off + d]);
         q_row[d]            = half(x0 * c - x1 * s);
-        q_row[half_dim + d] = half(x1 * c + x0 * s);
+        q_row[pair_off + d] = half(x1 * c + x0 * s);
     }
 
     // ── K/V rotation + paged write (only owning q_head per kv_head) ─
@@ -320,9 +332,9 @@ kernel void rope_append_f16_specialized(
         const float c  = float(cos_row[d]);
         const float s  = float(sin_row[d]);
         const float x0 = float(k_row[d]);
-        const float x1 = float(k_row[half_dim + d]);
+        const float x1 = float(k_row[pair_off + d]);
         k_row[d]            = half(x0 * c - x1 * s);
-        k_row[half_dim + d] = half(x1 * c + x0 * s);
+        k_row[pair_off + d] = half(x1 * c + x0 * s);
     }
     // Fence the K writes — the paged write below has thread `d` read
     // `k_row[d]`, which (for d ≥ half_dim) was written by thread
@@ -396,14 +408,15 @@ kernel void rope_append_bf16_specialized(
     device const bfloat* sin_row = cos_sin + pos * rot_dim + half_dim;
 
     const uint q_dim = num_q * head_dim;
+    const uint pair_off = ROPE_PAIR_OFF;
     device bfloat* q_row = q_inout + t * q_dim + q_head * head_dim;
     if (d < half_dim) {
         const float c  = float(cos_row[d]);
         const float s  = float(sin_row[d]);
         const float x0 = float(q_row[d]);
-        const float x1 = float(q_row[half_dim + d]);
+        const float x1 = float(q_row[pair_off + d]);
         q_row[d]            = bfloat(x0 * c - x1 * s);
-        q_row[half_dim + d] = bfloat(x1 * c + x0 * s);
+        q_row[pair_off + d] = bfloat(x1 * c + x0 * s);
     }
 
     if (q_head % group_r != 0) return;
@@ -416,9 +429,9 @@ kernel void rope_append_bf16_specialized(
         const float c  = float(cos_row[d]);
         const float s  = float(sin_row[d]);
         const float x0 = float(k_row[d]);
-        const float x1 = float(k_row[half_dim + d]);
+        const float x1 = float(k_row[pair_off + d]);
         k_row[d]            = bfloat(x0 * c - x1 * s);
-        k_row[half_dim + d] = bfloat(x1 * c + x0 * s);
+        k_row[pair_off + d] = bfloat(x1 * c + x0 * s);
     }
     threadgroup_barrier(mem_flags::mem_device);
 
@@ -506,3 +519,210 @@ kernel void rope_interleaved_bf16(
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// rope_append_normed_* — Gemma4 per-head norm prologue + RoPE + paged write
+//
+// Fuses the per-layer chain
+//   q = rmsnorm(q_raw, q_gains)        (per head, over HEAD_DIM)
+//   k = rmsnorm(k_raw, k_gains)
+//   v = rmsnorm_unit(v_raw)
+//   (q', k', v') = rope_append(q, k, v, ...)
+// into the rope dispatch. Mirrors `Instruction::RopeAppendNormed`.
+//
+// BIT-EXACTNESS CONTRACT: the standalone `rmsnorm_specialized_impl` /
+// `rmsnorm_unit_impl` run with tg_size = 256 (THREADS_PER_GROUP) — a
+// strided `i += 256` accumulation and a 256-wide tree. This kernel
+// runs HEAD_DIM threads (256 sliding / 512 global), so the prologue
+// REPLICATES the 256-thread pattern exactly (threads d >= 256 idle
+// through the reduction) — identical f32 summation order, identical
+// rms, and normed values are rounded to T_act in threadgroup memory
+// exactly where the unfused chain rounded to memory. The rotation
+// then matches `rope_append_*_specialized` verbatim.
+//
+// OUTPUT CONTRACT (differs from the unfused chain ON PURPOSE):
+//   - q' is written for ALL lanes (rotated pairs + pass-through of
+//     unrotated lanes) to the q buffer (aliased to q_raw storage).
+//   - K and V go ONLY to the paged cache. The k'/v' arena tiles are
+//     dead on Gemma4 (every attention impl reads K/V from the cache)
+//     and on global layers k_raw and v_raw are THE SAME buffer
+//     (k_eq_v), so arena writeback would self-conflict.
+//
+// Function constants: ROPE_* 0..6 as rope_append + 7 = ROPE_NORM_EPS,
+// 8 = ROPE_NORM_W_OFFSET (Gemma4 stores full gains -> 0.0).
+//
+// Bindings (must match `interpreter::metal::lowering` for
+// `Instruction::RopeAppendNormed`):
+//   buffer(0) = q_inout  (raw in; normed+rotated out, in place)
+//   buffer(1) = k_in     (raw; read-only)
+//   buffer(2) = v_in     (raw; read-only — k_in == v_in on k_eq_v)
+//   buffer(3) = cos_sin, 4 = positions, 5 = slot_mapping,
+//   buffer(6/7) = kv chunk tables, 8 = q_gains, 9 = k_gains.
+//
+// Dispatch: threadgroups (M, NUM_Q_HEADS, 1) x (HEAD_DIM, 1, 1).
+// ---------------------------------------------------------------------------
+
+/// 256-thread-replica per-head RMS: exact clone of the standalone
+/// `rmsnorm_specialized_impl` reduction (tg_size = 256), regardless of
+/// this kernel's actual threadgroup width. ALL threads of the TG must
+/// call this (threadgroup barriers inside).
+template <typename T_act>
+inline float rope_norm_rms_256(
+    device const T_act* row,
+    uint n,
+    float eps,
+    threadgroup float* scratch,
+    uint d)
+{
+    float local_sum = 0.0f;
+    if (d < 256u) {
+        for (uint i = d; i < n; i += 256u) {
+            float val = float(row[i]);
+            local_sum += val * val;
+        }
+        scratch[d] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (d < stride) {
+            scratch[d] += scratch[d + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return sqrt(scratch[0] / float(n) + eps);
+}
+
+template <typename T_act, typename T_scale>
+[[kernel]] void rope_append_normed_impl(
+    device       T_act* q_inout      [[buffer(0)]],
+    device const T_act* k_in         [[buffer(1)]],
+    device const T_act* v_in         [[buffer(2)]],
+    device const T_act* cos_sin      [[buffer(3)]],
+    device const uint*  positions    [[buffer(4)]],
+    device const uint*  slot_mapping [[buffer(5)]],
+    device const uint64_t* kv_cache_k [[buffer(6)]],
+    device const uint64_t* kv_cache_v [[buffer(7)]],
+    device const T_scale* q_gains    [[buffer(8)]],
+    device const T_scale* k_gains    [[buffer(9)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 tid    [[thread_position_in_threadgroup]])
+{
+    const uint t        = tg_pos.x;
+    const uint q_head   = tg_pos.y;
+    const uint d        = tid.x;
+    const uint head_dim = ROPE_HEAD_DIM;
+    const uint rot_dim  = ROPE_ROT_DIM;
+    const uint half_dim = rot_dim / 2;
+    const uint num_q    = ROPE_NUM_Q_HEADS;
+    const uint num_kv   = ROPE_NUM_KV_HEADS;
+    const uint block_sz = ROPE_BLOCK_SIZE;
+    const uint group_r  = num_q / num_kv;
+    const uint pair_off = ROPE_PAIR_OFF;
+
+    if (q_head >= num_q || d >= head_dim) return;
+
+    // 512 = max head_dim this kernel serves (Gemma4 global). The
+    // lowering asserts head_dim <= 512.
+    threadgroup float scratch[256];
+    threadgroup T_act q_tg[512];
+    threadgroup T_act k_tg[512];
+
+    const uint pos = positions[t];
+    device const T_act* cos_row = cos_sin + pos * rot_dim;
+    device const T_act* sin_row = cos_sin + pos * rot_dim + half_dim;
+
+    // ── Q: per-head rmsnorm into TG memory, then rotate ──────────────
+    const uint q_dim = num_q * head_dim;
+    device T_act* q_row = q_inout + t * q_dim + q_head * head_dim;
+    {
+        const float rms = rope_norm_rms_256(q_row, head_dim, ROPE_NORM_EPS, scratch, d);
+        const float w   = float(q_gains[d]) + ROPE_NORM_W_OFFSET;
+        q_tg[d] = T_act((float(q_row[d]) / rms) * w);
+    }
+    // All raw-q reads complete before any q_inout write below.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(q_tg[d]);
+        const float x1 = float(q_tg[pair_off + d]);
+        q_row[d]            = T_act(x0 * c - x1 * s);
+        q_row[pair_off + d] = T_act(x1 * c + x0 * s);
+    } else if (d < pair_off || d >= pair_off + half_dim) {
+        // Lanes outside every rotation pair pass the normed value
+        // through (proportional rope: lanes [half, pair_off) and
+        // [pair_off + half, head_dim)).
+        q_row[d] = q_tg[d];
+    }
+
+    // ── K/V: owning q_head only (uniform per-TG branch) ─────────────
+    if (q_head % group_r != 0) return;
+    const uint kv_head = q_head / group_r;
+    const uint kv_dim  = num_kv * head_dim;
+    device const T_act* k_row = k_in + t * kv_dim + kv_head * head_dim;
+    device const T_act* v_row = v_in + t * kv_dim + kv_head * head_dim;
+
+    {
+        const float rms = rope_norm_rms_256(k_row, head_dim, ROPE_NORM_EPS, scratch, d);
+        const float w   = float(k_gains[d]) + ROPE_NORM_W_OFFSET;
+        k_tg[d] = T_act((float(k_row[d]) / rms) * w);
+    }
+    // REQUIRED: the V reduction below overwrites `scratch` — without
+    // this barrier a fast thread clobbers scratch[0] while slower
+    // threads are still reading it as rms_k for their k_tg lane
+    // (found as a nondeterministic per-token K-cache divergence vs
+    // the unfused chain, first manifesting mid-prompt at prefill).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // V unit-norm (no gains, no offset — mirrors rmsnorm_unit_impl).
+    // Its internal barriers also order the k_tg fill above before the
+    // rotation below.
+    T_act v_final;
+    {
+        const float rms = rope_norm_rms_256(v_row, head_dim, ROPE_NORM_EPS, scratch, d);
+        v_final = T_act(float(v_row[d]) / rms);
+    }
+    // K rotation in TG memory (each pair touched by one thread).
+    if (d < half_dim) {
+        const float c  = float(cos_row[d]);
+        const float s  = float(sin_row[d]);
+        const float x0 = float(k_tg[d]);
+        const float x1 = float(k_tg[pair_off + d]);
+        k_tg[d]            = T_act(x0 * c - x1 * s);
+        k_tg[pair_off + d] = T_act(x1 * c + x0 * s);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Paged write — identical addressing to rope_append_*_specialized.
+    const uint slot = slot_mapping[t];
+    if (slot == 0xFFFFFFFFu) return;
+    const uint block_id     = slot / block_sz;
+    const uint block_offset = slot % block_sz;
+    const uint kv_blk_stride  = num_kv * block_sz * head_dim;
+    const uint kv_head_stride = block_sz * head_dim;
+    const uint kv_tok_stride  = head_dim;
+    const uint chunk        = block_id / ROPE_BLOCKS_PER_CHUNK;
+    const uint blk_in_chunk = block_id % ROPE_BLOCKS_PER_CHUNK;
+    device T_act* k_dst = (device T_act*)kv_cache_k[chunk]
+        + blk_in_chunk * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+    device T_act* v_dst = (device T_act*)kv_cache_v[chunk]
+        + blk_in_chunk * kv_blk_stride
+        + kv_head      * kv_head_stride
+        + block_offset * kv_tok_stride;
+
+    k_dst[d] = k_tg[d];
+    v_dst[d] = v_final;
+}
+
+#define INST_ROPE_APPEND_NORMED(act_tag, act_type, scale_tag, scale_type)   \
+  template [[host_name("rope_append_normed_" #act_tag "_s_" #scale_tag     \
+                       "_specialized")]]                                    \
+  [[kernel]] decltype(rope_append_normed_impl<act_type, scale_type>)       \
+      rope_append_normed_impl<act_type, scale_type>;
+
+INST_ROPE_APPEND_NORMED(f16,  half,   f16,  half)
+INST_ROPE_APPEND_NORMED(bf16, bfloat, f16,  half)
+INST_ROPE_APPEND_NORMED(bf16, bfloat, bf16, bfloat)
+INST_ROPE_APPEND_NORMED(f16,  half,   bf16, bfloat)

@@ -364,6 +364,18 @@ pub fn apply_signature(
     op: OpKind,
     inputs: &[Shape],
 ) -> Result<OpSig, ShapeError> {
+    apply_signature_with_geometry(solver, op, inputs, false)
+}
+
+/// Like [`apply_signature`], with the hybrid-attention-geometry flag
+/// (see [`Inferred::hybrid_attention_geometry`]). The 3-arg wrapper
+/// keeps every uniform-geometry call site (and test) unchanged.
+pub fn apply_signature_with_geometry(
+    solver: &mut Solver,
+    op: OpKind,
+    inputs: &[Shape],
+    hybrid_attention_geometry: bool,
+) -> Result<OpSig, ShapeError> {
     match op {
         OpKind::Embed => sig_embed(solver, inputs),
         OpKind::RmsNorm => sig_rmsnorm(solver, inputs),
@@ -373,11 +385,11 @@ pub fn apply_signature(
         // in the picked kernel (interleaved pair vs. NeoX), not in
         // the type signature.
         OpKind::RopeAppendInterleaved => sig_rope_append(solver, inputs),
-        OpKind::Attention => sig_attention(solver, inputs),
+        OpKind::Attention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
         // Same q/k/v constraints as `attention`; the distinction is
         // in the picked kernel (window-masked vs. dense), not in
         // the type signature.
-        OpKind::SlidingAttention => sig_attention(solver, inputs),
+        OpKind::SlidingAttention => sig_attention(solver, inputs, op, hybrid_attention_geometry),
         // Vision varlen attention: q/k/v + cu_seqlens + max_seqlen.
         // No heads-layout anchoring — vision shapes are pinned at
         // the qkv-gemm weight, not at attention. See `sig_varlen_attention`.
@@ -389,6 +401,10 @@ pub fn apply_signature(
         OpKind::QuickGelu => sig_unary_elementwise(solver, inputs, op),
         OpKind::GeluErf => sig_unary_elementwise(solver, inputs, op),
         OpKind::TanhSoftCap => sig_unary_elementwise(solver, inputs, op),
+        // Shape-preserving; the per-head reduction width is baked by
+        // the Impl at fan_out (per attention class), not by the sig.
+        OpKind::RmsNormUnit => sig_unary_elementwise(solver, inputs, op),
+        OpKind::ScalarWeightMul => sig_scalar_weight_mul(solver, inputs),
         OpKind::Add => sig_binary_elementwise(solver, inputs, op),
         // Same shape-preserving rule as `Add`. Used inside the
         // LayerNorm fusion pattern `(mean, sub, rmsnorm)`.
@@ -623,32 +639,20 @@ fn sig_gemm(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> 
 /// them (the rest are shape-equivalent to q and k). Callers should
 /// bind all three targets to q's shape, k's shape, v's shape
 /// respectively; we expose those via the signature's *constraints*.
-fn sig_rope_append(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+fn sig_rope_append(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
     expect_args(OpKind::RopeAppend, inputs, 6)?;
     let q = &inputs[0];
-    let k = &inputs[1];
-    let v = &inputs[2];
-    // Assert heads-layout on last dim.
-    let attn_heads = Dim::Mul(vec![
-        Dim::Bound("num_attention_heads".into()),
-        Dim::Bound("head_dim".into()),
-    ]);
-    let kv_heads = Dim::Mul(vec![
-        Dim::Bound("num_key_value_heads".into()),
-        Dim::Bound("head_dim".into()),
-    ]);
+    // Shape-preserving on q/k/v. The heads-layout anchors moved to the
+    // downstream attention sigs, which are per-CLASS: the same
+    // rope_append op serves both Gemma4 classes (sliding 16×256 q vs
+    // global 16×512 q), so a single anchor here would mis-unify one of
+    // them. Projection widths are concrete from weights.json, and
+    // `sig_attention` still enforces the per-class heads layout.
     if q.is_empty() {
         return Err(ShapeError::BadArgs {
             op: OpKind::RopeAppend,
             reason: "q must have rank >= 1".into(),
         });
-    }
-    solver.unify(q.last().unwrap(), &attn_heads)?;
-    if !k.is_empty() {
-        solver.unify(k.last().unwrap(), &kv_heads)?;
-    }
-    if !v.is_empty() {
-        solver.unify(v.last().unwrap(), &kv_heads)?;
     }
     // Output for the first target (conventionally q') = q's shape.
     // The caller binds the other two targets separately (see
@@ -662,7 +666,12 @@ fn sig_rope_append(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, Shape
 /// the same q/k/v unification constraints; the encoder form simply omits the
 /// two opaque KV-side externs. Impl matchers downstream discriminate on arity
 /// to pick decoder vs encoder kernels.
-fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+fn sig_attention(
+    solver: &mut Solver,
+    inputs: &[Shape],
+    op: OpKind,
+    hybrid_attention_geometry: bool,
+) -> Result<OpSig, ShapeError> {
     if inputs.len() != 3 && inputs.len() != 5 {
         return Err(ShapeError::ArgCount {
             op: OpKind::Attention,
@@ -673,13 +682,24 @@ fn sig_attention(solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeEr
     let q = &inputs[0];
     let k = &inputs[1];
     let v = &inputs[2];
+    // Per-class anchors (Gemma4): `attention()` is the GLOBAL class —
+    // `global_head_dim` × `num_global_key_value_heads` (defaulted to
+    // the base values for every uniform-geometry arch by
+    // `extract_bounds`' derived-bounds pass); `sliding_attention()`
+    // keeps the base names.
+    let (hd_name, kv_name): (&str, &str) =
+        if op == OpKind::SlidingAttention || !hybrid_attention_geometry {
+            ("head_dim", "num_key_value_heads")
+        } else {
+            ("global_head_dim", "num_global_key_value_heads")
+        };
     let attn_heads = Dim::Mul(vec![
         Dim::Bound("num_attention_heads".into()),
-        Dim::Bound("head_dim".into()),
+        Dim::Bound(hd_name.into()),
     ]);
     let kv_heads = Dim::Mul(vec![
-        Dim::Bound("num_key_value_heads".into()),
-        Dim::Bound("head_dim".into()),
+        Dim::Bound(kv_name.into()),
+        Dim::Bound(hd_name.into()),
     ]);
     if q.is_empty() {
         return Err(ShapeError::BadArgs {
@@ -920,6 +940,22 @@ fn sig_moe(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> 
 }
 
 /// Elementwise unary ops (silu, gelu, …) preserve shape.
+/// `scalar_weight_mul(x: [...], w: [1])` → `[...]` — multiply by a
+/// loaded one-element weight (Gemma4 `layer_scalar`).
+fn sig_scalar_weight_mul(_solver: &mut Solver, inputs: &[Shape]) -> Result<OpSig, ShapeError> {
+    expect_args(OpKind::ScalarWeightMul, inputs, 2)?;
+    let w = &inputs[1];
+    if w.len() != 1 {
+        return Err(ShapeError::BadArgs {
+            op: OpKind::ScalarWeightMul,
+            reason: format!("weight must have rank 1, got {}", w.len()),
+        });
+    }
+    Ok(OpSig {
+        output: inputs[0].clone(),
+    })
+}
+
 fn sig_unary_elementwise(
     _solver: &mut Solver,
     inputs: &[Shape],
@@ -999,6 +1035,8 @@ fn weight_arg_ranks(op: OpKind) -> &'static [(usize, usize)] {
         OpKind::GeluErf => &[],
         OpKind::VisionRope => &[],
         OpKind::TanhSoftCap => &[],
+        OpKind::RmsNormUnit => &[],
+        OpKind::ScalarWeightMul => &[(1, 1)],
         OpKind::Add => &[],
         OpKind::Sub => &[],
         OpKind::Mean => &[],
@@ -1131,6 +1169,14 @@ pub fn extern_shape(kind: ExternKind) -> Shape {
 pub struct Inferred {
     pub locals: HashMap<LocalId, Shape>,
     pub weights: HashMap<WeightId, Shape>,
+    /// True when the model's bounds declare a global attention class
+    /// with DIFFERENT dims from the base/sliding class (Gemma4). The
+    /// fuf unroller threads this back into `apply_signature` so the
+    /// `attention()` anchor uses the global_* bound names only when
+    /// they're genuinely distinct — uniform arches keep the historical
+    /// base-name anchors (the solver compares Dim expressions
+    /// STRUCTURALLY, so name changes are visible even at equal values).
+    pub hybrid_attention_geometry: bool,
 }
 
 /// Run shape inference over a classified program.
@@ -1159,7 +1205,17 @@ pub fn infer(
     manifest: &crate::weights_manifest::WeightsManifest,
     bounds: &std::collections::BTreeMap<String, u64>,
 ) -> Result<Inferred, ShapeError> {
+    let hybrid_attention_geometry = match (
+        bounds.get("global_head_dim"),
+        bounds.get("head_dim"),
+        bounds.get("num_global_key_value_heads"),
+        bounds.get("num_key_value_heads"),
+    ) {
+        (Some(g_hd), Some(hd), g_kv, kv) => g_hd != hd || g_kv.or(kv) != kv.or(g_kv),
+        _ => false,
+    };
     let mut cx = InferCtx::from_program(program);
+    cx.hybrid_attention_geometry = hybrid_attention_geometry;
     cx.infer_stmts(&program.statements, program)?;
 
     // Anchor weights against the manifest. Dataflow has pinned every
@@ -1224,7 +1280,11 @@ pub fn infer(
     for (id, shape) in cx.weights {
         weights.insert(id, cx.solver.close_shape(&shape)?);
     }
-    Ok(Inferred { locals, weights })
+    Ok(Inferred {
+        locals,
+        weights,
+        hybrid_attention_geometry,
+    })
 }
 
 /// Evaluate a `Dim` to a concrete `u64` using `bounds`, walking
@@ -1713,6 +1773,8 @@ fn rewrite_expr_reads(expr: &mut Expr, producer: LocalId, replacement: LocalId) 
 
 struct InferCtx {
     solver: Solver,
+    /// See [`Inferred::hybrid_attention_geometry`].
+    hybrid_attention_geometry: bool,
     locals: HashMap<LocalId, Shape>,
     weights: HashMap<WeightId, Shape>,
     /// Copy of `Program::reshape_targets` — on the second inference
@@ -1726,6 +1788,7 @@ impl InferCtx {
     fn from_program(program: &Program) -> Self {
         Self {
             solver: Solver::new(),
+            hybrid_attention_geometry: false,
             locals: HashMap::new(),
             weights: HashMap::new(),
             reshape_targets: program.reshape_targets.clone(),
@@ -1805,7 +1868,7 @@ impl InferCtx {
                         .iter()
                         .map(|a| self.expr_shape(a))
                         .collect::<Result<_, _>>()?;
-                    apply_signature(&mut self.solver, *op, &all_input_shapes)?;
+                    apply_signature_with_geometry(&mut self.solver, *op, &all_input_shapes, self.hybrid_attention_geometry)?;
                     // Now bind targets to the post-unification
                     // shapes. (Since rope_append is shape-preserving,
                     // target shapes equal input shapes.)
@@ -1844,7 +1907,7 @@ impl InferCtx {
                         .iter()
                         .map(|a| self.expr_shape(a))
                         .collect::<Result<_, _>>()?;
-                    apply_signature(&mut self.solver, *op, &all_input_shapes)?;
+                    apply_signature_with_geometry(&mut self.solver, *op, &all_input_shapes, self.hybrid_attention_geometry)?;
                     self.locals.insert(targets[0], q_shape);
                     self.locals.insert(targets[1], k_shape);
                     Ok(())
@@ -2032,7 +2095,7 @@ impl InferCtx {
                     .iter()
                     .map(|a| self.expr_shape(a))
                     .collect::<Result<_, _>>()?;
-                let sig = apply_signature(&mut self.solver, *op, &inputs)?;
+                let sig = apply_signature_with_geometry(&mut self.solver, *op, &inputs, self.hybrid_attention_geometry)?;
                 Ok(sig.output)
             }
             Expr::Mul { lhs, rhs } => {

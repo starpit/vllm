@@ -1,0 +1,30 @@
+{
+  "model": "mlx-community/gemma-4-12B-it-4bit",
+  "prompt_text": "Write a Python function that reverses a string.",
+  "token_ids": [
+    2,
+    105,
+    2364,
+    107,
+    6974,
+    496,
+    17856,
+    1292,
+    600,
+    140927,
+    496,
+    2483,
+    236761,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+  ],
+  "greedy_next_token": 3810,
+  "greedy_next_piece": "There"
+}

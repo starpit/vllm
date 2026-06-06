@@ -267,3 +267,77 @@ kernel void tanh_soft_cap_bf16(
     float result = cap * tanh(x / cap);
     out[gid] = bfloat(result);
 }
+
+// Specialized ScalarMul: out = in * SCALE with the compile-time
+// constant baked as function constant 2 (slots 0/1 belong to
+// BIAS_ADD_NUM_COLS / TANH_SOFTCAP_CAP — fn-const indices are
+// file-scoped). Used by the `Instruction::ScalarMul` lowering arm
+// (Gemma-family embed scaling `embed(...) * sqrt(hidden_size)`).
+// First exercised by Gemma4-on-metal — the arm previously referenced
+// these symbols without any .metal definition (latent dead arm).
+constant float SCALAR_MUL_SCALE [[function_constant(2)]];
+
+kernel void scalar_mul_f16_specialized(
+    device       half* out    [[buffer(0)]],
+    device const half* input  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = half(float(input[gid]) * SCALAR_MUL_SCALE);
+}
+
+kernel void scalar_mul_bf16_specialized(
+    device       bfloat* out    [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = bfloat(float(input[gid]) * SCALAR_MUL_SCALE);
+}
+
+// ScalarWeightMul: out = in * w[0] — multiply by a loaded [1]-shaped
+// weight (Gemma4 `layer_scalar`, applied to the hidden state at the
+// end of every decoder layer). Exact-thread dispatch like
+// `residual_add_*_specialized`; no function constants.
+kernel void scalar_weight_mul_f16_specialized(
+    device       half* out    [[buffer(0)]],
+    device const half* input  [[buffer(1)]],
+    device const half* weight [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = half(float(input[gid]) * float(weight[0]));
+}
+
+kernel void scalar_weight_mul_bf16_specialized(
+    device       bfloat* out    [[buffer(0)]],
+    device const bfloat* input  [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = bfloat(float(input[gid]) * float(weight[0]));
+}
+
+// Specialized variants: the cap is a per-model compile-time constant
+// (`W::FINAL_LOGIT_SOFTCAPPING`), so it bakes into the pipeline as a
+// function constant instead of a runtime scalar buffer — same Phase
+// 5.B pattern as `bias_add_*_specialized`. Used by the metal
+// `Instruction::TanhSoftCap` lowering arm (Gemma2/4 final logit
+// softcapping: `out = cap * tanh(x / cap)`). Slot 1: function-constant
+// indices are file-scoped and slot 0 belongs to BIAS_ADD_NUM_COLS.
+constant float TANH_SOFTCAP_CAP [[function_constant(1)]];
+
+kernel void tanh_soft_cap_f16_specialized(
+    device const half* input [[buffer(0)]],
+    device half* out [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float x = float(input[gid]);
+    out[gid] = half(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
+}
+
+kernel void tanh_soft_cap_bf16_specialized(
+    device const bfloat* input [[buffer(0)]],
+    device bfloat* out [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float x = float(input[gid]);
+    out[gid] = bfloat(TANH_SOFTCAP_CAP * tanh(x / TANH_SOFTCAP_CAP));
+}

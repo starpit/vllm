@@ -21,6 +21,7 @@ use crate::util::{self, Buffer};
 use dispatch2::DispatchData;
 use ferrite_fusion_synth::{
     aot::aot_compile_metallib,
+    atom_lib::MlpAct,
     fuse_pass::{ChunkConstants, SynthesisBackend, synthesize_mlp_pre_down_chunk},
 };
 use ferrite_metal_kernels::stream::MetalStream;
@@ -113,7 +114,14 @@ fn bench_one(s: &ModelShape, m: u32, launch_overhead_us: f64) -> f64 {
         rms_norm_eps: s.rms_eps,
         has_linear_bias: false,
     };
-    let synth = synthesize_mlp_pre_down_chunk(SynthesisBackend::Metal, "bfloat", "half", &consts);
+    let synth = synthesize_mlp_pre_down_chunk(
+        SynthesisBackend::Metal,
+        "bfloat",
+        "half",
+        &consts,
+        MlpAct::Silu,
+        4,
+    );
     let bytes = aot_compile_metallib(&synth.symbol, &synth.source);
     assert!(
         !bytes.is_empty(),

@@ -476,7 +476,12 @@ impl<'a> Unroller<'a> {
                 let (inputs, input_shapes): (Vec<FufInput>, Vec<Shape>) =
                     resolved.into_iter().unzip();
                 let mut throwaway = crate::shape::Solver::new();
-                let sig = crate::shape::apply_signature(&mut throwaway, *op, &input_shapes)
+                let sig = crate::shape::apply_signature_with_geometry(
+                    &mut throwaway,
+                    *op,
+                    &input_shapes,
+                    self.inferred.hybrid_attention_geometry,
+                )
                     .map_err(|e| {
                         UnrollError::UnsupportedCfgShape(format!(
                             "nested {} shape: {e}",

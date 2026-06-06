@@ -31,6 +31,7 @@ arch-qwen3         = ["dep:ferrite-model-qwen3"]
 arch-qwen3-moe     = ["dep:ferrite-model-qwen3-moe"]
 arch-qwen3-5       = ["dep:ferrite-model-qwen3-5"]
 arch-qwen3-5-moe   = ["dep:ferrite-model-qwen3-5-moe"]
+arch-gemma4        = ["dep:ferrite-model-gemma4"]
 arch-qwen3-5-vl    = ["arch-qwen3-5", "dep:ferrite-model-qwen3-5-vl"]
 
 all-arches = [
@@ -55,6 +56,7 @@ all-arches = [
     "arch-qwen3-moe",
     "arch-qwen3-5",
     "arch-qwen3-5-moe",
+    "arch-gemma4",
     "arch-qwen3-5-vl",
 ]
 
@@ -77,6 +79,7 @@ cuda = [
     "ferrite-model-qwen3-moe?/cuda",
     "ferrite-model-qwen3-5?/cuda",
     "ferrite-model-qwen3-5-moe?/cuda",
+    "ferrite-model-gemma4?/cuda",
     "ferrite-model-qwen3-5-vl?/cuda",
     "ferrite-model-deepseek-v2?/cuda",
     "ferrite-model-deepseek-v3?/cuda",
@@ -101,6 +104,7 @@ metal = [
     "ferrite-model-qwen3-moe?/metal",
     "ferrite-model-qwen3-5?/metal",
     "ferrite-model-qwen3-5-moe?/metal",
+    "ferrite-model-gemma4?/metal",
     "ferrite-model-qwen3-5-vl?/metal",
     "ferrite-model-mixtral?/metal",
 ]
@@ -130,6 +134,7 @@ nccl = [
     "ferrite-model-qwen3-moe?/nccl",
     "ferrite-model-qwen3-5?/nccl",
     "ferrite-model-qwen3-5-moe?/nccl",
+    "ferrite-model-gemma4?/nccl",
     "ferrite-model-qwen3-5-vl?/nccl",
     "ferrite-model-deepseek-v2?/nccl",
     "ferrite-model-deepseek-v3?/nccl",
@@ -158,4 +163,5 @@ ferrite-model-qwen3        = { path = "../ferrite-model-qwen3",        optional 
 ferrite-model-qwen3-moe    = { path = "../ferrite-model-qwen3-moe",    optional = true }
 ferrite-model-qwen3-5      = { path = "../ferrite-model-qwen3-5",      optional = true }
 ferrite-model-qwen3-5-moe  = { path = "../ferrite-model-qwen3-5-moe",  optional = true }
+ferrite-model-gemma4       = { path = "../ferrite-model-gemma4",       optional = true }
 ferrite-model-qwen3-5-vl   = { path = "../ferrite-model-qwen3-5-vl",   optional = true }

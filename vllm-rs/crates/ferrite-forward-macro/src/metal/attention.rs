@@ -318,7 +318,18 @@ impl Implementation for MetalAttentionImpl {
                 ],
             ),
             (true, false) => SlidingAttentionViaCacheImpl.opcode_shape(),
-            (true, true) => SlidingAttentionPrefillContiguousImpl.opcode_shape(),
+            // Sliding prefill mirrors the non-sliding paged prefill
+            // shape — the metal runtime reads K/V from the paged cache
+            // and applies the window as a kernel function constant.
+            (true, true) => OpcodeShape::new(
+                "SlidingAttentionPrefillPaged",
+                vec![
+                    ("q_slot", syn::parse_quote!(u32)),
+                    ("out_slot", syn::parse_quote!(u32)),
+                    ("layer", syn::parse_quote!(u32)),
+                    ("interleaved", syn::parse_quote!(bool)),
+                ],
+            ),
         }
     }
     fn fan_out(
@@ -332,16 +343,19 @@ impl Implementation for MetalAttentionImpl {
         match (self.is_sliding, self.is_multihead) {
             (false, false) => AttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
             // Metal prefill: emit `Instruction::AttentionPrefillPaged`
-            // instead of `AttentionPrefillContiguous`. The paged kernel
-            // reads K/V from the per-layer paged cache (written upstream
-            // by `RopeAppend`), so we drop the k_slot/v_slot operands
-            // and carry the layer index instead. K/V tiles still get
-            // produced by the upstream FusedQkvRopePrefill+RopeAppend
-            // chain (and consumed by the cache write); they're just
-            // not read by this attention kernel. Required for
-            // chunked-prefill / prefix-cache / multi-turn paths the
-            // contiguous prefill cannot handle.
-            (false, true) => {
+            // (or its sliding sibling) instead of the contiguous
+            // variant. The paged kernel reads K/V from the per-layer
+            // paged cache (written upstream by `RopeAppend`), so we
+            // drop the k_slot/v_slot operands and carry the layer
+            // index instead. K/V tiles still get produced by the
+            // upstream FusedQkvRopePrefill+RopeAppend chain (and
+            // consumed by the cache write); they're just not read by
+            // this attention kernel. Required for chunked-prefill /
+            // prefix-cache / multi-turn paths the contiguous prefill
+            // cannot handle. The sliding variant differs only in the
+            // ATTN_WINDOW function constant baked by the runtime
+            // lowering arm.
+            (_, true) => {
                 let tile = m.claimed_tiles[0];
                 let node = fuf.get(tile);
                 let resolve = |idx: usize| -> (TileId, u8) {
@@ -379,17 +393,24 @@ impl Implementation for MetalAttentionImpl {
                 // a future cuda eval body for this variant should walk
                 // the FUF (`layer_rope_is_interleaved`) instead.
                 let interleaved = false;
-                Some(vec![ferrite_forward::Instruction::AttentionPrefillPaged(
-                    q_slot,
-                    out_slot,
-                    layer,
-                    interleaved,
-                )])
+                let instr = if self.is_sliding {
+                    ferrite_forward::Instruction::SlidingAttentionPrefillPaged(
+                        q_slot,
+                        out_slot,
+                        layer,
+                        interleaved,
+                    )
+                } else {
+                    ferrite_forward::Instruction::AttentionPrefillPaged(
+                        q_slot,
+                        out_slot,
+                        layer,
+                        interleaved,
+                    )
+                };
+                Some(vec![instr])
             }
             (true, false) => SlidingAttentionViaCacheImpl.fan_out(m, fuf, program, bounds, slots),
-            (true, true) => {
-                SlidingAttentionPrefillContiguousImpl.fan_out(m, fuf, program, bounds, slots)
-            }
         }
     }
 }

@@ -209,6 +209,35 @@ pub trait CanonicalParams: WeightAccessors {
     /// Default equals `HEAD_DIM` (full rope, the common case).
     const ROT_DIM: u32 = Self::HEAD_DIM;
 
+    /// Per-layer-class attention geometry for hybrid sliding/global
+    /// architectures whose two classes differ in dims (Gemma4: sliding
+    /// layers `head_dim 256 × 8 kv heads`, global layers `head_dim 512
+    /// × 1 kv head`). The DSL's `attention()` (global) vs
+    /// `sliding_attention()` (local) tiles lower to distinct
+    /// Instruction variants, so the metal lowering feeds the GLOBAL_*
+    /// family to the full-attention arms and the base `HEAD_DIM` /
+    /// `NUM_KV_HEADS` to the sliding arms. Defaults equal the base
+    /// values — uniform-geometry models compile unchanged. Sourced
+    /// from config `global_head_dim` / `num_global_key_value_heads`.
+    const GLOBAL_HEAD_DIM: u32 = Self::HEAD_DIM;
+    /// See [`Self::GLOBAL_HEAD_DIM`].
+    const NUM_GLOBAL_KV_HEADS: u32 = Self::NUM_KV_HEADS;
+    /// Partial-rope rotation dim for the GLOBAL class (Gemma4:
+    /// proportional rope rotates 128 of 512). Defaults to the global
+    /// head_dim (full rope).
+    const GLOBAL_ROT_DIM: u32 = Self::GLOBAL_HEAD_DIM;
+    /// `num_q_heads * global_head_dim` — the global-class Q/attn-out
+    /// row width (Gemma4: 16×512 = 8192 vs sliding 16×256 = 4096).
+    const GLOBAL_Q_SIZE: usize = Self::Q_SIZE;
+    /// Gemma4 "proportional" partial rope on the GLOBAL class (config
+    /// `global_partial_rotary_factor`): rotation pairs span the FULL
+    /// head's halves — lane `i < GLOBAL_ROT_DIM/2` pairs with `i +
+    /// GLOBAL_HEAD_DIM/2` (mlx `ProportionalRoPE`), NOT `i +
+    /// GLOBAL_ROT_DIM/2` like standard HF partial rotary (Qwen3.5).
+    /// The metal RopeAppend arm keys the kernel's pairing offset on
+    /// this. False everywhere else.
+    const ROPE_PROPORTIONAL: bool = false;
+
     /// Element dtype the metal backend should run this canonical in.
     /// Picks between the `_f16_specialized` / `_bf16_specialized`
     /// shader symbols and matching MPS GEMM data type. Default
@@ -625,6 +654,37 @@ pub enum Instruction {
     SpliceMmEmbeds(u32),
     ScalarMul(u32, u32, f32),
     TanhSoftCap(u32, u32),
+    /// Unit-gain RMSNorm (no learnable scale — mlx `RMSNormNoScale`,
+    /// Gemma4 `v_norm`). `(in_slot, out_slot, hidden_size,
+    /// m_multiplier)`: input treated as `[M * m_multiplier,
+    /// hidden_size]` rows, each normalized by rsqrt(mean(x²)+eps)
+    /// with gain ≡ 1. The per-head width is baked per attention
+    /// class by `RmsNormUnitImpl::fan_out`.
+    RmsNormUnit(u32, u32, u32, u32),
+    /// Multiply by a loaded `[1]`-shaped weight (Gemma4
+    /// `layer_scalar[layer]`). `(in_slot, out_slot, layer)`; the
+    /// weight resolves through the tape-level RmsNorm-kind accessor.
+    ScalarWeightMul(u32, u32, u32),
+    /// Gemma4 post-FFN tail fused into one kernel:
+    /// `out = (rmsnorm(delta, gains) + residual) * layer_scalar`
+    /// (the DSL's `rmsnorm(down) → add(.., hidden) → scalar_weight_mul`
+    /// chain — norm-THEN-add, the mirror image of `FusedAddRmsNorm`).
+    /// `(delta_slot, residual_slot, out_slot, layer, hidden_size)`.
+    /// Weights resolve through RmsNorm-kind accessors: sub-slot 0 =
+    /// post-FFN norm gains `[hidden]`, sub-slot 1 = `layer_scalar [1]`.
+    NormAddScalarMul(u32, u32, u32, u32, u32),
+    /// Gemma4 pre-attention tail fused into the rope dispatch:
+    /// per-head `rmsnorm(q, q_gains)` / `rmsnorm(k, k_gains)` /
+    /// `rmsnorm_unit(v)` prologues + NeoX RoPE + paged KV write.
+    /// Field layout mirrors [`RopeAppend`](Instruction::RopeAppend):
+    /// `(q_slot, k_slot, v_slot, q_out_slot, k_out_slot, v_out_slot,
+    /// layer, interleaved, is_global)` — in-slots are the RAW
+    /// projection outputs (pre-norm). Q is normed+rotated in place;
+    /// K/V go to the cache ONLY (their arena tiles are dead on
+    /// Gemma4, and k_eq_v global layers share one raw buffer).
+    /// Weights: RmsNorm-kind sub-slots 0/1 = q/k gains; CosSin
+    /// auto-injected.
+    RopeAppendNormed(u32, u32, u32, u32, u32, u32, u32, bool, bool),
     /// `FusedAddRmsNorm(delta_slot, residual_slot, layer, hidden_size, m_multiplier)`.
     /// See [`RmsNorm`](Instruction::RmsNorm) for the field semantics.
     /// FusedAddRmsNorm is always on the residual stream so
@@ -709,6 +769,16 @@ pub enum Instruction {
     EncoderAttention(u32, u32, u32, u32),
     SlidingAttentionViaCache(u32, u32, u32, bool),
     SlidingAttentionPrefillContiguous(u32, u32, u32, u32, bool),
+    /// Sliding-window variant of [`Instruction::AttentionPrefillPaged`]
+    /// — same operands `(q_slot, out_slot, layer, interleaved)` and the
+    /// same paged-cache read path; the metal lowering arm additionally
+    /// bakes `W::SLIDING_WINDOW` into the kernel's `ATTN_WINDOW`
+    /// function constant and never routes to the steel kernel (steel
+    /// has no window support). Emitted only by the metal adapter
+    /// (`metal::attention::fan_out`, sliding+multihead arm); cuda
+    /// routes sliding prefill through
+    /// [`Instruction::SlidingAttentionPrefillContiguous`].
+    SlidingAttentionPrefillPaged(u32, u32, u32, bool),
     /// Vision-tower variable-length attention: `(q_slot, k_slot,
     /// v_slot, out_slot, cu_seqlens_kind)`. The `cu_seqlens_kind`
     /// u8 discriminant selects which `(cu_seqlens, max_seqlen)` pair
@@ -829,7 +899,13 @@ pub enum Instruction {
     /// Args: (in_slot, out_slot, layer, head_dim).
     #[cfg(fa3_built)]
     FlashAttention3Decode(u32, u32, u32, u32),
-    RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool),
+    /// `(q_slot, k_slot, v_slot, q_out, k_out, v_out, layer,
+    /// interleaved, is_global)`. `is_global` selects the attention
+    /// geometry class on hybrid sliding/global arches (Gemma4): the
+    /// metal lowering reads `GLOBAL_HEAD_DIM/NUM_GLOBAL_KV_HEADS/
+    /// GLOBAL_ROT_DIM` when true, the base consts when false.
+    /// Identical on uniform models (GLOBAL_* default to base).
+    RopeAppend(u32, u32, u32, u32, u32, u32, u32, bool, bool),
     MlaSplit(u32, u32, u32),
     MlaAttention(u32, u32, u32, u32, u32),
     /// Gated-DeltaNet linear attention (Qwen3.5 / Qwen3-Next). Args:
@@ -1055,6 +1131,12 @@ pub enum Instruction {
     /// configs). CUDA eval is `unreachable!` — metal-only (CUDA's
     /// q-MLP routes through Marlin/Bnb/etc).
     SiluMul(u32, u32, u32, u32),
+    /// GELU (tanh approx) sibling of [`Instruction::SiluMul`] for the
+    /// decomposed GeGLU q-MLP path (Gemma2/3/4:
+    /// `gelu_pytorch_tanh(gate) * up`). Same tuple fields
+    /// `(gate_slot, up_slot, out_slot)`, same `[M, intermediate_size]`
+    /// shapes. Metal-only.
+    GeluMul(u32, u32, u32),
     /// Fused gate+up GEMM + SiluMul for large-M prefill (M ≥ 8).
     /// Metal-only; emitted by `MetalSynthGateUpSiluMulImpl`.
     /// Fields: `(x_norm_slot, out_slot, layer, group_size, bits,
@@ -2155,6 +2237,12 @@ impl Instruction {
                      `Instruction::AttentionPrefillContiguous` (flash_attn_contiguous)."
                 );
             }
+            Instruction::SlidingAttentionPrefillPaged(_q_slot, _out_slot, _layer, _interleaved) => {
+                unimplemented!(
+                    "SlidingAttentionPrefillPaged is metal-only — cuda routes sliding \
+                     prefill through `Instruction::SlidingAttentionPrefillContiguous`."
+                );
+            }
             Instruction::EncoderAttention(q_slot, k_slot, v_slot, out_slot) => {
                 // Encoder/bidirectional self-attention: same FA2 kernel
                 // as the prefill prefill path but with `is_causal=false`
@@ -2701,6 +2789,9 @@ impl Instruction {
                 v_out_slot,
                 layer,
                 interleaved,
+                // cuda eval keeps uniform geometry (Gemma4 is
+                // metal-first; class-aware cuda eval lands with P7).
+                _is_global,
             ) => unsafe {
                 let layer = ctx.layer_offset + layer;
                 let cos_sin = ctx.wm.cos_sin_at(bucket, op_idx, 0, layer);
@@ -3822,6 +3913,34 @@ impl Instruction {
                     "Instruction::SiluMul is metal-only — emitted by the \
                      decomposed q-MLP path on Affine; cuda's q-MLP routes \
                      through Marlin/Bnb/Fp8/etc fused kernels"
+                );
+            }
+            Instruction::GeluMul(..) => {
+                unreachable!(
+                    "Instruction::GeluMul is metal-only — emitted by the \
+                     decomposed GeGLU q-MLP path on Affine (Gemma2/3/4); \
+                     cuda routes GeGLU through its fused dense kernels"
+                );
+            }
+            Instruction::RmsNormUnit(..) => {
+                unimplemented!(
+                    "RmsNormUnit cuda eval is unwired — Gemma4 is metal-first; \
+                     land a cuda unit-gain rmsnorm before enabling Gemma4 on cuda"
+                );
+            }
+            Instruction::ScalarWeightMul(..) => {
+                unimplemented!(
+                    "ScalarWeightMul cuda eval is unwired — Gemma4 is metal-first"
+                );
+            }
+            Instruction::NormAddScalarMul(..) => {
+                unimplemented!(
+                    "NormAddScalarMul cuda eval is unwired — Gemma4 is metal-first"
+                );
+            }
+            Instruction::RopeAppendNormed(..) => {
+                unimplemented!(
+                    "RopeAppendNormed cuda eval is unwired — Gemma4 is metal-first"
                 );
             }
             Instruction::MetalBiasAdd(..) => {

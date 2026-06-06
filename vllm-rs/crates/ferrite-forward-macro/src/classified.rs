@@ -263,6 +263,18 @@ pub enum OpKind {
     /// preserving. Used at logit exit for architectures that cap
     /// large pre-softmax magnitudes.
     TanhSoftCap,
+    /// Unit-gain RMSNorm — no learnable scale (mlx `RMSNormNoScale`).
+    /// Gemma4 `v_norm`: V is rms-normalized per head before the cache
+    /// write with NO weight on disk. DSL `rmsnorm_unit(x)`; the Impl
+    /// bakes the per-head reduction width from the attention class
+    /// (sliding vs global) at fan_out time.
+    RmsNormUnit,
+    /// Multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar`
+    /// applied to the hidden state at the end of every layer). DSL
+    /// `scalar_weight_mul(x, layer_scalar[layer])`. Distinct from
+    /// `ScalarMul` (compile-time constant) and `Mul` (same-shape
+    /// elementwise).
+    ScalarWeightMul,
     Add,
     /// Tensor-tensor elementwise subtract: `sub(x, y) -> x - y`.
     /// Shape-preserving like `Add`. Exists as a math primitive so
@@ -515,6 +527,8 @@ impl OpKind {
             "silu" => Some(Self::Silu),
             "gelu" => Some(Self::Gelu),
             "tanh_softcap" => Some(Self::TanhSoftCap),
+            "rmsnorm_unit" => Some(Self::RmsNormUnit),
+            "scalar_weight_mul" => Some(Self::ScalarWeightMul),
             "add" => Some(Self::Add),
             "sub" => Some(Self::Sub),
             "mean" => Some(Self::Mean),
@@ -553,6 +567,8 @@ impl OpKind {
             Self::GeluErf => "gelu_erf",
             Self::VisionRope => "vision_rope",
             Self::TanhSoftCap => "tanh_softcap",
+            Self::RmsNormUnit => "rmsnorm_unit",
+            Self::ScalarWeightMul => "scalar_weight_mul",
             Self::Add => "add",
             Self::Sub => "sub",
             Self::Mean => "mean",
@@ -631,6 +647,10 @@ pub struct Program {
     /// for Gemma3-MM-style multimodal where HF nests the text decoder
     /// under `language_model.<...>`.
     pub decoder_safetensors_prefix: Option<String>,
+    /// DSL-leaf → disk-leaf renames (see
+    /// `ModelParams::weight_leaf_renames`). Applied by
+    /// `codegen::safetensors_prefix` after segment translation.
+    pub weight_leaf_renames: Vec<(String, String)>,
 }
 
 /// Side table: `LocalId` → debug ident.

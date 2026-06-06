@@ -40,6 +40,12 @@ pub struct KvCachePool {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub num_layers: usize,
+    /// Per-layer `num_kv_heads * block_size * head_dim` overriding the
+    /// uniform `num_kv_heads * block_size * head_dim` when the model's
+    /// attention geometry differs per layer class (Gemma4: sliding
+    /// layers 8×16×256 = 32768 elems/block, global layers 1×16×512 =
+    /// 8192). `None` = uniform (every existing arch).
+    per_layer_block_elems: Option<Vec<usize>>,
     /// The dtype stored in cache (may differ from model dtype when FP8).
     cache_dtype: DType,
     /// Per-layer K scale: GPU f32 scalar RAII wrappers. Only used when FP8.
@@ -209,6 +215,7 @@ impl KvCachePool {
             num_kv_heads,
             head_dim,
             num_layers,
+            per_layer_block_elems: None,
             cache_dtype: dtype,
             #[cfg(feature = "cuda")]
             k_scale_ptrs,
@@ -251,6 +258,7 @@ impl KvCachePool {
             num_kv_heads: 0,
             head_dim: 0,
             num_layers: 0,
+            per_layer_block_elems: None,
             cache_dtype: DType::BF16,
             #[cfg(feature = "cuda")]
             k_scale_ptrs: Vec::new(),
@@ -342,6 +350,11 @@ impl KvCachePool {
         block_size: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        // Per-layer block-elem override for hybrid-geometry models
+        // (Gemma4). `None` = uniform layers (the common case). When
+        // `Some`, len must equal `num_layers` and each entry is that
+        // layer's `kv_heads * block_size * head_dim`.
+        per_layer_block_elems: Option<Vec<usize>>,
         dtype: DType,
         blocks_per_chunk: usize,
         // Chunks to allocate up front. `1` = reactive/lazy (grow on
@@ -361,6 +374,15 @@ impl KvCachePool {
         // Elements per paged block = kv_blk_stride (num_kv_heads *
         // block_size * head_dim). A chunk holds `blocks_in_chunk` of these.
         let per_block_elems = num_kv_heads * block_size * head_dim;
+        if let Some(v) = per_layer_block_elems.as_ref() {
+            assert_eq!(
+                v.len(),
+                num_layers,
+                "per_layer_block_elems len must equal num_layers"
+            );
+        }
+        let layer_block_elems =
+            |layer: usize| per_layer_block_elems.as_ref().map_or(per_block_elems, |v| v[layer]);
 
         let mut k_chunks: Vec<Vec<RawGpuMem>> = Vec::with_capacity(num_layers);
         let mut v_chunks: Vec<Vec<RawGpuMem>> = Vec::with_capacity(num_layers);
@@ -377,14 +399,14 @@ impl KvCachePool {
         // one chunk.
         // At least one chunk (if the pool is non-empty), at most all.
         let initial_chunks = initial_chunks.clamp(num_chunks.min(1), num_chunks);
-        for _layer in 0..num_layers {
+        for layer in 0..num_layers {
             let mut kc = Vec::with_capacity(num_chunks);
             let mut vc = Vec::with_capacity(num_chunks);
             for chunk in 0..initial_chunks {
                 // Chunk may be partial so chunk bytes sum to exactly
                 // num_blocks (no over-allocation).
                 let blocks_here = blocks_per_chunk.min(num_blocks - chunk * blocks_per_chunk);
-                let bytes = blocks_here * per_block_elems * elem;
+                let bytes = blocks_here * layer_block_elems(layer) * elem;
                 kc.push(alloc_chunk(bytes)?);
                 vc.push(alloc_chunk(bytes)?);
             }
@@ -416,6 +438,7 @@ impl KvCachePool {
             num_kv_heads,
             head_dim,
             num_layers,
+            per_layer_block_elems,
             cache_dtype: dtype,
             #[cfg(feature = "cuda")]
             k_scale_ptrs: Vec::new(),
@@ -560,8 +583,14 @@ impl KvCachePool {
             let blocks_here = self
                 .blocks_per_chunk
                 .min(self.num_blocks - next * self.blocks_per_chunk);
-            let bytes = blocks_here * per_block_elems * elem;
             for layer in 0..self.num_layers {
+                // Per-layer block size for hybrid-geometry models
+                // (Gemma4); uniform fallback otherwise.
+                let lbe = self
+                    .per_layer_block_elems
+                    .as_ref()
+                    .map_or(per_block_elems, |v| v[layer]);
+                let bytes = blocks_here * lbe * elem;
                 let kc = alloc_chunk(bytes)?;
                 let vc = alloc_chunk(bytes)?;
                 let ka = gpu_addr(&kc);

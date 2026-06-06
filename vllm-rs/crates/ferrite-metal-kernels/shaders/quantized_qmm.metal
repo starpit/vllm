@@ -200,7 +200,12 @@ METAL_FUNC void qmm_t_impl_inline(
     uint  simd_lane_id,
     uint3 tgid)
 {
-  static_assert(bits == 4, "qmm_t_impl_inline only instantiated for bits=4");
+  // bits=8 rides the same MLX QuantizedBlockLoader path (taken when
+  // T_compute == T_scale); the hand-inlined mixed-compute W loader
+  // below is nibble(4-bit)-specialized, so b8 is only instantiated
+  // for the same-compute symbol family (Gemma4 8-bit MLP, bf16/bf16).
+  static_assert(bits == 4 || bits == 8,
+                "qmm_t_impl_inline only instantiated for bits in {4, 8}");
   static_assert(group_size == 16 || group_size == 32 || group_size == 64 ||
                     group_size == 128,
                 "qmm_t_impl_inline expects group_size in {16, 32, 64, 128}");
@@ -1113,6 +1118,31 @@ INST_QMM_ALL(f16,  half,   bf16, bfloat, 128)
 // in half — ~1.7× faster on M1 Max for prefill matmuls. Output stays
 // bf16 so the residual stream's bf16 dynamic range is preserved.
 // Only qmm_t (not qmm_n; qmm_n isn't on the prefill hot path).
+// 8-bit Standard qmm_t (Gemma4 MLP projections: 8-bit g64 with bf16
+// activations + bf16 scales; f16/f16 combo kept for unit tests). Only
+// the Standard kernel family — NAX static_asserts bits==4 and the
+// 8-bit path never routes to SplitK (`pick_qmm_t_kernel` gate in the
+// lowering). Same-compute only: the mixed-compute inline W loader is
+// nibble-specialized.
+#define INST_QMM_T_B8(act_tag, act_type, scale_tag, scale_type, gs, aln_tag, aln_val) \
+  template [[host_name(                                                               \
+      "affine_qmm_t_" #act_tag "_s_" #scale_tag "_gs_" #gs                            \
+      "_b_8_alN_" #aln_tag "_batch_0")]] [[kernel]] void                              \
+  affine_qmm_t_kernel<act_type, act_type, scale_type, gs, 8, aln_val>(                \
+      const device uint32_t*   w        [[buffer(0)]],                                \
+      const device scale_type* scales   [[buffer(1)]],                                \
+      const device scale_type* biases   [[buffer(2)]],                                \
+      const device act_type*   x        [[buffer(3)]],                                \
+      device act_type*         y        [[buffer(4)]],                                \
+      uint  simd_group_id [[simdgroup_index_in_threadgroup]],                         \
+      uint  simd_lane_id  [[thread_index_in_simdgroup]],                              \
+      uint3 tgid          [[threadgroup_position_in_grid]]);
+
+INST_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, true,  true)
+INST_QMM_T_B8(bf16, bfloat, bf16, bfloat, 64, false, false)
+INST_QMM_T_B8(f16,  half,   f16,  half,   64, true,  true)
+INST_QMM_T_B8(f16,  half,   f16,  half,   64, false, false)
+
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, true,  true)
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  64, false, false)
 INST_QMM_T_C(bf16, bfloat, f16, half, f16, half,  32, true,  true)

@@ -1,0 +1,5 @@
+# Per-layer activation goldens are ~60MB of .npy — regenerable from the
+# checkpoint via oracle_goldens.py / oracle_layer0.py / oracle_decode_step.py.
+# The small JSON goldens (generations.json, window.json, meta.json) are kept.
+*.npy
+__pycache__/

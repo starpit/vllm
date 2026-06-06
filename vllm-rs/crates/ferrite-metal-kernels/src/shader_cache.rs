@@ -112,12 +112,72 @@ impl ShaderCache {
             libraries.insert(name.to_string(), lib);
         }
 
-        // NAX qmm_t: runtime-compiled from source (offline metallib
-        // toolchain miscompiles MPP matmul2d — see
-        // `compile_nax_library_from_source`).
-        let nax_lib = compile_nax_library_from_source(&device).map_err(|e| {
-            MetalStreamError::ShaderCompilationFailed(format!("compile `quantized_qmm_nax`: {e}"))
-        })?;
+        // FERRITE_JIT_QMV=1 — toolchain probe: swap the AOT-embedded
+        // qmv library for a runtime `newLibraryWithSource` compile of
+        // the same source (see `compile_qmv_library_from_source`).
+        // Bench-only; default path is untouched.
+        if std::env::var_os("FERRITE_JIT_QMV").is_some() {
+            let lib = compile_qmv_library_from_source(&device).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "FERRITE_JIT_QMV runtime compile: {e}"
+                ))
+            })?;
+            libraries.insert("quantized_qmv".to_string(), lib);
+            eprintln!(
+                "[ferrite-metal] FERRITE_JIT_QMV=1: quantized_qmv compiled at \
+                 runtime (driver compiler) instead of the xcrun metallib"
+            );
+        }
+
+        // NAX qmm_t: runtime-compiled from source. Findings from the
+        // 2026-06-04 compile-path investigation (Gemma4 prefill):
+        //  - the LOCAL offline toolchain (xcrun metal, SDK 26.5)
+        //    miscompiles MPP matmul2d from this source REGARDLESS of
+        //    math mode / flags (parity fails) — runtime compile is
+        //    the only correct local path;
+        //  - the runtime-compiled kernel runs ~11 TFLOPS on the
+        //    Gemma4 MLP shape while the MLX WHEEL's offline-built
+        //    binary of the byte-identical kernel runs 13.1 TFLOPS in
+        //    the same harness (their CI metal toolchain codegens MPP
+        //    better than both our local paths) — see
+        //    `qmm_t_nax_b8_bf16_gemma4_mlp_bench`;
+        //  - mlx's own JIT uses the same options as ours (no fast
+        //    math, LanguageVersion4_0), so a newer local toolchain is
+        //    the only known way to capture the last ~1.2x.
+        // `FERRITE_NAX_OFFLINE_LIB=1` loads the build.rs-compiled
+        // metallib (KNOWN BAD locally — parity-failing; kept as the
+        // toolchain probe); any other value = path to a metallib.
+        let nax_lib = if let Some(v) = std::env::var_os("FERRITE_NAX_OFFLINE_LIB") {
+            // "1" = the build.rs-embedded metallib; any other value =
+            // a filesystem path to a metallib (flag-set A/B probes).
+            let bytes: &'static [u8] = if v == "1" {
+                &crate::embedded_metallib!("quantized_qmm_nax")[..]
+            } else {
+                // Leaked on purpose: debug-only A/B path; the library
+                // (and the no-copy dispatch_data view into the bytes)
+                // lives for the process anyway.
+                Box::leak(
+                    std::fs::read(&v)
+                        .map_err(|e| {
+                            MetalStreamError::ShaderCompilationFailed(format!(
+                                "read {v:?}: {e}"
+                            ))
+                        })?
+                        .into_boxed_slice(),
+                )
+            };
+            load_library_from_bytes(&device, bytes).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "load `quantized_qmm_nax.metallib`: {e}"
+                ))
+            })?
+        } else {
+            compile_nax_library_from_source(&device).map_err(|e| {
+                MetalStreamError::ShaderCompilationFailed(format!(
+                    "compile `quantized_qmm_nax`: {e}"
+                ))
+            })?
+        };
         libraries.insert("quantized_qmm_nax".to_string(), nax_lib);
 
         Ok(Self {
@@ -360,6 +420,35 @@ pub fn load_library_from_bytes(device: &Device, bytes: &'static [u8]) -> Result<
 /// framework include inside `metal_nax.h` is resolved by the runtime
 /// compiler. Function constants (`QMM_K/N/M`) and `[[host_name]]`
 /// instantiations resolve normally via `newFunctionWithName`.
+/// Toolchain probe: compile `quantized_qmv.metal` from MSL source at
+/// runtime via `newLibraryWithSource` instead of the build.rs
+/// `xcrun metal` metallib. Activated by `FERRITE_JIT_QMV=1` (see
+/// `ShaderCache::new`).
+///
+/// Why this exists: the decode qmv kernels are byte-identical in source
+/// and launch config to mlx's, yet mlx's compiled binaries stream
+/// faster (the qmm precedent measured their CI-built metallib at 1.18x
+/// our local xcrun build of identical source, and local xcrun outright
+/// MISCOMPILES MPP — see the NAX block below). This switch A/Bs the
+/// runtime driver compiler against our offline toolchain on the qmv
+/// family without touching prod defaults. NOTE: a different compiler
+/// may produce different fast-math roundings — verbatim-parity goldens
+/// can flip under this probe; bench-only.
+///
+/// Options: default MTLCompileOptions (fast math ON) to match what
+/// `build.rs` passes to `xcrun metal` for this library; language
+/// version left at the runtime default (newest the OS supports).
+pub fn compile_qmv_library_from_source(device: &Device) -> Result<Library, String> {
+    const QMV_SRC: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/shaders/quantized_qmv.metal"
+    ));
+    let opts = MTLCompileOptions::new();
+    device
+        .newLibraryWithSource_options_error(&NSString::from_str(QMV_SRC), Some(&opts))
+        .map_err(|e| format!("newLibraryWithSource(quantized_qmv) failed: {:?}", e))
+}
+
 pub fn compile_nax_library_from_source(device: &Device) -> Result<Library, String> {
     const NAX_HEADER: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/metal_nax.h"));
@@ -372,7 +461,11 @@ pub fn compile_nax_library_from_source(device: &Device) -> Result<Library, Strin
 
     let opts = MTLCompileOptions::new();
     opts.setMathMode(MTLMathMode::Safe); // == fastMath off; what mlx uses
-    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    // Language version: default to 4.0; FERRITE_NAX_LANG_DEFAULT=1
+    // leaves the runtime default (newest the OS supports) — perf A/B.
+    if std::env::var_os("FERRITE_NAX_LANG_DEFAULT").is_none() {
+        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    }
     device
         .newLibraryWithSource_options_error(&NSString::from_str(&source), Some(&opts))
         .map_err(|e| format!("newLibraryWithSource(quantized_qmm_nax) failed: {:?}", e))

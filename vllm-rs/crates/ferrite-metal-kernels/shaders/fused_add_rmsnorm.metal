@@ -263,3 +263,87 @@ kernel void fused_add_rmsnorm_f16_vec4(
         output[gid * N_div4 + i] = half4((float4(sum_val) / rms) * float4(w));
     }
 }
+
+/// Gemma4 post-FFN tail, fused (the norm-THEN-add mirror of
+/// `fused_add_rmsnorm_specialized_impl`):
+///
+///   out = (rmsnorm(delta, gains, eps) + residual) * layer_scalar
+///
+/// i.e. the DSL chain `post_ffwd_normed = rmsnorm(down, post_ffwd_ln);
+/// hidden = add(post_ffwd_normed, hidden); hidden = scalar_weight_mul(
+/// hidden, layer_scalar[layer])` in one dispatch. Reduction runs over
+/// `delta` only (the residual is NOT part of the norm — order differs
+/// from FusedAddRmsNorm). No in-place writes: `out` is a distinct slot.
+///
+/// Bindings (must match `interpreter::metal::lowering` for
+/// `Instruction::NormAddScalarMul`):
+///   buffer(0) = delta        (in; norm input — down-proj output)
+///   buffer(1) = residual     (in)
+///   buffer(2) = out          (out; the new hidden_states)
+///   buffer(3) = gains        (in; [hidden], on-disk dtype)
+///   buffer(4) = layer_scalar (in; [1],     on-disk dtype)
+///
+/// Function constants: FUSED_ARN_{M, HIDDEN_SIZE, EPS, WEIGHT_OFFSET}
+/// (same quartet/slots as fused_add_rmsnorm — shared RmsNormConstants).
+///
+/// Dispatch: `(M, 1, 1)` threadgroups × `tg_size` threads, cooperative
+/// reduction over `HIDDEN_SIZE`.
+template <typename T_act, typename T_scale>
+[[kernel]] void norm_add_scalar_mul_impl(
+    device const T_act*   delta        [[buffer(0)]],
+    device const T_act*   residual     [[buffer(1)]],
+    device       T_act*   out          [[buffer(2)]],
+    device const T_scale* gains        [[buffer(3)]],
+    device const T_scale* layer_scalar [[buffer(4)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (gid >= FUSED_ARN_M) return;
+
+    threadgroup float shared_sum[1024];
+
+    // Pass 1: sum-of-squares over delta (the norm input).
+    float local_sum = 0.0f;
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        local_sum += d * d;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(FUSED_ARN_HIDDEN_SIZE) + FUSED_ARN_EPS);
+    float s = float(layer_scalar[0]);
+
+    // Pass 2: out = (normed + residual) * layer_scalar. Round to T_act
+    // at EVERY op boundary the unfused chain rounds at (RmsNorm store,
+    // Add store, ScalarWeightMul store) — keeps the fused kernel
+    // BIT-IDENTICAL to the rmsnorm/add/scalar_weight_mul sequence, so
+    // verbatim greedy parity is preserved by construction.
+    for (uint i = tid; i < FUSED_ARN_HIDDEN_SIZE; i += tg_size) {
+        float d = float(delta[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float r = float(residual[gid * FUSED_ARN_HIDDEN_SIZE + i]);
+        float w = float(gains[i]) + FUSED_ARN_WEIGHT_OFFSET;
+        T_act normed = T_act((d / rms) * w);
+        T_act summed = T_act(float(normed) + r);
+        out[gid * FUSED_ARN_HIDDEN_SIZE + i] = T_act(float(summed) * s);
+    }
+}
+
+#define INST_NORM_ADD_SCALAR_MUL(act_tag, act_type, scale_tag, scale_type)    \
+  template [[host_name("norm_add_scalar_mul_" #act_tag "_s_" #scale_tag      \
+                       "_specialized")]]                                      \
+  [[kernel]] decltype(norm_add_scalar_mul_impl<act_type, scale_type>)        \
+      norm_add_scalar_mul_impl<act_type, scale_type>;
+
+INST_NORM_ADD_SCALAR_MUL(f16,  half,   f16,  half)
+INST_NORM_ADD_SCALAR_MUL(bf16, bfloat, f16,  half)
+INST_NORM_ADD_SCALAR_MUL(bf16, bfloat, bf16, bfloat)
+INST_NORM_ADD_SCALAR_MUL(f16,  half,   bf16, bfloat)

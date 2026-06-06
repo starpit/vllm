@@ -1,0 +1,28 @@
+{
+  "model": "mlx-community/gemma-4-12B-it-4bit",
+  "prompt_text": "What is the capital of France?",
+  "token_ids": [
+    2,
+    105,
+    2364,
+    107,
+    3689,
+    563,
+    506,
+    5279,
+    529,
+    7001,
+    236881,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+  ],
+  "greedy_next_token": 818,
+  "greedy_next_piece": "The"
+}

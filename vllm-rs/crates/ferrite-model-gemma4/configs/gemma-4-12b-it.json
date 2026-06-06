@@ -1,0 +1,40 @@
+{
+  "_comment": "Gemma 4 12B (mlx-community/gemma-4-12B-it-4bit) — text decoder of Gemma4UnifiedForConditionalGeneration. Fields flattened from HF text_config to TOP-LEVEL (extract_bounds only captures top-level ints/scalars). Two attention classes: sliding (head_dim 256, 8 kv, window 1024, theta 1e4 full rotary) and global (global_head_dim 512, 1 kv, k_eq_v, proportional rope rot=0.25*512=128 denom=512, theta 1e6). Scale=1.0 BOTH classes via attention_multiplier. attn_q_dim/q_global_dim/kv_dim/k_global_dim are derived dims for weights.json. weight_leaf_renames folds the *_global DSL names back to the shared on-disk leaves.",
+  "architectures": [
+    "Gemma4UnifiedForConditionalGeneration"
+  ],
+  "model_type": "gemma4_unified",
+  "decoder_safetensors_prefix": "language_model",
+  "hidden_size": 3840,
+  "num_hidden_layers": 48,
+  "num_attention_heads": 16,
+  "num_key_value_heads": 8,
+  "head_dim": 256,
+  "global_head_dim": 512,
+  "num_global_key_value_heads": 1,
+  "intermediate_size": 15360,
+  "vocab_size": 262144,
+  "max_position_embeddings": 131072,
+  "max_blocks_per_seq": 2048,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 1000000.0,
+  "rope_local_base_freq": 10000.0,
+  "global_partial_rotary_factor": 0.25,
+  "attention_multiplier": 1.0,
+  "sliding_window": 1024,
+  "sliding_window_pattern": 6,
+  "final_logit_softcapping": 30.0,
+  "tie_word_embeddings": true,
+  "attn_q_dim": 4096,
+  "q_global_dim": 8192,
+  "kv_dim": 2048,
+  "k_global_dim": 512,
+  "torch_dtype": "bfloat16",
+  "weight_leaf_renames": {
+    "self_attn.q_proj_global": "self_attn.q_proj",
+    "self_attn.k_proj_global": "self_attn.k_proj",
+    "self_attn.o_proj_global": "self_attn.o_proj",
+    "self_attn.q_norm_global": "self_attn.q_norm",
+    "self_attn.k_norm_global": "self_attn.k_norm"
+  }
+}

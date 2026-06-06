@@ -1,0 +1,29 @@
+{
+  "model": "mlx-community/gemma-4-12B-it-4bit",
+  "prompt_text": "Continue the sentence: the quick brown fox",
+  "token_ids": [
+    2,
+    105,
+    2364,
+    107,
+    34230,
+    506,
+    13315,
+    236787,
+    506,
+    3823,
+    8864,
+    37423,
+    106,
+    107,
+    105,
+    4368,
+    107,
+    100,
+    45518,
+    107,
+    101
+  ],
+  "greedy_next_token": 236804,
+  "greedy_next_piece": "j"
+}

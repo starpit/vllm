@@ -111,13 +111,51 @@ impl ChatTemplate {
         self
     }
 
+    /// Fallback: load the template from a sibling `chat_template.jinja`
+    /// file (the Gemma 4 repo convention — HF transformers#45205 moved
+    /// the template out of tokenizer_config.json into a standalone
+    /// file, and conversions often omit re-embedding it).
+    fn from_sibling_jinja(tokenizer_config_path: &Path) -> Result<Option<Self>, ServeError> {
+        let jinja = tokenizer_config_path
+            .parent()
+            .map(|d| d.join("chat_template.jinja"))
+            .filter(|p| p.exists());
+        let Some(jinja) = jinja else {
+            return Ok(None);
+        };
+        let template_str = std::fs::read_to_string(&jinja).map_err(|e| {
+            ServeError::Internal(format!("failed to read {}: {e}", jinja.display()))
+        })?;
+        if template_str.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut tpl = Self::new(template_str)?;
+        // bos/eos still come from tokenizer_config.json when present —
+        // the .jinja file carries only the template body, and Gemma 4's
+        // template opens with `{{ bos_token }}` (an empty render here
+        // silently drops <bos> and shifts every prompt token).
+        if tokenizer_config_path.exists()
+            && let Ok(data) = std::fs::read_to_string(tokenizer_config_path)
+            && let Ok(config) = serde_json::from_str::<TokenizerConfig>(&data)
+        {
+            if let Some(bos) = extract_token_string(config.bos_token) {
+                tpl = tpl.with_bos_token(bos);
+            }
+            if let Some(eos) = extract_token_string(config.eos_token) {
+                tpl = tpl.with_eos_token(eos);
+            }
+        }
+        Ok(Some(tpl))
+    }
+
     /// Load a `ChatTemplate` from a `tokenizer_config.json` file.
     ///
     /// Returns `None` if the file doesn't exist or doesn't contain a
-    /// `chat_template` field.
+    /// `chat_template` field (falls back to a sibling
+    /// `chat_template.jinja` in both cases).
     pub fn from_tokenizer_config(path: &Path) -> Result<Option<Self>, ServeError> {
         if !path.exists() {
-            return Ok(None);
+            return Self::from_sibling_jinja(path);
         }
 
         let data = std::fs::read_to_string(path)
@@ -155,7 +193,10 @@ impl ChatTemplate {
                     })
                     .unwrap_or_default()
             }
-            _ => return Ok(None),
+            // Gemma 4 convention (HF transformers#45205): the template
+            // ships as a SEPARATE `chat_template.jinja` file beside
+            // tokenizer_config.json instead of an embedded field.
+            _ => return Self::from_sibling_jinja(path),
         };
 
         if template_str.is_empty() {

@@ -480,6 +480,9 @@ pub fn rust_type_for_weight_consumed_by(op: OpKind) -> TokenStream {
     match op {
         OpKind::Embed => quote! { ::ferrite_kernels::layers::Embedding },
         OpKind::RmsNorm => quote! { ::ferrite_kernels::layers::RmsNorm },
+        // `layer_scalar` ([1]-shaped) loads exactly like an RmsNorm
+        // gain — a plain keep-dtype vector.
+        OpKind::ScalarWeightMul => quote! { ::ferrite_kernels::layers::RmsNorm },
         OpKind::Gemm => quote! { ::ferrite_kernels::layers::LinearLayer },
         // Vision learned positional embedding (G.7(c.1)). Same wrapper
         // as `Embed` — the kernel call is the same and the loader
@@ -1552,13 +1555,37 @@ impl Implementation for RmsNormRefImpl {
         let is_q_norm = acc_name.contains("q_norm");
         let is_k_norm = acc_name.contains("k_norm");
         let is_head_norm = is_q_norm || is_k_norm;
+        // Per-class head norms (Gemma4): `q_norm_global`/`k_norm_global`
+        // normalize the GLOBAL class's head_dim (512) over the global
+        // kv-head count (1); the plain names keep the base (sliding)
+        // dims. The `_global` suffix is the DSL convention paired with
+        // `weight_leaf_renames` (both classes share the on-disk leaf).
+        let is_global_norm = is_head_norm && acc_name.contains("_global");
         let hidden = *bounds.get("hidden_size").unwrap_or(&0) as u32;
-        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let base_head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let head_dim = if is_global_norm {
+            bounds
+                .get("global_head_dim")
+                .copied()
+                .map(|v| v as u32)
+                .unwrap_or(base_head_dim)
+        } else {
+            base_head_dim
+        };
         let num_q_heads = bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
-        let num_kv_heads = bounds
+        let base_num_kv = bounds
             .get("num_key_value_heads")
             .copied()
             .unwrap_or(num_q_heads as u64) as u32;
+        let num_kv_heads = if is_global_norm {
+            bounds
+                .get("num_global_key_value_heads")
+                .copied()
+                .map(|v| v as u32)
+                .unwrap_or(base_num_kv)
+        } else {
+            base_num_kv
+        };
         let hidden_size = if is_head_norm && head_dim > 0 {
             head_dim
         } else {
@@ -1956,6 +1983,12 @@ fn decompose_reshape_dim(d: &crate::shape::Dim, bounds: &BTreeMap<String, u64>) 
 /// they're ported.
 pub fn starter_library() -> ImplementationLibrary {
     let mut lib = ImplementationLibrary::new();
+    // Target-agnostic singletons needed on BOTH backends (Gemma4 is
+    // metal-first): unit-gain rmsnorm (`v_norm`) and the per-layer
+    // [1]-weight multiply (`layer_scalar`). Registered outside the
+    // cfg blocks so the metal solve sees them too.
+    lib.push(Box::new(RmsNormUnitImpl));
+    lib.push(Box::new(ScalarWeightMulImpl));
     // The cuda / metal pushes are cfg-disjoint (no model crate ever
     // builds with both backends on; the macro's own `compile_error!`
     // upstream rejects the combo). Gating them here means: under
@@ -2048,12 +2081,51 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(
             crate::metal::synth_gate_up_silu_mul::MetalSynthGateUpSiluMulImpl::bf16_gs64_s_bf16(),
         ));
+        // Gemma4 GeGLU variant — tanh-GELU gate over b8 MLP
+        // projections (`mlx-affine-b4-g64-mlp8` preset). `applies_to`
+        // scopes it to offset-0-norm mlx-affine models; the FUF
+        // matcher additionally requires an `OpKind::Gelu` gate and b8
+        // Affine storage, so Llama/Qwen routing is untouched.
+        lib.push(Box::new(
+            crate::metal::synth_mlp_pre_down::MetalSynthMlpPreDownImpl::gelu_b8_gs64_s_bf16(),
+        ));
         // Metal Fused Add+RMSNorm implementations - only match Metal targets
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedAddRmsNormImpl::new_fp16(),
         ));
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedAddRmsNormImpl::new_bf16(),
+        ));
+        // Gemma4 post-FFN tail (rmsnorm → add → scalar_weight_mul) in
+        // one bit-exact kernel. Matcher requires ScalarWeightMul, so
+        // it can only fire on Gemma4.
+        lib.push(Box::new(
+            crate::metal::fused_kernels::MetalNormAddScalarMulImpl::new_fp16(),
+        ));
+        lib.push(Box::new(
+            crate::metal::fused_kernels::MetalNormAddScalarMulImpl::new_bf16(),
+        ));
+        // Gemma4 pre-attention tail (q/k per-head norms + v unit-norm
+        // folded into the rope dispatch, -144 dispatches/token).
+        // Bit-exact vs the unfused chain (verbatim 4/4 after the K->V
+        // scratch-barrier fix).
+        //
+        // MEASURED TRADE (M5 base, 2026-06-05): +1.0 ms TPOT on
+        // gemma-4-12B decode (101.28 -> 102.27, 5 runs/side, same
+        // thermal window) — the three standalone norms are data-
+        // independent and ran barrier-free (wall = max, not sum); the
+        // fused TG serializes all three tree reductions. ENABLED
+        // anyway as an owner call for the bigger picture: on higher-
+        // bandwidth parts the 93.5 ms memory floor collapses (M-Ultra
+        // class ~20 ms) while the serial-reduction cost stays flat, so
+        // the saved dispatches dominate. If an M5-base config needs
+        // the last 1 ms back, gate here on MetalSpec::generation like
+        // SynthMlpPreDown's M1 gate.
+        lib.push(Box::new(
+            crate::metal::rope::MetalRopeAppendNormedImpl::new_fp16(),
+        ));
+        lib.push(Box::new(
+            crate::metal::rope::MetalRopeAppendNormedImpl::new_bf16(),
         ));
         // Metal Fused Gate-Up-SiLU-Mul implementations - only match Metal targets
         lib.push(Box::new(
@@ -2064,6 +2136,9 @@ pub fn starter_library() -> ImplementationLibrary {
         ));
         lib.push(Box::new(
             crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_gelu_fp16(),
+        ));
+        lib.push(Box::new(
+            crate::metal_bridge::MetalFusedGateUpSiluMulImpl::new_gelu_bf16(),
         ));
         // Metal Attention implementations - only match Metal targets.
         // Decode (M=1) variants emit `Instruction::AttentionViaCache`;
@@ -4468,6 +4543,254 @@ impl Implementation for TanhSoftCapImpl {
         let in_slot_idx = slots.of(in_id, in_slot);
         let out_slot_idx = slots.of(tile, 0);
         Some(vec![Instruction::TanhSoftCap(in_slot_idx, out_slot_idx)])
+    }
+}
+
+/// Unit-gain RMSNorm singleton (`rmsnorm_unit(x)`, mlx
+/// `RMSNormNoScale`). Gemma4 normalizes V per head before the cache
+/// write with no learnable scale. The per-head reduction width is
+/// baked per attention CLASS at fan_out: the tile's value flows into a
+/// `rope_append` whose attention consumer is `sliding_attention`
+/// (base head_dim × kv heads) or `attention` (global head_dim × global
+/// kv heads, Gemma4: 512×1).
+#[derive(Debug)]
+pub struct RmsNormUnitImpl;
+
+impl Implementation for RmsNormUnitImpl {
+    fn name(&self) -> &'static str {
+        "rmsnorm_unit"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::RmsNormUnit)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        // One read + one write over a [T, kv*head_dim] tensor.
+        let width = ctx.bounds.get("hidden_size").copied().unwrap_or(0);
+        let numel = ctx.num_tokens() * width;
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * numel as f64 * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "RmsNormUnit",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("hidden_size", syn::parse_quote!(u32)),
+                ("m_multiplier", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = match node.inputs.first() {
+            Some(FufInput::Tile { id, slot }) => (*id, *slot),
+            other => panic!("RmsNormUnit: first input must be a Tile (got {other:?})"),
+        };
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+
+        // Attention class: the unit-norm output feeds a rope_append
+        // tile; that rope's attention consumer decides sliding vs
+        // global geometry. Sliding consumer ⇒ base (head_dim, kv);
+        // anything else (incl. uniform models) ⇒ global, which
+        // defaults to base when the config lacks global_* keys.
+        let rope = fuf.nodes.iter().find(|n| {
+            matches!(n.op, OpKind::RopeAppend | OpKind::RopeAppendInterleaved)
+                && consumes_tile(n, tile)
+        });
+        let is_sliding = rope.is_some_and(|r| {
+            fuf.nodes
+                .iter()
+                .any(|n| n.op == OpKind::SlidingAttention && consumes_tile(n, r.id))
+        });
+        let head_dim = *bounds.get("head_dim").unwrap_or(&0);
+        let num_kv = *bounds.get("num_key_value_heads").unwrap_or(&1);
+        let (hidden, m_mult) = if is_sliding {
+            (head_dim, num_kv)
+        } else {
+            (
+                *bounds.get("global_head_dim").unwrap_or(&head_dim),
+                *bounds.get("num_global_key_value_heads").unwrap_or(&num_kv),
+            )
+        };
+        assert!(
+            hidden > 0,
+            "RmsNormUnit: model must declare head_dim for the per-head reduction width"
+        );
+        Some(vec![ferrite_forward::Instruction::RmsNormUnit(
+            in_slot_idx,
+            out_slot_idx,
+            hidden as u32,
+            m_mult as u32,
+        )])
+    }
+}
+
+/// Multiply by a loaded `[1]`-shaped weight (Gemma4 `layer_scalar`,
+/// applied to the hidden state at the end of every decoder layer).
+/// DSL `scalar_weight_mul(x, layer_scalar[layer])`.
+#[derive(Debug)]
+pub struct ScalarWeightMulImpl;
+
+impl Implementation for ScalarWeightMulImpl {
+    fn name(&self) -> &'static str {
+        "scalar_weight_mul"
+    }
+
+    fn target_compatible(&self, _profile: &TargetProfile) -> bool {
+        true
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        single_tile_match(fuf, seed, OpKind::ScalarWeightMul)
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let numel = ctx.num_tokens() * ctx.bounds.get("hidden_size").copied().unwrap_or(0);
+        let bw_gb = ctx.profile.memory_bandwidth_gbps;
+        let bytes = 2.0 * numel as f64 * BYTES_PER_ELEM;
+        if bw_gb > 0.0 {
+            (bytes / (bw_gb * 1e9)) * 1e6
+        } else {
+            0.0
+        }
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources::ZERO
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        const H: &[Handoff] = &[Handoff::StreamOrder, Handoff::StreamEvent];
+        H
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::RowMajorBf16; m.boundary_outputs.len()]
+    }
+
+    fn is_compute_bound(&self) -> bool {
+        false
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        default_required_weights(claimed_tiles, fuf, program)
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "ScalarWeightMul",
+            vec![
+                ("in_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        _bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let tile = m.claimed_tiles[0];
+        let node = fuf.get(tile);
+        let (in_id, in_slot) = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } => Some((*id, *slot)),
+                _ => None,
+            })
+            .expect("ScalarWeightMul: input tile");
+        let layer = node
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Weight { index: Some(l), .. } => Some(*l as u32),
+                _ => None,
+            })
+            .expect("ScalarWeightMul: layered weight ref (layer_scalar[layer])");
+        let in_slot_idx = slots.of(in_id, in_slot);
+        let out_slot_idx = slots.of(tile, 0);
+        Some(vec![ferrite_forward::Instruction::ScalarWeightMul(
+            in_slot_idx,
+            out_slot_idx,
+            layer,
+        )])
     }
 }
 
@@ -8144,6 +8467,7 @@ impl Implementation for RopeAppendRefImpl {
                 ("v_out_slot", syn::parse_quote!(u32)),
                 ("layer", syn::parse_quote!(u32)),
                 ("interleaved", syn::parse_quote!(bool)),
+                ("is_global", syn::parse_quote!(bool)),
             ],
         )
     }
@@ -8159,6 +8483,16 @@ impl Implementation for RopeAppendRefImpl {
         let rope_id = m.claimed_tiles[0];
         let node = fuf.get(rope_id);
         let interleaved = node.op == OpKind::RopeAppendInterleaved;
+        // Attention-geometry class: a rope tile consumed by a
+        // `sliding_attention()` tile belongs to the sliding class
+        // (base HEAD_DIM/NUM_KV_HEADS/ROT_DIM); one consumed by
+        // `attention()` is the global class (GLOBAL_* consts). On
+        // uniform-geometry models the two const families are equal,
+        // so the default `true` is also correct when no attention
+        // consumer is found (e.g. encoder shapes).
+        let is_global = !fuf.nodes.iter().any(|n| {
+            n.op == OpKind::SlidingAttention && consumes_tile(n, rope_id)
+        });
         let resolve_tile = |idx: usize| -> (TileId, u8) {
             match node.inputs.get(idx) {
                 Some(FufInput::Tile { id, slot }) => (*id, *slot),
@@ -8195,6 +8529,7 @@ impl Implementation for RopeAppendRefImpl {
             v_out_slot,
             layer,
             interleaved,
+            is_global,
         )])
     }
 }
@@ -16404,6 +16739,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
@@ -16435,6 +16771,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
             decoder_safetensors_prefix: None,
+            weight_leaf_renames: Vec::new(),
         };
 
         let mk_model = |name: &str, key: &str, val: u64| crate::config::ModelParams {
@@ -16455,6 +16792,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
@@ -16521,6 +16859,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
             decoder_safetensors_prefix: None,
+            weight_leaf_renames: Vec::new(),
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16540,6 +16879,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
@@ -16629,6 +16969,7 @@ mod tests {
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
             decoder_safetensors_prefix: None,
+            weight_leaf_renames: Vec::new(),
         };
 
         let mk_model = |name: &str, kvs: &[(&str, u64)]| crate::config::ModelParams {
@@ -16648,6 +16989,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
@@ -17189,6 +17531,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,

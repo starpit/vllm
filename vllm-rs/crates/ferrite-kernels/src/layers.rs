@@ -2687,11 +2687,19 @@ impl RmsNorm {
     /// Extending the kernel signature is its own thread; out of P10c
     /// scope.
     pub fn load(weights: &mut GpuWeights, prefix: &str, eps: f32) -> Result<Self> {
+        // Standard convention: `<prefix>.weight`. Fallback: the bare
+        // `<prefix>` key — Gemma4's per-layer `layer_scalar` is a bare
+        // [1] tensor with no `.weight` suffix on disk (it loads through
+        // the RmsNorm accessor kind as a 1-element gain).
         let weight_name = format!("{prefix}.weight");
         #[cfg(feature = "metal")]
-        let weight = weights.take_keep_dtype(&weight_name)?;
+        let weight = weights
+            .take_keep_dtype(&weight_name)
+            .or_else(|_| weights.take_keep_dtype(prefix))?;
         #[cfg(not(feature = "metal"))]
-        let weight = weights.take(&weight_name)?;
+        let weight = weights
+            .take(&weight_name)
+            .or_else(|_| weights.take(prefix))?;
         Ok(Self::new(weight, eps))
     }
 

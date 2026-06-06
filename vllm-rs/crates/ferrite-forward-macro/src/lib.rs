@@ -262,6 +262,7 @@ fn dedup_quant_sig(method: Option<&crate::quantization::QuantMethod>) -> String 
             bits,
             group_size,
             quantize_embed,
+            ..
         }) => {
             let qe = if *quantize_embed { "-qe" } else { "" };
             format!("q:affine-b{bits}-g{group_size}{qe}")
@@ -545,6 +546,7 @@ fn compile_common(
     // (text-only, Qwen-style VL) leave it `None`.
     if matches!(mode.prelude, classified::Prelude::Decoder) {
         classified.decoder_safetensors_prefix = models[0].decoder_safetensors_prefix.clone();
+        classified.weight_leaf_renames = models[0].weight_leaf_renames.clone();
     }
 
     // Shape inference may flag reshape-recoverable mismatches (e.g.
@@ -946,6 +948,18 @@ fn compile_common(
                 "scalar_mul_inplace",
                 "scalar_offset_rms_norm",
                 "tanh_softcap_inplace",
+                // Gemma4 singletons: unit-gain rmsnorm (v_norm) and
+                // the per-layer [1]-weight multiply (layer_scalar).
+                "rmsnorm_unit",
+                "scalar_weight_mul",
+                // Gemma4 post-FFN tail fusion (rmsnorm+add+scalar_mul
+                // in one kernel — norm-side, no matmul).
+                "metal_norm_add_scalar_mul_f16",
+                "metal_norm_add_scalar_mul_bf16",
+                // Gemma4 pre-attn tail fusion (q/k norms + v unit-norm
+                // inside the rope dispatch — norm-side, no matmul).
+                "metal_rope_append_normed_f16",
+                "metal_rope_append_normed_bf16",
                 "softcap",
                 "nosoftcap",
                 "deepseek_moe_ref",
@@ -1440,6 +1454,92 @@ fn compile_common(
                 }
             }
         };
+        // Per-variant `per_layer_kv_token_elems` arms — Some(vec![..])
+        // for hybrid-attention-geometry arches (Gemma4), None elsewhere.
+        // Same per-variant dedup mechanics as gdn_runtime_config above.
+        let per_layer_kv_elems_tokens = {
+            let mut per_variant: std::collections::BTreeMap<
+                String,
+                Option<proc_macro2::TokenStream>,
+            > = std::collections::BTreeMap::new();
+            for sm in &solved {
+                let key = sm.mod_name.clone();
+                per_variant.entry(key).or_insert_with(|| {
+                    codegen::emit_per_layer_kv_token_elems_arm_body(&sm.fuf, sm.model)
+                });
+            }
+            if per_variant.values().all(|v| v.is_none()) {
+                proc_macro2::TokenStream::new()
+            } else {
+                let arms: Vec<proc_macro2::TokenStream> = arch_dispatch_arms
+                    .iter()
+                    .map(|a| {
+                        let variant_ident = pascal_case(&a.model_ident);
+                        let body = per_variant
+                            .get(&a.model_ident.to_string())
+                            .cloned()
+                            .flatten()
+                            .unwrap_or_else(|| quote! { ::core::option::Option::None });
+                        quote! { Weights::#variant_ident(_) => #body, }
+                    })
+                    .collect();
+                quote! {
+                    fn per_layer_kv_token_elems(
+                        &self,
+                    ) -> ::core::option::Option<::std::vec::Vec<usize>> {
+                        match self {
+                            #(#arms)*
+                        }
+                    }
+                }
+            }
+        };
+        // Per-variant `max_blocks_per_seq` arms — the metal block-table
+        // row stride (`CanonicalParams::MAX_BLOCKS_PER_SEQ`). Emitted
+        // only when some variant overrides the trait default (128) via
+        // the `max_blocks_per_seq` config key (Gemma4: 2048); the
+        // executor packs host-side block_table rows at this stride so
+        // multi-seq rows land where the kernels read them.
+        let max_blocks_per_seq_tokens = {
+            let mut per_variant: std::collections::BTreeMap<String, Option<u64>> =
+                std::collections::BTreeMap::new();
+            for sm in &solved {
+                let key = sm.mod_name.clone();
+                per_variant
+                    .entry(key)
+                    .or_insert_with(|| sm.model.bounds.get("max_blocks_per_seq").copied());
+            }
+            if per_variant.values().all(|v| v.is_none() || *v == Some(128)) {
+                proc_macro2::TokenStream::new()
+            } else {
+                let arms: Vec<proc_macro2::TokenStream> = arch_dispatch_arms
+                    .iter()
+                    .map(|a| {
+                        let variant_ident = pascal_case(&a.model_ident);
+                        let v = per_variant
+                            .get(&a.model_ident.to_string())
+                            .copied()
+                            .flatten()
+                            .unwrap_or(128);
+                        let lit = proc_macro2::Literal::usize_unsuffixed(v as usize);
+                        quote! { Weights::#variant_ident(_) => #lit, }
+                    })
+                    .collect();
+                quote! {
+                    fn max_blocks_per_seq(&self) -> usize {
+                        match self {
+                            #(#arms)*
+                        }
+                    }
+                }
+            }
+        };
+        let gdn_runtime_config_tokens = quote! {
+            #gdn_runtime_config_tokens
+            #per_layer_kv_elems_tokens
+            #max_blocks_per_seq_tokens
+        };
+
         emit_arch_dispatcher(
             &arch_ident,
             &hf_arches,

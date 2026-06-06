@@ -7316,6 +7316,16 @@ struct LogitsUpdateCtx<'a> {
 #[cfg(feature = "metal")]
 fn kv_per_block_bytes(model: &dyn ferrite_forward::FerriteWeights, block_size: usize) -> usize {
     let elt_bytes: usize = 2;
+    // Hybrid-attention-geometry arches (Gemma4) size each layer by its
+    // own kv_heads*head_dim; uniform arches use the single product.
+    // Mis-summing here mis-sizes the scheduler's KV budget.
+    if let Some(per_layer) = model.per_layer_kv_token_elems() {
+        return per_layer
+            .iter()
+            .map(|e| e.saturating_mul(2).saturating_mul(block_size))
+            .sum::<usize>()
+            .saturating_mul(elt_bytes);
+    }
     (model.num_hidden_layers() as usize)
         .saturating_mul(2)
         .saturating_mul(model.num_key_value_heads() as usize)
@@ -7983,6 +7993,10 @@ impl FerriteWorker {
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
+                // Draft pool stays uniform (matching the uniform
+                // SingleBufferKvLayer sizing above): spec-decode is not
+                // enabled for hybrid-attention-geometry arches (Gemma4).
+                None,
                 cache_dtype,
                 blocks_per_chunk,
                 usize::MAX,
@@ -9201,16 +9215,28 @@ impl Worker for FerriteWorker {
         let per_block_elems = (model.num_key_value_heads() as usize)
             * self.config.block_size
             * (model.head_dim() as usize);
+        // Hybrid-attention-geometry arches (Gemma4): per-layer
+        // kv_heads*head_dim from the macro-emitted IR walk; each layer's
+        // buffers and pool chunks size to their own class.
+        let per_layer_block_elems: Option<Vec<usize>> = model
+            .per_layer_kv_token_elems()
+            .map(|v| v.iter().map(|e| e * self.config.block_size).collect());
         let elem_bytes = cache_dtype.size_bytes();
         let chunk_bytes_logical = blocks_per_chunk * per_block_elems * elem_bytes;
 
         let mut single_buf_layers: Vec<
             ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer,
         > = Vec::with_capacity(num_layers_for_pool * 2);
-        for _ in 0..(num_layers_for_pool * 2) {
+        for slot in 0..(num_layers_for_pool * 2) {
+            // Slot s ↔ layer s/2 (K at s%2==0, V at s%2==1) — must match
+            // the pool's alloc order L0K, L0V, L1K, … (slot = c % n_slots).
+            let slot_chunk_bytes = per_layer_block_elems
+                .as_ref()
+                .map(|v| blocks_per_chunk * v[slot / 2] * elem_bytes)
+                .unwrap_or(chunk_bytes_logical);
             let layer = ferrite_metal_kernels::single_buffer_kv::SingleBufferKvLayer::new(
                 &mtl_device,
-                chunk_bytes_logical,
+                slot_chunk_bytes,
                 num_chunks_total,
             )
             .map_err(|e| ExecutorError::WorkerInit(format!("SingleBufferKvLayer: {e}")))?;
@@ -9242,6 +9268,7 @@ impl Worker for FerriteWorker {
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
+                per_layer_block_elems.clone(),
                 cache_dtype,
                 blocks_per_chunk,
                 // Reactive: 1 chunk up front; the rest grow on demand via
@@ -9685,15 +9712,23 @@ impl Worker for FerriteWorker {
         // requests other than seq_idx=0 produce incoherent output;
         // single-seq runs are unaffected because only row 0 is read.
         //
-        // Plumbing the per-canonical `MAX_BLOCKS_PER_SEQ` through
-        // the worker would require the FerriteWeights trait to
-        // expose it; for now hardcode the trait default (128). The
-        // kernel constant 5 is set to this same value in
-        // `lowering.rs::AttentionPrefillPaged` /
-        // `AttentionViaCache` arms.
-        const KERNEL_BLOCK_TABLE_STRIDE: usize = 128;
+        // The per-canonical `MAX_BLOCKS_PER_SEQ` comes through the
+        // macro-emitted `FerriteWeights::max_blocks_per_seq()` (trait
+        // default 128; Gemma4 overrides to 2048 via the
+        // `max_blocks_per_seq` config key). The kernels bake the same
+        // value as function constant 5 in
+        // `lowering.rs::AttentionPrefillPaged` / `AttentionViaCache` —
+        // a host/kernel stride mismatch made every `seq_idx > 0` read
+        // the wrong block-table row (zeros → physical block 0 → seq 0's
+        // KV), corrupting all concurrent/batched Gemma4 requests while
+        // single-seq runs stayed clean.
+        let kernel_block_table_stride: usize = self
+            .model
+            .as_ref()
+            .map(|m| m.max_blocks_per_seq())
+            .unwrap_or(128);
         let runtime_max_blocks = attn.block_ids.iter().map(|b| b.len()).max().unwrap_or(0);
-        let max_blocks_eff = KERNEL_BLOCK_TABLE_STRIDE.max(runtime_max_blocks).max(1);
+        let max_blocks_eff = kernel_block_table_stride.max(runtime_max_blocks).max(1);
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
         if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {

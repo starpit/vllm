@@ -129,6 +129,54 @@ INST_RMSNORM(bf16, bfloat, f16, half)
 INST_RMSNORM(bf16, bfloat, bf16, bfloat)
 INST_RMSNORM(f16,  half,   bf16, bfloat)
 
+// Unit-gain RMSNorm — no learnable scale (gain ≡ 1, no weight buffer).
+// Faithful port of mlx `RMSNormNoScale` (Gemma4 `v_norm`: V is
+// rms-normalized per head before the cache write, with NO weights on
+// disk). Same fn-consts as the weighted variant minus the offset.
+template <typename T_act>
+[[kernel]] void rmsnorm_unit_impl(
+    device       T_act* output [[buffer(0)]],
+    device const T_act* input  [[buffer(1)]],
+    uint gid     [[threadgroup_position_in_grid]],
+    uint tid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    if (gid >= RMSNORM_M) return;
+
+    // Same tree reduction as `rmsnorm_specialized_impl` — identical
+    // accumulation order keeps the two norms bit-consistent.
+    threadgroup float shared_sum[1024];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = sqrt(shared_sum[0] / float(RMSNORM_HIDDEN_SIZE) + RMSNORM_EPS);
+    for (uint i = tid; i < RMSNORM_HIDDEN_SIZE; i += tg_size) {
+        float val = float(input[gid * RMSNORM_HIDDEN_SIZE + i]);
+        output[gid * RMSNORM_HIDDEN_SIZE + i] = T_act(val / rms);
+    }
+}
+
+#define INST_RMSNORM_UNIT(act_tag, act_type)                          \
+  template [[host_name("rmsnorm_unit_" #act_tag "_specialized")]]     \
+  [[kernel]] decltype(rmsnorm_unit_impl<act_type>)                    \
+      rmsnorm_unit_impl<act_type>;
+
+INST_RMSNORM_UNIT(f16,  half)
+INST_RMSNORM_UNIT(bf16, bfloat)
+
 /// BF16 variant (uses float16 as Metal doesn't have native bfloat16)
 kernel void rmsnorm_bf16(
     device const float* input [[buffer(0)]],

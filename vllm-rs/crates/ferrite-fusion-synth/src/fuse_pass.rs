@@ -24,7 +24,7 @@
 #![allow(dead_code)] // MVP demo; full pipeline wiring in next phase.
 
 use crate::atom::{Atom, AtomConstantValue, AtomCtx};
-use crate::atom_lib::{AddRmsNormAtom, AffineQmvAtom, RopeAppendAtom, SiluMulAtom};
+use crate::atom_lib::{AddRmsNormAtom, AffineQmvAtom, MlpAct, RopeAppendAtom, SiluMulAtom};
 
 /// Backend-neutral synthesis target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,16 +209,19 @@ fn synthesize_pre_attn_chunk_impl(
     // buffer is row 0..) and the W/S/B channel triple bound below.
     let qmv_q = AffineQmvAtom {
         group_size: consts.group_size,
+        bits: 4,
         local_head_expr: "__head",
         has_linear_bias: consts.has_linear_bias,
     };
     let qmv_k = AffineQmvAtom {
         group_size: consts.group_size,
+        bits: 4,
         local_head_expr: "(__head - __num_q)",
         has_linear_bias: consts.has_linear_bias,
     };
     let qmv_v = AffineQmvAtom {
         group_size: consts.group_size,
+        bits: 4,
         local_head_expr: "(__head - __num_q - __num_kv)",
         has_linear_bias: consts.has_linear_bias,
     };
@@ -522,10 +525,12 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
 /// differences:
 ///   1. No RoPE / KV-cache write — the epilogue is a SiluMul atom.
 ///   2. The qmv tile axis spans `intermediate_size / TILE_N` tiles
-///      (rather than `num_q + 2*num_kv` heads). TILE_N is set equal
-///      to HEAD_DIM so the same `32 * TILE_N / MK_ROWS_PER_SIMDGROUP`
-///      thread count and per-simdgroup row layout reuse the existing
-///      AffineQmvAtom unchanged.
+///      (rather than `num_q + 2*num_kv` heads). TILE_N is set to
+///      `min(HEAD_DIM, 128)` so the same `32 * TILE_N /
+///      MK_ROWS_PER_SIMDGROUP` thread count and per-simdgroup row
+///      layout reuse the existing AffineQmvAtom unchanged while
+///      respecting Metal's 1024 threads-per-TG ceiling (Gemma4
+///      head_dim=256).
 ///   3. Two separate qmv calls write to two TG-mem float scratch
 ///      buffers (`gate_smem`, `up_smem`); the SiluMul atom reads both.
 ///
@@ -538,6 +543,8 @@ pub fn synthesize_mlp_pre_down_chunk(
     t_act: &'static str,
     t_scale: &'static str,
     consts: &ChunkConstants,
+    act: MlpAct,
+    mlp_bits: u32,
 ) -> SynthesizedKernel {
     assert_eq!(
         backend,
@@ -575,12 +582,13 @@ pub fn synthesize_mlp_pre_down_chunk(
     ];
 
     let addrms = AddRmsNormAtom::default();
-    let silu_mul = SiluMulAtom;
+    let silu_mul = SiluMulAtom { act };
     // Both qmv bands address row 0..intermediate of their own
     // separate weight buffer — local_head_expr is just `__head` (the
     // tile index, since TILE_N = __head_dim).
     let qmv = AffineQmvAtom {
         group_size: consts.group_size,
+        bits: mlp_bits,
         local_head_expr: "__head",
         // MLP gate/up have no per-row linear bias.
         has_linear_bias: false,
@@ -635,9 +643,17 @@ pub fn synthesize_mlp_pre_down_chunk(
         .emit_metal_body(&sm_ctx)
         .expect("SiluMulAtom Metal emit");
 
+    // Legacy symbol for the (Silu, b4) variant — keeps existing cost-CSV
+    // rows and metallib registrations valid. New variants carry act/bits
+    // tags (Gemma4: synth_mlp_pre_down_gelu_b8_bfloat_bfloat_gs64).
+    let variant_tag = match (act, mlp_bits) {
+        (MlpAct::Silu, 4) => String::new(),
+        (MlpAct::Silu, b) => format!("b{b}_"),
+        (MlpAct::Gelu, b) => format!("gelu_b{b}_"),
+    };
     let symbol = format!(
-        "synth_mlp_pre_down_{}_{}_gs{}",
-        t_act, t_scale, consts.group_size,
+        "synth_mlp_pre_down_{}{}_{}_gs{}",
+        variant_tag, t_act, t_scale, consts.group_size,
     );
 
     let source_tail = format!(
@@ -734,7 +750,13 @@ constant constexpr uint __SCRATCH_MAX  = __HEAD_DIM_MAX / MK_ROWS_PER_SIMDGROUP;
         silu_mul_body = silu_mul_body,
         hidden_lit = consts.hidden,
         intermediate_lit = consts.intermediate,
-        tile_n_lit = consts.head_dim,
+        // TILE_N is a tile width, not a head geometry — reusing
+        // head_dim is a convenience that keeps llama/qwen kernels
+        // byte-identical, but it must respect Metal's 1024
+        // threads-per-TG ceiling (`32 * TILE_N / 4`). Gemma4's
+        // head_dim=256 would need 2048 threads; cap at 128 (the
+        // lowering arm mirrors this — `lowering.rs` SynthMlpPreDown).
+        tile_n_lit = consts.head_dim.min(128),
         eps_lit = format_msl_float(consts.rms_norm_eps),
     );
 

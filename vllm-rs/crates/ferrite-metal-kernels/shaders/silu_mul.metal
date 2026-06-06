@@ -55,3 +55,46 @@ template <typename T>
 
 INST_SILU_MUL(f16,  half)
 INST_SILU_MUL(bf16, bfloat)
+
+// GELU (tanh approximation) sibling for the decomposed GeGLU q-MLP
+// path (Gemma2/3/4: `gelu_pytorch_tanh(gate) * up`). Same three
+// instructions as the SwiGLU decomposition, with `GeluMul` as the
+// elementwise tail. Formula matches `gelu_approx` in
+// `fused_gate_up_silu_mul.metal` and mlx `nn.gelu_approx`:
+//   GELU(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x³)))
+// Float accumulator throughout (the tanh argument overflows half).
+template <typename T>
+[[kernel]] void gelu_mul(
+    device       T* out  [[buffer(0)]],
+    const device T* gate [[buffer(1)]],
+    const device T* up   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= SILU_MUL_N) {
+    return;
+  }
+  float g = float(gate[gid]);
+  float u = float(up[gid]);
+  const float sqrt_2_over_pi = 0.7978845608f;
+  const float coeff = 0.044715f;
+  // Clamp the tanh argument: Metal's fast-math tanh computes
+  // (exp(2x)-1)/(exp(2x)+1), which is inf/inf = NaN once 2x
+  // overflows exp (|x| ≳ 44 — i.e. ANY gate ≥ ~10.06; Gemma4 layer-0
+  // gates reach 57.5). tanh(15) rounds to exactly 1.0f, so the clamp
+  // is bit-exact vs a saturating tanh. Same fix as activation.metal.
+  float inner = clamp(
+      sqrt_2_over_pi * (g + coeff * g * g * g), -15.0f, 15.0f);
+  float gelu_g = 0.5f * g * (1.0f + tanh(inner));
+  out[gid] = static_cast<T>(gelu_g * u);
+}
+
+#define INST_GELU_MUL(dtype_tag, mtl_type)                                \
+  template [[host_name("gelu_mul_" #dtype_tag)]] [[kernel]] void          \
+  gelu_mul<mtl_type>(                                                     \
+      device       mtl_type* out  [[buffer(0)]],                          \
+      const device mtl_type* gate [[buffer(1)]],                          \
+      const device mtl_type* up   [[buffer(2)]],                          \
+      uint gid [[thread_position_in_grid]]);
+
+INST_GELU_MUL(f16,  half)
+INST_GELU_MUL(bf16, bfloat)

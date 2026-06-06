@@ -48,6 +48,11 @@ pub struct MetalSynthMlpPreDownImpl {
     pub scale_tag: &'static str,
     pub group_size: u32,
     pub bits: u32,
+    /// MLP gate activation this variant claims: `OpKind::Silu`
+    /// (Llama/Qwen GLU) or `OpKind::Gelu` (Gemma GeGLU). Drives both
+    /// the FUF match and the kernel-symbol variant tag — mirrors
+    /// `fuse_pass::synthesize_mlp_pre_down_chunk`.
+    pub act_op: OpKind,
 }
 
 impl MetalSynthMlpPreDownImpl {
@@ -57,6 +62,7 @@ impl MetalSynthMlpPreDownImpl {
             scale_tag: "half",
             group_size: 64,
             bits: 4,
+            act_op: OpKind::Silu,
         }
     }
     /// Qwen3-family BF16-scale variant.
@@ -66,7 +72,35 @@ impl MetalSynthMlpPreDownImpl {
             scale_tag: "bfloat",
             group_size: 64,
             bits: 4,
+            act_op: OpKind::Silu,
         }
+    }
+    /// Gemma4 GeGLU variant: tanh-GELU gate over 8-bit MLP
+    /// projections (`mlx-affine-b4-g64-mlp8` preset), BF16 scales.
+    pub fn gelu_b8_gs64_s_bf16() -> Self {
+        Self {
+            act_tag: "bfloat",
+            scale_tag: "bfloat",
+            group_size: 64,
+            bits: 8,
+            act_op: OpKind::Gelu,
+        }
+    }
+
+    /// Kernel symbol — MUST stay byte-identical to the naming in
+    /// `fuse_pass::synthesize_mlp_pre_down_chunk` (legacy untagged
+    /// name for the (Silu, b4) variant keeps existing cost-CSV rows
+    /// and metallib registrations valid).
+    fn symbol(&self) -> String {
+        let variant_tag = match (self.act_op, self.bits) {
+            (OpKind::Gelu, b) => format!("gelu_b{b}_"),
+            (_, 4) => String::new(),
+            (_, b) => format!("b{b}_"),
+        };
+        format!(
+            "synth_mlp_pre_down_{}{}_{}_gs{}",
+            variant_tag, self.act_tag, self.scale_tag, self.group_size,
+        )
     }
 }
 
@@ -111,8 +145,19 @@ impl Implementation for MetalSynthMlpPreDownImpl {
         // mlx-affine checkpoints: the M=1 synth megakernel's fused rmsnorm
         // double-counts the pre-applied zero-centered offset → degenerate
         // output. Route to the (correct) unfused chain.
+        //
+        // Gelu-variant exemption (Gemma4): the synth AddRmsNormAtom
+        // applies plain `w·x̂` (offset 0). Models whose runtime norm
+        // offset is 0 — Gemma4 stores FULL gains, `norm_weight_runtime_
+        // offset` returns 0.0 — match that exactly, so the double-count
+        // hazard doesn't exist. Scoped to the Gelu variant so the Silu
+        // (Llama/Qwen) routing is untouched.
         if crate::metal::synth_gate_up_silu_mul::is_mlx_affine(ctx.model) {
-            return false;
+            let gelu_offset0 = self.act_op == OpKind::Gelu
+                && crate::codegen::norm_weight_runtime_offset(ctx.model) == 0.0;
+            if !gelu_offset0 {
+                return false;
+            }
         }
         let is_qwen3 = crate::metal::synth_gate_up_silu_mul::is_qwen3_arch(ctx.model);
         matches!(
@@ -192,13 +237,14 @@ impl Implementation for MetalSynthMlpPreDownImpl {
             }
         }
 
-        // Silu consumes exactly one of the Gemms (the gate).
-        let silu_node = fuf
+        // The gate activation (Silu or Gelu, per variant) consumes
+        // exactly one of the Gemms (the gate).
+        let act_node = fuf
             .nodes
             .iter()
-            .find(|n| n.op == OpKind::Silu && gemms.iter().any(|g| consumes_tile(n, *g)))?;
-        let silu_tile = silu_node.id;
-        // Mul consumes the Silu and the other (up) Gemm.
+            .find(|n| n.op == self.act_op && gemms.iter().any(|g| consumes_tile(n, *g)))?;
+        let silu_tile = act_node.id;
+        // Mul consumes the activation and the other (up) Gemm.
         let mul_node = fuf.nodes.iter().find(|n| {
             if n.op != OpKind::Mul || !consumes_tile(n, silu_tile) {
                 return false;
@@ -260,10 +306,7 @@ impl Implementation for MetalSynthMlpPreDownImpl {
             return 1.0e15;
         }
 
-        let synth_name = format!(
-            "synth_mlp_pre_down_{}_{}_gs{}",
-            self.act_tag, self.scale_tag, self.group_size,
-        );
+        let synth_name = self.symbol();
         if let Some(cost) = ctx.profile.cost_us_for(&synth_name, num_tokens, hidden, 0) {
             return cost;
         }
@@ -387,7 +430,7 @@ impl Implementation for MetalSynthMlpPreDownImpl {
                 OpKind::Add => add_tile = Some(t),
                 OpKind::RmsNorm => rmsnorm_tile = Some(t),
                 OpKind::Gemm => gemm_tiles.push(t),
-                OpKind::Silu => silu_tile = Some(t),
+                op if op == self.act_op => silu_tile = Some(t),
                 OpKind::Mul => mul_tile = Some(t),
                 _ => {}
             }
@@ -474,10 +517,7 @@ impl Implementation for MetalSynthMlpPreDownImpl {
             _ => return None,
         };
 
-        let symbol = format!(
-            "synth_mlp_pre_down_{}_{}_gs{}",
-            self.act_tag, self.scale_tag, self.group_size,
-        );
+        let symbol = self.symbol();
         let _ = bits;
         // Gate/up LinearLayers and RmsNorm flow through
         // `required_weights()`; codegen assigns sub-slots

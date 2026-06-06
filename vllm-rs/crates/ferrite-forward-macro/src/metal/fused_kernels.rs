@@ -261,6 +261,14 @@ impl MetalFusedGateUpSiluMulImpl {
         }
     }
 
+    pub fn new_gelu_bf16() -> Self {
+        Self {
+            kernel_name: "fused_gate_up_gelu_mul_bf16",
+            dtype: "bf16",
+            is_gelu: true,
+        }
+    }
+
     /// Decomposed cost for Affine 4-bit Gate-Up-SiLU-Mul. `fan_out`
     /// emits 3 separate Instructions for this storage (gate AffineQmm,
     /// up AffineQmm, SiluMul) — there is no fused affine kernel —
@@ -357,18 +365,20 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         WorkloadConstraint::Any
     }
 
-    fn matches(&self, fuf: &Fuf, seed: TileId, profile: &TargetProfile) -> Option<MatchInfo> {
-        // GELU variant has no affine decomposition path today —
-        // delegate to the canonical Dense-only CUDA matcher.
-        if self.is_gelu {
-            return FusedGateUpGeluMulImpl.matches(fuf, seed, profile);
-        }
-        // SiLU variant: same 4-tile `(Gemm, Gemm, Silu, Mul)` claim
-        // as the CUDA matcher, but accept Dense (existing fused
-        // kernel) AND MLX-affine (decomposed q-MLP — fan_out emits
-        // `AffineQmm` + `AffineQmm` + `SiluMul`). The CUDA matcher's
-        // storage gate at `impl_lib.rs:2971` is restricted to Dense,
-        // so the walk has to live here for the Affine path.
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        // Same 4-tile `(Gemm, Gemm, <act>, Mul)` claim as the CUDA
+        // matcher, but accept Dense (existing fused kernel) AND
+        // MLX-affine / NVFP4 (decomposed q-MLP — fan_out emits
+        // `AffineQmm` + `AffineQmm` + `SiluMul`/`GeluMul`). The CUDA
+        // matcher's storage gate at `impl_lib.rs:2971` is restricted
+        // to Dense, so the walk has to live here for the quant paths.
+        // `is_gelu` only changes the activation OpKind in the walk
+        // (Gemma-family GeGLU) and the decomposed tail opcode.
+        let act_kind = if self.is_gelu {
+            OpKind::Gelu
+        } else {
+            OpKind::Silu
+        };
         let gate_gemm = fuf.get(seed);
         if gate_gemm.op != OpKind::Gemm {
             return None;
@@ -384,7 +394,7 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         let silu_node = fuf
             .nodes
             .iter()
-            .find(|n| n.op == OpKind::Silu && consumes_tile(n, seed))?;
+            .find(|n| n.op == act_kind && consumes_tile(n, seed))?;
         let silu_id = silu_node.id;
         let mul_node = fuf
             .nodes
@@ -558,10 +568,10 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         fuf: &Fuf,
         program: &Program,
     ) -> Vec<WeightAccessor> {
-        if self.is_gelu {
+        if self.is_gelu && !storage_of_first_gemm(claimed_tiles, fuf).is_decomposed_quant() {
             return FusedGateUpGeluMulImpl.required_weights(claimed_tiles, fuf, program);
         }
-        // SiLU: storage-polymorphic accessor shape.
+        // Storage-polymorphic accessor shape (both activations).
         //   * Dense → one fused accessor whose source aggregates
         //     gate_proj + up_proj weight refs (the loader concats
         //     them into a single `[gate|up]` LinearLayer at load
@@ -588,8 +598,12 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
 
     fn extra_opcode_shapes(&self) -> Vec<OpcodeShape> {
         if self.is_gelu {
-            // No affine GELU decomposition path today.
-            return Vec::new();
+            // GELU: Affine/NVFP4 fan out into `*Qmm` ×2 + `GeluMul`.
+            return vec![
+                affine_qmm_opcode_shape(),
+                nvfp4_qmm_opcode_shape(),
+                gelu_mul_opcode_shape(),
+            ];
         }
         // SiLU: the Affine path fans out into `AffineQmm` ×2 +
         // `SiluMul`, and the NVFP4 path into `Nvfp4Qmm` ×2 + `SiluMul`.
@@ -614,17 +628,19 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
         bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
-        if self.is_gelu {
-            return FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots);
-        }
-        // Discriminate Dense (single fused emit) vs Affine
-        // (decomposed `AffineQmm` + `AffineQmm` + `SiluMul`) on the
+        // Discriminate Dense (single fused emit) vs Affine/NVFP4
+        // (decomposed `*Qmm` + `*Qmm` + `SiluMul`/`GeluMul`) on the
         // gate Gemm's weight storage. `matches()` already enforces
         // gate/up agreement, so inspecting one suffices.
         if !storage_of_first_gemm(&m.claimed_tiles, fuf).is_decomposed_quant() {
+            if self.is_gelu {
+                return FusedGateUpGeluMulImpl.fan_out(m, fuf, program, bounds, slots);
+            }
             return FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots);
         }
-        Some(quant_decomposed_fan_out(m, fuf, program, bounds, slots))
+        Some(quant_decomposed_fan_out(
+            m, fuf, program, bounds, slots, self.is_gelu,
+        ))
     }
 }
 
@@ -688,6 +704,20 @@ fn silu_mul_opcode_shape() -> OpcodeShape {
     )
 }
 
+/// `Instruction::GeluMul` variant shape — identical fields to
+/// [`silu_mul_opcode_shape`]; the lowering arm consumes the three
+/// slots into the `gelu_mul_<dtype>` kernel's bindings.
+fn gelu_mul_opcode_shape() -> OpcodeShape {
+    OpcodeShape::new(
+        "GeluMul",
+        vec![
+            ("gate_slot", syn::parse_quote!(u32)),
+            ("up_slot", syn::parse_quote!(u32)),
+            ("out_slot", syn::parse_quote!(u32)),
+        ],
+    )
+}
+
 /// Build the three-instruction decomposition (`qmm` gate, `qmm` up,
 /// SiluMul) used when the fused gate-up SiLU MLP claim's Gemms have a
 /// dequant-on-read 4-bit storage (MLX-affine → `AffineQmm`, NVFP4 →
@@ -700,12 +730,14 @@ fn quant_decomposed_fan_out(
     program: &Program,
     bounds: &BTreeMap<String, u64>,
     slots: &SlotMap,
+    is_gelu: bool,
 ) -> Vec<ferrite_forward::Instruction> {
+    let act_kind = if is_gelu { OpKind::Gelu } else { OpKind::Silu };
     let silu_id = *m
         .claimed_tiles
         .iter()
-        .find(|t| fuf.get(**t).op == OpKind::Silu)
-        .expect("MetalFusedGateUpSiluMul(Affine): claim contains Silu");
+        .find(|t| fuf.get(**t).op == act_kind)
+        .expect("MetalFusedGateUpSiluMul(Affine): claim contains the activation tile");
     let mul_id = *m
         .claimed_tiles
         .iter()
@@ -786,8 +818,8 @@ fn quant_decomposed_fan_out(
         gate_k,
     );
     let up_inst = decomposed_qmm_inst(up_node, in_slot_idx, up_out_idx, up_layer_lit, up_n, up_k);
-    // SwiGLU invariant: gate and up project to the same width; that
-    // width sizes the elementwise SiluMul tail.
+    // SwiGLU/GeGLU invariant: gate and up project to the same width;
+    // that width sizes the elementwise activation-mul tail.
     assert_eq!(
         gate_n, up_n,
         "MetalFusedGateUpSiluMul(Affine): gate N ({gate_n}) != up N ({up_n})"
@@ -802,9 +834,16 @@ fn quant_decomposed_fan_out(
          `intermediate_size` (or the all-MoE shared-expert derivation) \
          resolved to 0 for a body that has a dense SwiGLU MLP"
     );
-    let silu_mul_inst =
-        ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx, gate_n);
-    vec![gate_inst, up_inst, silu_mul_inst]
+    // GeGLU (Gemma2/3/4) emits the gelu_tanh sibling; GeluMul reads
+    // its width from `W::INTERMEDIATE_SIZE` at lowering (no per-claim
+    // width field — no GeGLU MoE hybrid exists; adopt SiluMul's width
+    // field if one ever does).
+    let act_mul_inst = if is_gelu {
+        ferrite_forward::Instruction::GeluMul(gate_out_idx, up_out_idx, final_out_idx)
+    } else {
+        ferrite_forward::Instruction::SiluMul(gate_out_idx, up_out_idx, final_out_idx, gate_n)
+    };
+    vec![gate_inst, up_inst, act_mul_inst]
 }
 
 /// Emit the per-Gemm decode instruction for the decomposed quant MLP,
@@ -848,6 +887,263 @@ fn decomposed_qmm_inst(
         other => {
             panic!("decomposed_qmm_inst: gate/up Gemm storage isn't a decomposed quant ({other:?})")
         }
+    }
+}
+
+
+/// Gemma4 post-FFN tail fusion. Claims the 3-tile elementwise chain
+///
+///   `RmsNorm(down, post_ffwd_ln) → Add(normed, residual) →
+///    ScalarWeightMul(sum, layer_scalar)`
+///
+/// and emits one `Instruction::NormAddScalarMul` — the norm-THEN-add
+/// mirror of `MetalFusedAddRmsNormImpl`. The kernel
+/// (`norm_add_scalar_mul_*` in `fused_add_rmsnorm.metal`) rounds to
+/// the activation dtype at every boundary the unfused chain rounds
+/// at, so the fusion is BIT-IDENTICAL to the 3-kernel sequence at
+/// every M (no batch-variance introduced; safe at prefill too —
+/// strictly fewer bytes: 4 row-passes vs 9).
+///
+/// Only Gemma4 has `ScalarWeightMul`, so the matcher can never fire
+/// on another arch.
+#[derive(Debug)]
+pub struct MetalNormAddScalarMulImpl {
+    /// Kernel name for cost-table lookup.
+    kernel_name: &'static str,
+    dtype: &'static str,
+}
+
+impl MetalNormAddScalarMulImpl {
+    pub fn new_fp16() -> Self {
+        Self {
+            kernel_name: "norm_add_scalar_mul_f16",
+            dtype: "fp16",
+        }
+    }
+    pub fn new_bf16() -> Self {
+        Self {
+            kernel_name: "norm_add_scalar_mul_bf16",
+            dtype: "bf16",
+        }
+    }
+}
+
+impl Implementation for MetalNormAddScalarMulImpl {
+    fn name(&self) -> &'static str {
+        match self.dtype {
+            "fp16" => "metal_norm_add_scalar_mul_f16",
+            _ => "metal_norm_add_scalar_mul_bf16",
+        }
+    }
+
+    fn target_compatible(&self, profile: &TargetProfile) -> bool {
+        // Metal-only: `Instruction::NormAddScalarMul` has no cuda
+        // lowering (Gemma4 is metal-first).
+        profile.backend == Backend::Metal
+    }
+
+    fn workload_constraint(&self) -> WorkloadConstraint {
+        WorkloadConstraint::Any
+    }
+
+    fn matches(&self, fuf: &Fuf, seed: TileId, _profile: &TargetProfile) -> Option<MatchInfo> {
+        let seed_node = fuf.get(seed);
+        if seed_node.op != OpKind::RmsNorm {
+            return None;
+        }
+        // The norm input (down-proj output) — a tile, not a weight.
+        let (delta_tile, _delta_slot) = first_tile_input(seed_node)?;
+
+        // Exactly one consumer of the norm: the residual Add.
+        let consumers: Vec<&crate::fuf::FufNode> = fuf
+            .nodes
+            .iter()
+            .filter(|n| consumes_tile(n, seed))
+            .collect();
+        let [add_node] = consumers.as_slice() else {
+            return None;
+        };
+        if add_node.op != OpKind::Add {
+            return None;
+        }
+        // Both Add operands are tiles; the non-norm one is the residual.
+        let add_tile_inputs: Vec<TileId> = add_node
+            .inputs
+            .iter()
+            .filter_map(|i| match i {
+                FufInput::Tile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if add_tile_inputs.len() != 2 || !add_tile_inputs.contains(&seed) {
+            return None;
+        }
+        let residual_tile = *add_tile_inputs.iter().find(|&&t| t != seed)?;
+
+        // Exactly one consumer of the Add: the layer_scalar multiply.
+        let add_consumers: Vec<&crate::fuf::FufNode> = fuf
+            .nodes
+            .iter()
+            .filter(|n| consumes_tile(n, add_node.id))
+            .collect();
+        let [swm_node] = add_consumers.as_slice() else {
+            return None;
+        };
+        if swm_node.op != OpKind::ScalarWeightMul {
+            return None;
+        }
+
+        let mut claimed = vec![seed, add_node.id, swm_node.id];
+        claimed.sort();
+        Some(MatchInfo {
+            claimed_tiles: claimed,
+            boundary_outputs: vec![swm_node.id],
+            boundary_inputs: vec![delta_tile, residual_tile],
+        })
+    }
+
+    fn cost_us(&self, _m: &MatchInfo, ctx: &CostCtx) -> f64 {
+        let m = ctx.num_tokens() as u32;
+        let hidden = ctx.bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+        if let Some(cost) = ctx.profile.cost_us_for(self.kernel_name, m, hidden, 0) {
+            return cost;
+        }
+        if hidden == 0 {
+            return 1.0e9;
+        }
+        let bw = ctx.profile.memory_bandwidth_gbps;
+        if bw <= 0.0 {
+            return 1.0e9;
+        }
+        // Reads: delta + residual rows; gains. Writes: out rows.
+        // (layer_scalar [1] is noise.)
+        let bytes = (m as f64) * (hidden as f64) * 2.0 * 3.0 + (hidden as f64) * 2.0;
+        bytes / 1e9 / bw * 1e6
+    }
+
+    fn resources(&self, _m: &MatchInfo) -> Resources {
+        Resources {
+            shmem_bytes: 4 * 1024,
+            regs_per_thread: 32,
+            threads_per_cta: 256,
+        }
+    }
+
+    fn launch_kind(&self) -> LaunchKind {
+        LaunchKind::HostCallback
+    }
+
+    fn supported_input_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder]
+    }
+
+    fn supported_output_handoffs(&self) -> &[Handoff] {
+        &[Handoff::StreamOrder]
+    }
+
+    fn input_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_inputs.len()]
+    }
+
+    fn output_layouts(&self, m: &MatchInfo) -> Vec<Layout> {
+        vec![Layout::Any; m.boundary_outputs.len()]
+    }
+
+    fn opcode_shape(&self) -> OpcodeShape {
+        OpcodeShape::new(
+            "NormAddScalarMul",
+            vec![
+                ("delta_slot", syn::parse_quote!(u32)),
+                ("residual_slot", syn::parse_quote!(u32)),
+                ("out_slot", syn::parse_quote!(u32)),
+                ("layer", syn::parse_quote!(u32)),
+                ("hidden_size", syn::parse_quote!(u32)),
+            ],
+        )
+    }
+
+    fn fan_out(
+        &self,
+        m: &MatchInfo,
+        fuf: &Fuf,
+        _program: &Program,
+        bounds: &BTreeMap<String, u64>,
+        slots: &SlotMap,
+    ) -> Option<Vec<ferrite_forward::Instruction>> {
+        let mut rms_tile: Option<TileId> = None;
+        let mut add_tile: Option<TileId> = None;
+        let mut swm_tile: Option<TileId> = None;
+        for &t in &m.claimed_tiles {
+            match fuf.get(t).op {
+                OpKind::RmsNorm => rms_tile = Some(t),
+                OpKind::Add => add_tile = Some(t),
+                OpKind::ScalarWeightMul => swm_tile = Some(t),
+                _ => {}
+            }
+        }
+        let rms_tile = rms_tile?;
+        let add_tile = add_tile?;
+        let swm_tile = swm_tile?;
+
+        let (delta_id, delta_sub) = first_tile_input(fuf.get(rms_tile))?;
+        let delta_slot = slots.of(delta_id, delta_sub);
+        let (residual_id, residual_sub) = fuf
+            .get(add_tile)
+            .inputs
+            .iter()
+            .find_map(|i| match i {
+                FufInput::Tile { id, slot } if *id != rms_tile => Some((*id, *slot)),
+                _ => None,
+            })?;
+        let residual_slot = slots.of(residual_id, residual_sub);
+        let out_slot = slots.of(swm_tile, 0);
+
+        // Layer index from the norm-gain weight input.
+        let layer = m.claimed_tiles.iter().find_map(|&t| {
+            fuf.get(t).inputs.iter().find_map(|i| match i {
+                FufInput::Weight {
+                    index: Some(layer), ..
+                } => Some(*layer as u32),
+                _ => None,
+            })
+        })?;
+        let hidden = bounds.get("hidden_size").copied().unwrap_or(0) as u32;
+
+        Some(vec![ferrite_forward::Instruction::NormAddScalarMul(
+            delta_slot,
+            residual_slot,
+            out_slot,
+            layer,
+            hidden,
+        )])
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn output_alias(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+    ) -> Vec<((TileId, u8), Option<(TileId, u8)>)> {
+        // Only the ScalarWeightMul output is externally visible (the
+        // new hidden_states); the norm and add intermediates never
+        // materialize.
+        let swm = *claimed_tiles
+            .iter()
+            .find(|t| matches!(fuf.get(**t).op, OpKind::ScalarWeightMul))
+            .expect("NormAddScalarMul claim contains ScalarWeightMul");
+        vec![((swm, 0), None)]
+    }
+
+    fn required_weights(
+        &self,
+        claimed_tiles: &[TileId],
+        fuf: &Fuf,
+        program: &Program,
+    ) -> Vec<WeightAccessor> {
+        // Tile order [rmsnorm, add, swm] → accessors [post_ffwd_ln
+        // gains, layer_scalar] → RmsNorm-kind sub-slots 0 / 1; the
+        // lowering arm binds them at buffers 3 / 4 in that order.
+        default_required_weights(claimed_tiles, fuf, program)
     }
 }
 

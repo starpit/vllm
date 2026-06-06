@@ -161,6 +161,27 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let b = lit_u32(b);
             quote! { TanhSoftCap(#a, #b) }
         }
+        I::RmsNormUnit(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            quote! { RmsNormUnit(#a, #b, #c, #d) }
+        }
+        I::ScalarWeightMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { ScalarWeightMul(#a, #b, #c) }
+        }
+        I::NormAddScalarMul(a, b, c, d, e) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            quote! { NormAddScalarMul(#a, #b, #c, #d, #e) }
+        }
         I::FusedAddRmsNorm(a, b, c, d, e) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -314,6 +335,13 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let e = lit_bool(e);
             quote! { SlidingAttentionPrefillContiguous(#a, #b, #c, #d, #e) }
         }
+        I::SlidingAttentionPrefillPaged(a, b, c, d) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_bool(d);
+            quote! { SlidingAttentionPrefillPaged(#a, #b, #c, #d) }
+        }
         I::VarlenAttention(a, b, c, d, e) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
@@ -398,7 +426,7 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let g = lit_bool(g);
             quote! { FlashInferAttentionPrefill(#a, #b, #c, #d, #e, #f, #g) }
         }
-        I::RopeAppend(a, b, c, d, e, f, g, h) => {
+        I::RopeAppend(a, b, c, d, e, f, g, h, i) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
@@ -407,7 +435,18 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let f = lit_u32(f);
             let g = lit_u32(g);
             let h = lit_bool(h);
-            quote! { RopeAppend(#a, #b, #c, #d, #e, #f, #g, #h) }
+            let i = lit_bool(i);
+            quote! { RopeAppend(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
+        }
+        I::RopeAppendNormed(a, b, c, d, e, f, g, h, i) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            let d = lit_u32(d);
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            let g = lit_u32(g);
+            quote! { RopeAppendNormed(#a, #b, #c, #d, #e, #f, #g, #h, #i) }
         }
         I::MlaSplit(a, b, c) => {
             let a = lit_u32(a);
@@ -824,6 +863,12 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let w = lit_u32(w);
             quote! { SiluMul(#a, #b, #c, #w) }
         }
+        I::GeluMul(a, b, c) => {
+            let a = lit_u32(a);
+            let b = lit_u32(b);
+            let c = lit_u32(c);
+            quote! { GeluMul(#a, #b, #c) }
+        }
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(a, b, c, d, e, f) => {
             let a = lit_u32(a);
@@ -862,6 +907,9 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::SpliceMmEmbeds(..) => "SpliceMmEmbeds",
         I::ScalarMul(..) => "ScalarMul",
         I::TanhSoftCap(..) => "TanhSoftCap",
+        I::RmsNormUnit(..) => "RmsNormUnit",
+        I::ScalarWeightMul(..) => "ScalarWeightMul",
+        I::NormAddScalarMul(..) => "NormAddScalarMul",
         I::FusedAddRmsNorm(..) => "FusedAddRmsNorm",
         I::FusedAddRmsNormWithOffset(..) => "FusedAddRmsNormWithOffset",
         I::ScalarOffsetRmsNorm(..) => "ScalarOffsetRmsNorm",
@@ -881,6 +929,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::EncoderAttention(..) => "EncoderAttention",
         I::SlidingAttentionViaCache(..) => "SlidingAttentionViaCache",
         I::SlidingAttentionPrefillContiguous(..) => "SlidingAttentionPrefillContiguous",
+        I::SlidingAttentionPrefillPaged(..) => "SlidingAttentionPrefillPaged",
         I::VarlenAttention(..) => "VarlenAttention",
         I::VisionRope(..) => "VisionRope",
         I::QuickGelu(..) => "QuickGelu",
@@ -897,6 +946,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::FlashAttention3Decode(..) => "FlashAttention3Decode",
         I::FlashInferAttentionPrefill(..) => "FlashInferAttentionPrefill",
         I::RopeAppend(..) => "RopeAppend",
+        I::RopeAppendNormed(..) => "RopeAppendNormed",
         I::MlaSplit(..) => "MlaSplit",
         I::MlaAttention(..) => "MlaAttention",
         I::GatedDeltaNet(..) => "GatedDeltaNet",
@@ -950,6 +1000,7 @@ pub fn instruction_variant_name(inst: &Instruction) -> &'static str {
         I::SynthPreAttn(..) => "SynthPreAttn",
         I::SynthMlpPreDown(..) => "SynthMlpPreDown",
         I::SiluMul(..) => "SiluMul",
+        I::GeluMul(..) => "GeluMul",
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(..) => "SynthGateUpSiluMul",
         #[cfg(feature = "metal")]
@@ -1025,6 +1076,27 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
         I::TanhSoftCap(a, b) => match idx {
             0 => u(a),
             1 => u(b),
+            _ => None,
+        },
+        I::RmsNormUnit(a, b, c, d) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            _ => None,
+        },
+        I::NormAddScalarMul(a, b, c, d, e) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            _ => None,
+        },
+        I::ScalarWeightMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
             _ => None,
         },
         I::FusedAddRmsNorm(a, b, c, d, e) => match idx {
@@ -1161,6 +1233,12 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
+        I::SlidingAttentionPrefillPaged(a, b, c, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
         I::SlidingAttentionPrefillContiguous(a, b, c, d, _) => match idx {
             0 => u(a),
             1 => u(b),
@@ -1250,7 +1328,17 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             5 => u(f),
             _ => None,
         },
-        I::RopeAppend(a, b, c, d, e, f, g, _) => match idx {
+        I::RopeAppendNormed(a, b, c, d, e, f, g, _, _) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            3 => u(d),
+            4 => u(e),
+            5 => u(f),
+            6 => u(g),
+            _ => None,
+        },
+        I::RopeAppend(a, b, c, d, e, f, g, _, _) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -1647,6 +1735,12 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
+        I::GeluMul(a, b, c) => match idx {
+            0 => u(a),
+            1 => u(b),
+            2 => u(c),
+            _ => None,
+        },
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(a, b, c, d, e, _f) => match idx {
             0 => u(a),
@@ -1732,6 +1826,27 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             0 => I::TanhSoftCap(n, b),
             1 => I::TanhSoftCap(a, n),
             _ => panic!("TanhSoftCap: bad idx {idx}"),
+        },
+        I::RmsNormUnit(a, b, c, d) => match idx {
+            0 => I::RmsNormUnit(n, b, c, d),
+            1 => I::RmsNormUnit(a, n, c, d),
+            2 => I::RmsNormUnit(a, b, n, d),
+            3 => I::RmsNormUnit(a, b, c, n),
+            _ => panic!("RmsNormUnit: bad idx {idx}"),
+        },
+        I::ScalarWeightMul(a, b, c) => match idx {
+            0 => I::ScalarWeightMul(n, b, c),
+            1 => I::ScalarWeightMul(a, n, c),
+            2 => I::ScalarWeightMul(a, b, n),
+            _ => panic!("ScalarWeightMul: bad idx {idx}"),
+        },
+        I::NormAddScalarMul(a, b, c, d, e) => match idx {
+            0 => I::NormAddScalarMul(n, b, c, d, e),
+            1 => I::NormAddScalarMul(a, n, c, d, e),
+            2 => I::NormAddScalarMul(a, b, n, d, e),
+            3 => I::NormAddScalarMul(a, b, c, n, e),
+            4 => I::NormAddScalarMul(a, b, c, d, n),
+            _ => panic!("NormAddScalarMul: bad idx {idx}"),
         },
         I::FusedAddRmsNorm(a, b, c, d, e) => match idx {
             0 => I::FusedAddRmsNorm(n, b, c, d, e),
@@ -1874,6 +1989,12 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             3 => I::SlidingAttentionPrefillContiguous(a, b, c, n, e),
             _ => panic!("SlidingAttentionPrefillContiguous: bad idx {idx}"),
         },
+        I::SlidingAttentionPrefillPaged(a, b, c, d) => match idx {
+            0 => I::SlidingAttentionPrefillPaged(n, b, c, d),
+            1 => I::SlidingAttentionPrefillPaged(a, n, c, d),
+            2 => I::SlidingAttentionPrefillPaged(a, b, n, d),
+            _ => panic!("SlidingAttentionPrefillPaged: bad idx {idx}"),
+        },
         I::VarlenAttention(a, b, c, d, e) => match idx {
             0 => I::VarlenAttention(n, b, c, d, e),
             1 => I::VarlenAttention(a, n, c, d, e),
@@ -1954,14 +2075,24 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             5 => I::FlashInferAttentionPrefill(a, b, c, d, e, n, g),
             _ => panic!("FlashInferAttentionPrefill: bad idx {idx}"),
         },
-        I::RopeAppend(a, b, c, d, e, f, g, h) => match idx {
-            0 => I::RopeAppend(n, b, c, d, e, f, g, h),
-            1 => I::RopeAppend(a, n, c, d, e, f, g, h),
-            2 => I::RopeAppend(a, b, n, d, e, f, g, h),
-            3 => I::RopeAppend(a, b, c, n, e, f, g, h),
-            4 => I::RopeAppend(a, b, c, d, n, f, g, h),
-            5 => I::RopeAppend(a, b, c, d, e, n, g, h),
-            6 => I::RopeAppend(a, b, c, d, e, f, n, h),
+        I::RopeAppendNormed(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::RopeAppendNormed(n, b, c, d, e, f, g, h, i),
+            1 => I::RopeAppendNormed(a, n, c, d, e, f, g, h, i),
+            2 => I::RopeAppendNormed(a, b, n, d, e, f, g, h, i),
+            3 => I::RopeAppendNormed(a, b, c, n, e, f, g, h, i),
+            4 => I::RopeAppendNormed(a, b, c, d, n, f, g, h, i),
+            5 => I::RopeAppendNormed(a, b, c, d, e, n, g, h, i),
+            6 => I::RopeAppendNormed(a, b, c, d, e, f, n, h, i),
+            _ => panic!("RopeAppendNormed: bad idx {idx}"),
+        },
+        I::RopeAppend(a, b, c, d, e, f, g, h, i) => match idx {
+            0 => I::RopeAppend(n, b, c, d, e, f, g, h, i),
+            1 => I::RopeAppend(a, n, c, d, e, f, g, h, i),
+            2 => I::RopeAppend(a, b, n, d, e, f, g, h, i),
+            3 => I::RopeAppend(a, b, c, n, e, f, g, h, i),
+            4 => I::RopeAppend(a, b, c, d, n, f, g, h, i),
+            5 => I::RopeAppend(a, b, c, d, e, n, g, h, i),
+            6 => I::RopeAppend(a, b, c, d, e, f, n, h, i),
             _ => panic!("RopeAppend: bad idx {idx}"),
         },
         I::MlaSplit(a, b, c) => match idx {
@@ -2367,6 +2498,12 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             1 => I::SiluMul(a, n, c, w),
             2 => I::SiluMul(a, b, n, w),
             _ => panic!("SiluMul: bad idx {idx}"),
+        },
+        I::GeluMul(a, b, c) => match idx {
+            0 => I::GeluMul(n, b, c),
+            1 => I::GeluMul(a, n, c),
+            2 => I::GeluMul(a, b, n),
+            _ => panic!("GeluMul: bad idx {idx}"),
         },
         #[cfg(feature = "metal")]
         I::SynthGateUpSiluMul(a, b, c, d, e, f) => match idx {
@@ -3455,6 +3592,31 @@ pub fn lower_bucket(
             }
             let (kv_w, kv_r) = imp.kv_layer_io(&claimed, fuf);
 
+            // Metadata-only emits (Reshape/Alias/Free) lower to ZERO
+            // device dispatches — every metal `lower_one` returns an
+            // empty command Vec for them, so a `true` flag computed
+            // here is silently DROPPED by the runtime tape assembly
+            // (flags are only pushed for n_cmds >= 1). Letting such a
+            // row "fire" a barrier and CLEAR the pending sets opens a
+            // lost-barrier hole: the next real dispatch sees an
+            // analytically-flushed state that no runtime barrier ever
+            // flushed. (Found on Gemma4: the q-head Reshape between
+            // v_proj's write and rmsnorm_unit's read of the same slot
+            // cleared the pending write → the unit norm raced the NAX
+            // matmul.) Metadata rows are excluded from hazard
+            // bookkeeping entirely; their aliasing semantics are
+            // already covered by `resolve_owner`, which maps every
+            // downstream reader to the owning slot.
+            let metadata_only = !emits.is_empty()
+                && emits.iter().all(|e| {
+                    matches!(
+                        e,
+                        ferrite_forward::Instruction::Reshape(..)
+                            | ferrite_forward::Instruction::Alias(..)
+                            | ferrite_forward::Instruction::Free(..)
+                    )
+                });
+
             // Hazard check against pending sets. RAW (my reads ∩
             // pending writes) + WAW (my writes ∩ pending writes) +
             // WAR (my writes ∩ pending reads) + KV-layer
@@ -3468,7 +3630,34 @@ pub fn lower_bucket(
                 || kv_w
                     .map(|l| pending_kv_writes.contains(&l) || pending_kv_reads.contains(&l))
                     .unwrap_or(false);
-            let need_barrier = !first_dispatch && (arena_conflict || kv_conflict);
+            let need_barrier =
+                !metadata_only && !first_dispatch && (arena_conflict || kv_conflict);
+            if std::env::var_os("FERRITE_MACRO_BARRIER_DEBUG").is_some() {
+                eprintln!(
+                    "[hazard] imp={:32} claimed={:?} reads={:?} writes={:?} \
+                     kv_w={:?} kv_r={:?} pending_w={:?} pending_r={:?} barrier={}",
+                    imp.name(),
+                    claimed,
+                    sg_reads,
+                    sg_writes,
+                    kv_w,
+                    kv_r,
+                    {
+                        let mut v: Vec<u32> = pending_writes.iter().copied().collect();
+                        v.sort();
+                        v
+                    },
+                    {
+                        let mut v: Vec<u32> = pending_reads.iter().copied().collect();
+                        v.sort();
+                        v
+                    },
+                    need_barrier,
+                );
+                if metadata_only {
+                    eprintln!("[hazard]   ^ metadata-only (excluded from pending sets)");
+                }
+            }
             if need_barrier {
                 pending_writes.clear();
                 pending_reads.clear();
@@ -3480,21 +3669,32 @@ pub fn lower_bucket(
             // subsequent emits (e.g. AffineQmmTSplitK's qmm_t →
             // reduce pair sharing scratch) are conservatively
             // serialized — Impls that need internal concurrency
-            // can refine this later.
+            // can refine this later. Metadata-only rows always get
+            // `false` (the runtime drops their flags anyway).
             for (i, _emit) in emits.iter().enumerate() {
-                barriers.push(if i == 0 { need_barrier } else { true });
+                barriers.push(if metadata_only {
+                    false
+                } else if i == 0 {
+                    need_barrier
+                } else {
+                    true
+                });
             }
-            // Update pending sets after recording the flag.
-            pending_writes.extend(sg_writes.iter().copied());
-            pending_reads.extend(sg_reads.iter().copied());
-            if let Some(l) = kv_w {
-                pending_kv_writes.insert(l);
-            }
-            if let Some(l) = kv_r {
-                pending_kv_reads.insert(l);
-            }
-            if !emits.is_empty() {
-                first_dispatch = false;
+            // Update pending sets after recording the flag —
+            // metadata-only rows contribute nothing (no dispatch =
+            // no device-memory access to track).
+            if !metadata_only {
+                pending_writes.extend(sg_writes.iter().copied());
+                pending_reads.extend(sg_reads.iter().copied());
+                if let Some(l) = kv_w {
+                    pending_kv_writes.insert(l);
+                }
+                if let Some(l) = kv_r {
+                    pending_kv_reads.insert(l);
+                }
+                if !emits.is_empty() {
+                    first_dispatch = false;
+                }
             }
             // Rotary cos_sin cache is keyed off the *claim*, not a
             // weight ref — `RotaryLocal` is an `Extern` input on the
@@ -3753,6 +3953,16 @@ pub fn instruction_weight_count(inst: &Instruction) -> usize {
         I::AffineEmbed(..) => 1,
         // Single RmsNorm.
         I::RmsNorm(..) | I::FusedAddRmsNorm(..) => 1,
+        // ScalarWeightMul consumes its layer_scalar[layer] accessor
+        // (RmsNorm-kind [1] vector) through the same tape locator path.
+        I::ScalarWeightMul(..) => 1,
+        // NormAddScalarMul: post-FFN norm gains [hidden] + the
+        // layer_scalar [1] — both RmsNorm-kind, sub-slots 0/1.
+        I::NormAddScalarMul(..) => 2,
+        // RopeAppendNormed: q_norm + k_norm gains (RmsNorm-kind,
+        // sub-slots 0/1). CosSin is auto-injected by the rotary
+        // check, not counted here (mirrors FusedQkvQkNormRopeCache).
+        I::RopeAppendNormed(..) => 2,
         // Megakernels — same accessor inventory as their unfused
         // chains (RmsNorm + 3 LinearLayer / RmsNorm + 2 LinearLayer /
         // 2 LinearLayer). CosSin is auto-injected on top by the
@@ -3840,6 +4050,7 @@ pub fn instruction_consumes_rotary(inst: &Instruction) -> bool {
             | I::SlidingAttentionViaCache(..)
             | I::FlashInferAttentionDecode(..)
             | I::RopeAppend(..)
+            | I::RopeAppendNormed(..)
             | I::CutlassFusedQkvRopeCache(..)
             | I::CutlassFusedQkvRopePrefill(..)
             | I::MarlinFusedQkvRopeCache(..)

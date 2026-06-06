@@ -226,6 +226,13 @@ u32_newtype!(
     /// Number of `head_dim` positions touched by RoPE (`W::ROT_DIM`).
     /// Equal to `head_dim` for full RoPE, smaller for partial RoPE.
     RotDim,
+    /// Element-pairing offset for the RoPE rotation: lane `d <
+    /// rot_dim/2` rotates the `(d, d + pair_off)` pair. Standard NeoX
+    /// (full and HF-partial) pairs within the rot window (`pair_off =
+    /// rot_dim/2`); Gemma4's proportional rope pairs across the full
+    /// head's halves (`pair_off = head_dim/2` — mlx `ProportionalRoPE`
+    /// rotates the first rot_dim/2 lanes of EACH head half).
+    RopePairOff,
     /// Tokens per paged KV-cache block (`W::BLOCK_SIZE`).
     BlockSize,
     /// Reactive (chunked) KV pool granularity — paged blocks backed by
@@ -256,6 +263,11 @@ u32_newtype!(
 );
 
 i32_newtype!(
+    /// Sliding-window width in tokens (`W::SLIDING_WINDOW`) for the
+    /// `attention.metal` kernels' `ATTN_WINDOW [[function_constant(7)]]`.
+    /// `0` disables the window (full attention); declared as signed
+    /// `int` to match the MSL declaration.
+    AttnWindow,
     /// MLX-affine `[[function_constant]] constant int` packed-K size.
     /// Same semantic as `KDim`, but the qmv / qmm_t MLX-port shaders
     /// declare the constant as signed `int`.

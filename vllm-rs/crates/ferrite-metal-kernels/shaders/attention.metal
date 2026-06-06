@@ -47,6 +47,14 @@ constant uint  ATTN_MAX_BLOCKS_PER_SEQ [[function_constant(5)]];
 // `attention_prefill_sdpa_v2_paged_*` via `AttentionPrefillPagedConstants`.)
 constant uint  ATTN_BLOCKS_PER_CHUNK   [[function_constant(6)]];
 
+// Sliding-window attention (Gemma2/3/4 alternating layers). A query at
+// absolute position `q` attends to keys `k` with `0 <= q - k < window`
+// (self + window-1 prior — matches both mlx `create_causal_mask`
+// `linds < rinds + window_size` and HF's `(q-k) >= window` masking).
+// `0` disables the window entirely; the compiler folds the checks away
+// for non-sliding pipelines (full-attention models pass 0).
+constant int   ATTN_WINDOW             [[function_constant(7)]];
+
 // Cap on `seq_used_k[seq]` the shared-logits buffer can hold.
 // Each token uses 4 bytes; this cap × 4 == threadgroup memory bytes
 // dedicated to the partial-logits scratch. Smaller is better for
@@ -140,11 +148,12 @@ kernel void attention_via_cache_v2_f16_specialized(
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
+
     // Per-thread Q + accumulators (qk_per_thread should be a
     // compile-time constant; runtime division of head_dim/BD makes
     // this a runtime sized loop).
-    thread U q_reg[8];                  // qk_per_thread <= 8 (head_dim<=256)
-    thread U o_reg[8];
+    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512;
+    thread U o_reg[16];                 // Gemma4 global layers are 512)
 
     // Threadgroup scratch for per-simdgroup max + sum_exp combine.
     threadgroup U tg_outputs[BN * BD];
@@ -173,6 +182,15 @@ kernel void attention_via_cache_v2_f16_specialized(
     // simd_gid, simd_gid+BN, simd_gid+2*BN, ... The simdgroup that
     // overshoots `kv_len` skips its iteration and contributes 0.
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        // Sliding window: decode Q sits at absolute position kv_len-1;
+        // skip keys older than the window. Branch is simdgroup-uniform
+        // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
+        // Sliding window: decode Q sits at absolute position kv_len-1;
+        // skip keys older than the window. Branch is simdgroup-uniform
+        // (i derives from simd_gid) and folds away when ATTN_WINDOW=0.
+        if (ATTN_WINDOW > 0 && (int(kv_len) - 1 - int(i)) >= ATTN_WINDOW) {
+            continue;
+        }
         // Resolve paged cache pointer for token i in this simdgroup.
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
@@ -319,8 +337,8 @@ kernel void attention_via_cache_v2_bf16_specialized(
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[8];
-    thread U o_reg[8];
+    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512)
+    thread U o_reg[16];
 
     threadgroup U tg_outputs[BN * BD];
     threadgroup U tg_max[BN];
@@ -345,6 +363,10 @@ kernel void attention_via_cache_v2_bf16_specialized(
     // Online softmax over K axis. Each simdgroup `simd_gid` covers
     // tokens at indices simd_gid, simd_gid+BN, simd_gid+2*BN, ...
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
+        // Sliding window: see f16 sibling (decode Q at kv_len-1).
+        if (ATTN_WINDOW > 0 && (int(kv_len) - 1 - int(i)) >= ATTN_WINDOW) {
+            continue;
+        }
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
         const uint token_in_block = i - logical_block * block_size;
@@ -561,8 +583,8 @@ kernel void attention_prefill_sdpa_v2_paged_f16_specialized(
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[8];                  // qk_per_thread <= 8 (head_dim<=256)
-    thread U o_reg[8];
+    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512;
+    thread U o_reg[16];                 // Gemma4 global layers are 512)
 
     threadgroup U tg_outputs[BN * BD];
     threadgroup U tg_max[BN];
@@ -588,6 +610,10 @@ kernel void attention_prefill_sdpa_v2_paged_f16_specialized(
     // threadgroup-uniform).
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
         if (i > q_abs_pos) continue;
+        // Sliding window: attend iff q_abs_pos - i < window.
+        if (ATTN_WINDOW > 0 && int(q_abs_pos) - int(i) >= ATTN_WINDOW) {
+            continue;
+        }
 
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
@@ -739,8 +765,8 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
     const uint kv_head_stride = block_size * head_dim;
     const uint kv_tok_stride  = head_dim;
 
-    thread U q_reg[8];
-    thread U o_reg[8];
+    thread U q_reg[16];                 // qk_per_thread <= 16 (head_dim<=512)
+    thread U o_reg[16];
 
     threadgroup U tg_outputs[BN * BD];
     threadgroup U tg_max[BN];
@@ -760,6 +786,10 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
 
     for (uint i = simd_gid; i < kv_len; i += uint(BN)) {
         if (i > q_abs_pos) continue;
+        // Sliding window: attend iff q_abs_pos - i < window.
+        if (ATTN_WINDOW > 0 && int(q_abs_pos) - int(i) >= ATTN_WINDOW) {
+            continue;
+        }
 
         const uint logical_block = i / block_size;
         const uint physical_block = row_block_table[logical_block];
@@ -838,5 +868,449 @@ kernel void attention_prefill_sdpa_v2_paged_bf16_specialized(
         for (uint j = 0; j < qk_per_thread; ++j) {
             o_ptr[j] = bfloat(o_reg[j]);
         }
+    }
+}
+
+/// GQA-cooperative paged SDPA prefill (f16): one threadgroup per
+/// (kv_head, query); each simdgroup owns ONE q-head of the GQA group
+/// and K/V blocks are staged through threadgroup memory ONCE per
+/// query, shared by all `gqa = NUM_Q_HEADS / NUM_KV_HEADS` heads.
+///
+/// Motivation: `attention_prefill_sdpa_v2_paged_*` launches one TG
+/// per (q_head, query) — at high GQA every K/V byte is re-streamed
+/// from device `gqa` times. Gemma4's global layers (head_dim 512,
+/// 16:1 GQA) ran bandwidth-bound at ~350 ms/layer on T=2930 prefill;
+/// staging cuts device K/V traffic by `gqa`×.
+///
+/// Layout/semantics identical to the v2 kernel (same buffers, same
+/// fn-consts incl. ATTN_WINDOW, same causal shift). Differences:
+///   - grid = (NUM_KV_HEADS, total_q, 1); threads = (32*gqa, 1, 1)
+///     (lowering asserts 32*gqa <= 1024 i.e. gqa <= 32).
+///   - chunked online softmax per paged block (BLOCK_SIZE <= 16 keys
+///     per stage; one block_table lookup per stage).
+///   - no cross-simdgroup merge: each simdgroup covers the FULL key
+///     range for its head; lanes store their own dim slice.
+///
+/// Constraints (enforced by the lowering arm): HEAD_DIM % 32 == 0,
+/// HEAD_DIM <= 512, BLOCK_SIZE <= 16, 2 <= gqa <= 32.
+kernel void attention_prefill_sdpa_gqa_shared_f16_specialized(
+    device       half* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
+    device const half* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
+    device const uint* cu_seqlens_q [[buffer(2)]],   // [batch+1]
+    device const uint* seq_used_k   [[buffer(3)]],   // [batch]
+    device const uint* block_table  [[buffer(4)]],   // [batch, MAX_BLOCKS_PER_SEQ]
+    device const uint64_t* k_cache  [[buffer(5)]],   // chunk-address table
+    device const uint64_t* v_cache  [[buffer(6)]],   // chunk-address table
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / 32u;
+    const uint gqa         = num_q / num_kv;
+    const uint tg_threads  = gqa * 32u;
+
+    const uint kv_head_idx = tg_pos.x;            // 0..NUM_KV_HEADS
+    const uint global_q    = tg_pos.y;            // 0..total_q
+    const uint q_head_idx  = kv_head_idx * gqa + simd_gid;
+
+    // Staged K/V block: BLOCK_SIZE x HEAD_DIM elements, statically
+    // sized to the 16 x 512 maximum (16 KB at 2 B/elem).
+    threadgroup half kv_smem[16 * 512];
+
+    // Locate this Q token's sequence via cu_seqlens_q (same scan +
+    // sentinel as the v2 kernel).
+    uint seq_idx   = 0;
+    uint seq_start = 0;
+    uint seq_end   = 0;
+    bool in_range  = false;
+    for (uint b = 0; b < 1024u; ++b) {
+        const uint lo = cu_seqlens_q[b];
+        const uint hi = cu_seqlens_q[b + 1];
+        if (global_q >= lo && global_q < hi) {
+            seq_idx   = b;
+            seq_start = lo;
+            seq_end   = hi;
+            in_range  = true;
+            break;
+        }
+        if (hi <= lo) break;       // sentinel: end of batch
+    }
+    if (!in_range) {
+        // Padding lane: zero this TG's gqa output rows (each lane
+        // writes its own dim slice of its simdgroup's head).
+        device half* o_ptr =
+            output + (global_q * num_q + q_head_idx) * head_dim
+                   + simd_lid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) o_ptr[j] = half(0);
+        return;
+    }
+
+    const uint new_q_for_seq = seq_end - seq_start;
+    const uint q_pos_in_new  = global_q - seq_start;
+    const uint kv_len        = seq_used_k[seq_idx];
+    const uint q_abs_pos     = (kv_len - new_q_for_seq) + q_pos_in_new;
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+
+    thread U q_reg[16];                 // qk_per_thread <= 16
+    thread U o_reg[16];
+    thread U p_reg[16];                 // per-chunk probs (block_size <= 16)
+
+    device const half* q_row = q + (global_q * num_q + q_head_idx) * head_dim;
+    device       half* o_row = output + (global_q * num_q + q_head_idx) * head_dim;
+    device const uint* row_block_table = block_table + seq_idx * max_blocks;
+
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U run_max = -FLT_MAX;
+    U sum_exp = 0;
+
+    // Key range for THIS query: causal cap at q_abs_pos, window floor
+    // at q_abs_pos - window + 1. Blocks are processed stage-by-stage;
+    // all simdgroups walk the same stages (the staging is TG-wide) but
+    // skip invalid keys per-element. The block range uses the TG-wide
+    // bounds = this query's own bounds (one query per TG).
+    const uint last_key = min(kv_len - 1u, q_abs_pos);
+    uint first_key = 0;
+    if (ATTN_WINDOW > 0 && int(q_abs_pos) - ATTN_WINDOW + 1 > 0) {
+        first_key = uint(int(q_abs_pos) - ATTN_WINDOW + 1);
+    }
+    const uint blk_lo = first_key / block_size;
+    const uint blk_hi = last_key / block_size;          // inclusive
+
+    for (uint blk = blk_lo; blk <= blk_hi; ++blk) {
+        const uint base_key = blk * block_size;
+        const uint physical_block = row_block_table[blk];
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
+        const uint blk_elems = block_size * head_dim;
+
+        // ── Stage K block (TG-cooperative) ──────────────────────────
+        {
+            device const half* k_base =
+                (device const half*)k_cache[chunk]
+                + blk_in_chunk * kv_blk_stride
+                + kv_head_idx  * kv_head_stride;
+            for (uint idx = tid.x; idx < blk_elems; idx += tg_threads) {
+                kv_smem[idx] = k_base[idx];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Scores for this block's keys (per simdgroup) ────────────
+        U chunk_max = -FLT_MAX;
+        for (uint kk = 0; kk < block_size; ++kk) {
+            const uint key = base_key + kk;
+            const bool valid = key >= first_key && key <= last_key;
+            U score = -FLT_MAX;
+            if (valid) {
+                U partial = 0;
+                threadgroup const half* k_row =
+                    kv_smem + kk * head_dim + simd_lid * qk_per_thread;
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    partial += q_reg[j] * U(k_row[j]);
+                }
+                score = simd_sum(partial);
+                chunk_max = max(chunk_max, score);
+            }
+            p_reg[kk] = score;
+        }
+
+        // ── Chunked online-softmax update ───────────────────────────
+        if (chunk_max > -FLT_MAX) {
+            const U new_max = max(run_max, chunk_max);
+            const U factor = metal::fast::exp(run_max - new_max);
+            sum_exp *= factor;
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] *= factor;
+            }
+            for (uint kk = 0; kk < block_size; ++kk) {
+                if (p_reg[kk] > -FLT_MAX) {
+                    const U p = metal::fast::exp(p_reg[kk] - new_max);
+                    p_reg[kk] = p;
+                    sum_exp += p;
+                } else {
+                    p_reg[kk] = 0;
+                }
+            }
+            run_max = new_max;
+        } else {
+            for (uint kk = 0; kk < block_size; ++kk) p_reg[kk] = 0;
+        }
+
+        // ── Stage V block over the same smem ────────────────────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            device const half* v_base =
+                (device const half*)v_cache[chunk]
+                + blk_in_chunk * kv_blk_stride
+                + kv_head_idx  * kv_head_stride;
+            for (uint idx = tid.x; idx < blk_elems; idx += tg_threads) {
+                kv_smem[idx] = v_base[idx];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Accumulate O over this block's keys ─────────────────────
+        for (uint kk = 0; kk < block_size; ++kk) {
+            const U p = p_reg[kk];
+            if (p != 0) {
+                threadgroup const half* v_row =
+                    kv_smem + kk * head_dim + simd_lid * qk_per_thread;
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    o_reg[j] += p * U(v_row[j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Store: lanes own disjoint dim slices; normalize by sum ──────
+    device half* o_ptr = o_row + simd_lid * qk_per_thread;
+    const U inv = (sum_exp != 0) ? (U(1) / sum_exp) : U(0);
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        o_ptr[j] = half(o_reg[j] * inv);
+    }
+}
+
+/// GQA-cooperative paged SDPA prefill (bf16): one threadgroup per
+/// (kv_head, query); each simdgroup owns ONE q-head of the GQA group
+/// and K/V blocks are staged through threadgroup memory ONCE per
+/// query, shared by all `gqa = NUM_Q_HEADS / NUM_KV_HEADS` heads.
+///
+/// Motivation: `attention_prefill_sdpa_v2_paged_*` launches one TG
+/// per (q_head, query) — at high GQA every K/V byte is re-streamed
+/// from device `gqa` times. Gemma4's global layers (head_dim 512,
+/// 16:1 GQA) ran bandwidth-bound at ~350 ms/layer on T=2930 prefill;
+/// staging cuts device K/V traffic by `gqa`×.
+///
+/// Layout/semantics identical to the v2 kernel (same buffers, same
+/// fn-consts incl. ATTN_WINDOW, same causal shift). Differences:
+///   - grid = (NUM_KV_HEADS, total_q, 1); threads = (32*gqa, 1, 1)
+///     (lowering asserts 32*gqa <= 1024 i.e. gqa <= 32).
+///   - chunked online softmax per paged block (BLOCK_SIZE <= 16 keys
+///     per stage; one block_table lookup per stage).
+///   - no cross-simdgroup merge: each simdgroup covers the FULL key
+///     range for its head; lanes store their own dim slice.
+///
+/// Constraints (enforced by the lowering arm): HEAD_DIM % 32 == 0,
+/// HEAD_DIM <= 512, BLOCK_SIZE <= 16, 2 <= gqa <= 32.
+kernel void attention_prefill_sdpa_gqa_shared_bf16_specialized(
+    device       bfloat* output       [[buffer(0)]],   // [total_q, num_q_heads, head_dim]
+    device const bfloat* q            [[buffer(1)]],   // [total_q, num_q_heads, head_dim]
+    device const uint* cu_seqlens_q [[buffer(2)]],   // [batch+1]
+    device const uint* seq_used_k   [[buffer(3)]],   // [batch]
+    device const uint* block_table  [[buffer(4)]],   // [batch, MAX_BLOCKS_PER_SEQ]
+    device const uint64_t* k_cache  [[buffer(5)]],   // chunk-address table
+    device const uint64_t* v_cache  [[buffer(6)]],   // chunk-address table
+    uint3  tg_pos    [[threadgroup_position_in_grid]],
+    uint3  tid       [[thread_position_in_threadgroup]],
+    uint   simd_gid  [[simdgroup_index_in_threadgroup]],
+    uint   simd_lid  [[thread_index_in_simdgroup]])
+{
+    typedef float U;
+
+    const uint head_dim    = ATTN_HEAD_DIM;
+    const uint num_q       = ATTN_NUM_Q_HEADS;
+    const uint num_kv      = ATTN_NUM_KV_HEADS;
+    const uint block_size  = ATTN_BLOCK_SIZE;
+    const uint max_blocks  = ATTN_MAX_BLOCKS_PER_SEQ;
+    const float scale      = ATTN_SCALE_FC;
+    const uint qk_per_thread = head_dim / 32u;
+    const uint gqa         = num_q / num_kv;
+    const uint tg_threads  = gqa * 32u;
+
+    const uint kv_head_idx = tg_pos.x;            // 0..NUM_KV_HEADS
+    const uint global_q    = tg_pos.y;            // 0..total_q
+    const uint q_head_idx  = kv_head_idx * gqa + simd_gid;
+
+    // Staged K/V block: BLOCK_SIZE x HEAD_DIM elements, statically
+    // sized to the 16 x 512 maximum (16 KB at 2 B/elem).
+    threadgroup bfloat kv_smem[16 * 512];
+
+    // Locate this Q token's sequence via cu_seqlens_q (same scan +
+    // sentinel as the v2 kernel).
+    uint seq_idx   = 0;
+    uint seq_start = 0;
+    uint seq_end   = 0;
+    bool in_range  = false;
+    for (uint b = 0; b < 1024u; ++b) {
+        const uint lo = cu_seqlens_q[b];
+        const uint hi = cu_seqlens_q[b + 1];
+        if (global_q >= lo && global_q < hi) {
+            seq_idx   = b;
+            seq_start = lo;
+            seq_end   = hi;
+            in_range  = true;
+            break;
+        }
+        if (hi <= lo) break;       // sentinel: end of batch
+    }
+    if (!in_range) {
+        // Padding lane: zero this TG's gqa output rows (each lane
+        // writes its own dim slice of its simdgroup's head).
+        device bfloat* o_ptr =
+            output + (global_q * num_q + q_head_idx) * head_dim
+                   + simd_lid * qk_per_thread;
+        for (uint j = 0; j < qk_per_thread; ++j) o_ptr[j] = bfloat(0);
+        return;
+    }
+
+    const uint new_q_for_seq = seq_end - seq_start;
+    const uint q_pos_in_new  = global_q - seq_start;
+    const uint kv_len        = seq_used_k[seq_idx];
+    const uint q_abs_pos     = (kv_len - new_q_for_seq) + q_pos_in_new;
+
+    const uint kv_blk_stride  = num_kv * block_size * head_dim;
+    const uint kv_head_stride = block_size * head_dim;
+
+    thread U q_reg[16];                 // qk_per_thread <= 16
+    thread U o_reg[16];
+    thread U p_reg[16];                 // per-chunk probs (block_size <= 16)
+
+    device const bfloat* q_row = q + (global_q * num_q + q_head_idx) * head_dim;
+    device       bfloat* o_row = output + (global_q * num_q + q_head_idx) * head_dim;
+    device const uint* row_block_table = block_table + seq_idx * max_blocks;
+
+    for (uint i = 0; i < qk_per_thread; ++i) {
+        q_reg[i] = U(scale) * U(q_row[simd_lid * qk_per_thread + i]);
+        o_reg[i] = 0;
+    }
+
+    U run_max = -FLT_MAX;
+    U sum_exp = 0;
+
+    // Key range for THIS query: causal cap at q_abs_pos, window floor
+    // at q_abs_pos - window + 1. Blocks are processed stage-by-stage;
+    // all simdgroups walk the same stages (the staging is TG-wide) but
+    // skip invalid keys per-element. The block range uses the TG-wide
+    // bounds = this query's own bounds (one query per TG).
+    const uint last_key = min(kv_len - 1u, q_abs_pos);
+    uint first_key = 0;
+    if (ATTN_WINDOW > 0 && int(q_abs_pos) - ATTN_WINDOW + 1 > 0) {
+        first_key = uint(int(q_abs_pos) - ATTN_WINDOW + 1);
+    }
+    const uint blk_lo = first_key / block_size;
+    const uint blk_hi = last_key / block_size;          // inclusive
+
+    for (uint blk = blk_lo; blk <= blk_hi; ++blk) {
+        const uint base_key = blk * block_size;
+        const uint physical_block = row_block_table[blk];
+        uint chunk;
+        uint blk_in_chunk;
+        if (ATTN_BLOCKS_PER_CHUNK == 0u) {
+            chunk = 0u;
+            blk_in_chunk = physical_block;
+        } else {
+            chunk = physical_block / ATTN_BLOCKS_PER_CHUNK;
+            blk_in_chunk = physical_block % ATTN_BLOCKS_PER_CHUNK;
+        }
+        const uint blk_elems = block_size * head_dim;
+
+        // ── Stage K block (TG-cooperative) ──────────────────────────
+        {
+            device const bfloat* k_base =
+                (device const bfloat*)k_cache[chunk]
+                + blk_in_chunk * kv_blk_stride
+                + kv_head_idx  * kv_head_stride;
+            for (uint idx = tid.x; idx < blk_elems; idx += tg_threads) {
+                kv_smem[idx] = k_base[idx];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Scores for this block's keys (per simdgroup) ────────────
+        U chunk_max = -FLT_MAX;
+        for (uint kk = 0; kk < block_size; ++kk) {
+            const uint key = base_key + kk;
+            const bool valid = key >= first_key && key <= last_key;
+            U score = -FLT_MAX;
+            if (valid) {
+                U partial = 0;
+                threadgroup const bfloat* k_row =
+                    kv_smem + kk * head_dim + simd_lid * qk_per_thread;
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    partial += q_reg[j] * U(k_row[j]);
+                }
+                score = simd_sum(partial);
+                chunk_max = max(chunk_max, score);
+            }
+            p_reg[kk] = score;
+        }
+
+        // ── Chunked online-softmax update ───────────────────────────
+        if (chunk_max > -FLT_MAX) {
+            const U new_max = max(run_max, chunk_max);
+            const U factor = metal::fast::exp(run_max - new_max);
+            sum_exp *= factor;
+            for (uint j = 0; j < qk_per_thread; ++j) {
+                o_reg[j] *= factor;
+            }
+            for (uint kk = 0; kk < block_size; ++kk) {
+                if (p_reg[kk] > -FLT_MAX) {
+                    const U p = metal::fast::exp(p_reg[kk] - new_max);
+                    p_reg[kk] = p;
+                    sum_exp += p;
+                } else {
+                    p_reg[kk] = 0;
+                }
+            }
+            run_max = new_max;
+        } else {
+            for (uint kk = 0; kk < block_size; ++kk) p_reg[kk] = 0;
+        }
+
+        // ── Stage V block over the same smem ────────────────────────
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            device const bfloat* v_base =
+                (device const bfloat*)v_cache[chunk]
+                + blk_in_chunk * kv_blk_stride
+                + kv_head_idx  * kv_head_stride;
+            for (uint idx = tid.x; idx < blk_elems; idx += tg_threads) {
+                kv_smem[idx] = v_base[idx];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Accumulate O over this block's keys ─────────────────────
+        for (uint kk = 0; kk < block_size; ++kk) {
+            const U p = p_reg[kk];
+            if (p != 0) {
+                threadgroup const bfloat* v_row =
+                    kv_smem + kk * head_dim + simd_lid * qk_per_thread;
+                for (uint j = 0; j < qk_per_thread; ++j) {
+                    o_reg[j] += p * U(v_row[j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Store: lanes own disjoint dim slices; normalize by sum ──────
+    device bfloat* o_ptr = o_row + simd_lid * qk_per_thread;
+    const U inv = (sum_exp != 0) ? (U(1) / sum_exp) : U(0);
+    for (uint j = 0; j < qk_per_thread; ++j) {
+        o_ptr[j] = bfloat(o_reg[j] * inv);
     }
 }

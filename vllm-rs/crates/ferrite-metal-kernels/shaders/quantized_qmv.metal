@@ -1063,6 +1063,21 @@ INST_QMV_ALL(f16,  half,   bf16, bfloat, 32)
 INST_QMV_ALL(f16,  half,   bf16, bfloat, 64)
 INST_QMV_ALL(f16,  half,   bf16, bfloat, 128)
 
+// 8-bit instantiations (Gemma4 MLP projections: 8-bit g64). The qmv /
+// qdot template bodies are bits-generic (faithful MLX port — bits ∈
+// {2,3,4,5,6,8} branches); only the entry-point symbols were 4-bit
+// until now. bf16/bf16 = the Gemma4 production combo; f16/f16 kept
+// for unit tests. batch_0 only (the decode/prefill paths never use
+// the batched variants for the MLP).
+#define INST_QMV_ALL_B8(act_tag, act_type, scale_tag, scale_type, gs)                       \
+  INST_QMV_BATCHED(affine_qmv_fast, act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
+  INST_QMV_BATCHED(affine_qmv,      act_tag, act_type, scale_tag, scale_type, gs, 8, 0)     \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 64, 0) \
+  INST_QMV_QUAD(affine_qmv_quad,    act_tag, act_type, scale_tag, scale_type, gs, 8, 128,0)
+
+INST_QMV_ALL_B8(bf16, bfloat, bf16, bfloat, 64)
+INST_QMV_ALL_B8(f16,  half,   f16,  half,   64)
+
 // ─────────────────────────────────────────────────────────────────
 // nvfp4 CLEAN decode-matvec — FAITHFUL PORT of MLX `fp_qmv_impl`
 // (mlx/backend/metal/kernels/fp_quantized.h). NVFP4 is NOT bolted onto

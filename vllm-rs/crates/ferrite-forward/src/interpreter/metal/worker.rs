@@ -104,6 +104,29 @@ pub struct BoundBuffer {
     pub offset: u64,
 }
 
+/// Per-command dump metadata retained at bake time when
+/// `FERRITE_DUMP_DIR` is set. One entry per lowered command, in tape
+/// order — index i corresponds to the i-th flat dispatch slot the
+/// MTL4 run loop walks (all-`Icb` buckets emit exactly one dispatch
+/// per command, order-preserving), so the pool's activation-dump
+/// replay (`run_dump_pass`) can stop after command i and read its
+/// output arena slot before later commands recycle it.
+pub struct DumpCmd {
+    pub kernel: KernelId,
+    /// `(binding_index, arena_slot)` for every `Binding::ArenaSlot`
+    /// the command binds (offsets are always 0 — arena slots are
+    /// whole buffers). Which index is the output is kernel-specific;
+    /// the comparison script owns that mapping.
+    pub arena_slots: Vec<(u8, u32)>,
+    /// The command's runtime gate — a dump point whose gate doesn't
+    /// fire for the live `(num_tokens, num_seqs, has_spec)` holds
+    /// stale data and must be skipped.
+    pub gate: Option<super::lowered::RuntimeGate>,
+    /// The macro-emitted `barrier_before` flag — surfaced in the dump
+    /// manifest so hazard-analysis gaps are observable.
+    pub barrier: bool,
+}
+
 /// One bucket's baked artifacts: the execution plan and MTL4 steps.
 pub struct BucketBaking {
     pub bucket_m: u32,
@@ -111,6 +134,10 @@ pub struct BucketBaking {
     /// any step is a `Gemm` (MPS f16) or a kernel exceeds the 31-binding
     /// cap (such buckets have no MTL4 execution path).
     pub mtl4_steps: Option<Vec<super::mtl4::Mtl4Step>>,
+    /// Activation-dump sidecar (see [`DumpCmd`]). `Some` only when
+    /// `FERRITE_DUMP_DIR` was set at worker-bake time; `None` costs
+    /// nothing on the production path.
+    pub dump_cmds: Option<Vec<DumpCmd>>,
     /// Per-bucket inline-constants buffer. Backs every
     /// `Binding::Inline { value }` in this bucket's commands by packing
     /// all u32 values into one shared-storage MTLBuffer at consecutive
@@ -509,7 +536,33 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None)
+        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None, None)
+    }
+
+    /// Activation-dump replay segment: encode only the flat dispatch
+    /// indices in `range` (counting every dispatch slot in step order,
+    /// including runtime-gate-skipped ones, so indices stay aligned
+    /// with the lowered command order / the [`DumpCmd`] sidecar).
+    /// Used by the pool's `run_dump_pass` to re-run the tape in
+    /// segments with a host wait + arena readback between them.
+    pub fn run_bucket_mtl4_range(
+        &self,
+        bucket: usize,
+        num_tokens: u32,
+        num_seqs: u32,
+        has_spec_tokens: bool,
+        enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), WorkerError> {
+        self.run_bucket_mtl4_inner(
+            bucket,
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            enc,
+            None,
+            Some(range),
+        )
     }
 
     /// Variant with optional GPU-timestamp instrumentation.
@@ -538,9 +591,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             has_spec_tokens,
             enc,
             Some(timing),
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_bucket_mtl4_inner(
         &self,
         bucket: usize,
@@ -549,6 +604,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
         mut timing: Option<&super::pool::DispatchTimingState>,
+        range: Option<std::ops::Range<usize>>,
     ) -> Result<(), WorkerError> {
         use ::objc2_metal::{
             MTL4CommandEncoder, MTL4ComputeCommandEncoder as _, MTL4TimestampGranularity,
@@ -573,6 +629,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
         let count_barriers = std::env::var_os("FERRITE_METAL_COUNT_BARRIERS").is_some();
         let mut total_dispatches: usize = 0;
         let mut total_barriers: usize = 0;
+        // Flat dispatch index across all steps. Counts EVERY dispatch
+        // slot (including range-filtered and gate-skipped ones) so it
+        // stays aligned with the lowered command order — the contract
+        // the `DumpCmd` sidecar / `run_bucket_mtl4_range` rely on.
+        let mut flat_idx: usize = 0;
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -583,6 +644,23 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 .zip(step.m_scaling.iter())
                 .zip(step.runtime_gate.iter())
             {
+                let this_idx = flat_idx;
+                flat_idx += 1;
+                // In range mode: skip dispatches outside the segment,
+                // and suppress the barrier on the segment's FIRST
+                // dispatch — its predecessor ran in a previous command
+                // buffer (commit + host wait = stronger ordering), and
+                // a leading barrier on an empty encoder is something
+                // the production path never emits.
+                let mut need_barrier = *need_barrier;
+                if let Some(r) = &range {
+                    if !r.contains(&this_idx) {
+                        continue;
+                    }
+                    if this_idx == r.start {
+                        need_barrier = false;
+                    }
+                }
                 if !gate_matches(*gate, num_tokens, num_seqs, has_spec_tokens) {
                     // Skipped: the lm_head slice's gather/qmv/scatter
                     // (gated single-seq) doesn't fire for batched
@@ -595,11 +673,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 }
                 if count_barriers {
                     total_dispatches += 1;
-                    if *need_barrier {
+                    if need_barrier {
                         total_barriers += 1;
                     }
                 }
-                if *need_barrier {
+                if need_barrier {
                     // Default to `None` visibility — measured -30 ms
                     // TTFT @ 1024-tok / -89 ms @ 2048-tok on M4
                     // Llama-3.2-3B-4bit, coherent on the standard probes
@@ -1012,9 +1090,42 @@ fn bake_bucket<W: CanonicalParams>(
     }
 
     let mtl4_steps = super::mtl4::bake_mtl4_steps(&steps, &device);
+    // Activation-dump sidecar: retain per-command kernel id + arena
+    // bindings + runtime gate so the pool's dump replay can stop after
+    // any command and read its output slot. Flat dispatch index ==
+    // command index (one dispatch per command, order preserved through
+    // step coalescing). Gated on the same env var the pool's
+    // `run_dump_pass` reads; `None` on the production path.
+    let dump_cmds = if std::env::var_os("FERRITE_DUMP_DIR").is_some() {
+        Some(
+            tape.commands
+                .iter()
+                .enumerate()
+                .map(|(cmd_idx, cmd)| DumpCmd {
+                    kernel: cmd.kernel,
+                    arena_slots: cmd
+                        .bindings
+                        .iter()
+                        .filter_map(|b| match b {
+                            Binding::ArenaSlot {
+                                slot,
+                                binding_index,
+                            } => Some((*binding_index, *slot)),
+                            _ => None,
+                        })
+                        .collect(),
+                    gate: tape.runtime_gate.get(cmd_idx).copied().unwrap_or(None),
+                    barrier: tape.barrier_before.get(cmd_idx).copied().unwrap_or(true),
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
     Ok(BucketBaking {
         bucket_m: tape.bucket_m,
         mtl4_steps,
+        dump_cmds,
         moe_inline_buf,
     })
 }
@@ -1577,7 +1688,7 @@ fn resolve_bindings<W: CanonicalParams>(
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
 /// correct multi-row GEMM result.
-fn gate_matches(
+pub(super) fn gate_matches(
     gate: Option<super::lowered::RuntimeGate>,
     num_tokens: u32,
     num_seqs: u32,

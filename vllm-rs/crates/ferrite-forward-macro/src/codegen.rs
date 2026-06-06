@@ -74,7 +74,22 @@ fn safetensors_prefix(
         .iter()
         .map(|seg| translate_digit_suffix(seg))
         .collect();
-    let joined = segs.join(".");
+    let mut joined = segs.join(".");
+    // DSL-leaf → disk-leaf rename (Gemma4: `self_attn.q_proj_global`
+    // shares the on-disk leaf `self_attn.q_proj` with the sliding
+    // class at a different shape; the manifest needs distinct names,
+    // the checkpoint has one). Longest-suffix match on the dotted
+    // DSL path.
+    for (dsl_leaf, disk_leaf) in &program.weight_leaf_renames {
+        if joined == *dsl_leaf {
+            joined = disk_leaf.clone();
+            break;
+        }
+        if let Some(head) = joined.strip_suffix(&format!(".{dsl_leaf}")) {
+            joined = format!("{head}.{disk_leaf}");
+            break;
+        }
+    }
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     if is_vision {
         // Resolve the per-arch vision layout (defaults to today's
@@ -1364,7 +1379,9 @@ fn rms_norm_eps(model: &ModelParams) -> f32 {
 /// GDN gated RMSNorm uses its own kernel and is unaffected. Distinct
 /// from the GGUF-only `norm_weight_offset` (a load-time SUBTRACTION that
 /// un-bakes a converter's pre-applied constant). Default 0.0.
-fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
+// `pub(crate)`: also consulted by `MetalRopeAppendNormedImpl::applies_to`
+// (the synth norm prologue is only bit-correct for offset-0 models).
+pub(crate) fn norm_weight_runtime_offset(model: &ModelParams) -> f32 {
     // Read the parsed `bounds` table (booleans land there as 0/1, and
     // `apply_arch_semantic_defaults` inserts the flag for the
     // Qwen3.5/3.6 family whose verbatim HF configs never carry it)
@@ -3055,6 +3072,48 @@ fn emit_weights_struct(
         // 0.25 * 256 = 64); `None` ⇒ full rotary (rotary_dim == head_dim).
         let rotary_dim_metal: Option<usize> =
             partial.map(|f| (f * head_dim as f64).round() as usize);
+        // Gemma4 hybrid geometry: the `rotary` extern is the GLOBAL
+        // class's cache — "proportional" rope on global_head_dim (512)
+        // rotating global_partial_rotary_factor*512 = 128 dims with the
+        // freq exponent denominator = the FULL head_dim (mlx
+        // ProportionalRoPE). The sliding class keeps `rotary_local`
+        // (full rotary at the base head_dim). Keyed on the
+        // `global_partial_rotary_factor` scalar so no other arch routes
+        // here.
+        let global_proportional: Option<(usize, usize)> = model
+            .scalars
+            .get("global_partial_rotary_factor")
+            .copied()
+            .filter(|&f| (f - 1.0).abs() > 1e-9)
+            .map(|f| {
+                let g_hd = model
+                    .bounds
+                    .get("global_head_dim")
+                    .map(|&v| v as usize)
+                    .unwrap_or(head_dim);
+                let g_rd = (f * g_hd as f64).round() as usize;
+                (g_hd, g_rd)
+            });
+        if let Some((g_hd, g_rd)) = global_proportional {
+            assert!(
+                model.rope_scaling.is_none(),
+                "proportional global rope cannot combine with rope_scaling"
+            );
+            let g_hd_lit = proc_macro2::Literal::usize_unsuffixed(g_hd);
+            let g_rd_lit = proc_macro2::Literal::usize_unsuffixed(g_rd);
+            quote! {
+                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                let rotary =
+                    ::ferrite_kernels::rotary::RotaryCache::new_proportional_from_gpuweights(
+                        gw,
+                        #g_hd_lit,
+                        #g_rd_lit,
+                        rope_max_pos,
+                        #rope_theta,
+                        ::ferrite_cuda_core::dtype::DType::BF16,
+                    )?;
+            }
+        } else {
         match (rotary_dim_metal, scaling) {
             (None, None) => quote! {
                 let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
@@ -3165,6 +3224,7 @@ fn emit_weights_struct(
                     })();
             },
         }
+        } // else: !global_proportional
     } else {
         quote! {}
     };
@@ -5865,17 +5925,35 @@ fn emit_synthesized_kernel_sources_override(
     model: &ModelParams,
     tp_world_size: u8,
     has_linear_bias: bool,
+    mlp_uses_gelu: bool,
 ) -> TokenStream {
     use crate::quantization::QuantMethod;
-    let (bits, group_size) = match model.quantization.as_ref().map(|q| &q.method) {
+    let (bits, group_size, mlp_bits) = match model.quantization.as_ref().map(|q| &q.method) {
         Some(QuantMethod::Affine {
-            bits, group_size, ..
-        }) => (*bits, *group_size),
+            bits,
+            group_size,
+            bits_overrides,
+            ..
+        }) => {
+            // MLP projection width: the preset's bits_overrides carry
+            // per-suffix widths (Gemma4: mlp.{gate,up,down}_proj → 8).
+            let mlp_bits = bits_overrides
+                .iter()
+                .find(|(path, _)| path.contains("mlp."))
+                .map(|(_, b)| *b)
+                .unwrap_or(*bits);
+            (*bits, *group_size, mlp_bits)
+        }
         _ => return quote! {},
     };
     if bits != 4 {
         return quote! {};
     }
+    let mlp_act = if mlp_uses_gelu {
+        ::ferrite_fusion_synth::atom_lib::MlpAct::Gelu
+    } else {
+        ::ferrite_fusion_synth::atom_lib::MlpAct::Silu
+    };
     // bf16 activation is the default for every modern Llama / Qwen /
     // Mistral / Gemma metal arch (per CanonicalParams::METAL_DTYPE).
     // Future: thread W::METAL_DTYPE through and emit per-dtype variants.
@@ -5890,8 +5968,8 @@ fn emit_synthesized_kernel_sources_override(
     // Qwen3-Next, dense + MoE + the VL-wrapped `Qwen3_5ForConditional
     // Generation` text decoders) ships BF16 scales+biases. Match by
     // family prefix so new members are covered automatically.
-    let is_qwen3 = model.architectures.iter().any(|a| a.starts_with("Qwen3"));
-    let t_scale = if is_qwen3 { "bfloat" } else { "half" };
+    let is_bf16_scale = crate::quantization::is_bf16_scale_arch(model);
+    let t_scale = if is_bf16_scale { "bfloat" } else { "half" };
 
     // Model dims baked as MSL `constant constexpr` literals at synth
     // time. Same TP-sharding rules as `emit_canonical_params_impl`:
@@ -5962,6 +6040,8 @@ fn emit_synthesized_kernel_sources_override(
         t_act,
         t_scale,
         &consts,
+        mlp_act,
+        mlp_bits,
     );
     // AOT-compile each synth source to a `.metallib` blob at macro
     // expansion time. Same `xcrun metal -c` + `xcrun metallib`
@@ -6022,6 +6102,36 @@ fn emit_synthesized_kernel_sources_override(
 /// first hit. Drives the biased variant of the synth pre-attn
 /// megakernel — Qwen2/Qwen2.5 DSL emits `bias_add` on QKV, Llama
 /// does not.
+/// True when the DSL's MLP uses a tanh-GELU gate (`gelu(gemm(...)) *
+/// up`) — Gemma-family GeGLU. Drives the gelu variant of the synth MLP
+/// megakernel (`synth_mlp_pre_down_gelu_*`).
+pub fn program_has_gelu(program: &Program) -> bool {
+    fn scan_stmt(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Assign { value, .. } | Stmt::AssignTuple { value, .. } => scan_expr(value),
+            Stmt::For { body, .. } => body.iter().any(scan_stmt),
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => then_body.iter().any(scan_stmt) || else_body.iter().any(scan_stmt),
+        }
+    }
+    fn scan_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Call { op, args } => matches!(op, OpKind::Gelu) || args.iter().any(scan_expr),
+            Expr::Add { lhs, rhs } | Expr::Mul { lhs, rhs } => scan_expr(lhs) || scan_expr(rhs),
+            Expr::Local(_)
+            | Expr::Extern { .. }
+            | Expr::Weight { .. }
+            | Expr::ScalarLit(_)
+            | Expr::SqrtBound(_)
+            | Expr::ConfigScalar { .. } => false,
+        }
+    }
+    program.statements.iter().any(scan_stmt)
+}
+
 pub fn program_has_bias_add(program: &Program) -> bool {
     fn scan_stmt(stmt: &Stmt) -> bool {
         match stmt {
@@ -6053,6 +6163,7 @@ fn emit_canonical_params_impl(
     model: &ModelParams,
     tp_world_size: u8,
     has_bias_add: bool,
+    has_gelu_mlp: bool,
 ) -> TokenStream {
     let tp = tp_world_size as u32;
     let tp_us = tp_world_size as usize;
@@ -6225,6 +6336,90 @@ fn emit_canonical_params_impl(
         .map(|f| (f * head_dim as f64).round() as u32)
         .unwrap_or(head_dim);
     let rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(rot_dim_val);
+    // Per-layer-class geometry for hybrid sliding/global arches whose
+    // classes differ in dims (Gemma4: sliding 256×8kv full-rope vs
+    // global 512×1kv proportional-rope-128). Config keys
+    // `global_head_dim` / `num_global_key_value_heads` /
+    // `global_partial_rotary_factor` feed the GLOBAL_* consts read by
+    // the full-attention metal lowering arms; absent keys fall back to
+    // the base values (uniform models unchanged).
+    let global_head_dim: u32 = model
+        .bounds
+        .get("global_head_dim")
+        .map(|&v| v as u32)
+        .unwrap_or(head_dim);
+    let num_global_kv_heads: u32 = model
+        .bounds
+        .get("num_global_key_value_heads")
+        .map(|&v| (v as u32) / tp)
+        .unwrap_or(num_kv_heads);
+    let global_rot_dim: u32 = model
+        .scalars
+        .get("global_partial_rotary_factor")
+        .copied()
+        .filter(|&f| (f - 1.0).abs() > 1e-9)
+        .map(|f| (f * global_head_dim as f64).round() as u32)
+        // Fallback must honor the BASE partial factor on uniform
+        // models (global_head_dim == head_dim): Qwen3.5's full-
+        // attention layers lower through the is_global arm, and the
+        // old `global_head_dim` fallback rotated the FULL 256-dim
+        // head against the 64-wide partial cos/sin table — rows past
+        // the table read zeros and zeroed Q/K for every token beyond
+        // ~4 (the "rambling, input-blind thinker" failure). Hybrid
+        // arches with distinct global dims and genuinely full global
+        // rope (no factor) keep the old fallback.
+        .unwrap_or(if global_head_dim == head_dim {
+            rot_dim_val
+        } else {
+            global_head_dim
+        });
+    // GUARD (feedback_guard_per_bugfix): the rope cos/sin table is
+    // rotary_dim wide; a kernel-side rot const that disagrees reads
+    // past the table into zeros and silently zeroes Q/K for every
+    // token whose row falls outside it (the Qwen3.5 "input-blind
+    // rambling thinker" regression). On uniform-geometry models the
+    // global lowering arm serves the same heads as the base arm, so
+    // the two rot consts MUST agree — enforced at expansion time.
+    assert!(
+        global_head_dim != head_dim || global_rot_dim == rot_dim_val,
+        "model `{}`: GLOBAL_ROT_DIM {} != ROT_DIM {} on uniform geometry          (head_dim {}) — the is_global rope arm would rotate against a          mismatched cos/sin table width",
+        model.source_stem,
+        global_rot_dim,
+        rot_dim_val,
+        head_dim,
+    );
+    let global_q_size: usize = (num_q_heads as usize) * (global_head_dim as usize);
+    let global_head_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_head_dim);
+    let num_global_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_global_kv_heads);
+    let global_rot_dim_lit = proc_macro2::Literal::u32_unsuffixed(global_rot_dim);
+    let global_q_size_lit = proc_macro2::Literal::usize_unsuffixed(global_q_size);
+    // Proportional rope marker — same predicate that routes the
+    // rotary cache builder to `new_proportional_from_gpuweights`.
+    // Drives the metal rope kernel's pairing offset (lane i pairs
+    // with i + head_dim/2, not i + rot_dim/2).
+    let rope_proportional = global_rot_dim != global_head_dim
+        && model
+            .scalars
+            .get("global_partial_rotary_factor")
+            .is_some();
+    let rope_proportional_tokens: proc_macro2::TokenStream = if rope_proportional {
+        quote! { const ROPE_PROPORTIONAL: bool = true; }
+    } else {
+        quote! {}
+    };
+    // MAX_BLOCKS_PER_SEQ override — block-table row stride. The trait
+    // default (128 ≈ 2k tokens at block_size 16) silently truncates
+    // long-context serving; long-context arches set the explicit
+    // `max_blocks_per_seq` config key (Gemma4 bring-up: 2048 = 32k).
+    // Emitted conditionally so every existing arch keeps the default.
+    let max_blocks_override: proc_macro2::TokenStream = match model.bounds.get("max_blocks_per_seq")
+    {
+        Some(&v) => {
+            let lit = proc_macro2::Literal::u32_unsuffixed(v as u32);
+            quote! { const MAX_BLOCKS_PER_SEQ: u32 = #lit; }
+        }
+        None => quote! {},
+    };
     let attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(attn_scale);
     let attn_softcap_lit = proc_macro2::Literal::f32_unsuffixed(attn_softcap);
     let sliding_window_lit = proc_macro2::Literal::i32_unsuffixed(sliding_window);
@@ -6290,8 +6485,12 @@ fn emit_canonical_params_impl(
     // lowering arm's `kernel_symbol` matches the registered library.
     // Mismatch surfaces at worker init as
     // `PipelineLookup(no library …_bias in SpecializedPipelineCache)`.
-    let synth_sources_override =
-        emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add);
+    let synth_sources_override = emit_synthesized_kernel_sources_override(
+        model,
+        tp_world_size,
+        has_bias_add,
+        has_gelu_mlp,
+    );
 
     // SCALE_DTYPE override — only matters under `--features metal`.
     // mlx-community 4bit convention (probed across cached HF snapshots):
@@ -6306,7 +6505,7 @@ fn emit_canonical_params_impl(
         // Qwen3.5 / Qwen3.6 / Qwen3-Next, incl. the VL-wrapped
         // `Qwen3_5ForConditionalGeneration` text decoders). Must stay in
         // sync with the synth-kernel `t_scale` gate above.
-        let is_qwen3 = model.architectures.iter().any(|a| a.starts_with("Qwen3"));
+        let is_bf16_scale = crate::quantization::is_bf16_scale_arch(model);
         // NVFP4 (NVIDIA ModelOpt) checkpoints ship BF16 RMSNorm gains
         // (and BF16 embed/lm_head), unlike the mlx-community 4bit Llama
         // convention of F16. `SCALE_DTYPE` selects the rmsnorm /
@@ -6319,7 +6518,7 @@ fn emit_canonical_params_impl(
             model.quantization.as_ref().map(|qc| &qc.method),
             Some(crate::quantization::QuantMethod::Nvfp4 { .. })
         );
-        if is_qwen3 || is_nvfp4 {
+        if is_bf16_scale || is_nvfp4 {
             quote! {
                 #[cfg(feature = "metal")]
                 const SCALE_DTYPE:
@@ -6367,6 +6566,12 @@ fn emit_canonical_params_impl(
             const NORM_WEIGHT_OFFSET: f32 = #norm_weight_offset_lit;
             const RMS_NORM_EPS: f32 = #rms_norm_eps_lit;
             const ROT_DIM: u32 = #rot_dim_lit;
+            const GLOBAL_HEAD_DIM: u32 = #global_head_dim_lit;
+            const NUM_GLOBAL_KV_HEADS: u32 = #num_global_kv_heads_lit;
+            const GLOBAL_ROT_DIM: u32 = #global_rot_dim_lit;
+            const GLOBAL_Q_SIZE: usize = #global_q_size_lit;
+            #rope_proportional_tokens
+            #max_blocks_override
             const VISION_NUM_HEADS: u32 = #vision_num_heads_lit;
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
             const VISION_Q_SIZE: usize = #vision_q_size_lit;
@@ -6430,6 +6635,79 @@ pub fn emit_gdn_runtime_config_arm_body(
                 linear_layers: ::std::vec![ #(#bits),* ],
             },
         )
+    })
+}
+
+/// Emit the body for the per-arch `FerriteWeights::per_layer_kv_token_elems`
+/// override — `Some(vec![kv_heads_i * head_dim_i; num_layers])` for
+/// hybrid-attention-geometry arches whose sliding and global classes
+/// differ in dims (Gemma4: sliding 8×256, global 1×512).
+///
+/// The per-layer class mask is read straight off the unrolled FUF: every
+/// `OpKind::SlidingAttention` tile carries its layer as the KvCache
+/// extern index, so the mask is exactly the per-layer dispatch the
+/// `#[forward]` `if` resolved at unroll time (IR-driven, not re-derived).
+/// Returns `None` (trait default, uniform pool) when the body has no
+/// sliding tiles OR when both classes share the same dims (Gemma2/3).
+pub fn emit_per_layer_kv_token_elems_arm_body(
+    fuf: &Fuf,
+    model: &ModelParams,
+) -> Option<proc_macro2::TokenStream> {
+    let num_hidden_layers = match model.bounds.get("num_hidden_layers") {
+        Some(&n) => n as usize,
+        None => return None,
+    };
+    let mut sliding = vec![false; num_hidden_layers];
+    let mut has_sliding = false;
+    for node in &fuf.nodes {
+        if node.op != OpKind::SlidingAttention {
+            continue;
+        }
+        has_sliding = true;
+        for inp in &node.inputs {
+            if let FufInput::Extern {
+                kind: crate::classified::ExternKind::KvCache,
+                index: Some(l),
+            } = inp
+            {
+                let l = *l as usize;
+                if l < num_hidden_layers {
+                    sliding[l] = true;
+                }
+            }
+        }
+    }
+    if !has_sliding {
+        return None;
+    }
+    let head_dim = *model.bounds.get("head_dim").unwrap_or(&0) as usize;
+    let num_kv = *model.bounds.get("num_key_value_heads").unwrap_or(&0) as usize;
+    let g_hd = model
+        .bounds
+        .get("global_head_dim")
+        .map(|&v| v as usize)
+        .unwrap_or(head_dim);
+    let g_kv = model
+        .bounds
+        .get("num_global_key_value_heads")
+        .map(|&v| v as usize)
+        .unwrap_or(num_kv);
+    if g_hd == head_dim && g_kv == num_kv {
+        // Sliding/global classes share dims (Gemma2/3) — uniform pool.
+        return None;
+    }
+    let elems = sliding
+        .iter()
+        .map(|&is_sliding| {
+            if is_sliding {
+                num_kv * head_dim
+            } else {
+                g_kv * g_hd
+            }
+        })
+        .map(proc_macro2::Literal::usize_unsuffixed);
+    Some(quote! {
+        ::core::option::Option::Some(::std::vec![ #(#elems),* ])
     })
 }
 
@@ -6813,7 +7091,12 @@ pub fn emit_model(
     // `::ferrite_forward::Instruction::<Weights>::Variant(…)` over
     // 3-4 lines per row).
     let has_bias_add = program_has_bias_add(program);
-    let canonical_params_impl = emit_canonical_params_impl(model, tp_world_size, has_bias_add);
+    let canonical_params_impl = emit_canonical_params_impl(
+        model,
+        tp_world_size,
+        has_bias_add,
+        program_has_gelu(program),
+    );
     let weight_accessors_impl =
         emit_weight_accessors_impl(&canonical_lowered, model.source_stem.as_str());
     // Per-canonical: alias the generic `Instruction<Weights>` for
@@ -8484,6 +8767,7 @@ mod tests {
             rope_scaling_hash: None,
             mrope_section: None,
             vision_layout: None,
+            weight_leaf_renames: Vec::new(),
             vision_d_model_fingerprint: None,
             vision_patch_embed_flatten: None,
             vision_pos_embed_key: None,
@@ -9207,6 +9491,7 @@ mod fingerprint_tests {
             prelude: crate::classified::Prelude::Decoder,
             vision_layout: None,
             decoder_safetensors_prefix: None,
+            weight_leaf_renames: Vec::new(),
         }
     }
 

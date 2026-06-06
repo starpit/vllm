@@ -254,6 +254,13 @@ pub enum QuantMethod {
         bits: u32,
         group_size: u32,
         quantize_embed: bool,
+        /// Per-weight-path bit-width overrides keyed by dotted-path
+        /// SUFFIX (e.g. `"mlp.gate_proj"` → 8). Sorted for determinism.
+        /// Gemma4-12B ships its MLP projections at 8-bit g64 while the
+        /// attention projections + embed stay 4-bit; encoded in the
+        /// `mlx-affine-b4-g64-mlp8` preset's `bits_overrides` map.
+        /// Empty for every uniform-bits checkpoint.
+        bits_overrides: Vec<(String, u32)>,
     },
     /// NVIDIA ModelOpt NVFP4. Detected via `quant_method: "modelopt"`
     /// (or no `quant_method` in a standalone `hf_quant_config.json`)
@@ -415,7 +422,7 @@ fn parse_affine_no_method(
     if bits != 4 {
         return Err(ParseError::BadField {
             field: "bits",
-            reason: "MLX-affine ferrite path only handles 4-bit today",
+            reason: "MLX-affine ferrite path only handles a 4-bit default today",
         });
     }
     if !matches!(group_size, 32 | 64 | 128) {
@@ -423,6 +430,31 @@ fn parse_affine_no_method(
             field: "group_size",
             reason: "MLX-affine supports group_size ∈ {32, 64, 128}",
         });
+    }
+    // Optional per-path-suffix bit-width overrides (preset-owned shape,
+    // `bits_overrides: { "mlp.gate_proj": 8, ... }`). Gemma4-12B ships
+    // 8-bit MLP projections alongside the 4-bit default; only 8 is a
+    // valid override width (4 would be a pointless no-op entry).
+    let mut bits_overrides: Vec<(String, u32)> = Vec::new();
+    if let Some(ov) = obj.get("bits_overrides") {
+        let map = ov.as_object().ok_or(ParseError::BadField {
+            field: "bits_overrides",
+            reason: "must be an object of path-suffix -> bits",
+        })?;
+        for (k, v) in map {
+            let b = v.as_u64().ok_or(ParseError::BadField {
+                field: "bits_overrides",
+                reason: "override bits must be a u64",
+            })? as u32;
+            if b != 8 {
+                return Err(ParseError::BadField {
+                    field: "bits_overrides",
+                    reason: "MLX-affine override bits must be 8",
+                });
+            }
+            bits_overrides.push((k.clone(), b));
+        }
+        bits_overrides.sort();
     }
     // Optional discriminator emitted by the
     // `mlx-affine-b<bits>-g<gs>-qembed` preset. Default false — the
@@ -436,6 +468,7 @@ fn parse_affine_no_method(
         bits,
         group_size,
         quantize_embed,
+        bits_overrides,
     })
 }
 
@@ -853,6 +886,23 @@ fn parse_fp8(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
 ///
 /// Otherwise the method's parameters (bits/group_size/…) are carried
 /// through into `StorageFormat::Awq{..}` or `StorageFormat::Gptq{..}`.
+/// Arch families whose mlx-community quantized checkpoints ship BF16
+/// scales/biases AND BF16 RMSNorm gains (vs the Llama/Qwen2.5 F16
+/// convention): the whole Qwen3.x family and Gemma4 (`torch_dtype:
+/// bfloat16` conversions — verified on gemma-4-12B-it-4bit safetensors
+/// headers: every `.scales`/`.biases`/norm gain is BF16).
+///
+/// Single source of truth for the THREE consumers that must agree —
+/// codegen's `SCALE_DTYPE` const, the synth-kernel `t_scale` tag, and
+/// the synth Impl's `applies_to` gate. Divergence = `_s_half_` symbol
+/// reading BF16 bytes = garbage output.
+pub fn is_bf16_scale_arch(model: &crate::config::ModelParams) -> bool {
+    model
+        .architectures
+        .iter()
+        .any(|a| a.starts_with("Qwen3") || a.starts_with("Gemma4"))
+}
+
 pub fn storage_format_for_weight(
     program: &Program,
     fuf: &Fuf,
@@ -938,6 +988,7 @@ pub fn storage_format_for_weight(
             bits,
             group_size,
             quantize_embed,
+            ..
         } = qc.method
     {
         return if quantize_embed {
@@ -1071,7 +1122,21 @@ pub fn storage_format_for_weight(
             bits,
             group_size,
             quantize_embed: _,
-        } => StorageFormat::Affine { bits, group_size },
+            ref bits_overrides,
+        } => {
+            // Per-path bit-width override (Gemma4: 8-bit MLP projections).
+            // Matched on dotted-path suffix; WeightIds are layer-agnostic
+            // so `mlp.gate_proj` covers every layer.
+            let eff_bits = bits_overrides
+                .iter()
+                .find(|(suffix, _)| dotted.ends_with(suffix.as_str()))
+                .map(|&(_, b)| b)
+                .unwrap_or(bits);
+            StorageFormat::Affine {
+                bits: eff_bits,
+                group_size,
+            }
+        }
         QuantMethod::Nvfp4 { group_size } => StorageFormat::Nvfp4 { group_size },
     }
 }
@@ -1088,6 +1153,59 @@ mod tests {
     fn absent_config_returns_none() {
         let v = json(r#"{"hidden_size": 2048}"#);
         assert!(QuantizationConfig::parse(&v).unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_affine_bits_overrides() {
+        // The `mlx-affine-b4-g64-mlp8` preset shape (Gemma4-12B:
+        // 8-bit MLP projections over a 4-bit default).
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "bits_overrides": {
+                        "mlp.gate_proj": 8,
+                        "mlp.up_proj": 8,
+                        "mlp.down_proj": 8
+                    }
+                }
+            }"#,
+        );
+        let qc = QuantizationConfig::parse(&v).unwrap().expect("some");
+        let QuantMethod::Affine {
+            bits,
+            group_size,
+            ref bits_overrides,
+            ..
+        } = qc.method
+        else {
+            panic!("expected Affine, got {:?}", qc.method);
+        };
+        assert_eq!(bits, 4);
+        assert_eq!(group_size, 64);
+        assert_eq!(
+            bits_overrides.as_slice(),
+            &[
+                ("mlp.down_proj".to_string(), 8),
+                ("mlp.gate_proj".to_string(), 8),
+                ("mlp.up_proj".to_string(), 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn affine_bits_overrides_rejects_non_8() {
+        let v = json(
+            r#"{
+                "quantization_config": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "bits_overrides": { "mlp.gate_proj": 6 }
+                }
+            }"#,
+        );
+        assert!(QuantizationConfig::parse(&v).is_err());
     }
 
     #[test]

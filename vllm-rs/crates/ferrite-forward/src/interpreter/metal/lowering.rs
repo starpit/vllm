@@ -170,49 +170,93 @@ pub fn lower_pair<W: CanonicalParams>(
         std::env::var("FERRITE_METAL_LMHEAD_SLICE").ok().as_deref(),
         Some("0") | Some("off") | Some("false"),
     );
-    let slice_info =
-        if !slice_disabled && bucket_m > 1 && lm_head.len() == 1 && lh.commands.len() == 1 {
-            if let Instruction::AffineQmm(
-                in_slot,
-                out_slot,
-                layer,
-                n,
-                k,
-                group_size,
-                bits,
-                _vector_limit,
-            ) = &lm_head[0]
+    // The slice also tolerates a TRAILING `TanhSoftCap` (Gemma2/4
+    // final logit softcapping): `lm_head = [AffineQmm, TanhSoftCap]`
+    // lowers to gather → qmv → narrow softcap → scatter. Without this,
+    // the softcap's presence forced the FULL `M = bucket_m × vocab`
+    // lm_head GEMM at every prefill chunk — ~0.75 s of the Gemma4-12B
+    // T=2930 prefill was the discarded lm_head rows.
+    let qmm_cmd_ok = |idx: usize| {
+        matches!(
+            lh.commands.get(idx).map(|c| c.kernel),
+            Some(KernelId::AffineQmmT | KernelId::AffineQmmTNax)
+        )
+    };
+    let slice_info = if !slice_disabled && bucket_m > 1 {
+        match (lm_head, lh.commands.len()) {
+            // Plain lm_head (Llama / Qwen / Mistral).
+            (
+                [Instruction::AffineQmm(
+                    in_slot,
+                    out_slot,
+                    layer,
+                    n,
+                    k,
+                    group_size,
+                    bits,
+                    _vector_limit,
+                )],
+                1,
+            ) if qmm_cmd_ok(0) => Some(LmHeadSliceInfo {
+                in_slot: *in_slot,
+                out_slot: *out_slot,
+                layer: *layer,
+                // The lm_head AffineQmm is the FIRST instruction in
+                // the lm_head slice, so its op_idx is 0 inside the
+                // lm_head tape.
+                locator: WeightLocator {
+                    bucket: lm_head_tape_index,
+                    op_idx: 0,
+                    slot: 0,
+                },
+                n: *n,
+                k: *k,
+                group_size: *group_size,
+                bits: *bits,
+                softcap_out_slot: None,
+            }),
+            // lm_head + final softcap (Gemma2/4). The softcap must
+            // consume the qmm's output slot.
+            (
+                [Instruction::AffineQmm(
+                    in_slot,
+                    out_slot,
+                    layer,
+                    n,
+                    k,
+                    group_size,
+                    bits,
+                    _vector_limit,
+                ), Instruction::TanhSoftCap(sc_in, sc_out)],
+                2,
+            ) if qmm_cmd_ok(0)
+                && matches!(
+                    lh.commands.get(1).map(|c| c.kernel),
+                    Some(KernelId::TanhSoftCap)
+                )
+                && sc_in == out_slot =>
             {
-                if matches!(
-                    lh.commands[0].kernel,
-                    KernelId::AffineQmmT | KernelId::AffineQmmTNax
-                ) {
-                    Some(LmHeadSliceInfo {
-                        in_slot: *in_slot,
-                        out_slot: *out_slot,
-                        layer: *layer,
-                        // The lm_head AffineQmm is the LAST instruction in
-                        // the lm_head slice (lm_head.len() == 1 here), so
-                        // its op_idx is 0 inside the lm_head tape.
-                        locator: WeightLocator {
-                            bucket: lm_head_tape_index,
-                            op_idx: 0,
-                            slot: 0,
-                        },
-                        n: *n,
-                        k: *k,
-                        group_size: *group_size,
-                        bits: *bits,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
+                Some(LmHeadSliceInfo {
+                    in_slot: *in_slot,
+                    out_slot: *out_slot,
+                    layer: *layer,
+                    locator: WeightLocator {
+                        bucket: lm_head_tape_index,
+                        op_idx: 0,
+                        slot: 0,
+                    },
+                    n: *n,
+                    k: *k,
+                    group_size: *group_size,
+                    bits: *bits,
+                    softcap_out_slot: Some(*sc_out),
+                })
             }
-        } else {
-            None
-        };
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     use crate::interpreter::metal::lowered::RuntimeGate;
     if let Some(info) = slice_info {
@@ -233,8 +277,25 @@ pub fn lower_pair<W: CanonicalParams>(
         commands.push(lm_head_qmv_command::<W>(&info, profile, bucket_m));
         barrier_before.push(*lh.barrier_before.first().unwrap_or(&true));
         runtime_gate.push(Some(RuntimeGate::OnlyIfNoSpec));
+        // Trailing softcap (Gemma2/4): cap the narrow qmv output
+        // before the scatter so the scattered sample rows carry
+        // CAPPED logits (a partial/absent cap is not argmax-invariant
+        // against fully-capped reference values, and sampling reads
+        // these magnitudes). Dispatch covers rows 0..num_tokens —
+        // rows past num_sample_rows hold stale data whose capping is
+        // harmless (the scatter only copies rows 0..num_sample_rows).
+        if let Some(sc_out) = info.softcap_out_slot {
+            commands.push(lm_head_softcap_command::<W>(
+                info.out_slot,
+                sc_out,
+                info.n,
+                bucket_m,
+            ));
+            barrier_before.push(true);
+            runtime_gate.push(Some(RuntimeGate::OnlyIfNoSpec));
+        }
         commands.push(scatter_first_to_last_row_command::<W>(
-            info.out_slot,
+            info.softcap_out_slot.unwrap_or(info.out_slot),
             info.n,
             bucket_m,
         ));
@@ -291,6 +352,11 @@ struct LmHeadSliceInfo {
     k: u32,
     group_size: u32,
     bits: u32,
+    /// `Some(out_slot)` when the lm_head slice carries a trailing
+    /// `TanhSoftCap` (Gemma2/4 final logit softcapping) — the narrow
+    /// chain inserts a softcap between the qmv and the scatter, and
+    /// the scatter reads/writes the softcap's output slot.
+    softcap_out_slot: Option<u32>,
 }
 
 /// Lower the lm_head AffineQmm through a qmv matvec kernel
@@ -364,6 +430,56 @@ fn lm_head_qmv_command<W: CanonicalParams>(
             super::ids::LayerId(info.layer),
             info.locator,
         ),
+        gemm_dims: None,
+    }
+}
+
+/// Narrow softcap for the lm_head slice: `out = cap * tanh(in / cap)`
+/// over rows 0..num_tokens of the narrow qmv output (X-proportional
+/// scaling — same shape math as the full `I::TanhSoftCap` arm, but
+/// over the slice's `[rows, vocab]` region instead of the full-M
+/// logits buffer). Rows past `num_sample_rows` are stale and their
+/// capping is harmless; the scatter copies only the sample rows.
+fn lm_head_softcap_command<W: CanonicalParams>(
+    in_slot: u32,
+    out_slot: u32,
+    vocab_size: u32,
+    bucket_m: u32,
+) -> LoweredCommand {
+    debug_assert!(
+        W::FINAL_LOGIT_SOFTCAPPING > 0.0,
+        "lm_head_softcap_command built with FINAL_LOGIT_SOFTCAPPING <= 0"
+    );
+    LoweredCommand {
+        kernel: KernelId::TanhSoftCap,
+        library: "elementwise",
+        function: pick_specialized_symbol(
+            "tanh_soft_cap_f16_specialized",
+            "tanh_soft_cap_bf16_specialized",
+            W::METAL_DTYPE,
+        ),
+        // Slot 1: elementwise.metal's fn-const indices are file-scoped
+        // (slot 0 = BIAS_ADD_NUM_COLS).
+        constants: vec![ConstantValue::float(1, W::FINAL_LOGIT_SOFTCAPPING)],
+        dispatch: {
+            let mut d = DispatchShape::dispatch_1d(bucket_m * vocab_size, THREADS_PER_GROUP);
+            d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                seq_axis: None,
+                axis: super::lowered::MScaleAxis::X,
+                bucket_m: super::ids::BucketM(bucket_m),
+            });
+            d
+        },
+        bindings: vec![
+            Binding::ArenaSlot {
+                slot: in_slot,
+                binding_index: 0,
+            },
+            Binding::ArenaSlot {
+                slot: out_slot,
+                binding_index: 1,
+            },
+        ],
         gemm_dims: None,
     }
 }
@@ -612,6 +728,17 @@ fn update_shape_state(inst: &Instruction, cur_width: &mut u32, m_divisor: &mut u
         I::Gemm(_, _, _, n, _) => {
             *cur_width = *n;
         }
+        // Quantized matmuls publish `[*, n]` exactly like dense GEMMs.
+        // Without this arm, `cur_width` after an AffineQmm lm_head is
+        // whatever the last Gemm/Reshape left (Gemma4: the global-attn
+        // head reshape's 8192) — the trailing `TanhSoftCap` then caps
+        // only the first `eff_m * 8192` logits, and a PARTIAL cap is
+        // not argmax-invariant (uncapped raw values past the boundary
+        // outrun capped ones; flipped Gemma4 greedy decode at margins
+        // up to ~2).
+        I::AffineQmm(_, _, _, n, _, _, _, _) => {
+            *cur_width = *n;
+        }
         // The merger reshape `[num_tokens / div, width]`: the
         // num_tokens-scaling axis (`dims_nt_pow != 0`) carries the row
         // divisor; the static axis (`dims_nt_pow == 0`) is the new width.
@@ -813,6 +940,100 @@ fn lower_one<W: CanonicalParams>(
             gemm_dims: None,
         },
 
+        // ── Unit-gain RMSNorm (mlx RMSNormNoScale — Gemma4 v_norm) ─
+        // Same row math as `RmsNorm` with gain ≡ 1 and NO weight
+        // binding. (hidden_size, m_multiplier) are per-instruction —
+        // baked per attention class by `RmsNormUnitImpl::fan_out`
+        // (Gemma4: sliding 256×8, global 512×1).
+        I::RmsNormUnit(in_slot, out_slot, hidden_size, m_multiplier) => LoweredCommand {
+            kernel: KernelId::RmsNormUnit,
+            library: "rmsnorm",
+            function: pick_specialized_symbol(
+                "rmsnorm_unit_f16_specialized",
+                "rmsnorm_unit_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            // The unit kernel declares fn-consts 0..2 only (no
+            // WEIGHT_OFFSET slot 3); RmsNormConstants sets 0..3 and the
+            // extra constant is tolerated.
+            constants: super::kernel_constants::RmsNormConstants {
+                bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
+                q_size: super::ids::QSize(*hidden_size),
+                rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                weight_offset: 0.0,
+            }
+            .into(),
+            dispatch: DispatchShape {
+                threadgroups: (bucket_m * *m_multiplier, 1, 1),
+                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: *out_slot,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: *in_slot,
+                    binding_index: 1,
+                },
+            ],
+            gemm_dims: None,
+        },
+
+        // ── Multiply by a loaded [1]-shaped weight (Gemma4 layer_scalar) ─
+        // out = in * w[0] over the [M, HIDDEN_SIZE] hidden state.
+        // Exact-thread elementwise dispatch like `Add`; the weight
+        // loads through the RmsNorm-kind accessor (a 1-element gain).
+        I::ScalarWeightMul(in_slot, out_slot, layer) => LoweredCommand {
+            kernel: KernelId::ScalarWeightMul,
+            library: "elementwise",
+            function: pick_specialized_symbol(
+                "scalar_weight_mul_f16_specialized",
+                "scalar_weight_mul_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            constants: Vec::new(),
+            dispatch: {
+                let mut d = DispatchShape::dispatch_1d(
+                    eff_m * (W::HIDDEN_SIZE as u32),
+                    THREADS_PER_GROUP,
+                );
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
+                d
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: *out_slot,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: *in_slot,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: WeightBundleKind::RmsNorm,
+                    which: WeightTensor::Weight,
+                    layer: super::ids::LayerId(*layer + layer_offset),
+                    locator: WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: None,
+        },
+
         // ── Fused residual-add + RMSNorm ───────────────────────────
         I::FusedAddRmsNorm(delta_slot, residual_slot, layer, hidden_size, _m_multiplier) => {
             LoweredCommand {
@@ -860,6 +1081,75 @@ fn lower_one<W: CanonicalParams>(
                             slot: 0,
                         },
                         binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
+        I::NormAddScalarMul(delta_slot, residual_slot, out_slot, layer, hidden_size) => {
+            LoweredCommand {
+                kernel: KernelId::NormAddScalarMul,
+                library: "fused_add_rmsnorm",
+                function: norm_add_scalar_mul_kernel_static_name::<W>(scale_dtype_for::<W>()),
+                // Same fn-const quartet as FusedAddRmsNorm (M, hidden,
+                // eps, weight_offset) — the kernel reuses FUSED_ARN_*.
+                constants: super::kernel_constants::RmsNormConstants {
+                    bucket_m: super::ids::BucketM(bucket_m),
+                    q_size: super::ids::QSize(*hidden_size),
+                    rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: W::NORM_WEIGHT_OFFSET,
+                }
+                .into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: vec![
+                    // 0: delta (down-proj output; norm input, read)
+                    Binding::ArenaSlot {
+                        slot: *delta_slot,
+                        binding_index: 0,
+                    },
+                    // 1: residual (read)
+                    Binding::ArenaSlot {
+                        slot: *residual_slot,
+                        binding_index: 1,
+                    },
+                    // 2: out (write — the new hidden_states)
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 2,
+                    },
+                    // 3: post-FFN norm gains [hidden] (RmsNorm sub-slot 0)
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
+                        binding_index: 3,
+                    },
+                    // 4: layer_scalar [1] (RmsNorm sub-slot 1)
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 1,
+                        },
+                        binding_index: 4,
                     },
                 ],
                 gemm_dims: None,
@@ -1060,7 +1350,16 @@ fn lower_one<W: CanonicalParams>(
                 let is_nax = profile.is_some_and(|p| {
                     ferrite_metal_kernels::ferrite_metal_targets::is_nax_capable(p.generation)
                 }) && std::env::var_os("FERRITE_DISABLE_NAX").is_none();
-                let kernel = pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax);
+                // 8-bit weights (Gemma4 MLP projections): NAX has
+                // `_b_8_` instantiations (byte-per-element W-loader,
+                // same MMA) — the dominant Gemma4 prefill lever (the
+                // b8 MLP was ~77% of prefill GPU time on the Standard
+                // kernel). SplitK stays b4-only, so a b8 SplitK pick
+                // downgrades to Standard.
+                let kernel = match pick_qmm_t_kernel(bucket_m, n_v, k_v, /*B=*/ 1, gs, is_nax) {
+                    QmmTKernel::SplitK { .. } if *bits == 8 => QmmTKernel::Standard,
+                    k => k,
+                };
                 // NAX tile is 64×64 so align check uses 64; Standard/SplitK use 32.
                 let aligned_n = match kernel {
                     QmmTKernel::Nax => n_v.is_multiple_of(64),
@@ -1479,6 +1778,50 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Fused gelu_tanh(gate) * up — GeGLU q-MLP tail (Gemma) ──
+        //
+        // GELU sibling of the `SiluMul` arm above: the decomposed
+        // GeGLU MLP emits `(AffineQmm gate, AffineQmm up, GeluMul)`
+        // when gate/up are MLX-affine quantized (Gemma2/3/4). Same
+        // shapes, same dispatch, gelu_tanh activation.
+        I::GeluMul(gate_slot, up_slot, out_slot) => {
+            let dtype = dequant_dtype_for::<W>();
+            let n = bucket_m * (W::INTERMEDIATE_SIZE as u32);
+            LoweredCommand {
+                kernel: KernelId::GeluMul,
+                library: "silu_mul",
+                function: gelu_mul_static_name(dtype),
+                constants: super::kernel_constants::SiluMulConstants {
+                    n: super::ids::HiddenSize(n),
+                }
+                .into(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *gate_slot,
+                        binding_index: 1,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *up_slot,
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Qwen3.5 attention output gate: out = attn * sigmoid(gate) ──
         I::GateApply(attn_slot, gate_slot, out_slot) => {
             let dtype = dequant_dtype_for::<W>();
@@ -1864,10 +2207,32 @@ fn lower_one<W: CanonicalParams>(
             v_out_slot,
             layer,
             _interleaved,
+            is_global,
         ) => {
             // 2D dispatch: (M, num_heads) — one threadgroup per
             // (token, head) pair rotates the head's `head_dim` slice
             // and writes K/V to the layer's paged cache page.
+            //
+            // Geometry class (Gemma4): global tiles use GLOBAL_*
+            // (512 head_dim / 1 kv head / rot 128 proportional);
+            // sliding tiles use the base consts (256 / 8 / full).
+            // Identity on uniform models.
+            let (hd, n_kv, rd) = if *is_global {
+                (W::GLOBAL_HEAD_DIM, W::NUM_GLOBAL_KV_HEADS, W::GLOBAL_ROT_DIM)
+            } else {
+                (W::HEAD_DIM, W::NUM_KV_HEADS, W::ROT_DIM)
+            };
+            // Rotation pairing: standard NeoX pairs lane i with
+            // i + rot_dim/2 INSIDE the rot window (full rope and
+            // HF-style partial rope, e.g. Qwen3.5 rot 64 of 256).
+            // Gemma4's proportional rope (mlx `ProportionalRoPE`)
+            // instead rotates the first rot_dim/2 lanes of EACH
+            // head half — lane i pairs with i + head_dim/2.
+            let pair_off = if *is_global && W::ROPE_PROPORTIONAL {
+                hd / 2
+            } else {
+                rd / 2
+            };
             let n_q_heads = W::NUM_Q_HEADS;
             LoweredCommand {
                 kernel: KernelId::RopeAppend,
@@ -1878,19 +2243,20 @@ fn lower_one<W: CanonicalParams>(
                     W::METAL_DTYPE,
                 ),
                 constants: super::kernel_constants::RopeAppendConstants {
-                    head_dim: super::ids::HeadDim(W::HEAD_DIM),
+                    head_dim: super::ids::HeadDim(hd),
                     num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
-                    num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
-                    rot_dim: super::ids::RotDim(W::ROT_DIM),
+                    num_kv_heads: super::ids::NumKvHeads(n_kv),
+                    rot_dim: super::ids::RotDim(rd),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     blocks_per_chunk: super::ids::BlocksPerChunk(
                         ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
                     ),
+                    pair_off: super::ids::RopePairOff(pair_off),
                 }
                 .into(),
                 dispatch: DispatchShape {
                     threadgroups: (bucket_m, n_q_heads, 1),
-                    threads_per_threadgroup: (W::HEAD_DIM, 1, 1),
+                    threads_per_threadgroup: (hd, 1, 1),
                     m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,
@@ -1905,6 +2271,97 @@ fn lower_one<W: CanonicalParams>(
                         bucket: tape_index,
                         op_idx: index as u32,
                         slot: 0,
+                    },
+                    layer: super::ids::LayerId(*layer + layer_offset),
+                }
+                .into(),
+                gemm_dims: None,
+            }
+        }
+
+        // ── Gemma4 norm-prologue rope: per-head q/k rmsnorm + v unit-
+        // norm folded into the rope dispatch ────────────────────────
+        I::RopeAppendNormed(
+            _q_slot,
+            k_slot,
+            v_slot,
+            q_out_slot,
+            _k_out_slot,
+            _v_out_slot,
+            layer,
+            interleaved,
+            is_global,
+        ) => {
+            assert!(
+                !*interleaved,
+                "metal lowering: RopeAppendNormed is NeoX-only (the matcher \
+                 requires OpKind::RopeAppend)"
+            );
+            // Same geometry-class selection as the RopeAppend arm.
+            let (hd, n_kv, rd) = if *is_global {
+                (W::GLOBAL_HEAD_DIM, W::NUM_GLOBAL_KV_HEADS, W::GLOBAL_ROT_DIM)
+            } else {
+                (W::HEAD_DIM, W::NUM_KV_HEADS, W::ROT_DIM)
+            };
+            assert!(
+                hd <= 512,
+                "metal lowering: RopeAppendNormed threadgroup staging is sized \
+                 for head_dim <= 512 (got {hd})"
+            );
+            let pair_off = if *is_global && W::ROPE_PROPORTIONAL {
+                hd / 2
+            } else {
+                rd / 2
+            };
+            let n_q_heads = W::NUM_Q_HEADS;
+            LoweredCommand {
+                kernel: KernelId::RopeAppendNormed,
+                library: "rope",
+                function: rope_append_normed_kernel_static_name::<W>(scale_dtype_for::<W>()),
+                constants: super::kernel_constants::RopeAppendNormedConstants {
+                    head_dim: super::ids::HeadDim(hd),
+                    num_q_heads: super::ids::NumQHeads(n_q_heads),
+                    num_kv_heads: super::ids::NumKvHeads(n_kv),
+                    rot_dim: super::ids::RotDim(rd),
+                    block_size: super::ids::BlockSize(W::BLOCK_SIZE),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(
+                        ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                    ),
+                    pair_off: super::ids::RopePairOff(pair_off),
+                    rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: W::NORM_WEIGHT_OFFSET,
+                }
+                .into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, n_q_heads, 1),
+                    threads_per_threadgroup: (hd, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                // q_out aliases the raw q storage (in-place norm+rotate,
+                // staged through TG memory); k/v bind their RAW slots
+                // read-only — the kernel writes K/V to the cache only.
+                bindings: super::kernel_bindings::RopeAppendNormedBindingSet {
+                    q_out: super::ids::ArenaSlotIdx(*q_out_slot),
+                    k_in: super::ids::ArenaSlotIdx(*k_slot),
+                    v_in: super::ids::ArenaSlotIdx(*v_slot),
+                    cos_sin_locator: super::lowered::WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
+                    q_gains_locator: super::lowered::WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
+                    k_gains_locator: super::lowered::WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 1,
                     },
                     layer: super::ids::LayerId(*layer + layer_offset),
                 }
@@ -2282,12 +2739,15 @@ fn lower_one<W: CanonicalParams>(
             bits,
             symbol,
         ) => {
-            assert_eq!(
-                *bits, 4,
-                "metal lowering: SynthMlpPreDown only wired for bits=4"
+            assert!(
+                matches!(*bits, 4 | 8),
+                "metal lowering: SynthMlpPreDown only wired for bits=4/8"
             );
             let _ = group_size;
-            let tile_n = W::HEAD_DIM;
+            // Mirrors `synthesize_mlp_pre_down_chunk`'s TILE_N bake:
+            // min(HEAD_DIM, 128) keeps `threads_per_tg = 32*TILE_N/4`
+            // within Metal's 1024 ceiling (Gemma4 head_dim=256).
+            let tile_n = W::HEAD_DIM.min(128);
             let intermediate = W::INTERMEDIATE_SIZE as u32;
             let num_tiles = intermediate / tile_n;
             assert!(
@@ -2551,13 +3011,19 @@ fn lower_one<W: CanonicalParams>(
                     W::METAL_DTYPE,
                 ),
                 constants: super::kernel_constants::AttentionViaCacheConstants {
-                    head_dim: super::ids::HeadDim(W::HEAD_DIM),
+                    // `attention()` tiles are the GLOBAL class on
+                    // hybrid sliding/global arches (Gemma4: 512×1kv);
+                    // GLOBAL_* default to the base values on uniform
+                    // models, so this is identity for Llama/Qwen.
+                    head_dim: super::ids::HeadDim(W::GLOBAL_HEAD_DIM),
                     num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
-                    num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
+                    num_kv_heads: super::ids::NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
                     attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                     block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                     max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
                     blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk()),
+                    // Full attention: window disabled.
+                    window: super::ids::AttnWindow(0),
                 }
                 .into(),
                 dispatch: DispatchShape {
@@ -2658,7 +3124,9 @@ fn lower_one<W: CanonicalParams>(
                 super::lowered::MetalDtype::Bf16 => "bf16",
                 _ => "f16",
             };
-            let steel_symbol = steel_paged_symbol(steel_dtype_tag, W::HEAD_DIM);
+            // Class head_dim: 512 has no steel instantiation, so
+            // Gemma4 global prefill auto-falls-back to SDPA-paged.
+            let steel_symbol = steel_paged_symbol(steel_dtype_tag, W::GLOBAL_HEAD_DIM);
             let use_steel = match std::env::var("FERRITE_METAL_STEEL_ATTN").ok().as_deref() {
                 Some("0") | Some("off") | Some("false") => false,
                 Some("force") | Some("always") => steel_symbol.is_some(),
@@ -2679,9 +3147,11 @@ fn lower_one<W: CanonicalParams>(
                 )
             };
             let constants = super::kernel_constants::AttentionPrefillPagedConstants {
-                head_dim: super::ids::HeadDim(W::HEAD_DIM),
+                // GLOBAL class on hybrid arches; identity on uniform
+                // models (see the decode arm note).
+                head_dim: super::ids::HeadDim(W::GLOBAL_HEAD_DIM),
                 num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
-                num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
+                num_kv_heads: super::ids::NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
                 attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
                 block_size: super::ids::BlockSize(W::BLOCK_SIZE),
                 max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
@@ -2693,6 +3163,9 @@ fn lower_one<W: CanonicalParams>(
                 blocks_per_chunk: super::ids::BlocksPerChunk(
                     ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
                 ),
+                // Full attention: window disabled (both kernels read
+                // slot 7; 0 folds every window branch away).
+                window: super::ids::AttnWindow(0),
                 // Steel kernel reads slot 99; omitting it leaves Metal
                 // undefined and the kernel can hit a diagnostic path
                 // (the b3ddb3b46 regression). sdpa_vector ignores it.
@@ -2725,6 +3198,23 @@ fn lower_one<W: CanonicalParams>(
                     bucket_m: super::ids::BucketM(bucket_m),
                 }),
             };
+            // GQA-cooperative fallback: when steel can't take the
+            // shape (head_dim 512 has no steel instantiation — TG
+            // memory) AND the GQA ratio is high, the per-(q_head,
+            // query) sdpa_vector kernel re-streams identical K/V
+            // `gqa`× from device. The gqa_shared kernel stages each
+            // paged K/V block through threadgroup memory once per
+            // query and fans it out to all heads (one simdgroup per
+            // head). Gemma4 global layers (512 hd, 16:1) went from
+            // ~350 ms/layer to bandwidth-proportional on T=2930.
+            // Gated to gqa >= 8 so low-GQA arches keep the proven
+            // sdpa_vector path.
+            let gqa = W::NUM_Q_HEADS / W::NUM_GLOBAL_KV_HEADS.max(1);
+            let use_gqa_shared = !use_steel
+                && (8..=32).contains(&gqa)
+                && W::GLOBAL_HEAD_DIM % 32 == 0
+                && W::GLOBAL_HEAD_DIM <= 512
+                && W::BLOCK_SIZE <= 16;
             if use_steel {
                 // Symbol came from the codegen'd table above
                 // (`steel_symbol.is_some()` is the gate). Build the
@@ -2732,6 +3222,188 @@ fn lower_one<W: CanonicalParams>(
                 // `for_kernel::<K>` — there's no typed ZST for steel
                 // because BD lives in the symbol name; see the
                 // comment in `kernel_identity.rs`.
+                let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
+                LoweredCommand {
+                    kernel: KernelId::AttentionPrefillSdpaPaged,
+                    library: "attention_steel_paged",
+                    function,
+                    constants: constants.into(),
+                    dispatch,
+                    bindings: bindings.into(),
+                    gemm_dims: None,
+                }
+            } else if use_gqa_shared {
+                LoweredCommand {
+                    kernel: KernelId::AttentionPrefillSdpaPaged,
+                    library: "attention",
+                    function: pick_specialized_symbol(
+                        "attention_prefill_sdpa_gqa_shared_f16_specialized",
+                        "attention_prefill_sdpa_gqa_shared_bf16_specialized",
+                        W::METAL_DTYPE,
+                    ),
+                    constants: constants.into(),
+                    dispatch: DispatchShape {
+                        // One TG per (kv_head, query); `32 × gqa`
+                        // threads = one simdgroup per q-head (gqa <=
+                        // 32 keeps this within the 1024-thread cap).
+                        threadgroups: (W::NUM_GLOBAL_KV_HEADS, bucket_m, 1),
+                        threads_per_threadgroup: (32 * gqa, 1, 1),
+                        m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                            seq_axis: None,
+                            axis: super::lowered::MScaleAxis::Y,
+                            bucket_m: super::ids::BucketM(bucket_m),
+                        }),
+                    },
+                    bindings: bindings.into(),
+                    gemm_dims: None,
+                }
+            } else {
+                match W::METAL_DTYPE {
+                    super::lowered::MetalDtype::Bf16 => {
+                        LoweredCommand::for_kernel::<AttentionSdpaPagedBf16>(
+                            constants, bindings, dispatch,
+                        )
+                    }
+                    _ => LoweredCommand::for_kernel::<AttentionSdpaPagedF16>(
+                        constants, bindings, dispatch,
+                    ),
+                }
+            }
+        }
+
+        // ── Sliding-window decode attention (Gemma2/3/4 local layers) ─
+        // Identical to `AttentionViaCache` except the kernel's
+        // `ATTN_WINDOW` function constant carries `W::SLIDING_WINDOW`
+        // (the decode kernel skips keys with `kv_len-1 - k >= window`).
+        I::SlidingAttentionViaCache(q_slot, out_slot, layer, _is_decode) => {
+            debug_assert!(
+                W::SLIDING_WINDOW > 0,
+                "SlidingAttentionViaCache lowered with SLIDING_WINDOW <= 0"
+            );
+            let n_q_heads = W::NUM_Q_HEADS;
+            LoweredCommand {
+                kernel: KernelId::AttentionViaCache,
+                library: "attention",
+                function: pick_specialized_symbol(
+                    "attention_via_cache_v2_f16_specialized",
+                    "attention_via_cache_v2_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                constants: super::kernel_constants::AttentionViaCacheConstants {
+                    head_dim: super::ids::HeadDim(W::HEAD_DIM),
+                    num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
+                    num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
+                    attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
+                    block_size: super::ids::BlockSize(W::BLOCK_SIZE),
+                    max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                    blocks_per_chunk: super::ids::BlocksPerChunk(attention_blocks_per_chunk()),
+                    window: super::ids::AttnWindow(W::SLIDING_WINDOW),
+                }
+                .into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, n_q_heads, 1),
+                    threads_per_threadgroup: (1024, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: super::kernel_bindings::AttentionViaCacheBindingSet {
+                    output: super::ids::ArenaSlotIdx(*out_slot),
+                    q: super::ids::ArenaSlotIdx(*q_slot),
+                    kv_layer: super::ids::LayerId(*layer + layer_offset),
+                }
+                .into(),
+                gemm_dims: None,
+            }
+        }
+
+        // ── Sliding-window paged prefill (Gemma2/3/4 local layers) ──
+        // Same steel-vs-SDPA routing as `AttentionPrefillPaged`, with
+        // the BASE-class geometry (sliding head_dim/kv heads) and
+        // `ATTN_WINDOW = W::SLIDING_WINDOW` (fn-const slot 7, read by
+        // both kernels). The steel kernel additionally SKIPS K-tiles
+        // entirely older than the window (`kb_start`), making windowed
+        // prefill O(T·window) — the dominant Gemma-family TTFT lever
+        // (sliding layers are 40 of Gemma4-12B's 48).
+        I::SlidingAttentionPrefillPaged(q_slot, out_slot, layer, _interleaved) => {
+            debug_assert!(
+                W::SLIDING_WINDOW > 0,
+                "SlidingAttentionPrefillPaged lowered with SLIDING_WINDOW <= 0"
+            );
+            use super::kernel_identity::{AttentionSdpaPagedBf16, AttentionSdpaPagedF16};
+            use ferrite_metal_kernels::steel_paged::steel_paged_symbol;
+            let n_q_heads = W::NUM_Q_HEADS;
+            const BQ_STEEL: u32 = 32;
+            let steel_dtype_tag: &str = match W::METAL_DTYPE {
+                super::lowered::MetalDtype::Bf16 => "bf16",
+                _ => "f16",
+            };
+            // BASE class head_dim (sliding layers) — Gemma4: 256,
+            // which IS instantiated, so sliding prefill gets steel
+            // while the 512-wide global class falls back to SDPA.
+            let steel_symbol = steel_paged_symbol(steel_dtype_tag, W::HEAD_DIM);
+            let use_steel = match std::env::var("FERRITE_METAL_STEEL_ATTN").ok().as_deref() {
+                Some("0") | Some("off") | Some("false") => false,
+                Some("force") | Some("always") => steel_symbol.is_some(),
+                _ => steel_symbol.is_some() && bucket_m >= BQ_STEEL,
+            };
+            let (tg_shape, threads_per_tg, m_scale_axis) = if use_steel {
+                let nq_blocks = bucket_m.div_ceil(BQ_STEEL);
+                (
+                    (nq_blocks, n_q_heads, 1),
+                    (128u32, 1u32, 1u32),
+                    super::lowered::MScaleAxis::X,
+                )
+            } else {
+                (
+                    (n_q_heads, bucket_m, 1),
+                    (1024u32, 1u32, 1u32),
+                    super::lowered::MScaleAxis::Y,
+                )
+            };
+            let constants = super::kernel_constants::AttentionPrefillPagedConstants {
+                head_dim: super::ids::HeadDim(W::HEAD_DIM),
+                num_q_heads: super::ids::NumQHeads(W::NUM_Q_HEADS),
+                num_kv_heads: super::ids::NumKvHeads(W::NUM_KV_HEADS),
+                attn_scale: super::ids::AttnScale(W::ATTN_SCALE),
+                block_size: super::ids::BlockSize(W::BLOCK_SIZE),
+                max_blocks: super::ids::MaxBlocksPerSeq(W::MAX_BLOCKS_PER_SEQ),
+                blocks_per_chunk: super::ids::BlocksPerChunk(
+                    ::ferrite_fusion_synth::BLOCKS_PER_CHUNK,
+                ),
+                window: super::ids::AttnWindow(W::SLIDING_WINDOW),
+                // Steel reads slot 99 (the b3ddb3b46 lesson);
+                // sdpa_vector declares no slot 99.
+                debug_mode: if use_steel {
+                    Some(super::ids::AttnDebugMode(0))
+                } else {
+                    None
+                },
+            };
+            let bindings = super::kernel_bindings::AttentionPrefillPagedBindingSet {
+                output: super::ids::ArenaSlotIdx(*out_slot),
+                q: super::ids::ArenaSlotIdx(*q_slot),
+                kv_layer: super::ids::LayerId(*layer + layer_offset),
+            };
+            let dispatch = DispatchShape {
+                threadgroups: tg_shape,
+                threads_per_threadgroup: threads_per_tg,
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    // Steel: one grid-Z layer per sequence so a BQ
+                    // tile never straddles a sequence boundary (see
+                    // the AttentionPrefillPaged arm).
+                    seq_axis: if use_steel {
+                        Some(crate::interpreter::metal::lowered::MScaleAxis::Z)
+                    } else {
+                        None
+                    },
+                    axis: m_scale_axis,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            };
+            if use_steel {
                 let function = steel_symbol.expect("steel_symbol is Some when use_steel is true");
                 LoweredCommand {
                     kernel: KernelId::AttentionPrefillSdpaPaged,
@@ -2804,7 +3476,7 @@ fn lower_one<W: CanonicalParams>(
         },
 
         // ── Scalar-multiply broadcast ──────────────────────────────
-        I::ScalarMul(in_slot, out_slot, _scale) => LoweredCommand {
+        I::ScalarMul(in_slot, out_slot, scale) => LoweredCommand {
             kernel: KernelId::ScalarMul,
             library: "elementwise",
             function: pick_specialized_symbol(
@@ -2812,7 +3484,9 @@ fn lower_one<W: CanonicalParams>(
                 "scalar_mul_bf16_specialized",
                 W::METAL_DTYPE,
             ),
-            constants: Vec::new(),
+            // Slot 2: elementwise.metal fn-const indices are file-scoped
+            // (0 = BIAS_ADD_NUM_COLS, 1 = TANH_SOFTCAP_CAP).
+            constants: vec![ConstantValue::float(2, *scale)],
             dispatch: {
                 let mut d =
                     DispatchShape::dispatch_1d(bucket_m * W::Q_SIZE as u32, THREADS_PER_GROUP);
@@ -2838,6 +3512,57 @@ fn lower_one<W: CanonicalParams>(
             ],
             gemm_dims: None,
         },
+
+        // ── Final logit softcapping (Gemma2/Gemma4) ────────────────
+        //
+        // `out = cap * tanh(x / cap)` with cap =
+        // `W::FINAL_LOGIT_SOFTCAPPING` baked as function constant 0.
+        // Runs on the logits (`cur_width` = vocab after the lm_head
+        // GEMM); token-parallel exact-thread dispatch like `Add`.
+        // NOTE: the lm_head narrow-path rewrite in `lower_pair` now
+        // tolerates a trailing TanhSoftCap (`[AffineQmm, TanhSoftCap]`
+        // slices get gather → qmv → narrow softcap → scatter); this
+        // full-M arm remains the spec-decode fallback and the decode
+        // (bucket_m == 1) path.
+        I::TanhSoftCap(in_slot, out_slot) => {
+            debug_assert!(
+                W::FINAL_LOGIT_SOFTCAPPING > 0.0,
+                "TanhSoftCap lowered with FINAL_LOGIT_SOFTCAPPING <= 0"
+            );
+            LoweredCommand {
+                kernel: KernelId::TanhSoftCap,
+                library: "elementwise",
+                function: pick_specialized_symbol(
+                    "tanh_soft_cap_f16_specialized",
+                    "tanh_soft_cap_bf16_specialized",
+                    W::METAL_DTYPE,
+                ),
+                // Slot 1: elementwise.metal's fn-const indices are
+                // file-scoped (slot 0 = BIAS_ADD_NUM_COLS).
+                constants: vec![ConstantValue::float(1, W::FINAL_LOGIT_SOFTCAPPING)],
+                dispatch: {
+                    let mut d =
+                        DispatchShape::dispatch_1d(eff_m * cur_width, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 1,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
 
         // ── Per-row bias broadcast (singleton, non-synth path) ────
         //
@@ -3693,6 +4418,15 @@ fn silu_mul_static_name(dtype: DequantDtype) -> &'static str {
     }
 }
 
+/// `gelu_mul_<dtype>` sibling (decomposed GeGLU tail) — same
+/// `silu_mul.metal` library.
+fn gelu_mul_static_name(dtype: DequantDtype) -> &'static str {
+    match dtype {
+        DequantDtype::F16 => "gelu_mul_f16",
+        DequantDtype::Bf16 => "gelu_mul_bf16",
+    }
+}
+
 fn gate_apply_static_name(dtype: DequantDtype) -> &'static str {
     match dtype {
         DequantDtype::F16 => "gate_apply_f16",
@@ -4043,6 +4777,43 @@ fn fused_add_rmsnorm_kernel_static_name<W: CanonicalParams>(
         (MetalDtype::Bf16, S::Bf16) => "fused_add_rmsnorm_bf16_s_bf16_specialized",
         (dt, sdt) => unreachable!(
             "fused_add_rmsnorm_kernel_static_name: (dtype={dt:?}, \
+             scale_dtype={sdt:?}) not instantiated"
+        ),
+    }
+}
+
+/// `Instruction::NormAddScalarMul` symbol — the norm-THEN-add mirror
+/// of `fused_add_rmsnorm_kernel_static_name`; same dtype enumeration,
+/// same `fused_add_rmsnorm` library.
+fn norm_add_scalar_mul_kernel_static_name<W: CanonicalParams>(
+    scale_dtype: ScaleDtype,
+) -> &'static str {
+    use ScaleDtype as S;
+    match (W::METAL_DTYPE, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "norm_add_scalar_mul_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "norm_add_scalar_mul_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16) => "norm_add_scalar_mul_f16_s_bf16_specialized",
+        (MetalDtype::Bf16, S::Bf16) => "norm_add_scalar_mul_bf16_s_bf16_specialized",
+        (dt, sdt) => unreachable!(
+            "norm_add_scalar_mul_kernel_static_name: (dtype={dt:?},              scale_dtype={sdt:?}) not instantiated"
+        ),
+    }
+}
+
+/// `Instruction::RopeAppendNormed` symbol — same dtype enumeration as
+/// the rmsnorm/fused_add_rmsnorm families (T_scale = on-disk gain
+/// dtype), `rope` library.
+fn rope_append_normed_kernel_static_name<W: CanonicalParams>(
+    scale_dtype: ScaleDtype,
+) -> &'static str {
+    use ScaleDtype as S;
+    match (W::METAL_DTYPE, scale_dtype) {
+        (MetalDtype::F16, S::F16) => "rope_append_normed_f16_s_f16_specialized",
+        (MetalDtype::Bf16, S::F16) => "rope_append_normed_bf16_s_f16_specialized",
+        (MetalDtype::F16, S::Bf16) => "rope_append_normed_f16_s_bf16_specialized",
+        (MetalDtype::Bf16, S::Bf16) => "rope_append_normed_bf16_s_bf16_specialized",
+        (dt, sdt) => unreachable!(
+            "rope_append_normed_kernel_static_name: (dtype={dt:?}, \
              scale_dtype={sdt:?}) not instantiated"
         ),
     }

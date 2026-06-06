@@ -139,6 +139,15 @@ pub struct ModelParams {
     /// `Program::decoder_safetensors_prefix` and consumed by
     /// [`crate::codegen::safetensors_prefix`] under `Prelude::Decoder`.
     pub decoder_safetensors_prefix: Option<String>,
+    /// DSL-leaf → on-disk-leaf renames for arches whose layer classes
+    /// share an on-disk weight name with DIFFERENT shapes (Gemma4:
+    /// global layers' `self_attn.q_proj` is [8192, 3840] vs sliding
+    /// [4096, 3840] — the DSL uses distinct names like `q_proj_global`
+    /// so each gets its own manifest shape, and this map folds them
+    /// back to the shared disk leaf). JSON: `weight_leaf_renames:
+    /// {"self_attn.q_proj_global": "self_attn.q_proj", ...}`. Sorted
+    /// for determinism; empty for every other arch.
+    pub weight_leaf_renames: Vec<(String, String)>,
     /// HF `torch_dtype` string, lowercased. Read by codegen as the
     /// FALLBACK for the rotary cache compute dtype when the embed
     /// tensor isn't visible in the weights table at load time. Today's
@@ -1102,6 +1111,28 @@ fn model_params_from_json(
         .get("vision_pos_embed_key")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // Gemma4: DSL-name → on-disk leaf renames (global/sliding classes
+    // share disk leaves with different shapes). Sorted for stable
+    // longest-suffix matching in `codegen::safetensors_prefix`.
+    let weight_leaf_renames: Vec<(String, String)> = json
+        .get("weight_leaf_renames")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            let mut v: Vec<(String, String)> = m
+                .iter()
+                .map(|(k, val)| {
+                    (
+                        k.clone(),
+                        val.as_str()
+                            .expect("weight_leaf_renames values must be strings")
+                            .to_string(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
     let mut decoder_safetensors_prefix = parse_decoder_safetensors_prefix(json);
     let torch_dtype = parse_torch_dtype(json);
 
@@ -1130,6 +1161,7 @@ fn model_params_from_json(
         vision_patch_embed_flatten,
         vision_pos_embed_key,
         decoder_safetensors_prefix,
+        weight_leaf_renames,
         torch_dtype,
     })
 }
@@ -1374,6 +1406,29 @@ fn vision_params_from_json(
 
     let torch_dtype = parse_torch_dtype(json);
 
+    // Same top-level `weight_leaf_renames` hook as the text-only parse
+    // path (Gemma4's hybrid classes share disk leaves under a VL
+    // wrapper arch — dropping this here would silently break loads).
+    let weight_leaf_renames: Vec<(String, String)> = json
+        .get("weight_leaf_renames")
+        .and_then(|v| v.as_object())
+        .map(|m| {
+            let mut v: Vec<(String, String)> = m
+                .iter()
+                .map(|(k, val)| {
+                    (
+                        k.clone(),
+                        val.as_str()
+                            .expect("weight_leaf_renames values must be strings")
+                            .to_string(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+
     let mut decoder_safetensors_prefix = parse_decoder_safetensors_prefix(json);
     apply_arch_semantic_defaults(
         &architectures,
@@ -1401,6 +1456,7 @@ fn vision_params_from_json(
         vision_patch_embed_flatten,
         vision_pos_embed_key,
         decoder_safetensors_prefix,
+        weight_leaf_renames,
         torch_dtype,
     })
 }
@@ -2115,6 +2171,21 @@ fn apply_arch_semantic_defaults(
     // `"tie_word_embeddings": false` via its `.overrides.json`.
     if tie_word_embeddings.is_none() && (gemma3_family || gemma2_family) {
         *tie_word_embeddings = Some(true);
+    }
+    // Per-class attention geometry defaults: uniform-geometry arches
+    // never declare global_* keys, but the shape sigs anchor the
+    // `attention()` (global-class) tile to `global_head_dim` /
+    // `num_global_key_value_heads` unconditionally — default them to
+    // the base values so every existing arch resolves identically.
+    if !bounds.contains_key("global_head_dim")
+        && let Some(&hd) = bounds.get("head_dim")
+    {
+        bounds.insert("global_head_dim".to_string(), hd);
+    }
+    if !bounds.contains_key("num_global_key_value_heads")
+        && let Some(&kv) = bounds.get("num_key_value_heads")
+    {
+        bounds.insert("num_global_key_value_heads".to_string(), kv);
     }
 }
 

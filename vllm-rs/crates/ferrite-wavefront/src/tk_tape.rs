@@ -1723,6 +1723,30 @@ impl ByteOffsetExpr {
             base: ByteOffset::new((layer as u64) * K::LAYER_BYTES),
         }
     }
+
+    /// Construct [`Self::LinearLoop`] for a KV cache CHUNKED read
+    /// driven by a loop var iterating over chunks of `CHUNK_ROWS`
+    /// cache positions. Stride per loop iteration is
+    /// `CHUNK_ROWS × K::ROW_BYTES`; base is `layer × K::LAYER_BYTES`.
+    ///
+    /// Used by AttnDecode_Qkt's K/V loads (chunked iteration over
+    /// the cache). Replaces the placeholder `linear_loop::<128>` that
+    /// used a per-loop-step of just 128 bytes — production needs the
+    /// full row stride scaled by the chunk row count.
+    ///
+    /// `K: KvCacheShape` is the type-level cache-shape witness;
+    /// stride and base derive from K's const associated values, so
+    /// wrong stride for a given K is structurally impossible.
+    pub fn kv_cache_chunk_loop<const CHUNK_ROWS: usize, K: crate::subtile_ir::KvCacheShape>(
+        var: LoopVarId,
+        layer: u32,
+    ) -> Self {
+        Self::LinearLoop {
+            var,
+            stride_bytes: (CHUNK_ROWS as u64) * K::ROW_BYTES,
+            base: ByteOffset::new((layer as u64) * K::LAYER_BYTES),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1171,24 +1171,19 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // K and V are loaded fresh each iteration, no per-page
             // barrier infrastructure for those temp pages.
 
-            // TMA load K[chunk] from cache at offset
-            //   layer_base + iter * chunk_bytes
-            // For now use byte_off = (loop_var * row_bytes); a real
-            // implementation needs layer_base + iter * row_bytes via
-            // a const that combines them. The KvCacheLayout helper
-            // doesn't currently support runtime-loop-var-driven
-            // offsets (that's a follow-up: add a LinearLoop variant
-            // overload that uses the typed K stride).
-            let k_off = ByteOffsetExpr::linear_loop::<128>(
-                loop_var,
-                crate::tk_tape::ByteStride::<128, crate::tk_tape::PerLoopStep>::NEW,
-                ByteOffset::new(0),
-            );
-            let v_off = ByteOffsetExpr::linear_loop::<128>(
-                loop_var,
-                crate::tk_tape::ByteStride::<128, crate::tk_tape::PerLoopStep>::NEW,
-                ByteOffset::new(0),
-            );
+            // TMA load K[chunk] / V[chunk] from cache. Chunk index
+            // is the loop var; chunk size is 128 cache positions
+            // (matching the substrate page row count). Per-iteration
+            // byte stride = CHUNK_ROWS × K::ROW_BYTES, derived from
+            // the typed KvCacheLayout<K> witness.
+            //
+            // Layer base = 0 — the orchestrator uses per-layer cache
+            // TensorIds (layout.cache_tensor() / v_cache_tensor() are
+            // already layer-specific). If a unified-cache layout is
+            // ever needed, the call site passes the right layer arg.
+            const CHUNK_ROWS: usize = 128;
+            let k_off = ByteOffsetExpr::kv_cache_chunk_loop::<CHUNK_ROWS, K>(loop_var, 0);
+            let v_off = ByteOffsetExpr::kv_cache_chunk_loop::<CHUNK_ROWS, K>(loop_var, 0);
             state.push(Instr::LoadAsync(LoadSpec::new(
                 k_tile_page,
                 k_cache,

@@ -111,6 +111,14 @@ fn run_chat_inproc(args: &ChatArgs, model: &str) -> Result<()> {
     let t0 = std::time::Instant::now();
 
     let mut builder = LLM::builder(model).device(&args.device).dtype(&args.dtype);
+    // Chat is strictly sequential — one blocking chat_stream call at a
+    // time (REPL, -q, multi-prompt, and --bench alike), so exactly one
+    // sequence is ever running. Declare that instead of inheriting the
+    // server default (256): hybrid GDN arches reserve a recurrent-state
+    // slot per max_num_seqs up-front (~61 MiB/slot on Qwen3.5-35B —
+    // 15.7 GiB at the default, which is the difference between the 35B
+    // fitting on a 32 GiB box or failing the budget guard).
+    builder = builder.max_num_seqs(1);
     if let Some(ref token) = args.hf_token {
         builder = builder.hf_token(token);
     }

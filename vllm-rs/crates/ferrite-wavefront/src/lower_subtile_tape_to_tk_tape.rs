@@ -50,7 +50,7 @@ use crate::subtile_tape::{
     Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
 };
 use crate::tk_tape::{
-    ByteOffset, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
+    ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
     KvLayoutEntry, KvLayoutId, LoadSpec, LoopVarId as TkLoopVarId, PageBarrier, PageId,
     SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape, TkTape, U32Source, WarpRole,
     validate_tk_tape,
@@ -489,13 +489,13 @@ fn region_tile_shape(tr: &TensorRegion) -> TileShape {
     }
 }
 
-fn region_byte_offset<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, tr: &TensorRegion) -> ByteOffset {
+fn region_byte_offset<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, tr: &TensorRegion) -> ByteOffsetExpr {
     // Linear row-major offset: (rows.start * cols_total + cols.start) * elem_bytes.
     let shape = graph.tensors[tr.tensor.0 as usize];
     let off = ((tr.region.rows.start as u64) * (shape.cols as u64)
         + (tr.region.cols.start as u64))
         * (ELEM_BYTES as u64);
-    ByteOffset::from_const(off)
+    ByteOffsetExpr::Const(off)
 }
 
 fn emit_external_load<F: RopeForm, K: KvCacheShape>(

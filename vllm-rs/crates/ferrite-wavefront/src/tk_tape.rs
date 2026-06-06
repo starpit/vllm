@@ -286,7 +286,7 @@ pub enum Instr {
     StoreAsyncTyped {
         dst_page: PageId,
         dst_tensor: TensorId,
-        tile_type: TileType,
+        tile_type: TileTypeSpec,
         role: WarpRole,
     },
 
@@ -632,6 +632,10 @@ pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
     /// `expect_bytes` arithmetic) without storing it as a separate
     /// runtime field.
     const ELEM_BYTES: u32;
+    /// Erase the type-level dtype to its sealed runtime
+    /// [`TileDtypeTag`]. Used by typed Instr constructors that must
+    /// store the dtype on a heterogeneous Instr field.
+    fn tag() -> TileDtypeTag;
 }
 
 /// `kittens::bf16` — Hopper bfloat16. The only dtype currently bound
@@ -642,6 +646,9 @@ impl tile_dtype_sealed::Sealed for Bf16 {}
 impl TileDtype for Bf16 {
     const ST_ALIAS_SUFFIX: &'static str = "bf";
     const ELEM_BYTES: u32 = 2;
+    fn tag() -> TileDtypeTag {
+        TileDtypeTag::Bf16
+    }
 }
 
 /// Typed shared-memory tile handle: a [`PageId`] paired with type-level
@@ -849,25 +856,37 @@ pub struct SoftmaxStateId(pub(crate) u32);
 // / PageBarrierWaitLoop { var, start } per plan §3 step 8 — one Instr per
 // architectural primitive, no inner-match dispatch in the player.
 
-/// Byte-offset expression for TMA load/store source/dest. Stored as
-/// a pre-computed CUDA expression string, baked at tape-build time
-/// so the player emits literally — no inner-match dispatch / no
-/// emit-time arithmetic. Sealed: only the per-target lowering can
-/// construct one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ByteOffset(String);
+/// Byte-offset expression for TMA load/store source/dest.
+///
+/// Sealed enum (variants are `pub`, but the type is by-value match-only;
+/// new arms can only be added inside this crate). The IR carries
+/// **structured data**, not pre-formatted CUDA syntax; the player
+/// formats per arm at emit time. Per
+/// `feedback_no_premature_string_encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOffsetExpr {
+    /// `<c>u` — constant byte offset.
+    Const(u64),
+    /// `(<base>u + v<var> * <stride>u)` — loop-linear byte offset.
+    LinearLoop {
+        var: LoopVarId,
+        stride: u64,
+        base: u64,
+    },
+}
 
-impl ByteOffset {
-    /// Constant byte offset: `<c>u`.
-    pub fn from_const(c: u64) -> Self {
-        Self(format!("{c}u"))
+impl ByteOffsetExpr {
+    /// Convenience constant constructor mirroring the legacy
+    /// `ByteOffset::from_const(c)` API for call-site brevity. The
+    /// canonical path is `ByteOffsetExpr::Const(c)`.
+    pub const fn from_const(c: u64) -> Self {
+        Self::Const(c)
     }
-    /// Loop-linear byte offset: `(<base>u + v<var> * <stride>u)`.
-    pub fn linear_loop(var: LoopVarId, stride: u64, base: u64) -> Self {
-        Self(format!("({base}u + v{} * {stride}u)", var.0))
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
+
+    /// Convenience linear-loop constructor mirroring the legacy
+    /// `ByteOffset::linear_loop(var, stride, base)` API.
+    pub const fn linear_loop(var: LoopVarId, stride: u64, base: u64) -> Self {
+        Self::LinearLoop { var, stride, base }
     }
 }
 
@@ -878,17 +897,43 @@ pub struct TileShape {
     pub elem_bytes: u32,
 }
 
-/// Sealed CUDA tile-type spelling for [`Instr::StoreAsyncTyped`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TileType(String);
+/// Runtime sealed dtype tag. The `TileDtype` trait's `tag()` method
+/// is the only construction path; external types cannot satisfy
+/// `TileDtype` (sealed via `tile_dtype_sealed::Sealed`). Single
+/// variant today (`Bf16`); add variants as new dtypes land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TileDtypeTag {
+    Bf16,
+}
 
-impl TileType {
-    pub(crate) fn from_layout(s: impl Into<String>) -> Self {
-        Self(s.into())
+impl TileDtypeTag {
+    /// CUDA template-alias suffix: the `<suffix>` in
+    /// `kittens::st_<suffix><ROWS, COLS>`. See
+    /// `third_party/thunderkittens/include/types/shared/st.cuh:313`.
+    pub const fn st_alias_suffix(&self) -> &'static str {
+        match self {
+            Self::Bf16 => Bf16::ST_ALIAS_SUFFIX,
+        }
     }
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn elem_bytes(&self) -> u32 {
+        match self {
+            Self::Bf16 => Bf16::ELEM_BYTES,
+        }
     }
+}
+
+/// Structured replacement for the legacy `TileType(String)` carrier
+/// of pre-formatted `"kittens::st_bf<128, 128>"`. Per
+/// `feedback_no_premature_string_encoding`: the IR carries (rows,
+/// cols, dtype) as structured data; the player formats the alias at
+/// emit time. Wrong-shape construction goes through the typed
+/// `Instr::store_async_typed<ROWS, COLS, T>(SmemTileId<...>)` path,
+/// which derives the spec from const-generics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileTypeSpec {
+    pub rows: u32,
+    pub cols: u32,
+    pub dtype: TileDtypeTag,
 }
 
 /// TMA-load arguments. Fields are `pub` for player read-access; the
@@ -900,7 +945,7 @@ impl TileType {
 pub struct LoadSpec {
     pub dst_page: PageId,
     pub src_tensor: TensorId,
-    pub byte_off: ByteOffset,
+    pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
     /// Which page barrier `expect_bytes` arms.
@@ -916,7 +961,7 @@ impl LoadSpec {
     pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
         dst_page: PageId,
         src_tensor: TensorId,
-        byte_off: ByteOffset,
+        byte_off: ByteOffsetExpr,
         tile: SmemTileSpec<ROWS, COLS, T>,
         role: LoaderRole,
         barrier_page: PageId,
@@ -936,7 +981,7 @@ impl LoadSpec {
 pub struct StoreSpec {
     pub src_page: PageId,
     pub dst_tensor: TensorId,
-    pub byte_off: ByteOffset,
+    pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
 }
@@ -947,7 +992,7 @@ impl StoreSpec {
     pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
         src_page: PageId,
         dst_tensor: TensorId,
-        byte_off: ByteOffset,
+        byte_off: ByteOffsetExpr,
         tile: SmemTileSpec<ROWS, COLS, T>,
         role: StorerRole,
     ) -> Self {
@@ -1100,16 +1145,18 @@ impl Instr {
         dst_tensor: TensorId,
         role: StorerRole,
     ) -> Self {
-        let tile_type = format!(
-            "kittens::st_{}<{}, {}>",
-            T::ST_ALIAS_SUFFIX,
-            ROWS,
-            COLS,
-        );
+        // Erase the typed witness into structured runtime data —
+        // NOT a pre-formatted CUDA string. The format
+        // `kittens::st_<suffix><R, C>` lives in the player at emit
+        // time. Per `feedback_no_premature_string_encoding`.
         Self::StoreAsyncTyped {
             dst_page: src.page(),
             dst_tensor,
-            tile_type: TileType::from_layout(tile_type),
+            tile_type: TileTypeSpec {
+                rows: ROWS as u32,
+                cols: COLS as u32,
+                dtype: T::tag(),
+            },
             role: role.to_warp_role(),
         }
     }
@@ -1375,7 +1422,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffset::from_const(0),
+                    byte_off: ByteOffsetExpr::Const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
@@ -1398,7 +1445,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffset::from_const(0),
+                    byte_off: ByteOffsetExpr::Const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
@@ -1433,7 +1480,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffset::from_const(0),
+                    byte_off: ByteOffsetExpr::Const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),

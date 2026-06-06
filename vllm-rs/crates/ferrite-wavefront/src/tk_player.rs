@@ -52,13 +52,38 @@ mod tk20 {
         format!("kittens::group<1>::arrive(&{barrier}[{page}]);")
     }
 
+    /// Format a [`ByteOffsetExpr`] as a CUDA arithmetic expression at
+    /// emit time. Single-source format per arm — the IR carries
+    /// structured data, not a pre-formatted string. Per
+    /// `feedback_no_premature_string_encoding`.
+    pub fn byte_offset_expr(off: &crate::tk_tape::ByteOffsetExpr) -> String {
+        match off {
+            crate::tk_tape::ByteOffsetExpr::Const(c) => format!("{c}u"),
+            crate::tk_tape::ByteOffsetExpr::LinearLoop { var, stride, base } => {
+                format!("({base}u + v{} * {stride}u)", var.0)
+            }
+        }
+    }
+
+    /// Format a [`TileTypeSpec`] as a `kittens::st_<suffix><R, C>`
+    /// template alias at emit time. See
+    /// `third_party/thunderkittens/include/types/shared/st.cuh:313`.
+    pub fn tile_type_spec(spec: &crate::tk_tape::TileTypeSpec) -> String {
+        format!(
+            "kittens::st_{}<{}, {}>",
+            spec.dtype.st_alias_suffix(),
+            spec.rows,
+            spec.cols,
+        )
+    }
+
     /// `tma::load_async` + `expect_bytes` for one page. Takes the
     /// LoadSpec by reference so the caller arm collapses to one
     /// writeln per Instr (per plan §4 step 8 ≤5-line budget).
     pub fn tma_load_async(spec: &crate::tk_tape::LoadSpec) -> String {
         format!(
             "kittens::group<1>::tma::load_async(page_buf[{}], a{}, {}, {}u, {}u, {}u, &page_ready[{}]);",
-            spec.dst_page.0, spec.src_tensor.0, spec.byte_off.as_str(),
+            spec.dst_page.0, spec.src_tensor.0, byte_offset_expr(&spec.byte_off),
             spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes, spec.barrier_page.0,
         )
     }
@@ -66,7 +91,7 @@ mod tk20 {
     pub fn tma_store_async(spec: &crate::tk_tape::StoreSpec) -> String {
         format!(
             "kittens::group<1>::tma::store_async(a{}, page_buf[{}], {}, {}u, {}u, {}u);",
-            spec.dst_tensor.0, spec.src_page.0, spec.byte_off.as_str(),
+            spec.dst_tensor.0, spec.src_page.0, byte_offset_expr(&spec.byte_off),
             spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes,
         )
     }
@@ -83,9 +108,14 @@ mod tk20 {
         )
     }
 
-    pub fn tma_store_async_typed(src_page: u8, dst_arg_idx: u32, tile_type: &str) -> String {
+    pub fn tma_store_async_typed(
+        src_page: u8,
+        dst_arg_idx: u32,
+        tile_type: &crate::tk_tape::TileTypeSpec,
+    ) -> String {
+        let tt = tile_type_spec(tile_type);
         format!(
-            "kittens::group<1>::tma::store_async_typed<{tile_type}>(a{dst_arg_idx}, page_buf[{src_page}]);"
+            "kittens::group<1>::tma::store_async_typed<{tt}>(a{dst_arg_idx}, page_buf[{src_page}]);"
         )
     }
 
@@ -364,7 +394,7 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let _ = writeln!(out, "{}", tk20::tma_store_async(spec));
         }
         Instr::StoreAsyncTyped { dst_page, dst_tensor, tile_type, role: _ } => {
-            let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());
+            let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type);
             let _ = writeln!(out, "{s}");
         }
         Instr::ShTileMul { lhs, rhs, dst, width } => {

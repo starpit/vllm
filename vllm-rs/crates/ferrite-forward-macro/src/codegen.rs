@@ -6098,7 +6098,7 @@ fn dump_wavefront_mega(
                     &subtile_tape,
                     &rg,
                 );
-                let src = ferrite_wavefront::tk_player::emit_kernel(&tk_tape);
+                let src = ferrite_wavefront::tk_player::emit_kernel(&kernel_name, &tk_tape);
                 let cache_dir = std::path::PathBuf::from(
                     std::env::var("HOME").unwrap_or_else(|_| ".".into()),
                 )

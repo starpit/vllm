@@ -227,22 +227,34 @@ fn rope_side_str(side: crate::tk_tape::RopeSide) -> &'static str {
     }
 }
 
-/// Emit a full CUDA kernel — `__global__` signature from `kernel_args`,
-/// prelude declarations (page slots, page barriers, kv layouts, softmax
-/// state, kernel-arg aliases), then the Instr body. The result is a
-/// self-contained translation unit (modulo `kittens::*` headers and the
-/// `tk_runtime.cuh` declarations the dispatcher provides).
-pub fn emit_kernel(tape: &TkTape) -> String {
-    use crate::tk_tape::{KernelArgName, KernelArgTy, NUM_CONSUMER_WARPS, NUM_PAGES, NUM_WARPS, PreludeDecl};
+/// Emit a full CUDA translation unit — `__global__` kernel + matching
+/// `extern "C" cudaError_t launch_<name>(void* const* bufs, const
+/// uint32_t* u32_args, cudaStream_t stream)` host wrapper. The wrapper
+/// pokes `cudaFuncSetAttribute(...,
+/// cudaFuncAttributeMaxDynamicSharedMemorySize, NUM_PAGES*PAGE_SIZE)`
+/// then launches the kernel with `<<<1, NUM_WARPS*32, DYN_SMEM,
+/// stream>>>`.
+///
+/// `name` is the kernel's external symbol — both the `__global__` and
+/// `launch_<name>` use it. ferrite-wavefront/launcher.rs declares an
+/// `extern "C"` FFI to `launch_<name>` for each per-shape kernel; the
+/// macro-side dump_wavefront_mega writes the resulting .cu to
+/// ~/.cache/cudaforge/megakernels/<name>.cu.
+pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
+    use crate::tk_tape::{
+        KernelArgName, KernelArgTy, NUM_CONSUMER_WARPS, NUM_PAGES, NUM_WARPS, PAGE_SIZE,
+        PreludeDecl,
+    };
+
+    let total_threads = (NUM_WARPS as u32) * 32;
+    let dyn_smem: u64 = (NUM_PAGES as u64) * (PAGE_SIZE as u64);
 
     let mut out = String::new();
     out.push_str("// emitted by tk_player\n");
     out.push_str("#include <kittens.cuh>\n\n");
 
-    // Kernel signature: `__global__ void tk_kernel(<args...>)`.
-    out.push_str("extern \"C\" __global__ __launch_bounds__(");
-    let _ = write!(out, "{}", (NUM_WARPS as u32) * 32);
-    out.push_str(") void tk_kernel(\n");
+    // Kernel signature: `__global__ void <name>(<args...>)`.
+    let _ = write!(out, "extern \"C\" __global__ __launch_bounds__({total_threads}) void {name}(\n");
     for (i, arg) in tape.kernel_args.iter().enumerate() {
         let comma = if i + 1 == tape.kernel_args.len() { "" } else { "," };
         let name = match &arg.name {
@@ -324,6 +336,72 @@ pub fn emit_kernel(tape: &TkTape) -> String {
         emit_instr(&mut out, instr);
     }
 
+    out.push_str("}\n\n");
+
+    // ── Host launcher (C linkage) ──────────────────────────────────
+    //
+    // Emits `extern "C" cudaError_t launch_<name>(void* const* bufs,
+    // const uint32_t* u32_args, cudaStream_t stream)` so
+    // ferrite-wavefront/launcher.rs's FFI can dispatch the kernel
+    // without knowing its mangled C++ name or arg list — both are
+    // baked into this wrapper.
+    //
+    // Steps:
+    //  1. cudaFuncSetAttribute(MaxDynamicSharedMemorySize, NUM_PAGES *
+    //     PAGE_SIZE) lifts the H100 default 48 KB dyn-smem cap so the
+    //     page pool fits.
+    //  2. Single-CTA persistent megakernel launch
+    //     `<<<1, total_threads, DYN_SMEM, stream>>>`.
+    //  3. Forwards each `bufs[i]` cast to the declared kernel-arg
+    //     pointer type, and `u32_args[j]` for each runtime u32.
+
+    let _ = write!(
+        out,
+        "extern \"C\" cudaError_t launch_{name}(\n    \
+            void* const* bufs,\n    \
+            const uint32_t* u32_args,\n    \
+            cudaStream_t stream\n) {{\n"
+    );
+    let _ = writeln!(out, "    constexpr size_t DYN_SMEM = {dyn_smem}u;");
+    let _ = writeln!(out, "    (void)bufs; (void)u32_args;");
+    let _ = writeln!(
+        out,
+        "    cudaError_t __err = cudaFuncSetAttribute(\n        \
+            (const void*)&{name},\n        \
+            cudaFuncAttributeMaxDynamicSharedMemorySize,\n        \
+            (int)DYN_SMEM);\n    \
+            if (__err != cudaSuccess) return __err;"
+    );
+    let _ = write!(out, "    {name}<<<1, {total_threads}, DYN_SMEM, stream>>>(");
+    let mut bufptr_idx = 0usize;
+    let mut u32_idx = 0usize;
+    let mut first = true;
+    for arg in &tape.kernel_args {
+        if !first {
+            out.push_str(",");
+        }
+        first = false;
+        out.push_str("\n        ");
+        match &arg.ty {
+            crate::tk_tape::KernelArgTy::U32 { .. } => {
+                let _ = write!(out, "u32_args[{u32_idx}]");
+                u32_idx += 1;
+            }
+            crate::tk_tape::KernelArgTy::BufPtr(_) => {
+                // The kernel takes `const __grid_constant__
+                // kittens::CUtensorMap` — but our wrapper takes
+                // `void*` from the dispatcher. Pre-baked TMA
+                // descriptors (`kittens::gl<>` / cuTensorMapEncode
+                // ...) need real wiring; today we forward the
+                // pointer as a bf16* so the kernel-side TMA wrappers
+                // at least see a well-typed address.
+                let _ = write!(out, "*reinterpret_cast<const kittens::CUtensorMap*>(bufs[{bufptr_idx}])");
+                bufptr_idx += 1;
+            }
+        }
+    }
+    out.push_str("\n    );\n");
+    out.push_str("    return cudaGetLastError();\n");
     out.push_str("}\n");
     out
 }
@@ -446,7 +524,7 @@ mod tests {
     #[test]
     fn empty_tape_emits_only_header() {
         let tape = TkTape::default();
-        let out = emit_kernel(&tape);
+        let out = emit_kernel("tk_test", &tape);
         assert!(out.contains("// emitted by tk_player"));
         assert!(!out.contains("for ("));
     }
@@ -519,7 +597,7 @@ mod tests {
     fn cross_op_fence_is_a_sequence_of_primitive_instrs() {
         let mut tape = TkTape::default();
         tape.emit_cross_op_gmem_fence();
-        let out = emit_kernel(&tape);
+        let out = emit_kernel("tk_test", &tape);
         // The 5-Instr fence appears in the body, in order, each on its
         // own indented line. Kernel signature + prelude precede it.
         let body_start = out.find("// ── tape body ──\n").expect("tape body marker");
@@ -595,7 +673,7 @@ mod tests {
             },
         });
         tape.instrs.push(Instr::SyncthreadsCta { role: WarpRole::All });
-        let out = emit_kernel(&tape);
+        let out = emit_kernel("tk_test", &tape);
         let sig = out.find("extern \"C\" __global__").expect("signature");
         let alias = out.find("auto a0 = __num_kv_pages;").expect("kernel-arg alias");
         let pages = out.find("page_buf[NUM_PAGES]").expect("page_buf decl");

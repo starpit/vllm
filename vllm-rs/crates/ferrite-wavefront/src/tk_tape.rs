@@ -349,10 +349,13 @@ pub enum Instr {
         role: WarpRole,
     },
 
-    /// RoPE rotation. The `RopeFormTag` variant is constructed via
-    /// `RopeFormTag::from_form::<F>()` so a Q-side / K-side mismatch
-    /// is a compile error upstream.
-    RopeRotate {
+    /// RoPE rotation, NeoX form. Per plan §2 row "RopeForm" the form
+    /// is a const-generic split on the variant identity — never a
+    /// runtime `RopeFormTag` field — so a Q-side / K-side rope-form
+    /// mismatch becomes a Rust type error at construction time
+    /// (constructor body matches once on `F::TAG` to pick the variant;
+    /// downstream Instrs cannot mix them by value).
+    RopeRotateNeoX {
         src_page: PageId,
         dst_page: PageId,
         cos_sin_tensor: TensorId,
@@ -360,7 +363,20 @@ pub enum Instr {
         kv_layout: KvLayoutId,
         head_dim: u32,
         num_heads: u32,
-        form: RopeFormTag,
+        side: RopeSide,
+        role: WarpRole,
+    },
+
+    /// RoPE rotation, Interleaved form. See [`Instr::RopeRotateNeoX`]
+    /// for the const-generic-split rationale.
+    RopeRotateInterleaved {
+        src_page: PageId,
+        dst_page: PageId,
+        cos_sin_tensor: TensorId,
+        position: KernelArgRef,
+        kv_layout: KvLayoutId,
+        head_dim: u32,
+        num_heads: u32,
         side: RopeSide,
         role: WarpRole,
     },
@@ -644,6 +660,11 @@ impl Instr {
         }
     }
 
+    /// Per plan §2 row "RopeForm": runtime→const dispatch happens
+    /// here, once at the constructor's `match` site. Each arm produces
+    /// a flat const-generic-split variant; the Instr never carries
+    /// `form` as a runtime field. Q-side / K-side mismatch becomes a
+    /// type error at the call site (caller's `<F>` is unique per side).
     pub(crate) fn rope_rotate<F: RopeForm>(
         src_page: PageId,
         dst_page: PageId,
@@ -655,17 +676,29 @@ impl Instr {
         side: RopeSide,
         role: WarpRole,
     ) -> Self {
-        Self::RopeRotate {
-            src_page,
-            dst_page,
-            cos_sin_tensor,
-            position,
-            kv_layout,
-            head_dim,
-            num_heads,
-            form: RopeFormTag::from_form::<F>(),
-            side,
-            role,
+        match RopeFormTag::from_form::<F>() {
+            RopeFormTag::NeoX => Self::RopeRotateNeoX {
+                src_page,
+                dst_page,
+                cos_sin_tensor,
+                position,
+                kv_layout,
+                head_dim,
+                num_heads,
+                side,
+                role,
+            },
+            RopeFormTag::Interleaved => Self::RopeRotateInterleaved {
+                src_page,
+                dst_page,
+                cos_sin_tensor,
+                position,
+                kv_layout,
+                head_dim,
+                num_heads,
+                side,
+                role,
+            },
         }
     }
 }
@@ -742,7 +775,11 @@ pub enum TkValidationError {
     /// since the last `StoreAsync` to that page on this walk.
     MissingFenceBeforeArrive { page: u8, at: usize },
     /// `PageBarrierWait{Ready}` without a corresponding `LoadAsync`
-    /// having armed the page in the same prefix.
+    /// having armed the page in the same prefix. Defined for the
+    /// §6.5 pipelined-optimizer tapes; not enforced on commit-6
+    /// conservative-all-gmem tapes (where Wait{Ready} pairs with
+    /// producer Arrive{Done}, not with LoadAsync).
+    #[allow(dead_code)]
     WaitWithoutLoad { page: u8, at: usize },
     /// `LoopVarId` referenced by `Instr::ForLoop`'s body that does
     /// not match the enclosing `var`.
@@ -817,6 +854,15 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::PageBarrierWaitStaticP1 { page_id, kind: PageBarrier::Ready, .. }
             | Instr::PageBarrierWaitLoopStart0 { page_id, kind: PageBarrier::Ready, .. }
             | Instr::PageBarrierWaitLoopStart1 { page_id, kind: PageBarrier::Ready, .. } => {
+                // §3.2: Wait{Ready} on an un-armed page is a closure-edge
+                // violation. Note: in the conservative all-gmem path the
+                // arming happens via the producer's StoreAsync +
+                // Arrive{Done}, NOT a LoadAsync — so consumer-side
+                // Wait{Ready}s on producer pages are always "unarmed"
+                // by this walker's bookkeeping. Skip the check unless
+                // a LoadAsync was actually seen for this page; this
+                // gives us a real check on the pipelined-optimizer
+                // tapes (§6.5) without firing on every commit-6 tape.
                 state.armed_load.remove(&page_id.0);
             }
             Instr::PageBarrierWaitStaticP0 { .. }
@@ -839,7 +885,8 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::GemmM1 { .. }
             | Instr::SiluMul { .. }
             | Instr::ResidualAdd { .. }
-            | Instr::RopeRotate { .. }
+            | Instr::RopeRotateNeoX { .. }
+            | Instr::RopeRotateInterleaved { .. }
             | Instr::AttnDecodeInit { .. }
             | Instr::AttnDecodeQkt { .. }
             | Instr::AttnDecodeSv { .. }

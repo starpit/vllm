@@ -56,7 +56,7 @@ use crate::subtile_tape::{
 use crate::tk_tape::{
     AccumKind, ByteOffset, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
     KvLayoutEntry, KvLayoutId, LoadSpec, LoopVarId as TkLoopVarId, PageBarrier, PageId,
-    RopeFormTag, RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
+    RopeSide, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape,
     TkTape, U32Source, WarpRole, validate_tk_tape,
 };
 
@@ -747,7 +747,7 @@ fn emit_rope_rotate<F: RopeForm>(
     // tensor's shape — the IR doesn't carry one for Q-side rotate.
     let qk_layout = synthesize_q_layout(state, node, head_dim);
     let kv_layout = state.intern_kv_layout(qk_layout);
-    state.push(Instr::RopeRotate {
+    state.push(rope_rotate_instr::<F>(
         src_page,
         dst_page,
         cos_sin_tensor,
@@ -755,10 +755,8 @@ fn emit_rope_rotate<F: RopeForm>(
         kv_layout,
         head_dim,
         num_heads,
-        form: bridge_rope_form_tag::<F>(),
         side,
-        role: COMPUTE_ROLE,
-    });
+    ));
 }
 
 fn emit_rope_append<F: RopeForm>(
@@ -775,7 +773,7 @@ fn emit_rope_append<F: RopeForm>(
     let cos_sin_tensor = node.inputs[1].tensor;
     let src_page = page_of_nth(state, reads, 0, dst_page);
     let kv_layout = state.intern_kv_layout(layout);
-    state.push(Instr::RopeRotate {
+    state.push(rope_rotate_instr::<F>(
         src_page,
         dst_page,
         cos_sin_tensor,
@@ -783,10 +781,8 @@ fn emit_rope_append<F: RopeForm>(
         kv_layout,
         head_dim,
         num_heads,
-        form: bridge_rope_form_tag::<F>(),
-        side: RopeSide::K,
-        role: COMPUTE_ROLE,
-    });
+        RopeSide::K,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -947,15 +943,46 @@ fn synthesize_q_layout<F: RopeForm>(
     KvCacheLayout::for_cache_tensor(node.output.tensor, num_heads, head_dim)
 }
 
-/// Bridge SubtileIR's `RopeForm::TAG` (canonical) to TkTape's
-/// `RopeFormTag` (the legacy `tk_tape::RopeForm` trait will be deleted
-/// alongside the metal_tape carcass; until then this bridge keeps the
-/// canonical IR-side const flowing).
-fn bridge_rope_form_tag<F: RopeForm>() -> RopeFormTag {
+/// Build the const-generic-split `Instr::RopeRotate{NeoX,Interleaved}`
+/// variant from the IR-side `F: RopeForm` const generic. Per plan §2
+/// row "RopeForm": the `match` on `F::TAG` is the single runtime→const
+/// dispatch site; downstream Instrs cannot mix forms by value because
+/// the variant identity itself is the witness.
+#[allow(clippy::too_many_arguments)]
+fn rope_rotate_instr<F: RopeForm>(
+    src_page: PageId,
+    dst_page: PageId,
+    cos_sin_tensor: TensorId,
+    position: KernelArgRef,
+    kv_layout: KvLayoutId,
+    head_dim: u32,
+    num_heads: u32,
+    side: RopeSide,
+) -> Instr {
     use crate::subtile_ir::RopeFormTag as IrTag;
     match F::TAG {
-        IrTag::NeoX => RopeFormTag::NeoX,
-        IrTag::Interleaved => RopeFormTag::Interleaved,
+        IrTag::NeoX => Instr::RopeRotateNeoX {
+            src_page,
+            dst_page,
+            cos_sin_tensor,
+            position,
+            kv_layout,
+            head_dim,
+            num_heads,
+            side,
+            role: COMPUTE_ROLE,
+        },
+        IrTag::Interleaved => Instr::RopeRotateInterleaved {
+            src_page,
+            dst_page,
+            cos_sin_tensor,
+            position,
+            kv_layout,
+            head_dim,
+            num_heads,
+            side,
+            role: COMPUTE_ROLE,
+        },
     }
 }
 

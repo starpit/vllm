@@ -200,6 +200,42 @@ mod tk20 {
              kittens::group<1>::arrive(&{barrier}[{page}]); }}"
         )
     }
+
+    // ── Scaffolding helpers (used by emit_kernel) ──────────────────
+    //
+    // Per `feedback_dogfood_tk20_rust`: every `kittens::*` substring
+    // in the emitter lives inside this `tk20` module — including
+    // `#include`, kernel signature `kittens::CUtensorMap`, shared-
+    // memory page/semaphore declarations, the `softmax_state` array,
+    // and the host-wrapper `kittens::CUtensorMap*` cast.
+    //
+    // None of these are TK 2.0 calls per se — they are scaffolding —
+    // but the rule is layering, not call-site: if it says `kittens::`
+    // it lives in `tk20`.
+
+    pub fn header_include() -> &'static str {
+        "#include <kittens.cuh>\n\n"
+    }
+
+    pub fn ctensor_map_kernel_arg(name: &str, comma: &str) -> String {
+        format!("    const __grid_constant__ kittens::CUtensorMap {name}{comma}\n")
+    }
+
+    pub fn shared_st_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
+        format!("    __shared__ kittens::st_bf<{rows}, {cols}> page_buf[{count_macro}];\n")
+    }
+
+    pub fn shared_semaphore_decl(name: &str, count_macro: &str) -> String {
+        format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
+    }
+
+    pub fn softmax_state_array_decl(count: usize) -> String {
+        format!("    kittens::ops::softmax_state softmax_state[{count}];\n")
+    }
+
+    pub fn ctensor_map_cast(buf_idx: usize) -> String {
+        format!("*reinterpret_cast<const kittens::CUtensorMap*>(bufs[{buf_idx}])")
+    }
 }
 
 fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
@@ -208,14 +244,6 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
         PageBarrier::Ready => "page_ready",
         PageBarrier::Done => "page_done",
         PageBarrier::Consumed => "page_consumed",
-    }
-}
-
-fn rope_form_str(form: crate::tk_tape::RopeFormTag) -> &'static str {
-    use crate::tk_tape::RopeFormTag;
-    match form {
-        RopeFormTag::NeoX => "NeoX",
-        RopeFormTag::Interleaved => "Interleaved",
     }
 }
 
@@ -251,7 +279,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
 
     let mut out = String::new();
     out.push_str("// emitted by tk_player\n");
-    out.push_str("#include <kittens.cuh>\n\n");
+    out.push_str(tk20::header_include());
 
     // Kernel signature: `__global__ void <name>(<args...>)`.
     let _ = write!(out, "extern \"C\" __global__ __launch_bounds__({total_threads}) void {name}(\n");
@@ -265,7 +293,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
                 let _ = writeln!(out, "    uint32_t {name}{comma}");
             }
             KernelArgTy::BufPtr(_) => {
-                let _ = writeln!(out, "    const __grid_constant__ kittens::CUtensorMap {name}{comma}");
+                out.push_str(&tk20::ctensor_map_kernel_arg(name, comma));
             }
         }
     }
@@ -284,11 +312,11 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     // Substrate constants the body references.
     let _ = writeln!(out, "    constexpr uint NUM_PAGES = {NUM_PAGES}u;");
     let _ = writeln!(out, "    constexpr uint NUM_CONSUMER_WARPS = {NUM_CONSUMER_WARPS}u;");
-    let _ = writeln!(out, "    __shared__ kittens::st_bf<128, 128> page_buf[NUM_PAGES];");
-    out.push_str("    __shared__ kittens::semaphore page_ready[NUM_PAGES];\n");
-    out.push_str("    __shared__ kittens::semaphore page_done[NUM_PAGES];\n");
-    out.push_str("    __shared__ kittens::semaphore page_consumed[NUM_PAGES];\n");
-    out.push_str("    __shared__ kittens::semaphore page_carry[NUM_PAGES];\n");
+    out.push_str(&tk20::shared_st_bf_decl(128, 128, "NUM_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("page_ready", "NUM_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("page_carry", "NUM_PAGES"));
 
     // Per-prelude-decl emit. Each PreludeDecl variant lands one
     // declaration at function scope.
@@ -310,11 +338,9 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     }
 
     // Online-softmax state (one entry per AttnDecode).
-    let _ = writeln!(
-        out,
-        "    kittens::ops::softmax_state softmax_state[{}];",
-        std::cmp::max(1, count_softmax_states(tape)),
-    );
+    out.push_str(&tk20::softmax_state_array_decl(
+        std::cmp::max(1, count_softmax_states(tape)) as usize,
+    ));
 
     // KvCacheLayout table (per plan §2 line 88: TkTape consumer reads
     // the witness via single-source method `TkTape::kv_layout(id)`).
@@ -410,7 +436,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
                 // ...) need real wiring; today we forward the
                 // pointer as a bf16* so the kernel-side TMA wrappers
                 // at least see a well-typed address.
-                let _ = write!(out, "*reinterpret_cast<const kittens::CUtensorMap*>(bufs[{bufptr_idx}])");
+                out.push_str(&tk20::ctensor_map_cast(bufptr_idx));
                 bufptr_idx += 1;
             }
         }
@@ -503,8 +529,12 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::ResidualAdd { a_page, b_page, out_page, cols, role: _ } => {
             let _ = writeln!(out, "{}", tk20::residual_add(a_page.0, b_page.0, out_page.0, *cols));
         }
-        Instr::RopeRotate { src_page, dst_page, cos_sin_tensor, position, kv_layout, head_dim, num_heads, form, side, role: _ } => {
-            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, rope_form_str(*form), rope_side_str(*side));
+        Instr::RopeRotateNeoX { src_page, dst_page, cos_sin_tensor, position, kv_layout, head_dim, num_heads, side, role: _ } => {
+            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, "NeoX", rope_side_str(*side));
+            let _ = writeln!(out, "{s}");
+        }
+        Instr::RopeRotateInterleaved { src_page, dst_page, cos_sin_tensor, position, kv_layout, head_dim, num_heads, side, role: _ } => {
+            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, "Interleaved", rope_side_str(*side));
             let _ = writeln!(out, "{s}");
         }
         Instr::AttnDecodeInit {

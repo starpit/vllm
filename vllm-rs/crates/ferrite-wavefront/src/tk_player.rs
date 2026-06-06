@@ -320,8 +320,8 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
 fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
     match instr {
         Instr::SyncthreadsCta { role: _ } => out.push_str("__syncthreads();\n"),
-        Instr::SyncthreadsGroup { n_warps, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::sync(*n_warps));
+        Instr::SyncthreadsGroup { width, role: _ } => {
+            let _ = writeln!(out, "{}", tk20::sync(width.n()));
         }
         Instr::ThreadfenceBlock { role: _ } => out.push_str("__threadfence_block();\n"),
         Instr::ThreadfenceDevice { role: _ } => out.push_str("__threadfence();\n"),
@@ -411,11 +411,23 @@ mod tests {
         );
     }
 
+    /// `Instr::SyncthreadsGroup` is now constructed from a typed
+    /// `GroupWidth<N>` witness (N ∈ sealed `{1, 4, 16, 20}`); the
+    /// previous `n_warps: u32` runtime field would have accepted
+    /// arbitrary template parameters like `<8>`.
     #[test]
     fn syncthreads_group_emits_kittens_sync() {
+        use crate::tk_tape::GroupWidth;
         assert_eq!(
-            emit(Instr::SyncthreadsGroup { n_warps: 8, role: WarpRole::All }),
-            "kittens::group<8>::sync();\n"
+            emit(Instr::syncthreads_group(WarpRole::All, GroupWidth::<4>::WARPGROUP)),
+            "kittens::group<4>::sync();\n",
+        );
+        assert_eq!(
+            emit(Instr::syncthreads_group(
+                WarpRole::AllConsumers,
+                GroupWidth::<16>::ALL_CONSUMERS,
+            )),
+            "kittens::group<16>::sync();\n",
         );
     }
 
@@ -544,6 +556,25 @@ mod tests {
         assert_eq!(
             s,
             "kittens::group<16>::mul(page_buf[3], page_buf[1], page_buf[2]);\n",
+        );
+    }
+
+    /// `Instr::store_async_typed` derives the
+    /// `kittens::st_<NAME><ROWS, COLS>` template instantiation from
+    /// the `SmemTileId<ROWS, COLS, T>` type-level shape — a stringly-
+    /// typed mismatch (`"st_bf<128, 128>"` for a 64×128 tile) is
+    /// no longer expressible. The constructor erases the const-
+    /// generics into the runtime field; the player formats the call.
+    #[test]
+    fn store_async_typed_emits_typed_template_from_witness() {
+        use crate::subtile_ir::TensorId;
+        use crate::tk_tape::{Bf16, PageId, SmemTileId};
+        let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(5));
+        let s = emit(Instr::store_async_typed(src, TensorId(7), WarpRole::Storer));
+        assert_eq!(
+            s,
+            "kittens::group<1>::tma::store_async_typed<\
+             kittens::st_bf<128, 128>>(a7, page_buf[5]);\n",
         );
     }
 

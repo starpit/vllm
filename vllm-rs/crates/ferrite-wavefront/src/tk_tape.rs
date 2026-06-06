@@ -188,7 +188,13 @@ pub enum Instr {
     /// `__syncthreads()` — full CTA.
     SyncthreadsCta { role: WarpRole },
     /// `kittens::group<N>::sync()` — N-warp group sync.
-    SyncthreadsGroup { n_warps: u32, role: WarpRole },
+    /// `kittens::group<N>::sync()` — warp-group barrier sync.
+    ///
+    /// `width` is the sealed [`GroupWidthTag`] (recovered from a
+    /// `GroupWidth<N>` typed witness). N is restricted at construction
+    /// to the sealed set `{1, 4, 16, 20}`; an arbitrary u32 cannot
+    /// reach this variant.
+    SyncthreadsGroup { width: GroupWidthTag, role: WarpRole },
 
     /// `__threadfence_block()` — CTA-scope.
     ThreadfenceBlock { role: WarpRole },
@@ -490,23 +496,32 @@ mod tile_dtype_sealed {
     pub trait Sealed {}
 }
 
-/// Sealed marker for TK 2.0 tile element types. Each impl is the
-/// type-level identity of a `kittens::st_bf<…>` / `st_fl<…>` etc.
-/// `NAME` is the CUDA literal used by the emitter for the
-/// `kittens::st_<NAME><…>` template instantiation — but currently the
-/// substrate hardcodes `st_bf` in the page_buf decl, so `NAME` is for
-/// future emit (when non-bf16 pools land).
+/// Sealed marker for TK 2.0 tile element types. Each impl carries
+/// the `kittens::st_<alias>` template alias used by the emitter:
+///
+/// ```c++
+/// // third_party/thunderkittens/include/types/shared/st.cuh:313
+/// using st_bf = st<bf16,  _height, _width, _swizzle, _swizzle_bytes>;
+/// using st_fl = st<float, _height, _width, _swizzle, _swizzle_bytes>;
+/// using st_hf = st<half,  _height, _width, _swizzle, _swizzle_bytes>;
+/// ```
+///
+/// The alias suffix (e.g. `bf` for bf16) — NOT the underlying scalar
+/// name — is what concatenates after `kittens::st_` in emit. Hence
+/// `Bf16::ST_ALIAS_SUFFIX = "bf"`, not `"bf16"`.
 pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
-    const NAME: &'static str;
+    /// Suffix for the `kittens::st_<suffix><ROWS, COLS>` template
+    /// alias defined in `types/shared/st.cuh:313`.
+    const ST_ALIAS_SUFFIX: &'static str;
 }
 
 /// `kittens::bf16` — Hopper bfloat16. The only dtype currently bound
-/// to a page in the substrate.
+/// to a page in the substrate. Aliased as `kittens::st_bf<…>`.
 #[derive(Clone, Copy, Debug)]
 pub struct Bf16;
 impl tile_dtype_sealed::Sealed for Bf16 {}
 impl TileDtype for Bf16 {
-    const NAME: &'static str = "bf16";
+    const ST_ALIAS_SUFFIX: &'static str = "bf";
 }
 
 /// Typed shared-memory tile handle: a [`PageId`] paired with type-level
@@ -719,8 +734,19 @@ impl Instr {
         Self::SyncthreadsCta { role }
     }
 
-    pub(crate) fn syncthreads_group(role: WarpRole, n_warps: u32) -> Self {
-        Self::SyncthreadsGroup { n_warps, role }
+    /// Construct a [`Instr::SyncthreadsGroup`] from a typed
+    /// [`GroupWidth<N>`] witness. `N` is restricted to the sealed
+    /// set `{1, 4, 16, 20}` — passing an arbitrary integer is a
+    /// rustc error (no `Sealed` impl), per
+    /// `feedback_ff_subtile_compile_time_inviolable`.
+    pub(crate) fn syncthreads_group<const N: usize>(role: WarpRole, width: GroupWidth<N>) -> Self
+    where
+        GroupWidth<N>: group_width_sealed::Sealed,
+    {
+        Self::SyncthreadsGroup {
+            width: width.tag(),
+            role,
+        }
     }
 
     pub(crate) fn threadfence_device(role: WarpRole) -> Self {
@@ -802,16 +828,32 @@ impl Instr {
         }
     }
 
-    pub(crate) fn store_async_typed(
-        dst_page: PageId,
+    /// Construct a [`Instr::StoreAsyncTyped`] from a typed source
+    /// tile witness. `src` is a [`SmemTileId<ROWS, COLS, T>`] —
+    /// `ROWS`, `COLS`, and `T::NAME` are propagated into the emitted
+    /// `kittens::st_<NAME><ROWS, COLS>` template instantiation, so a
+    /// stringly-typed tile-type mismatch is unrepresentable.
+    /// Previously the constructor took `dst_page: PageId` and
+    /// `tile_type_str: impl Into<String>` — a caller could pass
+    /// `"kittens::st_bf<128, 128>"` when `dst_page` actually held a
+    /// `st_bf<64, 128>` tile. Per
+    /// `feedback_ff_subtile_compile_time_inviolable`, that gap is now
+    /// closed: the type system writes the format string.
+    pub(crate) fn store_async_typed<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        src: SmemTileId<ROWS, COLS, T>,
         dst_tensor: TensorId,
-        tile_type_str: impl Into<String>,
         role: WarpRole,
     ) -> Self {
+        let tile_type = format!(
+            "kittens::st_{}<{}, {}>",
+            T::ST_ALIAS_SUFFIX,
+            ROWS,
+            COLS,
+        );
         Self::StoreAsyncTyped {
-            dst_page,
+            dst_page: src.page(),
             dst_tensor,
-            tile_type: TileType::from_layout(tile_type_str),
+            tile_type: TileType::from_layout(tile_type),
             role,
         }
     }

@@ -119,6 +119,11 @@ pub struct KernelArg {
 #[derive(Debug, Clone)]
 pub enum KernelArgName {
     Fixed(&'static str),
+    /// Per-tensor kernel arg: canonical text is `t<TensorId.0>`. The
+    /// SubtileIR `TensorId` is the witness of identity — the player
+    /// is the only place the canonical text appears, so a lowering
+    /// cannot synthesize an unknown tensor name.
+    Tensor(TensorId),
 }
 
 #[derive(Debug, Clone)]
@@ -302,7 +307,7 @@ pub enum Instr {
     /// tensors declared as descriptor-bound on the kernel-arg side.
     StoreAsyncTyped {
         dst_page: PageId,
-        dst_tensor: TensorId,
+        dst_arg: KernelArgRef,
         tile_type: TileTypeSpec,
         role: WarpRole,
     },
@@ -2162,7 +2167,12 @@ impl ScalarF32 {
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
     pub dst_page: PageId,
-    pub src_tensor: TensorId,
+    /// Index into [`TkTape::kernel_args`] of the source tensor's
+    /// CTensorMap arg. The player resolves to `aN` where N is this
+    /// index (the kernel signature's `auto aN = ...` aliases). The
+    /// SubtileIR `TensorId` lives on the [`KernelArgTy::BufPtr`]
+    /// payload of the referenced kernel arg.
+    pub src_arg: KernelArgRef,
     pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
@@ -2178,7 +2188,7 @@ impl LoadSpec {
     /// Per `feedback_ff_subtile_compile_time_inviolable`.
     pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
         dst_page: PageId,
-        src_tensor: TensorId,
+        src_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
         tile: SmemTileSpec<ROWS, COLS, T>,
         role: LoaderRole,
@@ -2186,7 +2196,7 @@ impl LoadSpec {
     ) -> Self {
         Self {
             dst_page,
-            src_tensor,
+            src_arg,
             byte_off,
             tile: tile.shape(),
             role: role.to_warp_role(),
@@ -2205,7 +2215,7 @@ impl LoadSpec {
     /// the SubtileIR's tensor regions.
     pub(crate) fn new_runtime_shape(
         dst_page: PageId,
-        src_tensor: TensorId,
+        src_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
         tile: TileShape,
         role: LoaderRole,
@@ -2213,7 +2223,7 @@ impl LoadSpec {
     ) -> Self {
         Self {
             dst_page,
-            src_tensor,
+            src_arg,
             byte_off,
             tile,
             role: role.to_warp_role(),
@@ -2225,7 +2235,9 @@ impl LoadSpec {
 #[derive(Debug, Clone)]
 pub struct StoreSpec {
     pub src_page: PageId,
-    pub dst_tensor: TensorId,
+    /// Index into [`TkTape::kernel_args`] of the destination tensor's
+    /// CTensorMap arg. See [`LoadSpec::src_arg`].
+    pub dst_arg: KernelArgRef,
     pub byte_off: ByteOffsetExpr,
     pub tile: TileShape,
     pub role: WarpRole,
@@ -2236,14 +2248,14 @@ impl StoreSpec {
     /// COLS, T>`] witness. See [`LoadSpec::new`].
     pub(crate) fn new<const ROWS: usize, const COLS: usize, T: TileDtype>(
         src_page: PageId,
-        dst_tensor: TensorId,
+        dst_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
         tile: SmemTileSpec<ROWS, COLS, T>,
         role: StorerRole,
     ) -> Self {
         Self {
             src_page,
-            dst_tensor,
+            dst_arg,
             byte_off,
             tile: tile.shape(),
             role: role.to_warp_role(),
@@ -2253,14 +2265,14 @@ impl StoreSpec {
     /// Runtime-shape store, parallel to [`LoadSpec::new_runtime_shape`].
     pub(crate) fn new_runtime_shape(
         src_page: PageId,
-        dst_tensor: TensorId,
+        dst_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
         tile: TileShape,
         role: StorerRole,
     ) -> Self {
         Self {
             src_page,
-            dst_tensor,
+            dst_arg,
             byte_off,
             tile,
             role: role.to_warp_role(),
@@ -3496,7 +3508,7 @@ impl Instr {
     /// closed: the type system writes the format string.
     pub(crate) fn store_async_typed<const ROWS: usize, const COLS: usize, T: TileDtype>(
         src: SmemTileId<ROWS, COLS, T>,
-        dst_tensor: TensorId,
+        dst_arg: KernelArgRef,
         role: StorerRole,
     ) -> Self {
         // Erase the typed witness into structured runtime data —
@@ -3505,7 +3517,7 @@ impl Instr {
         // time. Per `feedback_no_premature_string_encoding`.
         Self::StoreAsyncTyped {
             dst_page: src.page(),
-            dst_tensor,
+            dst_arg,
             tile_type: TileTypeSpec {
                 rows: ROWS as u32,
                 cols: COLS as u32,
@@ -3881,7 +3893,7 @@ mod tests {
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
-                    dst_tensor: crate::subtile_ir::TensorId(0),
+                    dst_arg: KernelArgRef(0),
                     byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
@@ -3908,7 +3920,7 @@ mod tests {
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
-                    dst_tensor: crate::subtile_ir::TensorId(0),
+                    dst_arg: KernelArgRef(0),
                     byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
@@ -3947,7 +3959,7 @@ mod tests {
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
-                    dst_tensor: crate::subtile_ir::TensorId(0),
+                    dst_arg: KernelArgRef(0),
                     byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,

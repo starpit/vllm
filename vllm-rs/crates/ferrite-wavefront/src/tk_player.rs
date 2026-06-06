@@ -91,7 +91,7 @@ mod tk20 {
     pub fn tma_load_async(spec: &crate::tk_tape::LoadSpec) -> String {
         format!(
             "kittens::group<1>::tma::load_async(page_buf[{}], a{}, {}, {}u, {}u, {}u, &page_ready[{}]);",
-            spec.dst_page.0, spec.src_tensor.0, byte_offset_expr(&spec.byte_off),
+            spec.dst_page.0, spec.src_arg.0, byte_offset_expr(&spec.byte_off),
             spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes, spec.barrier_page.0,
         )
     }
@@ -99,7 +99,7 @@ mod tk20 {
     pub fn tma_store_async(spec: &crate::tk_tape::StoreSpec) -> String {
         format!(
             "kittens::group<1>::tma::store_async(a{}, page_buf[{}], {}, {}u, {}u, {}u);",
-            spec.dst_tensor.0, spec.src_page.0, byte_offset_expr(&spec.byte_off),
+            spec.dst_arg.0, spec.src_page.0, byte_offset_expr(&spec.byte_off),
             spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes,
         )
     }
@@ -536,7 +536,7 @@ mod tk20 {
 
     pub fn tma_store_async_typed(
         src_page: u8,
-        dst_arg_idx: u32,
+        dst_arg_idx: u16,
         tile_type: &crate::tk_tape::TileTypeSpec,
     ) -> String {
         let tt = tile_type_spec(tile_type);
@@ -569,7 +569,13 @@ mod tk20 {
     }
 
     pub fn ctensor_map_kernel_arg(name: &str, comma: &str) -> String {
-        format!("    const __grid_constant__ kittens::CUtensorMap {name}{comma}\n")
+        // CUDA driver type from `cuda.h` (which `kittens.cuh` includes
+        // host-side, line 36) — global namespace, no `kittens::`
+        // prefix. The TK 2.0 `KITTENS_NO_HOST` JIT path stubs a
+        // `kittens::CUtensorMap` opaque shim, but with the normal
+        // host include path we get the driver-API type and that's
+        // the one TK 2.0's TMA helpers expect via `kittens::gl<>::tma_desc`.
+        format!("    const __grid_constant__ CUtensorMap {name}{comma}\n")
     }
 
     pub fn shared_st_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
@@ -581,7 +587,7 @@ mod tk20 {
     }
 
     pub fn ctensor_map_cast(buf_idx: usize) -> String {
-        format!("*reinterpret_cast<const kittens::CUtensorMap*>(bufs[{buf_idx}])")
+        format!("*reinterpret_cast<const CUtensorMap*>(bufs[{buf_idx}])")
     }
 }
 
@@ -616,6 +622,18 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
 /// `extern "C"` FFI to `launch_<name>` for each per-shape kernel; the
 /// macro-side dump_wavefront_mega writes the resulting .cu to
 /// ~/.cache/cudaforge/megakernels/<name>.cu.
+pub(crate) fn kernel_arg_name(n: &crate::tk_tape::KernelArgName) -> String {
+    use crate::tk_tape::KernelArgName;
+    match n {
+        KernelArgName::Fixed(s) => (*s).to_string(),
+        // Per-tensor arg canonical text — `t<TensorId>`. The TensorId
+        // is the witness on `KernelArgTy::BufPtr(_)` so the dispatcher
+        // can map this kernel-arg slot back to a SubtileIR tensor at
+        // launch time.
+        KernelArgName::Tensor(t) => format!("t{}", t.0),
+    }
+}
+
 pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     use crate::tk_tape::{
         KernelArgName, KernelArgTy, NUM_CONSUMER_WARPS, NUM_PAGES, NUM_WARPS, PAGE_SIZE,
@@ -633,9 +651,8 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     let _ = write!(out, "extern \"C\" __global__ __launch_bounds__({total_threads}) void {name}(\n");
     for (i, arg) in tape.kernel_args.iter().enumerate() {
         let comma = if i + 1 == tape.kernel_args.len() { "" } else { "," };
-        let name = match &arg.name {
-            KernelArgName::Fixed(s) => *s,
-        };
+        let name_owned = kernel_arg_name(&arg.name);
+        let name = name_owned.as_str();
         match &arg.ty {
             KernelArgTy::U32 { .. } => {
                 let _ = writeln!(out, "    uint32_t {name}{comma}");
@@ -650,9 +667,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     // Per-arg name aliases: `auto a0 = <KernelArgName>;` so the Instr
     // stream can reference args by index without name lookup.
     for (i, arg) in tape.kernel_args.iter().enumerate() {
-        let name = match &arg.name {
-            KernelArgName::Fixed(s) => *s,
-        };
+        let name = kernel_arg_name(&arg.name);
         let _ = writeln!(out, "    auto a{i} = {name};");
     }
     let _ = write!(out, "\n");
@@ -843,8 +858,8 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::StoreAsync(spec) => {
             let _ = writeln!(out, "{}", tk20::tma_store_async(spec));
         }
-        Instr::StoreAsyncTyped { dst_page, dst_tensor, tile_type, role: _ } => {
-            let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type);
+        Instr::StoreAsyncTyped { dst_page, dst_arg, tile_type, role: _ } => {
+            let s = tk20::tma_store_async_typed(dst_page.0, dst_arg.0, tile_type);
             let _ = writeln!(out, "{s}");
         }
         Instr::ShTileMul { lhs, rhs, dst, width } => {
@@ -1201,10 +1216,9 @@ mod tests {
     /// generics into the runtime field; the player formats the call.
     #[test]
     fn store_async_typed_emits_typed_template_from_witness() {
-        use crate::subtile_ir::TensorId;
-        use crate::tk_tape::{Bf16, PageId, SmemTileId};
+        use crate::tk_tape::{Bf16, KernelArgRef, PageId, SmemTileId};
         let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(5));
-        let s = emit(Instr::store_async_typed(src, TensorId(7), crate::tk_tape::StorerRole));
+        let s = emit(Instr::store_async_typed(src, KernelArgRef(7), crate::tk_tape::StorerRole));
         assert_eq!(
             s,
             "kittens::group<1>::tma::store_async_typed<\

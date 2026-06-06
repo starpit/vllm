@@ -107,6 +107,11 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// `decode_position` kernel-arg slot for RopeRotate / RopeAppend,
     /// lazily minted on first rotary.
     position_arg: Option<KernelArgRef>,
+    /// SubtileIR `TensorId` → kernel-arg slot for the tensor's
+    /// CTensorMap. Lazily minted by [`Self::tensor_arg`] the first
+    /// time a Load/Store references the tensor; cached so multiple
+    /// references share one signature parameter.
+    tensor_arg_index: BTreeMap<TensorId, KernelArgRef>,
     /// Page-id allocator. `next_page` is the next-fresh id minted
     /// only if `free_pages` is empty; `release_page` pushes onto
     /// `free_pages` so recycled ids are popped before fresh ones.
@@ -159,6 +164,7 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             kernel_args: Vec::new(),
             seq_len_arg: None,
             position_arg: None,
+            tensor_arg_index: BTreeMap::new(),
             next_page: 0,
             free_pages: Vec::new(),
             slot_to_page: BTreeMap::new(),
@@ -352,6 +358,30 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             },
         });
         self.position_arg = Some(r);
+        r
+    }
+
+    /// Lazily mint a kernel-arg slot for `t`'s CTensorMap descriptor.
+    /// The arg's canonical name is `t<TensorId>`, set via
+    /// [`KernelArgName::Tensor`]. Each [`Instr::LoadAsync`] /
+    /// [`Instr::StoreAsync`] / [`Instr::StoreAsyncTyped`] references
+    /// the resulting [`KernelArgRef`] — never a raw [`TensorId`] —
+    /// so the emitted CUDA's `aN` aliases always resolve to a real
+    /// kernel-signature parameter.
+    ///
+    /// Per Phase A step 8 cat 6: prior code passed
+    /// `spec.src_tensor.0` (a global SubtileIR TensorId, e.g. 181)
+    /// as the body-side `aN` index without ever pushing a matching
+    /// kernel-arg, so nvcc reported `identifier "a181" undefined`.
+    fn tensor_arg(&mut self, t: TensorId) -> KernelArgRef {
+        if let Some(r) = self.tensor_arg_index.get(&t) {
+            return *r;
+        }
+        let r = self.intern_kernel_arg(KernelArg {
+            name: KernelArgName::Tensor(t),
+            ty: KernelArgTy::BufPtr(t),
+        });
+        self.tensor_arg_index.insert(t, r);
         r
     }
 
@@ -1103,11 +1133,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // because `generic_const_exprs` is unstable; the K-witnessed
             // method is the workaround.)
             let pos_arg = state.position();
+            let k_cache_arg = state.tensor_arg(layout.cache_tensor());
+            let v_cache_arg = state.tensor_arg(layout.v_cache_tensor());
 
             // K-cache write: rotated K (dst_page) → K cache at slot[p].
             state.push(Instr::StoreAsync(StoreSpec {
                 src_page: dst_page,
-                dst_tensor: layout.cache_tensor(),
+                dst_arg: k_cache_arg,
                 byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
                 tile: TileShape {
                     rows: 128,
@@ -1120,7 +1152,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // V-cache write: un-rotated V (v_page) → V cache at slot[p].
             state.push(Instr::StoreAsync(StoreSpec {
                 src_page: v_page,
-                dst_tensor: layout.v_cache_tensor(),
+                dst_arg: v_cache_arg,
                 byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
                 tile: TileShape {
                     rows: 128,
@@ -1200,8 +1232,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let q_page = state.resolve_input_page(q_in);
             // K and V cache TensorIds come from the layout witness
             // (single source of truth, not from reads[].)
-            let k_cache = layout.cache_tensor();
-            let v_cache = layout.v_cache_tensor();
+            let k_cache = state.tensor_arg(layout.cache_tensor());
+            let v_cache = state.tensor_arg(layout.v_cache_tensor());
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             const R: AllConsumersRole = AllConsumersRole;
@@ -1451,9 +1483,10 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     // data. Per `feedback_no_speculative_witnesses`.
     let tile = region_tile_shape(inp);
     let byte_off = region_byte_offset(state.graph, inp);
+    let src_arg = state.tensor_arg(inp.tensor);
     state.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
         dst_page,
-        inp.tensor,
+        src_arg,
         byte_off,
         tile,
         LOAD_ROLE,
@@ -1471,9 +1504,10 @@ fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
     // const-generic-vs-runtime-shape rationale.
     let tile = region_tile_shape(out);
     let byte_off = region_byte_offset(state.graph, out);
+    let dst_arg = state.tensor_arg(out.tensor);
     state.push(Instr::StoreAsync(StoreSpec::new_runtime_shape(
         dst_page,
-        out.tensor,
+        dst_arg,
         byte_off,
         tile,
         STORE_ROLE,

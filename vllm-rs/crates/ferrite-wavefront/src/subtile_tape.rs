@@ -248,6 +248,7 @@ pub enum ComputeInputs {
     A2([ComputeInput; 2]),
     A3([ComputeInput; 3]),
     A4([ComputeInput; 4]),
+    A5([ComputeInput; 5]),
     A6([ComputeInput; 6]),
     Variadic(Vec<ComputeInput>),
 }
@@ -261,6 +262,7 @@ impl ComputeInputs {
             Self::A2(arr) => Box::new(arr.iter()),
             Self::A3(arr) => Box::new(arr.iter()),
             Self::A4(arr) => Box::new(arr.iter()),
+            Self::A5(arr) => Box::new(arr.iter()),
             Self::A6(arr) => Box::new(arr.iter()),
             Self::Variadic(v) => Box::new(v.iter()),
         }
@@ -272,6 +274,7 @@ impl ComputeInputs {
             Self::A2(_) => 2,
             Self::A3(_) => 3,
             Self::A4(_) => 4,
+            Self::A5(_) => 5,
             Self::A6(_) => 6,
             Self::Variadic(v) => v.len(),
         }
@@ -309,6 +312,12 @@ impl ComputeInputs {
         match self {
             Self::A4(arr) => arr,
             _ => panic!("{arm}: expected ComputeInputs::A4, got {:?}", self.len()),
+        }
+    }
+    pub fn expect_a5(&self, arm: &'static str) -> &[ComputeInput; 5] {
+        match self {
+            Self::A5(arr) => arr,
+            _ => panic!("{arm}: expected ComputeInputs::A5, got {:?}", self.len()),
         }
     }
     pub fn expect_a6(&self, arm: &'static str) -> &[ComputeInput; 6] {
@@ -678,6 +687,13 @@ fn dispatch_compute_inputs(inputs: &[ComputeInputBuild<'_>]) -> ComputeInputs {
             ci_from(&inputs[1]),
             ci_from(&inputs[2]),
             ci_from(&inputs[3]),
+        ]),
+        5 => ComputeInputs::A5([
+            ci_from(&inputs[0]),
+            ci_from(&inputs[1]),
+            ci_from(&inputs[2]),
+            ci_from(&inputs[3]),
+            ci_from(&inputs[4]),
         ]),
         6 => ComputeInputs::A6([
             ci_from(&inputs[0]),

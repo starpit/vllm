@@ -1004,7 +1004,15 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             emit_store_and_arrive(state, &node.output, dst_page);
         }
         SubOp::RopeAppend { head_dim, layer, layout, _form: _ } => {
-            let [k_in, cos_in, sin_in, v_in] = inputs.expect_a4("RopeAppend");
+            // Arity 6 from the SubtileIR: [K, cos, sin, V, kcache, vcache].
+            // The last two (kcache, vcache) are graph-edge inputs needed
+            // for predecessor coverage, but the actual store sites take
+            // their tensor IDs from the `layout` witness, not from these
+            // input slots — so resolve_input_page is only invoked on the
+            // first four, and 4/5 are unused here. Their page-allocation
+            // is by design empty (cache tensors are global, not paged).
+            let [k_in, cos_in, sin_in, v_in, _kcache_in, _vcache_in] =
+                inputs.expect_a6("RopeAppend");
             // RopeAppend (step 10): rotate K (NeoX) + write rotated K
             // and un-rotated V into the paged KV cache at the runtime
             // decode position. Plan §"Per-SubOp Instr counts" line 26
@@ -1125,10 +1133,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             producer: _,
             softmax_state: _,
         } => {
-            // AttnDecode arity at the SubOp level is 1 (q); K/V cache
-            // tensors propagate via the `layout` witness rather than
-            // graph inputs.
-            let [q_in] = inputs.expect_a1("AttnDecode");
+            // AttnDecode arity 5 from the SubtileIR:
+            //   [q, kcache, vcache, slot_mapping, block_table] (or
+            //   similar — the precise non-q TensorIds vary; lowerer
+            //   only resolves q to a page; the cache tensors flow via
+            //   the `layout` witness, slot_mapping/block_table flow
+            //   via TmaLoadKvBlock helpers and runtime kernel args).
+            let [q_in, _kcache_in, _vcache_in, _slot_in, _block_in] =
+                inputs.expect_a5("AttnDecode");
             // AttnDecode (steps 11-14): online softmax over a paged
             // KV cache.
             //

@@ -1,11 +1,11 @@
-# Handoff — ff-subtile worktree, post-Commit 8 + §10 metal_tape scrub
+# Handoff — ff-subtile worktree, post first real-model emit
 
 ## Where to work
 
 - **Worktree:** `/Users/nickm/git/vllm/.claude/worktrees/ff-subtile`
 - **Branch:** `worktree-ff-subtile`
 - **Crate:** `vllm-rs/crates/ferrite-wavefront/`
-- **HEAD:** `c260bd19b1` — §10 dead-arm scrub of metal_tape.rs (-1318 LOC)
+- **HEAD:** `0fd390f99a` — TkTape probe nb=u32::MAX so the conservative lowering fits under NUM_PAGES; first time the pipeline emits a real `.cu` for Llama-3.2-1B (1984 lines / 118KB at `~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu`)
 
 `pwd && git branch --show-current` first thing — verify the worktree, per `memory/feedback_handoff_worktree_match.md`.
 
@@ -37,11 +37,29 @@ What landed in this session:
 
 73 unit + 12 doctests green throughout (post audit `wewpteccb`: dropped 9 typestate-redundant runtime tests; added 3 hazard compile_fail doctests).
 
-## Remaining work (all staged future commits)
+## How to trigger the TkTape probe
 
-1. **`lower.rs` deletion** (213 LOC) — plan §4 commit 7. Requires `to_wavefront.rs` (proc-macro side) to build SubtileIR directly. Multi-crate change.
-2. **`region_schedule.rs` deletion** (590 LOC) — plan §4 commit 10. mega.rs/partition.rs still consume Schedule/TapeInstr/play/schedule_from_assignment/ScheduleParams/partition_roundrobin/schedule_wavefront — requires migrating them to `SubtileTape` + `tk_player`. Substantial.
-3. **Commit 9 (E2E on H100)** — Pod-only.
+```bash
+FERRITE_WAVEFRONT=1 FERRITE_MODELS=llama-3.2-1b cargo build -p ferrite-model-llama --features metal
+```
+
+The macro's `dump_wavefront_mega` walks `lower_region` → `validate()` → `lower_dag_to_tape` → `lower_tape_to_tk` → `tk_player::emit_kernel` and writes the .cu. Look for `[wavefront-cuda-probe] llama-3.2-1b: wrote ... (118400 bytes)` in stderr.
+
+## Remaining work
+
+### Substrate-fit blockers (mid-redesign)
+
+1. **`kittens::ops::*` calls in emitted .cu are placeholders, not real TK 2.0 primitives** — the `tk_player::tk20::{rms_norm, gemm_m1, silu_mul, residual_add, rope_rotate, attn_decode_*}` helpers emit `kittens::ops::rms_norm(...)` etc. Those don't exist in `third_party/thunderkittens/include/`. Per `feedback_tk20_primitives_first` and plan §1 line 64-65 ("flat Instr enum, ONE variant per TK 2.0 / CUDA primitive"), each architectural Instr should expand to a sequence of primitive Instrs at the `lower_dag_to_tape` → `lower_tape_to_tk` lowering. Right now they're single Instrs that emit single fake-helper calls. To make the .cu compile, each arch op (RmsNorm, GemmM1, SiluMul, ResidualAdd, RopeRotate{NeoX,Interleaved}, AttnDecode{Init,Qkt,Sv,Finalise}) needs to be decomposed into TK 2.0 primitives from `include/ops/`. **This is the next big chunk of megakernel work.**
+   - Reference: `include/ops/group/shared/tile/reductions.cuh` (row_sum, row_max), `include/ops/group/mma/` (mma_AB), `include/ops/group/memory/` (tma::load_async, tma::store_async).
+   - Per `feedback_tk_player_one_call_per_arm`, each new primitive Instr must emit ≤5 lines, ONE TK 2.0 call.
+
+2. **NUM_PAGES=13 cap on max-live-slot for n-block tiling** — at nb=256 Llama needs ~24 concurrent live slots (q/k/v 8 blocks each). The probe currently uses `nb=u32::MAX` to force one block per Gemm. The §6.5 slot-coalescing pass (promote_shmem_carry_forward) is meant to fix this by reusing pages across non-overlapping live ranges. Until then, fine-grained nb requires more pages OR the §6.5 pass.
+
+### Plan-future commits (sequenced)
+
+3. **`lower.rs` deletion** (213 LOC) — plan §4 commit 7. Requires `to_wavefront.rs` (proc-macro side) to build SubtileIR directly. Multi-crate change.
+4. **`region_schedule.rs` deletion** (590 LOC) — plan §4 commit 10. mega.rs/partition.rs still consume Schedule/TapeInstr/play/schedule_from_assignment/ScheduleParams/partition_roundrobin/schedule_wavefront — requires migrating them to `SubtileTape` + `tk_player`. Substantial.
+5. **Commit 9 (E2E on H100)** — Pod-only. Blocked on (1).
 
 ## Substrate shape (current)
 

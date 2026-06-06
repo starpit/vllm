@@ -6,7 +6,7 @@
 //! MetalTapeBuilder, tile_qmv, PipelineSpec, PipelineInterner,
 //! QmvOperands/Shape/KernelInfo, Binding, RegionRef, Grid,
 //! ConstValue, FnConst, OpKind, OpDataflow, Executor) is dead —
-//! deleted in this commit. `lower_tape_to_tk` + `tk_player` own the
+//! deleted in this commit. `lower_subtile_tape_to_tk_tape` + `tk_player` own the
 //! GPU emit surface now. The §7 net-surface table targeted ~900 LOC
 //! after this scrub; the actual cut is steeper because the runtime
 //! is fully gone.

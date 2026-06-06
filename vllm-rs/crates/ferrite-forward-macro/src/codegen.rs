@@ -6073,7 +6073,7 @@ fn dump_wavefront_mega(
     //   LoweringInput (fused) -> SubtileIR (lower_region)
     //                         -> ValidatedGraph (typed witness)
     //                         -> SubtileTape (lower_dag_to_tape)
-    //                         -> TkTape (lower_tape_to_tk)
+    //                         -> TkTape (lower_subtile_tape_to_tk_tape)
     //                         -> CUDA String (tk_player::emit_kernel)
     // and write the .cu into ~/.cache/cudaforge/megakernels/ where
     // ferrite-cuda-builder/build.rs picks it up and compiles it into
@@ -6097,7 +6097,7 @@ fn dump_wavefront_mega(
         match ferrite_wavefront::subtile_ir::ValidatedGraph::new(&rg) {
             Ok(valid) => {
                 let subtile_tape = ferrite_wavefront::subtile_tape::lower_dag_to_tape(&valid);
-                let tk_tape = ferrite_wavefront::lower_tape_to_tk::lower_tape_to_tk(
+                let tk_tape = ferrite_wavefront::lower_subtile_tape_to_tk_tape::lower_subtile_tape_to_tk_tape(
                     &subtile_tape,
                     &rg,
                 );

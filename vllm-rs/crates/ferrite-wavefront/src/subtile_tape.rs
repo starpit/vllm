@@ -709,7 +709,7 @@ fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvC
 /// (alloc / free) lives outside.
 ///
 /// **No worker assignment, no fence, no memory class.** Per-target
-/// realization happens at the per-target lowering (`lower_tape_to_tk`).
+/// realization happens at the per-target lowering (`lower_subtile_tape_to_tk_tape`).
 ///
 /// The returned `SubtileTape` has been validated against `graph` via
 /// [`validate_subtile_tape`]; callers can assume well-formedness.

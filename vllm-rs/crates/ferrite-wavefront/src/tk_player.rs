@@ -71,124 +71,21 @@ mod tk20 {
         )
     }
 
-    pub fn rms_norm(
-        src_page: u8,
-        dst_page: u8,
-        gain_arg_idx: u32,
-        rows: u32,
-        cols: u32,
-        eps_bits: u32,
-    ) -> String {
-        format!(
-            "kittens::ops::rms_norm(page_buf[{dst_page}], page_buf[{src_page}], a{gain_arg_idx}, \
-             {rows}u, {cols}u, __builtin_bit_cast(float, {eps_bits}u));"
-        )
-    }
-
-    pub fn gemm_m1(
-        lhs_page: u8,
-        rhs_arg_idx: u32,
-        rhs_byte_off: &str,
-        out_page: u8,
-        m: u32,
-        n: u32,
-        k: u32,
-        accum: crate::tk_tape::AccumKind,
-    ) -> String {
-        // Single-token sealed-enum dispatch (same shape as
-        // barrier_name / rope_side_str — keeps tk20 helpers as
-        // pure string templates). Note: rope form is encoded by
-        // variant identity (Instr::RopeRotate{NeoX,Interleaved})
-        // rather than via a translator helper.
-        let accum_tok = accum_str(accum);
-        format!(
-            "kittens::ops::gemm_m1<{accum_tok}>(page_buf[{out_page}], page_buf[{lhs_page}], \
-             a{rhs_arg_idx}, {rhs_byte_off}, {m}u, {n}u, {k}u);"
-        )
-    }
-
-    fn accum_str(a: crate::tk_tape::AccumKind) -> &'static str {
-        use crate::tk_tape::AccumKind;
-        match a {
-            AccumKind::Zero => "ZERO",
-            AccumKind::Accumulate => "ACCUMULATE",
-        }
-    }
-
-    pub fn silu_mul(gate_page: u8, up_page: u8, out_page: u8, cols: u32) -> String {
-        format!(
-            "kittens::ops::silu_mul(page_buf[{out_page}], page_buf[{gate_page}], \
-             page_buf[{up_page}], {cols}u);"
-        )
-    }
-
-    pub fn residual_add(a_page: u8, b_page: u8, out_page: u8, cols: u32) -> String {
-        format!(
-            "kittens::ops::residual_add(page_buf[{out_page}], page_buf[{a_page}], \
-             page_buf[{b_page}], {cols}u);"
-        )
-    }
-
-    pub fn rope_rotate(
-        src_page: u8,
-        dst_page: u8,
-        cos_sin_arg_idx: u32,
-        position_arg_idx: u32,
-        kv_layout_id: u32,
-        head_dim: u32,
-        num_heads: u32,
-        form: &str,
-        side: &str,
-    ) -> String {
-        format!(
-            "kittens::ops::rope_rotate<{form}, {side}>(page_buf[{dst_page}], \
-             page_buf[{src_page}], a{cos_sin_arg_idx}, a{position_arg_idx}, \
-             kv_layouts[{kv_layout_id}], {head_dim}u, {num_heads}u);"
-        )
-    }
-
-    pub fn attn_decode_init(state: u32, num_q_heads: u32, num_kv_heads: u32, head_dim: u32) -> String {
-        format!(
-            "kittens::ops::attn_decode_init(softmax_state[{state}], {num_q_heads}u, \
-             {num_kv_heads}u, {head_dim}u);"
-        )
-    }
-
-    pub fn attn_decode_qkt(
-        state: u32,
-        q_page: u8,
-        k_page: u8,
-        scale_bits: u32,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    ) -> String {
-        format!(
-            "kittens::ops::attn_decode_qkt(softmax_state[{state}], page_buf[{q_page}], \
-             page_buf[{k_page}], __builtin_bit_cast(float, {scale_bits}u), {num_q_heads}u, \
-             {num_kv_heads}u, {head_dim}u);"
-        )
-    }
-
-    pub fn attn_decode_sv(
-        state: u32,
-        v_page: u8,
-        num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
-    ) -> String {
-        format!(
-            "kittens::ops::attn_decode_sv(softmax_state[{state}], page_buf[{v_page}], \
-             {num_q_heads}u, {num_kv_heads}u, {head_dim}u);"
-        )
-    }
-
-    pub fn attn_decode_finalise(state: u32, out_page: u8, num_q_heads: u32, head_dim: u32) -> String {
-        format!(
-            "kittens::ops::attn_decode_finalise(page_buf[{out_page}], softmax_state[{state}], \
-             {num_q_heads}u, {head_dim}u);"
-        )
-    }
+    // NUKED: rms_norm, gemm_m1, silu_mul, residual_add, rope_rotate,
+    // attn_decode_{init,qkt,sv,finalise} — these emitted invented
+    // `kittens::ops::*` calls that don't exist in
+    // `third_party/thunderkittens/include/`. Per
+    // `feedback_tk_2_0_only` (INVIOLABLE) + plan §1 line 64-65, every
+    // Instr must map to ONE TK 2.0 primitive in `include/ops/`, and
+    // every `kittens::*` substring this module emits must come from
+    // an actual `include/` header. Architectural Instrs (RmsNorm,
+    // GemmM1, SiluMul, ResidualAdd, RopeRotate, AttnDecode*) are
+    // gone too — they decompose into TK 2.0 primitive Instrs at the
+    // SubtileTape→TkTape lowering. The expansion is the next chunk
+    // of megakernel work; until it lands, the lowering produces a
+    // tape that contains only real TK 2.0 calls (sync / fence /
+    // tma::load_async / tma::store_async / mbarrier::*) plus the
+    // kernel-end drain.
 
     pub fn tma_store_async_typed(src_page: u8, dst_arg_idx: u32, tile_type: &str) -> String {
         format!(
@@ -231,10 +128,6 @@ mod tk20 {
         format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
     }
 
-    pub fn softmax_state_array_decl(count: usize) -> String {
-        format!("    kittens::ops::softmax_state softmax_state[{count}];\n")
-    }
-
     pub fn ctensor_map_cast(buf_idx: usize) -> String {
         format!("*reinterpret_cast<const kittens::CUtensorMap*>(bufs[{buf_idx}])")
     }
@@ -246,14 +139,6 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
         PageBarrier::Ready => "page_ready",
         PageBarrier::Done => "page_done",
         PageBarrier::Consumed => "page_consumed",
-    }
-}
-
-fn rope_side_str(side: crate::tk_tape::RopeSide) -> &'static str {
-    use crate::tk_tape::RopeSide;
-    match side {
-        RopeSide::Q => "Q",
-        RopeSide::K => "K",
     }
 }
 
@@ -339,38 +224,16 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
         }
     }
 
-    // Online-softmax state (one entry per AttnDecode).
-    out.push_str(&tk20::softmax_state_array_decl(
-        std::cmp::max(1, count_softmax_states(tape)) as usize,
-    ));
-
-    // KvCacheLayout table (per plan §2 line 88: TkTape consumer reads
-    // the witness via single-source method `TkTape::kv_layout(id)`).
-    // Emit a constexpr array whose entries match `tape.kv_layouts`
-    // exactly; `Instr::RopeRotate.kv_layout` indexes into it.
-    let n_layouts = std::cmp::max(1, tape.kv_layouts.len());
-    let _ = writeln!(
-        out,
-        "    constexpr struct {{ uint num_kv_heads; uint head_dim; }} kv_layouts[{n_layouts}] = {{"
-    );
-    if tape.kv_layouts.is_empty() {
-        out.push_str("        {0u, 0u},\n");
-    } else {
-        for entry in &tape.kv_layouts {
-            let _ = writeln!(
-                out,
-                "        {{{}u, {}u}},",
-                entry.num_kv_heads(),
-                entry.head_dim(),
-            );
-        }
-    }
-    out.push_str("    };\n");
+    // NUKED: softmax_state[] array decl + kv_layouts[] constexpr
+    // table — both fed the invented `kittens::ops::attn_decode_*` /
+    // `kittens::ops::rope_rotate` calls that no longer exist. They
+    // come back when AttnDecode / RopeRotate decompose into real
+    // TK 2.0 primitive Instrs and need to declare their own state /
+    // layout descriptors.
 
     // Suppress unused warnings for non-yet-used symbols.
     out.push_str("    (void)page_buf; (void)page_ready; (void)page_done;\n");
     out.push_str("    (void)page_consumed; (void)page_carry;\n");
-    out.push_str("    (void)softmax_state; (void)kv_layouts;\n");
 
     out.push_str("\n    // ── tape body ──\n");
 
@@ -449,24 +312,6 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     out
 }
 
-fn count_softmax_states(tape: &TkTape) -> u32 {
-    use crate::tk_tape::Instr as I;
-    let mut max_id: u32 = 0;
-    for instr in &tape.instrs {
-        if let I::AttnDecodeInit { state, .. }
-            | I::AttnDecodeQkt { state, .. }
-            | I::AttnDecodeSv { state, .. }
-            | I::AttnDecodeFinalise { state, .. } = instr
-        {
-            max_id = max_id.max(state.0 + 1);
-        }
-        if let I::ForLoopOpenConst { .. } | I::ForLoopOpenKernelArg { .. } | I::ForLoopClose { .. } = instr {
-            // Recurse-safe: ForLoop body is flat in the linear tape.
-        }
-    }
-    max_id
-}
-
 fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
     match instr {
         Instr::SyncthreadsCta { role: _ } => out.push_str("__syncthreads();\n"),
@@ -517,49 +362,16 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());
             let _ = writeln!(out, "{s}");
         }
-        Instr::RmsNorm { src_page, dst_page, gain_tensor, rows, cols, eps_bits, role: _ } => {
-            let s = tk20::rms_norm(src_page.0, dst_page.0, gain_tensor.0, *rows, *cols, *eps_bits);
-            let _ = writeln!(out, "{s}");
-        }
-        Instr::GemmM1 { lhs_page, rhs_tensor, rhs_byte_off, out_page, m, n, k, accum, role: _ } => {
-            let s = tk20::gemm_m1(lhs_page.0, rhs_tensor.0, rhs_byte_off.as_str(), out_page.0, *m, *n, k.get(), *accum);
-            let _ = writeln!(out, "{s}");
-        }
-        Instr::SiluMul { gate_page, up_page, out_page, cols, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::silu_mul(gate_page.0, up_page.0, out_page.0, *cols));
-        }
-        Instr::ResidualAdd { a_page, b_page, out_page, cols, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::residual_add(a_page.0, b_page.0, out_page.0, *cols));
-        }
-        Instr::RopeRotateNeoX { src_page, dst_page, cos_sin_tensor, position, kv_layout, side, role: _ } => {
-            // Per plan §2 line 92: head_dim / num_heads come from the
-            // single-source KvLayoutEntry, not duplicated Instr fields.
-            let entry = tape.kv_layout(*kv_layout);
-            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, entry.head_dim(), entry.num_kv_heads(), "NeoX", rope_side_str(*side));
-            let _ = writeln!(out, "{s}");
-        }
-        Instr::RopeRotateInterleaved { src_page, dst_page, cos_sin_tensor, position, kv_layout, side, role: _ } => {
-            let entry = tape.kv_layout(*kv_layout);
-            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, entry.head_dim(), entry.num_kv_heads(), "Interleaved", rope_side_str(*side));
-            let _ = writeln!(out, "{s}");
-        }
-        Instr::AttnDecodeInit { state, num_q_heads, kv_layout, producer: _, role: _ } => {
-            let entry = tape.kv_layout(*kv_layout);
-            let _ = writeln!(out, "{}", tk20::attn_decode_init(state.0, *num_q_heads, entry.num_kv_heads(), entry.head_dim()));
-        }
-        Instr::AttnDecodeQkt { state, q_page, k_page, scale_bits, num_q_heads, kv_layout, role: _ } => {
-            let entry = tape.kv_layout(*kv_layout);
-            let s = tk20::attn_decode_qkt(state.0, q_page.0, k_page.0, *scale_bits, *num_q_heads, entry.num_kv_heads(), entry.head_dim());
-            let _ = writeln!(out, "{s}");
-        }
-        Instr::AttnDecodeSv { state, v_page, num_q_heads, kv_layout, role: _ } => {
-            let entry = tape.kv_layout(*kv_layout);
-            let _ = writeln!(out, "{}", tk20::attn_decode_sv(state.0, v_page.0, *num_q_heads, entry.num_kv_heads(), entry.head_dim()));
-        }
-        Instr::AttnDecodeFinalise { state, out_page, num_q_heads, kv_layout, role: _ } => {
-            let entry = tape.kv_layout(*kv_layout);
-            let _ = writeln!(out, "{}", tk20::attn_decode_finalise(state.0, out_page.0, *num_q_heads, entry.head_dim()));
-        }
+        // NUKED: RmsNorm / GemmM1 / SiluMul / ResidualAdd /
+        // RopeRotateNeoX / RopeRotateInterleaved / AttnDecodeInit /
+        // AttnDecodeQkt / AttnDecodeSv / AttnDecodeFinalise — these
+        // were architectural-level Instrs that emitted invented
+        // `kittens::ops::*` calls. Per plan §1 line 64-65 + the
+        // INVIOLABLE feedback_tk_2_0_only / feedback_tk20_primitives_first,
+        // every Instr must map to ONE TK 2.0 primitive in
+        // `third_party/thunderkittens/include/`. Until each
+        // architectural op decomposes into TK 2.0 primitive Instrs at
+        // SubtileTape→TkTape lowering, the player has no Compute arms.
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
         }
@@ -708,20 +520,9 @@ mod tests {
         assert_eq!(s, "kittens::group<1>::arrive(&page_done[0]);\n");
     }
 
-    #[test]
-    fn silu_mul_arm_one_call() {
-        let s = emit(Instr::SiluMul {
-            gate_page: crate::tk_tape::PageId(1),
-            up_page: crate::tk_tape::PageId(2),
-            out_page: crate::tk_tape::PageId(3),
-            cols: 4096,
-            role: WarpRole::AllConsumers,
-        });
-        assert_eq!(
-            s,
-            "kittens::ops::silu_mul(page_buf[3], page_buf[1], page_buf[2], 4096u);\n"
-        );
-    }
+    // NUKED: silu_mul_arm_one_call — tested the invented Instr::SiluMul
+    // variant that emitted `kittens::ops::silu_mul`. Comes back when
+    // SiluMul decomposes into TK 2.0 primitive Instrs.
 
     #[test]
     fn emit_kernel_includes_signature_and_prelude() {

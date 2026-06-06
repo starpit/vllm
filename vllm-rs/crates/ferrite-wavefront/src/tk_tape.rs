@@ -19,7 +19,7 @@
 //!
 //! TkTape references source buffers by [`crate::subtile_ir::TensorId`].
 //! The v1 `metal_tape::BufId` namespace is no longer wired through the
-//! TkTape side of the redesign. The lowering (`lower_tape_to_tk`)
+//! TkTape side of the redesign. The lowering (`lower_subtile_tape_to_tk_tape`)
 //! preserves SubtileIR's TensorId for sources; the slot-realization
 //! decision (which slot goes to which page, which lives in smem vs
 //! gmem) lives at the TkTape optimizer passes, NOT at the source-side
@@ -27,38 +27,16 @@
 
 #![allow(dead_code)]
 
-use std::marker::PhantomData;
-
 use crate::subtile_ir::{KvCacheLayout, KvCacheProducer, KvCacheShape, TensorId};
 
-// ── Sealed RopeForm trait (NeoX vs Interleaved) ─────────────────────
-
-mod rope_form_seal {
-    pub trait Sealed {}
-}
-
-
-pub trait RopeForm: rope_form_seal::Sealed {
-    const PAIR_LO_EXPR: &'static str;
-    const PAIR_HI_EXPR: &'static str;
-    const NAME: &'static str;
-}
-
-pub struct NeoX;
-impl rope_form_seal::Sealed for NeoX {}
-impl RopeForm for NeoX {
-    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + __lane";
-    const PAIR_HI_EXPR: &'static str = "__i_lo + __half";
-    const NAME: &'static str = "NeoX";
-}
-
-pub struct Interleaved;
-impl rope_form_seal::Sealed for Interleaved {}
-impl RopeForm for Interleaved {
-    const PAIR_LO_EXPR: &'static str = "__row_head * __head_dim + 2u * __lane";
-    const PAIR_HI_EXPR: &'static str = "__i_lo + 1u";
-    const NAME: &'static str = "Interleaved";
-}
+// NUKED: RopeForm trait + NeoX / Interleaved markers + RopeFormTag
+// + GemmK witness + AccumKind + RopeSide + Instr::rope_rotate
+// constructor + _RopeFormBridge — all supported the architectural
+// Compute Instrs that emitted invented `kittens::ops::*` calls.
+// They reappear scoped to the actual TK 2.0 primitives that need
+// them (the rope-form invariant lives at the SubtileIR level via
+// `subtile_ir::RopeForm`, which is the canonical witness; the
+// TkTape-side duplicate was always redundant).
 
 // ── Substrate constants (re-exported from tk_warp_ir for now) ───────
 
@@ -305,128 +283,22 @@ pub enum Instr {
         role: WarpRole,
     },
 
-    // ── Compute — flat, one variant per architectural primitive.
-
-    /// Float-32 RMSNorm over a tile. `eps_bits` is the f32 bit pattern.
-    RmsNorm {
-        src_page: PageId,
-        dst_page: PageId,
-        gain_tensor: TensorId,
-        rows: u32,
-        cols: u32,
-        eps_bits: u32,
-        role: WarpRole,
-    },
-
-    /// Single-row GEMM (m=1) — output is `[1, n]`. `k` is the
-    /// sealed [`GemmK`] witness — constructable only via
-    /// [`GemmK::derive`] which asserts LHS-cols == RHS-cols.
-    GemmM1 {
-        lhs_page: PageId,
-        rhs_tensor: TensorId,
-        rhs_byte_off: ByteOffset,
-        out_page: PageId,
-        m: u32,
-        n: u32,
-        k: GemmK,
-        accum: AccumKind,
-        role: WarpRole,
-    },
-
-    /// `out = silu(gate) * up` — fused SwiGLU.
-    SiluMul {
-        gate_page: PageId,
-        up_page: PageId,
-        out_page: PageId,
-        cols: u32,
-        role: WarpRole,
-    },
-
-    /// `out = a + b` — residual add.
-    ResidualAdd {
-        a_page: PageId,
-        b_page: PageId,
-        out_page: PageId,
-        cols: u32,
-        role: WarpRole,
-    },
-
-    /// RoPE rotation, NeoX form. Per plan §2 row "RopeForm" the form
-    /// is a const-generic split on the variant identity — never a
-    /// runtime `RopeFormTag` field — so a Q-side / K-side rope-form
-    /// mismatch becomes a Rust type error at construction time
-    /// (constructor body matches once on `F::TAG` to pick the variant;
-    /// downstream Instrs cannot mix them by value).
-    RopeRotateNeoX {
-        src_page: PageId,
-        dst_page: PageId,
-        cos_sin_tensor: TensorId,
-        position: KernelArgRef,
-        kv_layout: KvLayoutId,
-        side: RopeSide,
-        role: WarpRole,
-    },
-
-    /// RoPE rotation, Interleaved form. See [`Instr::RopeRotateNeoX`]
-    /// for the const-generic-split rationale.
-    RopeRotateInterleaved {
-        src_page: PageId,
-        dst_page: PageId,
-        cos_sin_tensor: TensorId,
-        position: KernelArgRef,
-        kv_layout: KvLayoutId,
-        side: RopeSide,
-        role: WarpRole,
-    },
-
-    /// Initialise the online-softmax recurrence. `kv_layout` carries
-    /// the K-cache layout witness (per plan §2 line 88; resolved
-    /// through [`TkTape::kv_layout`]); `producer` records how the
-    /// cache was populated (per plan §2: "exhaustive match in
-    /// lowering, no `_ =>` arm"). Per plan §2 line 92 + audit DRIFT
-    /// fix: `head_dim` / `num_kv_heads` are NOT carried here — the
-    /// player reads them via `tape.kv_layout(kv_layout)` (single-
-    /// source method). `num_q_heads` is genuinely separate from KV
-    /// layout (Q-side head count).
-    AttnDecodeInit {
-        state: SoftmaxStateId,
-        num_q_heads: u32,
-        kv_layout: KvLayoutId,
-        producer: KvCacheProducer,
-        role: WarpRole,
-    },
-
-    /// One iteration of `S = Q · Kᵀ * scale` followed by online softmax.
-    /// `kv_layout` is the single source of head_dim / num_kv_heads.
-    AttnDecodeQkt {
-        state: SoftmaxStateId,
-        q_page: PageId,
-        k_page: PageId,
-        scale_bits: u32,
-        num_q_heads: u32,
-        kv_layout: KvLayoutId,
-        role: WarpRole,
-    },
-
-    /// `O += P · V` — second half of one online-softmax iteration.
-    /// `kv_layout` is the single source of head_dim / num_kv_heads.
-    AttnDecodeSv {
-        state: SoftmaxStateId,
-        v_page: PageId,
-        num_q_heads: u32,
-        kv_layout: KvLayoutId,
-        role: WarpRole,
-    },
-
-    /// `O / l_sum` and write to `out_page`. Closes the recurrence.
-    /// `kv_layout` is the single source of head_dim.
-    AttnDecodeFinalise {
-        state: SoftmaxStateId,
-        out_page: PageId,
-        num_q_heads: u32,
-        kv_layout: KvLayoutId,
-        role: WarpRole,
-    },
+    // ── Compute — NUKED.
+    //
+    // The architectural Compute Instrs (RmsNorm, GemmM1, SiluMul,
+    // ResidualAdd, RopeRotateNeoX, RopeRotateInterleaved,
+    // AttnDecodeInit/Qkt/Sv/Finalise) emitted invented
+    // `kittens::ops::*` calls. Per plan §1 line 64-65 ("flat Instr
+    // enum, ONE variant per TK 2.0 / CUDA primitive") and the
+    // INVIOLABLE feedback_tk_2_0_only / feedback_tk20_primitives_first
+    // rules, every Compute Instr must be a real TK 2.0 primitive
+    // call from `third_party/thunderkittens/include/`. Each
+    // architectural op above will reappear as a SEQUENCE of
+    // primitive Instrs (e.g. RmsNorm = warp::row_squared +
+    // shared_tile::row_sum + thread::rsqrt + warp::mul_row + ...)
+    // emitted by `lower_dag_to_tape` → `lower_subtile_tape_to_tk_tape`'s
+    // primitive-expansion pass. None of those primitive Instrs exist
+    // yet — they land alongside the expansion work.
 
     /// Inert marker the orchestrator emits at the start of an op
     /// when `EmitOpts::debug_handshake` is on.
@@ -552,88 +424,6 @@ pub struct StoreSpec {
     pub role: WarpRole,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccumKind {
-    Zero,
-    Accumulate,
-}
-
-/// `GemmK` — sealed typed witness for the GEMM contraction dim.
-///
-/// Per `SUBTILE_TAPE_HANDOFF.md` line 95 + plan §2 "Compile-time-or-
-/// garbage" hard rule: GemmK MUST be derived from operand shapes,
-/// never accepted as a raw `u32`. The only constructor
-/// [`GemmK::derive`] takes the LHS activation's `cols` and the RHS
-/// weight slice's `cols` (per `SubOp::MatmulTile`'s "W slice
-/// `[nr, kr]`" doc) and asserts they agree before producing the
-/// witness — a K-mismatch becomes a constructor `Err` at lowering
-/// time, not a wrong-K kernel call at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GemmK {
-    pub(crate) val: u32,
-}
-
-impl GemmK {
-    /// Construct from the two K-bearing operand extents. Returns
-    /// `Err` if they disagree (per plan §3 "Validator stretch": the
-    /// witness discharges the GEMM K-equality structural check at
-    /// the type level).
-    pub fn derive(lhs_cols: u32, rhs_cols: u32) -> Result<Self, GemmKMismatch> {
-        if lhs_cols == rhs_cols {
-            Ok(Self { val: lhs_cols })
-        } else {
-            Err(GemmKMismatch { lhs_cols, rhs_cols })
-        }
-    }
-
-    /// The contraction dim's runtime value (for emit / runtime use).
-    #[inline]
-    pub fn get(self) -> u32 {
-        self.val
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GemmKMismatch {
-    pub lhs_cols: u32,
-    pub rhs_cols: u32,
-}
-
-impl std::fmt::Display for GemmKMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "GEMM K-equality violated: lhs.cols={} != rhs.cols={}",
-            self.lhs_cols, self.rhs_cols,
-        )
-    }
-}
-
-/// Erased tag mirroring the `RopeForm` trait.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopeFormTag {
-    NeoX,
-    Interleaved,
-}
-
-impl RopeFormTag {
-    pub(crate) fn from_form<F: RopeForm>() -> Self {
-        if F::NAME == NeoX::NAME {
-            RopeFormTag::NeoX
-        } else if F::NAME == Interleaved::NAME {
-            RopeFormTag::Interleaved
-        } else {
-            unreachable!("RopeForm sealed: NAME must be NeoX or Interleaved")
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopeSide {
-    Q,
-    K,
-}
-
 /// Phase parity for `Instr::wait_static` / `Instr::wait_loop`
 /// constructors. Per plan §2 row "Phase (parity)": parity is a
 /// sealed enum, never a `u8` field; this enum makes the constructor
@@ -723,41 +513,6 @@ impl Instr {
         }
     }
 
-    /// Per plan §2 row "RopeForm": runtime→const dispatch happens
-    /// here, once at the constructor's `match` site. Each arm produces
-    /// a flat const-generic-split variant; the Instr never carries
-    /// `form` as a runtime field. Q-side / K-side mismatch becomes a
-    /// type error at the call site (caller's `<F>` is unique per side).
-    pub(crate) fn rope_rotate<F: RopeForm>(
-        src_page: PageId,
-        dst_page: PageId,
-        cos_sin_tensor: TensorId,
-        position: KernelArgRef,
-        kv_layout: KvLayoutId,
-        side: RopeSide,
-        role: WarpRole,
-    ) -> Self {
-        match RopeFormTag::from_form::<F>() {
-            RopeFormTag::NeoX => Self::RopeRotateNeoX {
-                src_page,
-                dst_page,
-                cos_sin_tensor,
-                position,
-                kv_layout,
-                side,
-                role,
-            },
-            RopeFormTag::Interleaved => Self::RopeRotateInterleaved {
-                src_page,
-                dst_page,
-                cos_sin_tensor,
-                position,
-                kv_layout,
-                side,
-                role,
-            },
-        }
-    }
 }
 
 // ── Witness handles surfacing tape-side dataflow ────────────────────
@@ -839,9 +594,6 @@ impl TkTape {
     }
 }
 
-#[doc(hidden)]
-pub struct _RopeFormBridge<F: RopeForm>(PhantomData<F>);
-
 // ── validate_tk_tape ────────────────────────────────────────────────
 //
 // Per SUBTILE_IR_REDESIGN.md §3.2 / §4 commit 6b: post-lowering /
@@ -867,7 +619,7 @@ pub enum TkValidationError {
     LoopVarMismatch { expected: u32, got: u32, at: usize },
 }
 
-/// Validate a [`TkTape`]. Runs at the exit of `lower_tape_to_tk` and
+/// Validate a [`TkTape`]. Runs at the exit of `lower_subtile_tape_to_tk_tape` and
 /// after every TkTape→TkTape optimizer pass.
 pub fn validate_tk_tape(tape: &TkTape) -> Result<(), Vec<TkValidationError>> {
     let mut errors = Vec::new();
@@ -968,19 +720,9 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
                 // structural CUDA. The body Instrs are walked in
                 // sequence after the open.
             }
-            // Compute Instrs are pure within-page work; they do not
-            // change cross-page barrier or store state.
-            Instr::RmsNorm { .. }
-            | Instr::GemmM1 { .. }
-            | Instr::SiluMul { .. }
-            | Instr::ResidualAdd { .. }
-            | Instr::RopeRotateNeoX { .. }
-            | Instr::RopeRotateInterleaved { .. }
-            | Instr::AttnDecodeInit { .. }
-            | Instr::AttnDecodeQkt { .. }
-            | Instr::AttnDecodeSv { .. }
-            | Instr::AttnDecodeFinalise { .. }
-            | Instr::DebugOpBeginMarker { .. } => {}
+            // No Compute Instrs exist yet — they reappear once the
+            // architectural ops decompose into TK 2.0 primitives.
+            Instr::DebugOpBeginMarker { .. } => {}
         }
     }
 }
@@ -1017,7 +759,7 @@ mod tests {
     #[test]
     fn validate_tk_tape_accepts_lower_output_shape() {
         // StoreAsync → Threadfence → Arrive{Done} is the conservative
-        // all-gmem post-condition lower_tape_to_tk emits. validator
+        // all-gmem post-condition lower_subtile_tape_to_tk_tape emits. validator
         // accepts.
         let tape = TkTape {
             kernel_args: vec![],
@@ -1065,21 +807,11 @@ mod tests {
     }
 
     /// `GemmK::derive` accepts when LHS-cols == RHS-cols and rejects
-    /// when they disagree. Per plan §2 + handoff line 95: GemmK is
-    /// the typed witness that discharges GEMM K-equality at the type
-    /// level; raw u32 K parameters are forbidden.
-    #[test]
-    fn gemm_k_derive_accepts_match() {
-        let k = GemmK::derive(4096, 4096).expect("equal cols accepted");
-        assert_eq!(k.get(), 4096);
-    }
-
-    #[test]
-    fn gemm_k_derive_rejects_mismatch() {
-        let err = GemmK::derive(4096, 2048).unwrap_err();
-        assert_eq!(err.lhs_cols, 4096);
-        assert_eq!(err.rhs_cols, 2048);
-    }
+    // NUKED: gemm_k_derive_* — GemmK is gone alongside Instr::GemmM1.
+    // It comes back when MatmulTile decomposes into TK 2.0 primitive
+    // Instrs (TmaExpect / TmaLoadTile / WgmmaMmaAB / etc.) and the
+    // K-equality lives in the typed RegTileId / SmemTileId shape
+    // parameters per the wbi32wl0g design synthesis.
 
     /// Per plan §3.2 lines 156-161 + audit DRIFT #3: ThreadfenceBlock
     /// is CTA-scope and insufficient to clear cross-worker Gmem

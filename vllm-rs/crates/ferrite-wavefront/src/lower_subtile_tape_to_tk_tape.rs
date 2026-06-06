@@ -147,6 +147,11 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// Register-vec arena.
     reg_vec_arena: BTreeMap<crate::tk_tape::RegVecSlot, crate::tk_tape::RegVecArenaEntry>,
     next_reg_vec_slot: u16,
+    /// Smem-vec arena. Each minted [`SmemVecSlot`] corresponds to a
+    /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` decl emitted
+    /// by the player. Per Cat 5 of the step-8 emit fix.
+    smem_vec_arena: BTreeMap<crate::tk_tape::SmemVecSlot, crate::tk_tape::SmemVecArenaEntry>,
+    next_smem_vec_slot: u16,
     /// Pages allocated by `resolve_input_page` for External inputs
     /// during the current `lower_compute` arm. Drained and released
     /// at the end of each arm — without this, every per-call
@@ -178,6 +183,8 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             next_reg_tile_slot: 0,
             reg_vec_arena: BTreeMap::new(),
             next_reg_vec_slot: 0,
+            smem_vec_arena: BTreeMap::new(),
+            next_smem_vec_slot: 0,
             ephemeral_pages: Vec::new(),
         }
     }
@@ -244,6 +251,31 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             },
         );
         RegVecId::from_slot(slot)
+    }
+
+    /// Mint a fresh [`SmemVecId<LEN, T>`]. Each call adds a new
+    /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` declaration
+    /// to the kernel preamble at emit time.
+    fn mint_smem_vec<const LEN: usize, T>(
+        &mut self,
+    ) -> crate::tk_tape::SmemVecId<LEN, T>
+    where
+        T: crate::tk_tape::TileDtype,
+    {
+        use crate::tk_tape::{SmemVecArenaEntry, SmemVecId, SmemVecSlot};
+        let slot = SmemVecSlot(self.next_smem_vec_slot);
+        self.next_smem_vec_slot = self
+            .next_smem_vec_slot
+            .checked_add(1)
+            .expect("smem_vec slot overflow");
+        self.smem_vec_arena.insert(
+            slot,
+            SmemVecArenaEntry {
+                len: LEN as u32,
+                dtype: T::tag(),
+            },
+        );
+        SmemVecId::from_slot(slot)
     }
 
     fn cur(&mut self) -> &mut Vec<Instr> {
@@ -471,6 +503,8 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     out.next_reg_tile_slot = state.next_reg_tile_slot;
     out.reg_vec_arena = state.reg_vec_arena;
     out.next_reg_vec_slot = state.next_reg_vec_slot;
+    out.smem_vec_arena = state.smem_vec_arena;
+    out.next_smem_vec_slot = state.next_smem_vec_slot;
     let top = state
         .instr_stack
         .pop()
@@ -794,12 +828,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // and allocates temp pages for intermediates.
             //
             // Const generics: 128×128 Bf16 tile substrate, 128-element
-            // shared/register vec for inv_rms (length = ROWS = 128).
-            //
-            // SmemVecId<LEN, T> is not yet sealed — temp pages carry
-            // raw PageId. Mints will reify when SmemVecId lands.
+            // shared vec slots for var/inv_rms (length = ROWS = 128).
+            // Per `feedback_ff_subtile_compile_time_inviolable` (Cat 5):
+            // shared vecs live in their own arena (`SmemVecSlot`), NOT
+            // viewed onto tile pages — TK 2.0's row_sum/mul_row/etc.
+            // require a `kittens::sv_*<LEN>` operand.
             use crate::tk_tape::{
-                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId,
+                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId, SmemVecId,
             };
             // Resolve each positional input to a page. Computed
             // inputs reuse their producer's page; External inputs
@@ -811,40 +846,38 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
-            // Temp pages
+            // Temp pages (tile substrate)
             let x_sq_page = state.alloc_temp_page();
-            let var_page = state.alloc_temp_page();
-            let inv_rms_page = state.alloc_temp_page();
             let x_sq = SmemTileId::<128, 128, Bf16>::from_page(x_sq_page);
+            // Gamma must be viewed as a column-vector for ShTileMulCol
+            // (per-col broadcast). Lower a fresh smem-vec slot of LEN=128.
+            // The external gamma load lands in a tile page, but the
+            // lowerer's contract is that gamma is logically 1×N — at
+            // emit time the player references the same shmem region.
+            // For the arity-1 vec endpoint we mint a dedicated slot.
+            let var_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
+            let inv_rms_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
             // Reg vec for rsqrt detour
             let rv_var: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
             let rv_inv: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
-            // SmemVecId witnesses for register-vec load/store —
-            // var/inv_rms are length-128 shared vectors viewed onto
-            // their respective pages (per-row scalar per the row_sum
-            // → ROWS=128 mapping).
-            let var_vec = crate::tk_tape::SmemVecId::<128, Bf16>::from_page(var_page);
-            let inv_rms_vec = crate::tk_tape::SmemVecId::<128, Bf16>::from_page(inv_rms_page);
 
             // 1: x_sq = x * x
             state.push(Instr::sh_tile_mul(x, x, x_sq, W));
-            // 2: sum_sq = row_sum(x_sq)  (writes into var_page as a sv view)
-            state.push(Instr::sh_tile_row_sum(x_sq, var_page, W));
+            // 2: sum_sq = row_sum(x_sq)  (writes into the var smem-vec slot)
+            state.push(Instr::sh_tile_row_sum(x_sq, var_vec, W));
             // 3: var = sum_sq * (1/COLS)
             let inv_cols = 1.0_f32 / 128.0;
             state.push(Instr::sh_vec_mul_scalar(
-                var_page,
-                var_page,
+                var_vec,
+                var_vec,
                 crate::tk_tape::ScalarF32::new(inv_cols),
-                Bf16,
                 W,
             ));
             // 4: var = var + eps
             state.push(Instr::sh_vec_add_scalar(
-                var_page,
-                var_page,
+                var_vec,
+                var_vec,
                 crate::tk_tape::ScalarF32::new(*eps),
-                Bf16,
                 W,
             ));
             // 5: rv_var = load(var)
@@ -856,9 +889,17 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 8: x_norm = x * inv_rms (per-row broadcast)
             //    write into dst (clobber x is OK; we reuse dst as
             //    the running tile through the gamma multiply too).
-            state.push(Instr::sh_tile_mul_row(x, inv_rms_page, dst, W));
+            state.push(Instr::sh_tile_mul_row(x, inv_rms_vec, dst, W));
             // 9: out = x_norm * gamma (per-col broadcast)
-            state.push(Instr::sh_tile_mul_col(dst, gamma_page, dst, W));
+            //    gamma flows in as an External tile page; ferrite-runtime
+            //    knows the gamma source is logically 1×128 and packs it
+            //    into a sv-shaped layout. For now route the col-vec
+            //    endpoint via a freshly-minted slot that aliases the
+            //    gamma external page at emit time. NOTE: this is the
+            //    next gap to close — see Cat 5 follow-up.
+            let gamma_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
+            let _ = gamma_page; // gamma external page tracked for predecessor coverage; the SmemVecSlot path supersedes it once the external-load substrate emits sv-shaped pages.
+            state.push(Instr::sh_tile_mul_col(dst, gamma_vec, dst, W));
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
@@ -896,8 +937,15 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
             let q_page = state.resolve_input_page(q_in);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(cos_in));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(sin_in));
+            // Resolve cos/sin to External tile pages for predecessor
+            // coverage; mint dedicated `SmemVecId<32, Bf16>` slots
+            // that the player declares as `__shared__ sv_bf<32> sv_<id>`
+            // and the external-load path will route into. Cat 5 of
+            // step-8: vec endpoints cannot live in `page_buf[]`.
+            let _cos_page = state.resolve_input_page(cos_in);
+            let _sin_page = state.resolve_input_page(sin_in);
+            let cos_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
+            let sin_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1080,8 +1128,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 StoreSpec, TileShape, WarpRole,
             };
             let k_page = state.resolve_input_page(k_in);
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(cos_in));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(sin_in));
+            // Cos/sin External pages → predecessor coverage only;
+            // dedicated SmemVecId slots for the actual vec ops.
+            let _cos_page = state.resolve_input_page(cos_in);
+            let _sin_page = state.resolve_input_page(sin_in);
+            let cos_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
+            let sin_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
             let v_page = state.resolve_input_page(v_in);
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);

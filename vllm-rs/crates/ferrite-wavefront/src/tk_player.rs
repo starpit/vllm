@@ -33,19 +33,24 @@ mod tk20 {
         format!("kittens::group<1>::tma::store_async_wait<{n}>();")
     }
 
-    /// `mbarrier.init` for one named page barrier slot.
+    /// `kittens::group<1>::init_semaphore(barrier[page], count)` — TK 2.0
+    /// signature at `ops/group/util/sync.cuh:35`. Pass an lvalue reference
+    /// (no `&`) — `barrier[N]` is a `kittens::semaphore`.
+    /// There is NO `kittens::mbarrier::init` namespace path in TK 2.0;
+    /// init/wait/arrive all live under `kittens::group<N>::`.
     pub fn mbarrier_init(barrier: &str, page: u8, count: u32) -> String {
-        format!("kittens::mbarrier::init(&{barrier}[{page}], {count});")
+        format!("kittens::group<1>::init_semaphore({barrier}[{page}], {count});")
     }
 
-    /// `mbarrier.wait` at a static parity.
+    /// `kittens::group<1>::wait(semaphore& sem, int kPhaseBit)` —
+    /// `ops/group/util/sync.cuh:112`.
     pub fn mbarrier_wait_static(barrier: &str, page: u8, parity: u8) -> String {
-        format!("kittens::mbarrier::wait(&{barrier}[{page}], {parity});")
+        format!("kittens::group<1>::wait({barrier}[{page}], {parity});")
     }
 
-    /// `mbarrier.wait` at a runtime loop-carried parity.
+    /// `kittens::group<1>::wait` at a runtime loop-carried parity.
     pub fn mbarrier_wait_loop(barrier: &str, page: u8, var: u32, start: u8) -> String {
-        format!("kittens::mbarrier::wait(&{barrier}[{page}], (v{var} + {start}u) & 1u);")
+        format!("kittens::group<1>::wait({barrier}[{page}], (v{var} + {start}u) & 1u);")
     }
 
     pub fn mbarrier_arrive(barrier: &str, page: u8) -> String {
@@ -406,14 +411,16 @@ mod tk20 {
 
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
-    pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
-        format!("kittens::group<{group_n}>::load(rv_{dst_slot}, page_buf[{src_page}]);")
+    /// `src_slot` indexes into the smem-vec arena — the player declares
+    /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` per slot.
+    pub fn load_smem_to_reg_vec(group_n: u32, src_slot: u16, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::load(rv_{dst_slot}, sv_{src_slot});")
     }
 
     /// `kittens::group<N>::store(page_buf[dst], rv_src)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:100`.
-    pub fn store_reg_vec_to_shmem(group_n: u32, src_slot: u16, dst_page: u8) -> String {
-        format!("kittens::group<{group_n}>::store(page_buf[{dst_page}], rv_{src_slot});")
+    pub fn store_reg_vec_to_shmem(group_n: u32, src_slot: u16, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::store(sv_{dst_slot}, rv_{src_slot});")
     }
 
     /// `kittens::group<N>::neg(rt_dst, rt_src)` — `register/tile/maps.cuh:572`.
@@ -467,10 +474,10 @@ mod tk20 {
 
     /// `kittens::group<N>::row_sum(sv_dst, st_src)` —
     /// `ops/group/shared/tile/reductions.cuh:97`. The dst page is
-    /// treated as a shared-vec view (until SmemVecId<R,T> lands).
-    pub fn st_row_sum(group_n: u32, dst_page: u8, src_page: u8) -> String {
+    /// `dst_slot` indexes into the smem-vec arena.
+    pub fn st_row_sum(group_n: u32, dst_slot: u16, src_page: u8) -> String {
         format!(
-            "kittens::group<{group_n}>::row_sum(page_buf[{dst_page}], page_buf[{src_page}]);"
+            "kittens::group<{group_n}>::row_sum(sv_{dst_slot}, page_buf[{src_page}]);"
         )
     }
 
@@ -478,14 +485,14 @@ mod tk20 {
     /// — scalar overload, shared-vec.
     pub fn sv_mul_scalar(
         group_n: u32,
-        dst_page: u8,
-        src_page: u8,
+        dst_slot: u16,
+        src_slot: u16,
         scalar: f32,
         dtype: &crate::tk_tape::TileDtypeTag,
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::mul(page_buf[{dst_page}], page_buf[{src_page}], \
+            "kittens::group<{group_n}>::mul(sv_{dst_slot}, sv_{src_slot}, \
              {scalar_ty}({scalar}f));"
         )
     }
@@ -494,14 +501,14 @@ mod tk20 {
     /// — scalar overload, shared-vec.
     pub fn sv_add_scalar(
         group_n: u32,
-        dst_page: u8,
-        src_page: u8,
+        dst_slot: u16,
+        src_slot: u16,
         scalar: f32,
         dtype: &crate::tk_tape::TileDtypeTag,
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::add(page_buf[{dst_page}], page_buf[{src_page}], \
+            "kittens::group<{group_n}>::add(sv_{dst_slot}, sv_{src_slot}, \
              {scalar_ty}({scalar}f));"
         )
     }
@@ -518,19 +525,19 @@ mod tk20 {
 
     /// `kittens::group<N>::mul_row(st_dst, st_src, sv_row_values)` —
     /// `ops/group/shared/tile/maps.cuh:361`.
-    pub fn st_mul_row(group_n: u32, dst_page: u8, src_page: u8, row_vec_page: u8) -> String {
+    pub fn st_mul_row(group_n: u32, dst_page: u8, src_page: u8, row_vec_slot: u16) -> String {
         format!(
             "kittens::group<{group_n}>::mul_row(page_buf[{dst_page}], page_buf[{src_page}], \
-             page_buf[{row_vec_page}]);"
+             sv_{row_vec_slot});"
         )
     }
 
     /// `kittens::group<N>::mul_col(st_dst, st_src, sv_col_values)` —
     /// `ops/group/shared/tile/maps.cuh:428`.
-    pub fn st_mul_col(group_n: u32, dst_page: u8, src_page: u8, col_vec_page: u8) -> String {
+    pub fn st_mul_col(group_n: u32, dst_page: u8, src_page: u8, col_vec_slot: u16) -> String {
         format!(
             "kittens::group<{group_n}>::mul_col(page_buf[{dst_page}], page_buf[{src_page}], \
-             page_buf[{col_vec_page}]);"
+             sv_{col_vec_slot});"
         )
     }
 
@@ -584,6 +591,15 @@ mod tk20 {
 
     pub fn shared_semaphore_decl(name: &str, count_macro: &str) -> String {
         format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
+    }
+
+    /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` — per-slot
+    /// shared-vec declaration. Distinct namespace from `page_buf[]`.
+    pub fn shared_sv_decl(idx: u16, len: u32, dtype: &crate::tk_tape::TileDtypeTag) -> String {
+        // TK 2.0 shares the suffix between `st_<suffix>` and
+        // `sv_<suffix>` (e.g. `st_bf` / `sv_bf`); reuse the witness.
+        let suffix = dtype.st_alias_suffix();
+        format!("    __shared__ kittens::sv_{suffix}<{len}> sv_{idx};\n")
     }
 
     pub fn ctensor_map_cast(buf_idx: usize) -> String {
@@ -680,6 +696,12 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_carry", "NUM_PAGES"));
+
+    // Per-slot shared-vec declarations. The arena is BTreeMap so
+    // emit order is deterministic.
+    for (slot, entry) in tape.smem_vec_arena() {
+        out.push_str(&tk20::shared_sv_decl(slot.0, entry.len, &entry.dtype));
+    }
 
     // Per-prelude-decl emit. Each PreludeDecl variant lands one
     // declaration at function scope.
@@ -1155,7 +1177,7 @@ mod tests {
                 kind: crate::tk_tape::PageBarrier::Ready,
                 count: 16,
             }),
-            "kittens::mbarrier::init(&page_ready[3], 16);\n"
+            "kittens::group<1>::init_semaphore(page_ready[3], 16);\n"
         );
     }
 
@@ -1166,7 +1188,7 @@ mod tests {
             kind: crate::tk_tape::PageBarrier::Ready,
             role: WarpRole::AllConsumers,
         });
-        assert_eq!(s, "kittens::mbarrier::wait(&page_ready[2], 1);\n");
+        assert_eq!(s, "kittens::group<1>::wait(page_ready[2], 1);\n");
     }
 
     #[test]

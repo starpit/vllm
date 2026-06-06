@@ -86,12 +86,23 @@ pub struct TkTape {
     /// Register-vec SSA arena. See [`Self::reg_tile_arena`].
     pub(crate) reg_vec_arena: BTreeMap<RegVecSlot, RegVecArenaEntry>,
 
+    /// Shared-vec arena. Each entry records a [`SmemVecSlot`]'s
+    /// runtime length + dtype, used by `emit_kernel` to declare
+    /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` per slot —
+    /// distinct from the tile-shaped `page_buf[]` array. TK 2.0
+    /// `row_sum`, `mul_row`, `mul_col`, `load_async` (vec) require
+    /// a `kittens::sv_*` operand, NOT a `kittens::st_*` page.
+    pub(crate) smem_vec_arena: BTreeMap<SmemVecSlot, SmemVecArenaEntry>,
+
     /// Next id minted by [`Self::mint_reg_tile`]; checked-add so
     /// u16 overflow panics with a clear message.
     pub(crate) next_reg_tile_slot: u16,
 
     /// Next id minted by [`Self::mint_reg_vec`].
     pub(crate) next_reg_vec_slot: u16,
+
+    /// Next id minted by [`Self::mint_smem_vec`].
+    pub(crate) next_smem_vec_slot: u16,
 }
 
 impl TkTape {
@@ -711,7 +722,7 @@ pub enum Instr {
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
     LoadVecSmemToReg {
-        src: PageId,
+        src: SmemVecSlot,
         dst: RegVecSlot,
         width: GroupWidthTag,
         role: WarpRole,
@@ -721,7 +732,7 @@ pub enum Instr {
     /// `ops/group/memory/vec/shared_to_register.cuh:100`.
     StoreRegVecToShmem {
         src: RegVecSlot,
-        dst: PageId,
+        dst: SmemVecSlot,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -809,7 +820,7 @@ pub enum Instr {
     /// of `src` to a scalar; the result vector has length = src.rows.
     ShTileRowSum {
         src: PageId,
-        dst: PageId,
+        dst: SmemVecSlot,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -819,8 +830,8 @@ pub enum Instr {
     /// (`ops/group/shared/vec/maps.cuh` mul + scalar bin_map). Used
     /// by RmsNorm (scale the row-sum by `1/cols`).
     ShVecMulScalar {
-        src: PageId,
-        dst: PageId,
+        src: SmemVecSlot,
+        dst: SmemVecSlot,
         scalar: ScalarF32,
         dtype: TileDtypeTag,
         width: GroupWidthTag,
@@ -830,8 +841,8 @@ pub enum Instr {
     /// `kittens::group<N>::add(sv_dst, sv_src, kittens::<dtype>(scalar))` —
     /// scalar overload, shared-vec. Used by RmsNorm (`+ eps`).
     ShVecAddScalar {
-        src: PageId,
-        dst: PageId,
+        src: SmemVecSlot,
+        dst: SmemVecSlot,
         scalar: ScalarF32,
         dtype: TileDtypeTag,
         width: GroupWidthTag,
@@ -858,7 +869,7 @@ pub enum Instr {
     /// src.rows). Used by RmsNorm (apply `inv_rms` per-row).
     ShTileMulRow {
         src: PageId,
-        row_vec: PageId,
+        row_vec: SmemVecSlot,
         dst: PageId,
         width: GroupWidthTag,
         role: WarpRole,
@@ -870,7 +881,7 @@ pub enum Instr {
     /// src.cols). Used by RmsNorm (apply gamma per-column).
     ShTileMulCol {
         src: PageId,
-        col_vec: PageId,
+        col_vec: SmemVecSlot,
         dst: PageId,
         width: GroupWidthTag,
         role: WarpRole,
@@ -1418,14 +1429,33 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, 
     }
 }
 
-/// Typed shared-memory vector handle. The substrate's pages are
-/// tile-shaped today; an `SmemVecId<LEN, T>` is a typed view onto
-/// a page that semantically holds an `LEN`-element vector of `T`.
-/// When non-uniform pools land (a separate `__shared__ kittens::sv_bf<LEN>
-/// vec_buf[]`), each pool will mint its own typed `SmemVecId<LEN, T>`,
-/// and downstream type-checks will refuse cross-pool mixing.
+/// Sealed shared-vec slot identifier. Distinct namespace from
+/// [`PageId`]: pages are uniformly typed `kittens::st_bf<R,C>` tiles
+/// (the `page_buf[]` array), while shared vecs are `kittens::sv_*<LEN>`
+/// objects, declared one-per-slot in the kernel preamble via
+/// [`TkTape::smem_vec_arena`]. Mixing the two namespaces was the
+/// step-8 cat-5 emit bug — `kittens::group<N>::row_sum(page_buf[N], ...)`
+/// fails the `ducks::sv::all V` concept constraint because `page_buf[N]`
+/// is a tile, not a vec. Per `feedback_ff_subtile_compile_time_inviolable`:
+/// the type system refuses the mismatch — `Instr::sh_tile_row_sum`'s
+/// `dst: SmemVecSlot` cannot accept a `PageId` (and vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SmemVecSlot(pub(crate) u16);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SmemVecArenaEntry {
+    pub(crate) len: u32,
+    pub(crate) dtype: TileDtypeTag,
+}
+
+/// Typed shared-memory vector handle. Backed by a [`SmemVecSlot`]
+/// minted at lowering time via [`TkTape::mint_smem_vec`]. The
+/// const-generic LEN + sealed `T: TileDtype` propagate into the
+/// typed Instr constructors so length/dtype mismatch across the
+/// vec endpoints (e.g. `row_sum.dst.LEN == src.ROWS`) is a rustc
+/// E0308 at construction.
 ///
-/// Constructor (`from_page`) is `pub(crate)` so only the lowerer can
+/// Constructor (`from_slot`) is `pub(crate)` so only the lowerer can
 /// mint these.
 ///
 /// # Compile-fail proof — length mismatch rejected
@@ -1442,19 +1472,19 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, 
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct SmemVecId<const LEN: usize, T: TileDtype> {
-    page: PageId,
+    slot: SmemVecSlot,
     _marker: PhantomData<fn() -> T>,
 }
 
 impl<const LEN: usize, T: TileDtype> SmemVecId<LEN, T> {
-    pub(crate) const fn from_page(page: PageId) -> Self {
+    pub(crate) const fn from_slot(slot: SmemVecSlot) -> Self {
         Self {
-            page,
+            slot,
             _marker: PhantomData,
         }
     }
-    pub const fn page(&self) -> PageId {
-        self.page
+    pub const fn slot(&self) -> SmemVecSlot {
+        self.slot
     }
     pub const fn len() -> usize {
         LEN
@@ -3165,7 +3195,7 @@ impl Instr {
         GroupWidth<N>: WarpLoadWidth,
     {
         Self::LoadVecSmemToReg {
-            src: src.page(),
+            src: src.slot(),
             dst: dst.slot(),
             width: width.tag(),
             role: role.to_warp_role(),
@@ -3188,7 +3218,7 @@ impl Instr {
     {
         Self::StoreRegVecToShmem {
             src: src.slot(),
-            dst: dst.page(),
+            dst: dst.slot(),
             width: width.tag(),
             role: role.to_warp_role(),
         }
@@ -3372,12 +3402,13 @@ impl Instr {
 
     // ── RmsNorm-unique constructors (commit B) ───────────────────
 
-    /// Construct [`Instr::ShTileRowSum`] with typed src tile witness.
-    /// `dst` is a shared-vec view onto a page; until `SmemVecId<R,T>`
-    /// lands, dst is a raw `PageId`.
+    /// Construct [`Instr::ShTileRowSum`] with typed src tile + dst
+    /// vec witnesses. `dst` is a [`SmemVecId<ROWS, T>`] — its
+    /// `LEN` is bound to the src tile's `ROWS` at the constructor
+    /// signature, so a length mismatch is rustc E0308.
     pub(crate) fn sh_tile_row_sum<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
         src: SmemTileId<ROWS, COLS, T>,
-        dst: PageId,
+        dst: SmemVecId<ROWS, T>,
         width: GroupWidth<N>,
     ) -> Self
     where
@@ -3385,27 +3416,27 @@ impl Instr {
     {
         Self::ShTileRowSum {
             src: src.page(),
-            dst,
+            dst: dst.slot(),
             width: width.tag(),
             role: COMPUTE_ROLE_TAG,
         }
     }
 
-    /// Construct [`Instr::ShVecMulScalar`]. Source is a shared-vec
-    /// view (PageId today); dtype derived from caller's choice.
-    pub(crate) fn sh_vec_mul_scalar<const N: usize, T: TileDtype>(
-        src: PageId,
-        dst: PageId,
+    /// Construct [`Instr::ShVecMulScalar`]. Both endpoints are typed
+    /// `SmemVecId<LEN, T>` — a length / dtype mismatch is rustc E0308
+    /// at the constructor.
+    pub(crate) fn sh_vec_mul_scalar<const N: usize, const LEN: usize, T: TileDtype>(
+        src: SmemVecId<LEN, T>,
+        dst: SmemVecId<LEN, T>,
         scalar: ScalarF32,
-        _dtype_witness: T,
         width: GroupWidth<N>,
     ) -> Self
     where
         GroupWidth<N>: ComputeWidth,
     {
         Self::ShVecMulScalar {
-            src,
-            dst,
+            src: src.slot(),
+            dst: dst.slot(),
             scalar,
             dtype: T::tag(),
             width: width.tag(),
@@ -3414,19 +3445,18 @@ impl Instr {
     }
 
     /// Construct [`Instr::ShVecAddScalar`]. See `sh_vec_mul_scalar`.
-    pub(crate) fn sh_vec_add_scalar<const N: usize, T: TileDtype>(
-        src: PageId,
-        dst: PageId,
+    pub(crate) fn sh_vec_add_scalar<const N: usize, const LEN: usize, T: TileDtype>(
+        src: SmemVecId<LEN, T>,
+        dst: SmemVecId<LEN, T>,
         scalar: ScalarF32,
-        _dtype_witness: T,
         width: GroupWidth<N>,
     ) -> Self
     where
         GroupWidth<N>: ComputeWidth,
     {
         Self::ShVecAddScalar {
-            src,
-            dst,
+            src: src.slot(),
+            dst: dst.slot(),
             scalar,
             dtype: T::tag(),
             width: width.tag(),
@@ -3456,11 +3486,12 @@ impl Instr {
     }
 
     /// Construct [`Instr::ShTileMulRow`] with typed src/dst tile
-    /// witnesses (must share R, C, T). `row_vec` is a PageId to a
-    /// shared-vec view of length R.
+    /// witnesses (must share R, C, T). `row_vec` is a typed
+    /// `SmemVecId<ROWS, T>` — its `LEN` must equal the tile's
+    /// `ROWS` (rustc E0308 on mismatch).
     pub(crate) fn sh_tile_mul_row<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
         src: SmemTileId<ROWS, COLS, T>,
-        row_vec: PageId,
+        row_vec: SmemVecId<ROWS, T>,
         dst: SmemTileId<ROWS, COLS, T>,
         width: GroupWidth<N>,
     ) -> Self
@@ -3469,7 +3500,7 @@ impl Instr {
     {
         Self::ShTileMulRow {
             src: src.page(),
-            row_vec,
+            row_vec: row_vec.slot(),
             dst: dst.page(),
             width: width.tag(),
             role: COMPUTE_ROLE_TAG,
@@ -3477,9 +3508,10 @@ impl Instr {
     }
 
     /// Construct [`Instr::ShTileMulCol`] — see `sh_tile_mul_row`.
+    /// `col_vec` length must equal tile `COLS`.
     pub(crate) fn sh_tile_mul_col<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
         src: SmemTileId<ROWS, COLS, T>,
-        col_vec: PageId,
+        col_vec: SmemVecId<COLS, T>,
         dst: SmemTileId<ROWS, COLS, T>,
         width: GroupWidth<N>,
     ) -> Self
@@ -3488,7 +3520,7 @@ impl Instr {
     {
         Self::ShTileMulCol {
             src: src.page(),
-            col_vec,
+            col_vec: col_vec.slot(),
             dst: dst.page(),
             width: width.tag(),
             role: COMPUTE_ROLE_TAG,
@@ -3639,6 +3671,29 @@ impl TkTape {
         RegVecId::from_slot(slot)
     }
 
+    /// Mint a fresh [`SmemVecId<LEN, T>`] slot. The kernel preamble
+    /// will declare `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;`
+    /// for each minted slot. See `feedback_ff_subtile_compile_time_inviolable`
+    /// — distinct from `page_buf[]` so a vec endpoint cannot be a
+    /// tile (and vice versa).
+    pub(crate) fn mint_smem_vec<const LEN: usize, T: TileDtype>(
+        &mut self,
+    ) -> SmemVecId<LEN, T> {
+        let slot = SmemVecSlot(self.next_smem_vec_slot);
+        self.next_smem_vec_slot = self
+            .next_smem_vec_slot
+            .checked_add(1)
+            .expect("smem_vec slot overflow (>= 65536 shared vectors in one kernel)");
+        self.smem_vec_arena.insert(
+            slot,
+            SmemVecArenaEntry {
+                len: LEN as u32,
+                dtype: T::tag(),
+            },
+        );
+        SmemVecId::from_slot(slot)
+    }
+
     /// Read accessor for the register-tile arena (used by the player
     /// to emit kernel-preamble decls in deterministic id order).
     pub fn reg_tile_arena(&self) -> &BTreeMap<RegTileSlot, RegTileArenaEntry> {
@@ -3647,6 +3702,10 @@ impl TkTape {
 
     pub fn reg_vec_arena(&self) -> &BTreeMap<RegVecSlot, RegVecArenaEntry> {
         &self.reg_vec_arena
+    }
+
+    pub(crate) fn smem_vec_arena(&self) -> &BTreeMap<SmemVecSlot, SmemVecArenaEntry> {
+        &self.smem_vec_arena
     }
 
     /// Append the cross-op gmem-fence as a 5-Instr atomic sequence.
@@ -3888,8 +3947,10 @@ mod tests {
             kv_layouts: vec![],
             reg_tile_arena: BTreeMap::new(),
             reg_vec_arena: BTreeMap::new(),
+            smem_vec_arena: BTreeMap::new(),
             next_reg_tile_slot: 0,
             next_reg_vec_slot: 0,
+            next_smem_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
@@ -3915,8 +3976,10 @@ mod tests {
             kv_layouts: vec![],
             reg_tile_arena: BTreeMap::new(),
             reg_vec_arena: BTreeMap::new(),
+            smem_vec_arena: BTreeMap::new(),
             next_reg_tile_slot: 0,
             next_reg_vec_slot: 0,
+            next_smem_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
@@ -3954,8 +4017,10 @@ mod tests {
             kv_layouts: vec![],
             reg_tile_arena: BTreeMap::new(),
             reg_vec_arena: BTreeMap::new(),
+            smem_vec_arena: BTreeMap::new(),
             next_reg_tile_slot: 0,
             next_reg_vec_slot: 0,
+            next_smem_vec_slot: 0,
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),

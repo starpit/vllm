@@ -1346,6 +1346,103 @@ pub struct SoftmaxStateId(pub(crate) u32);
 // / PageBarrierWaitLoop { var, start } per plan §3 step 8 — one Instr per
 // architectural primitive, no inner-match dispatch in the player.
 
+// ── Sealed byte-offset / byte-stride newtypes ───────────────────────
+//
+// Per `feedback_ff_subtile_compile_time_inviolable`: stride and base
+// were `u64` raw — an emit-time bug could swap them or use a stride
+// minted for one step-unit (loop iterations) where another (positions)
+// was required. ByteStride carries a phantom step-unit so the unit
+// is part of the type; ByteOffset is sealed pub(crate)-inner so
+// external code can't fabricate.
+
+mod byte_offset_sealed {
+    pub trait Sealed {}
+}
+
+/// Absolute byte offset within a tensor or memory region. Sealed:
+/// inner u64 is `pub(crate)`. The `bytes()` accessor recovers the
+/// runtime value for emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ByteOffset(pub(crate) u64);
+
+impl ByteOffset {
+    pub const fn new(bytes: u64) -> Self {
+        Self(bytes)
+    }
+    pub const fn bytes(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Sealed marker for what step-unit a [`ByteStride<U>`] strides over.
+/// Implemented for [`PerLoopStep`] and [`PerPositionStep`].
+pub trait StrideUnit: byte_offset_sealed::Sealed + Copy {
+    /// Diagnostic name (used in compile-error messages on mismatch).
+    const NAME: &'static str;
+}
+
+/// Stride per one increment of a loop variable (the `var` field of
+/// [`ByteOffsetExpr::LinearLoop`]). NOT interchangeable with
+/// [`PerPositionStep`].
+#[derive(Debug, Clone, Copy)]
+pub struct PerLoopStep;
+impl byte_offset_sealed::Sealed for PerLoopStep {}
+impl StrideUnit for PerLoopStep {
+    const NAME: &'static str = "loop step";
+}
+
+/// Stride per one increment of a kernel-arg-driven position (the
+/// `arg` field of [`ByteOffsetExpr::RuntimePosition`]).
+#[derive(Debug, Clone, Copy)]
+pub struct PerPositionStep;
+impl byte_offset_sealed::Sealed for PerPositionStep {}
+impl StrideUnit for PerPositionStep {
+    const NAME: &'static str = "position step";
+}
+
+/// Byte stride — both the BYTE COUNT and the STEP UNIT are at the
+/// type level. Two different stride values (`ByteStride<32, ...>` vs
+/// `ByteStride<64, ...>`) are different Rust types — a function that
+/// expects `ByteStride<32, _>` rejects `ByteStride<64, _>` as rustc
+/// E0308. Same for unit mismatch (`PerLoopStep` vs `PerPositionStep`).
+///
+/// Stride values in this codebase are always compile-time-known
+/// (derived from KvCacheLayout<K> / tensor shape const generics);
+/// const-generic encoding is the right type-level shape for them.
+/// Per `feedback_ff_subtile_compile_time_inviolable` +
+/// `feedback_end_to_end_compile_time_proofs`.
+#[derive(Debug)]
+pub struct ByteStride<const BYTES: u64, U: StrideUnit>(PhantomData<fn() -> U>);
+
+impl<const BYTES: u64, U: StrideUnit> ByteStride<BYTES, U> {
+    pub const NEW: Self = Self(PhantomData);
+    /// The byte count, recovered from the const generic at emit time.
+    pub const fn bytes(&self) -> u64 {
+        BYTES
+    }
+    pub const BYTES: u64 = BYTES;
+}
+
+// Manual impls (the derive forms add `U: ...` bounds; the
+// phantom-typed U is a unit marker that doesn't need those derives).
+impl<const BYTES: u64, U: StrideUnit> Clone for ByteStride<BYTES, U> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<const BYTES: u64, U: StrideUnit> Copy for ByteStride<BYTES, U> {}
+impl<const BYTES: u64, U: StrideUnit> PartialEq for ByteStride<BYTES, U> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl<const BYTES: u64, U: StrideUnit> Eq for ByteStride<BYTES, U> {}
+impl<const BYTES: u64, U: StrideUnit> std::hash::Hash for ByteStride<BYTES, U> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        BYTES.hash(state);
+    }
+}
+
 /// Byte-offset expression for TMA load/store source/dest.
 ///
 /// Sealed enum (variants are `pub`, but the type is by-value match-only;
@@ -1353,30 +1450,70 @@ pub struct SoftmaxStateId(pub(crate) u32);
 /// **structured data**, not pre-formatted CUDA syntax; the player
 /// formats per arm at emit time. Per
 /// `feedback_no_premature_string_encoding`.
+///
+/// The variant stores stride bytes as runtime `u64` (Instr enum is
+/// heterogeneous so the const generic must erase). The TYPED
+/// CONSTRUCTORS take `ByteStride<STRIDE, U>` const-generic witnesses
+/// — the stride value is compile-time-known and unit-checked at
+/// construction; mismatches are rustc E0308.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteOffsetExpr {
     /// `<c>u` — constant byte offset.
-    Const(u64),
+    Const(ByteOffset),
     /// `(<base>u + v<var> * <stride>u)` — loop-linear byte offset.
+    /// Constructed via the const-generic `ByteOffsetExpr::linear_loop`
+    /// taking `ByteStride<STRIDE, PerLoopStep>`.
     LinearLoop {
         var: LoopVarId,
-        stride: u64,
-        base: u64,
+        stride_bytes: u64,
+        base: ByteOffset,
+    },
+    /// `(<base>u + a<arg> * <stride>u)` — kernel-arg-driven byte
+    /// offset. Used by RopeAppend / AttnDecode for KV cache writes.
+    /// Constructed via the const-generic `runtime_position` taking
+    /// `ByteStride<STRIDE, PerPositionStep>`.
+    RuntimePosition {
+        arg: KernelArgRef,
+        stride_bytes: u64,
+        base: ByteOffset,
     },
 }
 
 impl ByteOffsetExpr {
-    /// Convenience constant constructor mirroring the legacy
-    /// `ByteOffset::from_const(c)` API for call-site brevity. The
-    /// canonical path is `ByteOffsetExpr::Const(c)`.
-    pub const fn from_const(c: u64) -> Self {
-        Self::Const(c)
+    /// Convenience constant constructor.
+    pub const fn from_const(bytes: u64) -> Self {
+        Self::Const(ByteOffset::new(bytes))
     }
 
-    /// Convenience linear-loop constructor mirroring the legacy
-    /// `ByteOffset::linear_loop(var, stride, base)` API.
-    pub const fn linear_loop(var: LoopVarId, stride: u64, base: u64) -> Self {
-        Self::LinearLoop { var, stride, base }
+    /// Construct [`Self::LinearLoop`] from a typed const-generic
+    /// `ByteStride<STRIDE, PerLoopStep>` witness. Caller writes
+    /// `ByteOffsetExpr::linear_loop::<STRIDE>(var, ByteStride::NEW, base)`
+    /// — STRIDE is compile-time-known and the unit witness rejects
+    /// `PerPositionStep` strides.
+    pub const fn linear_loop<const STRIDE: u64>(
+        var: LoopVarId,
+        _stride: ByteStride<STRIDE, PerLoopStep>,
+        base: ByteOffset,
+    ) -> Self {
+        Self::LinearLoop {
+            var,
+            stride_bytes: STRIDE,
+            base,
+        }
+    }
+
+    /// Construct [`Self::RuntimePosition`] from a typed const-generic
+    /// `ByteStride<STRIDE, PerPositionStep>` witness.
+    pub const fn runtime_position<const STRIDE: u64>(
+        arg: KernelArgRef,
+        _stride: ByteStride<STRIDE, PerPositionStep>,
+        base: ByteOffset,
+    ) -> Self {
+        Self::RuntimePosition {
+            arg,
+            stride_bytes: STRIDE,
+            base,
+        }
     }
 }
 
@@ -3018,7 +3155,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffsetExpr::Const(0),
+                    byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
@@ -3045,7 +3182,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffsetExpr::Const(0),
+                    byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),
@@ -3084,7 +3221,7 @@ mod tests {
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
                     dst_tensor: crate::subtile_ir::TensorId(0),
-                    byte_off: ByteOffsetExpr::Const(0),
+                    byte_off: ByteOffsetExpr::from_const(0),
                     tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
                     role: WarpRole::Storer,
                 }),

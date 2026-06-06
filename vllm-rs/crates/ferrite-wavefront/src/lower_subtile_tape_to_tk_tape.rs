@@ -972,7 +972,7 @@ fn region_byte_offset<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>, tr:
     let off = ((tr.region.rows.start as u64) * (shape.cols as u64)
         + (tr.region.cols.start as u64))
         * (ELEM_BYTES as u64);
-    ByteOffsetExpr::Const(off)
+    ByteOffsetExpr::from_const(off)
 }
 
 fn emit_external_load<F: RopeForm, K: KvCacheShape>(

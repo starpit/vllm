@@ -58,9 +58,12 @@ mod tk20 {
     /// `feedback_no_premature_string_encoding`.
     pub fn byte_offset_expr(off: &crate::tk_tape::ByteOffsetExpr) -> String {
         match off {
-            crate::tk_tape::ByteOffsetExpr::Const(c) => format!("{c}u"),
-            crate::tk_tape::ByteOffsetExpr::LinearLoop { var, stride, base } => {
-                format!("({base}u + v{} * {stride}u)", var.0)
+            crate::tk_tape::ByteOffsetExpr::Const(c) => format!("{}u", c.bytes()),
+            crate::tk_tape::ByteOffsetExpr::LinearLoop { var, stride_bytes, base } => {
+                format!("({}u + v{} * {}u)", base.bytes(), var.0, stride_bytes)
+            }
+            crate::tk_tape::ByteOffsetExpr::RuntimePosition { arg, stride_bytes, base } => {
+                format!("({}u + a{} * {}u)", base.bytes(), arg.0, stride_bytes)
             }
         }
     }

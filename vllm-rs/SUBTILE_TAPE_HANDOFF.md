@@ -35,7 +35,7 @@ What landed in this session:
 | `b6f2bfd380` | Drop GemmM1 accum if/else from tk20 helper |
 | `c260bd19b1` | §10 dead-arm scrub of metal_tape.rs (1471 → 153 LOC, -1318) |
 
-78 unit + 8 doctests green throughout.
+79 unit + 8 doctests green throughout.
 
 ## Remaining work (all staged future commits)
 
@@ -59,7 +59,7 @@ Flat Instr enum (no nested ComputeBody, no LoopCount, no ParityExpr, no ByteOffs
 - Sync: `SyncthreadsCta`, `SyncthreadsGroup{n_warps}`
 - Fence: `ThreadfenceBlock`, `ThreadfenceDevice`, `ThreadfenceSystem`
 - Commit/wait: `CommitGroupBulk`, `WaitGroupBulk{n}`
-- Page barrier: `BarrierInit`, `PageBarrierWaitStatic{parity:u8}`, `PageBarrierWaitLoop{var,start}`, `PageBarrierArrive`, `ArriveIfRuntimeEven`
+- Page barrier: `BarrierInit`, `PageBarrierWaitStaticP0` / `PageBarrierWaitStaticP1` (parity is a const-generic split per plan §2 row "Phase (parity)" — never a u8 field), `PageBarrierWaitLoopStart0` / `PageBarrierWaitLoopStart1` (same const-generic split on `start_parity`), `PageBarrierArrive`, `ArriveIfRuntimeEven`
 - Memory: `LoadAsync(LoadSpec)`, `StoreAsync(StoreSpec)`, `StoreAsyncTyped`
 - Compute: `RmsNorm`, `GemmM1{accum:AccumKind}`, `SiluMul`, `ResidualAdd`, `RopeRotate`, `AttnDecodeInit/Qkt/Sv/Finalise`, `DebugOpBeginMarker`
 - Control flow: `ForLoopOpenConst`, `ForLoopOpenKernelArg`, `ForLoopClose`

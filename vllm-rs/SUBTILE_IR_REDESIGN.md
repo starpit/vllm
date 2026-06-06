@@ -12,7 +12,7 @@ Fuf  (ferrite-forward macro internal)
 SubtileIR     (DAG, target-agnostic; "the math at subtile granularity")
  │
  ▼            [DAG → linear: a topological linearization, sequential semantics]
-SubtileTape   (linear, target-agnostic; just Compute + OpenLoop + CloseLoop)
+SubtileTape   (linear, target-agnostic; AllocSlot + Compute + FreeSlot + OpenLoop + CloseLoop — slot lifecycle wraps each Compute)
  │
  ▼            [target-agnostic → target-specific; work-distribution + sync chosen here]
 TkTape  /  MetalTape  /  …
@@ -51,8 +51,12 @@ time. We are a compiler.
 - `subtile.rs::SubtileGraph` (current) → `subtile_ir.rs::SubtileIR`
   (the DAG; reclaim the name, it IS the SubtileIR).
 - `subtile_ir.rs::SubtileIr` (current, Metal-flavored) →
-  `metal_tape.rs::MetalTape` (drop the "neutral" pretense — the
-  `PipelineSpec` etc. were always Metal-shaped).
+  scrubbed: the `MetalTape` type itself was deleted in commit 10
+  (the v1 Metal-runtime ISA had no consumers in the new pipeline);
+  `metal_tape.rs` survives as a 153-LOC carcass holding leaf types
+  (`BufId`, `PipeId`, `FlagId`, `WeightRole`, `WeightBundle`,
+  `WeightLoc`, `InputKind`, `BufferRef`) still referenced by
+  callers outside the wavefront pipeline.
 - NEW `subtile_tape.rs::SubtileTape` — the missing linear,
   target-agnostic layer where every DAG edge becomes an explicit
   **slot-lifecycle instruction** (`AllocSlot` / `Compute { writes,
@@ -156,14 +160,19 @@ Two validators, mirroring the two tapes:
     `FenceDevice` (or stricter scope as required by the consumer's
     reach).
   - **LoadAsync ↔ PageBarrierWait{Ready}** matched downstream.
+    *Lands with §6.5 shmem-promotion pass*: the commit-6 conservative
+    all-gmem path pairs `Wait{Ready}` with producer `Arrive{Done}`
+    rather than with `LoadAsync`, so the closure check only becomes
+    meaningful once pipelined Load→Wait edges land.
   - **Page-cycle closure**: every page slot's
     `Consumed → Ready → Done → Consumed` cycle closes — no orphan
-    transitions.
+    transitions. *§6.5 pass postcondition*.
   - **Phase parity**: `start_parity` propagated correctly across loop
     iterations; phantom-round arrives present where required.
+    *§6.5 pass postcondition*.
   - **Edge closure**: every shmem-promoted edge has exactly one
     matching arrive/wait on the same page at the same const-generic
-    `Phase`.
+    `Phase`. *§6.5 pass postcondition*.
   - **Pass postconditions**: each optimizer pass adds its own
     invariant to the assertion set (e.g. shmem-promotion guarantees
     `consumer_count == 1` and "no other edge aliases this `(buf,
@@ -406,15 +415,15 @@ Snapshot as of commit `56413bdf6f` (post-nuke):
 
 | Layer | Before | Now (snapshot) | After (target) |
 |---|---|---|---|
-| `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` (1536 LOC) | folded ~1400 LOC |
-| `subtile_ir.rs` (Metal-flavored, v1) | 1471 LOC | renamed `metal_tape.rs` (1471 LOC; dead arms not yet deleted) | dead arms deleted (~900 LOC) |
-| `subtile_tape.rs` | 0 LOC | 1662 LOC (slot-lifecycle landed; tests dominate) | ~600 LOC after the §10 cleanup |
-| `lower.rs` (`LoweringInput`/`LoweredOp`) | 1105 LOC | 206 LOC (much already cut) | DELETED |
+| `subtile.rs` + `region.rs` | ~2300 LOC | folded into `subtile_ir.rs` (1604 LOC) | folded ~1400 LOC |
+| `subtile_ir.rs` (Metal-flavored, v1) | 1471 LOC | scrubbed to `metal_tape.rs` (153 LOC carcass; MetalTape type deleted in commit 10, leaf types kept for callers) | further-cut to ~50 LOC once leaf-type callers migrate |
+| `subtile_tape.rs` | 0 LOC | 1725 LOC (slot-lifecycle + validate_subtile_tape landed; tests dominate) | ~600 LOC after the §10 cleanup |
+| `lower.rs` (`LoweringInput`/`LoweredOp`) | 1105 LOC | 213 LOC (much already cut) | DELETED |
 | `tape.rs` | 391 LOC | DELETED ✓ | DELETED |
-| `tk_tape.rs` | 727 LOC | 725 LOC (BufId nuked; ComputeBody flat) | grows ~+200 LOC for fence-Instr split + edge records (commit 6+) |
-| `tk_player.rs` | 248 LOC | 257 LOC (flat compute arms stubbed) | grows to ~600 LOC (full emit, ≤5 lines/arm) |
+| `tk_tape.rs` | 727 LOC | 960 LOC (parity-split Wait variants, KvLayoutId table, validate_tk_tape) | grows for §6.5 pass postcondition checks (closure / parity / edge-pairing) |
+| `tk_player.rs` | 248 LOC | 725 LOC (one ≤5-line tk20:: arm per Instr; emit_kernel host wrapper) | ~700 LOC once scaffolding `kittens::*` strings migrate to `tk20::*` helpers |
 | `tk_lower.rs` | 114 LOC | DELETED ✓ | DELETED |
-| `lower_tape_to_tk` (commit 6, conservative) | 0 LOC | 0 LOC (next) | ~400 LOC |
+| `lower_tape_to_tk` (commit 6, conservative) | 0 LOC | 1166 LOC ✓ (4-phase AttnDecode split, KvLayout interning, conservative all-gmem routing) | trims as §6.5 pass postconditions land |
 | Optimizer passes (commit 6.5.*) | 0 LOC | 0 LOC | ~700 LOC across headline passes |
-| Validators (5b, 6b) | 0 LOC | 5b ✓ inline in subtile_tape.rs; 6b pending | ~300 LOC each |
+| Validators (5b, 6b) | 0 LOC | 5b ✓ inline in subtile_tape.rs (~270 LOC); 6b ✓ inline in tk_tape.rs (~120 LOC, conservative checks; closure / parity / edge-pairing land alongside §6.5 passes) | ~300 LOC each at §6.5 land |
 | **Net status** | | -113 LOC (commit 56413bdf6f) on top of slot-lifecycle commits; carcasses pending §10 | net ≥ -1500 LOC (K8) |

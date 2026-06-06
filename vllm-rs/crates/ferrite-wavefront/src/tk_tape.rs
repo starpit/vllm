@@ -89,6 +89,22 @@ pub struct TkTape {
     /// CUDA sequences (cross-op fence, kernel-end drain) are SEQUENCES
     /// of primitive Instrs in this Vec, never a single fat Instr.
     pub instrs: Vec<Instr>,
+
+    /// KvCacheLayout witness table — interned per K/V cache `TensorId`.
+    /// `Instr::RopeRotate.kv_layout: KvLayoutId` and AttnDecode Instrs'
+    /// kv_layout field index into this Vec. Per plan §2 line 88 the
+    /// witness "propagates; consumer reads via single-source method"
+    /// — see [`TkTape::kv_layout`].
+    pub kv_layouts: Vec<KvLayoutEntry>,
+}
+
+impl TkTape {
+    /// Single-source read accessor for [`KvLayoutId`] — per plan §2
+    /// line 88, the consumer reads the `KvCacheLayout` witness via
+    /// this one method.
+    pub fn kv_layout(&self, id: KvLayoutId) -> &KvLayoutEntry {
+        &self.kv_layouts[id.0 as usize]
+    }
 }
 
 // ── kernel-arg declarations ─────────────────────────────────────────
@@ -837,6 +853,7 @@ mod tests {
         let tape = TkTape {
             kernel_args: vec![],
             prelude: vec![],
+            kv_layouts: vec![],
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),
@@ -859,6 +876,7 @@ mod tests {
         let tape = TkTape {
             kernel_args: vec![],
             prelude: vec![],
+            kv_layouts: vec![],
             instrs: vec![
                 Instr::StoreAsync(StoreSpec {
                     src_page: PageId(0),

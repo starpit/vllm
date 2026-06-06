@@ -293,6 +293,13 @@ pub fn lower_tape_to_tk<F: RopeForm>(
     for arg in state.kernel_args {
         out.kernel_args.push(arg);
     }
+    // Per plan §2 line 88: KvCacheLayout witness propagates to TkTape;
+    // consumer reads via TkTape::kv_layout(KvLayoutId). Move the
+    // intern table from the lowering's transient state onto the
+    // output tape so KvLayoutId references in Instr::RopeRotate /
+    // AttnDecode resolve to a real KvLayoutEntry, not a dangling
+    // index into a dropped Vec.
+    out.kv_layouts = state.kv_layouts;
     let top = state
         .instr_stack
         .pop()

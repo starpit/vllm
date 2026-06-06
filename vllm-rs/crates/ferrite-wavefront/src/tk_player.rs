@@ -316,13 +316,28 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
         std::cmp::max(1, count_softmax_states(tape)),
     );
 
-    // KvCacheLayout table (TensorId → layout const).
-    let _ = writeln!(out, "    constexpr struct {{ uint num_kv_heads; uint head_dim; }} kv_layouts[1] = {{ {{0u, 0u}} }};");
-    // (The lowering builds a real KvLayout table; the player emits the
-    // declaration that backs the `kv_layouts[<id>]` references in
-    // RopeRotate. A future commit fills the entries from
-    // `tape.prelude`'s KvLayoutEntries — for now a 1-entry stub keeps
-    // the C++ valid; the values are read only inside emitted ops.)
+    // KvCacheLayout table (per plan §2 line 88: TkTape consumer reads
+    // the witness via single-source method `TkTape::kv_layout(id)`).
+    // Emit a constexpr array whose entries match `tape.kv_layouts`
+    // exactly; `Instr::RopeRotate.kv_layout` indexes into it.
+    let n_layouts = std::cmp::max(1, tape.kv_layouts.len());
+    let _ = writeln!(
+        out,
+        "    constexpr struct {{ uint num_kv_heads; uint head_dim; }} kv_layouts[{n_layouts}] = {{"
+    );
+    if tape.kv_layouts.is_empty() {
+        out.push_str("        {0u, 0u},\n");
+    } else {
+        for entry in &tape.kv_layouts {
+            let _ = writeln!(
+                out,
+                "        {{{}u, {}u}},",
+                entry.layout.num_kv_heads(),
+                entry.layout.head_dim(),
+            );
+        }
+    }
+    out.push_str("    };\n");
 
     // Suppress unused warnings for non-yet-used symbols.
     out.push_str("    (void)page_buf; (void)page_ready; (void)page_done;\n");

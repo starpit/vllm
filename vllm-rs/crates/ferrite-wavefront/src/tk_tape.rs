@@ -432,6 +432,32 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    /// `kittens::group<N>::load(rt_dst, page_buf[src].subtile<COLS_SUB>(IDX))`
+    /// — TK 2.0 sub-tile reference at `types/shared/st.cuh:159`.
+    /// Loads a column-block of width `subtile_cols` at index
+    /// `subtile_idx` from a full shared tile into a register tile.
+    /// Used by RopeRotateNeoX to split q at head_dim/2.
+    LoadShmemSubTileToReg {
+        src: PageId,
+        subtile_cols: u16,
+        subtile_idx: u16,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
+    /// `kittens::group<N>::store(page_buf[dst].subtile<COLS_SUB>(IDX), rt_src)`
+    /// — inverse of LoadShmemSubTileToReg. Used by RopeRotateNeoX
+    /// to write upper/lower halves back into one page in-place.
+    StoreRegTileSubTileToShmem {
+        src: RegTileSlot,
+        dst: PageId,
+        subtile_cols: u16,
+        subtile_idx: u16,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::load(rv, sv)` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`. Load a
     /// shared vector into a register vector.
@@ -1035,6 +1061,49 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, 
     }
     pub const fn cols() -> usize {
         COLS
+    }
+}
+
+/// Typed shared-memory vector handle. The substrate's pages are
+/// tile-shaped today; an `SmemVecId<LEN, T>` is a typed view onto
+/// a page that semantically holds an `LEN`-element vector of `T`.
+/// When non-uniform pools land (a separate `__shared__ kittens::sv_bf<LEN>
+/// vec_buf[]`), each pool will mint its own typed `SmemVecId<LEN, T>`,
+/// and downstream type-checks will refuse cross-pool mixing.
+///
+/// Constructor (`from_page`) is `pub(crate)` so only the lowerer can
+/// mint these.
+///
+/// # Compile-fail proof — length mismatch rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, SmemVecId, TileDtype};
+/// fn _both<const L: usize, T: TileDtype>(
+///     _a: SmemVecId<L, T>,
+///     _b: SmemVecId<L, T>,
+/// ) {}
+/// let a: SmemVecId<32, Bf16> = unreachable!();
+/// let b: SmemVecId<64, Bf16> = unreachable!();
+/// _both(a, b);  // ← rustc rejects: L=32 vs L=64
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SmemVecId<const LEN: usize, T: TileDtype> {
+    page: PageId,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<const LEN: usize, T: TileDtype> SmemVecId<LEN, T> {
+    pub(crate) const fn from_page(page: PageId) -> Self {
+        Self {
+            page,
+            _marker: PhantomData,
+        }
+    }
+    pub const fn page(&self) -> PageId {
+        self.page
+    }
+    pub const fn len() -> usize {
+        LEN
     }
 }
 
@@ -1902,18 +1971,96 @@ impl Instr {
         }
     }
 
-    pub(crate) fn load_vec_smem_to_reg<
+    /// Construct [`Instr::LoadShmemSubTileToReg`] from typed witnesses.
+    /// Uses TK 2.0's `st.subtile<COLS_SUB>(idx)` primitive at
+    /// `types/shared/st.cuh:159`. Const-generic guards:
+    ///   - `COLS_FULL % COLS_SUB == 0` (sub-tile divides evenly)
+    ///   - `IDX * COLS_SUB < COLS_FULL` (slice index in range)
+    /// Both are `const{}` asserts — always-dead for valid usage,
+    /// fire at instantiation time on misuse.
+    pub(crate) fn load_shmem_subtile_to_reg<
         const N: usize,
         const ROWS: usize,
-        const COLS: usize,
+        const COLS_FULL: usize,
+        const COLS_SUB: usize,
+        const IDX: usize,
         T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: SmemTileId<ROWS, COLS_FULL, T>,
+        dst: RegTileId<ROWS, COLS_SUB, T, L>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        const {
+            assert!(
+                COLS_FULL % COLS_SUB == 0,
+                "load_shmem_subtile_to_reg: COLS_FULL must be divisible by COLS_SUB",
+            );
+            assert!(
+                IDX * COLS_SUB < COLS_FULL,
+                "load_shmem_subtile_to_reg: IDX * COLS_SUB out of range",
+            );
+        }
+        Self::LoadShmemSubTileToReg {
+            src: src.page(),
+            subtile_cols: COLS_SUB as u16,
+            subtile_idx: IDX as u16,
+            dst: dst.slot(),
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Construct [`Instr::StoreRegTileSubTileToShmem`] — inverse of
+    /// `load_shmem_subtile_to_reg`. Same const-generic guards.
+    pub(crate) fn store_reg_tile_subtile_to_shmem<
+        const N: usize,
+        const ROWS: usize,
+        const COLS_FULL: usize,
+        const COLS_SUB: usize,
+        const IDX: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<ROWS, COLS_SUB, T, L>,
+        dst: SmemTileId<ROWS, COLS_FULL, T>,
+        width: GroupWidth<N>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<N>: ComputeWidth,
+    {
+        const {
+            assert!(
+                COLS_FULL % COLS_SUB == 0,
+                "store_reg_tile_subtile_to_shmem: COLS_FULL must be divisible by COLS_SUB",
+            );
+            assert!(
+                IDX * COLS_SUB < COLS_FULL,
+                "store_reg_tile_subtile_to_shmem: IDX * COLS_SUB out of range",
+            );
+        }
+        Self::StoreRegTileSubTileToShmem {
+            src: src.slot(),
+            dst: dst.page(),
+            subtile_cols: COLS_SUB as u16,
+            subtile_idx: IDX as u16,
+            width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    pub(crate) fn load_vec_smem_to_reg<
+        const N: usize,
         const LEN: usize,
+        T: TileDtype,
         RV: RegVecLayout,
     >(
-        // src is a shared-memory page that holds a vector; the
-        // typed witness is SmemTileId<ROWS, COLS, T> for now (the
-        // page substrate). LEN unifies via where-clause caller-side.
-        src: SmemTileId<ROWS, COLS, T>,
+        src: SmemVecId<LEN, T>,
         dst: RegVecId<LEN, T, RV>,
         width: GroupWidth<N>,
         role: AllConsumersRole,
@@ -1931,14 +2078,12 @@ impl Instr {
 
     pub(crate) fn store_reg_vec_to_shmem<
         const N: usize,
-        const ROWS: usize,
-        const COLS: usize,
-        T: TileDtype,
         const LEN: usize,
+        T: TileDtype,
         RV: RegVecLayout,
     >(
         src: RegVecId<LEN, T, RV>,
-        dst: SmemTileId<ROWS, COLS, T>,
+        dst: SmemVecId<LEN, T>,
         width: GroupWidth<N>,
         role: AllConsumersRole,
     ) -> Self
@@ -2569,6 +2714,8 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::ShTileMulCol { .. }
             | Instr::LoadShmemToReg { .. }
             | Instr::StoreRegTileToShmem { .. }
+            | Instr::LoadShmemSubTileToReg { .. }
+            | Instr::StoreRegTileSubTileToShmem { .. }
             | Instr::LoadVecSmemToReg { .. }
             | Instr::StoreRegVecToShmem { .. }
             | Instr::RegTileNeg { .. }

@@ -724,9 +724,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // Reg vec for rsqrt detour
             let rv_var: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
             let rv_inv: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
-            // SmemTileId witnesses for register-vec load/store
-            let var_tile = SmemTileId::<128, 128, Bf16>::from_page(var_page);
-            let inv_rms_tile = SmemTileId::<128, 128, Bf16>::from_page(inv_rms_page);
+            // SmemVecId witnesses for register-vec load/store —
+            // var/inv_rms are length-128 shared vectors viewed onto
+            // their respective pages (per-row scalar per the row_sum
+            // → ROWS=128 mapping).
+            let var_vec = crate::tk_tape::SmemVecId::<128, Bf16>::from_page(var_page);
+            let inv_rms_vec = crate::tk_tape::SmemVecId::<128, Bf16>::from_page(inv_rms_page);
 
             // 1: x_sq = x * x
             state.push(Instr::sh_tile_mul(x, x, x_sq, W));
@@ -750,11 +753,11 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 W,
             ));
             // 5: rv_var = load(var)
-            state.push(Instr::load_vec_smem_to_reg(var_tile, rv_var, W, R));
+            state.push(Instr::load_vec_smem_to_reg(var_vec, rv_var, W, R));
             // 6: rv_inv = rsqrt(rv_var)
             state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, W, R));
             // 7: inv_rms = store(rv_inv)
-            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_tile, W, R));
+            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_vec, W, R));
             // 8: x_norm = x * inv_rms (per-row broadcast)
             //    write into dst (clobber x is OK; we reuse dst as
             //    the running tile through the gamma multiply too).
@@ -764,8 +767,94 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::RopeRotate { head_dim, _form: _ } => {
+            // RopeRotateNeoX: split q at head_dim/2; rotate as
+            //   out_even = q_even * cos - q_odd * sin
+            //   out_odd  = q_even * sin + q_odd * cos
+            // Per SUBTILE_TK20_DECOMP §"Per-SubOp Instr counts" line
+            // 24, 14 Instrs. Two are the implicit external loads of
+            // cos/sin (handled by the SubtileTape lowerer); 12 are
+            // emitted here.
+            //
+            // F: RopeForm is a const-generic on the lowerer; F::TAG
+            // selects NeoX vs Interleaved at type level. Interleaved
+            // (step 8) has a different decomposition and is deferred.
+            use crate::subtile_ir::RopeFormTag;
+            assert_eq!(
+                F::TAG,
+                RopeFormTag::NeoX,
+                "RopeRotate Interleaved form is plan step 8, not yet landed",
+            );
+            assert_eq!(
+                *head_dim, 64,
+                "RopeRotateNeoX: only head_dim=64 (Llama-3.2-1B) supported \
+                 today; got head_dim={}",
+                head_dim,
+            );
+
+            // reads: [q, cos, sin]
+            // q is in a 128×128 page (logical 128×64 with cols 0..64
+            // used; rotation operates on cols 0..32 vs 32..64 halves).
+            use crate::tk_tape::{
+                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegTileId,
+                RegVecId, RowLayout, SmemTileId, SmemVecId,
+            };
+            let q_page = state.page_of(reads[0]);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[1]));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(reads[2]));
+            let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
+            let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const R: AllConsumersRole = AllConsumersRole;
+
+            // Mint the 6 register tiles + 2 register vecs the
+            // rotation needs. 16 warps * 8 live rt's of 128×32 bf16
+            // = lots of registers; nvcc allocates and may spill.
+            let rt_q_even: RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_q_odd:  RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_a:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_b:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_c:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_d:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
+            let rv_cos: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+            let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+
+            // 1: rt_q_even = q[:, 0:32]
+            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 0, Bf16, RowLayout>(
+                q_full, rt_q_even, W, R,
+            ));
+            // 2: rt_q_odd = q[:, 32:64]
+            state.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
+                q_full, rt_q_odd, W, R,
+            ));
+            // 3: rv_cos = load(cos_vec)
+            state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, W, R));
+            // 4: rv_sin = load(sin_vec)
+            state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, W, R));
+            // 5: rt_a = q_even * cos
+            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_cos, rt_a, W, R));
+            // 6: rt_b = q_odd * sin
+            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_sin, rt_b, W, R));
+            // 7: rt_c = q_even * sin
+            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_sin, rt_c, W, R));
+            // 8: rt_d = q_odd * cos
+            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_cos, rt_d, W, R));
+            // 9: rt_a = rt_a - rt_b  (out_even = q_even*cos - q_odd*sin)
+            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, W, R));
+            // 10: rt_c = rt_c + rt_d  (out_odd  = q_even*sin + q_odd*cos)
+            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
+            // 11: dst[:, 0:32] = rt_a
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
+                rt_a, dst_full, W, R,
+            ));
+            // 12: dst[:, 32:64] = rt_c
+            state.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 1, Bf16, RowLayout>(
+                rt_c, dst_full, W, R,
+            ));
+
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         SubOp::MatmulTile
-        | SubOp::RopeRotate { .. }
         | SubOp::RopeAppend { .. }
         | SubOp::AttnDecode { .. } => {
             panic!(

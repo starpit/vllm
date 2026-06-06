@@ -215,6 +215,39 @@ mod tk20 {
         format!("kittens::group<{group_n}>::store(page_buf[{dst_page}], rt_{src_slot});")
     }
 
+    /// `kittens::group<N>::load(rt_dst, page_buf[src].subtile<COLS_SUB>(IDX))` —
+    /// uses TK 2.0's column-block sub-tile reference at
+    /// `types/shared/st.cuh:159`. Splits a full shared tile into
+    /// equal-width column blocks; each block is a real `st<...>`
+    /// reference (not a temporary view).
+    pub fn load_shmem_subtile_to_reg_tile(
+        group_n: u32,
+        src_page: u8,
+        subtile_cols: u16,
+        subtile_idx: u16,
+        dst_slot: u16,
+    ) -> String {
+        format!(
+            "kittens::group<{group_n}>::load(rt_{dst_slot}, \
+             page_buf[{src_page}].template subtile<{subtile_cols}>({subtile_idx}));"
+        )
+    }
+
+    /// Inverse of [`load_shmem_subtile_to_reg_tile`].
+    pub fn store_reg_tile_subtile_to_shmem(
+        group_n: u32,
+        src_slot: u16,
+        dst_page: u8,
+        subtile_cols: u16,
+        subtile_idx: u16,
+    ) -> String {
+        format!(
+            "kittens::group<{group_n}>::store(\
+             page_buf[{dst_page}].template subtile<{subtile_cols}>({subtile_idx}), \
+             rt_{src_slot});"
+        )
+    }
+
     /// `kittens::group<N>::load(rv_dst, page_buf[src])` —
     /// `ops/group/memory/vec/shared_to_register.cuh:14`.
     pub fn load_smem_to_reg_vec(group_n: u32, src_page: u8, dst_slot: u16) -> String {
@@ -686,6 +719,16 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let _ = writeln!(out, "{}",
                 tk20::store_reg_tile_to_shmem(width.n(), src.0, dst.0));
         }
+        Instr::LoadShmemSubTileToReg { src, subtile_cols, subtile_idx, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::load_shmem_subtile_to_reg_tile(
+                    width.n(), src.0, *subtile_cols, *subtile_idx, dst.0));
+        }
+        Instr::StoreRegTileSubTileToShmem { src, dst, subtile_cols, subtile_idx, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::store_reg_tile_subtile_to_shmem(
+                    width.n(), src.0, dst.0, *subtile_cols, *subtile_idx));
+        }
         Instr::LoadVecSmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",
                 tk20::load_smem_to_reg_vec(width.n(), src.0, dst.0));
@@ -1069,6 +1112,45 @@ mod tests {
             ));
         });
         assert_eq!(s, "kittens::group<16>::load(rt_2, page_buf[3]);\n");
+    }
+
+    /// `Instr::LoadShmemSubTileToReg` emits the TK 2.0 column-block
+    /// sub-tile reference per `types/shared/st.cuh:159`. Used by
+    /// RopeRotateNeoX to split q at head_dim/2.
+    #[test]
+    fn load_shmem_subtile_to_reg_emits_subtile_template() {
+        use crate::tk_tape::{
+            AllConsumersRole, Bf16, GroupWidth, PageId, RegTileId, RowLayout, SmemTileId,
+        };
+        let s = emit_with_rt_arena(|tape| {
+            let dst: RegTileId<128, 32, Bf16, RowLayout> = tape.mint_reg_tile();
+            let src = SmemTileId::<128, 128, Bf16>::from_page(PageId(4));
+            tape.push(Instr::load_shmem_subtile_to_reg::<16, 128, 128, 32, 1, Bf16, RowLayout>(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(
+            s,
+            "kittens::group<16>::load(rt_2, page_buf[4].template subtile<32>(1));\n",
+        );
+    }
+
+    #[test]
+    fn store_reg_tile_subtile_to_shmem_emits_subtile_template() {
+        use crate::tk_tape::{
+            AllConsumersRole, Bf16, GroupWidth, PageId, RegTileId, RowLayout, SmemTileId,
+        };
+        let s = emit_with_rt_arena(|tape| {
+            let src: RegTileId<128, 32, Bf16, RowLayout> = tape.mint_reg_tile();
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(7));
+            tape.push(Instr::store_reg_tile_subtile_to_shmem::<16, 128, 128, 32, 0, Bf16, RowLayout>(
+                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+            ));
+        });
+        assert_eq!(
+            s,
+            "kittens::group<16>::store(page_buf[7].template subtile<32>(0), rt_2);\n",
+        );
     }
 
     #[test]

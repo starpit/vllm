@@ -526,14 +526,19 @@ mod tests {
     /// `kittens::group<NUM_CONSUMER_WARPS>::mul(...)` from
     /// `ops/group/shared/tile/maps.cuh:306` — no invented helpers.
     /// Constructed via the typed [`GroupWidth<16>::ALL_CONSUMERS`]
-    /// witness; the const-generic propagates to emit as `<16>`.
+    /// + [`SmemTileId<128, 128, Bf16>`] witnesses; const-generics
+    /// propagate to emit as `<16>` and the shared shape proof rules
+    /// out lhs/rhs/dst shape mismatch at rustc time.
     #[test]
     fn sh_tile_mul_emits_real_tk20_call() {
-        use crate::tk_tape::{GroupWidth, PageId};
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(1));
+        let rhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(2));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(3));
         let s = emit(Instr::sh_tile_mul(
-            PageId(1),
-            PageId(2),
-            PageId(3),
+            lhs,
+            rhs,
+            dst,
             GroupWidth::<16>::ALL_CONSUMERS,
         ));
         assert_eq!(
@@ -546,11 +551,14 @@ mod tests {
     /// type-checks and emits `<4>`. Same code path, different N.
     #[test]
     fn sh_tile_mul_warpgroup_width_emits_group_4() {
-        use crate::tk_tape::{GroupWidth, PageId};
+        use crate::tk_tape::{Bf16, GroupWidth, PageId, SmemTileId};
+        let lhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(0));
+        let rhs = SmemTileId::<128, 128, Bf16>::from_page(PageId(1));
+        let dst = SmemTileId::<128, 128, Bf16>::from_page(PageId(2));
         let s = emit(Instr::sh_tile_mul(
-            PageId(0),
-            PageId(1),
-            PageId(2),
+            lhs,
+            rhs,
+            dst,
             GroupWidth::<4>::WARPGROUP,
         ));
         assert_eq!(

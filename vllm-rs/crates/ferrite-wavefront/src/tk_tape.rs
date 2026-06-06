@@ -463,6 +463,150 @@ impl GroupWidthTag {
     }
 }
 
+// ── Sealed `TileDtype` + typed `SmemTileId<ROWS, COLS, T>` ──────────
+//
+// Per `feedback_ff_subtile_compile_time_inviolable`: a `PageId` is a
+// runtime u8 index — it carries no shape/dtype, so an Instr taking
+// three `PageId`s cannot prove its operands have matching shape at
+// rustc time. The TK 2.0 `kittens::group<N>::mul(T &dst, const T &lhs,
+// const U &rhs)` template requires `dst` and `lhs` to have the same
+// type; mismatch is currently caught only at C++ instantiation
+// (downstream of codegen), violating the inviolable rule.
+//
+// `SmemTileId<const ROWS: usize, const COLS: usize, T: TileDtype>` is
+// a sealed phantom-typed wrapper around a `PageId`. Its const-generic
+// shape (ROWS × COLS) and dtype (T, sealed) are propagated through the
+// `Instr::sh_tile_mul` constructor — shape or dtype mismatch across
+// lhs/rhs/dst is a rustc unification failure.
+//
+// The substrate today is uniform `__shared__ kittens::st_bf<128,128>
+// page_buf[NUM_PAGES]`, so the only legal SmemTileId is
+// `<128, 128, Bf16>`. When non-uniform pools land (e.g. a separate
+// vector pool of `st_bf<1, 128>`), each pool will mint its own typed
+// SmemTileId, and the type system will refuse a vector tile where a
+// square tile is required.
+
+mod tile_dtype_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed marker for TK 2.0 tile element types. Each impl is the
+/// type-level identity of a `kittens::st_bf<…>` / `st_fl<…>` etc.
+/// `NAME` is the CUDA literal used by the emitter for the
+/// `kittens::st_<NAME><…>` template instantiation — but currently the
+/// substrate hardcodes `st_bf` in the page_buf decl, so `NAME` is for
+/// future emit (when non-bf16 pools land).
+pub trait TileDtype: tile_dtype_sealed::Sealed + Copy {
+    const NAME: &'static str;
+}
+
+/// `kittens::bf16` — Hopper bfloat16. The only dtype currently bound
+/// to a page in the substrate.
+#[derive(Clone, Copy, Debug)]
+pub struct Bf16;
+impl tile_dtype_sealed::Sealed for Bf16 {}
+impl TileDtype for Bf16 {
+    const NAME: &'static str = "bf16";
+}
+
+/// Typed shared-memory tile handle: a [`PageId`] paired with type-level
+/// shape (`ROWS × COLS`) and dtype (`T: TileDtype`, sealed).
+///
+/// Two `SmemTileId`s with different const-generics or dtypes are
+/// **different Rust types**. A constructor like [`Instr::sh_tile_mul`]
+/// that requires `(lhs, rhs, dst): (SmemTileId<R,C,T>, SmemTileId<R,C,T>,
+/// SmemTileId<R,C,T>)` rejects shape or dtype mismatch at rustc time
+/// (E0308 type mismatch on const-generic).
+///
+/// Construction (`from_page`) is `pub(crate)` so only the lowerer —
+/// which owns the page→shape mapping — can mint these; downstream
+/// consumers receive them and pass them through unchanged.
+///
+/// # Compile-fail proof — shape mismatch (COLS) rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, SmemTileId, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype>(
+///     _a: SmemTileId<R, C, T>,
+///     _b: SmemTileId<R, C, T>,
+///     _c: SmemTileId<R, C, T>,
+/// ) {}
+/// // `unreachable!()` types as `!` and coerces — the compile error
+/// // we want is the const-generic unification at the call site.
+/// let a: SmemTileId<128, 128, Bf16> = unreachable!();
+/// let b: SmemTileId<128,  64, Bf16> = unreachable!();
+/// let c: SmemTileId<128, 128, Bf16> = unreachable!();
+/// _all_same(a, b, c);  // ← rustc rejects: C=128 vs C=64
+/// ```
+///
+/// # Compile-fail proof — shape mismatch (ROWS) rejected
+///
+/// ```compile_fail
+/// use ferrite_wavefront::tk_tape::{Bf16, SmemTileId, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype>(
+///     _a: SmemTileId<R, C, T>,
+///     _b: SmemTileId<R, C, T>,
+/// ) {}
+/// let a: SmemTileId<128, 128, Bf16> = unreachable!();
+/// let b: SmemTileId< 64, 128, Bf16> = unreachable!();
+/// _all_same(a, b);  // ← rustc rejects: R=128 vs R=64
+/// ```
+///
+/// # Pass — matched shape & dtype accepted (type-check only)
+///
+/// ```
+/// use ferrite_wavefront::tk_tape::{Bf16, SmemTileId, TileDtype};
+/// fn _all_same<const R: usize, const C: usize, T: TileDtype>(
+///     _a: SmemTileId<R, C, T>,
+///     _b: SmemTileId<R, C, T>,
+///     _c: SmemTileId<R, C, T>,
+/// ) {}
+/// // Type-check the call without running it — the doctest passes if
+/// // rustc accepts the unification. `if false` keeps the body dead.
+/// fn _proof() {
+///     if false {
+///         let a: SmemTileId<128, 128, Bf16> = unreachable!();
+///         let b: SmemTileId<128, 128, Bf16> = unreachable!();
+///         let c: SmemTileId<128, 128, Bf16> = unreachable!();
+///         _all_same(a, b, c);
+///     }
+/// }
+/// _proof();
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SmemTileId<const ROWS: usize, const COLS: usize, T: TileDtype> {
+    page: PageId,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, T> {
+    /// Mint a typed tile handle for `page`. Caller asserts (by choice
+    /// of the const-generic instantiation site) that `page` indexes a
+    /// `kittens::st_<T::NAME><ROWS, COLS>`-typed shared buffer.
+    /// `pub(crate)` so only the lowerer can mint these.
+    pub(crate) const fn from_page(page: PageId) -> Self {
+        Self {
+            page,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Recover the runtime [`PageId`] for codegen / debug / Instr
+    /// field storage.
+    pub const fn page(&self) -> PageId {
+        self.page
+    }
+
+    /// Const accessors for the shape, exposed for diagnostics and
+    /// downstream type-level computation.
+    pub const fn rows() -> usize {
+        ROWS
+    }
+    pub const fn cols() -> usize {
+        COLS
+    }
+}
+
 /// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub(crate) u8);
@@ -628,22 +772,34 @@ impl Instr {
         Self::PageBarrierArrive { page_id: page, kind, role }
     }
 
-    /// Construct a [`Instr::ShTileMul`] from typed inputs. The
-    /// `GroupWidth<N>` is the const-generic typed witness — the
-    /// `where GroupWidth<N>: ComputeWidth` bound restricts N to the
-    /// compute-eligible widths {4, 16}. Calling this with
-    /// `GroupWidth::<1>::PER_WARP` is a Rust compile error
-    /// (`the trait ComputeWidth is not implemented for GroupWidth<1>`).
-    pub(crate) fn sh_tile_mul<const N: usize>(
-        lhs: PageId,
-        rhs: PageId,
-        dst: PageId,
+    /// Construct a [`Instr::ShTileMul`] from typed inputs.
+    ///
+    /// Two compile-time gates ride on this signature:
+    ///
+    /// 1. **`where GroupWidth<N>: ComputeWidth`** — restricts `N` to
+    ///    the compute-eligible widths `{4, 16}`. Calling with
+    ///    `GroupWidth::<1>::PER_WARP` is a rustc error.
+    /// 2. **All three operands are `SmemTileId<ROWS, COLS, T>`** with
+    ///    shared const-generics — a shape or dtype mismatch is a
+    ///    rustc E0308 (const-generic unification failure). The TK 2.0
+    ///    `mul(T &dst, const T &lhs, const U &rhs)` `T`-equality
+    ///    requirement is now a Rust type-check, not a downstream C++
+    ///    template instantiation error.
+    pub(crate) fn sh_tile_mul<const N: usize, const ROWS: usize, const COLS: usize, T: TileDtype>(
+        lhs: SmemTileId<ROWS, COLS, T>,
+        rhs: SmemTileId<ROWS, COLS, T>,
+        dst: SmemTileId<ROWS, COLS, T>,
         width: GroupWidth<N>,
     ) -> Self
     where
         GroupWidth<N>: ComputeWidth,
     {
-        Self::ShTileMul { lhs, rhs, dst, width: width.tag() }
+        Self::ShTileMul {
+            lhs: lhs.page(),
+            rhs: rhs.page(),
+            dst: dst.page(),
+            width: width.tag(),
+        }
     }
 
     pub(crate) fn store_async_typed(

@@ -428,21 +428,30 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // is implemented per SUBTILE_TK20_DECOMP.md.
     match &node.op {
         SubOp::Elementwise(EwKind::Mul) => {
-            // Compute width is the const-generic typed witness
-            // `GroupWidth::<16>::ALL_CONSUMERS`; the
-            // `where GroupWidth<N>: ComputeWidth` bound on
-            // `Instr::sh_tile_mul` rejects N=1 / N=20 at rustc time.
+            // Two compile-time witnesses ride on this constructor:
+            //   - `GroupWidth::<16>::ALL_CONSUMERS` — the `where
+            //     GroupWidth<N>: ComputeWidth` bound rejects N=1 /
+            //     N=20 at rustc time.
+            //   - `SmemTileId::<128, 128, Bf16>` — the substrate's
+            //     uniform `__shared__ kittens::st_bf<128, 128>
+            //     page_buf[]` shape. All three operands MUST share
+            //     ROWS, COLS, T at the type level; mismatch is a
+            //     rustc E0308. When non-uniform pools land, each
+            //     pool will mint its own SmemTileId<…> and a square
+            //     tile cannot be passed where a vector tile is
+            //     expected.
             // Per `feedback_ff_subtile_compile_time_inviolable`.
-            let lhs = state.page_of(reads[0]);
-            let rhs = state.page_of(reads[1]);
+            use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[1]));
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let _ = COMPUTE_ROLE; // role-tag retained for future
-                                  // walker-side gating; emit-side N
-                                  // is the typed witness below.
+                                  // walker-side gating.
             state.push(Instr::sh_tile_mul(
                 lhs,
                 rhs,
-                dst_page,
-                crate::tk_tape::GroupWidth::<16>::ALL_CONSUMERS,
+                dst,
+                GroupWidth::<16>::ALL_CONSUMERS,
             ));
             emit_store_and_arrive(state, &node.output, dst_page);
         }

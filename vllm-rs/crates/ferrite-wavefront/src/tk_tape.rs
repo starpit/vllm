@@ -1260,7 +1260,7 @@ pub struct Bf16;
 impl tile_dtype_sealed::Sealed for Bf16 {}
 impl TileDtype for Bf16 {
     const ST_ALIAS_SUFFIX: &'static str = "bf";
-    const SCALAR_NAME: &'static str = "bf16";
+    const SCALAR_NAME: &'static str = "kittens::bf16";
     const ELEM_BYTES: u32 = 2;
     fn tag() -> TileDtypeTag {
         TileDtypeTag::Bf16

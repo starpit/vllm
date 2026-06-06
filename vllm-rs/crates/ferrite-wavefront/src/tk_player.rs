@@ -151,7 +151,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::mul(page_buf[{dst}], page_buf[{lhs}], \
-             kittens::{scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar}f));"
         )
     }
 
@@ -167,7 +167,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::add(page_buf[{dst}], page_buf[{lhs}], \
-             kittens::{scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar}f));"
         )
     }
 
@@ -191,7 +191,7 @@ mod tk20 {
     ) -> String {
         let scalar = dtype.scalar_name();
         let lpath = layout.layout_path();
-        format!("    kittens::rt<kittens::{scalar}, {rows}, {cols}, {lpath}> rt_{slot};\n")
+        format!("    kittens::rt<{scalar}, {rows}, {cols}, {lpath}> rt_{slot};\n")
     }
 
     /// `rv<kittens::<scalar>, LEN, layout> rv_<slot>;` — preamble decl.
@@ -203,7 +203,7 @@ mod tk20 {
     ) -> String {
         let scalar = dtype.scalar_name();
         let lpath = layout.layout_path();
-        format!("    kittens::rv<kittens::{scalar}, {len}, {lpath}> rv_{slot};\n")
+        format!("    kittens::rv<{scalar}, {len}, {lpath}> rv_{slot};\n")
     }
 
     /// `kittens::group<N>::load(rt_dst, page_buf[src])` —
@@ -347,7 +347,7 @@ mod tk20 {
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::mul(rt_{dst}, rt_{lhs}, kittens::{scalar_ty}({scalar}f));"
+            "kittens::group<{group_n}>::mul(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar}f));"
         )
     }
     pub fn rt_row_max_acc(group_n: u32, acc: u16, src: u16) -> String {
@@ -454,7 +454,7 @@ mod tk20 {
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, kittens::{scalar_ty}({scalar}f));"
+            "kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar}f));"
         )
     }
 
@@ -481,7 +481,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::mul(page_buf[{dst_page}], page_buf[{src_page}], \
-             kittens::{scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar}f));"
         )
     }
 
@@ -497,7 +497,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::add(page_buf[{dst_page}], page_buf[{src_page}], \
-             kittens::{scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar}f));"
         )
     }
 

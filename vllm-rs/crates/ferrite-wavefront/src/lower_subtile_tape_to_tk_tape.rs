@@ -142,6 +142,12 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// Register-vec arena.
     reg_vec_arena: BTreeMap<crate::tk_tape::RegVecSlot, crate::tk_tape::RegVecArenaEntry>,
     next_reg_vec_slot: u16,
+    /// Pages allocated by `resolve_input_page` for External inputs
+    /// during the current `lower_compute` arm. Drained and released
+    /// at the end of each arm — without this, every per-call
+    /// External load would burn a fresh PageId, overflowing u8 across
+    /// a Llama-1B tape (hundreds of External weights × chunks).
+    ephemeral_pages: Vec<PageId>,
 }
 
 impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
@@ -166,6 +172,17 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             next_reg_tile_slot: 0,
             reg_vec_arena: BTreeMap::new(),
             next_reg_vec_slot: 0,
+            ephemeral_pages: Vec::new(),
+        }
+    }
+
+    /// Release all pages allocated by [`Self::resolve_input_page`]
+    /// during the current arm. Called at the end of `lower_compute`
+    /// so per-arm External loads don't burn unbounded PageIds.
+    fn release_ephemeral_pages(&mut self) {
+        let drained: Vec<PageId> = self.ephemeral_pages.drain(..).collect();
+        for p in drained {
+            self.free_pages.push(p);
         }
     }
 
@@ -270,6 +287,32 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             .get(&slot.index())
             .expect("compute_to references a slot that was not AllocSlot'd \
                      (would have been caught by validate_subtile_tape)")
+    }
+
+    /// Resolve a [`ComputeInput`] to the [`PageId`] holding its data.
+    /// For `Computed`: returns the existing slot→page mapping.
+    /// For `External`: allocates a fresh temp page, emits an
+    /// `emit_external_load` TMA load to bring the source-tensor
+    /// region into that page, and returns the new page.
+    ///
+    /// Per Phase A step 4 of the panic-RCA plan: this is the
+    /// per-input external resolution that replaces the broken
+    /// "load all externals into dst_page" loop at the top of
+    /// lower_compute.
+    fn resolve_input_page(&mut self, input: &ComputeInput) -> PageId {
+        match input {
+            ComputeInput::Computed(slot) => self.page_of(*slot),
+            ComputeInput::External { tensor, region } => {
+                let page = self.alloc_temp_page();
+                self.ephemeral_pages.push(page);
+                let tr = TensorRegion {
+                    tensor: *tensor,
+                    region: *region,
+                };
+                emit_external_load(self, &tr, page);
+                page
+            }
+        }
     }
 
     fn release_page(&mut self, slot: SlotId) {
@@ -510,14 +553,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
         }
     }
 
-    // External (source-tensor) loads: any input TensorRegion whose
-    // tensor is a leaf source is brought into a page via TMA.
-    let num_sources = state.graph.num_sources;
-    for inp in &node.inputs {
-        if inp.tensor.0 < num_sources {
-            emit_external_load(state, inp, dst_page);
-        }
-    }
+    // External-input loading is now per-arm, via
+    // `state.resolve_input_page(input)` (Phase A step 4+ of the
+    // panic-RCA plan). The previous "load all externals into dst_page"
+    // loop here was broken — it clobbered each external in turn.
+    // Each arm now allocates one temp page per External input and
+    // emits its TMA load there, in positional order.
 
     // SubOp dispatch — only Elementwise(Mul) is implemented. Every
     // other arch op panics: per INVIOLABLE feedback_tk_2_0_only +
@@ -546,8 +587,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //     expected.
             // Per `feedback_ff_subtile_compile_time_inviolable`.
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let _ = COMPUTE_ROLE; // role-tag retained for future
                                   // walker-side gating.
@@ -569,8 +610,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // emitted TK 2.0 primitive differs (`group<N>::add` vs
             // `group<N>::mul`).
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             state.push(Instr::sh_tile_add(
                 lhs,
@@ -607,8 +648,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             // First add: dst = reads[0] + reads[1]
-            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
             state.push(Instr::sh_tile_add(
                 r0,
                 r1,
@@ -617,7 +658,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             ));
             // Subsequent adds: dst += reads[i]
             for ci in &inputs[2..] {
-                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(ci.expect_computed_slot("SumReduce", 2)));
+                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(ci));
                 state.push(Instr::sh_tile_add(
                     dst,
                     rhs,
@@ -648,8 +689,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //   step 4: ShTileDiv     (dst, gate, dst)      // dst = silu(gate)
             //   step 5: ShTileMul     (dst, dst, up)        // dst = silu(gate) * up
             use crate::tk_tape::{Bf16, GroupWidth, ScalarF32, SmemTileId};
-            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let up = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let up = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             // step 1
@@ -691,7 +732,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32, SmemTileId,
             };
-            let src = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
+            let src = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let rt_x: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_neg: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
@@ -746,8 +787,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId,
             };
-            let x = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let gamma_page = state.page_of(inputs[1].expect_computed_slot("lower_compute", 1));
+            // Resolve each positional input to a page. Computed
+            // inputs reuse their producer's page; External inputs
+            // get a fresh temp page populated by an emit_external_load.
+            let x_page = state.resolve_input_page(&inputs[0]);
+            let gamma_page = state.resolve_input_page(&inputs[1]);
+            let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             const R: AllConsumersRole = AllConsumersRole;
@@ -839,9 +884,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegTileId,
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
-            let q_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[2].expect_computed_slot("lower_compute", 2)));
+            let q_page = state.resolve_input_page(&inputs[0]);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[2]));
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -929,8 +974,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AccReset, AllConsumersRole, Bf16, FenceExternal, Fp32,
                 GroupWidth, RegTileId, RoleWitness, RowLayout, SmemTileId,
             };
-            let a = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[0].expect_computed_slot("lower_compute", 0)));
-            let b = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
+            let a = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[0]));
+            let b = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1024,10 +1069,10 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
                 StoreSpec, TileShape, WarpRole,
             };
-            let k_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
-            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[1].expect_computed_slot("lower_compute", 1)));
-            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.page_of(inputs[2].expect_computed_slot("lower_compute", 2)));
-            let v_page = state.page_of(inputs[3].expect_computed_slot("lower_compute", 3));
+            let k_page = state.resolve_input_page(&inputs[0]);
+            let cos_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[1]));
+            let sin_vec = SmemVecId::<32, Bf16>::from_page(state.resolve_input_page(&inputs[2]));
+            let v_page = state.resolve_input_page(&inputs[3]);
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1169,7 +1214,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 WarpRole,
             };
             // reads = [q_page, k_cache_handle, v_cache_handle, ...]
-            let q_page = state.page_of(inputs[0].expect_computed_slot("lower_compute", 0));
+            let q_page = state.resolve_input_page(&inputs[0]);
             // K and V cache TensorIds come from the layout witness
             // (single source of truth, not from reads[].)
             let k_cache = layout.cache_tensor();
@@ -1383,6 +1428,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             );
         }
     }
+
+    // Release any temp pages allocated by `resolve_input_page` for
+    // External inputs during this arm. Without this, every per-call
+    // External load burns a fresh PageId — overflows u8 across a
+    // Llama-1B tape (hundreds of External weights × chunks).
+    state.release_ephemeral_pages();
 }
 
 // ── Per-op emit helpers ─────────────────────────────────────────────

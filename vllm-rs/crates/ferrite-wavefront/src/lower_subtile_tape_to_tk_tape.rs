@@ -134,6 +134,14 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// `OpenLoop`, popped by `CloseLoop`. The top entry is the loop
     /// body whose frame is on top of `instr_stack`.
     active_loop_stack: Vec<u32>,
+    /// Register-tile arena accumulated across the lowering. Moved
+    /// onto the output TkTape at finalize. See [`TkTape::mint_reg_tile`]
+    /// for the pattern.
+    reg_tile_arena: BTreeMap<crate::tk_tape::RegTileSlot, crate::tk_tape::RegTileArenaEntry>,
+    next_reg_tile_slot: u16,
+    /// Register-vec arena.
+    reg_vec_arena: BTreeMap<crate::tk_tape::RegVecSlot, crate::tk_tape::RegVecArenaEntry>,
+    next_reg_vec_slot: u16,
 }
 
 impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
@@ -154,7 +162,65 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             softmax_state_index: BTreeMap::new(),
             next_softmax_state: 0,
             active_loop_stack: Vec::new(),
+            reg_tile_arena: BTreeMap::new(),
+            next_reg_tile_slot: 0,
+            reg_vec_arena: BTreeMap::new(),
+            next_reg_vec_slot: 0,
         }
+    }
+
+    /// Mint a fresh [`RegTileId<R, C, T, L>`] in the lowering's
+    /// arena (transferred to TkTape at finalize). Mirrors
+    /// [`TkTape::mint_reg_tile`] but operates on the lowering's
+    /// transient state.
+    fn mint_reg_tile<const R: usize, const C: usize, T, L>(
+        &mut self,
+    ) -> crate::tk_tape::RegTileId<R, C, T, L>
+    where
+        T: crate::tk_tape::TileDtype,
+        L: crate::tk_tape::RegTileLayout,
+    {
+        use crate::tk_tape::{RegTileArenaEntry, RegTileId, RegTileSlot};
+        let slot = RegTileSlot(self.next_reg_tile_slot);
+        self.next_reg_tile_slot = self
+            .next_reg_tile_slot
+            .checked_add(1)
+            .expect("reg_tile slot overflow (>= 65536 register tiles in one kernel)");
+        self.reg_tile_arena.insert(
+            slot,
+            RegTileArenaEntry {
+                rows: R as u16,
+                cols: C as u16,
+                dtype: T::tag(),
+                layout: L::tag(),
+            },
+        );
+        RegTileId::from_slot(slot)
+    }
+
+    /// Mint a fresh [`RegVecId<LEN, T, RV>`].
+    fn mint_reg_vec<const LEN: usize, T, RV>(
+        &mut self,
+    ) -> crate::tk_tape::RegVecId<LEN, T, RV>
+    where
+        T: crate::tk_tape::TileDtype,
+        RV: crate::tk_tape::RegVecLayout,
+    {
+        use crate::tk_tape::{RegVecArenaEntry, RegVecId, RegVecSlot};
+        let slot = RegVecSlot(self.next_reg_vec_slot);
+        self.next_reg_vec_slot = self
+            .next_reg_vec_slot
+            .checked_add(1)
+            .expect("reg_vec slot overflow");
+        self.reg_vec_arena.insert(
+            slot,
+            RegVecArenaEntry {
+                len: LEN as u16,
+                dtype: T::tag(),
+                layout: RV::tag(),
+            },
+        );
+        RegVecId::from_slot(slot)
     }
 
     fn cur(&mut self) -> &mut Vec<Instr> {
@@ -309,6 +375,13 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     // AttnDecode resolve to a real KvLayoutEntry, not a dangling
     // index into a dropped Vec.
     out.kv_layouts = state.kv_layouts;
+    // Transfer the register-tile / register-vec arenas accumulated
+    // during lowering — emit_kernel walks these in id-order to emit
+    // the kernel-preamble decls.
+    out.reg_tile_arena = state.reg_tile_arena;
+    out.next_reg_tile_slot = state.next_reg_tile_slot;
+    out.reg_vec_arena = state.reg_vec_arena;
+    out.next_reg_vec_slot = state.next_reg_vec_slot;
     let top = state
         .instr_stack
         .pop()
@@ -550,8 +623,52 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             state.push(Instr::sh_tile_mul(dst, up, dst, W));
             emit_store_and_arrive(state, &node.output, dst_page);
         }
+        SubOp::Elementwise(EwKind::Silu) => {
+            // Silu: out = x * sigmoid(x) = x / (1 + exp(-x))
+            //
+            // Step 6 (register-resident chain, 6 Instrs per
+            // SUBTILE_TK20_DECOMP.md §"Per-SubOp Instr counts" line 20):
+            //   rt_x       = load(src_page)
+            //   rt_neg     = neg(rt_x)
+            //   rt_exp     = exp(rt_neg)
+            //   rt_denom   = add_scalar(rt_exp, 1.0)
+            //   rt_result  = div(rt_x, rt_denom)
+            //   store(dst_page, rt_result)
+            //
+            // 5 RegTileId<128, 128, Bf16, RowLayout> minted; the
+            // arena records each so emit_kernel can declare them in
+            // the preamble as `kittens::rt<...> rt_<id>;`.
+            //
+            // Per `feedback_no_simpler`: aliasing optimization (3
+            // slots minimum) is a perf concern for a follow-up; this
+            // commit lands the plan-aligned 5-slot version.
+            use crate::tk_tape::{
+                AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32, SmemTileId,
+            };
+            let src = SmemTileId::<128, 128, Bf16>::from_page(state.page_of(reads[0]));
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            let rt_x: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_neg: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_exp: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_denom: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_result: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const R: AllConsumersRole = AllConsumersRole;
+            // 1: rt_x = load(src_page)
+            state.push(Instr::load_shmem_to_reg(src, rt_x, W, R));
+            // 2: rt_neg = neg(rt_x)
+            state.push(Instr::reg_tile_neg(rt_x, rt_neg, W, R));
+            // 3: rt_exp = exp(rt_neg)
+            state.push(Instr::reg_tile_exp(rt_neg, rt_exp, W, R));
+            // 4: rt_denom = rt_exp + 1.0
+            state.push(Instr::reg_tile_add_scalar(rt_exp, rt_denom, ScalarF32::new(1.0), W, R));
+            // 5: rt_result = rt_x / rt_denom
+            state.push(Instr::reg_tile_div(rt_x, rt_denom, rt_result, W, R));
+            // 6: store(dst_page, rt_result)
+            state.push(Instr::store_reg_tile_to_shmem(rt_result, dst, W, R));
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
         SubOp::MatmulTile
-        | SubOp::Elementwise(EwKind::Silu)
         | SubOp::RmsNorm { .. }
         | SubOp::RopeRotate { .. }
         | SubOp::RopeAppend { .. }

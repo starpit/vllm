@@ -71,21 +71,17 @@ mod tk20 {
         )
     }
 
-    // NUKED: rms_norm, gemm_m1, silu_mul, residual_add, rope_rotate,
-    // attn_decode_{init,qkt,sv,finalise} — these emitted invented
-    // `kittens::ops::*` calls that don't exist in
-    // `third_party/thunderkittens/include/`. Per
-    // `feedback_tk_2_0_only` (INVIOLABLE) + plan §1 line 64-65, every
-    // Instr must map to ONE TK 2.0 primitive in `include/ops/`, and
-    // every `kittens::*` substring this module emits must come from
-    // an actual `include/` header. Architectural Instrs (RmsNorm,
-    // GemmM1, SiluMul, ResidualAdd, RopeRotate, AttnDecode*) are
-    // gone too — they decompose into TK 2.0 primitive Instrs at the
-    // SubtileTape→TkTape lowering. The expansion is the next chunk
-    // of megakernel work; until it lands, the lowering produces a
-    // tape that contains only real TK 2.0 calls (sync / fence /
-    // tma::load_async / tma::store_async / mbarrier::*) plus the
-    // kernel-end drain.
+    // ── Compute primitives — one helper per TK 2.0 callable. ───────
+
+    /// `kittens::group<N>::mul(dst, lhs, rhs)` —
+    /// `ops/group/shared/tile/maps.cuh:306` (binary tile×tile mul,
+    /// included into struct group<N> via `shared/shared.cuh` per
+    /// `ops/group/group.cuh:45`). Used by ShTileMul.
+    pub fn st_mul(group_n: u32, dst: u8, lhs: u8, rhs: u8) -> String {
+        format!(
+            "kittens::group<{group_n}>::mul(page_buf[{dst}], page_buf[{lhs}], page_buf[{rhs}]);"
+        )
+    }
 
     pub fn tma_store_async_typed(src_page: u8, dst_arg_idx: u32, tile_type: &str) -> String {
         format!(
@@ -139,6 +135,25 @@ fn barrier_name(kind: crate::tk_tape::PageBarrier) -> &'static str {
         PageBarrier::Ready => "page_ready",
         PageBarrier::Done => "page_done",
         PageBarrier::Consumed => "page_consumed",
+    }
+}
+
+/// Map a `WarpRole` to the `N` template parameter in
+/// `kittens::group<N>::*`. Loader / Storer / Consumer(_) are
+/// per-warp work (N=1); AllConsumers spans the consumer set
+/// (N=NUM_CONSUMER_WARPS); All spans the entire CTA (N=NUM_WARPS).
+/// Per the SUBTILE_TK20_DECOMP design's GroupWidth<N> note: this
+/// mapping is the runtime-derived form of what will become a sealed
+/// `GroupWidth<const N: usize>` once a SubOp lands that needs the
+/// const-generic check (warpgroup-only mma_AB rejecting an N=1 role
+/// at compile time). For ShTileMul (Llama Elementwise::Mul) the
+/// runtime form suffices.
+fn group_n_for(role: crate::tk_tape::WarpRole) -> u32 {
+    use crate::tk_tape::{NUM_CONSUMER_WARPS, NUM_WARPS, WarpRole};
+    match role {
+        WarpRole::Loader | WarpRole::Storer | WarpRole::Consumer(_) => 1,
+        WarpRole::AllConsumers => NUM_CONSUMER_WARPS as u32,
+        WarpRole::All => NUM_WARPS as u32,
     }
 }
 
@@ -362,16 +377,10 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let s = tk20::tma_store_async_typed(dst_page.0, dst_tensor.0, tile_type.as_str());
             let _ = writeln!(out, "{s}");
         }
-        // NUKED: RmsNorm / GemmM1 / SiluMul / ResidualAdd /
-        // RopeRotateNeoX / RopeRotateInterleaved / AttnDecodeInit /
-        // AttnDecodeQkt / AttnDecodeSv / AttnDecodeFinalise — these
-        // were architectural-level Instrs that emitted invented
-        // `kittens::ops::*` calls. Per plan §1 line 64-65 + the
-        // INVIOLABLE feedback_tk_2_0_only / feedback_tk20_primitives_first,
-        // every Instr must map to ONE TK 2.0 primitive in
-        // `third_party/thunderkittens/include/`. Until each
-        // architectural op decomposes into TK 2.0 primitive Instrs at
-        // SubtileTape→TkTape lowering, the player has no Compute arms.
+        Instr::ShTileMul { lhs, rhs, dst, role } => {
+            let n = group_n_for(*role);
+            let _ = writeln!(out, "{}", tk20::st_mul(n, dst.0, lhs.0, rhs.0));
+        }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
         }
@@ -523,6 +532,40 @@ mod tests {
     // NUKED: silu_mul_arm_one_call — tested the invented Instr::SiluMul
     // variant that emitted `kittens::ops::silu_mul`. Comes back when
     // SiluMul decomposes into TK 2.0 primitive Instrs.
+
+    /// `Instr::ShTileMul` emits one TK 2.0 call to
+    /// `kittens::group<NUM_CONSUMER_WARPS>::mul(...)` from
+    /// `ops/group/shared/tile/maps.cuh:306` — no invented helpers.
+    #[test]
+    fn sh_tile_mul_emits_real_tk20_call() {
+        let s = emit(Instr::ShTileMul {
+            lhs: crate::tk_tape::PageId(1),
+            rhs: crate::tk_tape::PageId(2),
+            dst: crate::tk_tape::PageId(3),
+            role: WarpRole::AllConsumers,
+        });
+        // 16 consumer warps in the substrate (NUM_CONSUMER_WARPS).
+        assert_eq!(
+            s,
+            "kittens::group<16>::mul(page_buf[3], page_buf[1], page_buf[2]);\n",
+        );
+    }
+
+    /// Per-warp role binds N=1 (Loader / Storer / Consumer(_) per
+    /// the group_n_for mapping).
+    #[test]
+    fn sh_tile_mul_per_warp_role_emits_group_1() {
+        let s = emit(Instr::ShTileMul {
+            lhs: crate::tk_tape::PageId(0),
+            rhs: crate::tk_tape::PageId(1),
+            dst: crate::tk_tape::PageId(2),
+            role: WarpRole::Loader,
+        });
+        assert_eq!(
+            s,
+            "kittens::group<1>::mul(page_buf[2], page_buf[0], page_buf[1]);\n",
+        );
+    }
 
     #[test]
     fn emit_kernel_includes_signature_and_prelude() {

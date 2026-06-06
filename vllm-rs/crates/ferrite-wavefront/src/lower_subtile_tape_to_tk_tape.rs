@@ -391,31 +391,69 @@ fn lower_close_loop<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K
 fn lower_compute<F: RopeForm, K: KvCacheShape>(
     state: &mut LoweringState<F, K>,
     node_id: SubtileId,
-    _writes: SlotId,
-    _reads: &[SlotId],
+    writes: SlotId,
+    reads: &[SlotId],
 ) {
-    // The architectural compute lowering — emit_matmul_tile,
-    // emit_sum_reduce, emit_elementwise, emit_silu_mul, emit_rmsnorm,
-    // emit_rope_rotate, emit_rope_append, emit_attn_decode — was
-    // nuked because it composed invented `kittens::ops::*` calls.
-    //
-    // Per plan §1 line 64-65 + INVIOLABLE feedback_tk_2_0_only /
-    // feedback_tk20_primitives_first, every Compute Instr must be a
-    // real TK 2.0 primitive call from `third_party/thunderkittens/
-    // include/`. Each architectural SubOp must decompose into a
-    // SEQUENCE of primitive Instrs (e.g. RmsNorm = warp::row_squared
-    // + shared_tile::row_sum + thread::rsqrt + warp::mul_row + ...)
-    // emitted by this lowering. None of that expansion exists yet;
-    // it lands alongside per-arch-op work.
-    //
-    // Until then, lower_compute refuses to fabricate a tape.
+    use crate::subtile_ir::{EwKind, SubOp};
+
     let node = &state.graph.nodes[node_id.0 as usize];
-    panic!(
-        "lower_compute: arch op {:?} has no TK 2.0 primitive expansion yet; \
-         see SUBTILE_TAPE_HANDOFF.md — emit_* helpers were nuked alongside the \
-         invented kittens::ops::* calls they used to produce",
-        std::mem::discriminant(&node.op),
-    );
+    let dst_page = state.page_of(writes);
+
+    // Wait on each predecessor slot's Ready barrier — the producer's
+    // StoreAsync + Arrive{Done} pairs with our Wait{Ready} on the
+    // same page. Conservative all-gmem path uses parity 0.
+    for r in reads {
+        let p = state.page_of(*r);
+        state.push(Instr::PageBarrierWaitStaticP0 {
+            page_id: p,
+            kind: PageBarrier::Ready,
+            role: COMPUTE_ROLE,
+        });
+    }
+
+    // External (source-tensor) loads: any input TensorRegion whose
+    // tensor is a leaf source is brought into a page via TMA.
+    let num_sources = state.graph.num_sources;
+    for inp in &node.inputs {
+        if inp.tensor.0 < num_sources {
+            emit_external_load(state, inp, dst_page);
+        }
+    }
+
+    // SubOp dispatch — only Elementwise(Mul) is implemented. Every
+    // other arch op panics: per INVIOLABLE feedback_tk_2_0_only +
+    // feedback_tk20_primitives_first, lower_compute will not
+    // fabricate a tape from invented `kittens::ops::*` helpers. Each
+    // arch op lands one at a time as its TK 2.0 primitive sequence
+    // is implemented per SUBTILE_TK20_DECOMP.md.
+    match &node.op {
+        SubOp::Elementwise(EwKind::Mul) => {
+            let lhs = state.page_of(reads[0]);
+            let rhs = state.page_of(reads[1]);
+            state.push(Instr::ShTileMul {
+                lhs,
+                rhs,
+                dst: dst_page,
+                role: COMPUTE_ROLE,
+            });
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
+        SubOp::MatmulTile
+        | SubOp::SumReduce
+        | SubOp::Elementwise(_)
+        | SubOp::SiluMul
+        | SubOp::RmsNorm { .. }
+        | SubOp::RopeRotate { .. }
+        | SubOp::RopeAppend { .. }
+        | SubOp::AttnDecode { .. } => {
+            panic!(
+                "lower_compute: arch op {:?} has no TK 2.0 primitive expansion yet; \
+                 see SUBTILE_TK20_DECOMP.md for the per-SubOp decomposition plan. \
+                 lower_compute refuses to emit invented kittens::ops::* helpers.",
+                std::mem::discriminant(&node.op),
+            );
+        }
+    }
 }
 
 // ── Per-op emit helpers ─────────────────────────────────────────────

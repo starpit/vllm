@@ -283,22 +283,29 @@ pub enum Instr {
         role: WarpRole,
     },
 
-    // ── Compute — NUKED.
+    // ── Compute — one variant per TK 2.0 primitive. ─────────────────
     //
-    // The architectural Compute Instrs (RmsNorm, GemmM1, SiluMul,
-    // ResidualAdd, RopeRotateNeoX, RopeRotateInterleaved,
-    // AttnDecodeInit/Qkt/Sv/Finalise) emitted invented
-    // `kittens::ops::*` calls. Per plan §1 line 64-65 ("flat Instr
-    // enum, ONE variant per TK 2.0 / CUDA primitive") and the
-    // INVIOLABLE feedback_tk_2_0_only / feedback_tk20_primitives_first
-    // rules, every Compute Instr must be a real TK 2.0 primitive
-    // call from `third_party/thunderkittens/include/`. Each
-    // architectural op above will reappear as a SEQUENCE of
-    // primitive Instrs (e.g. RmsNorm = warp::row_squared +
-    // shared_tile::row_sum + thread::rsqrt + warp::mul_row + ...)
-    // emitted by `lower_dag_to_tape` → `lower_subtile_tape_to_tk_tape`'s
-    // primitive-expansion pass. None of those primitive Instrs exist
-    // yet — they land alongside the expansion work.
+    // Per plan §1 line 64-65 + INVIOLABLE feedback_tk_2_0_only /
+    // feedback_tk20_primitives_first / feedback_tk_player_one_call_per_arm:
+    // each variant maps 1:1 to a real TK 2.0 callable in
+    // `third_party/thunderkittens/include/`. The architectural ops
+    // (RmsNorm, MatmulTile, SiluMul, RopeRotate*, AttnDecode_*) live
+    // upstream in `subtile_ir::SubOp` and decompose into sequences
+    // of these primitive Instrs at `lower_subtile_tape_to_tk_tape`.
+    //
+    // Implementation order per SUBTILE_TK20_DECOMP.md: ShTileMul
+    // first (smallest, no register tiles, no scalars, no TMA).
+
+    /// Pairwise multiply two shared tiles into a third — TK 2.0
+    /// primitive `kittens::group<N>::mul(dst, lhs, rhs)` at
+    /// `ops/group/shared/tile/maps.cuh:306`. Used by SubOp::Elementwise(Mul)
+    /// and (eventually) SiluMul / RmsNorm decompositions.
+    ShTileMul {
+        lhs: PageId,
+        rhs: PageId,
+        dst: PageId,
+        role: WarpRole,
+    },
 
     /// Inert marker the orchestrator emits at the start of an op
     /// when `EmitOpts::debug_handshake` is on.
@@ -720,9 +727,9 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
                 // structural CUDA. The body Instrs are walked in
                 // sequence after the open.
             }
-            // No Compute Instrs exist yet — they reappear once the
-            // architectural ops decompose into TK 2.0 primitives.
-            Instr::DebugOpBeginMarker { .. } => {}
+            // Compute Instrs are pure within-page work; they do not
+            // change cross-page barrier or store state.
+            Instr::ShTileMul { .. } | Instr::DebugOpBeginMarker { .. } => {}
         }
     }
 }

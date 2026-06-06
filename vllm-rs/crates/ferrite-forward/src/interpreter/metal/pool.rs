@@ -269,6 +269,15 @@ struct Mtl4Pool {
     allocator: crate::interpreter::metal::__re::Mtl4Allocator,
     shared_event: crate::interpreter::metal::__re::SharedEvent,
     signal_counter: u64,
+    /// Commit options carrying the feedback handler that records GPU
+    /// execution errors (e.g. kIOGPUCommandBufferCallbackErrorOutOfMemory).
+    /// Reused across commits; access is serialized by the `mtl4` Mutex.
+    commit_options: objc2::rc::Retained<objc2_metal::MTL4CommitOptions>,
+    /// Last GPU execution error reported via commit feedback. Checked
+    /// after every event wait — a silently-failed command buffer
+    /// otherwise produces all-zero outputs and degenerate logits
+    /// (the macOS 26.5.1 Qwen3.5-MoE "!!!!" failure mode).
+    commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 // `Retained<ProtocolObject<dyn MTL*>>` from objc2 isn't auto-Send/Sync
@@ -833,11 +842,38 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newSharedEvent()
             .expect("device.newSharedEvent() returned nil");
+        let commit_error: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let commit_options = unsafe { objc2_metal::MTL4CommitOptions::new() };
+        {
+            let err_slot = std::sync::Arc::clone(&commit_error);
+            let block = block2::RcBlock::new(
+                move |feedback: std::ptr::NonNull<
+                    objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommitFeedback>,
+                >| {
+                    use objc2_metal::MTL4CommitFeedback as _;
+                    let fb = unsafe { feedback.as_ref() };
+                    if let Some(e) = fb.error() {
+                        let msg = format!("{e}");
+                        eprintln!("[ferrite-metal] GPU COMMIT ERROR: {msg}");
+                        *err_slot.lock().expect("commit_error mutex") = Some(msg);
+                    }
+                },
+            );
+            unsafe { commit_options.addFeedbackHandler(block2::RcBlock::as_ptr(&block) as _) };
+            // The options object retains the handler block per Apple's
+            // contract ("references your commit feedback handler after
+            // you add it"); leak our RcBlock so the pointer stays valid
+            // for the pool's lifetime regardless.
+            std::mem::forget(block);
+        }
         *slot = Some(Mtl4Pool {
             queue,
             allocator,
             shared_event,
             signal_counter: 0,
+            commit_options,
+            commit_error,
         });
     }
 
@@ -868,6 +904,21 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         use objc2::runtime::AnyObject;
         use std::ptr::NonNull;
         self.ensure_mtl4();
+        // FERRITE_DUMP_PRIMARY=1 — diagnosis for STATEFUL arches (GDN):
+        // make the segmented dump pass the PRIMARY execution of the
+        // matching forward instead of a post-hoc replay, so state is
+        // fresh and dumped intermediates are the REAL values. The
+        // forward's normal monolithic run is skipped; output past
+        // FERRITE_DUMP_CMD_RANGE never executes, so generated text is
+        // garbage by design — dump-only runs.
+        if std::env::var_os("FERRITE_DUMP_PRIMARY").is_some()
+            && std::env::var("FERRITE_DUMP_NUM_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(num_tokens)
+        {
+            return self.maybe_run_dump_pass(worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens);
+        }
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
         let timing_enabled = std::env::var_os("FERRITE_METAL_DISPATCH_TIMING").is_some();
         let timing_state = if timing_enabled {
@@ -881,7 +932,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone) = {
+        let (signal_value, queue_clone, event_clone, commit_opts, commit_err) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
@@ -934,7 +985,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let ec = mtl4.shared_event.clone();
             // Drop the lock before the host-side wait so a concurrent
             // pool consumer can probe `ensure_mtl4` while we wait.
-            (val, qc, ec)
+            (
+                val,
+                qc,
+                ec,
+                mtl4.commit_options.clone(),
+                std::sync::Arc::clone(&mtl4.commit_error),
+            )
         };
         let encoded = t_pre.elapsed();
         let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
@@ -942,7 +999,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let cb_nn = NonNull::from(cb_protocol);
         let mut cb_array = [cb_nn];
         unsafe {
-            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
         }
         // Signal AFTER the cmdbuf so the wait fires only once GPU work
         // is fully drained.
@@ -956,6 +1013,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // hang and we'd rather panic than spin forever.
         let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
         if !ok {
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        // GPU execution errors (e.g. command-buffer OOM) arrive via the
+        // commit feedback handler and DO NOT fail the event wait — a
+        // failed CB otherwise yields all-zero outputs and degenerate
+        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
+        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
+            eprintln!("[ferrite-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
         // Reset the allocator now that the GPU is done. Holds the
@@ -1038,6 +1103,91 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let Some(dump_cmds) = baking.dump_cmds.as_ref() else {
             return Ok(());
         };
+        if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some() {
+            use objc2_metal::MTLBuffer as _;
+            for (i, b) in worker.arena.iter().enumerate().take(3) {
+                eprintln!(
+                    "[verify-arena] slot{i} gpuAddress={:#x} len={}",
+                    b.gpuAddress(),
+                    b.length()
+                );
+            }
+            // Sentinel-fill slot 0: distinguishes "kernel wrote zeros"
+            // (slot reads 0x00 after) from "kernel never executed"
+            // (sentinel survives).
+            if let Some(b) = worker.arena.first() {
+                let p = b.contents().as_ptr() as *mut u8;
+                unsafe { std::ptr::write_bytes(p, 0xAB, b.length() as usize) };
+                eprintln!("[verify-arena] slot0 sentinel-filled with 0xAB");
+            }
+            // Live GPU-read probe of cmd0's weight binding (stashed at
+            // bake): MTL3 compute copy of 32 bytes from the LIVE shard
+            // buffer at the LIVE offset; CPU-compare against UMA view.
+            if let Some((buf_ptr, off)) = super::mtl4::VERIFY_FIRST_WEIGHT.get() {
+                // SAFETY: diagnostic-only; buffer outlives the process
+                // via the allocator's MmapRegion.
+                let buf: &::objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> = unsafe {
+                    &*(*buf_ptr as *const ::objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>)
+                };
+                use objc2_metal::{
+                    MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
+                    MTLComputeCommandEncoder as _, MTLComputePipelineState as _, MTLDevice as _,
+                    MTLLibrary as _,
+                };
+                const MSL: &str = "#include <metal_stdlib>\nusing namespace metal;\nkernel void copy32(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], uint i [[thread_position_in_grid]]) { if (i < 32) dst[i] = src[i]; }";
+                let opts = objc2_metal::MTLCompileOptions::new();
+                let lib = self
+                    .device
+                    .newLibraryWithSource_options_error(
+                        &objc2_foundation::NSString::from_str(MSL),
+                        Some(&opts),
+                    )
+                    .expect("probe lib");
+                let func = lib
+                    .newFunctionWithName(&objc2_foundation::NSString::from_str("copy32"))
+                    .expect("probe fn");
+                let pso = self
+                    .device
+                    .newComputePipelineStateWithFunction_error(&func)
+                    .expect("probe pso");
+                let dstb = self
+                    .device
+                    .newBufferWithLength_options(
+                        4096,
+                        objc2_metal::MTLResourceOptions::StorageModeShared,
+                    )
+                    .expect("probe dst");
+                let q3 = self.device.newCommandQueue().expect("probe q");
+                let cb = q3.commandBuffer().expect("probe cb");
+                let enc = cb.computeCommandEncoder().expect("probe enc");
+                enc.setComputePipelineState(&pso);
+                unsafe {
+                    enc.setBuffer_offset_atIndex(Some(buf), *off as usize, 0);
+                    enc.setBuffer_offset_atIndex(Some(&dstb), 0, 1);
+                }
+                enc.dispatchThreads_threadsPerThreadgroup(
+                    objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+                    objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+                );
+                enc.endEncoding();
+                cb.commit();
+                unsafe { cb.waitUntilCompleted() };
+                let gpu =
+                    unsafe { std::slice::from_raw_parts(dstb.contents().as_ptr() as *const u8, 32) };
+                let cpu = unsafe {
+                    std::slice::from_raw_parts(
+                        (buf.contents().as_ptr() as *const u8).add(*off as usize),
+                        32,
+                    )
+                };
+                eprintln!(
+                    "[verify-gpuread] live shard @off={off}: match={} gpu[0..8]={:02x?} cpu[0..8]={:02x?}",
+                    gpu == cpu,
+                    &gpu[..8],
+                    &cpu[..8]
+                );
+            }
+        }
         let kernels_csv = std::env::var("FERRITE_DUMP_KERNELS")
             .unwrap_or_else(|_| "ScalarMul,ScalarWeightMul,RmsNorm,TanhSoftCap".to_string());
         // "all" = dump every command's arena outputs (intra-layer op
@@ -1210,7 +1360,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone) = {
+        let (signal_value, queue_clone, event_clone, commit_opts, commit_err) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
@@ -1241,13 +1391,15 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 mtl4.signal_counter,
                 mtl4.queue.clone(),
                 mtl4.shared_event.clone(),
+                mtl4.commit_options.clone(),
+                std::sync::Arc::clone(&mtl4.commit_error),
             )
         };
         let cb_protocol: &::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTL4CommandBuffer> =
             &cb;
         let mut cb_array = [NonNull::from(cb_protocol)];
         unsafe {
-            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
         }
         queue_clone.signalEvent_value(
             ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
@@ -1256,6 +1408,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
         if !ok {
             eprintln!("[dump] segment {:?} TIMED OUT (60s)", range);
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        // GPU execution errors (e.g. command-buffer OOM) arrive via the
+        // commit feedback handler and DO NOT fail the event wait — a
+        // failed CB otherwise yields all-zero outputs and degenerate
+        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
+        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
+            eprintln!("[ferrite-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
         if verbose {
@@ -1326,7 +1486,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             .device
             .newCommandBuffer()
             .expect("newCommandBuffer returned nil");
-        let (signal_value, queue_clone, event_clone, body_result) = {
+        let (signal_value, queue_clone, event_clone, body_result, commit_opts, commit_err) = {
             let mut slot = self.mtl4.lock().expect("mtl4 mutex");
             let mtl4 = slot.as_mut().expect("ensure_mtl4 succeeded");
             cb.beginCommandBufferWithAllocator(&mtl4.allocator);
@@ -1348,7 +1508,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             let val = mtl4.signal_counter;
             let qc = mtl4.queue.clone();
             let ec = mtl4.shared_event.clone();
-            (val, qc, ec, body_result)
+            (
+                val,
+                qc,
+                ec,
+                body_result,
+                mtl4.commit_options.clone(),
+                std::sync::Arc::clone(&mtl4.commit_error),
+            )
         };
         // Propagate body errors AFTER the encoder/CB have been ended
         // (so allocator state stays consistent) and BEFORE committing
@@ -1361,7 +1528,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let cb_nn = NonNull::from(cb_protocol);
         let mut cb_array = [cb_nn];
         unsafe {
-            queue_clone.commit_count(NonNull::from(&mut cb_array[0]), 1);
+            queue_clone.commit_count_options(NonNull::from(&mut cb_array[0]), 1, &commit_opts);
         }
         queue_clone.signalEvent_value(
             ::objc2::runtime::ProtocolObject::from_ref(&*event_clone),
@@ -1370,6 +1537,14 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         let committed = t_pre.elapsed();
         let ok = event_clone.waitUntilSignaledValue_timeoutMS(signal_value, 60_000);
         if !ok {
+            return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
+        }
+        // GPU execution errors (e.g. command-buffer OOM) arrive via the
+        // commit feedback handler and DO NOT fail the event wait — a
+        // failed CB otherwise yields all-zero outputs and degenerate
+        // logits silently (macOS 26.5.1 / Qwen3.5-MoE "!!!!").
+        if let Some(msg) = commit_err.lock().expect("commit_error mutex").take() {
+            eprintln!("[ferrite-metal] GPU commit error surfaced: {msg}");
             return Err(ForwardError::ExecutionFailed(MTLCommandBufferStatus::Error));
         }
         {
@@ -1586,6 +1761,16 @@ fn write_runtime_inputs(
     inputs: &ForwardInputs<'_>,
 ) -> Result<(), ForwardError> {
     write_slice("input_ids", &runtime.input_ids, inputs.input_ids)?;
+    // FERRITE_VERIFY_BINDINGS=1 — per-forward input attestation.
+    if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some() {
+        let n = inputs.input_ids.len().min(20);
+        eprintln!(
+            "[verify-inputs] num_tokens={} input_ids[..{}]={:?}",
+            inputs.input_ids.len(),
+            n,
+            &inputs.input_ids[..n]
+        );
+    }
     write_slice("positions", &runtime.positions, inputs.positions)?;
     if let Some(s) = inputs.slot_mapping {
         // Padding lanes get sentinel `u32::MAX` so the rope_append

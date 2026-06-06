@@ -257,6 +257,26 @@ impl MetalAllocator {
         &self.residency
     }
 
+    /// Allocation breakdown for budget diagnostics: (mmap regions
+    /// total bytes, arena capacity bytes, arena used bytes).
+    pub fn allocation_breakdown(&self) -> (usize, usize, usize) {
+        let regions: usize = self
+            .mmaps
+            .lock()
+            .expect("MetalAllocator mmaps Mutex")
+            .iter()
+            .map(|r| r.aligned_capacity)
+            .sum();
+        let (cap, used) = {
+            let arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
+            (
+                arenas.iter().map(|a| a.capacity).sum::<usize>(),
+                arenas.iter().map(|a| a.used).sum::<usize>(),
+            )
+        };
+        (regions, cap, used)
+    }
+
     pub fn set_arena_hook(&self, hook: ArenaHook) {
         let arenas = self.arenas.lock().expect("MetalAllocator arenas Mutex");
         for arena in arenas.iter() {

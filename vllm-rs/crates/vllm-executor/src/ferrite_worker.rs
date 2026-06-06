@@ -7154,6 +7154,40 @@ impl FerriteWorker {
                     };
                     drop(gpu_positions_2d);
                     let logits = *owned;
+                    // FERRITE_VERIFY_BINDINGS=1 — real-forward logits
+                    // attestation (UMA: OwnedTensor host-readable).
+                    // Degenerate logits (all-zero / flat / NaN) are the
+                    // silent-garbage signature; print stats of the LAST
+                    // row (the sampled one).
+                    if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some() {
+                        let rows = logits.dim(0);
+                        let vocab = logits.dim(1);
+                        let ptr = logits.as_gpu_tensor().raw_ptr() as *const half::f16;
+                        let last =
+                            unsafe { std::slice::from_raw_parts(ptr.add((rows - 1) * vocab), vocab) };
+                        let mut mx = f32::NEG_INFINITY;
+                        let mut mn = f32::INFINITY;
+                        let mut arg = 0usize;
+                        let mut nan = 0usize;
+                        for (i, &v) in last.iter().enumerate() {
+                            let f = v.to_f32();
+                            if f.is_nan() {
+                                nan += 1;
+                                continue;
+                            }
+                            if f > mx {
+                                mx = f;
+                                arg = i;
+                            }
+                            if f < mn {
+                                mn = f;
+                            }
+                        }
+                        eprintln!(
+                            "[verify-logits] rows={rows} vocab={vocab} last-row: max={mx:.4} at {arg} min={mn:.4} nan={nan} head={:?}",
+                            &last[..4.min(vocab)].iter().map(|v| v.to_f32()).collect::<Vec<_>>()
+                        );
+                    }
                     (Some(owned), logits)
                 }
             }
@@ -9363,14 +9397,28 @@ impl Worker for FerriteWorker {
                     gdn_cfg.head_v_dim as usize,
                     gdn_cfg.head_k_dim as usize,
                     |bytes| {
-                        // f32 conv/ssm state, GPU-resident across forwards
-                        // (no CPU touches) → StorageModePrivate + pin into
-                        // the same shared residency set as the KV pool, so
-                        // the lazy pager can't drop it mid-attention.
+                        // f32 conv/ssm state. MUST be StorageModeShared:
+                        // `RawGpuMem::from_buffer` takes `contents()` and
+                        // every per-layer conv/ssm pointer derives from
+                        // that CPU base. The old StorageModePrivate alloc
+                        // "worked" only because pre-26.5.1 drivers handed
+                        // out a CPU-mappable pointer for Private UMA
+                        // memory anyway; macOS 26.5.1 stopped doing that
+                        // for LARGE allocations (dedicated unmapped VM),
+                        // so the Qwen3.5-MoE-35B pool (~500 MB) silently
+                        // built wild per-layer addresses → garbage GDN
+                        // state → degenerate logits ("!!!!"), while small
+                        // pools (0.8B/9B, heap-suballocated and still
+                        // mapped) kept working. Metal validation layer
+                        // names it: `validateCPUWriteable` assert in
+                        // `RawGpuMem::from_buffer`. Shared is identical
+                        // bandwidth on UMA. Pinned into the same shared
+                        // residency set as the KV pool so the lazy pager
+                        // can't drop it mid-attention.
                         let buffer = mtl_device
                             .newBufferWithLength_options(
                                 bytes,
-                                ::objc2_metal::MTLResourceOptions::StorageModePrivate,
+                                ::objc2_metal::MTLResourceOptions::StorageModeShared,
                             )
                             .expect("GDN state buffer alloc returned nil");
                         residency.insert(&buffer);
@@ -9503,6 +9551,64 @@ impl Worker for FerriteWorker {
             available_reported as f64 / 1_073_741_824.0,
             draft_reservation as f64 / 1_073_741_824.0,
         );
+        // GUARD (feedback_guard_per_bugfix): if what's ALREADY allocated
+        // exceeds the device budget, no KV clamp can save this process —
+        // command buffers will OOM at execution and (before the commit-
+        // feedback guard) produced silent all-zero forwards. Qwen3.5-MoE
+        // -35B hit this on macOS 26.5.1: weights+overhead=34.9 GiB >
+        // total=25 GiB and the engine limped into garbage. Refuse loudly
+        // with the allocation breakdown so the excess is attributable.
+        if weights_and_overhead.saturating_add(peak_activation_estimate) > total {
+            let (regions, arena_cap, arena_used) = self
+                .gpu_device
+                .as_ref()
+                .map(|g| g.allocator.allocation_breakdown())
+                .unwrap_or((0, 0, 0));
+            // When the GDN recurrent-state reservation is what tips the
+            // budget (it scales linearly with --max-num-seqs; 61 MiB/slot
+            // on Qwen3.5-35B), compute the slot count that WOULD fit and
+            // put the exact flag in the error. Qwen3.5-MoE-35B on a
+            // 32 GiB box: 256 default slots = 15.7 GiB reserve = the
+            // entire macOS 26.5.1 "!!!!" incident; 8 slots = 0.5 GiB and
+            // the model runs with 2.5 GiB of KV.
+            let flag_hint = if gdn_reserve > 0 {
+                let per_slot = gdn_reserve / self.config.max_num_seqs.max(1);
+                let base = weights_and_overhead
+                    .saturating_sub(gdn_reserve)
+                    .saturating_add(peak_activation_estimate);
+                // Leave at least 1 GiB for KV after the pool.
+                let headroom = total.saturating_sub(base).saturating_sub(1 << 30);
+                let affordable = (headroom / per_slot.max(1)).max(1);
+                if affordable < self.config.max_num_seqs {
+                    format!(
+                        " The GDN state pool ({:.2} GiB) is sized by \
+                         --max-num-seqs={}; pass --max-num-seqs {} (or fewer) \
+                         to fit this model on this device.",
+                        gdn_reserve as f64 / 1_073_741_824.0,
+                        self.config.max_num_seqs,
+                        affordable.min(64),
+                    )
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            return Err(ExecutorError::WorkerInit(format!(
+                "model does not fit: allocated weights+overhead \
+                 ({:.1} GiB) + activation estimate ({:.1} MiB) exceed the \
+                 device working-set budget ({:.1} GiB). Breakdown: mmap \
+                 shard buffers {:.2} GiB, loader arenas {:.2} GiB capacity \
+                 ({:.2} GiB used), gdn_reserve {:.2} GiB.{flag_hint}",
+                weights_and_overhead as f64 / 1_073_741_824.0,
+                peak_activation_estimate as f64 / 1_048_576.0,
+                total as f64 / 1_073_741_824.0,
+                regions as f64 / 1_073_741_824.0,
+                arena_cap as f64 / 1_073_741_824.0,
+                arena_used as f64 / 1_073_741_824.0,
+                gdn_reserve as f64 / 1_073_741_824.0,
+            )));
+        }
         Ok(available_reported)
     }
 

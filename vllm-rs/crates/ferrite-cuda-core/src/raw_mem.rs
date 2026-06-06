@@ -67,8 +67,28 @@ impl RawGpuMem {
 #[cfg(feature = "metal")]
 impl RawGpuMem {
     pub fn from_buffer(buffer: Buffer) -> Self {
+        // GUARD (feedback_guard_per_bugfix): this wrapper derives CPU
+        // pointers from `contents()` — only valid for CPU-accessible
+        // storage. A StorageModePrivate buffer here silently yields a
+        // garbage base on macOS 26.5.1+ (large allocations return an
+        // unmapped pointer), which built wild per-layer GDN state
+        // addresses and produced degenerate "!!!!" logits with zero
+        // errors. Fail at construction instead.
+        use objc2_metal::MTLResource as _;
+        let mode = buffer.storageMode();
+        assert!(
+            mode == objc2_metal::MTLStorageMode::Shared,
+            "RawGpuMem::from_buffer requires StorageModeShared (CPU-accessible) \
+             storage; got {mode:?}. Private/Memoryless buffers have no valid \
+             contents() pointer — use a GPU-only wrapper or allocate Shared.",
+        );
         let base = buffer.contents().as_ptr() as *mut u8;
         let size = buffer.length();
+        assert!(
+            !base.is_null() || size == 0,
+            "RawGpuMem::from_buffer: contents() returned NULL for a {size}-byte \
+             Shared buffer",
+        );
         Self {
             buffer,
             base,

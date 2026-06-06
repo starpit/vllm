@@ -34,7 +34,7 @@ nccl = []
 # bring those in. The cfg gate inside `interpreter::metal::pipelines`
 # also requires `target_os = "macos"` so non-Apple builds with the
 # `metal` feature still compile (lowering only).
-metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal", "dep:ferrite-fusion-synth", "dep:ferrite-vision", "ferrite-vision/metal"]
+metal = ["dep:ferrite-metal-kernels", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:block2", "ferrite-cuda-core/metal", "dep:ferrite-kernels", "ferrite-kernels/metal", "dep:ferrite-fusion-synth", "dep:ferrite-vision", "ferrite-vision/metal"]
 # Pulls in `hf-hub`, `safetensors`, `clap` etc for the
 # `probe-weights` binary — these are only needed when somebody
 # runs the prober, so they're gated off by default to keep the
@@ -71,6 +71,7 @@ ferrite-vision = { path = "../ferrite-vision", optional = true }
 # downstream callers gate their consuming code.
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
 objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true, features = [
     # MTL4 surfaces for the in-progress migration off the
     # MTLCommandBuffer + Serial-encoder + ICB pattern. Probed at
@@ -85,6 +86,8 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTL4CommandQueue",
     "MTL4ComputeCommandEncoder",
     "MTL4ComputePipeline",
+    "MTL4CommitFeedback",
+    "block2",
 ] }
 objc2-foundation = { version = "0.3", optional = true }
 anyhow = { workspace = true }

@@ -361,8 +361,6 @@ pub enum Instr {
         cos_sin_tensor: TensorId,
         position: KernelArgRef,
         kv_layout: KvLayoutId,
-        head_dim: u32,
-        num_heads: u32,
         side: RopeSide,
         role: WarpRole,
     },
@@ -375,8 +373,6 @@ pub enum Instr {
         cos_sin_tensor: TensorId,
         position: KernelArgRef,
         kv_layout: KvLayoutId,
-        head_dim: u32,
-        num_heads: u32,
         side: RopeSide,
         role: WarpRole,
     },
@@ -385,45 +381,48 @@ pub enum Instr {
     /// the K-cache layout witness (per plan §2 line 88; resolved
     /// through [`TkTape::kv_layout`]); `producer` records how the
     /// cache was populated (per plan §2: "exhaustive match in
-    /// lowering, no `_ =>` arm").
+    /// lowering, no `_ =>` arm"). Per plan §2 line 92 + audit DRIFT
+    /// fix: `head_dim` / `num_kv_heads` are NOT carried here — the
+    /// player reads them via `tape.kv_layout(kv_layout)` (single-
+    /// source method). `num_q_heads` is genuinely separate from KV
+    /// layout (Q-side head count).
     AttnDecodeInit {
         state: SoftmaxStateId,
         num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
         kv_layout: KvLayoutId,
         producer: KvCacheProducer,
         role: WarpRole,
     },
 
     /// One iteration of `S = Q · Kᵀ * scale` followed by online softmax.
+    /// `kv_layout` is the single source of head_dim / num_kv_heads.
     AttnDecodeQkt {
         state: SoftmaxStateId,
         q_page: PageId,
         k_page: PageId,
         scale_bits: u32,
         num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
+        kv_layout: KvLayoutId,
         role: WarpRole,
     },
 
     /// `O += P · V` — second half of one online-softmax iteration.
+    /// `kv_layout` is the single source of head_dim / num_kv_heads.
     AttnDecodeSv {
         state: SoftmaxStateId,
         v_page: PageId,
         num_q_heads: u32,
-        num_kv_heads: u32,
-        head_dim: u32,
+        kv_layout: KvLayoutId,
         role: WarpRole,
     },
 
     /// `O / l_sum` and write to `out_page`. Closes the recurrence.
+    /// `kv_layout` is the single source of head_dim.
     AttnDecodeFinalise {
         state: SoftmaxStateId,
         out_page: PageId,
         num_q_heads: u32,
-        head_dim: u32,
+        kv_layout: KvLayoutId,
         role: WarpRole,
     },
 
@@ -671,8 +670,6 @@ impl Instr {
         cos_sin_tensor: TensorId,
         position: KernelArgRef,
         kv_layout: KvLayoutId,
-        head_dim: u32,
-        num_heads: u32,
         side: RopeSide,
         role: WarpRole,
     ) -> Self {
@@ -683,8 +680,6 @@ impl Instr {
                 cos_sin_tensor,
                 position,
                 kv_layout,
-                head_dim,
-                num_heads,
                 side,
                 role,
             },
@@ -694,8 +689,6 @@ impl Instr {
                 cos_sin_tensor,
                 position,
                 kv_layout,
-                head_dim,
-                num_heads,
                 side,
                 role,
             },
@@ -850,12 +843,20 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             Instr::StoreAsyncTyped { dst_page, .. } => {
                 state.pending_store.insert(dst_page.0);
             }
-            Instr::ThreadfenceBlock { .. }
-            | Instr::ThreadfenceDevice { .. }
+            Instr::ThreadfenceDevice { .. }
             | Instr::ThreadfenceSystem { .. }
             | Instr::WaitGroupBulk { n: 0, .. } => {
-                // All publish in-flight stores.
+                // Per plan §3.2 lines 156-161: cross-worker Gmem edges
+                // require FenceDevice or stricter (System). ThreadfenceBlock
+                // is CTA-scope and is NOT sufficient — it does NOT clear
+                // pending_store and a downstream Arrive{Done} on a still-
+                // pending page will fire MissingFenceBeforeArrive.
                 state.pending_store.clear();
+            }
+            Instr::ThreadfenceBlock { .. } => {
+                // Block-scope fence: insufficient for cross-worker
+                // visibility on Gmem-routed edges; pending_store is
+                // intentionally NOT cleared (plan §3.2).
             }
             Instr::CommitGroupBulk { .. } | Instr::WaitGroupBulk { .. } => {}
             Instr::LoadAsync(spec) => {
@@ -997,6 +998,35 @@ mod tests {
         assert!(
             err.iter().any(|e| matches!(e, TkValidationError::MissingFenceBeforeArrive { page: 0, .. })),
             "want MissingFenceBeforeArrive(0), got {err:?}"
+        );
+    }
+
+    /// Per plan §3.2 lines 156-161 + audit DRIFT #3: ThreadfenceBlock
+    /// is CTA-scope and insufficient to clear cross-worker Gmem
+    /// `pending_store`. A `StoreAsync → ThreadfenceBlock → Arrive{Done}`
+    /// sequence MUST be flagged as missing-fence.
+    #[test]
+    fn validate_tk_tape_rejects_block_fence_before_arrive() {
+        let tape = TkTape {
+            kernel_args: vec![],
+            prelude: vec![],
+            kv_layouts: vec![],
+            instrs: vec![
+                Instr::StoreAsync(StoreSpec {
+                    src_page: PageId(0),
+                    dst_tensor: crate::subtile_ir::TensorId(0),
+                    byte_off: ByteOffset::from_const(0),
+                    tile: TileShape { rows: 1, cols: 4, elem_bytes: 2 },
+                    role: WarpRole::Storer,
+                }),
+                Instr::ThreadfenceBlock { role: WarpRole::Storer },
+                Instr::PageBarrierArrive { page_id: PageId(0), kind: PageBarrier::Done, role: WarpRole::Storer },
+            ],
+        };
+        let err = validate_tk_tape(&tape).unwrap_err();
+        assert!(
+            err.iter().any(|e| matches!(e, TkValidationError::MissingFenceBeforeArrive { page: 0, .. })),
+            "ThreadfenceBlock is CTA-scope; cross-worker Gmem edges need FenceDevice or stricter (plan §3.2). Got: {err:?}"
         );
     }
 

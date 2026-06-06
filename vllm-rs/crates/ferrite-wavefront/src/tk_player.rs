@@ -374,7 +374,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
 
     for instr in &tape.instrs {
         out.push_str("    ");
-        emit_instr(&mut out, instr);
+        emit_instr(&mut out, tape, instr);
     }
 
     out.push_str("}\n\n");
@@ -465,7 +465,7 @@ fn count_softmax_states(tape: &TkTape) -> u32 {
     max_id
 }
 
-fn emit_instr(out: &mut String, instr: &Instr) {
+fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
     match instr {
         Instr::SyncthreadsCta { role: _ } => out.push_str("__syncthreads();\n"),
         Instr::SyncthreadsGroup { n_warps, role: _ } => {
@@ -529,34 +529,34 @@ fn emit_instr(out: &mut String, instr: &Instr) {
         Instr::ResidualAdd { a_page, b_page, out_page, cols, role: _ } => {
             let _ = writeln!(out, "{}", tk20::residual_add(a_page.0, b_page.0, out_page.0, *cols));
         }
-        Instr::RopeRotateNeoX { src_page, dst_page, cos_sin_tensor, position, kv_layout, head_dim, num_heads, side, role: _ } => {
-            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, "NeoX", rope_side_str(*side));
+        Instr::RopeRotateNeoX { src_page, dst_page, cos_sin_tensor, position, kv_layout, side, role: _ } => {
+            // Per plan §2 line 92: head_dim / num_heads come from the
+            // single-source KvLayoutEntry, not duplicated Instr fields.
+            let entry = tape.kv_layout(*kv_layout);
+            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, entry.head_dim(), entry.num_kv_heads(), "NeoX", rope_side_str(*side));
             let _ = writeln!(out, "{s}");
         }
-        Instr::RopeRotateInterleaved { src_page, dst_page, cos_sin_tensor, position, kv_layout, head_dim, num_heads, side, role: _ } => {
-            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, *head_dim, *num_heads, "Interleaved", rope_side_str(*side));
+        Instr::RopeRotateInterleaved { src_page, dst_page, cos_sin_tensor, position, kv_layout, side, role: _ } => {
+            let entry = tape.kv_layout(*kv_layout);
+            let s = tk20::rope_rotate(src_page.0, dst_page.0, cos_sin_tensor.0, position.0 as u32, kv_layout.0, entry.head_dim(), entry.num_kv_heads(), "Interleaved", rope_side_str(*side));
             let _ = writeln!(out, "{s}");
         }
-        Instr::AttnDecodeInit {
-            state,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            kv_layout: _,
-            producer: _,
-            role: _,
-        } => {
-            let _ = writeln!(out, "{}", tk20::attn_decode_init(state.0, *num_q_heads, *num_kv_heads, *head_dim));
+        Instr::AttnDecodeInit { state, num_q_heads, kv_layout, producer: _, role: _ } => {
+            let entry = tape.kv_layout(*kv_layout);
+            let _ = writeln!(out, "{}", tk20::attn_decode_init(state.0, *num_q_heads, entry.num_kv_heads(), entry.head_dim()));
         }
-        Instr::AttnDecodeQkt { state, q_page, k_page, scale_bits, num_q_heads, num_kv_heads, head_dim, role: _ } => {
-            let s = tk20::attn_decode_qkt(state.0, q_page.0, k_page.0, *scale_bits, *num_q_heads, *num_kv_heads, *head_dim);
+        Instr::AttnDecodeQkt { state, q_page, k_page, scale_bits, num_q_heads, kv_layout, role: _ } => {
+            let entry = tape.kv_layout(*kv_layout);
+            let s = tk20::attn_decode_qkt(state.0, q_page.0, k_page.0, *scale_bits, *num_q_heads, entry.num_kv_heads(), entry.head_dim());
             let _ = writeln!(out, "{s}");
         }
-        Instr::AttnDecodeSv { state, v_page, num_q_heads, num_kv_heads, head_dim, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::attn_decode_sv(state.0, v_page.0, *num_q_heads, *num_kv_heads, *head_dim));
+        Instr::AttnDecodeSv { state, v_page, num_q_heads, kv_layout, role: _ } => {
+            let entry = tape.kv_layout(*kv_layout);
+            let _ = writeln!(out, "{}", tk20::attn_decode_sv(state.0, v_page.0, *num_q_heads, entry.num_kv_heads(), entry.head_dim()));
         }
-        Instr::AttnDecodeFinalise { state, out_page, num_q_heads, head_dim, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::attn_decode_finalise(state.0, out_page.0, *num_q_heads, *head_dim));
+        Instr::AttnDecodeFinalise { state, out_page, num_q_heads, kv_layout, role: _ } => {
+            let entry = tape.kv_layout(*kv_layout);
+            let _ = writeln!(out, "{}", tk20::attn_decode_finalise(state.0, out_page.0, *num_q_heads, entry.head_dim()));
         }
         Instr::DebugOpBeginMarker { op_index } => {
             let _ = writeln!(out, "// op_begin {op_index}");
@@ -578,7 +578,8 @@ mod tests {
 
     fn emit(instr: Instr) -> String {
         let mut out = String::new();
-        emit_instr(&mut out, &instr);
+        let tape = TkTape::default();
+        emit_instr(&mut out, &tape, &instr);
         out
     }
 

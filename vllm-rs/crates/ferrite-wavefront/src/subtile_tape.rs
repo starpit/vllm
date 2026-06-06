@@ -866,13 +866,15 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::K
             // freed the slot, which would mean we're visiting node N
             // after N's last consumer, which violates the topo order
             // the SubtileIR's ascending-id invariant guarantees.
-            let token = written[p.0 as usize]
-                .take()
-                .unwrap_or_else(|| unreachable!(
-                    "lower_dag_to_tape: predecessor {} of node {} has no live SlotWritten — \
-                     consumer-count walk disagrees with predecessors list (loop invariant)",
-                    p.0, nid
-                ));
+            // Per plan §4 lines 199-200: no unwrap_or_else.
+            // The loop invariant (ascending topo + per-node
+            // consumer_remaining bookkeeping) guarantees the slot
+            // is live; .expect makes that explicit and panics with
+            // a fixed message rather than the rotted closure form.
+            let token = written[p.0 as usize].take().expect(
+                "lower_dag_to_tape: predecessor missing live SlotWritten \
+                 (consumer-count walk disagrees with predecessors list)",
+            );
             pred_tokens.push((p.0, token));
         }
         let read_refs: Vec<&SlotWritten> =
@@ -1681,13 +1683,19 @@ mod tests {
         // Validator already ran. silu(0)'s slot has two consumers
         // (silu(1) and silu(2)); it must be freed AFTER silu(2)'s
         // Compute, not after silu(1)'s.
+        // Per plan §4 lines 199-200: no `_ =>` arms (yes, even in
+        // tests). Enumerate every Instr variant explicitly.
         let frees: Vec<usize> = tape
             .instrs
             .iter()
             .enumerate()
             .filter_map(|(i, instr)| match instr {
                 Instr::FreeSlot { slot } if slot.id == 0 => Some(i),
-                _ => None,
+                Instr::FreeSlot { .. }
+                | Instr::AllocSlot { .. }
+                | Instr::Compute { .. }
+                | Instr::OpenLoop { .. }
+                | Instr::CloseLoop { .. } => None,
             })
             .collect();
         assert_eq!(frees.len(), 1);

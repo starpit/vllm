@@ -44,7 +44,6 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::num::NonZeroU32;
 
 use crate::subtile_ir::{
     KvCacheLayout, KvCacheProducer, KvCacheShape, RopeForm, SoftmaxStateId, SubOp, SubtileId,
@@ -395,14 +394,14 @@ fn apply_post_loop<F: RopeForm, K: KvCacheShape>(state: &mut LoweringState<F, K>
             state: smx,
             out_page,
             num_q_heads,
-            head_dim,
+            kv_layout,
             output,
         } => {
             state.push(Instr::AttnDecodeFinalise {
                 state: smx,
                 out_page,
                 num_q_heads,
-                head_dim,
+                kv_layout,
                 role: COMPUTE_ROLE,
             });
             emit_store_and_arrive(state, &output, out_page);
@@ -514,10 +513,17 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
 
     // Producer-side store + fence + Arrive{Done}. For AttnDecode the
     // store happens at Finalise (inside emit_attn_decode), so the
-    // outer skips this by returning early in that branch.
+    // outer skips this branch. Per plan §4 lines 199-200: exhaustive
+    // match, no `_ =>` arm.
     match node.op {
         SubOp::AttnDecode { .. } => {} // store handled in emit_attn_decode
-        _ => emit_store_and_arrive(state, &node.output, dst_page),
+        SubOp::MatmulTile
+        | SubOp::SumReduce
+        | SubOp::Elementwise(_)
+        | SubOp::SiluMul
+        | SubOp::RmsNorm { .. }
+        | SubOp::RopeRotate { .. }
+        | SubOp::RopeAppend { .. } => emit_store_and_arrive(state, &node.output, dst_page),
     }
 }
 
@@ -734,11 +740,6 @@ fn emit_rope_rotate<F: RopeForm, K: KvCacheShape>(
     reads: &[SlotId],
     side: RopeSide,
 ) {
-    let cols = node.output.region.cols.len;
-    let num_heads = NonZeroU32::new(head_dim.max(1))
-        .expect(".max(1) above guarantees nonzero")
-        .get();
-    let num_heads = cols / num_heads;
     let position = state.position();
     let cos_sin_tensor = node.inputs[1].tensor;
     let src_page = page_of_nth(state, reads, 0, dst_page);
@@ -753,8 +754,6 @@ fn emit_rope_rotate<F: RopeForm, K: KvCacheShape>(
         cos_sin_tensor,
         position,
         kv_layout,
-        head_dim,
-        num_heads,
         side,
     ));
 }
@@ -767,20 +766,17 @@ fn emit_rope_append<F: RopeForm, K: KvCacheShape>(
     dst_page: PageId,
     reads: &[SlotId],
 ) {
-    let cols = node.output.region.cols.len;
-    let num_heads = if head_dim == 0 { 1 } else { cols / head_dim };
     let position = state.position();
     let cos_sin_tensor = node.inputs[1].tensor;
     let src_page = page_of_nth(state, reads, 0, dst_page);
     let kv_layout = state.intern_kv_layout(layout);
+    let _ = head_dim; // head_dim now lives in the KvLayoutEntry only.
     state.push(rope_rotate_instr::<F, K>(
         src_page,
         dst_page,
         cos_sin_tensor,
         position,
         kv_layout,
-        head_dim,
-        num_heads,
         RopeSide::K,
     ));
 }
@@ -851,8 +847,6 @@ fn emit_attn_decode<F: RopeForm, K: KvCacheShape>(
         Instr::AttnDecodeInit {
             state: smx,
             num_q_heads,
-            num_kv_heads,
-            head_dim,
             kv_layout: kv_layout_id,
             producer,
             role: COMPUTE_ROLE,
@@ -869,16 +863,14 @@ fn emit_attn_decode<F: RopeForm, K: KvCacheShape>(
         k_page,
         scale_bits: scale.to_bits(),
         num_q_heads,
-        num_kv_heads,
-        head_dim,
+        kv_layout: kv_layout_id,
         role: COMPUTE_ROLE,
     });
     state.push(Instr::AttnDecodeSv {
         state: smx,
         v_page,
         num_q_heads,
-        num_kv_heads,
-        head_dim,
+        kv_layout: kv_layout_id,
         role: COMPUTE_ROLE,
     });
 
@@ -906,10 +898,10 @@ fn emit_attn_decode<F: RopeForm, K: KvCacheShape>(
             state: smx,
             out_page: dst_page,
             num_q_heads,
-            head_dim,
+            kv_layout: kv_layout_id,
             output: node.output,
         });
-    let _ = node;
+    let _ = (node, num_kv_heads, head_dim);
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -953,15 +945,12 @@ fn synthesize_q_layout<F: RopeForm, K: KvCacheShape>(
 /// row "RopeForm": the `match` on `F::TAG` is the single runtime→const
 /// dispatch site; downstream Instrs cannot mix forms by value because
 /// the variant identity itself is the witness.
-#[allow(clippy::too_many_arguments)]
 fn rope_rotate_instr<F: RopeForm, K: KvCacheShape>(
     src_page: PageId,
     dst_page: PageId,
     cos_sin_tensor: TensorId,
     position: KernelArgRef,
     kv_layout: KvLayoutId,
-    head_dim: u32,
-    num_heads: u32,
     side: RopeSide,
 ) -> Instr {
     use crate::subtile_ir::RopeFormTag as IrTag;
@@ -972,8 +961,6 @@ fn rope_rotate_instr<F: RopeForm, K: KvCacheShape>(
             cos_sin_tensor,
             position,
             kv_layout,
-            head_dim,
-            num_heads,
             side,
             role: COMPUTE_ROLE,
         },
@@ -983,8 +970,6 @@ fn rope_rotate_instr<F: RopeForm, K: KvCacheShape>(
             cos_sin_tensor,
             position,
             kv_layout,
-            head_dim,
-            num_heads,
             side,
             role: COMPUTE_ROLE,
         },
@@ -1007,7 +992,7 @@ enum PostLoopAction {
         state: TkSoftmaxStateId,
         out_page: PageId,
         num_q_heads: u32,
-        head_dim: u32,
+        kv_layout: KvLayoutId,
         output: TensorRegion,
     },
 }

@@ -35,7 +35,7 @@ What landed in this session:
 | `b6f2bfd380` | Drop GemmM1 accum if/else from tk20 helper |
 | `c260bd19b1` | §10 dead-arm scrub of metal_tape.rs (1471 → 153 LOC, -1318) |
 
-79 unit + 8 doctests green throughout.
+80 unit + 9 doctests green throughout.
 
 ## Remaining work (all staged future commits)
 
@@ -61,7 +61,7 @@ Flat Instr enum (no nested ComputeBody, no LoopCount, no ParityExpr, no ByteOffs
 - Commit/wait: `CommitGroupBulk`, `WaitGroupBulk{n}`
 - Page barrier: `BarrierInit`, `PageBarrierWaitStaticP0` / `PageBarrierWaitStaticP1` (parity is a const-generic split per plan §2 row "Phase (parity)" — never a u8 field), `PageBarrierWaitLoopStart0` / `PageBarrierWaitLoopStart1` (same const-generic split on `start_parity`), `PageBarrierArrive`, `ArriveIfRuntimeEven`
 - Memory: `LoadAsync(LoadSpec)`, `StoreAsync(StoreSpec)`, `StoreAsyncTyped`
-- Compute: `RmsNorm`, `GemmM1{accum:AccumKind}`, `SiluMul`, `ResidualAdd`, `RopeRotate`, `AttnDecodeInit/Qkt/Sv/Finalise`, `DebugOpBeginMarker`
+- Compute: `RmsNorm`, `GemmM1{accum:AccumKind}`, `SiluMul`, `ResidualAdd`, `RopeRotateNeoX` / `RopeRotateInterleaved` (const-generic split per §2 RopeForm row — no runtime `RopeFormTag` field; constructor matches once on `F::TAG` to pick the variant), `AttnDecodeInit/Qkt/Sv/Finalise` (each carries `kv_layout: KvLayoutId`; `head_dim` / `num_kv_heads` come from `tape.kv_layout(id)` per §2 line 92 single-source method), `DebugOpBeginMarker`
 - Control flow: `ForLoopOpenConst`, `ForLoopOpenKernelArg`, `ForLoopClose`
 
 `ByteOffset(String)` is a sealed pre-baked CUDA fragment type (no enum dispatch at emit time). Source identifiers are `subtile_ir::TensorId` (no `BufId`).

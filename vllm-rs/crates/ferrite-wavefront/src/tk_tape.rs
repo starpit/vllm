@@ -451,6 +451,19 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    /// `kittens::group<N>::load(rt, st)` — same TK 2.0 primitive as
+    /// `LoadShmemToReg` but the source is an `act_buf[N]` tile, not
+    /// a `page_buf[N]` tile. Emitted by the `_act_*` constructor
+    /// family. Player emits `act_buf[<src>]` instead of `page_buf[<src>]`.
+    /// Required for routing WGMMA A through the 64-row activation
+    /// pool — see audit ADDENDUM 3 §"Step 2 design".
+    LoadShmemToRegFromAct {
+        src: ActPageId,
+        dst: RegTileSlot,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::store(st, rt)` —
     /// `ops/group/memory/tile/shared_to_register.cuh:139`.
     StoreRegTileToShmem {
@@ -1262,6 +1275,12 @@ impl WarpLoadWidth for GroupWidth<1> {}
 pub trait WarpgroupLoadShape<const ST_ROWS: usize, const RT_ROWS: usize>:
     group_width_sealed::Sealed {}
 impl WarpgroupLoadShape<128, 32> for GroupWidth<4> {}
+/// Activation-pool variant: 64-row act tile distributed across 4 warps
+/// × 16 per-warp rows = WGMMA m64 (height=1 register tile per warp).
+/// Used by [`Instr::LoadShmemToRegFromAct`] / the `_act_*` constructor
+/// family that route the A operand through `act_buf` instead of
+/// `page_buf`. See audit ADDENDUM 3 §"Step 2 design".
+impl WarpgroupLoadShape<64, 16> for GroupWidth<4> {}
 
 /// Runtime carrier for the const-generic `GroupWidth<N>` after type
 /// erasure into [`Instr`]. Field is `pub(crate)` (sealed); the only
@@ -2679,6 +2698,33 @@ impl Instr {
         }
     }
 
+    /// Activation-pool variant of [`Self::load_shmem_to_reg_warpgroup`].
+    /// Same TK 2.0 primitive, but `src` is an [`ActSmemTileId`] from
+    /// the `act_buf` pool. Player emits `act_buf[N]` instead of
+    /// `page_buf[N]`. Per audit ADDENDUM 3 §"Step 2 design".
+    pub(crate) fn load_shmem_to_reg_warpgroup_from_act<
+        const ST_ROWS: usize,
+        const RT_ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: ActSmemTileId<ST_ROWS, COLS, T>,
+        dst: RegTileId<RT_ROWS, COLS, T, L>,
+        _width: GroupWidth<4>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<4>: WarpgroupLoadShape<ST_ROWS, RT_ROWS>,
+    {
+        Self::LoadShmemToRegFromAct {
+            src: src.page(),
+            dst: dst.slot(),
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     pub(crate) fn store_reg_tile_to_shmem<
         const N: usize,
         const ROWS: usize,
@@ -4044,6 +4090,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::ShTileMulRow { .. }
             | Instr::ShTileMulCol { .. }
             | Instr::LoadShmemToReg { .. }
+            | Instr::LoadShmemToRegFromAct { .. }
             | Instr::StoreRegTileToShmem { .. }
             | Instr::LoadShmemSubTileToReg { .. }
             | Instr::StoreRegTileSubTileToShmem { .. }

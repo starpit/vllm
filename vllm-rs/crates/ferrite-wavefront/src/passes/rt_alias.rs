@@ -83,6 +83,7 @@ fn instr_rt_accesses(instr: &Instr) -> Vec<(RegTileSlot, SlotAccess)> {
     match instr {
         // Smem ↔ reg moves
         LoadShmemToReg { dst, .. } => out.push((*dst, SlotAccess::Write)),
+        LoadShmemToRegFromAct { dst, .. } => out.push((*dst, SlotAccess::Write)),
         StoreRegTileToShmem { src, .. } => out.push((*src, SlotAccess::Read)),
         LoadShmemSubTileToReg { dst, .. } => out.push((*dst, SlotAccess::Write)),
         StoreRegTileSubTileToShmem { src, .. } => out.push((*src, SlotAccess::Read)),
@@ -403,6 +404,7 @@ fn rewrite_instr<F: Fn(&mut RegTileSlot)>(instr: &mut Instr, f: &F) {
     use Instr::*;
     match instr {
         LoadShmemToReg { dst, .. } => f(dst),
+        LoadShmemToRegFromAct { dst, .. } => f(dst),
         StoreRegTileToShmem { src, .. } => f(src),
         LoadShmemSubTileToReg { dst, .. } => f(dst),
         StoreRegTileSubTileToShmem { src, .. } => f(src),

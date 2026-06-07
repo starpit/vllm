@@ -240,6 +240,14 @@ mod tk20 {
         format!("kittens::group<{group_n}>::load(rt_{dst_slot}, page_buf[{src_page}]);")
     }
 
+    /// `kittens::group<N>::load(rt_dst, act_buf[src])` — same TK 2.0
+    /// primitive as `load_shmem_to_reg_tile`; differs only in the
+    /// shared-memory pool the tile lives in. Emitted from
+    /// `Instr::LoadShmemToRegFromAct`.
+    pub fn load_act_to_reg_tile(group_n: u32, src_page: u8, dst_slot: u16) -> String {
+        format!("kittens::group<{group_n}>::load(rt_{dst_slot}, act_buf[{src_page}]);")
+    }
+
     /// `kittens::group<N>::store(page_buf[dst], rt_src)` —
     /// `ops/group/memory/tile/shared_to_register.cuh:139`.
     pub fn store_reg_tile_to_shmem(group_n: u32, src_slot: u16, dst_page: u8) -> String {
@@ -978,6 +986,10 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::LoadShmemToReg { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",
                 tk20::load_shmem_to_reg_tile(width.n(), src.0, dst.0));
+        }
+        Instr::LoadShmemToRegFromAct { src, dst, width, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::load_act_to_reg_tile(width.n(), src.0, dst.0));
         }
         Instr::StoreRegTileToShmem { src, dst, width, role: _ } => {
             let _ = writeln!(out, "{}",

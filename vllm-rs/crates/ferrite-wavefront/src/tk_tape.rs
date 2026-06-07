@@ -1539,12 +1539,54 @@ pub struct SmemTileId<const ROWS: usize, const COLS: usize, T: TileDtype> {
     _marker: PhantomData<fn() -> T>,
 }
 
+/// Sealed marker — `(ROWS, COLS, T)` is a legal sub-tile shape of
+/// the `page_buf` substrate's [`PageTileSpec`] (128×128 bf16). Either
+/// the full-page shape (128, 128, Bf16) or a sub-tile that the
+/// existing emit paths use (e.g. 16×128 register-strip).
+///
+/// Per `feedback_end_to_end_compile_time_proofs`: every numeric proof
+/// the substrate's page-pool tile shape encodes MUST propagate to
+/// every `SmemTileId<R, C, T>` mint site as a `where`-clause witness.
+/// A wrong-shape mint (e.g., `SmemTileId<32, 64, Fp32>::from_page`)
+/// is now `error[E0277]: ... PageSubTileShape ... not satisfied`,
+/// not a runtime kernel deadlock from a malformed `kittens::st_bf`
+/// reference.
+///
+/// **Impl set today**:
+/// - `(128, 128, Bf16)` — full PageTileSpec (matmul B operand,
+///   substrate decl).
+/// - `(16, 128, Bf16)` — register-strip sub-tile (16 rows of 128
+///   cols, used by `LoadShmemSubTileToReg` for register-tile loads).
+///
+/// Adding a new sub-tile shape is a one-line `impl PageSubTileShape
+/// for SmemTileId<R, C, T> {}` here; the substrate-shape validity
+/// check happens at the `impl` site, not at the mint site.
+mod page_sub_tile_shape_sealed {
+    pub trait Sealed {}
+}
+pub trait PageSubTileShape: page_sub_tile_shape_sealed::Sealed {}
+
+impl page_sub_tile_shape_sealed::Sealed for SmemTileId<128, 128, Bf16> {}
+impl PageSubTileShape for SmemTileId<128, 128, Bf16> {}
+impl page_sub_tile_shape_sealed::Sealed for SmemTileId<16, 128, Bf16> {}
+impl PageSubTileShape for SmemTileId<16, 128, Bf16> {}
+
 impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, T> {
-    /// Mint a typed tile handle for `page`. Caller asserts (by choice
-    /// of the const-generic instantiation site) that `page` indexes a
-    /// `kittens::st_<T::NAME><ROWS, COLS>`-typed shared buffer.
+    /// Mint a typed tile handle for `page`. Restricted by the sealed
+    /// [`PageSubTileShape`] marker to shapes that are legal sub-tiles
+    /// of [`PageTileSpec`]: the full 128×128 page or a 16×128
+    /// register-strip. A wrong-shape instantiation (e.g.,
+    /// `SmemTileId::<32, 64, Fp32>::from_page(p)`) is `error[E0277]`,
+    /// not a runtime kernel hang.
     /// `pub(crate)` so only the lowerer can mint these.
-    pub(crate) const fn from_page(page: PageId) -> Self {
+    ///
+    /// Not `const`: the trait-bound discharge for sealed witnesses is
+    /// not yet stable in `const fn` context. Callers are runtime
+    /// lowerer code, not const contexts.
+    pub(crate) fn from_page(page: PageId) -> Self
+    where
+        Self: PageSubTileShape,
+    {
         Self {
             page,
             _marker: PhantomData,
@@ -1581,8 +1623,28 @@ pub struct ActSmemTileId<const ROWS: usize, const COLS: usize, T: TileDtype> {
     _marker: PhantomData<fn() -> T>,
 }
 
+/// Sealed marker — `(ROWS, COLS, T)` is a legal sub-tile shape of
+/// the `act_buf` substrate's [`ActTileSpec`] (64×128 bf16). Mirror
+/// of [`PageSubTileShape`]; impl set lists every shape the emit
+/// uses today against the act-pool. A wrong-shape mint is rejected
+/// at compile time, not at runtime.
+mod act_sub_tile_shape_sealed {
+    pub trait Sealed {}
+}
+pub trait ActSubTileShape: act_sub_tile_shape_sealed::Sealed {}
+
+impl act_sub_tile_shape_sealed::Sealed for ActSmemTileId<64, 128, Bf16> {}
+impl ActSubTileShape for ActSmemTileId<64, 128, Bf16> {}
+impl act_sub_tile_shape_sealed::Sealed for ActSmemTileId<16, 128, Bf16> {}
+impl ActSubTileShape for ActSmemTileId<16, 128, Bf16> {}
+
 impl<const ROWS: usize, const COLS: usize, T: TileDtype> ActSmemTileId<ROWS, COLS, T> {
-    pub(crate) const fn from_page(page: ActPageId) -> Self {
+    /// Mint a typed activation-tile handle. Restricted to shapes that
+    /// are legal sub-tiles of [`ActTileSpec`] via [`ActSubTileShape`].
+    pub(crate) fn from_page(page: ActPageId) -> Self
+    where
+        Self: ActSubTileShape,
+    {
         Self {
             page,
             _marker: PhantomData,
@@ -1703,26 +1765,32 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS
     /// stay only for the lowerer's runtime-shape boundary case.
     pub const WITNESS: Self = Self { _marker: PhantomData };
 
-    /// Mint a typed spec from a runtime shape. `pub(crate)`: only
-    /// the lowerer (which owns the page-shape mapping) can mint
-    /// these. `debug_assert!`s shape conformance — a release-mode
-    /// mismatch is a typed-witness lie, but the const-generics are
-    /// what flow into emit and downstream type-checks.
-    pub(crate) fn from_shape(shape: TileShape) -> Self {
-        debug_assert_eq!(
+    /// Mint a typed spec at the SubtileIR-graph runtime-shape
+    /// boundary. `pub(crate)`: only the lowerer (which owns the
+    /// page-shape mapping) can mint these. Release-mode `assert_eq!`
+    /// (NOT `debug_assert_eq!`): the proc-macro runs in release
+    /// mode, so a typed-witness lie must be caught at codegen time,
+    /// not silently produce a malformed `.cu`. Per the audit finding
+    /// `smem-tile-spec-debug-assert`.
+    ///
+    /// In const contexts (substrate emit, type-alias wiring) prefer
+    /// [`Self::WITNESS`] — it has no runtime input and so no runtime
+    /// check is needed.
+    pub(crate) fn from_runtime_shape(shape: TileShape) -> Self {
+        assert_eq!(
             shape.rows, ROWS as u32,
-            "SmemTileSpec<{ROWS},_,_>::from_shape: rows mismatch (got {})",
+            "SmemTileSpec<{ROWS},_,_>::from_runtime_shape: rows mismatch (got {})",
             shape.rows,
         );
-        debug_assert_eq!(
+        assert_eq!(
             shape.cols, COLS as u32,
-            "SmemTileSpec<_,{COLS},_>::from_shape: cols mismatch (got {})",
+            "SmemTileSpec<_,{COLS},_>::from_runtime_shape: cols mismatch (got {})",
             shape.cols,
         );
-        debug_assert_eq!(
+        assert_eq!(
             shape.elem_bytes,
             T::ELEM_BYTES,
-            "SmemTileSpec<_,_,T>::from_shape: elem_bytes mismatch (got {})",
+            "SmemTileSpec<_,_,T>::from_runtime_shape: elem_bytes mismatch (got {})",
             shape.elem_bytes,
         );
         Self {
@@ -2020,11 +2088,31 @@ impl ByteOffsetExpr {
     }
 }
 
+/// Runtime tile-shape triple at the SubtileIR-graph boundary. Used
+/// by the lowerer when the SubtileIR specifies a shape that is not
+/// a compile-time const generic (e.g., an `External` weight load
+/// whose shape varies per Llama-3.2-1B FUF tile). Per
+/// `feedback_no_premature_string_encoding` and
+/// `feedback_end_to_end_compile_time_proofs`: every consumer that
+/// can take a const-generic [`SmemTileSpec<R, C, T>`] does, and only
+/// the runtime-graph boundary uses this type.
+///
+/// **Sealed inner fields.** The fields are `pub(crate)` so a
+/// construction outside the crate is impossible. Inside the crate,
+/// constructions go through one of:
+///
+/// 1. [`SmemTileSpec::shape`] — recovered from the typed witness
+///    (compile-time path; no runtime check needed).
+/// 2. The lowerer's `region_tile_shape` (runtime-graph boundary;
+///    documented call site, single function).
+/// 3. [`SmemTileSpec::from_runtime_shape`] — the runtime → typed
+///    crossing, hardens to a release-mode `assert_eq!` (NOT
+///    `debug_assert!` — release mode is what the proc-macro runs in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TileShape {
-    pub rows: u32,
-    pub cols: u32,
-    pub elem_bytes: u32,
+    pub(crate) rows: u32,
+    pub(crate) cols: u32,
+    pub(crate) elem_bytes: u32,
 }
 
 /// Runtime sealed dtype tag. The `TileDtype` trait's `tag()` method

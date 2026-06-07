@@ -1529,7 +1529,7 @@ mod tests {
     fn tma_expect_emits_typed_byte_count() {
         use crate::tk_tape::{Bf16, LoaderRole, PageId, SmemTileSpec, TileShape};
         // For SmemTileSpec<128, 128, Bf16>: 128*128*2 = 32768 bytes
-        let spec = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+        let spec = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
             rows: 128, cols: 128, elem_bytes: 2,
         });
         let mut tape = TkTape::default();

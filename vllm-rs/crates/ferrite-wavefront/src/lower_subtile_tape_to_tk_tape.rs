@@ -1449,12 +1449,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // (no runtime byte-count param; type system writes it).
             // Per `feedback_tk20_tma_lane_gate`, the emit uses
             // `kittens::group<1>::tma::*` (lane-0-gated).
-            let k_shape = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+            let k_shape = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
                 rows: 128,
                 cols: 128,
                 elem_bytes: 2,
             });
-            let v_shape = SmemTileSpec::<128, 128, Bf16>::from_shape(TileShape {
+            let v_shape = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
                 rows: 128,
                 cols: 128,
                 elem_bytes: 2,

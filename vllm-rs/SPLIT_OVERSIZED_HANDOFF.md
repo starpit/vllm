@@ -1,192 +1,157 @@
-# Handoff — ff-subtile worktree, post-phase-2 K-tile + N-tile gap
+# Handoff — ff-subtile worktree, post-phase-3 NK extension; conservative-lowering broken at every op boundary
 
 ## Where to work
 
 - **Worktree:** `/Users/nickm/git/vllm/.claude/worktrees/ff-subtile`
 - **Branch:** `worktree-ff-subtile`
 - **Crate:** `vllm-rs/crates/ferrite-wavefront/`
-- **HEAD:** `36024bc11f` — split_oversized_loads_pass phase 2 (K-loop rewrite)
+- **HEAD:** `f0fc5eae1b` — split_oversized_loads_pass NK extension + Affine2D byte_off
 - **Pod:** `nick`, path `/home/nickm/vllm-ff-subtile/vllm-rs/`
 
 `pwd && git branch --show-current` first thing — per
 `memory/feedback_handoff_worktree_match.md`.
 
-## What this session did
+## Session arc (3 commits since 35c0cb7231)
 
-Phase 2 of `split_oversized_loads_pass` landed (`36024bc11f`,
-~900 LOC + 6 tests). The pass takes the conservative lowering's
-oversized External LoadAsyncs and rewrites them, paired with their
-consumer `WgmmaMmaAB_RegSmem` matmul-emit-sequence, into a K-loop
-over 128×128 chunks. Mirrors AttnDecode_Qkt's K-loop pattern.
-Postcondition (defensive walk): every `Instr::LoadAsync.tile.byte_size()`
-is `≤ PAGE_SIZE` after the pass.
+| Commit | Summary |
+|---|---|
+| `36024bc11f` | **Phase 2** — K-loop rewrite. Each oversized LoadAsync paired with its `WgmmaMmaAB_RegSmem` consumer is replaced by a K-loop over 128×128 chunks. Mirrors AttnDecode_Qkt. |
+| `3edbefc62e` | Handoff doc update: phase 2 done; production hits N>128 first. |
+| `f0fc5eae1b` | **Phase 3** — NK extension. Adds `ByteOffsetExpr::Affine2D` variant + player emit; dispatch in `plan_rewrite` (`n_blocks == 1` → K-only; `>1` → NK with outer N-loop wrapping inner K-loop and per-N output StoreAsync). 114 lib tests pass on the H100 pod. |
 
-110 lib tests pass on the H100 pod (104→110: +6 phase-2 tests).
+## State right now
 
-## What this session uncovered
-
-The prior handoff (`35c0cb7231`) said:
-
-> N-tiling beyond a single 128-col page is a separate transform
-> (not in this pass; M=N=128 is the only case the conservative
-> lowering produces today).
-
-That assumption was wrong about the production state. Driving
-ferrite-model-llama's proc-macro on the pod (`FERRITE_WAVEFRONT=1
-FERRITE_MODELS=llama-3.2-1b cargo build`) hits the pass's N>128
-compile-time guard before any K-tile rewrite can fire:
+The K-tile + N-tile machinery is correct and tested for the
+oversized LoadAsync side. Driving the proc-macro on the pod (after
+`f0fc5eae1b`) advances PAST the N>128 guard but hits a deeper gap:
 
 ```
-[wavefront] llama-3.2-1b: 244 fuf tiles, 115 subgraphs → 181 sources
-  (146 weights, 32 prefix-kv), 258 ops; ops [..., ("Gemm", 113), ...]
 error: custom attribute panicked
   --> crates/ferrite-model-llama/src/lib.rs:14:1
-  = help: message: split_oversized_loads_pass: B operand tile.cols = 2048,
-                   expected 128. N-tiling beyond a single 128-col page is
-                   a separate transform (not in this pass).
+  = help: message: split_oversized_loads_pass: A operand of Wgmma at idx 20
+                   has no LoadAsync (a_page = PageId(0)). The pass cannot
+                   K-fragment a prior-op page — re-staging from gmem
+                   requires routing changes upstream.
 ```
 
-The conservative lowering for Llama-3.2-1B produces ONE `SubOp::MatmulTile`
-per logical Linear (113 Gemms total = 7×16 + lm_head), with **full**
-`TensorRegion`s on both sides:
+For Llama-3.2-1B's `q = gemm(normed, q_proj_weight)`:
 
-| Operand | shape | bytes | status |
-|---|---|---|---|
-| A (act): | M × K_full = 128 × 2048 | 512 KB | oversized along K |
-| B (weight, q_proj): | K_full × N = 2048 × 2048 | 8 MB | oversized along **both** K and N |
-| Output: | M × N = 128 × 2048 | 512 KB | oversized along N |
+- `B` (q_proj weight) is `External` → `emit_external_load` emits a
+  fresh oversized LoadAsync. The pass K/N-tiles it. ✅
+- `A` (normed = RmsNorm output) is `Computed` →
+  `resolve_input_page` returns the existing page WITHOUT emitting a
+  LoadAsync. The pass's K-tile path needs a gmem source to re-load
+  per-K chunks; there isn't one in the tape. ❌
 
-`partition.rs::lower_partitioned` is NOT in the path that produces
-the SubtileIR for Llama (the `[wavefront]` log shows 113 Gemm nodes,
-not 113×n_blocks). One Gemm SubOp per Linear, full output.
+The deeper issue: the conservative lowering is **broken at every op
+boundary** for `hidden > PAGE_COLS` (= 128), not just at the Gemm
+LoadAsync side. Concrete trace:
 
-**The K-tile machinery in phase 2 is correct and tested.** But
-launching the kernel needs the M/N-tiling sibling pass to land
-first, otherwise the N>128 guard panics before K-tile ever fires.
+1. **RmsNorm forward**: arm reads input page as
+   `SmemTileId::<128, 128, Bf16>` and writes output as
+   `SmemTileId::<128, 128, Bf16>` (single 32 KB page). The
+   `SubtileIR::TensorRegion` for the output says `128 × hidden =
+   128 × 2048` (= 512 KB). Only the first 128 cols of K are computed.
+2. **`emit_store_and_arrive`**: takes `tile = region_tile_shape(out)`
+   = `128 × 2048` and emits `StoreAsync(dst_page, tile=128×2048)`.
+   The TMA store reads 512 KB from a 32 KB smem page → OOB on the
+   smem read side. The gmem write region is `128 × 2048` but only
+   the first 32 KB is meaningful data.
+3. **Gemm reads `A=normed`**: SubtileIR shows `Computed(rmsnorm_slot)`,
+   `resolve_input_page` returns the same `dst_page`. The Gemm reads
+   it as `SmemTileId::<128, 128, Bf16>` — gets the (correct, since
+   that's all RmsNorm wrote) first 128 cols. K=2048 portion is lost.
+4. **Gemm writes output**: same OOB pattern (`emit_store_and_arrive`
+   stores `128 × N_full` from a `128 × 128` page).
 
-## Phase 3: N-tile (and M-tile) sibling pass
+Every chained op carries this corruption. The test fixtures pass
+because they're synthetic single-op tapes — the chain isn't there.
 
-This is the next blocker for the kernel launch.
+## What needs to happen (the actual unblock)
 
-### What needs to happen architecturally
+The K-tile + N-tile machinery this session built is **necessary
+but not sufficient**. The conservative lowering needs M/N/K tiling
+**at the op level**, coordinated across the chain. Three options
+in increasing scope:
 
-Each oversized Gemm needs to become an OUTER N-loop wrapping the
-existing inner K-loop (which `split_oversized_loads_pass` already
-emits). The output store needs to be folded into the N-loop body.
+### Option A: Op-level tiling in the SubtileIR / lowering (RIGHT but BIG)
 
-Sketch:
+Restructure the SubtileIR so each `SubtileNode` is page-shaped:
+RmsNorm becomes `M_blocks × N_blocks` nodes each producing a 128×128
+sub-tile of the logical RmsNorm output. The Gemm chain consumes
+those page-shaped outputs naturally.
 
-```text
-BarrierInit a_page Ready One
-BarrierInit b_page Ready One
-ForLoopOpenConst { n_var, n: N_blocks }    ← N_full / 128
-  init_rt_zero(rt_d)                       ← re-init per N tile
-  ForLoopOpenConst { k_var, n: K_blocks }
-    TmaExpect A_page                       ← A independent of n_var
-    LoadAsync A chunk LinearLoop(k_var, stride_A_k)
-    TmaExpect B_page
-    LoadAsync B chunk LinearLoop(k_var, stride_B_k)  + LinearLoop(n_var, stride_B_n)
-    PageBarrierWaitLoopStart0 A k_var
-    PageBarrierWaitLoopStart0 B k_var
-    load_shmem_to_reg(A_page, rt_a)
-    wgmma_fence_acc(rt_d)
-    wgmma_mma_ab_reg_smem(...AccAccumulate, FenceExternal)
-    wgmma_async_wait(0)
-  ForLoopClose { k_var }
-  store_reg_tile_to_shmem_warpgroup(rt_d, dst_page)
-  StoreAsync dst_page → output, byte_off = LinearLoop(n_var, stride_out_n)
-ForLoopClose { n_var }
-CommitGroupBulk
-ThreadfenceDevice
-PageBarrierArrive Done dst_page             ← arrive ONCE, not per N tile
-```
+This is what the `partition.rs::lower_partitioned` path produces
+(N=64 blocks for q_proj at TP=1) but it's not in the wavefront
+ferrite-model-llama lowering path — that path produces ONE node per
+Linear with full TensorRegions. Routing wavefront through
+`lower_partitioned` (or porting the same fragmentation logic) is
+the architectural fix.
 
-### Issues that need design
+Scope: substantial. Touches the SubtileIR construction, every
+SubOp arm in `lower_subtile_tape_to_tk_tape`, and the page
+allocation strategy. Probably 2-3 weeks of work to do right.
 
-1. **Two-variable byte offsets.** B's per-iter byte offset depends on
-   BOTH `k_var` (stride = `K_BLOCK × N_full × 2` along rows of K×N
-   row-major) AND `n_var` (stride = `N_BLOCK × 2` along cols).
-   `ByteOffsetExpr::LinearLoop` carries one `var`/`stride_bytes`
-   pair. **A new `ByteOffsetExpr::Affine2D { var_a, stride_a,
-   var_b, stride_b, base }` variant** (or similar) is required, with
-   matching player emit. Same applies to A (which only depends on
-   `k_var`, but the variant takes both for symmetry).
+### Option B: Tape-level rewrite that re-stages from gmem (TRACTABLE)
 
-2. **Output StoreAsync needs N-loop indexing.** Currently
-   `emit_store_and_arrive` emits one `StoreAsync(dst → output)` with
-   a `ByteOffsetExpr::Const`. Inside the N-loop, the StoreAsync's
-   `byte_off` becomes `LinearLoop(n_var, stride_out_n)` and its
-   tile shape becomes `128×128` (not `128×N_full`). Use
-   `StoreSpec::new::<128, 128, Bf16>` on the typed-witness path
-   instead of `new_runtime_shape`.
+Extend `split_oversized_loads_pass` so when A is `Computed` (no
+LoadAsync), the pass walks BACK through the tape to find the prior
+op's `StoreAsync` whose `src_page == a_page`. That `StoreAsync`'s
+`dst_arg` is the gmem tensor that holds the prior op's full output.
+The pass then emits per-K-chunk `LoadAsync`s using that tensor as
+the source for `A`.
 
-3. **CommitGroupBulk / ThreadfenceDevice / Arrive-Done placement.**
-   These currently live AFTER the matmul-emit-sequence. With N
-   stores per output, you want:
-   - Inside the N-loop: nothing (the StoreAsyncs accumulate).
-   - After the N-loop close: ONE CommitGroupBulk + ThreadfenceDevice
-     + PageBarrierArrive Done.
+This works ONLY IF the prior op's gmem output is correct. Today it
+isn't (per #2 above — RmsNorm OOBs the smem read side). So Option B
+requires Option B' first:
 
-4. **Init_rt_zero placement.** The K-tile pass currently emits
-   `init_rt_zero` ONCE outside the loop. With N-tiling, it needs
-   to be re-issued per N iter (each output tile gets a fresh
-   accumulator).
+### Option B': Fix the smem-side OOB at every op (also TRACTABLE)
 
-5. **M-tile.** For workloads `[1024, 2048, 4096]` in the macro spec,
-   M = workload exceeds PAGE_ROWS = 128. M-tiling adds a third
-   outermost loop. Defer to a follow-up if not blocking — the smaller
-   workloads (which compile to separate kernels per the
-   `workloads = [1, 2, 4, 8, 64, 512, 1024, 2048, 4096]` spec) hit
-   N-tile first.
+A sibling pass that walks `StoreAsync` Instrs and detects the case
+where `tile.byte_size() > PAGE_SIZE` (smem side over-read). For
+each, rewrite into an N-loop that issues per-N-chunk StoreAsyncs
+from the same dst_page (whose 128×128 contents are NOT the right
+data for cols ≥ 128 anyway — so this needs the prior op's compute
+arm to have ALREADY been M/N-tiled, see Option A).
 
-### Where to land it
+Recursive: B' depends on the upstream RmsNorm/etc. arms producing
+correct multi-chunk output, which means the lowering's RmsNorm arm
+itself needs M/N-tiling.
 
-**Recommendation:** New sibling pass file
-`crates/ferrite-wavefront/src/passes/n_tile_loads.rs` that runs
-**before** `split_oversized_loads_pass` in the §6.5 pipeline (line
-570 of `lower_subtile_tape_to_tk_tape.rs`):
+### The honest assessment
 
-```rust
-crate::passes::n_tile_loads_pass(&mut out);     // NEW — runs first
-validate_tk_tape(&out).expect("n_tile_loads_pass: invalid TkTape");
+The scope of work to actually launch the kernel is **larger than the
+prior handoffs anticipated**. Phase 2 + Phase 3 are correct and
+well-scoped. The remaining work is:
 
-crate::passes::split_oversized_loads_pass(&mut out);  // existing K-tile
-validate_tk_tape(&out).expect("split_oversized_loads_pass: invalid TkTape");
-```
+1. **Lowering-level M/N tiling** for non-Gemm ops (RmsNorm,
+   Add, Mul, SiluMul, RopeRotate, RopeAppend) so each page-shaped
+   write-side maps to a 128×128 chunk. This belongs in the SubOp
+   arms of `lower_subtile_tape_to_tk_tape`, NOT in a TkTape→TkTape
+   pass.
 
-The N-tile pass produces `N_blocks` MatmulTile-emit-sequences each
-with B region `K_full × 128` (still oversized along K → 512 KB), and
-the K-tile pass then chunks each of those into 128×128.
+2. **Computed-input re-staging** in `split_oversized_loads_pass`
+   so when A is Computed, the pass walks back to the prior op's
+   StoreAsync to recover the source gmem tensor and emits fresh
+   LoadAsyncs.
 
-Pass shape mirrors `split_oversized_loads.rs`:
+OR, alternative:
 
-- Walk the tape, find Gemm-emit-sequences whose B operand has
-  `tile.cols > PAGE_COLS`.
-- For each, splice the (LoadAsyncs + matmul-emit-sequence + StoreAsync
-  + commit + fence + arrive) span with an N-loop wrapping a copy of
-  the inner sequence per N iter.
-- Same compile-time invariants (typed const-generic witnesses, sealed
-  enums, where-clauses) per `feedback_ff_subtile_compile_time_inviolable`.
+3. **Route ferrite-model-llama through `lower_partitioned`** so each
+   SubtileNode is page-shaped at the SubtileIR level. Then the pass
+   pipeline as-is (rt_alias, page_coalesce, split_oversized_loads
+   with K-only) is sufficient.
 
-### Estimated scope
-
-~600 LOC + tests. Complexity comes from:
-
-- The `Affine2D` byte-offset variant and its player emit.
-- The output StoreAsync rewrite (needed once for the byte_off, once
-  for the tile shape, once for the typed `new` constructor).
-- The CommitGroupBulk / Arrive-Done batching across N iters.
-
-The K-tile sibling already proves the pattern (~900 LOC + 6 tests
-on the same kind of synthetic tape harness). N-tile is structurally
-similar but has the extra wrinkle of the output store.
+Option 3 is probably the cleanest path to a working kernel, IF
+`lower_partitioned`'s output is well-formed for wavefront's
+codegen (it was designed for the partition.rs / TP path).
 
 ## Pod paths + commands
 
 Path: `/home/nickm/vllm-ff-subtile/vllm-rs/` on `nick`. Context:
 `nickm/api-fmaas-vllm-d-fmaas-res-ibm-com:6443/nickm@us.ibm.com`.
 
-Sync:
+Sync src/:
 
 ```
 oc --context nickm/... rsync \
@@ -194,61 +159,54 @@ oc --context nickm/... rsync \
   nick:/home/nickm/vllm-ff-subtile/vllm-rs/crates/ferrite-wavefront/src/
 ```
 
-Pod tests:
+Pod tests (114 should pass after `f0fc5eae1b`):
 
 ```
-oc --context nickm/... rsh nick bash -c 'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
-  FERRITE_MODELS=llama-3.2-1b cargo test -p ferrite-wavefront --lib'
+oc --context nickm/... rsh nick bash -c \
+  'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
+   FERRITE_MODELS=llama-3.2-1b cargo test -p ferrite-wavefront --lib'
 ```
 
-Force regen the .cu (when N-tile lands and the build no longer
-panics):
+Force regen the .cu (today this hits the "A has no LoadAsync"
+panic; will work once Option 3 lands or Option 2 covers Computed
+inputs):
 
 ```
-oc --context nickm/... rsh nick bash -c 'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
-  cargo clean -p ferrite-forward-macro -p ferrite-model-llama && \
-  FERRITE_WAVEFRONT=1 FERRITE_MODELS=llama-3.2-1b \
-    cargo build -p ferrite-model-llama --features cuda'
+oc --context nickm/... rsh nick bash -c \
+  'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
+   cargo clean -p ferrite-forward-macro -p ferrite-model-llama && \
+   FERRITE_WAVEFRONT=1 FERRITE_MODELS=llama-3.2-1b \
+   cargo build -p ferrite-model-llama --features cuda'
 ```
 
-Inspect emitted .cu:
+Inspect emitted .cu (when it builds):
 `~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu`.
-
-nvcc compile (on pod):
-
-```
-nvcc -gencode=arch=compute_90a,code=sm_90a -std=c++20 -O3 \
-  --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr \
-  -DNDEBUG -DKITTENS_HOPPER -Xcompiler=-fPIC -Xcompiler=-fno-strict-aliasing \
-  -I third_party/thunderkittens/include \
-  -c ~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu \
-  -o /tmp/mk.o
-```
 
 ## Open tasks
 
-- **Phase 3 — n_tile_loads_pass (the actual rewrite).** Blocker for
-  the kernel launch.
+- **The actual unblock** — pick Option 1, 2+B', or 3 from §"What
+  needs to happen". Option 3 is the recommended path.
 - #71 split_oversized_loads_pass phase 2 — **DONE** at `36024bc11f`.
+- Phase 3 NK extension — **DONE** at `f0fc5eae1b`.
 - #53 RopeRotateInterleaved (Instr step, deferred).
 - 2 deferred audit findings: `subtile-cols-idx-flat-u16`, S4 PageId
   pub(crate) inner.
 
 ## What "done" looks like for the next session
 
-1. `n_tile_loads_pass` lands (~600 LOC + tests). Same compile-time-
-   safety bar (typed witnesses, sealed enums) as phase 2.
-2. `cargo test -p ferrite-wavefront --lib` green.
-3. `ByteOffsetExpr::Affine2D` (or chosen variant for two-var
-   indexing) lands with the player emit.
-4. `StoreSpec::new_loop_indexed_n` (or similar) emits the per-N-tile
-   output store with typed `SmemTileSpec<128, 128, Bf16>` witness.
-5. Pod regen produces a .cu with the K-then-N nested loops.
-6. nvcc + ptxas compile cleanly.
-7. cudaFuncSetAttribute accepts the DYN_SMEM (substrate is
+1. Pick a path (Option 1, 2+B', or 3). Option 3 recommended.
+2. If Option 3: route ferrite-model-llama through
+   `lower_partitioned`, validate the resulting SubtileIR has
+   page-shaped nodes (244 fuf tiles → many more nodes per Gemm),
+   verify the existing pass pipeline handles it.
+3. Pod regen produces a .cu with all chained ops correctly tiled.
+4. nvcc + ptxas compile cleanly.
+5. cudaFuncSetAttribute accepts the DYN_SMEM (substrate is
    224 KB ≤ Hopper's 228 KB — verified by const_assert).
-8. The kernel actually runs (`vllm bench latency` or similar) and
-   produces coherent decode output for a Llama-3.2-1B prompt.
+6. Kernel runs (`vllm bench latency` or similar) and produces
+   coherent decode output for a Llama-3.2-1B prompt.
 
-Steps 1-2 alone get the next session past the panic. Steps 3-8
-unblock the original goal.
+The K-tile + N-tile pass machinery is in place; it just needs the
+upstream lowering to produce well-formed page-shaped nodes (or the
+Computed-input re-staging extension) for it to actually fire on
+production tapes.

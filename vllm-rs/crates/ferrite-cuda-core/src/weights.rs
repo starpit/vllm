@@ -26,6 +26,8 @@ use cudarc::driver::sys::CUstream;
 
 use crate::DeviceAllocator;
 #[cfg(feature = "cuda")]
+use crate::alloc::RawGpuMem;
+#[cfg(feature = "cuda")]
 use crate::driver;
 use crate::dtype::DType;
 use crate::tensor::GpuTensor;
@@ -310,178 +312,371 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 }
 
 // ---------------------------------------------------------------------------
-// Pre-cast pipeline — background thread pre-faults + casts tensors into pinned
-// buffers so take() just enqueues a DMA from already-ready pinned memory.
+// Pre-stage pipeline — a pool of background workers faults mmap pages with
+// real sequential reads and streams every tensor (cast or byte-identical)
+// chunk-by-chunk through a small per-worker pinned slot straight into a
+// device buffer, so take() just hands over an already-uploaded tensor.
 // ---------------------------------------------------------------------------
 
-/// Background worker: iterates through tensors, pre-faults mmap pages, casts
-/// float data into per-tensor pinned buffers, and stores results in `state.ready`.
+/// Number of parallel pre-stage worker threads. Matches the proven
+/// local-FS concurrency of runai-model-streamer
+/// (`RUNAI_STREAMER_CONCURRENCY` default 16) and fastsafetensors
+/// (`max_threads` default 16): enough concurrent read streams to
+/// saturate a disk that a single faulting thread cannot (measured
+/// 230 MB/s single-thread vs 375 MB/s disk ceiling on a GCP pd).
+#[cfg(feature = "cuda")]
+const PRECAST_WORKERS: usize = 16;
+
+/// Per-worker pinned staging slot size. Each worker allocates ONE slot
+/// for its lifetime and streams tensors through it in chunks:
+/// mmap → slot (the read that faults the pages) → blocking H2D. The
+/// blocking copy guarantees the slot is reusable on return — no events,
+/// no stream sync. 2 MiB is runai-model-streamer's local-FS block floor
+/// (`min_fs_block_bytesize`); fastsafetensors uses 1 MiB per thread.
+/// Total pinned memory: PRECAST_WORKERS × 2 MiB = 32 MiB, pinned once —
+/// per-tensor `cuMemAllocHost` was measured to cap the whole pipeline
+/// at 1.2 GiB/s (page-locking cost scales with bytes pinned).
+#[cfg(feature = "cuda")]
+const STAGE_SLOT_BYTES: usize = 2 << 20;
+
+/// Identity of a tensor's backing bytes: (mmap base, offset, len).
+/// The ready-map is keyed by data identity rather than tensor name so
+/// prefix aliases (two names sharing one mmap range — see the
+/// VL-wrapper aliasing in [`load_shard_into_map`]) stage and pin the
+/// bytes once instead of twice.
+#[cfg(feature = "cuda")]
+type PrecastKey = (usize, usize, usize);
+
+#[cfg(feature = "cuda")]
+fn precast_key(mmap: &Arc<memmap2::Mmap>, data_offset: usize, size_bytes: usize) -> PrecastKey {
+    (mmap.as_ptr() as usize, data_offset, size_bytes)
+}
+
+/// One unit of pre-stage work: (key, mmap, data_offset, size_bytes, dtype).
+#[cfg(feature = "cuda")]
+type PrecastWorkItem = (PrecastKey, Arc<memmap2::Mmap>, usize, usize, DType);
+
+/// Background worker: pulls tensors off the shared work list
+/// (largest-first), faults their mmap pages with one sequential pass,
+/// and streams the bytes through this worker's single pinned slot into
+/// a freshly allocated device buffer — casting float chunks to the
+/// target dtype on the way when needed, byte-copying otherwise.
+/// Device-resident results land in `state.shared.ready` for take().
 ///
-/// CUDA-only: uses `mem_alloc_host` for pinned-host destinations. The
-/// Metal path (unified memory) doesn't need pinning and skips this
-/// pipeline entirely.
+/// The sequential chunk reads ARE the pre-fault: each worker streams
+/// its tensor's pages in order, and [`PRECAST_WORKERS`] concurrent
+/// streams keep the disk's queue full on a cold cache. The blocking
+/// per-chunk H2D means a finished entry needs no further
+/// synchronization — take() can hand the buffer out directly.
+///
+/// CUDA-only. The Metal path (unified memory) doesn't need staging and
+/// skips this pipeline entirely.
 #[cfg(feature = "cuda")]
 fn precast_worker(
     state: Arc<PrecastState>,
     target_dtype: Option<DType>,
-    work: Vec<(String, Arc<memmap2::Mmap>, usize, usize, DType)>,
+    work: Arc<Vec<PrecastWorkItem>>,
+    next: Arc<std::sync::atomic::AtomicUsize>,
+    ctx: usize,
+    stats: Arc<PrecastStats>,
 ) {
-    let mut precast_count = 0usize;
-    let mut prefault_count = 0usize;
+    // CUDA calls need a current context on THIS thread — spawned
+    // threads do not inherit the spawning thread's context. (The old
+    // single-thread pipeline skipped this; its cast-path
+    // `mem_alloc_host` failed with INVALID_CONTEXT and every cast
+    // model silently fell back to pageable uploads.)
+    if let Err(e) = unsafe { driver::ctx_set_current(ctx as cudarc::driver::sys::CUcontext) } {
+        tracing::warn!("pre-stage worker: ctx_set_current failed, worker idle: {e}");
+        precast_worker_finish(&state, &stats);
+        return;
+    }
+    // One pinned staging slot for this worker's lifetime.
+    let slot = match unsafe { driver::mem_alloc_host(STAGE_SLOT_BYTES) } {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("pre-stage worker: pinned slot alloc failed, worker idle: {e}");
+            precast_worker_finish(&state, &stats);
+            return;
+        }
+    };
 
-    for (name, mmap, data_offset, size_bytes, dtype) in &work {
+    loop {
         if state.shutdown.load(Ordering::Relaxed) {
             break;
         }
-
-        let data = &mmap[*data_offset..*data_offset + *size_bytes];
-
-        // Determine if this tensor needs casting.
-        let needs_cast = match target_dtype {
-            Some(target) => {
-                matches!(dtype, DType::F32 | DType::F16 | DType::BF16) && *dtype != target
-            }
-            None => false,
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        let Some((key, mmap, data_offset, size_bytes, dtype)) = work.get(i) else {
+            break;
         };
 
+        // Claim the key.
+        {
+            let mut s = state.shared.lock().unwrap();
+            if s.consumed.contains(key) || s.ready.contains_key(key) || s.in_progress.contains(key)
+            {
+                continue; // Alias duplicate, or the consumer already went slow-path.
+            }
+            s.in_progress.insert(*key);
+        }
+
+        // Stream the tensor outside the lock — this is the expensive
+        // part and the part that faults the mmap pages.
+        let data = &mmap[*data_offset..*data_offset + *size_bytes];
+        let result = unsafe { stage_to_device(data, *dtype, target_dtype, slot) };
+
+        let mut s = state.shared.lock().unwrap();
+        s.in_progress.remove(key);
+        match result {
+            Ok(entry) => {
+                if entry.dtype == *dtype {
+                    stats.staged.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.cast.fetch_add(1, Ordering::Relaxed);
+                }
+                stats.bytes.fetch_add(entry.size_bytes, Ordering::Relaxed);
+                s.ready.insert(*key, entry);
+            }
+            Err(e) => {
+                // Non-fatal — take() falls back to the pageable path.
+                tracing::warn!("pre-stage failed (falling back to pageable upload): {e}");
+            }
+        }
+        drop(s);
+        state.cv.notify_all();
+    }
+
+    unsafe {
+        driver::mem_free_host(slot).ok();
+    }
+    precast_worker_finish(&state, &stats);
+}
+
+/// Stream one tensor from its mmap bytes into a fresh device buffer
+/// through `slot` (a [`STAGE_SLOT_BYTES`] pinned staging buffer),
+/// casting each chunk to `target_dtype` when the tensor is a float of
+/// a different dtype. Returns the device-resident entry.
+///
+/// # Safety
+/// `slot` must be a valid pinned allocation of [`STAGE_SLOT_BYTES`],
+/// and the calling thread must have a current CUDA context.
+#[cfg(feature = "cuda")]
+unsafe fn stage_to_device(
+    data: &[u8],
+    dtype: DType,
+    target_dtype: Option<DType>,
+    slot: *mut u8,
+) -> Result<PrecastEntry> {
+    let needs_cast = match target_dtype {
+        Some(target) => matches!(dtype, DType::F32 | DType::F16 | DType::BF16) && dtype != target,
+        None => false,
+    };
+    let target = if needs_cast {
+        target_dtype.unwrap_or(dtype)
+    } else {
+        dtype
+    };
+
+    let src_elem = dtype.size_bytes();
+    let dst_elem = target.size_bytes();
+    let numel = data.len() / src_elem;
+    let staged_bytes = numel * dst_elem;
+
+    let dev_ptr = unsafe { driver::mem_alloc(staged_bytes)? };
+    let gpu = unsafe { RawGpuMem::new(dev_ptr, staged_bytes) };
+
+    // Elements per chunk, sized so the CHUNK OUTPUT fits the slot.
+    let chunk_elems = STAGE_SLOT_BYTES / dst_elem.max(src_elem);
+    anyhow::ensure!(chunk_elems > 0, "stage slot smaller than one element");
+
+    let mut done = 0usize;
+    while done < numel {
+        let n = chunk_elems.min(numel - done);
+        let src = &data[done * src_elem..(done + n) * src_elem];
         if needs_cast {
-            let target = target_dtype.unwrap();
-            // Cast into a freshly allocated pinned buffer.
-            match cast_into_pinned(data, *dtype, target) {
-                Ok(entry) => {
-                    state.ready.lock().unwrap().insert(name.clone(), entry);
-                    precast_count += 1;
-                }
-                Err(e) => {
-                    // Non-fatal — take() will fall back to synchronous path.
-                    tracing::debug!("Precast failed for {name}: {e}");
-                }
-            }
+            cast_slice_into(slot, src, dtype, target, n)?;
         } else {
-            // No casting needed, but pre-fault the mmap pages by reading
-            // through the data. This ensures pages are in the page cache
-            // by the time take() does the H2D DMA.
-            prefault_pages(data);
-            prefault_count += 1;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), slot, n * src_elem);
+            }
         }
-    }
-
-    tracing::info!(
-        "Precast pipeline done: {precast_count} tensors cast into pinned buffers, \
-         {prefault_count} tensors pre-faulted"
-    );
-}
-
-/// Pre-fault mmap pages by reading through the data at page-stride intervals.
-/// This triggers page faults now so take() doesn't block on disk I/O later.
-/// CUDA-only — invoked from the precast pipeline.
-#[cfg(feature = "cuda")]
-fn prefault_pages(data: &[u8]) {
-    // Read one byte per page (4KB) to fault each page into the page cache.
-    // The volatile read prevents the compiler from optimizing this away.
-    let page_size = 4096;
-    let mut offset = 0;
-    while offset < data.len() {
         unsafe {
-            std::ptr::read_volatile(&data[offset]);
+            driver::memcpy_htod(gpu.ptr().add(done * dst_elem), slot, n * dst_elem)?;
         }
-        offset += page_size;
-    }
-}
-
-/// Cast tensor data into a new pinned host buffer. CUDA-only.
-#[cfg(feature = "cuda")]
-fn cast_into_pinned(data: &[u8], src_dtype: DType, target: DType) -> Result<PrecastEntry> {
-    let numel = data.len() / src_dtype.size_bytes();
-    let cast_size = numel * target.size_bytes();
-
-    // Allocate pinned host memory for this tensor.
-    let alloc_size = cast_size.next_power_of_two().max(4096);
-    let pinned_ptr = unsafe { driver::mem_alloc_host(alloc_size) }
-        .map_err(|e| anyhow::anyhow!("pinned alloc for precast: {e}"))?;
-
-    // Dispatch the cast.
-    match (src_dtype, target) {
-        (DType::F32, DType::BF16) => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, numel) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = half::bf16::from_f32(*s).to_bits();
-            }
-        }
-        (DType::F32, DType::F16) => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const f32, numel) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = half::f16::from_f32(*s).to_bits();
-            }
-        }
-        (DType::F16, DType::BF16) => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
-            }
-        }
-        (DType::BF16, DType::F16) => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut u16, numel) };
-            for (s, d) in src.iter().zip(dst.iter_mut()) {
-                *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
-            }
-        }
-        (DType::BF16 | DType::F16, DType::F32) => {
-            let src = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, numel) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(pinned_ptr as *mut f32, numel) };
-            if src_dtype == DType::BF16 {
-                for (s, d) in src.iter().zip(dst.iter_mut()) {
-                    *d = half::bf16::from_bits(*s).to_f32();
-                }
-            } else {
-                for (s, d) in src.iter().zip(dst.iter_mut()) {
-                    *d = half::f16::from_bits(*s).to_f32();
-                }
-            }
-        }
-        _ => {
-            // Free and bail — shouldn't happen for float types.
-            unsafe { driver::mem_free_host(pinned_ptr).ok() };
-            bail!("unhandled cast: {src_dtype:?} → {target:?}");
-        }
+        done += n;
     }
 
     Ok(PrecastEntry {
-        pinned_ptr,
-        size_bytes: cast_size,
+        gpu,
+        size_bytes: staged_bytes,
         dtype: target,
     })
 }
 
-/// A pre-cast tensor ready for H2D DMA. Data lives in a pinned host buffer.
+/// Cast `numel` elements from `src` (dtype `src_dtype`) into `dst`
+/// as `target`. Scalar loops, matching the cast dispatch the pinned
+/// pipeline has always used; parallelism comes from the worker pool,
+/// not SIMD.
+#[cfg(feature = "cuda")]
+fn cast_slice_into(
+    dst: *mut u8,
+    src: &[u8],
+    src_dtype: DType,
+    target: DType,
+    numel: usize,
+) -> Result<()> {
+    match (src_dtype, target) {
+        (DType::F32, DType::BF16) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::bf16::from_f32(*s).to_bits();
+            }
+        }
+        (DType::F32, DType::F16) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::f16::from_f32(*s).to_bits();
+            }
+        }
+        (DType::F16, DType::BF16) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::bf16::from_f32(half::f16::from_bits(*s).to_f32()).to_bits();
+            }
+        }
+        (DType::BF16, DType::F16) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut u16, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::f16::from_f32(half::bf16::from_bits(*s).to_f32()).to_bits();
+            }
+        }
+        (DType::BF16, DType::F32) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::bf16::from_bits(*s).to_f32();
+            }
+        }
+        (DType::F16, DType::F32) => {
+            let s = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u16, numel) };
+            let d = unsafe { std::slice::from_raw_parts_mut(dst as *mut f32, numel) };
+            for (s, d) in s.iter().zip(d.iter_mut()) {
+                *d = half::f16::from_bits(*s).to_f32();
+            }
+        }
+        _ => bail!("unhandled cast: {src_dtype:?} → {target:?}"),
+    }
+    Ok(())
+}
+
+/// Last worker out logs the pipeline totals.
+#[cfg(feature = "cuda")]
+fn precast_worker_finish(state: &PrecastState, stats: &PrecastStats) {
+    // Wake any consumer blocked on an `in_progress` key we may have
+    // abandoned during shutdown.
+    state.cv.notify_all();
+    if stats.live_workers.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let secs = stats.t0.elapsed().as_secs_f64();
+        let bytes = stats.bytes.load(Ordering::Relaxed);
+        let gib = bytes as f64 / (1u64 << 30) as f64;
+        tracing::info!(
+            "Pre-stage pipeline done: {} cast + {} copied to device, \
+             {gib:.2} GiB in {secs:.2}s ({:.2} GiB/s)",
+            stats.cast.load(Ordering::Relaxed),
+            stats.staged.load(Ordering::Relaxed),
+            gib / secs.max(f64::EPSILON),
+        );
+    }
+}
+
+/// Byte-copy tensor data into a new pinned host buffer (no cast).
+/// The sequential `memcpy` doubles as the page-cache pre-fault on a
+/// cold start. CUDA-only.
+#[cfg(feature = "cuda")]
+/// Locate a dim-0 shard inside a pre-staged entry's device bytes.
+/// Returns `(src_dev_ptr, shard_shape, shard_bytes)`, or `None` when
+/// the shard isn't a contiguous range of the entry (dim != 0, scalar
+/// shape, or a non-divisible leading dim) and the caller must use
+/// the gather slow path.
+#[cfg(feature = "cuda")]
+fn shard_of_entry(
+    entry: &PrecastEntry,
+    shape: &[usize],
+    dim: usize,
+    rank: usize,
+    world_size: usize,
+) -> Option<(*const u8, Vec<usize>, usize)> {
+    if dim != 0 || shape.is_empty() || world_size == 0 || !shape[0].is_multiple_of(world_size) {
+        return None;
+    }
+    let elem = entry.dtype.size_bytes();
+    let row_elems: usize = shape[1..].iter().product();
+    let shard_size = shape[0] / world_size;
+    let shard_bytes = shard_size * row_elems * elem;
+    // Sanity: the staged bytes must cover exactly world_size shards.
+    if shard_bytes * world_size != entry.size_bytes || rank >= world_size {
+        return None;
+    }
+    let mut shard_shape = shape.to_vec();
+    shard_shape[0] = shard_size;
+    let src = unsafe { entry.gpu.ptr().add(rank * shard_bytes) as *const u8 };
+    Some((src, shard_shape, shard_bytes))
+}
+
+/// Cast tensor data into a new pinned host buffer. CUDA-only.
+/// A pre-staged tensor, already uploaded to the device by a pre-stage
+/// worker. take() transfers `gpu` into the allocator's lifetime
+/// tracker and wraps it in a `GpuTensor` — no further copy or sync
+/// needed (the worker's per-chunk H2D copies are blocking).
 /// CUDA-only.
 #[cfg(feature = "cuda")]
 struct PrecastEntry {
-    /// Pinned host buffer containing the (possibly cast) tensor data.
-    pinned_ptr: *mut u8,
+    /// Device buffer holding the (possibly cast) tensor data.
+    gpu: RawGpuMem,
     /// Size of valid data in bytes.
     size_bytes: usize,
     /// The effective dtype after casting.
     dtype: DType,
 }
 
-// Safety: pinned host memory is accessible from any thread.
+/// Mutable state for the pre-stage pipeline, behind one mutex. The
+/// lock only guards map/set bookkeeping — copies and casts run
+/// outside it.
 #[cfg(feature = "cuda")]
-unsafe impl Send for PrecastEntry {}
+#[derive(Default)]
+struct PrecastShared {
+    /// Pre-staged tensors ready for take(), keyed by data identity.
+    ready: HashMap<PrecastKey, PrecastEntry>,
+    /// Keys a worker is currently streaming. take() briefly waits on
+    /// `cv` for these instead of duplicating the upload on the
+    /// pageable slow path.
+    in_progress: std::collections::HashSet<PrecastKey>,
+    /// Keys the consumer already handled via the slow path — workers
+    /// skip these (no point staging bytes nobody will take).
+    consumed: std::collections::HashSet<PrecastKey>,
+}
 
-/// Shared state for the pre-cast pipeline. CUDA-only.
+/// Shared state for the pre-stage pipeline. CUDA-only.
 #[cfg(feature = "cuda")]
 struct PrecastState {
-    /// Pre-cast tensors ready for take(). Protected by mutex — contention is
-    /// low because the producer adds entries one at a time and the consumer
-    /// (take()) removes them.
-    ready: Mutex<HashMap<String, PrecastEntry>>,
-    /// Signal for the background thread to stop (e.g. on drop).
+    shared: Mutex<PrecastShared>,
+    /// Signaled on: entry ready, worker exit. Paired with `shared`.
+    cv: std::sync::Condvar,
+    /// Signal for the background workers to stop (e.g. on drop).
     shutdown: AtomicBool,
+}
+
+/// Aggregate counters for the pipeline-done log line. CUDA-only.
+#[cfg(feature = "cuda")]
+struct PrecastStats {
+    cast: std::sync::atomic::AtomicUsize,
+    staged: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    live_workers: std::sync::atomic::AtomicUsize,
+    t0: std::time::Instant,
 }
 
 /// Model weights loaded from CPU (mmap) to GPU with pipelined pre-casting.
@@ -507,14 +702,14 @@ pub struct GpuWeights {
     /// the slow path is rare (precast handles the hot path).
     /// Grows as needed, never shrinks.
     cast_scratch: Vec<u8>,
-    /// Pre-cast pipeline state, shared with background thread.
+    /// Pre-stage pipeline state, shared with the background workers.
     /// CUDA-only optimization (uses pinned host memory for DMA);
     /// `None` under non-CUDA backends.
     #[cfg(feature = "cuda")]
     precast: Option<Arc<PrecastState>>,
-    /// Join handle for the background precast thread (CUDA-only).
+    /// Join handles for the background pre-stage workers (CUDA-only).
     #[cfg(feature = "cuda")]
-    precast_handle: Option<std::thread::JoinHandle<()>>,
+    precast_handles: Vec<std::thread::JoinHandle<()>>,
     /// Backend allocator: device memory + H2D primitive. The
     /// concrete type is `CudaAllocator` under cuda or
     /// `MetalAllocator` under metal — see [`BackendAllocator`]
@@ -566,7 +761,7 @@ impl GpuWeights {
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
-            precast_handle: None,
+            precast_handles: Vec::new(),
             allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
@@ -708,7 +903,7 @@ impl GpuWeights {
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
-            precast_handle: None,
+            precast_handles: Vec::new(),
             allocator,
             _mmaps: Vec::new(),
             quantized: HashMap::new(),
@@ -758,7 +953,7 @@ impl GpuWeights {
                 #[cfg(feature = "cuda")]
                 precast: None,
                 #[cfg(feature = "cuda")]
-                precast_handle: None,
+                precast_handles: Vec::new(),
                 allocator,
                 _mmaps: Vec::new(),
                 quantized: HashMap::new(),
@@ -815,7 +1010,7 @@ impl GpuWeights {
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
-            precast_handle: None,
+            precast_handles: Vec::new(),
             allocator,
             _mmaps: mmaps,
             quantized: HashMap::new(),
@@ -998,23 +1193,29 @@ impl GpuWeights {
         self.target_dtype
     }
 
-    /// Start the background pre-cast pipeline.
+    /// Start the background pre-stage pipeline.
     ///
-    /// Spawns a thread that iterates through all tensors (largest first),
-    /// pre-faults their mmap pages (triggering disk I/O), and casts float
-    /// tensors into individual pinned host buffers. This runs concurrently
-    /// with model construction code calling `take()`.
+    /// Spawns [`PRECAST_WORKERS`] threads that pull tensors off a shared
+    /// list (largest first), fault their mmap pages with one sequential
+    /// read, and stream the bytes through a small per-worker pinned slot
+    /// straight into per-tensor device buffers — casting floats to
+    /// `target_dtype` when needed, byte-copying otherwise. This runs
+    /// concurrently with model construction code calling `take()`, which
+    /// hands over the already-uploaded device buffers with no further
+    /// copy.
     ///
-    /// For tensors that don't need casting (already in target dtype), the
-    /// thread still pre-faults the mmap pages so they're resident in the page
-    /// cache by the time `take()` does the H2D DMA.
+    /// Host memory overhead is fixed: [`PRECAST_WORKERS`] ×
+    /// [`STAGE_SLOT_BYTES`] of pinned staging. Device memory staged
+    /// ahead of take() is the tensors themselves — their final
+    /// destination.
     ///
-    /// Must be called after `set_target_dtype()`. Safe to call multiple times
-    /// (subsequent calls are no-ops if already running).
+    /// Must be called after `set_target_dtype()`, from a thread with a
+    /// current CUDA context (the workers inherit it explicitly). Safe to
+    /// call multiple times (subsequent calls are no-ops if already
+    /// running).
     ///
-    /// CUDA-only: pre-casts into pinned host buffers for async DMA. The
-    /// Metal path uses unified-memory `MTLBuffer`s — no DMA, no
-    /// pinning, no precast pipeline.
+    /// CUDA-only. The Metal path uses unified-memory `MTLBuffer`s — no
+    /// DMA, no staging, no precast pipeline.
     #[cfg(feature = "cuda")]
     pub fn start_precast(&mut self) {
         if self.precast.is_some() {
@@ -1023,32 +1224,63 @@ impl GpuWeights {
 
         let target_dtype = self.target_dtype;
 
-        // Collect tensor metadata for the background thread. We give it
-        // clones of the CpuTensorRef data it needs (Arc<Mmap> is cheap to clone).
-        // Sort largest first so the biggest tensors start pre-faulting early.
-        let mut work: Vec<(String, Arc<memmap2::Mmap>, usize, usize, DType)> = self
+        // The workers need a current CUDA context for `mem_alloc_host`;
+        // capture the caller's (from_path documents the requirement).
+        let ctx = match unsafe { driver::ctx_get_current() } {
+            Ok(ctx) if !ctx.is_null() => ctx as usize,
+            _ => {
+                tracing::warn!("start_precast: no current CUDA context; pre-stage disabled");
+                return;
+            }
+        };
+
+        // Collect tensor metadata for the background workers (Arc<Mmap>
+        // is cheap to clone), deduplicating aliases that share one mmap
+        // range. Sort largest first so the biggest tensors start
+        // faulting early.
+        let mut seen = std::collections::HashSet::new();
+        let mut work: Vec<PrecastWorkItem> = self
             .tensors
-            .iter()
-            .filter_map(|(name, r)| {
+            .values()
+            .filter_map(|r| {
                 let mmap = r.mmap.as_ref()?.clone();
-                Some((name.clone(), mmap, r.data_offset, r.size_bytes, r.dtype))
+                let key = precast_key(&mmap, r.data_offset, r.size_bytes);
+                seen.insert(key)
+                    .then_some((key, mmap, r.data_offset, r.size_bytes, r.dtype))
             })
             .collect();
         work.sort_by_key(|b| std::cmp::Reverse(b.3)); // Largest first.
+        let work = Arc::new(work);
 
         let state = Arc::new(PrecastState {
-            ready: Mutex::new(HashMap::new()),
+            shared: Mutex::new(PrecastShared::default()),
+            cv: std::sync::Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
         self.precast = Some(Arc::clone(&state));
 
-        let handle = std::thread::Builder::new()
-            .name("weight-precast".into())
-            .spawn(move || {
-                precast_worker(state, target_dtype, work);
-            })
-            .expect("failed to spawn precast thread");
-        self.precast_handle = Some(handle);
+        let stats = Arc::new(PrecastStats {
+            cast: std::sync::atomic::AtomicUsize::new(0),
+            staged: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            live_workers: std::sync::atomic::AtomicUsize::new(PRECAST_WORKERS),
+            t0: std::time::Instant::now(),
+        });
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for i in 0..PRECAST_WORKERS {
+            let state = Arc::clone(&state);
+            let work = Arc::clone(&work);
+            let next = Arc::clone(&next);
+            let stats = Arc::clone(&stats);
+            let handle = std::thread::Builder::new()
+                .name(format!("weight-prestage-{i}"))
+                .spawn(move || {
+                    precast_worker(state, target_dtype, work, next, ctx, stats);
+                })
+                .expect("failed to spawn pre-stage worker");
+            self.precast_handles.push(handle);
+        }
     }
 
     /// Remove a tensor by name and copy it to GPU. Returns a GPU tensor.
@@ -1073,21 +1305,16 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Fast path: check if precast pipeline has this tensor
-        // ready. Cuda-only — Metal has no precast.
+        // Fast path: the pre-stage pipeline already uploaded this
+        // tensor (blocking per-chunk H2D — no sync needed). Transfer
+        // the device buffer into the allocator's lifetime tracker and
+        // wrap it. Cuda-only — Metal has no precast.
         #[cfg(feature = "cuda")]
-        if let Some(entry) = self.take_precast(name) {
-            // The allocator's `alloc_and_copy_host` synchronizes
-            // before returning, so the entry's pinned buffer is safe
-            // to free immediately after.
-            let gpu_ptr = unsafe {
-                self.allocator
-                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
-            };
-            unsafe {
-                driver::mem_free_host(entry.pinned_ptr).ok();
-            }
-            return Ok(unsafe { GpuTensor::new(gpu_ptr, &cpu_ref.shape, entry.dtype) });
+        if let Some(entry) = self.take_precast(&cpu_ref) {
+            let ptr = entry.gpu.ptr();
+            let dtype = entry.dtype;
+            self.allocator.push_alloc(entry.gpu);
+            return Ok(unsafe { GpuTensor::new(ptr, &cpu_ref.shape, dtype) });
         }
 
         // Slow path: synchronous pre-fault + cast + DMA.
@@ -1126,14 +1353,20 @@ impl GpuWeights {
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
-        // CUDA precast path would have produced cast bytes; consume the
-        // precast slot so it's not leaked, but ignore the cast and use
-        // the on-disk view. (Metal has no precast.)
+        // Consume the pre-stage slot so it's not leaked. When the entry
+        // holds a byte-identical staged copy (no cast — entry dtype ==
+        // on-disk dtype), hand its device buffer over directly
+        // (cuMemAlloc alignment satisfies any scalar `min_align`); a
+        // cast entry's bytes are ignored — dropping it frees the
+        // staging — and the on-disk view is uploaded instead. (Metal
+        // has no precast.)
         #[cfg(feature = "cuda")]
-        if let Some(entry) = self.take_precast(name) {
-            unsafe {
-                driver::mem_free_host(entry.pinned_ptr).ok();
-            }
+        if let Some(entry) = self.take_precast(&cpu_ref)
+            && entry.dtype == cpu_ref.dtype
+        {
+            let ptr = entry.gpu.ptr();
+            self.allocator.push_alloc(entry.gpu);
+            return Ok(unsafe { GpuTensor::new(ptr, &cpu_ref.shape, cpu_ref.dtype) });
         }
         let gpu_ptr = unsafe {
             self.allocator.alloc_and_copy_host_aligned(
@@ -1182,15 +1415,11 @@ impl GpuWeights {
         );
 
         #[cfg(feature = "cuda")]
-        if let Some(entry) = self.take_precast(name) {
-            let gpu_ptr = unsafe {
-                self.allocator
-                    .alloc_and_copy_host(entry.pinned_ptr as *const u8, entry.size_bytes)?
-            };
-            unsafe {
-                driver::mem_free_host(entry.pinned_ptr).ok();
-            }
-            return Ok(unsafe { GpuTensor::new(gpu_ptr, shape, entry.dtype) });
+        if let Some(entry) = self.take_precast(&cpu_ref) {
+            let ptr = entry.gpu.ptr();
+            let dtype = entry.dtype;
+            self.allocator.push_alloc(entry.gpu);
+            return Ok(unsafe { GpuTensor::new(ptr, shape, dtype) });
         }
 
         let (data, size_bytes, dtype) = self.maybe_cast_cpu(&cpu_ref);
@@ -1214,18 +1443,15 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
-        // Fast path: use pre-cast data if available.
-        if let Some(entry) = self.take_precast(name) {
-            driver::memcpy_htod_async(
-                dst,
-                entry.pinned_ptr as *const u8,
-                entry.size_bytes,
-                stream,
-            )?;
+        // Fast path: the tensor is already device-resident — D2D it
+        // into the fused buffer. Sync before dropping the entry: the
+        // drop frees the staging source and cuMemFree is not ordered
+        // against in-flight stream work.
+        if let Some(entry) = self.take_precast(&cpu_ref) {
+            driver::memcpy_dtod_async(dst, entry.gpu.ptr(), entry.size_bytes, stream)?;
             let size = entry.size_bytes;
-            // Sync before freeing the pinned source buffer.
             driver::stream_synchronize(stream)?;
-            driver::mem_free_host(entry.pinned_ptr).ok();
+            drop(entry);
             return Ok(size);
         }
 
@@ -1298,12 +1524,32 @@ impl GpuWeights {
         self.alloc_packed_from_host(bytes, &shape, DType::F32)
     }
 
-    /// Try to take a pre-cast entry for the given tensor name. CUDA-only.
+    /// Try to take a pre-staged entry for the given tensor's bytes.
+    /// CUDA-only.
+    ///
+    /// Keyed by data identity, so aliased names resolve to the same
+    /// entry. If a worker is mid-copy on this key, waits for it (the
+    /// wait is bounded by one tensor's copy). If no worker has
+    /// started it, marks the key consumed — so no worker wastes a
+    /// pinned buffer on bytes the caller is about to upload via the
+    /// slow path — and returns `None`.
     #[cfg(feature = "cuda")]
-    fn take_precast(&self, name: &str) -> Option<PrecastEntry> {
+    fn take_precast(&self, cpu_ref: &CpuTensorRef) -> Option<PrecastEntry> {
         let state = self.precast.as_ref()?;
-        let mut ready = state.ready.lock().ok()?;
-        ready.remove(name)
+        let mmap = cpu_ref.mmap.as_ref()?;
+        let key = precast_key(mmap, cpu_ref.data_offset, cpu_ref.size_bytes);
+        let mut s = state.shared.lock().ok()?;
+        loop {
+            if let Some(entry) = s.ready.remove(&key) {
+                return Some(entry);
+            }
+            if s.in_progress.contains(&key) && !state.shutdown.load(Ordering::Relaxed) {
+                s = state.cv.wait(s).ok()?;
+                continue;
+            }
+            s.consumed.insert(key);
+            return None;
+        }
     }
 
     /// Take a tensor and return its data as a CPU `Vec<f32>`.
@@ -2607,6 +2853,39 @@ impl GpuWeights {
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
 
+        // Pre-staged fast path: a dim-0 shard is a contiguous row range
+        // of the staged (possibly cast) device-resident full tensor.
+        // world==1 hands the whole staged buffer over zero-copy; world>1
+        // D2D-copies the slice out and frees the staging. A dim-1 shard
+        // needs a strided gather on host bytes — the staged entry is
+        // unusable there and just dropped (tp>1 row-parallel only).
+        // (No dump_shard_head on this path — it reads host memory.)
+        #[cfg(feature = "cuda")]
+        if let Some(entry) = self.take_precast(&cpu_ref)
+            && let Some((src, shard_shape, shard_bytes)) =
+                shard_of_entry(&entry, &cpu_ref.shape, dim, rank, world_size)
+        {
+            let dtype = entry.dtype;
+            if shard_bytes == entry.size_bytes {
+                // world == 1: the staged buffer IS the tensor.
+                let ptr = entry.gpu.ptr();
+                self.allocator.push_alloc(entry.gpu);
+                return Ok(unsafe { GpuTensor::new(ptr, &shard_shape, dtype) });
+            }
+            let stream = self.allocator.stream();
+            let dev = unsafe {
+                let dev = driver::mem_alloc(shard_bytes)?;
+                driver::memcpy_dtod_async(dev, src, shard_bytes, stream)?;
+                // Sync before the entry drop frees the staging source.
+                driver::stream_synchronize(stream)?;
+                dev
+            };
+            self.allocator
+                .push_alloc(unsafe { RawGpuMem::new(dev, shard_bytes) });
+            drop(entry);
+            return Ok(unsafe { GpuTensor::new(dev, &shard_shape, dtype) });
+        }
+
         let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
 
         let size_bytes = shard_shape.iter().product::<usize>() * dtype.size_bytes();
@@ -2634,6 +2913,19 @@ impl GpuWeights {
             .tensors
             .remove(name)
             .ok_or_else(|| anyhow::anyhow!("weight not found: {name}"))?;
+
+        // Pre-staged fast path — same shape as `take_shard`'s; see the
+        // comment there. D2D into the fused buffer, syncing before the
+        // entry drop frees the staging source.
+        if let Some(entry) = self.take_precast(&cpu_ref)
+            && let Some((src, _shard_shape, shard_bytes)) =
+                shard_of_entry(&entry, &cpu_ref.shape, dim, rank, world_size)
+        {
+            driver::memcpy_dtod_async(dst, src, shard_bytes, stream)?;
+            driver::stream_synchronize(stream)?;
+            drop(entry);
+            return Ok(shard_bytes);
+        }
 
         let (data, shard_shape, dtype) = self.shard_cpu_data(&cpu_ref, dim, rank, world_size);
 
@@ -2886,22 +3178,25 @@ fn dump_shard_head(
 
 impl Drop for GpuWeights {
     fn drop(&mut self) {
-        // Signal precast thread to stop and wait for it (cuda only).
+        // Signal pre-stage workers to stop and wait for them (cuda only).
         #[cfg(feature = "cuda")]
         {
             if let Some(state) = &self.precast {
                 state.shutdown.store(true, Ordering::Relaxed);
+                // Wake budget-blocked workers so they observe shutdown.
+                state.cv.notify_all();
             }
-            if let Some(handle) = self.precast_handle.take() {
+            for handle in self.precast_handles.drain(..) {
                 handle.join().ok();
             }
-            // Free any unconsumed precast pinned buffers.
+            // Free any unconsumed pre-staged device buffers (tensors the
+            // checkpoint ships but the model never takes) — dropping the
+            // entries drops their `RawGpuMem`s. The dropping thread holds
+            // the load-time CUDA context.
             if let Some(state) = &self.precast
-                && let Ok(mut ready) = state.ready.lock()
+                && let Ok(mut s) = state.shared.lock()
             {
-                for (_name, entry) in ready.drain() {
-                    unsafe { driver::mem_free_host(entry.pinned_ptr).ok() };
-                }
+                s.ready.clear();
             }
         }
         // `cast_scratch: Vec<u8>` drops itself.

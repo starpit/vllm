@@ -100,6 +100,15 @@ pub unsafe fn ctx_set_current(ctx: CUcontext) -> Result<()> {
     check(sys::cuCtxSetCurrent(ctx))
 }
 
+/// Get the calling thread's current context. Spawned threads start with
+/// no current context — pass this handle in and `ctx_set_current` it
+/// before any driver call that needs one (e.g. `mem_alloc_host`).
+pub unsafe fn ctx_get_current() -> Result<CUcontext> {
+    let mut ctx: CUcontext = std::ptr::null_mut();
+    check(sys::cuCtxGetCurrent(&mut ctx))?;
+    Ok(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // Memory allocation
 // ---------------------------------------------------------------------------
@@ -151,6 +160,19 @@ pub unsafe fn memset_d8(ptr: *mut u8, value: u8, bytes: usize, stream: CUstream)
 // ---------------------------------------------------------------------------
 
 /// Async host-to-device copy on a specific stream.
+/// Synchronous (blocking) H2D copy. Unlike the `_async` variant this is
+/// not stream-ordered: it returns once the bytes are on the device, so
+/// the host source can be reused immediately — the pre-stage workers
+/// rely on that to recycle one small pinned slot per worker without
+/// events or stream synchronization.
+pub unsafe fn memcpy_htod(dst_device: *mut u8, src_host: *const u8, bytes: usize) -> Result<()> {
+    check(sys::cuMemcpyHtoD_v2(
+        dst_device as CUdeviceptr,
+        src_host as *const std::ffi::c_void,
+        bytes,
+    ))
+}
+
 pub unsafe fn memcpy_htod_async(
     dst: *mut u8,
     src: *const u8,

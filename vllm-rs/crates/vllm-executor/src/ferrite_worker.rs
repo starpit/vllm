@@ -3736,6 +3736,7 @@ impl Worker for FerriteWorker {
         let tp_world = self.config.tp_world_size.max(1);
         let tp_rank = self.config.tp_rank;
         let stream = device.compute_stream;
+        let t_parse = std::time::Instant::now();
         let mut weights = unsafe {
             let device_mut = self.device.as_mut().unwrap();
             GpuWeights::from_path(
@@ -3748,6 +3749,7 @@ impl Worker for FerriteWorker {
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("weight load failed: {e}")))?;
+        let t_parse = t_parse.elapsed();
         info!("FerriteWorker: parsed {} weight tensors", weights.len());
         let uses_ggml = weights.is_gguf();
         let device = self.device.as_ref().unwrap();
@@ -3779,9 +3781,11 @@ impl Worker for FerriteWorker {
             }
         }
 
-        // 6b. Start background pre-cast pipeline. This pre-faults mmap pages
-        // and casts float tensors into pinned buffers concurrently with model
-        // construction. Must be after set_target_dtype() and merge_lora().
+        // 6b. Start the background pre-stage pipeline. Worker threads fault
+        // mmap pages and stage/cast tensors into pinned buffers concurrently
+        // with model construction. Must be after set_target_dtype() and
+        // merge_lora().
+        let t_construct = std::time::Instant::now();
         weights.start_precast();
 
         // 7. Construct model. Ferrite-forward is the sole model-construction
@@ -3934,13 +3938,26 @@ impl Worker for FerriteWorker {
             ))
         })?;
 
+        let t_construct = t_construct.elapsed();
+
         // Sync to ensure all async H2D weight copies are complete.
+        let t_sync = std::time::Instant::now();
         unsafe { driver::stream_synchronize(device.compute_stream) }
             .map_err(|e| ExecutorError::WorkerInit(format!("weight sync: {e}")))?;
+        let t_sync = t_sync.elapsed();
 
         // Collect GPU weight allocation pointers for sleep/wake lifecycle.
         self.weight_gpu_allocs = weights.take_gpu_allocs();
+        let t_drop = std::time::Instant::now();
         drop(weights); // CPU mmaps freed, GPU memory owned by model layers
+        info!(
+            "FerriteWorker: load phases — parse {:.2}s, construct+upload {:.2}s, \
+             sync {:.3}s, teardown {:.3}s",
+            t_parse.as_secs_f64(),
+            t_construct.as_secs_f64(),
+            t_sync.as_secs_f64(),
+            t_drop.elapsed().as_secs_f64(),
+        );
 
         self.model_dtype = dtype;
         self.resolved_architecture = Some(arch);

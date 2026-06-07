@@ -1453,8 +1453,21 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // `elem-bytes-literal-2-in-rope-append`.
             let k_shape = PageTileSpec::WITNESS;
             let v_shape = PageTileSpec::WITNESS;
-            state.push(Instr::tma_expect(k_tile_page, k_shape, LoaderRole));
-            state.push(Instr::tma_expect(v_tile_page, v_shape, LoaderRole));
+            // expect_bytes arms `page_ready[*]` — same semaphore that
+            // the matching tma_load_async + PageBarrierWait{Ready}
+            // operate on. Per audit `tma-expect-bytes-arms-wrong-barrier`.
+            state.push(Instr::tma_expect(
+                k_tile_page,
+                PageBarrier::Ready,
+                k_shape,
+                LoaderRole,
+            ));
+            state.push(Instr::tma_expect(
+                v_tile_page,
+                PageBarrier::Ready,
+                v_shape,
+                LoaderRole,
+            ));
 
             state.push(Instr::LoadAsync(LoadSpec::new(
                 k_tile_page,

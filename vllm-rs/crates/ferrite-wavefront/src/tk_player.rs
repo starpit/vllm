@@ -80,12 +80,21 @@ mod tk20 {
         }
     }
 
-    /// Format a [`TileTypeSpec`] as a `kittens::st_<suffix><R, C>`
-    /// template alias at emit time. See
-    /// `third_party/thunderkittens/include/types/shared/st.cuh:313`.
+    /// Format a [`TileTypeSpec`] as a `kittens::st_<suffix><R, C, true,
+    /// SUBSTRATE_SWIZZLE_BYTES>` template alias at emit time. The
+    /// swizzle args come from the same single-source const that drives
+    /// `st_type_literal` and the substrate's `shared_alloc_decl` —
+    /// both spellings now reference the SAME TK 2.0 instantiation.
+    /// Per audit `tile-type-spec-missing-swizzle-vs-substrate-decl`:
+    /// previously this helper emitted `<R, C>` (default-swizzle alias)
+    /// while the substrate emitted `<R, C, true, 64>` — two divergent
+    /// instantiations would have produced silently-wrong stride math
+    /// inside `tma::store_async_typed<T>` against a page allocated
+    /// with the swizzle override.
     pub fn tile_type_spec(spec: &crate::tk_tape::TileTypeSpec) -> String {
+        let sw = crate::tk_tape::SUBSTRATE_SWIZZLE_BYTES;
         format!(
-            "kittens::st_{}<{}, {}>",
+            "kittens::st_{}<{}, {}, true, {sw}>",
             spec.dtype.st_alias_suffix(),
             spec.rows,
             spec.cols,
@@ -295,9 +304,16 @@ mod tk20 {
     /// `ops/group/util/tma.cuh:18`. Used by MatmulTile to arm the
     /// barrier with a known transaction byte count derived from
     /// the typed shape+dtype.
-    pub fn tma_expect_bytes(barrier_page: u8, bytes: u32) -> String {
+    pub fn tma_expect_bytes(barrier_name: &str, barrier_page: u8, bytes: u32) -> String {
+        // The barrier name (page_ready / page_done / page_consumed)
+        // comes from the same `barrier_name(kind)` mapping that
+        // wait/arrive Instrs use. Per audit finding
+        // `tma-expect-bytes-arms-wrong-barrier`: previously this
+        // helper hardcoded `page_done` while every actual TMA pair
+        // armed `page_ready` — silent corruption (mbarrier wait
+        // returned before the cp.async.bulk completed).
         format!(
-            "kittens::group<1>::tma::expect_bytes(page_done[{barrier_page}], {bytes}u);"
+            "kittens::group<1>::tma::expect_bytes({barrier_name}[{barrier_page}], {bytes}u);"
         )
     }
 
@@ -1093,12 +1109,18 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
                 tk20::store_reg_tile_subtile_to_shmem(
                     width.n(), src.0, dst.0, *subtile_cols, *subtile_idx));
         }
-        Instr::TmaExpect { barrier_page, tile, role: _ } => {
+        Instr::TmaExpect { barrier_page, kind, tile, role: _ } => {
             // Bytes derive from the typed-witness-sourced tile shape;
-            // the barrier_page and the matching LoadSpec.tile share
-            // the same numeric proof. Per cluster P fix.
+            // the kind (PageBarrier::Ready/Done/Consumed) routes
+            // through the same `barrier_name` mapping as wait/arrive
+            // Instrs, so expect/load/wait all reference the SAME
+            // semaphore. Per audit `tma-expect-bytes-arms-wrong-barrier`.
             let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
-            let _ = writeln!(out, "{}", tk20::tma_expect_bytes(barrier_page.0, bytes as u32));
+            let _ = writeln!(
+                out,
+                "{}",
+                tk20::tma_expect_bytes(barrier_name(*kind), barrier_page.0, bytes as u32)
+            );
         }
         Instr::InitRtZero { dst, width, role: _ } => {
             let _ = writeln!(out, "{}", tk20::rt_zero(width.n(), dst.0));
@@ -1423,7 +1445,7 @@ mod tests {
         assert_eq!(
             s,
             "kittens::group<1>::tma::store_async_typed<\
-             kittens::st_bf<128, 128>>(a7, page_buf[5]);\n",
+             kittens::st_bf<128, 128, true, 64>>(a7, page_buf[5]);\n",
         );
     }
 
@@ -1561,13 +1583,14 @@ mod tests {
         let spec = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
             rows: 128, cols: 128, elem_bytes: 2,
         });
+        use crate::tk_tape::PageBarrier;
         let mut tape = TkTape::default();
-        tape.push(Instr::tma_expect(PageId(5), spec, LoaderRole));
+        tape.push(Instr::tma_expect(PageId(5), PageBarrier::Ready, spec, LoaderRole));
         let mut s = String::new();
         for instr in &tape.instrs {
             emit_instr(&mut s, &tape, instr);
         }
-        assert_eq!(s, "kittens::group<1>::tma::expect_bytes(page_done[5], 32768u);\n");
+        assert_eq!(s, "kittens::group<1>::tma::expect_bytes(page_ready[5], 32768u);\n");
     }
 
     #[test]

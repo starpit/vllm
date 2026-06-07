@@ -781,6 +781,18 @@ pub enum Instr {
     /// shared typed shape, both can be rewritten consistently.
     TmaExpect {
         barrier_page: PageId,
+        /// **Which barrier this expect_bytes arms.** Must match the
+        /// [`PageBarrier`] kind that the matching `LoadAsync` /
+        /// `PageBarrierWait*` reference. Per audit finding
+        /// `tma-expect-bytes-arms-wrong-barrier`: previously the player
+        /// hardcoded `page_done[barrier_page]` while every actual TMA
+        /// pair arrived on `page_ready[barrier_page]`, leaving the
+        /// transaction-byte counter on the wrong semaphore — silent
+        /// data corruption (mbarrier wait could return before the TMA
+        /// actually completed). The `kind` field forces lockstep: the
+        /// same `barrier_name(kind)` mapping handles all of expect /
+        /// load / wait / arrive.
+        kind: PageBarrier,
         tile: TileShape,
         role: WarpRole,
     },
@@ -3353,11 +3365,13 @@ impl Instr {
     /// via the same TileShape.
     pub(crate) fn tma_expect<const ROWS: usize, const COLS: usize, T: TileDtype>(
         barrier_page: PageId,
+        kind: PageBarrier,
         shape_witness: SmemTileSpec<ROWS, COLS, T>,
         role: LoaderRole,
     ) -> Self {
         Self::TmaExpect {
             barrier_page,
+            kind,
             tile: shape_witness.shape(),
             role: role.to_warp_role(),
         }

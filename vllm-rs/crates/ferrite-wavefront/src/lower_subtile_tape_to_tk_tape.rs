@@ -834,7 +834,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // viewed onto tile pages — TK 2.0's row_sum/mul_row/etc.
             // require a `kittens::sv_*<LEN>` operand.
             use crate::tk_tape::{
-                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegVecId, SmemTileId, SmemVecId,
+                AllConsumersRole, Bf16, GroupWidth, OrthoLayout, RegVecId, SmemTileId, SmemVecId,
             };
             // Resolve each positional input to a page. Computed
             // inputs reuse their producer's page; External inputs
@@ -858,8 +858,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let var_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
             let inv_rms_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
             // Reg vec for rsqrt detour
-            let rv_var: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
-            let rv_inv: RegVecId<128, Bf16, NaiveLayout> = state.mint_reg_vec();
+            // RmsNorm reg-vecs flow through TK 2.0's unary_op (rsqrt) —
+            // pointwise per-element, layout-agnostic. Pick OrthoLayout to
+            // avoid drift if a later refactor routes these through a
+            // row-reduction or row_map (both want ortho on row-layout rt).
+            // Per `feedback_ff_subtile_compile_time_inviolable`: choose
+            // the strictest compatible layout up front.
+            let rv_var: RegVecId<128, Bf16, OrthoLayout> = state.mint_reg_vec();
+            let rv_inv: RegVecId<128, Bf16, OrthoLayout> = state.mint_reg_vec();
 
             // 1: x_sq = x * x
             state.push(Instr::sh_tile_mul(x, x, x_sq, W));
@@ -933,7 +939,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // q is in a 128×128 page (logical 128×64 with cols 0..64
             // used; rotation operates on cols 0..32 vs 32..64 halves).
             use crate::tk_tape::{
-                AllConsumersRole, Bf16, GroupWidth, NaiveLayout, RegTileId,
+                AllConsumersRole, AlignLayout, Bf16, GroupWidth, RegTileId,
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
             let q_page = state.resolve_input_page(q_in);
@@ -961,8 +967,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rt_b:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_c:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_d:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
-            let rv_cos: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
-            let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+            // RopeRotate uses `mul_col` (col_map) on row-layout rt;
+            // TK 2.0 col_map requires V::layout == row_vec_layout =
+            // align_l (rt_base.cuh:78). NaiveLayout fails the static
+            // assert at maps.cuh:287.
+            let rv_cos: RegVecId<32, Bf16, AlignLayout> = state.mint_reg_vec();
+            let rv_sin: RegVecId<32, Bf16, AlignLayout> = state.mint_reg_vec();
 
             // 1: rt_q_even = q[:, 0:32]
             state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 0, Bf16, RowLayout>(
@@ -1124,7 +1134,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // input slots).
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, ByteOffset, ByteOffsetExpr,
-                ByteStride, GroupWidth, NaiveLayout, PerPositionStep,
+                AlignLayout, ByteStride, GroupWidth, PerPositionStep,
                 RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
                 StoreSpec, TileShape, WarpRole,
             };
@@ -1149,8 +1159,9 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rt_b:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_c:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_d:      RegTileId<128, 32, Bf16, RowLayout> = state.mint_reg_tile();
-            let rv_cos: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
-            let rv_sin: RegVecId<32, Bf16, NaiveLayout> = state.mint_reg_vec();
+            // mul_col (col_map) on row-layout rt → V must be align_l.
+            let rv_cos: RegVecId<32, Bf16, AlignLayout> = state.mint_reg_vec();
+            let rv_sin: RegVecId<32, Bf16, AlignLayout> = state.mint_reg_vec();
 
             // Rotation (12 Instrs, identical algorithm to step 7)
             state.push(Instr::load_shmem_subtile_to_reg::<1, 128, 128, 32, 0, Bf16, RowLayout>(
@@ -1276,7 +1287,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AccAccumulate, AccReset, AllConsumersRole, Bf16,
                 ByteOffset, ByteOffsetExpr, FenceExternal, Fp32,
-                GroupWidth, LoaderRole, NaiveLayout, RegTileId,
+                AlignLayout, GroupWidth, LoaderRole, OrthoLayout, RegTileId,
                 RegVecId, RoleWitness, RowLayout, ScalarF32,
                 SmemTileId, SmemTileSpec, StoreSpec, TileShape,
                 WarpRole,
@@ -1312,10 +1323,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rt_o:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
             let rt_s:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
             let rt_p:   RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
-            let rv_m:     RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
-            let rv_l:     RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
-            let rv_m_old: RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
-            let rv_alpha: RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
+            // AttnDecode rv's: row_max_acc / row_sum_acc / row_map (mul_row,
+            // sub_row, div_row) all flow through TK 2.0 row_reduce / row_map
+            // on a row-layout rt — both require V::layout == col_vec_layout
+            // = ortho_l (rt_base.cuh:79, reductions.cuh:23, maps.cuh:149).
+            let rv_m:     RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_l:     RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_m_old: RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_alpha: RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
 
             // ── Init phase (3 Instrs) ────────────────────────────
             state.push(Instr::init_rt_zero(rt_o, WL, R));

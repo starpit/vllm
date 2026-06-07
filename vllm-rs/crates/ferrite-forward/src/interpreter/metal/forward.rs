@@ -91,6 +91,19 @@ pub struct ForwardInputs<'a> {
     /// it verbatim into `RuntimeBindings::vision_rope_freqs` regardless
     /// of element dtype.
     pub vision_rope_freqs: Option<&'a [u8]>,
+    /// Qwen2.5-VL windowed attention: per-image cu_seqlens for the
+    /// FULL-attention layers (i32 bytes, `cu_seqlens_kind = 1`).
+    /// `None` for non-windowed towers.
+    pub vision_cu_seqlens_full: Option<&'a [u8]>,
+    /// Qwen2.5-VL windowed attention: per-window cu_seqlens for the
+    /// window-attention layers (i32 bytes, `cu_seqlens_kind = 2`).
+    pub vision_cu_seqlens_window: Option<&'a [u8]>,
+    /// Qwen2.5-VL: merged-row window permutation (u32 bytes) read by
+    /// `Instruction::EmbeddingGather(kind = 0)`.
+    pub vision_window_index: Option<&'a [u8]>,
+    /// Qwen2.5-VL: inverse permutation (u32 bytes) read by
+    /// `Instruction::EmbeddingGather(kind = 1)`.
+    pub vision_reverse_indices: Option<&'a [u8]>,
     /// Vision patch pixel rows (`[num_tokens, vision_in_features]`,
     /// model dtype) as raw bytes. `None` for non-vision arches;
     /// required for any bucket that runs `Instruction::LoadPixels`.

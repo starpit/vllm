@@ -1856,6 +1856,23 @@ fn write_runtime_inputs(
     if let Some(b) = inputs.pos_embeds {
         write_bytes("pos_embeds", &runtime.vision_pos_embeds, b)?;
     }
+    // Qwen2.5-VL windowed-attention externs (i32/u32 bytes, verbatim).
+    if let Some(b) = inputs.vision_cu_seqlens_full {
+        write_bytes("vision_cu_seqlens_full", &runtime.vision_cu_seqlens_full, b)?;
+    }
+    if let Some(b) = inputs.vision_cu_seqlens_window {
+        write_bytes(
+            "vision_cu_seqlens_window",
+            &runtime.vision_cu_seqlens_window,
+            b,
+        )?;
+    }
+    if let Some(b) = inputs.vision_window_index {
+        write_bytes("vision_window_index", &runtime.vision_window_index, b)?;
+    }
+    if let Some(b) = inputs.vision_reverse_indices {
+        write_bytes("vision_reverse_indices", &runtime.vision_reverse_indices, b)?;
+    }
     // Multimodal splice (MM-bearing batches only). mm_embeds = the
     // projected vision output (bytes); mm_dst_rows = per-row dst (u32).
     if let Some(b) = inputs.mm_embeds {
@@ -2071,6 +2088,10 @@ mod tests {
             mm_embeds: alloc(device, 16),
             mm_dst_rows: alloc(device, 16),
             mrope_cos_sin: alloc(device, 16),
+            vision_cu_seqlens_full: alloc(device, 16),
+            vision_cu_seqlens_window: alloc(device, 16),
+            vision_window_index: alloc(device, 16),
+            vision_reverse_indices: alloc(device, 16),
         }
     }
 
@@ -2375,6 +2396,10 @@ mod tests {
             mm_embeds: alloc(d, 16),
             mm_dst_rows: alloc(d, 16),
             mrope_cos_sin: alloc(d, 16),
+            vision_cu_seqlens_full: alloc(d, 16),
+            vision_cu_seqlens_window: alloc(d, 16),
+            vision_window_index: alloc(d, 16),
+            vision_reverse_indices: alloc(d, 16),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

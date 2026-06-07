@@ -256,17 +256,30 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         // METAL: the raw f32 `freqs` angle table the `vision_rope_2d`
         // kernel reads (it derives cos/sin internally). CUDA consumes
         // the precomputed cos/sin above instead, so `freqs` is None
-        // there. NOTE: built in NATURAL token order — correct for
-        // non-windowed towers (Qwen3.5-VL); windowed arches (Qwen2.5-VL)
-        // would need the same block-grouped permute as cos/sin, but the
-        // metal varlen-attn arm only wires the non-windowed (kind 0)
-        // path today, so this is consistent.
+        // there. Windowed arches (Qwen2.5-VL) get the SAME S²-block
+        // window permute as the cuda cos/sin tables above — the rope
+        // kernel indexes angle rows by (window-permuted) token row, so
+        // natural-order angles would rotate every token by some other
+        // token's 2-D position and scramble attention.
         #[cfg(feature = "metal")]
-        let freqs_buf: Option<GpuTensor> = Some(device.alloc_gpu_tensor_from_host(
-            &[total_l, half_rot],
-            DType::F32,
-            ferrite_vision::f32_slice_as_bytes(&cfg.build_rope_freqs_f32(&grid_thw, total_l)),
-        ));
+        let freqs_buf: Option<GpuTensor> = {
+            let freqs_nat = cfg.build_rope_freqs_f32(&grid_thw, total_l);
+            let freqs_final = match window_dispatch.as_ref() {
+                Some(wd) => ferrite_vision::permute_rows_block_grouped_f32(
+                    &freqs_nat,
+                    total_l,
+                    half_rot,
+                    cfg.spatial_merge_size as usize,
+                    &wd.window_index,
+                ),
+                None => freqs_nat,
+            };
+            Some(device.alloc_gpu_tensor_from_host(
+                &[total_l, half_rot],
+                DType::F32,
+                ferrite_vision::f32_slice_as_bytes(&freqs_final),
+            ))
+        };
         #[cfg(not(feature = "metal"))]
         let freqs_buf: Option<GpuTensor> = None;
         let freqs_view = freqs_buf.as_ref().map(|t| unsafe { t.as_view() });

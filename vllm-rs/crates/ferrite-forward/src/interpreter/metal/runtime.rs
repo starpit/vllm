@@ -104,6 +104,16 @@ pub struct RuntimeBindings {
     /// place of the static `WeightBundleKind::CosSin` cache when
     /// `W::MROPE_SECTION.is_some()`. 16-byte placeholder on 1D-rope arches.
     pub mrope_cos_sin: Buffer,
+    /// i32 cu_seqlens for Qwen2.5-VL full-attention layers
+    /// (`cu_seqlens_kind = 1`). 16-byte placeholder elsewhere.
+    pub vision_cu_seqlens_full: Buffer,
+    /// i32 cu_seqlens for Qwen2.5-VL window-attention layers
+    /// (`cu_seqlens_kind = 2`).
+    pub vision_cu_seqlens_window: Buffer,
+    /// u32 merged-row window permutation (`EmbeddingGather` kind 0).
+    pub vision_window_index: Buffer,
+    /// u32 inverse permutation (`EmbeddingGather` kind 1).
+    pub vision_reverse_indices: Buffer,
 }
 
 impl RuntimeBindings {
@@ -136,6 +146,10 @@ impl RuntimeBindings {
             RuntimeBindingKind::MmEmbeds => &self.mm_embeds,
             RuntimeBindingKind::MmDstRows => &self.mm_dst_rows,
             RuntimeBindingKind::MropeCosSin => &self.mrope_cos_sin,
+            RuntimeBindingKind::VisionCuSeqlensFull => &self.vision_cu_seqlens_full,
+            RuntimeBindingKind::VisionCuSeqlensWindow => &self.vision_cu_seqlens_window,
+            RuntimeBindingKind::VisionWindowIndex => &self.vision_window_index,
+            RuntimeBindingKind::VisionReverseIndices => &self.vision_reverse_indices,
         }
     }
 }

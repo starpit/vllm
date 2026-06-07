@@ -1561,7 +1561,20 @@ impl Implementation for RmsNormRefImpl {
         // dims. The `_global` suffix is the DSL convention paired with
         // `weight_leaf_renames` (both classes share the on-disk leaf).
         let is_global_norm = is_head_norm && acc_name.contains("_global");
-        let hidden = *bounds.get("hidden_size").unwrap_or(&0) as u32;
+        // Residual-stream width. For a VISION-prelude program the
+        // standalone rmsnorm operates on `vision_embed_dim`, NOT the
+        // text decoder's `hidden_size` (qwen2.5-VL: 1280 vs 2048).
+        // Other towers (qwen2-VL / qwen3.5-VL) wrap their norms in the
+        // `(mean,sub,rmsnorm,bias_add)` LayerNorm fusion, which a
+        // different Impl lowers — so this standalone path was never
+        // vision-exercised before and silently baked the text width
+        // (kernel then reduced over the wrong element count → the norm
+        // degenerated to a passthrough, garbling the whole tower).
+        let hidden = if matches!(program.prelude, crate::classified::Prelude::Vision) {
+            *bounds.get("vision_embed_dim").unwrap_or(&0) as u32
+        } else {
+            *bounds.get("hidden_size").unwrap_or(&0) as u32
+        };
         let base_head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
         let head_dim = if is_global_norm {
             bounds
@@ -2275,6 +2288,11 @@ pub fn starter_library() -> ImplementationLibrary {
         lib.push(Box::new(PosEmbedRefImpl));
         lib.push(Box::new(LoadPixelsImpl));
         lib.push(Box::new(LoadPosEmbedsImpl));
+        // Row-permutation gather (Qwen2.5-VL window order / inverse) —
+        // the metal `EmbeddingGather` lowering arm dispatches the
+        // `embedding_gather.metal` row-gather against the
+        // `vision_window_index` / `vision_reverse_indices` externs.
+        lib.push(Box::new(EmbeddingGatherImpl));
         // Multimodal embed splice (metal) — claims the post-Embed
         // `OpKind::MmEmbedSplice` that `insert_mm_splices` injects.
         // Target-agnostic matcher; the metal `SpliceMmEmbeds` lowering
@@ -5182,10 +5200,16 @@ impl Implementation for FusedAddRmsNormImpl {
             .expect("FusedAddRmsNorm: required_weights returned empty");
         let (_base, layer) = split_base_layer(&acc.name.to_string());
         let layer = layer.unwrap_or(0) as u32;
-        // Always on the residual stream → `hidden_size`,
-        // `m_multiplier = 1`. See `RmsNormRefImpl::fan_out` for the
-        // field semantics.
-        let hidden_size = *bounds.get("hidden_size").unwrap_or(&0) as u32;
+        // Always on the residual stream → the full width,
+        // `m_multiplier = 1`. Vision-prelude towers (Qwen2.5-VL: norm2
+        // + every post-attn norm fuse into (Add, RmsNorm)) ride the
+        // `vision_embed_dim` stream, NOT the text `hidden_size` — see
+        // `RmsNormRefImpl::fan_out` for the same vision-width rule.
+        let hidden_size = if matches!(program.prelude, crate::classified::Prelude::Vision) {
+            *bounds.get("vision_embed_dim").unwrap_or(&0) as u32
+        } else {
+            *bounds.get("hidden_size").unwrap_or(&0) as u32
+        };
         Some(vec![Instruction::FusedAddRmsNorm(
             delta_idx,
             residual_idx,

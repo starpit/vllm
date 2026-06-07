@@ -351,6 +351,10 @@ impl SpecializedPipelineCache {
                     "vision_layernorm",
                     crate::embedded_metallib!("vision_layernorm"),
                 ),
+                (
+                    "embedding_gather",
+                    crate::embedded_metallib!("embedding_gather"),
+                ),
             ],
         )?;
         // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at

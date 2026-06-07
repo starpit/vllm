@@ -321,6 +321,9 @@ pub enum KernelId {
     /// function constants VA_HEAD_DIM/VA_NUM_HEADS/VA_NUM_SEGS/
     /// VA_N_TOKENS/VA_SCALE.
     VisionVarlenAttn,
+    /// Row gather by a runtime u32 index buffer (`embedding_gather.metal`)
+    /// — Qwen2.5-VL window permutation / inverse.
+    EmbeddingGather,
     /// Standalone tanh-approx GELU (Qwen3.5-VL ViT MLP / merger MLP).
     /// Maps to `gelu_tanh_{f16,bf16}` in `activation.metallib`. Bindings:
     /// `(out @ 0, in @ 1, n inline @ 2)`.
@@ -841,6 +844,18 @@ pub enum RuntimeBindingKind {
     /// forward builds + writes it per forward via `ForwardInputs`. 16-byte
     /// placeholder on 1D-rope arches (never bound).
     MropeCosSin,
+    /// i32 cu_seqlens bound by `VarlenAttention(cu_seqlens_kind = 1)`
+    /// — Qwen2.5-VL full-attention layers. Per-image boundaries.
+    VisionCuSeqlensFull,
+    /// i32 cu_seqlens bound by `VarlenAttention(cu_seqlens_kind = 2)`
+    /// — Qwen2.5-VL window-attention layers. Per-window boundaries.
+    VisionCuSeqlensWindow,
+    /// u32 merged-row permutation read by `EmbeddingGather(kind = 0)`
+    /// (natural → window-grouped order).
+    VisionWindowIndex,
+    /// u32 inverse permutation read by `EmbeddingGather(kind = 1)`
+    /// (window-grouped → natural order at the merger output).
+    VisionReverseIndices,
 }
 
 /// One ICB command: kernel + dispatch shape + bindings.

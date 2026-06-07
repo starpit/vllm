@@ -470,6 +470,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
             r.insert(&runtime.mm_embeds);
             r.insert(&runtime.mm_dst_rows);
             r.insert(&runtime.mrope_cos_sin);
+            r.insert(&runtime.vision_cu_seqlens_full);
+            r.insert(&runtime.vision_cu_seqlens_window);
+            r.insert(&runtime.vision_window_index);
+            r.insert(&runtime.vision_reverse_indices);
             r.commit();
         }
 
@@ -1957,6 +1961,10 @@ mod tests {
             mm_embeds: alloc_buffer(device, 16),
             mm_dst_rows: alloc_buffer(device, 16),
             mrope_cos_sin: alloc_buffer(device, 16),
+            vision_cu_seqlens_full: alloc_buffer(device, 16),
+            vision_cu_seqlens_window: alloc_buffer(device, 16),
+            vision_window_index: alloc_buffer(device, 16),
+            vision_reverse_indices: alloc_buffer(device, 16),
         }
     }
 

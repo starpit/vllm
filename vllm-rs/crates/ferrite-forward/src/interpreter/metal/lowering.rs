@@ -742,12 +742,16 @@ fn update_shape_state(inst: &Instruction, cur_width: &mut u32, m_divisor: &mut u
         // The merger reshape `[num_tokens / div, width]`: the
         // num_tokens-scaling axis (`dims_nt_pow != 0`) carries the row
         // divisor; the static axis (`dims_nt_pow == 0`) is the new width.
+        // The divisor is SET unconditionally (including back to 1):
+        // Qwen2.5-VL reshapes `[L/S², S²·E]` for the window gather and
+        // then BACK to `[L, E]` before the encoder blocks — a sticky
+        // divisor would shrink every downstream op's `eff_m` by S².
+        // (Qwen3.5-VL's single trailing merger reshape never exposed
+        // this.)
         I::Reshape(_, _, dims_lit, dims_nt_pow, dims_div_lit, ndim) => {
             for ax in 0..(*ndim as usize).min(dims_lit.len()) {
                 if dims_nt_pow[ax] != 0 {
-                    if dims_div_lit[ax] > 1 {
-                        *m_divisor = dims_div_lit[ax];
-                    }
+                    *m_divisor = dims_div_lit[ax].max(1);
                 } else {
                     *cur_width = dims_lit[ax];
                 }
@@ -4294,17 +4298,28 @@ fn lower_one<W: CanonicalParams>(
         // cu_seqlens entries past the real segments form empty ranges
         // that never match. q/k/v/out are `[L, H, D]` token-major.
         I::VarlenAttention(q_slot, k_slot, v_slot, out_slot, cu_seqlens_kind) => {
-            if *cu_seqlens_kind != 0 {
-                // kind 1 (full) / 2 (window) are Qwen2.5-VL windowed
-                // attention; their cu_seqlens externs aren't wired on
-                // metal yet (Qwen3.5-VL is single-segment, kind 0).
-                return Err(LoweringError::UnsupportedVariant {
-                    index,
-                    variant_type: "VarlenAttention(cu_seqlens_kind != 0) \
-                                   — metal vision attention only wires kind 0 \
-                                   (Qwen3.5-VL); window attention is unported",
-                });
-            }
+            // kind 0: single per-image segmentation in `cu_seqlens_q`
+            // (Qwen3.5-VL / LocateAnything / Qwen2-VL). kinds 1/2:
+            // Qwen2.5-VL windowed attention — the full-attention layers
+            // read per-image boundaries, the window layers per-window
+            // boundaries; both arrive as dedicated runtime externs. The
+            // kernel is identical across kinds (its segment-search walks
+            // whatever cu_seqlens it's bound to; `VA_NUM_SEGS` stays the
+            // bucket_m upper bound and zero-padded tail entries form
+            // empty ranges).
+            let cu_binding = match cu_seqlens_kind {
+                0 => RuntimeBindingKind::CuSeqlensQ,
+                1 => RuntimeBindingKind::VisionCuSeqlensFull,
+                2 => RuntimeBindingKind::VisionCuSeqlensWindow,
+                other => {
+                    return Err(LoweringError::UnsupportedVariant {
+                        index,
+                        variant_type: match other {
+                            _ => "VarlenAttention(cu_seqlens_kind > 2)",
+                        },
+                    });
+                }
+            };
             let hd = W::VISION_HEAD_DIM;
             let nh = W::VISION_NUM_HEADS;
             LoweredCommand {
@@ -4350,8 +4365,69 @@ fn lower_one<W: CanonicalParams>(
                         binding_index: 3,
                     },
                     Binding::Runtime {
-                        kind: RuntimeBindingKind::CuSeqlensQ,
+                        kind: cu_binding,
                         binding_index: 4,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── Row gather by runtime index buffer (Qwen2.5-VL) ────────
+        //
+        // `out[i, :] = src[indices[i], :]` over the CURRENT logical
+        // tile shape — the DSL reshapes to `[L/S², S²·E]` around the
+        // kind-0 gather so window permutation moves whole merge
+        // groups, and runs kind 1 on the `[L/S², d_model]` merger
+        // output. Mirrors the cuda `kernels::embedding_gather` row
+        // semantics; indices come from the `vision_window_index` /
+        // `vision_reverse_indices` runtime externs (kind 0 / 1).
+        I::EmbeddingGather(in_slot, out_slot, indices_kind) => {
+            let idx_binding = match indices_kind {
+                0 => RuntimeBindingKind::VisionWindowIndex,
+                1 => RuntimeBindingKind::VisionReverseIndices,
+                _ => {
+                    return Err(LoweringError::UnsupportedVariant {
+                        index,
+                        variant_type: "EmbeddingGather(indices_kind > 1)",
+                    });
+                }
+            };
+            let n_elems = eff_m * cur_width;
+            LoweredCommand {
+                kernel: KernelId::EmbeddingGather,
+                library: "embedding_gather",
+                function: embedding_gather_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Runtime {
+                        kind: idx_binding,
+                        binding_index: 2,
+                    },
+                    Binding::Inline {
+                        binding_index: 3,
+                        value: n_elems,
+                    },
+                    Binding::Inline {
+                        binding_index: 4,
+                        value: cur_width,
                     },
                 ],
                 gemm_dims: None,
@@ -4594,6 +4670,18 @@ fn quick_gelu_static_name(dtype: MetalDtype) -> &'static str {
         MetalDtype::Bf16 => "quick_gelu_bf16",
         MetalDtype::Int4 => {
             panic!("quick_gelu: Int4 unsupported (activations are bf16/f16)")
+        }
+    }
+}
+
+/// `embedding_gather.metal` host-name picker (row gather by a runtime
+/// u32 index buffer — Qwen2.5-VL window permutation / inverse).
+fn embedding_gather_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "embedding_gather_rows_f16",
+        MetalDtype::Bf16 => "embedding_gather_rows_bf16",
+        MetalDtype::Int4 => {
+            panic!("embedding_gather: Int4 unsupported (activations are bf16/f16)")
         }
     }
 }

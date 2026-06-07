@@ -37,7 +37,7 @@
 //!   output (`embedding_gather(_, reverse_indices)`). Cos/sin are
 //!   pre-permuted host-side by the vision wrapper before upload.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use ferrite_forward_macro::vision_forward;
 
 /// Qwen2.5-VL CPU preprocessing: same family conventions as Qwen2-VL —
@@ -62,7 +62,7 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     numbered_image_tag_marker: None,
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
 mod qwen2_5_vl {
     /// Qwen2.5-VL vision tower params — field name = the bound name the

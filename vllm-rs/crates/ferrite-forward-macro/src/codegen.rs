@@ -4630,11 +4630,22 @@ fn emit_layered_load_body(
             // `_concat_packed` path; cuda keeps the existing stream-
             // based GGUF / vision / sharded variants.
             if cfg!(feature = "metal") {
+                // Vision bodies use the per-MODEL vision layered root
+                // (Qwen2.5-VL's fused gate_up under `vision_tower.
+                // blocks`); the decoder root here would query
+                // `model.layers.<L>.<leaf>` and fail the load.
+                let root = if is_vision {
+                    vision_root_lit_opt
+                        .clone()
+                        .expect("is_vision=true requires vision_layered_root")
+                } else {
+                    dec_root_lit.clone()
+                };
                 quote! {
                     ::ferrite_forward::load_layered_linear_dense_concat_packed(
                         gw,
                         #n_lit,
-                        #dec_root_lit,
+                        #root,
                         &[ #(#suffixes),* ],
                     )?
                 }
@@ -6307,6 +6318,25 @@ fn emit_canonical_params_impl(
         0.0
     };
 
+    // Vision-only bodies (the `#[vision_forward]` crates — qwen2-vl,
+    // qwen2.5-vl, qwen3.5-vl, locateanything) carry NO text
+    // `head_dim` / `num_attention_heads` / `hidden_size` bounds, so the
+    // text-named consts above resolved to 0 (Q_SIZE = 0·0, HIDDEN_SIZE
+    // fell back to q_size = 0). That's invisible for towers that read
+    // only the `VISION_*` consts — but qwen2.5-vl's dense SwiGLU lowers
+    // to `FusedGateUpSiluMul`, whose gate/up gemm K-dim is `W::HIDDEN_SIZE`
+    // and inner width `W::INTERMEDIATE_SIZE`; a K=0 gemm zeros the whole
+    // MLP. Re-derive the residual-stream consts from the vision bounds so
+    // any `W::`-const reader on a vision Weights sees the tower's real
+    // width. Vision attention itself reads `VISION_*` and is unchanged;
+    // text crates (`num_q_heads > 0`) skip this branch entirely, so no
+    // committed text/VL-text decoder shifts.
+    let vision_embed_dim = *model.bounds.get("vision_embed_dim").unwrap_or(&0) as usize;
+    let is_vision_only = num_q_heads == 0 && vision_num_heads > 0;
+    let head_dim = if is_vision_only { vision_head_dim } else { head_dim };
+    let num_q_heads = if is_vision_only { vision_num_heads } else { num_q_heads };
+    let q_size = if is_vision_only { vision_q_size } else { q_size };
+
     let head_dim_lit = proc_macro2::Literal::u32_unsuffixed(head_dim);
     let num_q_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_q_heads);
     let num_kv_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_kv_heads);
@@ -6314,12 +6344,14 @@ fn emit_canonical_params_impl(
     let kv_size_lit = proc_macro2::Literal::usize_unsuffixed(kv_size);
     // HIDDEN_SIZE = residual stream width = config.json `hidden_size`.
     // Distinct from Q_SIZE on GQA arches with head_dim != hidden/num_heads.
+    // Vision-only bodies fall back to `vision_embed_dim` (not q_size) so
+    // the SwiGLU K-dim above is the tower width even when H·D != embed.
     let hidden_size_for_const: usize = model
         .bounds
         .get("hidden_size")
         .copied()
         .map(|v| v as usize)
-        .unwrap_or(q_size);
+        .unwrap_or(if is_vision_only { vision_embed_dim } else { q_size });
     let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
@@ -7908,6 +7940,21 @@ pub fn emit_model(
                             mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
                             mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
                             mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
+                            // Qwen2.5-VL windowed-attention externs:
+                            // i32/u32 rows bounded by the max bucket.
+                            // Tiny — sized unconditionally.
+                            vision_cu_seqlens_full: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_cu_seqlens_window: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_window_index: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_reverse_indices: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -8051,6 +8098,32 @@ pub fn emit_model(
                 ),
                 ::core::option::Option::None => ::core::option::Option::None,
             };
+            // Qwen2.5-VL windowed-attention externs (i32/u32 byte
+            // views; `None` on non-windowed towers and text bodies).
+            let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_cu_seqlens_window = ctx.vision_cu_seqlens_window.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_window_index = ctx.vision_window_index.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_reverse_indices = ctx.vision_reverse_indices.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Multimodal splice: vision embeddings (bytes) + a per-source-
             // row destination map built from `embed_patches`. Text-only
             // batches leave `embed_patches` empty → both `None` (no-op).
@@ -8100,6 +8173,10 @@ pub fn emit_model(
                 vision_rope_freqs,
                 pixels,
                 pos_embeds,
+                vision_cu_seqlens_full,
+                vision_cu_seqlens_window,
+                vision_window_index,
+                vision_reverse_indices,
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
@@ -8297,6 +8374,21 @@ pub fn emit_model(
                             mm_embeds: alloc(METAL_MM_EMBEDS_BYTES),
                             mm_dst_rows: alloc(METAL_MM_DST_ROWS_BYTES),
                             mrope_cos_sin: alloc(METAL_MROPE_COS_SIN_BYTES),
+                            // Qwen2.5-VL windowed-attention externs:
+                            // i32/u32 rows bounded by the max bucket.
+                            // Tiny — sized unconditionally.
+                            vision_cu_seqlens_full: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_cu_seqlens_window: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_window_index: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
+                            vision_reverse_indices: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -8434,6 +8526,32 @@ pub fn emit_model(
                 ),
                 ::core::option::Option::None => ::core::option::Option::None,
             };
+            // Qwen2.5-VL windowed-attention externs (i32/u32 byte
+            // views; `None` on non-windowed towers and text bodies).
+            let vision_cu_seqlens_full = ctx.vision_cu_seqlens_full.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_cu_seqlens_window = ctx.vision_cu_seqlens_window.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_window_index = ctx.vision_window_index.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
+            let vision_reverse_indices = ctx.vision_reverse_indices.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Multimodal splice: vision embeddings (bytes) + a per-source-
             // row destination map built from `embed_patches`. Text-only
             // batches leave `embed_patches` empty → both `None` (no-op).
@@ -8483,6 +8601,10 @@ pub fn emit_model(
                 vision_rope_freqs,
                 pixels,
                 pos_embeds,
+                vision_cu_seqlens_full,
+                vision_cu_seqlens_window,
+                vision_window_index,
+                vision_reverse_indices,
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,

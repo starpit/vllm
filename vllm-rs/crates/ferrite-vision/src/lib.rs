@@ -831,6 +831,37 @@ fn invert_permutation(perm: &[u32]) -> Vec<u32> {
 /// preserved. Mirrors the Qwen2.5-VL host-side cos/sin permutation
 /// pattern: reshape to `[L/S², S²·inner]`, gather by `window_index`,
 /// reshape back to `[L, inner]`.
+/// f32 sibling of [`permute_rows_block_grouped_bf16`] — same S²-block
+/// row permutation over an f32 table. Used for the metal `freqs`
+/// angle extern on windowed towers (Qwen2.5-VL): the `vision_rope_2d`
+/// kernel reads per-token angle rows, so window-permuted tokens need
+/// window-permuted rows exactly like the cuda cos/sin tables.
+pub fn permute_rows_block_grouped_f32(
+    src: &[f32],
+    total_l: usize,
+    inner: usize,
+    spatial_merge_size: usize,
+    permutation: &[u32],
+) -> Vec<f32> {
+    let s2 = spatial_merge_size * spatial_merge_size;
+    debug_assert_eq!(total_l % s2, 0, "total_l ({total_l}) must be ÷ S² ({s2})");
+    debug_assert_eq!(src.len(), total_l * inner, "src length mismatch");
+    debug_assert_eq!(
+        permutation.len(),
+        total_l / s2,
+        "permutation length mismatch"
+    );
+    let block_elems = s2 * inner;
+    let mut out = vec![0f32; src.len()];
+    for (dst_block, &src_block) in permutation.iter().enumerate() {
+        let dst_start = dst_block * block_elems;
+        let src_start = (src_block as usize) * block_elems;
+        out[dst_start..dst_start + block_elems]
+            .copy_from_slice(&src[src_start..src_start + block_elems]);
+    }
+    out
+}
+
 pub fn permute_rows_block_grouped_bf16(
     src: &[u16],
     total_l: usize,

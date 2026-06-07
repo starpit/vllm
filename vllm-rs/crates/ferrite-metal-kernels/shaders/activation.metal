@@ -367,3 +367,46 @@ kernel void fatrelu_f32(
     float x = input[gid];
     output[gid] = (x > threshold) ? x : 0.0f;
 }
+// ============================================================================
+// QuickGELU: x * sigmoid(1.702 * x) — the CLIP/Qwen2-VL block-MLP
+// activation (mlx_vlm models/qwen2_vl/vision.py nn.quick_gelu). A
+// sigmoid approximation of GELU, numerically DISTINCT from both the
+// tanh and erf flavors above — Qwen2-VL uses quick_gelu in tower
+// blocks and gelu_erf in the patch merger, so all three coexist.
+// ============================================================================
+
+kernel void quick_gelu_f16(
+    device half* output [[buffer(0)]],
+    device const half* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = float(input[gid]);
+    output[gid] = half(x / (1.0f + metal::exp(-1.702f * x)));
+}
+
+kernel void quick_gelu_bf16(
+    device bfloat* output [[buffer(0)]],
+    device const bfloat* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = float(input[gid]);
+    output[gid] = bfloat(x / (1.0f + metal::exp(-1.702f * x)));
+}
+
+kernel void quick_gelu_f32(
+    device float* output [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = input[gid];
+    output[gid] = x / (1.0f + metal::exp(-1.702f * x));
+}

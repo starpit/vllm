@@ -61,7 +61,6 @@ pub fn classify_with(ast: &ast::Ast, prelude: Prelude) -> ClassifyResult<Program
         weights: cx.weights,
         reshape_targets: cx.reshape_targets,
         prelude,
-        vision_layout: None,
         decoder_safetensors_prefix: None,
         weight_leaf_renames: Vec::new(),
     })

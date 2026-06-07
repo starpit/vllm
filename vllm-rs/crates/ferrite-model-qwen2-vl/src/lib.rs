@@ -17,7 +17,7 @@
 //! crate (`ferrite-model-qwen2-5-vl`). Both VL crates rely on
 //! `ferrite-model-qwen2` for the shared text decoder.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use ferrite_forward_macro::vision_forward;
 
 /// Per-arch CPU preprocessing declaration baked into every emitted
@@ -49,7 +49,7 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     numbered_image_tag_marker: None,
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
 mod qwen2_vl {
     /// Qwen2-VL vision tower params — field name = the bound name the

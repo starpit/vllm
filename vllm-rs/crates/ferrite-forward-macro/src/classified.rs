@@ -633,13 +633,6 @@ pub struct Program {
     /// safetensors prefix conventions (`model.layers.<L>.<x>` vs
     /// `visual.blocks.<L>.<x>`), reshape `nt` source, etc.
     pub prelude: Prelude,
-    /// On-disk safetensors layout for vision-prelude programs.
-    /// Populated by `compile_common` from the arch's representative
-    /// config (`vision_safetensors_layout` JSON field). `None` for
-    /// decoder programs and for vision configs that omit the field —
-    /// codegen falls back to
-    /// [`crate::config::VisionSafetensorsLayout::qwen_default`].
-    pub vision_layout: Option<crate::config::VisionSafetensorsLayout>,
     /// Decoder-side safetensors prefix to prepend to every text-decoder
     /// safetensors key. Populated by `compile_common` from the arch's
     /// representative config (`decoder_safetensors_prefix` JSON field).

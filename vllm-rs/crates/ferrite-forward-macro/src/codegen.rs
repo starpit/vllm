@@ -60,6 +60,7 @@ use crate::solver::WorkloadAssignments;
 fn safetensors_prefix(
     program: &Program,
     decoder_safetensors_prefix: Option<&str>,
+    vision_layout: Option<&crate::config::VisionSafetensorsLayout>,
     id: WeightId,
     index: Option<u64>,
 ) -> String {
@@ -102,10 +103,12 @@ fn safetensors_prefix(
         // (`const SAFETENSORS` on the carrier mod) — enforced at
         // config parse, so absence here is a compiler bug, not a
         // config gap.
-        let layout = program
-            .vision_layout
-            .as_ref()
-            .expect("vision safetensors layout enforced at config parse");
+        // Per-MODEL layout (`model.arch.safetensors` at the call site) —
+        // NOT a crate-global: sibling variants of one arch can drift
+        // (mlx_vlm repacks `visual.*` as `vision_tower.*`), and a
+        // models[0]-keyed layout poisons every other variant's paths.
+        let layout =
+            vision_layout.expect("vision safetensors layout enforced at config parse");
         // Subtree override: when the DSL path's first segment maps
         // to a sibling subtree on disk, the override fully replaces
         // the `<default_root>(.<layered_subpath>.{l})?` prefix and
@@ -618,6 +621,7 @@ fn plan_field_load(
             safetensors_prefix(
                 program,
                 model.arch.decoder_prefix.as_deref(),
+                model.arch.safetensors.as_ref(),
                 *id,
                 *idx,
             )
@@ -4512,6 +4516,19 @@ fn emit_layered_load_body(
         None
     };
     let decoder_zero_prefix_ref: Option<&str> = decoder_zero_prefix.as_deref();
+    // Root literal for the quantized layered loaders (affine / nvfp4),
+    // whose helpers take the root as a plain string parameter: the
+    // vision layout's `<root>.<subpath>` under vision bodies, else the
+    // decoder root. Written when only text was ever quantized — a
+    // quantized vision tower with `#dec_root_lit` queries
+    // `model.layers.<L>.<leaf>` and fails the load on the first block.
+    let quant_root_lit: TokenStream = if is_vision {
+        vision_root_lit_opt
+            .clone()
+            .expect("is_vision=true requires vision_layered_root")
+    } else {
+        dec_root_lit.clone()
+    };
     match plan {
         FieldLoad::Embedding(prefix) => {
             let suffix = layered_suffix(prefix, vision_zero_prefix_ref, decoder_zero_prefix_ref);
@@ -4684,7 +4701,7 @@ fn emit_layered_load_body(
             // qmm_t dispatchers `MetalAffineQmmImpl` emits.
             quote! {
                 ::ferrite_forward::load_layered_linear_affine_quant(
-                    gw, #n_lit, #dec_root_lit, #suffix, #gs_lit, #bits_lit,
+                    gw, #n_lit, #quant_root_lit, #suffix, #gs_lit, #bits_lit,
                 )?
             }
         }
@@ -4704,7 +4721,7 @@ fn emit_layered_load_body(
             let bits_lit = proc_macro2::Literal::u32_unsuffixed(*bits);
             quote! {
                 ::ferrite_forward::load_layered_linear_affine_dequant_concat_as_dense(
-                    gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit,
+                    gw, #n_lit, #quant_root_lit, &[ #(#suffixes),* ], #gs_lit, #bits_lit,
                 )?
             }
         }
@@ -4713,7 +4730,7 @@ fn emit_layered_load_body(
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             quote! {
                 ::ferrite_forward::load_layered_linear_nvfp4_quant(
-                    gw, #n_lit, #dec_root_lit, #suffix, #gs_lit,
+                    gw, #n_lit, #quant_root_lit, #suffix, #gs_lit,
                 )?
             }
         }
@@ -4731,7 +4748,7 @@ fn emit_layered_load_body(
             let gs_lit = proc_macro2::Literal::u32_unsuffixed(*group_size);
             quote! {
                 ::ferrite_forward::load_layered_linear_nvfp4_quant_concat(
-                    gw, #n_lit, #dec_root_lit, &[ #(#suffixes),* ], #gs_lit,
+                    gw, #n_lit, #quant_root_lit, &[ #(#suffixes),* ], #gs_lit,
                 )?
             }
         }
@@ -9503,7 +9520,6 @@ mod fingerprint_tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         }

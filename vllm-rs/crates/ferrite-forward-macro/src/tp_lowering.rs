@@ -406,7 +406,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         }
@@ -771,7 +770,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };
@@ -857,7 +855,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };
@@ -900,7 +897,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };
@@ -971,7 +967,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };
@@ -1039,7 +1034,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };
@@ -1119,7 +1113,6 @@ mod tests {
             weights,
             reshape_targets: Default::default(),
             prelude: crate::classified::Prelude::Decoder,
-            vision_layout: None,
             decoder_safetensors_prefix: None,
             weight_leaf_renames: Vec::new(),
         };

@@ -4091,6 +4091,43 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // Same dispatch shape again; QuickGELU = x·sigmoid(1.702x)
+        // (Qwen2-VL tower blocks — its merger uses `gelu_erf`, so both
+        // flavors appear in one tape).
+        I::QuickGelu(in_slot, out_slot) => {
+            let n_elems = eff_m * cur_width;
+            LoweredCommand {
+                kernel: KernelId::VisionGelu,
+                library: "activation",
+                function: quick_gelu_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: n_elems,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Vision pixels materialization (Qwen3.5-VL ViT prelude) ──
         //
         // Faithful to the cuda `Instruction::LoadPixels` eval (a D2D
@@ -4545,6 +4582,18 @@ fn gelu_erf_static_name(dtype: MetalDtype) -> &'static str {
         MetalDtype::Bf16 => "gelu_erf_bf16",
         MetalDtype::Int4 => {
             panic!("gelu_erf: Int4 unsupported (activations are bf16/f16)")
+        }
+    }
+}
+
+/// `activation.metal` `quick_gelu` host-name picker
+/// (x·sigmoid(1.702x) — Qwen2-VL tower blocks).
+fn quick_gelu_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "quick_gelu_f16",
+        MetalDtype::Bf16 => "quick_gelu_bf16",
+        MetalDtype::Int4 => {
+            panic!("quick_gelu: Int4 unsupported (activations are bf16/f16)")
         }
     }
 }

@@ -627,11 +627,10 @@ fn compile_common(
 
     // Per-arch declarations (resolved with per-checkpoint drift in
     // `config::resolve_arch_spec`) flow to codegen through the
-    // classified program. Pulled from the representative model —
-    // variants of one arch share the declaration; only sizes differ.
-    if matches!(mode.prelude, classified::Prelude::Vision) {
-        classified.vision_layout = models[0].arch.safetensors.clone();
-    }
+    // classified program — EXCEPT the vision safetensors layout,
+    // which is per-MODEL (sibling variants drift: mlx_vlm repacks
+    // rename `visual.*` to `vision_tower.*`) and is read from
+    // `model.arch.safetensors` at each codegen call site instead.
     if matches!(mode.prelude, classified::Prelude::Decoder) {
         classified.decoder_safetensors_prefix = models[0].arch.decoder_prefix.clone();
     }
@@ -796,6 +795,17 @@ fn compile_common(
             // non-trivial vector) MUST NOT share a canonical — the
             // shim would bake the canonical's rotary for both.
             parts.push(format!("r:{}", self.model.rope_scaling_hash.unwrap_or(0)));
+            // Resolved per-arch declaration (+ per-checkpoint drift):
+            // safetensors layout, decoder prefix, scale dtype, rope
+            // style, … all bake into the emitted loader / glue
+            // (`vision_tower.*` vs `visual.*` paths, `_s_bf16_`
+            // symbol arms). Two variants with identical bounds but
+            // drifted specs (qwen2-vl-2b-instruct vs the
+            // mlx_vlm-repacked qwen2-vl-2b-mlx) MUST NOT share a
+            // canonical — folding them emits conflicting
+            // `VisionArchWeights` impls (E0119) or, worse, one
+            // variant silently loading the other's paths.
+            parts.push(format!("a:{:?}", self.model.arch));
             parts.push(dedup_quant_sig(
                 self.model.quantization.as_ref().map(|qc| &qc.method),
             ));

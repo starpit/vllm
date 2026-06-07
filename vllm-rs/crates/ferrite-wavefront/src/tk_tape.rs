@@ -2668,7 +2668,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::InitRtZero {
             dst: dst.slot(),
@@ -2857,7 +2857,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileMulScalar {
             lhs: lhs.slot(),
@@ -2883,7 +2883,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileRowMaxAcc {
             src: src.slot(),
@@ -2907,7 +2907,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileRowSumAcc {
             src: src.slot(),
@@ -2932,7 +2932,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileSubRow {
             src: src.slot(),
@@ -2956,7 +2956,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileExp2 {
             src: src.slot(),
@@ -2981,7 +2981,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileDivRow {
             src: src.slot(),
@@ -3005,7 +3005,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegVecSub {
             lhs: lhs.slot(),
@@ -3028,7 +3028,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegVecExp2 {
             src: src.slot(),
@@ -3051,7 +3051,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegVecMul {
             lhs: lhs.slot(),
@@ -3080,7 +3080,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileCopyConvert {
             src: src.slot(),
@@ -3102,7 +3102,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegVecCopy {
             src: src.slot(),
@@ -3130,7 +3130,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileMulRow {
             src: src.slot(),
@@ -3237,7 +3237,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileNeg {
             src: src.slot(),
@@ -3260,7 +3260,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileExp {
             src: src.slot(),
@@ -3284,7 +3284,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileAdd {
             lhs: lhs.slot(),
@@ -3309,7 +3309,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileSub {
             lhs: lhs.slot(),
@@ -3334,7 +3334,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileDiv {
             lhs: lhs.slot(),
@@ -3363,7 +3363,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileMulCol {
             src: src.slot(),
@@ -3388,7 +3388,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegTileAddScalar {
             lhs: lhs.slot(),
@@ -3473,7 +3473,7 @@ impl Instr {
         role: AllConsumersRole,
     ) -> Self
     where
-        GroupWidth<N>: ComputeWidth,
+        GroupWidth<N>: WarpLoadWidth,
     {
         Self::RegVecUnaryRsqrt {
             src: src.slot(),

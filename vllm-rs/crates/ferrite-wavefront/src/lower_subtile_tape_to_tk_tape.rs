@@ -796,13 +796,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 1: rt_x = load(src_page)
             state.push(Instr::load_shmem_to_reg(src, rt_x, WL, R));
             // 2: rt_neg = neg(rt_x)
-            state.push(Instr::reg_tile_neg(rt_x, rt_neg, W, R));
+            state.push(Instr::reg_tile_neg(rt_x, rt_neg, WL, R));
             // 3: rt_exp = exp(rt_neg)
-            state.push(Instr::reg_tile_exp(rt_neg, rt_exp, W, R));
+            state.push(Instr::reg_tile_exp(rt_neg, rt_exp, WL, R));
             // 4: rt_denom = rt_exp + 1.0
-            state.push(Instr::reg_tile_add_scalar(rt_exp, rt_denom, ScalarF32::new(1.0), W, R));
+            state.push(Instr::reg_tile_add_scalar(rt_exp, rt_denom, ScalarF32::new(1.0), WL, R));
             // 5: rt_result = rt_x / rt_denom
-            state.push(Instr::reg_tile_div(rt_x, rt_denom, rt_result, W, R));
+            state.push(Instr::reg_tile_div(rt_x, rt_denom, rt_result, WL, R));
             // 6: store(dst_page, rt_result)
             state.push(Instr::store_reg_tile_to_shmem(rt_result, dst, WL, R));
             emit_store_and_arrive(state, &node.output, dst_page);
@@ -883,7 +883,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 5: rv_var = load(var)
             state.push(Instr::load_vec_smem_to_reg(var_vec, rv_var, WL, R));
             // 6: rv_inv = rsqrt(rv_var)
-            state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, W, R));
+            state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, WL, R));
             // 7: inv_rms = store(rv_inv)
             state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_vec, WL, R));
             // 8: x_norm = x * inv_rms (per-row broadcast)
@@ -977,17 +977,17 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // 4: rv_sin = load(sin_vec)
             state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, WL, R));
             // 5: rt_a = q_even * cos
-            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_cos, rt_a, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_cos, rt_a, WL, R));
             // 6: rt_b = q_odd * sin
-            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_sin, rt_b, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_sin, rt_b, WL, R));
             // 7: rt_c = q_even * sin
-            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_sin, rt_c, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_q_even, rv_sin, rt_c, WL, R));
             // 8: rt_d = q_odd * cos
-            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_cos, rt_d, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_q_odd, rv_cos, rt_d, WL, R));
             // 9: rt_a = rt_a - rt_b  (out_even = q_even*cos - q_odd*sin)
-            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, W, R));
+            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, WL, R));
             // 10: rt_c = rt_c + rt_d  (out_odd  = q_even*sin + q_odd*cos)
-            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
+            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, WL, R));
             // 11: dst[:, 0:32] = rt_a
             state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 0, Bf16, RowLayout>(
                 rt_a, dst_full, WL, R,
@@ -1035,13 +1035,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
 
             // Mint the fp32 accumulator
             let rt_d: RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
 
             // Step 4: zero the accumulator
-            state.push(Instr::init_rt_zero(rt_d, W16, R));
+            state.push(Instr::init_rt_zero(rt_d, WL, R));
             // Step 5: fence on D
             state.push(Instr::wgmma_fence_acc(rt_d, W4));
             // Step 6: D += A @ B
@@ -1160,12 +1161,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             ));
             state.push(Instr::load_vec_smem_to_reg(cos_vec, rv_cos, WL, R));
             state.push(Instr::load_vec_smem_to_reg(sin_vec, rv_sin, WL, R));
-            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_cos, rt_a, W, R));
-            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_sin, rt_b, W, R));
-            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_sin, rt_c, W, R));
-            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_cos, rt_d, W, R));
-            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, W, R));
-            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, W, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_cos, rt_a, WL, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_sin, rt_b, WL, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_even, rv_sin, rt_c, WL, R));
+            state.push(Instr::reg_tile_mul_col(rt_k_odd, rv_cos, rt_d, WL, R));
+            state.push(Instr::reg_tile_sub(rt_a, rt_b, rt_a, WL, R));
+            state.push(Instr::reg_tile_add(rt_c, rt_d, rt_c, WL, R));
             state.push(Instr::store_reg_tile_subtile_to_shmem::<1, 128, 128, 32, 0, Bf16, RowLayout>(
                 rt_a, dst_full, WL, R,
             ));
@@ -1288,6 +1289,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let v_cache = state.tensor_arg(layout.v_cache_tensor());
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
 
             // Tile geometry:
@@ -1316,7 +1318,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let rv_alpha: RegVecId<128, Fp32, NaiveLayout> = state.mint_reg_vec();
 
             // ── Init phase (3 Instrs) ────────────────────────────
-            state.push(Instr::init_rt_zero(rt_o, W16, R));
+            state.push(Instr::init_rt_zero(rt_o, WL, R));
             state.push(Instr::init_rv_neg_infty(rv_m, W16, R));
             state.push(Instr::init_rv_zero(rv_l, W16, R));
 
@@ -1434,17 +1436,17 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             const LOG2_E: f32 = 1.442_695_f32;
             let scaled = (*scale) * LOG2_E;
             state.push(Instr::reg_tile_mul_scalar(
-                rt_s, rt_s, ScalarF32::new(scaled), W16, R,
+                rt_s, rt_s, ScalarF32::new(scaled), WL, R,
             ));
             // m_old = m  (save before updating)
-            state.push(Instr::reg_vec_copy(rv_m, rv_m_old, W16, R));
+            state.push(Instr::reg_vec_copy(rv_m, rv_m_old, WL, R));
             // m = max(m, row_max(S)) via accumulating row_max_acc
-            state.push(Instr::reg_tile_row_max_acc(rt_s, rv_m, W16, R));
+            state.push(Instr::reg_tile_row_max_acc(rt_s, rv_m, WL, R));
             // alpha = exp2(m_old - m)
-            state.push(Instr::reg_vec_sub(rv_m_old, rv_m, rv_alpha, W16, R));
-            state.push(Instr::reg_vec_exp2(rv_alpha, rv_alpha, W16, R));
+            state.push(Instr::reg_vec_sub(rv_m_old, rv_m, rv_alpha, WL, R));
+            state.push(Instr::reg_vec_exp2(rv_alpha, rv_alpha, WL, R));
             // l *= alpha
-            state.push(Instr::reg_vec_mul(rv_l, rv_alpha, rv_l, W16, R));
+            state.push(Instr::reg_vec_mul(rv_l, rv_alpha, rv_l, WL, R));
             // o *= alpha (per-row rescale)
             //
             // RegTileMulRow: rv_alpha (length 128 == rt_o.rows) is
@@ -1452,15 +1454,15 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // the online softmax accumulator was correct only for
             // seq_len ≤ chunk_size; this Instr makes multi-chunk
             // decode numerically correct.
-            state.push(Instr::reg_tile_mul_row(rt_o, rv_alpha, rt_o, W16, R));
+            state.push(Instr::reg_tile_mul_row(rt_o, rv_alpha, rt_o, WL, R));
             // S -= m  (sub_row)
-            state.push(Instr::reg_tile_sub_row(rt_s, rv_m, rt_s, W16, R));
+            state.push(Instr::reg_tile_sub_row(rt_s, rv_m, rt_s, WL, R));
             // P = exp2(S) (in fp32)
-            state.push(Instr::reg_tile_exp2(rt_s, rt_s, W16, R));
+            state.push(Instr::reg_tile_exp2(rt_s, rt_s, WL, R));
             // l += row_sum(P)
-            state.push(Instr::reg_tile_row_sum_acc(rt_s, rv_l, W16, R));
+            state.push(Instr::reg_tile_row_sum_acc(rt_s, rv_l, WL, R));
             // Convert P to bf16 for the WGMMA
-            state.push(Instr::reg_tile_copy_convert(rt_s, rt_p, W16, R));
+            state.push(Instr::reg_tile_copy_convert(rt_s, rt_p, WL, R));
             // O += P @ V (accumulate)
             state.push(Instr::wgmma_fence_acc(rt_o, W4));
             state.push(Instr::wgmma_mma_ab_reg_smem(
@@ -1471,7 +1473,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
 
             // ── Finalise phase ───────────────────────────────────
             // O /= l (per-row divide)
-            state.push(Instr::reg_tile_div_row(rt_o, rv_l, rt_o, W16, R));
+            state.push(Instr::reg_tile_div_row(rt_o, rv_l, rt_o, WL, R));
             // Store O → dst page (fp32 → bf16 cast at TK 2.0's
             // store boundary, same workaround as MatmulTile).
             state.push(Instr::StoreRegTileToShmem {

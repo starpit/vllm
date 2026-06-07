@@ -1417,9 +1417,9 @@ mod tests {
         use crate::tk_tape::{AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout};
         let s = emit_with_rt_arena(|tape| {
             let dst: RegTileId<128, 128, Bf16, RowLayout> = tape.mint_reg_tile();
-            tape.push(Instr::init_rt_zero(dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole));
+            tape.push(Instr::init_rt_zero(dst, GroupWidth::<1>::PER_WARP, AllConsumersRole));
         });
-        assert_eq!(s, "kittens::group<16>::zero(rt_2);\n");
+        assert_eq!(s, "kittens::group<1>::zero(rt_2);\n");
     }
 
     #[test]
@@ -1527,10 +1527,10 @@ mod tests {
             let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             tape.push(Instr::reg_tile_neg(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::neg(rt_3, rt_2);\n");
+        assert_eq!(s, "kittens::group<1>::neg(rt_3, rt_2);\n");
     }
 
     #[test]
@@ -1540,10 +1540,10 @@ mod tests {
             let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             tape.push(Instr::reg_tile_exp(
-                src, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::exp(rt_3, rt_2);\n");
+        assert_eq!(s, "kittens::group<1>::exp(rt_3, rt_2);\n");
     }
 
     #[test]
@@ -1554,10 +1554,10 @@ mod tests {
             let rhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             tape.push(Instr::reg_tile_add(
-                lhs, rhs, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                lhs, rhs, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::add(rt_4, rt_2, rt_3);\n");
+        assert_eq!(s, "kittens::group<1>::add(rt_4, rt_2, rt_3);\n");
     }
 
     #[test]
@@ -1568,10 +1568,10 @@ mod tests {
             let rhs: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             tape.push(Instr::reg_tile_div(
-                lhs, rhs, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                lhs, rhs, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::div(rt_4, rt_2, rt_3);\n");
+        assert_eq!(s, "kittens::group<1>::div(rt_4, rt_2, rt_3);\n");
     }
 
     #[test]
@@ -1581,10 +1581,10 @@ mod tests {
             let src: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             tape.push(Instr::reg_tile_add_scalar(
-                src, dst, ScalarF32::new(1.0), GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, dst, ScalarF32::new(1.0), GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::add(rt_3, rt_2, kittens::bf16(1.000000f));\n");
+        assert_eq!(s, "kittens::group<1>::add(rt_3, rt_2, kittens::bf16(1.000000f));\n");
     }
 
     #[test]
@@ -1595,10 +1595,10 @@ mod tests {
             let dst: RegTileId<16, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let col_vec: RegVecId<128, Bf16, OrthoLayout> = tape.mint_reg_vec();
             tape.push(Instr::reg_tile_mul_col(
-                src, col_vec, dst, GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
+                src, col_vec, dst, GroupWidth::<1>::PER_WARP, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::mul_col(rt_3, rt_2, rv_0);\n");
+        assert_eq!(s, "kittens::group<1>::mul_col(rt_3, rt_2, rv_0);\n");
     }
 
     /// Verify the kernel preamble emits register-tile decls in

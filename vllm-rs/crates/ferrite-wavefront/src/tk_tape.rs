@@ -144,6 +144,61 @@ const _: () = assert!(
      Reduce NUM_PAGES, NUM_ACT_PAGES, or shrink PageTileSpec / ActTileSpec.",
 );
 
+// ── Mbarrier arrival counts ──────────────────────────────────────────
+//
+// Per `feedback_compile_time_or_garbage` (INVIOLABLE) +
+// `feedback_no_redundant_const_generics`: the arrival count of a
+// `kittens::semaphore` (mbarrier) is bounded at compile time —
+// mismatched count is a kernel deadlock (mbarrier never resolves),
+// so the value cannot be a free runtime u32. The sealed enum below
+// limits `BarrierInit { count }` to TK 2.0-legal values that match
+// known producer/consumer roles in the kernel.
+//
+// Variants:
+// - `One` — single-warp TMA load (`kittens::group<1>::tma::*`
+//   arrives once on Ready). The lone TMA arm-warp issues one
+//   `arrive` per loaded page.
+// - `AllConsumers` — all consumer warps arrive on Done/Consumed
+//   (count = NUM_CONSUMER_WARPS). Producer waits on this before
+//   reusing the page in the next pipeline iteration.
+//
+// Fabricating an arbitrary u32 is impossible (sealed inner field on
+// each variant via the enum's value being the const inline). Adding
+// a new arrival pattern is a one-line `enum` extension here, not a
+// silently-merged numeric literal at the BarrierInit construction
+// site.
+
+/// Sealed mbarrier arrival count. Per
+/// `feedback_compile_time_or_garbage` + audit finding
+/// `barrier-init-count-untyped-u32`. Replace what was previously
+/// `count: u32` on [`Instr::BarrierInit`] with this sealed enum so
+/// a wrong count is rustc E0277 (no impl matching `From<u32>` etc.),
+/// not a runtime mbarrier deadlock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrivalCount {
+    /// Single-warp arrival pattern: one `kittens::group<1>::arrive`
+    /// per BarrierInit cycle. Used for TMA-load Ready barriers
+    /// (the lone arm-warp arrives once when the load completes).
+    One,
+    /// Every consumer warp arrives once: count =
+    /// [`NUM_CONSUMER_WARPS`]. Used for Done/Consumed barriers
+    /// where all consumer warps must have finished reading the
+    /// page before the producer reuses it.
+    AllConsumers,
+}
+
+impl ArrivalCount {
+    /// The actual u32 arrival count, derived from the variant +
+    /// substrate constants. The player calls this at emit time;
+    /// no unconstrained u32 ever appears on the IR.
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::AllConsumers => NUM_CONSUMER_WARPS as u32,
+        }
+    }
+}
+
 // ── The tape ────────────────────────────────────────────────────────
 
 /// One persistent-CTA tape — produced by the walker, consumed by the
@@ -341,11 +396,14 @@ pub enum Instr {
     // ── Page barriers — TK 2.0 mbarrier handshake ────────────────
 
     /// `mbarrier.init` for a named page barrier. `count` is the
-    /// expected arrival count.
+    /// expected arrival count, sealed to a small set of TK 2.0-legal
+    /// values via [`ArrivalCount`]. A wrong count = kernel deadlock
+    /// (mbarrier never resolves), so the value is constrained at
+    /// compile time, not runtime.
     BarrierInit {
         page_id: PageId,
         kind: PageBarrier,
-        count: u32,
+        count: ArrivalCount,
     },
 
     /// Wait on `page_<kind>[page_id]` at compile-time parity 0. Per

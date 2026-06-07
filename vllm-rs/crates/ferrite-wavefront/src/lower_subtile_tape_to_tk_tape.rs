@@ -1401,12 +1401,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             state.push(Instr::BarrierInit {
                 page_id: k_tile_page,
                 kind: PageBarrier::Ready,
-                count: 1,
+                count: crate::tk_tape::ArrivalCount::One,
             });
             state.push(Instr::BarrierInit {
                 page_id: v_tile_page,
                 kind: PageBarrier::Ready,
-                count: 1,
+                count: crate::tk_tape::ArrivalCount::One,
             });
 
             // ── Loop body (Qkt + Sv phases) ──────────────────────

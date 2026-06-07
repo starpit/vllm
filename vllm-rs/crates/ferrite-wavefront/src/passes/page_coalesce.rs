@@ -493,7 +493,7 @@ pub fn page_coalesce_pass(tape: &mut TkTape) {
 mod tests {
     use super::*;
     use crate::tk_tape::{
-        AllConsumersRole, Bf16, GroupWidth, PageBarrier, PageId, RegTileId,
+        AllConsumersRole, ArrivalCount, Bf16, GroupWidth, PageBarrier, PageId, RegTileId,
         RoleWitness, RowLayout, SmemTileId, TkTape,
     };
 
@@ -508,7 +508,7 @@ mod tests {
         tape.instrs.push(Instr::BarrierInit {
             page_id: p0,
             kind: PageBarrier::Ready,
-            count: 1,
+            count: ArrivalCount::One,
         });
         tape.instrs.push(Instr::PageBarrierWaitStaticP0 {
             page_id: p0,
@@ -524,7 +524,7 @@ mod tests {
         tape.instrs.push(Instr::BarrierInit {
             page_id: p1,
             kind: PageBarrier::Ready,
-            count: 1,
+            count: ArrivalCount::One,
         });
         tape.instrs.push(Instr::PageBarrierWaitStaticP0 {
             page_id: p1,
@@ -564,7 +564,7 @@ mod tests {
             tape.instrs.push(Instr::BarrierInit {
                 page_id: PageId(i),
                 kind: PageBarrier::Ready,
-                count: 1,
+                count: ArrivalCount::One,
             });
             tape.instrs.push(Instr::PageBarrierArrive {
                 page_id: PageId(i),
@@ -593,7 +593,7 @@ mod tests {
             tape.instrs.push(Instr::BarrierInit {
                 page_id: p,
                 kind: PageBarrier::Ready,
-                count: 1,
+                count: ArrivalCount::One,
             });
             tape.instrs.push(Instr::PageBarrierArrive {
                 page_id: p,
@@ -626,7 +626,7 @@ mod tests {
             tape.instrs.push(Instr::BarrierInit {
                 page_id: PageId(i),
                 kind: PageBarrier::Ready,
-                count: 1,
+                count: ArrivalCount::One,
             });
         }
         // All used at the very end — every page is live across
@@ -653,7 +653,7 @@ mod tests {
         tape.instrs.push(Instr::BarrierInit {
             page_id: PageId(0),
             kind: PageBarrier::Ready,
-            count: 1,
+            count: ArrivalCount::One,
         });
         tape.instrs.push(Instr::PageBarrierArrive {
             page_id: PageId(0),
@@ -663,7 +663,7 @@ mod tests {
         tape.instrs.push(Instr::BarrierInit {
             page_id: PageId(42),
             kind: PageBarrier::Ready,
-            count: 1,
+            count: ArrivalCount::One,
         });
         tape.instrs.push(Instr::load_shmem_to_reg(
             src_high,

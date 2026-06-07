@@ -832,12 +832,22 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
         "NUM_ACT_PAGES",
         ActTileSpec::WITNESS,
     ));
-    out.push_str(&tk20::shared_semaphore_decl("page_ready", "NUM_PAGES"));
-    out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
-    out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));
-    out.push_str(&tk20::shared_semaphore_decl("page_carry", "NUM_PAGES"));
-    out.push_str(&tk20::shared_semaphore_decl("act_ready", "NUM_ACT_PAGES"));
-    out.push_str(&tk20::shared_semaphore_decl("act_done", "NUM_ACT_PAGES"));
+    // Page-barrier semaphore arrays. Driven by the [`PageBarrier`]
+    // enum so adding a variant automatically emits its array (and
+    // dropping a variant drops the emit). Closes audit finding
+    // `dead-page-carry-and-act-barrier-decls`: pre-fix, `page_carry`
+    // / `act_ready` / `act_done` were emitted statically but never
+    // touched by any Instr — two-sources-of-truth between the static
+    // decl strings and the actual `PageBarrier` variant set. The
+    // sealed `barrier_name` mapping is now the single source.
+    //
+    // Act-pool barriers will land here (driven off an `ActPageBarrier`
+    // enum) when actual Act-side barrier Instrs land — per
+    // `feedback_no_speculative_witnesses`.
+    use crate::tk_tape::PageBarrier;
+    for kind in [PageBarrier::Ready, PageBarrier::Done, PageBarrier::Consumed] {
+        out.push_str(&tk20::shared_semaphore_decl(barrier_name(kind), "NUM_PAGES"));
+    }
 
     // Per-slot shared-vec declarations. The arena is BTreeMap so
     // emit order is deterministic.
@@ -873,7 +883,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
 
     // Suppress unused warnings for non-yet-used symbols.
     out.push_str("    (void)page_buf; (void)page_ready; (void)page_done;\n");
-    out.push_str("    (void)page_consumed; (void)page_carry;\n");
+    out.push_str("    (void)page_consumed;\n");
 
     // Register-tile / register-vec decls — walk the BTreeMap arenas
     // in id-order so preamble emit is deterministic (= stable goldens).
@@ -992,7 +1002,7 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
             let _ = writeln!(out, "{}", tk20::group_tma_store_async_wait(*n));
         }
         Instr::BarrierInit { page_id, kind, count } => {
-            let _ = writeln!(out, "{}", tk20::mbarrier_init(barrier_name(*kind), page_id.0, *count));
+            let _ = writeln!(out, "{}", tk20::mbarrier_init(barrier_name(*kind), page_id.0, count.count()));
         }
         Instr::PageBarrierWaitStaticP0 { page_id, kind, role: _ } => {
             let s = tk20::mbarrier_wait_static(barrier_name(*kind), page_id.0, 0);
@@ -1206,7 +1216,7 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tk_tape::WarpRole;
+    use crate::tk_tape::{ArrivalCount, WarpRole};
 
     fn emit(instr: Instr) -> String {
         let mut out = String::new();
@@ -1325,7 +1335,7 @@ mod tests {
             emit(Instr::BarrierInit {
                 page_id: crate::tk_tape::PageId(3),
                 kind: crate::tk_tape::PageBarrier::Ready,
-                count: 16,
+                count: ArrivalCount::AllConsumers,
             }),
             "kittens::group<1>::init_semaphore(page_ready[3], 16);\n"
         );

@@ -4856,6 +4856,22 @@ pub enum TkValidationError {
     /// `LoopVarId` referenced by `Instr::ForLoop`'s body that does
     /// not match the enclosing `var`.
     LoopVarMismatch { expected: u32, got: u32, at: usize },
+    /// `TmaExpect` and the matching `LoadAsync` on the same
+    /// `barrier_page` carry DIFFERENT `tile` shapes. The TK 2.0
+    /// mbarrier transaction-byte protocol requires expect and load
+    /// to share an exact byte count; mismatch causes either deadlock
+    /// (wait never resolves) or premature wait-return (consumer reads
+    /// uninitialized smem). Per audit findings
+    /// `tma-expect-no-witness-link-to-load-spec-bytes`,
+    /// `tma-expect-bytes-arena-erasure`,
+    /// `tma-expect-loadasync-shape-not-paired`.
+    TmaExpectLoadShapeMismatch {
+        page: u8,
+        expect_tile: TileShape,
+        load_tile: TileShape,
+        expect_at: usize,
+        load_at: usize,
+    },
 }
 
 /// Validate a [`TkTape`]. Runs at the exit of `lower_subtile_tape_to_tk_tape` and
@@ -4881,6 +4897,18 @@ struct WalkState {
     /// `Wait{Ready}` on a page never armed in this prefix is a
     /// wait-without-load error.
     armed_load: std::collections::BTreeSet<u8>,
+    /// Pages with an open `TmaExpect{Ready}` whose `tile` shape must
+    /// match the next `LoadAsync` on the same `barrier_page`. Per
+    /// audit findings `tma-expect-no-witness-link-to-load-spec-bytes`,
+    /// `tma-expect-bytes-arena-erasure`, `tma-expect-loadasync-shape-not-paired`:
+    /// the two Instrs each accept their own SmemTileSpec witness;
+    /// nothing structurally requires them to be the SAME witness. A
+    /// future caller (or pass) passing different witnesses produces
+    /// a kernel that arms the mbarrier with N bytes but loads M ≠ N
+    /// — wait stalls forever or returns before the load completes.
+    /// The validator catches the mismatch at lower-time (codegen),
+    /// not runtime. Map: barrier_page → expected TileShape.
+    pending_expect_tile: std::collections::BTreeMap<u8, TileShape>,
 }
 
 impl WalkState {
@@ -4914,8 +4942,29 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
                 // intentionally NOT cleared (plan §3.2).
             }
             Instr::CommitGroupBulk { .. } | Instr::WaitGroupBulk { .. } => {}
+            Instr::TmaExpect { barrier_page, kind: PageBarrier::Ready, tile, role: _ } => {
+                // Stash the expected tile shape; the matching
+                // LoadAsync (next one with the same barrier_page) must
+                // carry the SAME tile.
+                state.pending_expect_tile.insert(barrier_page.0, *tile);
+            }
+            // TmaExpect for non-Ready kinds is benign for the pair
+            // check; producer-side Done/Consumed barriers don't gate a
+            // TMA load that drains transaction bytes.
+            Instr::TmaExpect { kind: _, .. } => {}
             Instr::LoadAsync(spec) => {
                 state.armed_load.insert(spec.dst_page.0);
+                if let Some(expect_tile) = state.pending_expect_tile.remove(&spec.barrier_page.0) {
+                    if expect_tile != spec.tile {
+                        errors.push(TkValidationError::TmaExpectLoadShapeMismatch {
+                            page: spec.barrier_page.0,
+                            expect_tile,
+                            load_tile: spec.tile,
+                            expect_at: i.saturating_sub(1), // approximate
+                            load_at: i,
+                        });
+                    }
+                }
             }
             Instr::PageBarrierArrive {
                 page_id,

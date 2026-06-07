@@ -50,10 +50,10 @@ use crate::subtile_tape::{
     ComputeInput, ComputeInputs, Instr as STInstr, LoopBound, LoopVarId as STLoopVarId, SlotId, SubtileTape,
 };
 use crate::tk_tape::{
-    ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
+    Bf16, ByteOffsetExpr, Instr, KernelArg, KernelArgName, KernelArgRef, KernelArgTy,
     KvLayoutEntry, KvLayoutId, LoadSpec, LoopVarId as TkLoopVarId, PageBarrier, PageId,
-    SoftmaxStateId as TkSoftmaxStateId, StoreSpec, TileShape, TkTape, U32Source, WarpRole,
-    validate_tk_tape,
+    PageTileSpec, SoftmaxStateId as TkSoftmaxStateId, StoreSpec, StorerRole, TileShape, TkTape,
+    U32Source, WarpRole, validate_tk_tape,
 };
 
 // ── BF16 element width ──────────────────────────────────────────────
@@ -1249,30 +1249,27 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let v_cache_arg = state.tensor_arg(layout.v_cache_tensor());
 
             // K-cache write: rotated K (dst_page) → K cache at slot[p].
-            state.push(Instr::StoreAsync(StoreSpec {
-                src_page: dst_page,
-                dst_arg: k_cache_arg,
-                byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
-                tile: TileShape {
-                    rows: 128,
-                    cols: 128,
-                    elem_bytes: 2,
-                },
-                role: WarpRole::Storer,
-            }));
+            // Use the typed `StoreSpec::new` so the tile shape is bound
+            // to the canonical `PageTileSpec::WITNESS` — single source
+            // with the substrate. Per audit findings
+            // `kvcache-storespec-bypasses-typed-constructor` and
+            // `elem-bytes-literal-2-in-rope-append`.
+            state.push(Instr::StoreAsync(StoreSpec::new::<128, 128, Bf16>(
+                dst_page,
+                k_cache_arg,
+                ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
+                PageTileSpec::WITNESS,
+                StorerRole,
+            )));
 
             // V-cache write: un-rotated V (v_page) → V cache at slot[p].
-            state.push(Instr::StoreAsync(StoreSpec {
-                src_page: v_page,
-                dst_arg: v_cache_arg,
-                byte_off: ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
-                tile: TileShape {
-                    rows: 128,
-                    cols: 128,
-                    elem_bytes: 2,
-                },
-                role: WarpRole::Storer,
-            }));
+            state.push(Instr::StoreAsync(StoreSpec::new::<128, 128, Bf16>(
+                v_page,
+                v_cache_arg,
+                ByteOffsetExpr::kv_cache_runtime_position::<K>(pos_arg, *layer),
+                PageTileSpec::WITNESS,
+                StorerRole,
+            )));
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
@@ -1449,16 +1446,13 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // (no runtime byte-count param; type system writes it).
             // Per `feedback_tk20_tma_lane_gate`, the emit uses
             // `kittens::group<1>::tma::*` (lane-0-gated).
-            let k_shape = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
-                rows: 128,
-                cols: 128,
-                elem_bytes: 2,
-            });
-            let v_shape = SmemTileSpec::<128, 128, Bf16>::from_runtime_shape(TileShape {
-                rows: 128,
-                cols: 128,
-                elem_bytes: 2,
-            });
+            // Both shapes are compile-time const (the K and V cache
+            // tiles are page-pool-shaped); use the canonical
+            // `PageTileSpec::WITNESS` rather than a runtime-shape
+            // round-trip. Closes audit
+            // `elem-bytes-literal-2-in-rope-append`.
+            let k_shape = PageTileSpec::WITNESS;
+            let v_shape = PageTileSpec::WITNESS;
             state.push(Instr::tma_expect(k_tile_page, k_shape, LoaderRole));
             state.push(Instr::tma_expect(v_tile_page, v_shape, LoaderRole));
 

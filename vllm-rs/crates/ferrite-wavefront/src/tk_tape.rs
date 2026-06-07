@@ -124,6 +124,20 @@ pub const ACT_PAGE_SIZE: u32 = ActTileSpec::byte_size();
 /// to clear that.)
 pub const HOPPER_MAX_DYN_SMEM_BYTES: u32 = 228 * 1024;
 
+/// Hopper sm_90a max warps per CTA — 1024 threads/block ÷ 32
+/// threads/warp. A NUM_WARPS bump that exceeds this would silently
+/// fail at `cudaLaunchKernel` with `cudaErrorInvalidConfiguration`.
+/// The const_assert below makes that a Rust compile error instead.
+pub const HOPPER_MAX_WARPS_PER_CTA: u8 = 32;
+
+/// Compile-time guard: NUM_WARPS must fit Hopper's per-CTA warp cap.
+/// Per audit finding `num-warps-no-hopper-bound`.
+const _: () = assert!(
+    NUM_WARPS <= HOPPER_MAX_WARPS_PER_CTA,
+    "NUM_WARPS exceeds Hopper sm_90a 32-warps-per-CTA cap. \
+     Reduce NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS.",
+);
+
 /// Total dynamic-smem claim of the substrate's pools — derived from
 /// the typed witnesses. Mirrors what the kernel's `al.allocate<>`
 /// chain consumes for `page_buf` + `act_buf`. Note: barriers are
@@ -647,13 +661,22 @@ pub enum Instr {
     // warpgroup-only (GroupWidth<4>); the typed constructors enforce.
 
     /// `kittens::group<1>::tma::expect_bytes(page_<barrier>[barrier_page],
-    /// bytes)` — `ops/group/util/tma.cuh:18`. Sets the expected
-    /// transaction byte count on a page mbarrier before issuing the
-    /// TMA load that arms it. The byte count is derived from the
-    /// shape/dtype at construction.
+    /// rows*cols*elem_bytes)` — `ops/group/util/tma.cuh:18`. Sets the
+    /// expected transaction byte count on a page mbarrier before
+    /// issuing the TMA load that arms it.
+    ///
+    /// `tile` is a sealed [`TileShape`] (fields `pub(crate)`) — the
+    /// only path to one is via the typed [`SmemTileSpec`] witness on
+    /// [`Instr::tma_expect`]. The player computes bytes at emit time
+    /// as `tile.rows * tile.cols * tile.elem_bytes`. Per audit
+    /// finding `tma-expect-bytes-arena-erasure`: previously `bytes:
+    /// u32` discarded the typed witness; a future pass mutating
+    /// LoadSpec.tile (without matching TmaExpect.bytes) silently
+    /// desynchronized the mbarrier transaction-byte arming. With the
+    /// shared typed shape, both can be rewritten consistently.
     TmaExpect {
         barrier_page: PageId,
-        bytes: u32,
+        tile: TileShape,
         role: WarpRole,
     },
 
@@ -685,8 +708,8 @@ pub enum Instr {
         a_page: PageId,
         b_page: PageId,
         d: RegTileSlot,
-        fence: u8,
-        accumulate: u8,
+        fence: FenceTag,
+        accumulate: AccTag,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -729,8 +752,8 @@ pub enum Instr {
         a_page: PageId,
         b_page: PageId,
         d: RegTileSlot,
-        fence: u8,
-        accumulate: u8,
+        fence: FenceTag,
+        accumulate: AccTag,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -743,8 +766,8 @@ pub enum Instr {
         a: RegTileSlot,
         b_page: PageId,
         d: RegTileSlot,
-        fence: u8,
-        accumulate: u8,
+        fence: FenceTag,
+        accumulate: AccTag,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -757,8 +780,8 @@ pub enum Instr {
         a: RegTileSlot,
         b_page: PageId,
         d: RegTileSlot,
-        fence: u8,
-        accumulate: u8,
+        fence: FenceTag,
+        accumulate: AccTag,
         width: GroupWidthTag,
         role: WarpRole,
     },
@@ -1142,9 +1165,13 @@ pub struct StorerRole;
 impl role_sealed::Sealed for StorerRole {}
 
 /// `ConsumerRole(u8)` — one of the consumer warps; the inner u8 is
-/// the consumer index inside the consumer set (0..NUM_CONSUMER_WARPS).
+/// the consumer index inside the consumer set
+/// (`0..NUM_CONSUMER_WARPS`). Inner field is `pub(crate)` (sealed)
+/// — external code cannot fabricate a `ConsumerRole(99)` that would
+/// emit a never-fires `if (warpid() == 99)` consumer dispatch. Per
+/// audit finding `consumer-role-pub-u8-no-bound`.
 #[derive(Debug, Clone, Copy)]
-pub struct ConsumerRole(pub u8);
+pub struct ConsumerRole(pub(crate) u8);
 impl role_sealed::Sealed for ConsumerRole {}
 
 /// `AllConsumersRole` — the full NUM_CONSUMER_WARPS-wide consumer
@@ -1273,6 +1300,100 @@ impl FencePolicy for FenceInternal {
     const KIND: u32 = 1;
 }
 
+// ── Sealed Instr-side tags for FencePolicy / AccPolicy ───────────────
+//
+// Per audit finding `fence-accumulate-u8-on-wgmma-instr`: the four
+// WGMMA Instrs previously stored `fence: FenceTag, accumulate: u8`. The
+// constructors take typed `FencePolicy` / `AccPolicy` witnesses and
+// erase to `F::KIND as u8` — once on the Instr, anyone could set
+// `fence: 7` and the player would emit `mma_AB<..., 7, 7>(...)`.
+// TK 2.0's WGMMA templates declare these as `bool`, so 7 collapses
+// to 1, and the wrong fence skips `mma_fence_acc` → register-tile
+// not visible to subsequent mma → silent wrong matmul.
+//
+// Sealed enums replace the raw u8: only the typed witness's `tag()`
+// can mint one, the Instr stores the tag, and the player matches on
+// it. No free u8 path.
+
+/// Sealed tag form of [`FencePolicy`] — the only construction is
+/// [`FencePolicy::tag()`]. The Instr stores this in place of `u8`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceTag {
+    External,
+    Internal,
+}
+
+impl FenceTag {
+    /// Recover the kittens-template `bool`-equivalent at emit time.
+    /// 0 = External (separate WgmmaFenceAcc Instr precedes this mma);
+    /// 1 = Internal (mma template emits its own fence).
+    pub const fn kind(self) -> u32 {
+        match self {
+            Self::External => 0,
+            Self::Internal => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for FenceTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind())
+    }
+}
+
+/// Add a `tag()` method to every concrete `FencePolicy` impl. The
+/// trait-level method routes through the typed witness so a future
+/// `FencePolicy` impl MUST provide a tag.
+pub trait FencePolicyTag: FencePolicy {
+    fn tag(self) -> FenceTag;
+}
+impl FencePolicyTag for FenceExternal {
+    fn tag(self) -> FenceTag {
+        FenceTag::External
+    }
+}
+impl FencePolicyTag for FenceInternal {
+    fn tag(self) -> FenceTag {
+        FenceTag::Internal
+    }
+}
+
+/// Sealed tag form of [`AccPolicy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccTag {
+    Reset,
+    Accumulate,
+}
+
+impl AccTag {
+    pub const fn kind(self) -> u32 {
+        match self {
+            Self::Reset => 0,
+            Self::Accumulate => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for AccTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.kind())
+    }
+}
+
+pub trait AccPolicyTag: AccPolicy {
+    fn tag(self) -> AccTag;
+}
+impl AccPolicyTag for AccReset {
+    fn tag(self) -> AccTag {
+        AccTag::Reset
+    }
+}
+impl AccPolicyTag for AccAccumulate {
+    fn tag(self) -> AccTag {
+        AccTag::Accumulate
+    }
+}
+
 // ── Sealed const-generic `GroupWidth<N>` + `ComputeWidth` marker ────
 //
 // Per `feedback_ff_subtile_compile_time_inviolable`: every numeric
@@ -1302,6 +1423,31 @@ impl group_width_sealed::Sealed for GroupWidth<1> {}
 impl group_width_sealed::Sealed for GroupWidth<4> {}
 impl group_width_sealed::Sealed for GroupWidth<16> {}
 impl group_width_sealed::Sealed for GroupWidth<20> {}
+
+// Compile-time guard: the `<16>` and `<20>` GroupWidth seals above
+// MUST equal `NUM_CONSUMER_WARPS` and `NUM_WARPS` respectively.
+// Without these asserts, a future bump of NUM_CONSUMER_WARPS (say
+// to 12) would leave `GroupWidth<16>::ALL_CONSUMERS` emitting
+// `kittens::group<16>::*` while `ArrivalCount::AllConsumers` correctly
+// emits `init_semaphore(..., 12)` — kernel deadlock as the mbarrier
+// expects 12 arrivals but only 16-warp-collective compute Instrs run.
+// Per audit finding `groupwidth-numeric-literals-vs-num-consumer-warps`.
+//
+// Note: stable Rust does not yet allow `GroupWidth<{NUM_CONSUMER_WARPS
+// as usize}>` directly (`feature(generic_const_exprs)` would). The
+// const_assert below makes the literals load-bearing: changing
+// NUM_CONSUMER_WARPS WITHOUT updating the seal here is a Rust compile
+// error.
+const _: () = assert!(
+    NUM_CONSUMER_WARPS as usize == 16,
+    "NUM_CONSUMER_WARPS drift: GroupWidth<16>::ALL_CONSUMERS hardcodes 16; \
+     update both together (or migrate to GroupWidth of NUM_CONSUMER_WARPS \
+     when generic_const_exprs lands).",
+);
+const _: () = assert!(
+    NUM_WARPS as usize == 20,
+    "NUM_WARPS drift: GroupWidth<20>::ALL hardcodes 20; update both together.",
+);
 
 impl GroupWidth<1> {
     /// Per-warp scope: `kittens::group<1>::*`. Used by Loader / Storer
@@ -2543,20 +2689,28 @@ impl ScalarF32 {
 /// of struct-literal construction inside the crate (`pub(crate)`
 /// would block both at once). The compile-time gate on `tile`
 /// shape/dtype lives at [`LoadSpec::new`].
+/// Spec for `Instr::LoadAsync`. **All fields are `pub(crate)` —
+/// constructable ONLY through [`LoadSpec::new`] (typed) or
+/// [`LoadSpec::new_runtime_shape`] (runtime-boundary). Per audit
+/// finding `iter2-2-loadspec-storespec-pub-fields-allow-bypass`:
+/// previously `pub` fields let in-crate callers struct-literal a
+/// LoadSpec with arbitrary `tile: TileShape { rows, cols, elem_bytes
+/// }`, bypassing the typed witness gate and producing TMA loads
+/// whose byte counts could drift from PageTileSpec at runtime.
 #[derive(Debug, Clone)]
 pub struct LoadSpec {
-    pub dst_page: PageId,
+    pub(crate) dst_page: PageId,
     /// Index into [`TkTape::kernel_args`] of the source tensor's
     /// CTensorMap arg. The player resolves to `aN` where N is this
     /// index (the kernel signature's `auto aN = ...` aliases). The
     /// SubtileIR `TensorId` lives on the [`KernelArgTy::BufPtr`]
     /// payload of the referenced kernel arg.
-    pub src_arg: KernelArgRef,
-    pub byte_off: ByteOffsetExpr,
-    pub tile: TileShape,
-    pub role: WarpRole,
+    pub(crate) src_arg: KernelArgRef,
+    pub(crate) byte_off: ByteOffsetExpr,
+    pub(crate) tile: TileShape,
+    pub(crate) role: WarpRole,
     /// Which page barrier `expect_bytes` arms.
-    pub barrier_page: PageId,
+    pub(crate) barrier_page: PageId,
 }
 
 impl LoadSpec {
@@ -2611,15 +2765,19 @@ impl LoadSpec {
     }
 }
 
+/// Spec for `Instr::StoreAsync`. **All fields are `pub(crate)` —
+/// constructable ONLY through [`StoreSpec::new`] (typed) or
+/// [`StoreSpec::new_runtime_shape`] (runtime-boundary). Same
+/// rationale as [`LoadSpec`].
 #[derive(Debug, Clone)]
 pub struct StoreSpec {
-    pub src_page: PageId,
+    pub(crate) src_page: PageId,
     /// Index into [`TkTape::kernel_args`] of the destination tensor's
     /// CTensorMap arg. See [`LoadSpec::src_arg`].
-    pub dst_arg: KernelArgRef,
-    pub byte_off: ByteOffsetExpr,
-    pub tile: TileShape,
-    pub role: WarpRole,
+    pub(crate) dst_arg: KernelArgRef,
+    pub(crate) byte_off: ByteOffsetExpr,
+    pub(crate) tile: TileShape,
+    pub(crate) role: WarpRole,
 }
 
 impl StoreSpec {
@@ -3083,16 +3241,19 @@ impl Instr {
     // ── MatmulTile / WGMMA constructors (step 9) ─────────────────
 
     /// Construct [`Instr::TmaExpect`] from a typed shape+dtype
-    /// witness so byte-count derives from `ROWS * COLS * T::ELEM_BYTES`
-    /// — caller cannot pass a mismatched runtime byte count.
+    /// witness. The witness's [`SmemTileSpec::shape`] is recorded on
+    /// the Instr (sealed-fields TileShape), so the mbarrier expect
+    /// bytes derive from the same numeric proof as the matching
+    /// LoadSpec's `tile` — a future pass rewriting one rewrites both
+    /// via the same TileShape.
     pub(crate) fn tma_expect<const ROWS: usize, const COLS: usize, T: TileDtype>(
         barrier_page: PageId,
-        _shape_witness: SmemTileSpec<ROWS, COLS, T>,
+        shape_witness: SmemTileSpec<ROWS, COLS, T>,
         role: LoaderRole,
     ) -> Self {
         Self::TmaExpect {
             barrier_page,
-            bytes: (ROWS * COLS) as u32 * T::ELEM_BYTES,
+            tile: shape_witness.shape(),
             role: role.to_warp_role(),
         }
     }
@@ -3180,8 +3341,8 @@ impl Instr {
         T_AB: TileDtype,
         T_D: TileDtype,
         L: RegTileLayout,
-        F: FencePolicy,
-        AC: AccPolicy,
+        F: FencePolicyTag,
+        AC: AccPolicyTag,
     >(
         d: RegTileId<M, N, T_D, L>,
         a: SmemTileId<M, K, T_AB>,
@@ -3204,8 +3365,8 @@ impl Instr {
             a_page: a.page(),
             b_page: b.page(),
             d: d.slot(),
-            fence: F::KIND as u8,
-            accumulate: AC::KIND as u8,
+            fence: _fence.tag(),
+            accumulate: _accumulate.tag(),
             width: GroupWidth::<4>::WARPGROUP.tag(),
             role: WarpRole::AllConsumers,
         }
@@ -3223,8 +3384,8 @@ impl Instr {
         T_AB: TileDtype,
         T_D: TileDtype,
         L: RegTileLayout,
-        F: FencePolicy,
-        AC: AccPolicy,
+        F: FencePolicyTag,
+        AC: AccPolicyTag,
     >(
         d: RegTileId<M_PER_WARP, N, T_D, L>,
         a: RegTileId<M_PER_WARP, K, T_AB, L>,
@@ -3247,8 +3408,8 @@ impl Instr {
             a: a.slot(),
             b_page: b.page(),
             d: d.slot(),
-            fence: F::KIND as u8,
-            accumulate: AC::KIND as u8,
+            fence: _fence.tag(),
+            accumulate: _accumulate.tag(),
             width: GroupWidth::<4>::WARPGROUP.tag(),
             role: WarpRole::AllConsumers,
         }
@@ -3315,8 +3476,8 @@ impl Instr {
         T_AB: TileDtype,
         T_D: TileDtype,
         L: RegTileLayout,
-        F: FencePolicy,
-        AC: AccPolicy,
+        F: FencePolicyTag,
+        AC: AccPolicyTag,
     >(
         d: RegTileId<M, N, T_D, L>,
         a: SmemTileId<M, K, T_AB>,
@@ -3339,8 +3500,8 @@ impl Instr {
             a_page: a.page(),
             b_page: b.page(),
             d: d.slot(),
-            fence: F::KIND as u8,
-            accumulate: AC::KIND as u8,
+            fence: _fence.tag(),
+            accumulate: _accumulate.tag(),
             width: GroupWidth::<4>::WARPGROUP.tag(),
             role: WarpRole::AllConsumers,
         }
@@ -3356,8 +3517,8 @@ impl Instr {
         T_D: TileDtype,
         L_A: RegTileLayout,
         L_D: RegTileLayout,
-        F: FencePolicy,
-        AC: AccPolicy,
+        F: FencePolicyTag,
+        AC: AccPolicyTag,
     >(
         d: RegTileId<M, N, T_D, L_D>,
         a: RegTileId<M, K, T_AB, L_A>,
@@ -3380,8 +3541,8 @@ impl Instr {
             a: a.slot(),
             b_page: b.page(),
             d: d.slot(),
-            fence: F::KIND as u8,
-            accumulate: AC::KIND as u8,
+            fence: _fence.tag(),
+            accumulate: _accumulate.tag(),
             width: GroupWidth::<4>::WARPGROUP.tag(),
             role: WarpRole::AllConsumers,
         }

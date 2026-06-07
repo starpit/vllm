@@ -323,8 +323,8 @@ mod tk20 {
         d_slot: u16,
         a_page: u8,
         b_page: u8,
-        fence: u8,
-        accumulate: u8,
+        fence: crate::tk_tape::FenceTag,
+        accumulate: crate::tk_tape::AccTag,
     ) -> String {
         format!(
             "kittens::group<4>::mma_AB<decltype(rt_{d_slot}), \
@@ -352,8 +352,8 @@ mod tk20 {
         d_slot: u16,
         a_page: u8,
         b_page: u8,
-        fence: u8,
-        accumulate: u8,
+        fence: crate::tk_tape::FenceTag,
+        accumulate: crate::tk_tape::AccTag,
     ) -> String {
         format!(
             "kittens::group<4>::mma_ABt<decltype(rt_{d_slot}), \
@@ -366,8 +366,8 @@ mod tk20 {
         d_slot: u16,
         a_slot: u16,
         b_page: u8,
-        fence: u8,
-        accumulate: u8,
+        fence: crate::tk_tape::FenceTag,
+        accumulate: crate::tk_tape::AccTag,
     ) -> String {
         format!(
             "kittens::group<4>::mma_AB<decltype(rt_{d_slot}), \
@@ -382,8 +382,8 @@ mod tk20 {
         d_slot: u16,
         a_slot: u16,
         b_page: u8,
-        fence: u8,
-        accumulate: u8,
+        fence: crate::tk_tape::FenceTag,
+        accumulate: crate::tk_tape::AccTag,
     ) -> String {
         format!(
             "kittens::group<4>::mma_ABt<decltype(rt_{d_slot}), \
@@ -753,16 +753,24 @@ pub(crate) fn kernel_arg_name(n: &crate::tk_tape::KernelArgName) -> String {
 
 pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     use crate::tk_tape::{
-        ACT_PAGE_SIZE, KernelArgName, KernelArgTy, NUM_ACT_PAGES, NUM_CONSUMER_WARPS,
-        NUM_PAGES, NUM_WARPS, PAGE_SIZE, PreludeDecl,
+        KernelArgName, KernelArgTy, NUM_ACT_PAGES, NUM_CONSUMER_WARPS,
+        NUM_PAGES, NUM_WARPS, PreludeDecl, SUBSTRATE_DYN_SMEM_BYTES,
     };
 
     let total_threads = (NUM_WARPS as u32) * 32;
-    // DYN_SMEM = page_buf + act_buf budgets. Both pools share the
-    // same dynamic-smem allocation; the host wrapper will set
-    // `cudaFuncAttributeMaxDynamicSharedMemorySize` to this sum.
-    let dyn_smem: u64 = (NUM_PAGES as u64) * (PAGE_SIZE as u64)
-        + (NUM_ACT_PAGES as u64) * (ACT_PAGE_SIZE as u64);
+    // DYN_SMEM = the canonical substrate const, NOT a re-derivation.
+    // Per audit finding `dyn-smem-recomputed-in-player`: previously
+    // the player computed `NUM_PAGES * PAGE_SIZE + NUM_ACT_PAGES *
+    // ACT_PAGE_SIZE` locally, which is the SAME formula as
+    // `tk_tape::SUBSTRATE_DYN_SMEM_BYTES`. Two sources of truth — a
+    // future change adding a third pool / counting static smem on
+    // the substrate side would silently fail to propagate to the
+    // host-wrapper's `cudaFuncSetAttribute` arg, and the kernel
+    // would launch with a too-small budget. The const_assert in
+    // tk_tape.rs (`SUBSTRATE_DYN_SMEM_BYTES <=
+    // HOPPER_MAX_DYN_SMEM_BYTES`) and the launch-time
+    // `cudaFuncSetAttribute` size now share ONE source.
+    let dyn_smem: u64 = SUBSTRATE_DYN_SMEM_BYTES as u64;
 
     let mut out = String::new();
     out.push_str("// emitted by tk_player\n");
@@ -1078,8 +1086,12 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
                 tk20::store_reg_tile_subtile_to_shmem(
                     width.n(), src.0, dst.0, *subtile_cols, *subtile_idx));
         }
-        Instr::TmaExpect { barrier_page, bytes, role: _ } => {
-            let _ = writeln!(out, "{}", tk20::tma_expect_bytes(barrier_page.0, *bytes));
+        Instr::TmaExpect { barrier_page, tile, role: _ } => {
+            // Bytes derive from the typed-witness-sourced tile shape;
+            // the barrier_page and the matching LoadSpec.tile share
+            // the same numeric proof. Per cluster P fix.
+            let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
+            let _ = writeln!(out, "{}", tk20::tma_expect_bytes(barrier_page.0, bytes as u32));
         }
         Instr::InitRtZero { dst, width, role: _ } => {
             let _ = writeln!(out, "{}", tk20::rt_zero(width.n(), dst.0));

@@ -158,6 +158,11 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// External load would burn a fresh PageId, overflowing u8 across
     /// a Llama-1B tape (hundreds of External weights × chunks).
     ephemeral_pages: Vec<PageId>,
+    /// Activation-pool page allocator. Distinct namespace from
+    /// `next_page` / `free_pages`. Sized to NUM_ACT_PAGES at the
+    /// substrate.
+    next_act_page: u8,
+    free_act_pages: Vec<crate::tk_tape::ActPageId>,
 }
 
 impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
@@ -186,6 +191,8 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             smem_vec_arena: BTreeMap::new(),
             next_smem_vec_slot: 0,
             ephemeral_pages: Vec::new(),
+            next_act_page: 0,
+            free_act_pages: Vec::new(),
         }
     }
 
@@ -314,6 +321,23 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             let p = PageId(self.next_page);
             self.next_page = self.next_page.checked_add(1).expect(
                 "PageId overflow (>=256 concurrent live slots) on temp alloc",
+            );
+            p
+        }
+    }
+
+    /// Allocate a 64×128 activation page from the act_buf pool.
+    /// Distinct namespace from `alloc_temp_page` — the page indexes
+    /// into `act_buf[NUM_ACT_PAGES]`, not `page_buf[NUM_PAGES]`. Used
+    /// by WGMMA A/D and (later) AttnDecode q/k/v tiles per audit
+    /// ADDENDUM 3.
+    fn alloc_act_page(&mut self) -> crate::tk_tape::ActPageId {
+        if let Some(reused) = self.free_act_pages.pop() {
+            reused
+        } else {
+            let p = crate::tk_tape::ActPageId(self.next_act_page);
+            self.next_act_page = self.next_act_page.checked_add(1).expect(
+                "ActPageId overflow (>=256 act pages); raise NUM_ACT_PAGES",
             );
             p
         }

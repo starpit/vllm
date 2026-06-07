@@ -734,7 +734,15 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     out.push_str(tk20::header_include());
 
     // Kernel signature: `__global__ void <name>(<args...>)`.
-    let _ = write!(out, "extern \"C\" __global__ __launch_bounds__({total_threads}) void {name}(\n");
+    // Kernel signature. We deliberately do NOT emit __launch_bounds__:
+    // a tight `min_threads` (= NUM_WARPS*32) tells ptxas to fit
+    // multiple blocks per SM, which caps regs/thread at ~96 and
+    // breaks Hopper WGMMA accumulators (each fp32 32×128 rt =
+    // 128 lane-regs alone). With the bound dropped, ptxas defaults
+    // to up to 255 regs/thread (single block per SM if needed).
+    // Per audit ADDENDUM 2 §"setmaxnreg".
+    let _ = write!(out, "extern \"C\" __global__ void {name}(\n");
+    let _ = total_threads; // retained for future setmaxnreg integration
     for (i, arg) in tape.kernel_args.iter().enumerate() {
         let comma = if i + 1 == tape.kernel_args.len() { "" } else { "," };
         let name_owned = kernel_arg_name(&arg.name);
@@ -762,13 +770,15 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     let _ = writeln!(out, "    constexpr uint NUM_PAGES = {NUM_PAGES}u;");
     let _ = writeln!(out, "    constexpr uint NUM_ACT_PAGES = {NUM_ACT_PAGES}u;");
     let _ = writeln!(out, "    constexpr uint NUM_CONSUMER_WARPS = {NUM_CONSUMER_WARPS}u;");
-    out.push_str(&tk20::shared_st_bf_decl(128, 128, "NUM_PAGES"));
-    // Activation page pool — 64×128 to satisfy WGMMA m64 (A.rows == 4
-    // tile rows). See SUBTILE_TK20_DECOMP.md §"Resolved decision 4"
-    // and PHASE_A_AUDIT.md ADDENDUM 2 §"Substrate-shrink cascade".
-    // Distinct from `page_buf` (128×128) so weights stay K=128 and no
-    // K-tiling is needed for WGMMA B.
-    out.push_str(&tk20::shared_act_bf_decl(64, 128, "NUM_ACT_PAGES"));
+    // Dynamic shared memory via TK 2.0's `shared_allocator` pattern
+    // (per `third_party/thunderkittens/README.md`). Total static smem
+    // would exceed 48KB cap (page_buf alone is 416KB at 13×128×128×2);
+    // dynamic smem path uses `cudaFuncAttributeMaxDynamicSharedMemorySize`
+    // (set by the host wrapper at launch) and Hopper's 228KB max.
+    out.push_str("    extern __shared__ kittens::alignment_dummy __shm[];\n");
+    out.push_str("    kittens::shared_allocator al((int*)&__shm[0]);\n");
+    out.push_str("    auto &page_buf = al.allocate<kittens::st_bf<128, 128, true, 64>, NUM_PAGES>();\n");
+    out.push_str("    auto &act_buf = al.allocate<kittens::st_bf<64, 128, true, 64>, NUM_ACT_PAGES>();\n");
     out.push_str(&tk20::shared_semaphore_decl("page_ready", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));
@@ -1734,7 +1744,7 @@ mod tests {
         let out = emit_kernel("tk_test", &tape);
         let sig = out.find("extern \"C\" __global__").expect("signature");
         let alias = out.find("auto a0 = __num_kv_pages;").expect("kernel-arg alias");
-        let pages = out.find("page_buf[NUM_PAGES]").expect("page_buf decl");
+        let pages = out.find("&page_buf = al.allocate").expect("page_buf decl");
         let body = out.find("// ── tape body ──").expect("body marker");
         assert!(sig < alias);
         assert!(alias < pages);

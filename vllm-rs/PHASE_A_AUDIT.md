@@ -524,3 +524,83 @@ issue needs a substrate-IR design pass that:
 This is its own milestone (plan calls for it but the per-SubOp
 Instr counts didn't budget for register pressure). Don't iterate
 on this without a fresh plan section.
+
+---
+
+## ADDENDUM 2 (2026-06-07) — post-rt_alias_pass
+
+### What landed
+
+`rt_alias_pass` (commit `6006a478a3`) — first §6.5 optimizer pass.
+Linear-scan greedy coalescing keyed on `RegTileArenaEntry`,
+loop-aware (slots defined inside a loop body extend their effective
+live range to the enclosing `[loop_open, loop_close]` extent;
+predecessors are admitted only if their effective_last_use precedes
+the candidate's `loop_open`). Plan-faithful — slots into the §6.5
+pass infrastructure with `crates/ferrite-wavefront/src/passes/`
+directory and per-pass validator postcondition.
+
+Pod measurements:
+* `reg_tile_arena` cardinality: 71 → 9 (87% reduction).
+* Llama-1B megakernel still ptxas-fails with 96-reg target —
+  the remaining 9 rt's collectively need ~704 lane-regs. Pass
+  did its job; the floor is set by the register-tile shapes
+  (32-row per-warp under width=4 = 128 lane-regs per fp32 tile
+  × 2 tiles + 4 per-warp accumulator vecs ≈ 384 lane-regs in
+  AttnDecode alone), not arena multiplicity.
+
+### Substrate-shrink attempt + cascade
+
+Tried switching uniform substrate from 64×128 page rows × cols to
+**64-row pages** (matching plan §"Resolved decision 4" "pad
+act_smem to 4 tile rows"). With 64-row substrate, WGMMA per-warp
+rt drops to 16-row height=1, AttnDecode register total drops to
+~192 lane-regs — under the 256/lane budget.
+
+The cascade: 64-row uniform substrate means **B**'s rows = 64,
+which is the matmul **K** dim. WGMMA `rt-A · st-B` requires
+`A.cols == B.rows` (= K). Our matmul A has cols = 128 (head_dim
+or hidden chunk). Mismatch.
+
+To make 64-row substrate work for WGMMA:
+* **Option A**: K-tile in the lowerer — emit `2× wgmma_mma_ab_reg_smem`
+  per logical matmul, each on a 64-K slice, accumulating into rt_d.
+  Requires a K-loop in MatmulTile / AttnDecode_Qkt / AttnDecode_Sv
+  arms. Substantial arm-rewrite work.
+* **Option B**: Split substrate pools — separate `act_pool` (64×128)
+  and `weight_pool` (128×128). Doubles the `__shared__` decls,
+  introduces a sealed `ActPageId` namespace, lowerer routes WGMMA
+  A/D pages to act, B pages to weight. Plan §"Resolved 4" implied
+  this with "padding waste vs a parallel warp-scope mma Instr
+  variant — padding keeps a single MMA path."
+* **Option C**: Hopper `setmaxnreg` PTX intrinsic. Asymmetric
+  per-warpgroup register budgets — service warps trade their share
+  to consumer warps. Available in TK 2.0 helpers. Doesn't change
+  the substrate; just makes ptxas's per-thread budget non-uniform.
+
+Reverted the substrate-shrink attempt — it requires either A or
+B as a structural commit. Returning to the stable 8h+rt_alias
+state (97 ferrite-wavefront tests green; arena 9 entries on the
+emitted Llama-1B megakernel; ptxas blocks at 96 regs).
+
+### Concrete next steps (ordered by leverage)
+
+1. **`rt_to_smem_pass`** (or lowerer rewrite) for `RopeRotate` /
+   `RopeAppend` — eliminates 5 of the 9 remaining rt's
+   (`rt<bf16, 128, 32>` per-warp). Per the recon table, every
+   op in the RoPE chain has a shared analog (`mul_col`, `sub`,
+   `add`); the only blocker is shared-side sub-tile col views.
+   Plan-faithful (§6.5 pass infrastructure already exists).
+2. **`setmaxnreg` warp specialization** — drops the
+   `__launch_bounds__(640)` floor by giving consumer warps
+   ~200 regs/lane instead of the uniform 96. Hopper-native;
+   TK 2.0 has helpers. Touches `tk_player.rs::emit_kernel`
+   preamble + per-warp role gating. Low-touch, high-impact.
+3. **Substrate split (A or B)** — only if 1+2 don't get to
+   compile-clean. Larger commit; defer until needed.
+
+`rt_alias_pass` is committed and works; the foundation for §6.5
+is in place. Next pass to land is `rt_to_smem_pass` for the
+liftable RoPE chain. ptxas-clean is 1-2 commits away once that
+lands and either the launch_bounds is loosened or the substrate
+splits.

@@ -29,6 +29,14 @@
 //!   disjoint and whose [`crate::tk_tape::RegTileArenaEntry`] is
 //!   identical. Plan §6.5-class pass; the first concrete one to
 //!   land.
+//! - [`page_coalesce`]: block-shared `PageId` linear-scan coalescing
+//!   onto a fixed pool of [`crate::tk_tape::NUM_PAGES`] physical
+//!   pages. Same algorithm as `rt_alias`, but with a HARD cap (smem
+//!   capacity is bounded). Panics with a liveness diagnostic if the
+//!   tape's max-concurrent-live-page count exceeds the pool, rather
+//!   than silently emitting `page_buf[NUM_PAGES]` OOB.
 
+pub mod page_coalesce;
 pub mod rt_alias;
+pub use page_coalesce::page_coalesce_pass;
 pub use rt_alias::rt_alias_pass;

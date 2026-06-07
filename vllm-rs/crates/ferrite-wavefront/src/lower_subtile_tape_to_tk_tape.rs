@@ -552,6 +552,19 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     validate_tk_tape(&out)
         .expect("rt_alias_pass: produced invalid TkTape (post-condition)");
 
+    // Second §6.5 pass: `page_coalesce_pass` — collapse PageIds with
+    // disjoint live ranges onto a fixed pool of NUM_PAGES physical
+    // pages. The conservative lowering above mints fresh PageIds per
+    // Compute, which on a Llama-3.2-1B tape yields PageIds 0..68 even
+    // though only NUM_PAGES = 13 physical pages exist; without
+    // coalescing the kernel does `page_buf[NUM_PAGES]` OOB at
+    // runtime. The pass enforces its compile-time-or-garbage
+    // postcondition by panicking with a liveness diagnostic if max
+    // concurrent live > pool cap, rather than emitting a bad tape.
+    crate::passes::page_coalesce_pass(&mut out);
+    validate_tk_tape(&out)
+        .expect("page_coalesce_pass: produced invalid TkTape (post-condition)");
+
     out
 }
 

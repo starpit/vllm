@@ -1658,7 +1658,7 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS
 }
 
 /// Sealed per §2: inner field is `pub(crate)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub(crate) u8);
 
 /// Sealed activation-page id — distinct namespace from [`PageId`].

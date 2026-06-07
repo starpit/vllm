@@ -24,7 +24,7 @@ use tracing::info;
 use vllm_common::SamplingParams;
 #[cfg(feature = "cuda")]
 use vllm_common::engine_io::EmbeddingData;
-use vllm_config::CudaGraphMode;
+use vllm_config::{CudaGraphConfig, CudaGraphMode};
 use vllm_core::scheduler::output::SchedulerOutput;
 use vllm_engine::executor::ModelRunnerOutput;
 use vllm_model::weight::HfModelConfig;
@@ -4480,22 +4480,55 @@ impl Worker for FerriteWorker {
         // Capture CUDA graphs for common decode batch sizes.
         // During decode, every request has q_len=1, so shapes are deterministic.
         let capture_sizes = if self.config.cuda_graph_sizes.is_empty() {
-            // Match Python vLLM's capture sizes: [1, 2, 4] + range(8, 256, 8) + range(256, 512+1, 16)
-            let mut sizes = vec![1, 2, 4];
-            let mut s = 8;
-            while s < 256 {
-                sizes.push(s);
-                s += 8;
-            }
-            while s <= 512 {
-                sizes.push(s);
-                s += 16;
-            }
-            sizes
+            // Fallback when no sizes were threaded in (the serve CLI
+            // always populates `cuda_graph_sizes` via
+            // `auto_capture_sizes`, so this fires only for callers that
+            // leave it empty). Use the same `max_num_seqs`-clamped
+            // Python-matching list rather than an unconditional 1..512
+            // run — batch sizes above `max_num_seqs` are never replayed
+            // (`nearest_graph_size` caps the runtime batch at it), so
+            // capturing them is dead work.
+            CudaGraphConfig::auto_capture_sizes(self.config.max_num_seqs.max(1))
         } else {
             self.config.cuda_graph_sizes.clone()
         };
         let max_bs = *capture_sizes.iter().max().unwrap();
+
+        // Decode sk (KV-span) buckets to capture, clamped to what the
+        // deployment's `max_model_len` can reach. `seqused_k` is bounded
+        // by `max_model_len`, so for a context-capped model the larger
+        // buckets are dead work — never selected by `pick_sk_bucket` at
+        // replay — and capturing them wastes both startup time (two
+        // forwards each) and the attention workspace they reserve as the
+        // pool high-water mark. Keep every bucket strictly below
+        // `max_model_len`, plus the first one at/above it as the
+        // covering ceiling (a seq of length `L` needs a bucket `>= L`).
+        // At default 32k context no bucket reaches the cap, so all four
+        // survive — parity with the prior unconditional list.
+        const DECODE_SK_BUCKETS_ALL: &[u32] = &[128, 512, 2048, 8192];
+        let cap_max_model_len = self
+            .config
+            .max_model_len
+            .or_else(|| {
+                self.hf_config
+                    .as_ref()
+                    .and_then(|c| c.max_position_embeddings)
+            })
+            .unwrap_or(4096) as u32;
+        let keep = DECODE_SK_BUCKETS_ALL
+            .iter()
+            .position(|&b| b >= cap_max_model_len)
+            .map_or(DECODE_SK_BUCKETS_ALL.len(), |i| i + 1);
+        let decode_sk_buckets = &DECODE_SK_BUCKETS_ALL[..keep];
+        if decode_sk_buckets.len() < DECODE_SK_BUCKETS_ALL.len() {
+            info!(
+                "CUDA graph: capturing {} of {} decode sk buckets (max_model_len={cap_max_model_len} \
+                 can't reach the rest): {decode_sk_buckets:?}",
+                decode_sk_buckets.len(),
+                DECODE_SK_BUCKETS_ALL.len(),
+            );
+        }
+        let max_sk_bucket = *decode_sk_buckets.last().unwrap();
 
         // Piecewise CUDA-graph capture was removed alongside the hand-written
         // CUDA model forwards (the per-piece `execute_*_piece` bodies dispatched
@@ -4558,7 +4591,7 @@ impl Worker for FerriteWorker {
                 unsafe {
                     runner
                         .init_fp8_buffers(
-                            8192, // matches max of DECODE_SK_BUCKETS below
+                            max_sk_bucket as usize, // largest decode sk bucket captured below
                             kv_cache.num_kv_heads,
                             kv_cache.head_dim,
                             self.model_dtype,
@@ -4596,8 +4629,7 @@ impl Worker for FerriteWorker {
             // (sized by attention-workspace * KV span); subsequent
             // smaller (sk, bs) reuse the same memory rather than
             // growing the pool incrementally.
-            const DECODE_SK_BUCKETS: &[u32] = &[128, 512, 2048, 8192];
-            'capture: for &sk_bucket in DECODE_SK_BUCKETS.iter().rev() {
+            'capture: for &sk_bucket in decode_sk_buckets.iter().rev() {
                 for &bs in capture_sizes.iter().rev() {
                     info!("Capturing CUDA graph for batch_size={bs}, sk_bucket={sk_bucket}...");
                     let kv_ref = kv_cache;

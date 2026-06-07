@@ -2335,6 +2335,31 @@ pub enum ByteOffsetExpr {
         stride_bytes: u64,
         base: ByteOffset,
     },
+    /// `(<base>u + v<outer> * <outer_stride>u + v<inner> * <inner_stride>u)`
+    /// — two-loop affine byte offset. Used by the NK-tile pass
+    /// (`split_oversized_loads_pass` outer N + inner K loops): a
+    /// Gemm B operand of shape `K_full × N_full` row-major needs
+    /// `base + n_var × (N_BLOCK × elem_bytes) + k_var × (K_BLOCK × N_full × elem_bytes)`
+    /// to address the per-(n, k) chunk start. One-var
+    /// [`Self::LinearLoop`] cannot encode the dependence on both
+    /// loop vars simultaneously.
+    ///
+    /// Field-construction only inside the crate (variant is `pub`,
+    /// fields `pub(crate)`). Strides are runtime `u64` here because
+    /// at the pass-rewrite site the stride for B's outer-N component
+    /// depends on `N_BLOCK = 128` (compile-time) but the inner-K
+    /// component depends on the runtime `tile.cols` (= `N_full` of
+    /// the originally-loaded big region) — that is known only at
+    /// pass time, not at type level. Per
+    /// `feedback_no_premature_string_encoding`: structured data on
+    /// the IR; player formats at emit.
+    Affine2D {
+        outer_var: LoopVarId,
+        outer_stride_bytes: u64,
+        inner_var: LoopVarId,
+        inner_stride_bytes: u64,
+        base: ByteOffset,
+    },
 }
 
 impl ByteOffsetExpr {

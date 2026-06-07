@@ -96,9 +96,9 @@
 //!   a diagnostic in that case so the caller sees the gap.
 
 use crate::tk_tape::{
-    AccTag, ArrivalCount, Bf16, ByteOffset, ByteOffsetExpr, Instr, LoadSpec, LoaderRole,
-    LoopVarId, PAGE_SIZE, PageBarrier, Parity, SmemTileSpec, TileDtype, TileShape, TkTape,
-    WarpRole,
+    AccTag, ArrivalCount, Bf16, ByteOffset, ByteOffsetExpr, FenceTag, GroupWidthTag, Instr,
+    KernelArgRef, LoadSpec, LoaderRole, LoopVarId, PAGE_SIZE, PageBarrier, PageId, Parity,
+    RegTileSlot, SmemTileSpec, TileDtype, TileShape, TkTape, WarpRole,
 };
 
 /// WGMMA bf16 K-block size on Hopper sm_90a — `kittens::warpgroup`'s
@@ -230,16 +230,22 @@ fn max_existing_loop_var(instrs: &[Instr]) -> Option<u32> {
             Instr::ForLoopClose { var } => bump(var.0),
             Instr::PageBarrierWaitLoopStart0 { var, .. } => bump(var.0),
             Instr::PageBarrierWaitLoopStart1 { var, .. } => bump(var.0),
-            Instr::LoadAsync(spec) => {
-                if let ByteOffsetExpr::LinearLoop { var, .. } = &spec.byte_off {
-                    bump(var.0);
+            Instr::LoadAsync(spec) => match &spec.byte_off {
+                ByteOffsetExpr::LinearLoop { var, .. } => bump(var.0),
+                ByteOffsetExpr::Affine2D { outer_var, inner_var, .. } => {
+                    bump(outer_var.0);
+                    bump(inner_var.0);
                 }
-            }
-            Instr::StoreAsync(spec) => {
-                if let ByteOffsetExpr::LinearLoop { var, .. } = &spec.byte_off {
-                    bump(var.0);
+                _ => {}
+            },
+            Instr::StoreAsync(spec) => match &spec.byte_off {
+                ByteOffsetExpr::LinearLoop { var, .. } => bump(var.0),
+                ByteOffsetExpr::Affine2D { outer_var, inner_var, .. } => {
+                    bump(outer_var.0);
+                    bump(inner_var.0);
                 }
-            }
+                _ => {}
+            },
             // Other Instrs do not bear a `LoopVarId`. The exhaustive
             // tail leaves the catch-all to silence rustc; new variants
             // bearing a LoopVarId must be added explicitly above.
@@ -422,9 +428,11 @@ fn plan_rewrite(
     );
     let k_blocks = k_full / K_BLOCK;
 
-    // 5. Per-iter chunk shape constraints — only 128×128 chunks
-    //    supported (substrate page tile shape). M/N tiling is a
-    //    sibling pass.
+    // 5. Per-iter chunk shape constraints. M is bounded to PAGE_ROWS
+    //    here (no M-tiling in this pass; the conservative lowering's
+    //    MatmulTile arm hardcodes A as a 128-row page already, and
+    //    the macro's larger workloads compile into separate kernels).
+    //    N may be > PAGE_COLS — the NK path below handles that.
     let m_chunk = a_load_spec
         .as_ref()
         .map(|s| s.tile.rows)
@@ -439,10 +447,12 @@ fn plan_rewrite(
          M-tiling beyond a single 128-row page is a separate transform (not in this pass).",
     );
     assert!(
-        n_full == PAGE_COLS,
-        "split_oversized_loads_pass: B operand tile.cols = {n_full}, expected {PAGE_COLS}. \
-         N-tiling beyond a single 128-col page is a separate transform (not in this pass).",
+        n_full % PAGE_COLS == 0,
+        "split_oversized_loads_pass: B operand tile.cols ({n_full}) is not a multiple of \
+         PAGE_COLS ({PAGE_COLS}). The N-tile path requires N divisible by 128; non-aligned \
+         N needs explicit padding upstream.",
     );
+    let n_blocks = n_full / PAGE_COLS;
 
     // 6. Per-iter byte strides.
     //
@@ -484,8 +494,19 @@ fn plan_rewrite(
         Bf16::ELEM_BYTES,
         elem_bytes,
     );
-    let a_stride_bytes: u64 = (K_BLOCK as u64) * elem_bytes;
-    let b_stride_bytes: u64 = (K_BLOCK as u64) * (n_full as u64) * elem_bytes;
+    // A operand (M × K_full row-major): K-stride steps along cols.
+    let a_k_stride_bytes: u64 = (K_BLOCK as u64) * elem_bytes;
+    // B operand (K_full × N_full row-major): K-stride steps along
+    // ROWS of the K×N tile, advancing K_BLOCK rows × N_full cols per
+    // chunk. N-stride steps along COLS, advancing one N_BLOCK column
+    // window. Both feed [`ByteOffsetExpr::Affine2D`] in the NK case
+    // and `LinearLoop` in the K-only case.
+    let b_k_stride_bytes: u64 = (K_BLOCK as u64) * (n_full as u64) * elem_bytes;
+    let b_n_stride_bytes: u64 = (PAGE_COLS as u64) * elem_bytes;
+    // Output (M × N_full row-major): N-stride steps along COLS,
+    // advancing one N_BLOCK column window per N iter. Only used in
+    // the NK path (K-only path leaves the output StoreAsync alone).
+    let out_n_stride_bytes: u64 = (PAGE_COLS as u64) * elem_bytes;
 
     // 7. Operand source / base byte offsets.
     let (a_src_arg, a_base_off) = a_load_spec
@@ -508,24 +529,19 @@ fn plan_rewrite(
             );
         });
 
-    // 8. Mint a fresh LoopVarId.
-    let var = LoopVarId(*next_var);
+    // 8. Mint fresh LoopVarIds. K-only path uses one (k_var). NK
+    //    path uses two (n_var as outer, k_var as inner).
+    let k_var = LoopVarId(*next_var);
     *next_var += 1;
 
-    // 9. Determine the splice span.
-    //    start = the earliest of {load_a_async, load_b_async, init_idx}
-    //    end   = wait_idx + 1 (exclusive; wait_idx is the
-    //            wgmma_async_wait that we move INTO the loop body).
-    //    The store_reg_tile_to_shmem_warpgroup that follows wait_idx
-    //    is left in place — it stays AFTER the rewritten loop, only
-    //    runs once after K-loop finishes.
+    // 9. Determine the splice span's start. start = earliest of
+    //    {load_a_async, load_b_async, init_idx}.
     let candidates: [Option<usize>; 3] = [load_a_async, load_b_async, Some(init_idx)];
     let start = candidates
         .iter()
         .filter_map(|x| *x)
         .min()
         .expect("init_idx is Some");
-    let end = wait_idx + 1;
 
     // 10. Sanity-check the [start, init_idx) interior — every Instr
     //     in there should be a LoadAsync targeting a_page or b_page,
@@ -544,16 +560,294 @@ fn plan_rewrite(
         }
     }
 
-    // 11. Build the replacement Instr stream.
+    // 11. Dispatch K-only vs NK based on whether B's N exceeds
+    //     PAGE_COLS. K-only is the simpler path that leaves the
+    //     existing post-matmul StoreAsync / Commit / Fence / Arrive
+    //     untouched after the K-loop. NK extends the splice span to
+    //     also include those, wraps everything in an outer N-loop,
+    //     and rewrites the StoreAsync's byte_off + tile shape.
+    if n_blocks == 1 {
+        let end = wait_idx + 1;
+        let out = emit_k_only_body(
+            instrs,
+            init_idx,
+            load_a_idx,
+            fence_idx,
+            wait_idx,
+            a_page,
+            b_page,
+            a_slot,
+            d_slot,
+            fence_tag,
+            width_tag,
+            wgmma_role,
+            a_src_arg,
+            a_base_off,
+            b_src_arg,
+            b_base_off,
+            a_k_stride_bytes,
+            b_k_stride_bytes,
+            k_blocks,
+            k_var,
+        );
+        (start..end, out)
+    } else {
+        // NK path: mint outer n_var, find post-wait Instrs, emit
+        // nested loops + per-N output store.
+        let n_var = LoopVarId(*next_var);
+        *next_var += 1;
+
+        // Walk forward from wait_idx + 1 to identify the post-matmul
+        // sequence emitted by `emit_store_and_arrive` in the
+        // lowering. Each is bounded to a small window so a non-
+        // matching tape doesn't pull random distant Instrs into the
+        // splice.
+        let store_smem_idx = (wait_idx + 1..(wait_idx + 4).min(instrs.len()))
+            .find(|i| matches!(
+                &instrs[*i],
+                Instr::StoreRegTileToShmem { src, .. } if *src == d_slot
+            ))
+            .unwrap_or_else(|| panic!(
+                "split_oversized_loads_pass: no StoreRegTileToShmem(src={d_slot:?}) \
+                 within 3 instrs after WgmmaAsyncWait(idx {wait_idx}). NK rewrite \
+                 requires the conservative MatmulTile arm's post-matmul shape.",
+            ));
+        let dst_page = match &instrs[store_smem_idx] {
+            Instr::StoreRegTileToShmem { dst, .. } => *dst,
+            _ => unreachable!(),
+        };
+        let store_async_idx = (store_smem_idx + 1..(store_smem_idx + 6).min(instrs.len()))
+            .find(|i| matches!(
+                &instrs[*i],
+                Instr::StoreAsync(spec) if spec.src_page == dst_page
+            ))
+            .unwrap_or_else(|| panic!(
+                "split_oversized_loads_pass: no StoreAsync(src={dst_page:?}) within 5 instrs \
+                 after StoreRegTileToShmem(idx {store_smem_idx}). NK rewrite requires \
+                 emit_store_and_arrive's StoreAsync follow-on.",
+            ));
+        let commit_idx = (store_async_idx + 1..(store_async_idx + 6).min(instrs.len()))
+            .find(|i| matches!(&instrs[*i], Instr::CommitGroupBulk { .. }))
+            .unwrap_or_else(|| panic!(
+                "split_oversized_loads_pass: no CommitGroupBulk within 5 instrs after \
+                 StoreAsync(idx {store_async_idx}). NK rewrite requires \
+                 emit_store_and_arrive's commit follow-on.",
+            ));
+        let fence_dev_idx = (commit_idx + 1..(commit_idx + 6).min(instrs.len()))
+            .find(|i| matches!(&instrs[*i], Instr::ThreadfenceDevice { .. }))
+            .unwrap_or_else(|| panic!(
+                "split_oversized_loads_pass: no ThreadfenceDevice within 5 instrs after \
+                 CommitGroupBulk(idx {commit_idx}). NK rewrite requires \
+                 emit_store_and_arrive's fence follow-on.",
+            ));
+        let arrive_done_idx = (fence_dev_idx + 1..(fence_dev_idx + 6).min(instrs.len()))
+            .find(|i| matches!(
+                &instrs[*i],
+                Instr::PageBarrierArrive { page_id, kind: PageBarrier::Done, .. }
+                    if *page_id == dst_page
+            ))
+            .unwrap_or_else(|| panic!(
+                "split_oversized_loads_pass: no PageBarrierArrive(Done, {dst_page:?}) within \
+                 5 instrs after ThreadfenceDevice(idx {fence_dev_idx}). NK rewrite requires \
+                 emit_store_and_arrive's arrive-Done follow-on.",
+            ));
+
+        // Original output StoreAsync — pull out its src_arg + base
+        // for the per-N rewrite.
+        let (out_dst_arg, out_base_off, out_role, out_elem_bytes) = match &instrs[store_async_idx] {
+            Instr::StoreAsync(spec) => {
+                let base = base_of(&spec.byte_off);
+                (spec.dst_arg, base, spec.role, spec.tile.elem_bytes)
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            out_elem_bytes as u64, elem_bytes,
+            "split_oversized_loads_pass: output StoreAsync.elem_bytes ({}) != operand \
+             elem_bytes ({}). NK rewrite assumes uniform Bf16 dtype.",
+            out_elem_bytes, elem_bytes,
+        );
+
+        let end = arrive_done_idx + 1;
+        let out = emit_nk_body(
+            instrs,
+            init_idx,
+            load_a_idx,
+            fence_idx,
+            wait_idx,
+            store_smem_idx,
+            commit_idx,
+            fence_dev_idx,
+            arrive_done_idx,
+            a_page,
+            b_page,
+            dst_page,
+            a_slot,
+            d_slot,
+            fence_tag,
+            width_tag,
+            wgmma_role,
+            a_src_arg,
+            a_base_off,
+            b_src_arg,
+            b_base_off,
+            out_dst_arg,
+            out_base_off,
+            out_role,
+            a_k_stride_bytes,
+            b_k_stride_bytes,
+            b_n_stride_bytes,
+            out_n_stride_bytes,
+            k_blocks,
+            n_blocks,
+            k_var,
+            n_var,
+        );
+        (start..end, out)
+    }
+}
+
+/// Emit the K-only rewrite body — single K-loop wrapping the
+/// matmul-emit-sequence; init_rt_zero outside; store_reg_tile_to_shmem
+/// stays AFTER the splice (untouched). See module doc §"Rewrite shape".
+#[allow(clippy::too_many_arguments)]
+fn emit_k_only_body(
+    instrs: &[Instr],
+    init_idx: usize,
+    load_a_idx: usize,
+    fence_idx: usize,
+    wait_idx: usize,
+    a_page: PageId,
+    b_page: PageId,
+    a_slot: RegTileSlot,
+    d_slot: RegTileSlot,
+    fence_tag: FenceTag,
+    width_tag: GroupWidthTag,
+    wgmma_role: WarpRole,
+    a_src_arg: KernelArgRef,
+    a_base_off: ByteOffset,
+    b_src_arg: KernelArgRef,
+    b_base_off: ByteOffset,
+    a_k_stride_bytes: u64,
+    b_k_stride_bytes: u64,
+    k_blocks: u32,
+    k_var: LoopVarId,
+) -> Vec<Instr> {
     let mut out: Vec<Instr> = Vec::with_capacity(13);
-
-    // (a) InitRtZero — moved out (above the loop). Cloned from the
-    //     original conservative emit so width / role / dst tags
-    //     match.
     out.push(instrs[init_idx].clone());
+    out.push(Instr::BarrierInit {
+        page_id: a_page,
+        kind: PageBarrier::Ready,
+        count: ArrivalCount::One,
+    });
+    out.push(Instr::BarrierInit {
+        page_id: b_page,
+        kind: PageBarrier::Ready,
+        count: ArrivalCount::One,
+    });
+    out.push(Instr::ForLoopOpenConst { var: k_var, n: k_blocks });
+    out.push(Instr::tma_expect(
+        a_page,
+        PageBarrier::Ready,
+        SmemTileSpec::<128, 128, Bf16>::WITNESS,
+        LoaderRole,
+    ));
+    out.push(Instr::LoadAsync(LoadSpec::new::<128, 128, Bf16>(
+        a_page,
+        a_src_arg,
+        ByteOffsetExpr::LinearLoop { var: k_var, stride_bytes: a_k_stride_bytes, base: a_base_off },
+        SmemTileSpec::<128, 128, Bf16>::WITNESS,
+        LoaderRole,
+        a_page,
+    )));
+    out.push(Instr::tma_expect(
+        b_page,
+        PageBarrier::Ready,
+        SmemTileSpec::<128, 128, Bf16>::WITNESS,
+        LoaderRole,
+    ));
+    out.push(Instr::LoadAsync(LoadSpec::new::<128, 128, Bf16>(
+        b_page,
+        b_src_arg,
+        ByteOffsetExpr::LinearLoop { var: k_var, stride_bytes: b_k_stride_bytes, base: b_base_off },
+        SmemTileSpec::<128, 128, Bf16>::WITNESS,
+        LoaderRole,
+        b_page,
+    )));
+    out.push(Instr::wait_loop(
+        a_page,
+        PageBarrier::Ready,
+        k_var,
+        Parity::P0,
+        WarpRole::AllConsumers,
+    ));
+    out.push(Instr::wait_loop(
+        b_page,
+        PageBarrier::Ready,
+        k_var,
+        Parity::P0,
+        WarpRole::AllConsumers,
+    ));
+    out.push(instrs[load_a_idx].clone());
+    out.push(instrs[fence_idx].clone());
+    out.push(Instr::WgmmaMmaAB_RegSmem {
+        a: a_slot,
+        b_page,
+        d: d_slot,
+        fence: fence_tag,
+        accumulate: AccTag::Accumulate,
+        width: width_tag,
+        role: wgmma_role,
+    });
+    out.push(instrs[wait_idx].clone());
+    out.push(Instr::ForLoopClose { var: k_var });
+    out
+}
 
-    // (b) BarrierInit Ready, count=One for both pages. Each TMA
-    //     load = one mbarrier arrival; count=One closes the phase.
+/// Emit the NK rewrite body — outer N-loop wraps the inner K-loop;
+/// per-N init_rt_zero + per-N output StoreAsync (LinearLoop on n_var,
+/// tile=128×128); CommitGroupBulk + ThreadfenceDevice + Arrive Done
+/// emitted ONCE after the N-loop closes. See module doc §"NK rewrite".
+#[allow(clippy::too_many_arguments)]
+fn emit_nk_body(
+    instrs: &[Instr],
+    init_idx: usize,
+    load_a_idx: usize,
+    fence_idx: usize,
+    wait_idx: usize,
+    store_smem_idx: usize,
+    commit_idx: usize,
+    fence_dev_idx: usize,
+    arrive_done_idx: usize,
+    a_page: PageId,
+    b_page: PageId,
+    dst_page: PageId,
+    a_slot: RegTileSlot,
+    d_slot: RegTileSlot,
+    fence_tag: FenceTag,
+    width_tag: GroupWidthTag,
+    wgmma_role: WarpRole,
+    a_src_arg: KernelArgRef,
+    a_base_off: ByteOffset,
+    b_src_arg: KernelArgRef,
+    b_base_off: ByteOffset,
+    out_dst_arg: KernelArgRef,
+    out_base_off: ByteOffset,
+    out_role: WarpRole,
+    a_k_stride_bytes: u64,
+    b_k_stride_bytes: u64,
+    b_n_stride_bytes: u64,
+    out_n_stride_bytes: u64,
+    k_blocks: u32,
+    n_blocks: u32,
+    k_var: LoopVarId,
+    n_var: LoopVarId,
+) -> Vec<Instr> {
+    let mut out: Vec<Instr> = Vec::with_capacity(20);
+
+    // Pre-loop: BarrierInits for A_page / B_page (count=One per
+    // TMA-load arrival). These survive across both N and K
+    // iterations — `mbarrier::wait` auto-flips parity per phase.
     out.push(Instr::BarrierInit {
         page_id: a_page,
         kind: PageBarrier::Ready,
@@ -565,79 +859,73 @@ fn plan_rewrite(
         count: ArrivalCount::One,
     });
 
-    // (c) Loop open.
-    out.push(Instr::ForLoopOpenConst { var, n: k_blocks });
+    // Outer N-loop open.
+    out.push(Instr::ForLoopOpenConst { var: n_var, n: n_blocks });
 
-    // (d) Per-iter body.
-    //     i. TmaExpect for A_page (Ready barrier, 128×128 Bf16).
+    // Per-N: re-init rt_d to zero (each output tile gets a fresh
+    // accumulator).
+    out.push(instrs[init_idx].clone());
+
+    // Inner K-loop open.
+    out.push(Instr::ForLoopOpenConst { var: k_var, n: k_blocks });
+
+    // K-loop body: TmaExpect + LoadAsync (A: k-only LinearLoop;
+    // B: 2D Affine n_var × k_var) + waits + WGMMA + async-wait.
     out.push(Instr::tma_expect(
         a_page,
         PageBarrier::Ready,
         SmemTileSpec::<128, 128, Bf16>::WITNESS,
         LoaderRole,
     ));
-    //     ii. LoadAsync chunk A.
     out.push(Instr::LoadAsync(LoadSpec::new::<128, 128, Bf16>(
         a_page,
         a_src_arg,
-        ByteOffsetExpr::LinearLoop {
-            var,
-            stride_bytes: a_stride_bytes,
-            base: a_base_off,
-        },
+        // A operand: M × K_full row-major; A_chunk[m, k_var] depends
+        // on k_var only (not n_var — A is shared across all N tiles).
+        ByteOffsetExpr::LinearLoop { var: k_var, stride_bytes: a_k_stride_bytes, base: a_base_off },
         SmemTileSpec::<128, 128, Bf16>::WITNESS,
         LoaderRole,
         a_page,
     )));
-    //     iii. TmaExpect for B_page.
     out.push(Instr::tma_expect(
         b_page,
         PageBarrier::Ready,
         SmemTileSpec::<128, 128, Bf16>::WITNESS,
         LoaderRole,
     ));
-    //     iv. LoadAsync chunk B.
     out.push(Instr::LoadAsync(LoadSpec::new::<128, 128, Bf16>(
         b_page,
         b_src_arg,
-        ByteOffsetExpr::LinearLoop {
-            var,
-            stride_bytes: b_stride_bytes,
+        // B operand: K_full × N_full row-major; B_chunk[k_var, n_var]
+        // depends on BOTH loop vars. The Affine2D variant encodes
+        // `base + n_var × n_stride + k_var × k_stride`.
+        ByteOffsetExpr::Affine2D {
+            outer_var: n_var,
+            outer_stride_bytes: b_n_stride_bytes,
+            inner_var: k_var,
+            inner_stride_bytes: b_k_stride_bytes,
             base: b_base_off,
         },
         SmemTileSpec::<128, 128, Bf16>::WITNESS,
         LoaderRole,
         b_page,
     )));
-    //     v. Wait on both Ready barriers (parity flips with var per
-    //        TK 2.0 mbarrier::wait semantics — same convention as
-    //        AttnDecode_Qkt).
     out.push(Instr::wait_loop(
         a_page,
         PageBarrier::Ready,
-        var,
+        k_var,
         Parity::P0,
         WarpRole::AllConsumers,
     ));
     out.push(Instr::wait_loop(
         b_page,
         PageBarrier::Ready,
-        var,
+        k_var,
         Parity::P0,
         WarpRole::AllConsumers,
     ));
-    //     vi. load_shmem_to_reg(A_page → rt_a) — copied verbatim
-    //         from the original conservative emit so width / role /
-    //         dst tags match.
     out.push(instrs[load_a_idx].clone());
-    //     vii. wgmma_fence_acc(rt_d) — copied verbatim.
     out.push(instrs[fence_idx].clone());
-    //     viii. WGMMA with AccAccumulate (init_rt_zero outside the
-    //           loop makes iter 0 equivalent to AccReset). FenceTag
-    //           inherits from the conservative emit (FenceExternal —
-    //           ensures TMA-write to b_page is visible to WGMMA's
-    //           smem read; mirrors AttnDecode K-loop body fence
-    //           policy).
     out.push(Instr::WgmmaMmaAB_RegSmem {
         a: a_slot,
         b_page,
@@ -647,16 +935,45 @@ fn plan_rewrite(
         width: width_tag,
         role: wgmma_role,
     });
-    //     ix. wgmma_async_wait — moved INTO the loop body so iter
-    //         k+1's LoadAsync into b_page does not race with iter k's
-    //         WGMMA still reading b_page (mirror of AttnDecode K-loop
-    //         body shape).
     out.push(instrs[wait_idx].clone());
 
-    // (e) Loop close.
-    out.push(Instr::ForLoopClose { var });
+    // Inner K-loop close.
+    out.push(Instr::ForLoopClose { var: k_var });
 
-    (start..end, out)
+    // Per-N output store: register tile → smem dst_page (cloned),
+    // then smem dst_page → gmem output[m, n_var × 128 .. (n_var+1) × 128]
+    // via a per-N-iter StoreAsync with LinearLoop byte_off and
+    // SmemTileSpec<128, 128, Bf16> tile shape.
+    out.push(instrs[store_smem_idx].clone());
+    out.push(Instr::StoreAsync(crate::tk_tape::StoreSpec::new::<128, 128, Bf16>(
+        dst_page,
+        out_dst_arg,
+        ByteOffsetExpr::LinearLoop {
+            var: n_var,
+            stride_bytes: out_n_stride_bytes,
+            base: out_base_off,
+        },
+        SmemTileSpec::<128, 128, Bf16>::WITNESS,
+        // Reconstruct StorerRole from the original WarpRole. The
+        // original conservative emit used STORE_ROLE = StorerRole;
+        // typed StoreSpec::new takes StorerRole directly. We pass
+        // crate::tk_tape::StorerRole as the role witness — the
+        // out_role value is only needed for the assertion below.
+        crate::tk_tape::StorerRole,
+    )));
+    let _ = out_role; // surfaced via the `crate::tk_tape::StorerRole` witness above.
+
+    // Outer N-loop close.
+    out.push(Instr::ForLoopClose { var: n_var });
+
+    // Post-loop drain: ONE CommitGroupBulk + ThreadfenceDevice +
+    // Arrive Done, batching all per-N StoreAsyncs. Cloned from the
+    // original conservative emit so role tags match.
+    out.push(instrs[commit_idx].clone());
+    out.push(instrs[fence_dev_idx].clone());
+    out.push(instrs[arrive_done_idx].clone());
+
+    out
 }
 
 /// Recover the `base` byte offset from a [`ByteOffsetExpr`]. The
@@ -667,6 +984,7 @@ fn base_of(expr: &ByteOffsetExpr) -> ByteOffset {
         ByteOffsetExpr::Const(off) => *off,
         ByteOffsetExpr::LinearLoop { base, .. } => *base,
         ByteOffsetExpr::RuntimePosition { base, .. } => *base,
+        ByteOffsetExpr::Affine2D { base, .. } => *base,
     }
 }
 
@@ -703,7 +1021,8 @@ mod tests {
 
     /// Build a synthetic conservative MatmulTile-emit-sequence with
     /// oversized External LoadAsyncs into A_page and B_page, plus
-    /// the matmul body. K_full = 2048, N_full = 128.
+    /// the matmul body. NO post-matmul StoreAsync / Commit / Fence /
+    /// Arrive — used for the K-only path which doesn't need them.
     fn synthetic_oversized_gemm_tape(k_full: u32, n_full: u32) -> TkTape {
         let mut tape = TkTape::default();
         const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
@@ -716,32 +1035,22 @@ mod tests {
         let rt_a: RegTileId<32, 128, Bf16, RowLayout> = tape.mint_reg_tile();
         let rt_d: RegTileId<32, 128, Fp32, RowLayout> = tape.mint_reg_tile();
 
-        // (a) Big external loads — A is M×K_full, B is K_full×N_full.
         tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
             a_page,
-            KernelArgRef(0), // act tensor
+            KernelArgRef(0),
             ByteOffsetExpr::from_const(0),
-            TileShape {
-                rows: 128,
-                cols: k_full,
-                elem_bytes: 2,
-            },
+            TileShape { rows: 128, cols: k_full, elem_bytes: 2 },
             LoaderRole,
             a_page,
         )));
         tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
             b_page,
-            KernelArgRef(1), // weight tensor
+            KernelArgRef(1),
             ByteOffsetExpr::from_const(0),
-            TileShape {
-                rows: k_full,
-                cols: n_full,
-                elem_bytes: 2,
-            },
+            TileShape { rows: k_full, cols: n_full, elem_bytes: 2 },
             LoaderRole,
             b_page,
         )));
-        // (b) Matmul body (conservative shape).
         tape.instrs.push(Instr::init_rt_zero(rt_d, WL, R));
         tape.instrs.push(Instr::load_shmem_to_reg_warpgroup(
             SmemTileId::<128, 128, Bf16>::from_page(a_page),
@@ -765,6 +1074,34 @@ mod tests {
             W4,
             R,
         ));
+        tape
+    }
+
+    /// Build a synthetic conservative MatmulTile-emit-sequence
+    /// INCLUDING the post-matmul StoreAsync / CommitGroupBulk /
+    /// ThreadfenceDevice / PageBarrierArrive Done sequence emitted
+    /// by `emit_store_and_arrive`. Required by the NK rewrite path
+    /// (which extends the splice span to cover those Instrs and
+    /// rewrites the StoreAsync's byte_off + tile shape).
+    fn synthetic_full_gemm_tape(k_full: u32, n_full: u32) -> TkTape {
+        use crate::tk_tape::{StoreSpec, StorerRole};
+        let mut tape = synthetic_oversized_gemm_tape(k_full, n_full);
+        let dst_page = PageId(2);
+        let storer_role = StorerRole.to_warp_role();
+        tape.instrs.push(Instr::StoreAsync(StoreSpec::new_runtime_shape(
+            dst_page,
+            KernelArgRef(2),
+            ByteOffsetExpr::from_const(0),
+            TileShape { rows: 128, cols: n_full, elem_bytes: 2 },
+            StorerRole,
+        )));
+        tape.instrs.push(Instr::CommitGroupBulk { role: storer_role });
+        tape.instrs.push(Instr::ThreadfenceDevice { role: WarpRole::All });
+        tape.instrs.push(Instr::PageBarrierArrive {
+            page_id: dst_page,
+            kind: PageBarrier::Done,
+            role: storer_role,
+        });
         tape
     }
 
@@ -1078,6 +1415,156 @@ mod tests {
                 assert!(bytes_of_tile(&spec.tile) <= PAGE_SIZE as u64);
             }
         }
+    }
+
+    /// NK rewrite headline test: K = 2048, N = 256 — NK path (n_blocks=2)
+    /// emits nested loops with Affine2D byte_off on B's chunk LoadAsync.
+    #[test]
+    fn rewrites_nk_into_nested_loops() {
+        let mut tape = synthetic_full_gemm_tape(2048, 256);
+        split_oversized_loads_pass(&mut tape);
+
+        // Postcondition: every LoadAsync ≤ PAGE_SIZE.
+        for (i, ins) in tape.instrs.iter().enumerate() {
+            if let Instr::LoadAsync(spec) = ins {
+                assert!(
+                    bytes_of_tile(&spec.tile) <= PAGE_SIZE as u64,
+                    "post-pass LoadAsync at idx {i}: oversized {:?}",
+                    spec.tile,
+                );
+            }
+        }
+
+        // Two ForLoopOpenConst instrs: outer N (n=2), inner K (n=16).
+        let loops: Vec<(LoopVarId, u32)> = tape
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::ForLoopOpenConst { var, n } => Some((*var, *n)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(loops.len(), 2, "NK emits exactly two ForLoopOpenConst (outer N, inner K)");
+        let (n_var, n_count) = loops[0];
+        let (k_var, k_count) = loops[1];
+        assert_eq!(n_count, 256 / 128, "N_blocks = N_full / 128");
+        assert_eq!(k_count, 2048 / 128, "K_blocks = K_full / 128");
+        assert_ne!(n_var, k_var, "outer N and inner K vars are distinct");
+
+        // Inner K-loop sits between outer N-open and outer N-close.
+        let n_open = tape.instrs.iter().position(|i| matches!(i, Instr::ForLoopOpenConst { var, .. } if *var == n_var)).unwrap();
+        let k_open = tape.instrs.iter().position(|i| matches!(i, Instr::ForLoopOpenConst { var, .. } if *var == k_var)).unwrap();
+        let k_close = tape.instrs.iter().rposition(|i| matches!(i, Instr::ForLoopClose { var } if *var == k_var)).unwrap();
+        let n_close = tape.instrs.iter().rposition(|i| matches!(i, Instr::ForLoopClose { var } if *var == n_var)).unwrap();
+        assert!(n_open < k_open && k_open < k_close && k_close < n_close,
+            "loop nesting: N(open) < K(open) < K(close) < N(close); got {n_open} < {k_open} < {k_close} < {n_close}");
+
+        // B chunk LoadAsync uses Affine2D with both n_var and k_var.
+        let b_load = tape.instrs.iter().find_map(|i| match i {
+            Instr::LoadAsync(spec) if spec.dst_page == PageId(1) => Some(spec),
+            _ => None,
+        }).expect("B chunk LoadAsync present");
+        match &b_load.byte_off {
+            ByteOffsetExpr::Affine2D { outer_var, outer_stride_bytes, inner_var, inner_stride_bytes, .. } => {
+                assert_eq!(*outer_var, n_var, "B's outer var is n_var");
+                assert_eq!(*inner_var, k_var, "B's inner var is k_var");
+                // B is K_full × N_full = 2048 × 256 row-major.
+                // outer (n) stride = N_BLOCK × elem_bytes = 128 × 2 = 256
+                // inner (k) stride = K_BLOCK × N_full × elem_bytes = 128 × 256 × 2 = 65536
+                assert_eq!(*outer_stride_bytes, 256, "B n-stride = 128 × 2");
+                assert_eq!(*inner_stride_bytes, 128 * 256 * 2, "B k-stride = K_BLOCK × N_full × 2");
+            }
+            other => panic!("expected B byte_off = Affine2D, got {other:?}"),
+        }
+
+        // A chunk LoadAsync uses LinearLoop on k_var only (A is independent of n).
+        let a_load = tape.instrs.iter().find_map(|i| match i {
+            Instr::LoadAsync(spec) if spec.dst_page == PageId(0) => Some(spec),
+            _ => None,
+        }).expect("A chunk LoadAsync present");
+        match &a_load.byte_off {
+            ByteOffsetExpr::LinearLoop { var, stride_bytes, .. } => {
+                assert_eq!(*var, k_var, "A's loop var is k_var (independent of n)");
+                assert_eq!(*stride_bytes, 128 * 2, "A k-stride = K_BLOCK × elem_bytes");
+            }
+            other => panic!("expected A byte_off = LinearLoop, got {other:?}"),
+        }
+
+        // Output StoreAsync is INSIDE the N-loop, with LinearLoop(n_var).
+        let store_idx = tape.instrs.iter().position(|i| matches!(i, Instr::StoreAsync(_))).unwrap();
+        assert!(store_idx > k_close && store_idx < n_close,
+            "output StoreAsync sits between K-close and N-close (per-N tile store); got store_idx={store_idx}");
+        let store = match &tape.instrs[store_idx] {
+            Instr::StoreAsync(spec) => spec,
+            _ => unreachable!(),
+        };
+        assert_eq!(store.tile.rows, 128, "per-N output tile rows");
+        assert_eq!(store.tile.cols, 128, "per-N output tile cols");
+        match &store.byte_off {
+            ByteOffsetExpr::LinearLoop { var, stride_bytes, .. } => {
+                assert_eq!(*var, n_var, "output store byte_off uses n_var");
+                assert_eq!(*stride_bytes, 128 * 2, "output n-stride = N_BLOCK × elem_bytes");
+            }
+            other => panic!("expected output StoreAsync byte_off = LinearLoop, got {other:?}"),
+        }
+
+        // CommitGroupBulk + ThreadfenceDevice + Arrive Done are AFTER N-close
+        // (one drain per Gemm, not per N tile).
+        let commit_idx = tape.instrs.iter().rposition(|i| matches!(i, Instr::CommitGroupBulk { .. })).unwrap();
+        let fence_idx = tape.instrs.iter().rposition(|i| matches!(i, Instr::ThreadfenceDevice { .. })).unwrap();
+        let arrive_idx = tape.instrs.iter().rposition(|i| matches!(i, Instr::PageBarrierArrive { kind: PageBarrier::Done, .. })).unwrap();
+        assert!(n_close < commit_idx && commit_idx < fence_idx && fence_idx < arrive_idx,
+            "drain (commit, fence, arrive) lives AFTER N-close once; got {n_close} < {commit_idx} < {fence_idx} < {arrive_idx}");
+        // No CommitGroupBulk inside the loops.
+        let commits_inside = tape.instrs[n_open + 1..n_close]
+            .iter()
+            .filter(|i| matches!(i, Instr::CommitGroupBulk { .. }))
+            .count();
+        assert_eq!(commits_inside, 0, "no CommitGroupBulk inside the N-loop body (would commit per-N)");
+
+        // init_rt_zero is INSIDE the N-loop body (re-init per N iter).
+        let init_inside = tape.instrs[n_open + 1..n_close]
+            .iter()
+            .filter(|i| matches!(i, Instr::InitRtZero { .. }))
+            .count();
+        assert_eq!(init_inside, 1, "init_rt_zero re-runs per N iter (lives inside N body)");
+    }
+
+    /// NK rewrite is idempotent — running the pass twice doesn't
+    /// re-rewrite (postcondition holds after first call).
+    #[test]
+    fn nk_idempotent() {
+        let mut tape = synthetic_full_gemm_tape(2048, 256);
+        split_oversized_loads_pass(&mut tape);
+        let len_after_first = tape.instrs.len();
+        split_oversized_loads_pass(&mut tape);
+        assert_eq!(tape.instrs.len(), len_after_first);
+    }
+
+    /// NK with N exactly = PAGE_COLS (n_blocks = 1) takes the K-only
+    /// path — no outer N-loop.
+    #[test]
+    fn n_equals_page_cols_takes_k_only_path() {
+        let mut tape = synthetic_full_gemm_tape(2048, 128);
+        split_oversized_loads_pass(&mut tape);
+        let loops: Vec<u32> = tape
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::ForLoopOpenConst { n, .. } => Some(*n),
+                _ => None,
+            })
+            .collect();
+        // K-only emits ONE loop (K_blocks = 16); NK would emit two.
+        assert_eq!(loops, vec![16], "K-only path: one loop with n = K_blocks = 16");
+    }
+
+    /// NK with N not divisible by PAGE_COLS panics.
+    #[test]
+    #[should_panic(expected = "not a multiple of PAGE_COLS")]
+    fn nk_non_aligned_n_panics() {
+        let mut tape = synthetic_full_gemm_tape(2048, 200);
+        split_oversized_loads_pass(&mut tape);
     }
 
     /// `max_existing_loop_var` returns `None` for an empty tape.

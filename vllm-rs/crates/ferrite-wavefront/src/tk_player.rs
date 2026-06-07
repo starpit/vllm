@@ -77,6 +77,20 @@ mod tk20 {
             crate::tk_tape::ByteOffsetExpr::RuntimePosition { arg, stride_bytes, base } => {
                 format!("({}u + a{} * {}u)", base.bytes(), arg.0, stride_bytes)
             }
+            crate::tk_tape::ByteOffsetExpr::Affine2D {
+                outer_var,
+                outer_stride_bytes,
+                inner_var,
+                inner_stride_bytes,
+                base,
+            } => format!(
+                "({}u + v{} * {}u + v{} * {}u)",
+                base.bytes(),
+                outer_var.0,
+                outer_stride_bytes,
+                inner_var.0,
+                inner_stride_bytes,
+            ),
         }
     }
 

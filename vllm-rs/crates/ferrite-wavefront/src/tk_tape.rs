@@ -3144,6 +3144,35 @@ impl Instr {
     /// witnesses. `_fence` and `_accumulate` are sealed policy
     /// witnesses (FencePolicy / AccPolicy); their const KIND erases
     /// to runtime u8 for emit (TK 2.0 template booleans).
+    // ── WGMMA shape sealed witnesses ──────────────────────────────
+    // Per `feedback_no_redundant_const_generics` +
+    // `feedback_compile_time_or_garbage` + audit findings
+    // `wgmma-shape-relation-no-where` and `wgmma-dtype-pair-unbounded`:
+    // the four wgmma_* constructors below take `(M, K, N, T_AB, T_D)`
+    // as independent generics. TK 2.0 / sm_90a has hard rules
+    // (`ops/group/mma/warpgroup.cuh:139,192,323`):
+    //
+    // - smem-smem variant: collective `M % 64 == 0`, K aligned to
+    //   `TILE_ROW_DIM` (16 for bf16), N aligned to `TILE_COL_DIM` (8).
+    // - rt-A variant: per-warp `M_PER_WARP * 4 == collective_M`, with
+    //   the same K/N rules.
+    // - bf16 → fp32 is the only T_AB/T_D combo with current consumers
+    //   (Llama-3.2-1B Gemm + AttnDecode QKt/Sv).
+    //
+    // The sealed `WgmmaShape` marker below is impl'd ONLY for the
+    // `(M, K, N, T_AB, T_D)` tuples ferrite-wavefront actually emits.
+    // A wrong-shape Wgmma instantiation (e.g.,
+    // `wgmma_mma_ab_smem_smem::<32, 32, 32, Fp32, Fp32, ...>`) is
+    // now `error[E0277]: ... WgmmaShape ... not satisfied` at rustc
+    // time, NOT an nvcc/ptxas template-instantiation error or worse,
+    // a silently-wrong M-shard distribution at runtime.
+    //
+    // Adding a new legal combo is a one-line `impl WgmmaShape for
+    // WgmmaSmemSmemShape<M, K, N, T_AB, T_D> {}` here. The substrate-
+    // shape validity check happens at the impl site, not at the call
+    // site. Per `feedback_no_speculative_witnesses` only the consumed
+    // combos are sealed today.
+
     pub(crate) fn wgmma_mma_ab_smem_smem<
         const M: usize,
         const K: usize,
@@ -3160,7 +3189,10 @@ impl Instr {
         _fence: F,
         _accumulate: AC,
         _width: GroupWidth<4>,
-    ) -> Self {
+    ) -> Self
+    where
+        WgmmaSmemSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+    {
         Self::WgmmaMmaAB_SmemSmem {
             a_page: a.page(),
             b_page: b.page(),
@@ -3193,7 +3225,10 @@ impl Instr {
         _fence: F,
         _accumulate: AC,
         _width: GroupWidth<4>,
-    ) -> Self {
+    ) -> Self
+    where
+        WgmmaRegSmemShape<M_PER_WARP, K, N, T_AB, T_D>: WgmmaShape,
+    {
         Self::WgmmaMmaABt_RegSmem {
             a: a.slot(),
             b_page: b.page(),
@@ -3275,7 +3310,10 @@ impl Instr {
         _fence: F,
         _accumulate: AC,
         _width: GroupWidth<4>,
-    ) -> Self {
+    ) -> Self
+    where
+        WgmmaSmemSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+    {
         Self::WgmmaMmaABt_SmemSmem {
             a_page: a.page(),
             b_page: b.page(),
@@ -3306,7 +3344,10 @@ impl Instr {
         _fence: F,
         _accumulate: AC,
         _width: GroupWidth<4>,
-    ) -> Self {
+    ) -> Self
+    where
+        WgmmaRegSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+    {
         Self::WgmmaMmaAB_RegSmem {
             a: a.slot(),
             b_page: b.page(),
@@ -4035,6 +4076,72 @@ impl Instr {
     }
 
 }
+
+// ── WGMMA shape sealed witness ──────────────────────────────────────
+//
+// See the comment block above the `wgmma_mma_ab_smem_smem` constructor
+// (in the `impl Instr {}` block) for the rationale. This block defines
+// the witness types + sealed marker trait + the legal-tuple impls.
+
+/// Phantom witness type identifying a `wgmma_mma_*_smem_smem` shape
+/// tuple `(M, K, N, T_AB, T_D)`. Construction is impossible (no
+/// fields, sealed via the `Sealed` supertrait of `WgmmaShape`); only
+/// used as a type-level argument to the `where` bound on each
+/// `wgmma_*_smem_smem` constructor.
+pub struct WgmmaSmemSmemShape<
+    const M: usize,
+    const K: usize,
+    const N: usize,
+    T_AB: TileDtype,
+    T_D: TileDtype,
+> {
+    _marker: PhantomData<(fn() -> T_AB, fn() -> T_D)>,
+}
+
+/// Phantom witness for `wgmma_mma_*_reg_smem` shape tuples. The first
+/// parameter is `M_PER_WARP` (per-warp register-tile rows); collective
+/// M is `4 * M_PER_WARP`.
+pub struct WgmmaRegSmemShape<
+    const M_PER_WARP: usize,
+    const K: usize,
+    const N: usize,
+    T_AB: TileDtype,
+    T_D: TileDtype,
+> {
+    _marker: PhantomData<(fn() -> T_AB, fn() -> T_D)>,
+}
+
+mod wgmma_shape_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed marker — `(M, K, N, T_AB, T_D)` is a TK 2.0 sm_90a-legal
+/// WGMMA shape combo. Impl'd ONLY for the tuples ferrite-wavefront
+/// actually uses today (per `feedback_no_speculative_witnesses`).
+/// A wrong-shape constructor call is `error[E0277]: ... WgmmaShape
+/// ... not satisfied`, NOT an nvcc/ptxas error or runtime garbage.
+pub trait WgmmaShape: wgmma_shape_sealed::Sealed {}
+
+// ── Smem-smem legal combos ──────────────────────────────────────────
+
+// `(M=128, K=128, N=128, Bf16, Fp32)` — collective M=128 warpgroup
+// matmul. Used by ferrite-wavefront tests today (the lowerer routes
+// through the rt-A variant for AttnDecode K@V; future GemmTile
+// emits would land here).
+impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<128, 128, 128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaSmemSmemShape<128, 128, 128, Bf16, Fp32> {}
+
+// `(M=64, K=128, N=128, Bf16, Fp32)` — collective M=64 warpgroup
+// matmul. m64 is the minimum collective M for WGMMA.
+impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<64, 128, 128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaSmemSmemShape<64, 128, 128, Bf16, Fp32> {}
+
+// ── Reg-smem legal combos ───────────────────────────────────────────
+
+// `(M_PER_WARP=32, K=128, N=128, Bf16, Fp32)` — collective M=128
+// (4 warps × 32 rows). Used by AttnDecode P@V and similar.
+impl wgmma_shape_sealed::Sealed for WgmmaRegSmemShape<32, 128, 128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaRegSmemShape<32, 128, 128, Bf16, Fp32> {}
 
 // ── Witness handles surfacing tape-side dataflow ────────────────────
 

@@ -1,158 +1,254 @@
-# Handoff — ff-subtile worktree, post-iter-3 audit + split_oversized_loads_pass phase 1
+# Handoff — ff-subtile worktree, post-phase-2 K-tile + N-tile gap
 
 ## Where to work
 
 - **Worktree:** `/Users/nickm/git/vllm/.claude/worktrees/ff-subtile`
 - **Branch:** `worktree-ff-subtile`
 - **Crate:** `vllm-rs/crates/ferrite-wavefront/`
-- **HEAD:** `157a3ea461` — split_oversized_loads_pass phase 1 (detect + diagnostic)
-- **Pod path:** `/home/nickm/vllm-ff-subtile/vllm-rs/` on `nick`
+- **HEAD:** `36024bc11f` — split_oversized_loads_pass phase 2 (K-loop rewrite)
+- **Pod:** `nick`, path `/home/nickm/vllm-ff-subtile/vllm-rs/`
 
-`pwd && git branch --show-current` first thing — per `memory/feedback_handoff_worktree_match.md`. The worktree branched from `feat/rust`; commits stay on `worktree-ff-subtile`.
+`pwd && git branch --show-current` first thing — per
+`memory/feedback_handoff_worktree_match.md`.
 
 ## What this session did
 
-The user asked for "sync to pod and try the launch." That surfaced a real lowering correctness bug: `emit_external_load` was attempting to TMA-load full-K weight regions (8 MB for Llama-3.2-1B's 2048×2048 projection weights, 525 MB for lm_head) into single 32 KB pages. Pre-audit, the kernel emitted these huge loads silently; runtime would have OOB'd into adjacent pages.
+Phase 2 of `split_oversized_loads_pass` landed (`36024bc11f`,
+~900 LOC + 6 tests). The pass takes the conservative lowering's
+oversized External LoadAsyncs and rewrites them, paired with their
+consumer `WgmmaMmaAB_RegSmem` matmul-emit-sequence, into a K-loop
+over 128×128 chunks. Mirrors AttnDecode_Qkt's K-loop pattern.
+Postcondition (defensive walk): every `Instr::LoadAsync.tile.byte_size()`
+is `≤ PAGE_SIZE` after the pass.
 
-Before that surfaced, the audit-fix-audit loop the user kicked off ran for three full iterations + a fourth in flight. **46 of 48 confirmed compile-time-safety findings closed.**
+110 lib tests pass on the H100 pod (104→110: +6 phase-2 tests).
 
-| Commits this session (newest → oldest) | Cluster |
-|---|---|
-| `157a3ea461` | split_oversized_loads_pass phase 1 — detect + diagnostic |
-| `98dab8db7d` | validate_tk_tape pair-check for TmaExpect/LoadAsync tile drift |
-| `d69bdbea5f` | iter-3 batch (exhaustive page-instr match, runtime-shape PAGE_SIZE asserts (later removed by 157a3ea461), sv-arena cap, external-load triple — the latter reverted post-plan-re-read) |
-| `676932d739` | TmaExpect.kind sealed (REAL BUG: was arming page_done while load arrived on page_ready) + tile_type_spec swizzle parity |
-| `b43a80d5b1` | SubstratePool enum + SUBSTRATE_SWIZZLE_BYTES + static-smem accounting |
-| `7bcfb334f2` | seal LoadSpec/StoreSpec fields, FenceTag/AccTag enums, TmaExpect.tile |
-| `97da162805` | dim-role typed witnesses (M64/M128/K128/N128/MPerWarp32 + bridge MDimFor/KDimFor/NDimFor) for WgmmaShape |
-| `13c5f1ea42` | sealed WgmmaShape witness |
-| `0d0c0f0dcd` | sealed ArrivalCount enum + PageBarrier-driven semaphore emit |
-| `40a92f70c3` | seal SmemTileId::from_page (PageSubTileShape/ActSubTileShape sealed markers) + TileShape boundary harden |
-| `63722522cb` | substrate / DYN_SMEM compile-time witness chain (PageTileSpec, ActTileSpec, byte_size, st_type_literal helper, HOPPER_MAX_DYN_SMEM_BYTES const_assert; NUM_PAGES=5/NUM_ACT_PAGES=4 to fit Hopper) |
-| `1f7771146a` | page_coalesce_pass — second §6.5 optimizer pass |
-| `70e4bdda7b` | phase A step 8 — pod nvcc compile passes (sm_90a) |
+## What this session uncovered
 
-102→104 lib tests pass at every commit boundary.
+The prior handoff (`35c0cb7231`) said:
 
-## State right now
+> N-tiling beyond a single 128-col page is a separate transform
+> (not in this pass; M=N=128 is the only case the conservative
+> lowering produces today).
 
-The conservative lowering produces a `Instr::LoadAsync` with `tile.byte_size() = 8388608` for Llama-3.2-1B's q_proj/k_proj/v_proj weights. The new `split_oversized_loads_pass` (phase 1) detects this at codegen time and panics with full diagnostic:
+That assumption was wrong about the production state. Driving
+ferrite-model-llama's proc-macro on the pod (`FERRITE_WAVEFRONT=1
+FERRITE_MODELS=llama-3.2-1b cargo build`) hits the pass's N>128
+compile-time guard before any K-tile rewrite can fire:
 
 ```
-split_oversized_loads_pass [phase 1 detect-only]:
-Instr::LoadAsync at instr-index 16 has tile 2048×2048×2B = 8388608 bytes,
-exceeds PAGE_SIZE = 32768 bytes. dst_page=1, barrier_page=1, src_arg=3.
+[wavefront] llama-3.2-1b: 244 fuf tiles, 115 subgraphs → 181 sources
+  (146 weights, 32 prefix-kv), 258 ops; ops [..., ("Gemm", 113), ...]
+error: custom attribute panicked
+  --> crates/ferrite-model-llama/src/lib.rs:14:1
+  = help: message: split_oversized_loads_pass: B operand tile.cols = 2048,
+                   expected 128. N-tiling beyond a single 128-col page is
+                   a separate transform (not in this pass).
 ```
 
-The .cu cannot be regenerated until phase 2 (the actual rewrite) lands. **Phase 2 is the blocker for "actually launch the kernel on Hopper."**
+The conservative lowering for Llama-3.2-1B produces ONE `SubOp::MatmulTile`
+per logical Linear (113 Gemms total = 7×16 + lm_head), with **full**
+`TensorRegion`s on both sides:
 
-The substrate itself is sound:
-- 5 page_buf + 4 act_buf + sealed semaphore arrays = 224 KB ≤ Hopper's 228 KB (verified by const_assert at compile time)
-- 102→104 lib tests + 22 doctests pass
-- 46/48 audit findings closed; 2 deferred per `feedback_no_speculative_witnesses`
-- The previous "phase A step 8 — pod nvcc compile passes" milestone (`70e4bdda7b`) is invalidated by the iter-3 PAGE_SIZE / TmaExpect-barrier-kind / tile_type_spec-swizzle fixes — the .cu it produced was syntactically clean but would have OOB'd at runtime. The fixes since then make the .cu actually correct *once phase 2 lands*.
+| Operand | shape | bytes | status |
+|---|---|---|---|
+| A (act): | M × K_full = 128 × 2048 | 512 KB | oversized along K |
+| B (weight, q_proj): | K_full × N = 2048 × 2048 | 8 MB | oversized along **both** K and N |
+| Output: | M × N = 128 × 2048 | 512 KB | oversized along N |
 
-## Phase 2: the actual rewrite
+`partition.rs::lower_partitioned` is NOT in the path that produces
+the SubtileIR for Llama (the `[wavefront]` log shows 113 Gemm nodes,
+not 113×n_blocks). One Gemm SubOp per Linear, full output.
 
-This is the work to unblock the launch. ~400 LOC + tests. Mirror `passes/page_coalesce.rs` shape.
+**The K-tile machinery in phase 2 is correct and tested.** But
+launching the kernel needs the M/N-tiling sibling pass to land
+first, otherwise the N>128 guard panics before K-tile ever fires.
 
-### Algorithm
+## Phase 3: N-tile (and M-tile) sibling pass
 
-For each `Instr::LoadAsync(spec)` where `spec.tile.byte_size() > PAGE_SIZE`:
+This is the next blocker for the kernel launch.
 
-1. **Walk forward to identify the consuming MatmulTile-emit-sequence.** The lowering's MatmulTile arm emits this fixed shape:
-   ```
-   init_rt_zero(rt_d)
-   load_shmem_to_reg_warpgroup(a_page → rt_a)
-   wgmma_fence_acc(rt_d)
-   wgmma_mma_ab_reg_smem(rt_d, rt_a, b_page, FenceExternal, AccReset, W4)
-   wgmma_async_wait(0)
-   store_reg_tile_to_shmem_warpgroup(rt_d → dst_page)
-   ```
-   The big LoadAsync's `dst_page` is either `a_page` or `b_page` for the next MatmulTile-sequence in tape order. Walk forward to find that sequence.
+### What needs to happen architecturally
 
-2. **Find the matching second LoadAsync.** Both A and B operands are likely big; both need K-fragmenting in lockstep. The other operand's LoadAsync is the next LoadAsync in tape order before the matmul sequence (the lowering emits `resolve_input_page` for A then B before the matmul).
+Each oversized Gemm needs to become an OUTER N-loop wrapping the
+existing inner K-loop (which `split_oversized_loads_pass` already
+emits). The output store needs to be folded into the N-loop body.
 
-3. **Compute K-block count.** A is `M × K_full`; B is `K_full × N`. K_block = TK 2.0 WGMMA bf16 K (= 128). K_blocks = `K_full / 128`. Both A.cols and B.rows agree on K_full.
+Sketch:
 
-4. **Compute per-K-block byte strides.** Both LoadSpecs have `byte_off: ByteOffsetExpr`; for the rewrite, replace each with `ByteOffsetExpr::LinearLoop { var, stride_bytes, base }` where:
-   - A's K-stride: K-chunk along cols of an M×K_full row-major tile = `K_block × elem_bytes` (= `128 × 2 = 256` for bf16).
-   - B's K-stride: K-chunk along rows of a K_full×N row-major tile = `K_block × N × elem_bytes` (= `128 × N × 2`).
-   - `base` is the LoadSpec's existing `byte_off` (preserved as the iter-0 base).
-   - `var` is a fresh `LoopVarId` minted at the rewrite site (use `tape.alloc_loop_var()` or equivalent).
+```text
+BarrierInit a_page Ready One
+BarrierInit b_page Ready One
+ForLoopOpenConst { n_var, n: N_blocks }    ← N_full / 128
+  init_rt_zero(rt_d)                       ← re-init per N tile
+  ForLoopOpenConst { k_var, n: K_blocks }
+    TmaExpect A_page                       ← A independent of n_var
+    LoadAsync A chunk LinearLoop(k_var, stride_A_k)
+    TmaExpect B_page
+    LoadAsync B chunk LinearLoop(k_var, stride_B_k)  + LinearLoop(n_var, stride_B_n)
+    PageBarrierWaitLoopStart0 A k_var
+    PageBarrierWaitLoopStart0 B k_var
+    load_shmem_to_reg(A_page, rt_a)
+    wgmma_fence_acc(rt_d)
+    wgmma_mma_ab_reg_smem(...AccAccumulate, FenceExternal)
+    wgmma_async_wait(0)
+  ForLoopClose { k_var }
+  store_reg_tile_to_shmem_warpgroup(rt_d, dst_page)
+  StoreAsync dst_page → output, byte_off = LinearLoop(n_var, stride_out_n)
+ForLoopClose { n_var }
+CommitGroupBulk
+ThreadfenceDevice
+PageBarrierArrive Done dst_page             ← arrive ONCE, not per N tile
+```
 
-5. **Splice in the rewrite.** Replace the `[LoadAsync_A, LoadAsync_B, ...MatmulTile-emit-sequence]` span with:
-   ```
-   init_rt_zero(rt_d, ...)                                    // unchanged
-   BarrierInit{page_id: A_page, kind: Ready, count: One}      // NEW
-   BarrierInit{page_id: B_page, kind: Ready, count: One}      // NEW
-   ForLoopOpenConst { var, n: K_blocks }                      // NEW
-     TmaExpect{barrier_page: A_page, kind: Ready, tile: A_chunk}  // NEW per iter
-     LoadAsync{spec: A_chunk_spec with LinearLoop byte_off}   // REPLACES big LoadAsync_A
-     TmaExpect{barrier_page: B_page, kind: Ready, tile: B_chunk}  // NEW per iter
-     LoadAsync{spec: B_chunk_spec with LinearLoop byte_off}   // REPLACES big LoadAsync_B
-     PageBarrierWaitLoopStart0{page_id: A_page, kind: Ready, role}  // NEW
-     PageBarrierWaitLoopStart0{page_id: B_page, kind: Ready, role}  // NEW
-     load_shmem_to_reg_warpgroup(a_page → rt_a)              // unchanged
-     wgmma_fence_acc(rt_d)                                   // unchanged
-     wgmma_mma_ab_reg_smem(rt_d, rt_a, b_page, FenceExternal, AccAccumulate, W4)  // FROM AccReset
-     PageBarrierArrive{page_id: A_page, kind: Done, role}    // NEW: signal A consumed
-     PageBarrierArrive{page_id: B_page, kind: Done, role}    // NEW: signal B consumed
-   ForLoopClose { var }                                      // NEW
-   wgmma_async_wait(0, W4)                                   // unchanged
-   store_reg_tile_to_shmem_warpgroup(rt_d, dst_page, ...)    // unchanged
-   ```
+### Issues that need design
 
-   `AccAccumulate` always (init_rt_zero outside the loop makes iter 0 equivalent to `AccReset + accumulate-into-zero`).
+1. **Two-variable byte offsets.** B's per-iter byte offset depends on
+   BOTH `k_var` (stride = `K_BLOCK × N_full × 2` along rows of K×N
+   row-major) AND `n_var` (stride = `N_BLOCK × 2` along cols).
+   `ByteOffsetExpr::LinearLoop` carries one `var`/`stride_bytes`
+   pair. **A new `ByteOffsetExpr::Affine2D { var_a, stride_a,
+   var_b, stride_b, base }` variant** (or similar) is required, with
+   matching player emit. Same applies to A (which only depends on
+   `k_var`, but the variant takes both for symmetry).
 
-### Subtleties to watch
+2. **Output StoreAsync needs N-loop indexing.** Currently
+   `emit_store_and_arrive` emits one `StoreAsync(dst → output)` with
+   a `ByteOffsetExpr::Const`. Inside the N-loop, the StoreAsync's
+   `byte_off` becomes `LinearLoop(n_var, stride_out_n)` and its
+   tile shape becomes `128×128` (not `128×N_full`). Use
+   `StoreSpec::new::<128, 128, Bf16>` on the typed-witness path
+   instead of `new_runtime_shape`.
 
-- **Page reuse with parity.** Each iteration overwrites A_page and B_page. The conservative pattern uses `BarrierWaitLoopStart0/Start1` for parity-alternating waits. Mirror what the AttnDecode K-loop does (see `lower_subtile_tape_to_tk_tape::SubOp::AttnDecode` arm around line 1394–1500) — it has the same producer/consumer cycle on K and V tile pages.
+3. **CommitGroupBulk / ThreadfenceDevice / Arrive-Done placement.**
+   These currently live AFTER the matmul-emit-sequence. With N
+   stores per output, you want:
+   - Inside the N-loop: nothing (the StoreAsyncs accumulate).
+   - After the N-loop close: ONE CommitGroupBulk + ThreadfenceDevice
+     + PageBarrierArrive Done.
 
-- **TmaExpect needs to be re-armed per iteration**, not just once before the loop. expect_bytes is consumed by the load. The pattern: TmaExpect → LoadAsync (drains transaction-bytes), then on the next iter the barrier is re-init'd / the next TmaExpect arms again.
+4. **Init_rt_zero placement.** The K-tile pass currently emits
+   `init_rt_zero` ONCE outside the loop. With N-tiling, it needs
+   to be re-issued per N iter (each output tile gets a fresh
+   accumulator).
 
-- **The lowering of MatmulTile already does this for AttnDecode K-loop.** Look at how `lower_subtile_tape_to_tk_tape.rs:~1394–1500` does the K-loop body for AttnDecode — that's the closest existing pattern for a per-iter (TmaExpect, LoadAsync, Wait, Compute, Arrive) cycle. The K-tile pass for Gemm should produce structurally the same shape.
+5. **M-tile.** For workloads `[1024, 2048, 4096]` in the macro spec,
+   M = workload exceeds PAGE_ROWS = 128. M-tiling adds a third
+   outermost loop. Defer to a follow-up if not blocking — the smaller
+   workloads (which compile to separate kernels per the
+   `workloads = [1, 2, 4, 8, 64, 512, 1024, 2048, 4096]` spec) hit
+   N-tile first.
 
-- **`ByteOffsetExpr::LinearLoop` field-construction.** The const-generic `linear_loop::<STRIDE>(var, ByteStride::NEW, base)` constructor requires STRIDE as a const. In the pass, stride is computed at tape-runtime (depends on `spec.tile.cols`). Use field-literal construction: `ByteOffsetExpr::LinearLoop { var, stride_bytes, base }`. Fields are `pub(crate)` so the pass module can construct directly.
+### Where to land it
 
-- **The pass postcondition** added to `validate_tk_tape`: `for every Instr::LoadAsync, spec.tile.byte_size() <= PAGE_SIZE`. Add the new validation arm and a matching `TkValidationError` variant.
+**Recommendation:** New sibling pass file
+`crates/ferrite-wavefront/src/passes/n_tile_loads.rs` that runs
+**before** `split_oversized_loads_pass` in the §6.5 pipeline (line
+570 of `lower_subtile_tape_to_tk_tape.rs`):
 
-- **Test coverage.** Mirror `passes/page_coalesce.rs` test shape — synthetic tape with one big LoadAsync + matmul-sequence; assert post-pass shape includes `ForLoopOpenConst`, K_blocks-many small LoadAsyncs, etc.
+```rust
+crate::passes::n_tile_loads_pass(&mut out);     // NEW — runs first
+validate_tk_tape(&out).expect("n_tile_loads_pass: invalid TkTape");
 
-### What NOT to do
+crate::passes::split_oversized_loads_pass(&mut out);  // existing K-tile
+validate_tk_tape(&out).expect("split_oversized_loads_pass: invalid TkTape");
+```
 
-- **Don't push K-tiling into SubtileIR.** The user explicitly rejected that direction (3× restated "isn't this a TkTape→TkTape transformation?"). The plan §0 says SubtileIR is target-agnostic; K=128 is a TK 2.0 / Hopper specific number.
+The N-tile pass produces `N_blocks` MatmulTile-emit-sequences each
+with B region `K_full × 128` (still oversized along K → 512 KB), and
+the K-tile pass then chunks each of those into 128×128.
 
-- **Don't pattern-match too aggressively.** The pass works on a CLEAR pattern: big LoadAsync followed (in tape order, after possibly some intervening Instrs from the second External resolve) by a MatmulTile-emit-sequence. If the pattern doesn't match, leave the LoadAsync alone (the validator postcondition will fail and codegen-time-error). Don't try to handle non-matmul big loads in this pass.
+Pass shape mirrors `split_oversized_loads.rs`:
 
-- **Don't add a `debug_assert!` PAGE_SIZE check anywhere.** Per `feedback_compile_time_or_garbage`, the pass IS the gate. The construction-time asserts in `LoadSpec::new_runtime_shape`/`StoreSpec::new_runtime_shape` were removed in `157a3ea461` for exactly this reason — they pre-empted the pass.
+- Walk the tape, find Gemm-emit-sequences whose B operand has
+  `tile.cols > PAGE_COLS`.
+- For each, splice the (LoadAsyncs + matmul-emit-sequence + StoreAsync
+  + commit + fence + arrive) span with an N-loop wrapping a copy of
+  the inner sequence per N iter.
+- Same compile-time invariants (typed const-generic witnesses, sealed
+  enums, where-clauses) per `feedback_ff_subtile_compile_time_inviolable`.
+
+### Estimated scope
+
+~600 LOC + tests. Complexity comes from:
+
+- The `Affine2D` byte-offset variant and its player emit.
+- The output StoreAsync rewrite (needed once for the byte_off, once
+  for the tile shape, once for the typed `new` constructor).
+- The CommitGroupBulk / Arrive-Done batching across N iters.
+
+The K-tile sibling already proves the pattern (~900 LOC + 6 tests
+on the same kind of synthetic tape harness). N-tile is structurally
+similar but has the extra wrinkle of the output store.
 
 ## Pod paths + commands
 
-- Sync: `oc --context nickm/api-fmaas-vllm-d-fmaas-res-ibm-com:6443/nickm@us.ibm.com rsync /Users/nickm/git/vllm/.claude/worktrees/ff-subtile/vllm-rs/crates/ferrite-wavefront/src/ nick:/home/nickm/vllm-ff-subtile/vllm-rs/crates/ferrite-wavefront/src/`
-- Force regen on pod: `oc --context ... rsh nick bash -c 'cd /home/nickm/vllm-ff-subtile/vllm-rs && cargo clean -p ferrite-forward-macro -p ferrite-model-llama && FERRITE_WAVEFRONT=1 FERRITE_MODELS=llama-3.2-1b cargo build -p ferrite-model-llama --features cuda'`
-- Inspect emitted .cu: `~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu`
-- nvcc compile: `nvcc -gencode=arch=compute_90a,code=sm_90a -std=c++20 -O3 --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr -DNDEBUG -DKITTENS_HOPPER -Xcompiler=-fPIC -Xcompiler=-fno-strict-aliasing -I third_party/thunderkittens/include -c ~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu -o /tmp/mk.o`
+Path: `/home/nickm/vllm-ff-subtile/vllm-rs/` on `nick`. Context:
+`nickm/api-fmaas-vllm-d-fmaas-res-ibm-com:6443/nickm@us.ibm.com`.
 
-## Iter-4 audit (still in flight when this handoff was written)
+Sync:
 
-The 4th iteration of the audit-fix workflow returned 9 confirmed findings. Most are minor witness-coverage gaps in the same vein as iter-2/3 cleanups (TileTypeSpec.{rows,cols,dtype} fields are `pub` should be `pub(crate)`; `wgmma_async_wait(n: u32)` should be sealed to {Zero, One, Two}; etc.). None are blocking the launch path. Triage those AFTER phase 2 lands and the kernel actually runs.
+```
+oc --context nickm/... rsync \
+  /Users/nickm/git/vllm/.claude/worktrees/ff-subtile/vllm-rs/crates/ferrite-wavefront/src/ \
+  nick:/home/nickm/vllm-ff-subtile/vllm-rs/crates/ferrite-wavefront/src/
+```
 
-The full iter-4 output is at `/private/tmp/claude-502/-Users-nickm-git-vllm--claude-worktrees-ff-subtile/779e6b2f-0507-4b8c-90c3-5424d5968068/tasks/w9oj6z4qv.output` if you want to review.
+Pod tests:
+
+```
+oc --context nickm/... rsh nick bash -c 'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
+  FERRITE_MODELS=llama-3.2-1b cargo test -p ferrite-wavefront --lib'
+```
+
+Force regen the .cu (when N-tile lands and the build no longer
+panics):
+
+```
+oc --context nickm/... rsh nick bash -c 'cd /home/nickm/vllm-ff-subtile/vllm-rs && \
+  cargo clean -p ferrite-forward-macro -p ferrite-model-llama && \
+  FERRITE_WAVEFRONT=1 FERRITE_MODELS=llama-3.2-1b \
+    cargo build -p ferrite-model-llama --features cuda'
+```
+
+Inspect emitted .cu:
+`~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu`.
+
+nvcc compile (on pod):
+
+```
+nvcc -gencode=arch=compute_90a,code=sm_90a -std=c++20 -O3 \
+  --use_fast_math --expt-extended-lambda --expt-relaxed-constexpr \
+  -DNDEBUG -DKITTENS_HOPPER -Xcompiler=-fPIC -Xcompiler=-fno-strict-aliasing \
+  -I third_party/thunderkittens/include \
+  -c ~/.cache/cudaforge/megakernels/tk_decode_full_llama_3_2_1b.cu \
+  -o /tmp/mk.o
+```
 
 ## Open tasks
 
-- #71 split_oversized_loads_pass phase 2 (the actual rewrite) — THIS IS THE BLOCKER
-- #53 RopeRotateInterleaved (Instr step, deferred)
-- 2 deferred audit findings: subtile-cols-idx-flat-u16, S4 PageId pub(crate) inner
+- **Phase 3 — n_tile_loads_pass (the actual rewrite).** Blocker for
+  the kernel launch.
+- #71 split_oversized_loads_pass phase 2 — **DONE** at `36024bc11f`.
+- #53 RopeRotateInterleaved (Instr step, deferred).
+- 2 deferred audit findings: `subtile-cols-idx-flat-u16`, S4 PageId
+  pub(crate) inner.
 
 ## What "done" looks like for the next session
 
-1. Phase 2 lands (~400 LOC + tests).
+1. `n_tile_loads_pass` lands (~600 LOC + tests). Same compile-time-
+   safety bar (typed witnesses, sealed enums) as phase 2.
 2. `cargo test -p ferrite-wavefront --lib` green.
-3. Pod regen produces a .cu.
-4. nvcc + ptxas compile the .cu cleanly.
-5. cudaFuncSetAttribute accepts the DYN_SMEM (it should: 224 KB ≤ 228 KB).
-6. The kernel actually runs (vllm bench latency or similar) and produces coherent decode output for a Llama-3.2-1B prompt.
+3. `ByteOffsetExpr::Affine2D` (or chosen variant for two-var
+   indexing) lands with the player emit.
+4. `StoreSpec::new_loop_indexed_n` (or similar) emits the per-N-tile
+   output store with typed `SmemTileSpec<128, 128, Bf16>` witness.
+5. Pod regen produces a .cu with the K-then-N nested loops.
+6. nvcc + ptxas compile cleanly.
+7. cudaFuncSetAttribute accepts the DYN_SMEM (substrate is
+   224 KB ≤ Hopper's 228 KB — verified by const_assert).
+8. The kernel actually runs (`vllm bench latency` or similar) and
+   produces coherent decode output for a Llama-3.2-1B prompt.
 
-Step 6 is the original goal the audit-fix loop was supposed to unblock. After 14+ commits worth of typed-witness work, phase 2 is the last piece between the substrate and the launch.
+Steps 1-2 alone get the next session past the panic. Steps 3-8
+unblock the original goal.

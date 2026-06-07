@@ -289,7 +289,73 @@ pub fn expand_placeholders_by_policy(
             }
             ranges
         }
+        crate::PlaceholderPolicy::BracketRepeat {
+            start_token_id,
+            end_token_id,
+        } => {
+            let mut ranges = Vec::new();
+            let mut i = 0;
+            let mut k = 0;
+            while i < token_ids.len() {
+                if token_ids[i] == marker_token_id {
+                    if k >= counts.len() {
+                        i += 1;
+                        continue;
+                    }
+                    let n = counts[k];
+                    // Replace the single marker at index `i` with
+                    // `[start, marker × N, end]` (LocateAnything:
+                    // `<img>` + `<IMG_CONTEXT>` × N + `</img>`). Total
+                    // length = N + 2. Splice positions are the N
+                    // marker tokens (offset i+1..i+1+N) — the same
+                    // positions mlx-vlm's masked scatter writes.
+                    let mut expansion: Vec<u32> = Vec::with_capacity(n + 2);
+                    expansion.push(*start_token_id);
+                    for _ in 0..n {
+                        expansion.push(marker_token_id);
+                    }
+                    expansion.push(*end_token_id);
+
+                    token_ids.splice(i..i + 1, expansion);
+                    ranges.push(vllm_common::multimodal::PlaceholderRange {
+                        offset: i + 1,
+                        length: n,
+                    });
+                    i += n + 2;
+                    k += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            ranges
+        }
     }
+}
+
+/// Replace every literal numbered image tag (`<image-1>`, `<image-23>`,
+/// …) in a chat-template-rendered prompt with `marker` (the placeholder
+/// token's text). Mirrors mlx-vlm `processing_locateanything.py`'s
+/// `re.sub(r"<image-\d+>", …)` pre-tokenization step — required for
+/// arches whose template renders numbered text instead of a marker
+/// token (see [`crate::MmMetadata::numbered_image_tag_marker`]).
+pub fn replace_numbered_image_tags(text: &str, marker: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<image-") {
+        let tail = &rest[start + "<image-".len()..];
+        let digits = tail.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 && tail.as_bytes().get(digits) == Some(&b'>') {
+            out.push_str(&rest[..start]);
+            out.push_str(marker);
+            rest = &tail[digits + 1..];
+        } else {
+            // `<image-` without `digits>` — not a tag; keep scanning.
+            out.push_str(&rest[..start + "<image-".len()]);
+            rest = tail;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -366,5 +432,40 @@ mod tests {
         assert_eq!(ranges[0].length, 3);
         assert_eq!(ranges[1].offset, 5);
         assert_eq!(ranges[1].length, 2);
+    }
+
+    #[test]
+    fn bracket_repeat_expansion() {
+        // LocateAnything: marker → [start, marker × N, end], splice at
+        // the N marker positions (mirrors mlx-vlm `<img>` +
+        // `<IMG_CONTEXT>` × N + `</img>`).
+        let policy = crate::PlaceholderPolicy::BracketRepeat {
+            start_token_id: 7,
+            end_token_id: 8,
+        };
+        let mut tokens = vec![1, 99, 2, 99, 3];
+        let ranges = expand_placeholders_by_policy(&mut tokens, 99, &[3, 2], &policy);
+        assert_eq!(tokens, vec![1, 7, 99, 99, 99, 8, 2, 7, 99, 99, 8, 3]);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].offset, 2);
+        assert_eq!(ranges[0].length, 3);
+        assert_eq!(ranges[1].offset, 8);
+        assert_eq!(ranges[1].length, 2);
+    }
+
+    #[test]
+    fn numbered_image_tags_replaced() {
+        assert_eq!(
+            replace_numbered_image_tags("a<image-1>b<image-23>c", "<M>"),
+            "a<M>b<M>c"
+        );
+        // Non-tags pass through untouched.
+        assert_eq!(
+            replace_numbered_image_tags("<image->x<image-1y><imagez>", "<M>"),
+            "<image->x<image-1y><imagez>"
+        );
+        assert_eq!(replace_numbered_image_tags("no tags", "<M>"), "no tags");
+        // Tag at string boundaries.
+        assert_eq!(replace_numbered_image_tags("<image-9>", "<M>"), "<M>");
     }
 }

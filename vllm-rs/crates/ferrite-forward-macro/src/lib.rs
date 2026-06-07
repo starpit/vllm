@@ -25,7 +25,9 @@ use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
+use syn::spanned::Spanned;
 
+mod arch_spec;
 mod ast;
 use ferrite_fusion_synth::atom;
 use ferrite_fusion_synth::atom_lib;
@@ -364,9 +366,9 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let args = parse_macro_input!(args as ForwardArgs);
-    let carrier = parse_macro_input!(item as ItemFn);
+    let carrier = parse_macro_input!(item as syn::Item);
 
-    match compile_common(&args, &carrier, CompileMode::DECODER) {
+    match parse_carrier(carrier).and_then(|c| compile_common(&args, &c, CompileMode::DECODER)) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -391,11 +393,102 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn vision_forward(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ForwardArgs);
-    let carrier = parse_macro_input!(item as ItemFn);
+    let carrier = parse_macro_input!(item as syn::Item);
 
-    match compile_common(&args, &carrier, CompileMode::VISION) {
+    match parse_carrier(carrier).and_then(|c| compile_common(&args, &c, CompileMode::VISION)) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// The macro's carrier item: either the bare `fn` form (standard
+/// arches — flat verbatim-HF harvest, no declarations) or the `mod`
+/// form, whose items the macro CONSUMES as the arch's declaration
+/// surface (see [`arch_spec`]): exactly one `fn` (the DSL body), an
+/// optional `struct Params` (the typed bound schema), and recognized
+/// `const` items (safetensors layout, rope style, decoder prefix, …).
+struct Carrier {
+    /// The DSL-bearing fn. In the `mod` form its name is
+    /// conventionally `forward`; the ARCH name comes from the mod.
+    func: ItemFn,
+    /// Arch name: mod ident (mod form) or fn ident (bare form).
+    arch_name: String,
+    /// Span for error reporting anchored at the arch's name.
+    name_span: Span,
+    /// The arch's parsed declarations. Default (empty) for the bare
+    /// `fn` form.
+    spec: arch_spec::DeclaredArchSpec,
+}
+
+fn parse_carrier(item: syn::Item) -> syn::Result<Carrier> {
+    match item {
+        syn::Item::Fn(func) => {
+            let arch_name = func.sig.ident.to_string();
+            let name_span = func.sig.ident.span();
+            Ok(Carrier {
+                func,
+                arch_name,
+                name_span,
+                spec: arch_spec::DeclaredArchSpec::default(),
+            })
+        }
+        syn::Item::Mod(m) => {
+            let arch_name = m.ident.to_string();
+            let name_span = m.ident.span();
+            let Some((_, items)) = m.content else {
+                return Err(syn::Error::new(
+                    name_span,
+                    "carrier mod must have an inline body",
+                ));
+            };
+            let mut spec = arch_spec::DeclaredArchSpec::default();
+            let mut func: Option<ItemFn> = None;
+            for it in items {
+                match it {
+                    syn::Item::Fn(f) => {
+                        if func.is_some() {
+                            return Err(syn::Error::new(
+                                f.sig.ident.span(),
+                                "carrier mod must contain exactly one fn (the DSL body)",
+                            ));
+                        }
+                        func = Some(f);
+                    }
+                    syn::Item::Struct(s) => {
+                        if s.ident != "Params" {
+                            return Err(syn::Error::new(
+                                s.ident.span(),
+                                "the only struct a carrier mod may declare is `Params`",
+                            ));
+                        }
+                        spec.parse_params_struct(&s)?;
+                    }
+                    syn::Item::Const(c) => spec.parse_const(&c)?,
+                    other => {
+                        return Err(syn::Error::new(
+                            name_span,
+                            format!(
+                                "carrier mod may only contain one fn, `struct Params`, \
+                                 and declaration consts — found {other:?}",
+                            ),
+                        ));
+                    }
+                }
+            }
+            let func = func.ok_or_else(|| {
+                syn::Error::new(name_span, "carrier mod is missing the DSL fn")
+            })?;
+            Ok(Carrier {
+                func,
+                arch_name,
+                name_span,
+                spec,
+            })
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "#[forward] / #[vision_forward] expects a fn or a mod carrier",
+        )),
     }
 }
 
@@ -457,7 +550,7 @@ impl CompileMode {
 
 fn compile_common(
     args: &ForwardArgs,
-    carrier: &ItemFn,
+    carrier: &Carrier,
     mode: CompileMode,
 ) -> syn::Result<proc_macro2::TokenStream> {
     // CARGO_MANIFEST_DIR at macro-expansion time is the invoking
@@ -471,9 +564,9 @@ fn compile_common(
         )
     })?;
     let base = std::path::PathBuf::from(manifest_dir);
-    let arch_name = carrier.sig.ident.to_string();
+    let arch_name = carrier.arch_name.clone();
     let models_dir = discover_models_dir(&base, &arch_name)
-        .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+        .map_err(|e| syn::Error::new(carrier.name_span, e))?;
 
     // `pixel_pack = path::to::fn` is OPTIONAL under VISION mode.
     // When unset, the trait's default `pixel_pack` (which delegates
@@ -484,7 +577,7 @@ fn compile_common(
     // (SigLIP raster, etc.). Decoder mode ignores the arg if set.
 
     // ── Front end: parse + classify ───────────────────────────────
-    let ast = parse::parse_block(&carrier.block)
+    let ast = parse::parse_block(&carrier.func.block)
         .map_err(|e| syn::Error::new(args.span, format!("parse: {e}")))?;
     let mut classified = classify::classify_with(&ast, mode.prelude)
         .map_err(|e| syn::Error::new(args.span, format!("classify: {e}")))?;
@@ -499,14 +592,15 @@ fn compile_common(
     let models = match mode.prelude {
         // `#[vision_forward]` configs are verbatim VL-wrapper HF
         // checkpoints; the vision loader derives the `vision_*`
-        // bound set from the nested `vision_config` block instead
-        // of the decoder's flat top-level harvest.
-        classified::Prelude::Vision => config::load_dir_vision(&models_dir),
-        _ => config::load_dir(&models_dir),
+        // bound set from the nested `vision_config` block via the
+        // carrier's declared `Params` schema instead of the
+        // decoder's flat top-level harvest.
+        classified::Prelude::Vision => config::load_dir_vision(&models_dir, &carrier.spec),
+        _ => config::load_dir(&models_dir, &carrier.spec),
     }
     .map_err(|e| {
         syn::Error::new(
-            carrier.sig.ident.span(),
+            carrier.name_span,
             format!("models_dir `{}`: {e}", models_dir.display()),
         )
     })?;
@@ -520,34 +614,28 @@ fn compile_common(
             return Ok(quote! {});
         }
         return Err(syn::Error::new(
-            carrier.sig.ident.span(),
+            carrier.name_span,
             format!("no *.json configs in {}", models_dir.display()),
         ));
     }
     let manifest = weights_manifest::load_or_empty(&models_dir).map_err(|e| {
         syn::Error::new(
-            carrier.sig.ident.span(),
+            carrier.name_span,
             format!("weights.json in {}: {e}", models_dir.display()),
         )
     })?;
 
-    // Vision-prelude programs route safetensors prefixes through
-    // the per-arch layout. Pull from the representative model;
-    // every variant of one vision arch shares the layout (only
-    // `d_model` differs across variants — the layout itself is
-    // arch-uniform). Decoder programs leave it `None`.
+    // Per-arch declarations (resolved with per-checkpoint drift in
+    // `config::resolve_arch_spec`) flow to codegen through the
+    // classified program. Pulled from the representative model —
+    // variants of one arch share the declaration; only sizes differ.
     if matches!(mode.prelude, classified::Prelude::Vision) {
-        classified.vision_layout = models[0].vision_layout.clone();
+        classified.vision_layout = models[0].arch.safetensors.clone();
     }
-    // Decoder-side safetensors-prefix override (e.g. Gemma3-MM nests
-    // the text decoder under `language_model.<...>`). Pulled from the
-    // representative model — variants of one decoder arch share the
-    // disk layout. Decoder programs that don't set the JSON field
-    // (text-only, Qwen-style VL) leave it `None`.
     if matches!(mode.prelude, classified::Prelude::Decoder) {
-        classified.decoder_safetensors_prefix = models[0].decoder_safetensors_prefix.clone();
-        classified.weight_leaf_renames = models[0].weight_leaf_renames.clone();
+        classified.decoder_safetensors_prefix = models[0].arch.decoder_prefix.clone();
     }
+    classified.weight_leaf_renames = models[0].arch.weight_leaf_renames.clone();
 
     // Shape inference may flag reshape-recoverable mismatches (e.g.
     // per-head QK-norm in Qwen3/Gemma3). Catch those, synthesize the
@@ -577,7 +665,7 @@ fn compile_common(
     #[cfg(feature = "cuda")]
     let target_profile = {
         let target_def = ferrite_cuda_targets::detect()
-            .map_err(|e| syn::Error::new(carrier.sig.ident.span(), e))?;
+            .map_err(|e| syn::Error::new(carrier.name_span, e))?;
         target::from_profile_def(target_def)
     };
 
@@ -586,7 +674,7 @@ fn compile_common(
         use ferrite_metal_kernels::device::detect_device;
         let metal_device = detect_device().ok_or_else(|| {
             syn::Error::new(
-                carrier.sig.ident.span(),
+                carrier.name_span,
                 "No Metal device detected. Metal backend requires macOS with Apple Silicon.",
             )
         })?;
@@ -1291,7 +1379,7 @@ fn compile_common(
             &hf,
             &classified,
             &library,
-            &carrier.block,
+            &carrier.func.block,
             solved.iter().map(|s| s.model),
             solved.iter().map(|s| &s.fuf),
             solved.iter().map(|s| &s.sfufs),
@@ -1398,7 +1486,7 @@ fn compile_common(
     // empty-arms early-return — but the explicit skip here makes the
     // intent visible at the call site.
     let arch_dispatch_ts = if mode.emit_arch_dispatch {
-        let arch_ident = Ident::new(&arch_name, carrier.sig.ident.span());
+        let arch_ident = Ident::new(&arch_name, carrier.name_span);
         // Hybrid (Gated-DeltaNet) arches: the per-arch
         // `FerriteWeights::gdn_runtime_config` override the worker reads
         // to size + allocate the GDN state pool. Empty for non-hybrid
@@ -1545,7 +1633,7 @@ fn compile_common(
             &hf_arches,
             &arch_dispatch_arms,
             &models_dir,
-            carrier.sig.ident.span(),
+            carrier.name_span,
             gdn_runtime_config_tokens,
         )?
     } else {

@@ -33,7 +33,12 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64],
 )]
-fn qwen3_moe() {
+mod qwen3_moe {
+    // Qwen3 sparse-MoE routers renormalize the top-k weights; configs
+    // that omit `norm_topk_prob` default it TRUE (modeling code).
+    const BOUND_DEFAULTS: &[(&str, u64)] = &[("norm_topk_prob", 1)];
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
         normed = rmsnorm(hidden_states, input_layernorm[layer]);
@@ -53,4 +58,5 @@ fn qwen3_moe() {
     }
     normed = rmsnorm(hidden_states, norm);
     logits = gemm(normed, lm_head);
+    }
 }

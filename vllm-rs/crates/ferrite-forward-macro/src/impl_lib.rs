@@ -16738,12 +16738,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         };
 
@@ -16791,12 +16786,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         };
 
@@ -16878,12 +16868,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         };
 
@@ -16988,12 +16973,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         };
 
@@ -17530,12 +17510,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         }
     }

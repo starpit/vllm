@@ -38,6 +38,7 @@ members = [
     "crates/ferrite-model-qwen2-vl",
     "crates/ferrite-model-qwen2-5-vl",
     "crates/ferrite-model-qwen3-5-vl",
+    "crates/ferrite-model-locateanything",
     "crates/ferrite-model-gemma3-mm",
     "crates/ferrite-model-qwen3",
     "crates/ferrite-model-qwen3-moe",

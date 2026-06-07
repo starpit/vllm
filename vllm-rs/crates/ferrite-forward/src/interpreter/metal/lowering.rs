@@ -4051,6 +4051,46 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── Vision standalone erf-exact GELU (LocateAnything projector) ─
+        //
+        // Same dispatch shape as `I::Gelu` above; only the kernel symbol
+        // differs (`gelu_erf` = exact erf, NOT the tanh approximation —
+        // the two flavors coexist in one model: MoonViT block MLPs use
+        // tanh, the multimodal projector uses erf).
+        I::GeluErf(in_slot, out_slot) => {
+            let n_elems = eff_m * cur_width;
+            LoweredCommand {
+                kernel: KernelId::VisionGelu,
+                library: "activation",
+                function: gelu_erf_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: {
+                    let mut d = DispatchShape::dispatch_1d(n_elems, THREADS_PER_GROUP);
+                    d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    });
+                    d
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: n_elems,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Vision pixels materialization (Qwen3.5-VL ViT prelude) ──
         //
         // Faithful to the cuda `Instruction::LoadPixels` eval (a D2D
@@ -4178,7 +4218,7 @@ fn lower_one<W: CanonicalParams>(
             let rope_cmd = |out_slot: u32, in_slot: u32| LoweredCommand {
                 kernel: KernelId::VisionRope,
                 library: "vision_rope_2d",
-                function: vision_rope_2d_static_name(W::METAL_DTYPE),
+                function: vision_rope_2d_static_name(W::METAL_DTYPE, W::VISION_ROPE_INTERLEAVED),
                 constants: consts(),
                 dispatch: dispatch(),
                 bindings: vec![
@@ -4498,12 +4538,30 @@ fn gelu_tanh_static_name(dtype: MetalDtype) -> &'static str {
     }
 }
 
-/// `vision_rope_2d.metal` host-name picker.
-fn vision_rope_2d_static_name(dtype: MetalDtype) -> &'static str {
+/// `activation.metal` `gelu_erf` host-name picker (erf-exact GELU).
+fn gelu_erf_static_name(dtype: MetalDtype) -> &'static str {
     match dtype {
-        MetalDtype::F16 => "vision_rope_2d_f16",
-        MetalDtype::Bf16 => "vision_rope_2d_bf16",
-        MetalDtype::Int4 => panic!("vision_rope_2d: Int4 unsupported (vision tower is bf16/f16)"),
+        MetalDtype::F16 => "gelu_erf_f16",
+        MetalDtype::Bf16 => "gelu_erf_bf16",
+        MetalDtype::Int4 => {
+            panic!("gelu_erf: Int4 unsupported (activations are bf16/f16)")
+        }
+    }
+}
+
+/// `vision_rope_2d.metal` host-name picker. `interleaved` selects the
+/// adjacent-pair (GPT-J / MoonViT) entry points over the NeoX
+/// rotate_half ones — driven by `W::VISION_ROPE_INTERLEAVED` (the
+/// `vision_rope_style` config key).
+fn vision_rope_2d_static_name(dtype: MetalDtype, interleaved: bool) -> &'static str {
+    match (dtype, interleaved) {
+        (MetalDtype::F16, false) => "vision_rope_2d_f16",
+        (MetalDtype::Bf16, false) => "vision_rope_2d_bf16",
+        (MetalDtype::F16, true) => "vision_rope_2d_interleaved_f16",
+        (MetalDtype::Bf16, true) => "vision_rope_2d_interleaved_bf16",
+        (MetalDtype::Int4, _) => {
+            panic!("vision_rope_2d: Int4 unsupported (vision tower is bf16/f16)")
+        }
     }
 }
 

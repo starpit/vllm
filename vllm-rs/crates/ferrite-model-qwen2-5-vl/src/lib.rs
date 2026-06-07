@@ -59,11 +59,76 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     chat_template_image_part_type: "image",
     placeholder_policy: ferrite_vision::PlaceholderPolicy::RepeatMarker,
     mrope_positions: true,
+    numbered_image_tag_marker: None,
 };
 
 #[cfg(feature = "cuda")]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
-fn qwen2_5_vl() {
+mod qwen2_5_vl {
+    /// Qwen2.5-VL vision tower params — field name = the bound name the
+    /// DSL / weights.json reference; `#[from]` paths index the VERBATIM
+    /// HF config.json's nested `vision_config` block (configs/ carry it
+    /// byte-for-byte). Embed dim is spelled `hidden_size` (not Qwen2-VL's
+    /// `embed_dim`); the SwiGLU MLP width is `intermediate_size`, zero-
+    /// padded to the next multiple of 8 for the cuBLAS bf16 GEMM K
+    /// (`__pad_to_mult8__` in weights.json). The block MLP weights key
+    /// off `vision_intermediate_size_padded`, so — matching the legacy
+    /// derivation — no `vision_mlp_hidden` bound is declared.
+    struct Params {
+        #[from = "vision_config.hidden_size"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.depth"]
+        vision_depth: u64,
+        #[from = "vision_config.num_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.in_chans"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_merge_factor"]
+        vision_merge_hidden: u64,
+        #[expr = "vision_head_dim / 2"]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.intermediate_size"]
+        vision_intermediate_size: u64,
+        #[expr = "(vision_intermediate_size + 7) / 8 * 8"]
+        vision_intermediate_size_padded: u64,
+        #[from = "vision_config.window_size"]
+        vision_window_size: u64,
+        #[from = "vision_config.out_hidden_size"]
+        d_model: u64,
+    }
+
+    /// Qwen2.5-VL vision blocks hardcode 1e-6 (transformers / mlx-vlm);
+    /// the flat `vision_norm_eps` override wins when present. (Macro
+    /// default is 1e-6 — declared here for the record.)
+    const NORM_EPS: f64 = 1e-6;
+    const SAFETENSORS: Layout = Layout {
+        root: "visual",
+        blocks: "blocks",
+        subtrees: &[],
+    };
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "visual.merger.mlp.2.weight",
+        dim: 0,
+    };
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "visual.patch_embed.proj.weight",
+        leading_dim: 0,
+        channels_last: false,
+    };
+
+    fn forward() {
     hidden_states = gemm(pixels, patch_embed.proj);
 
     // Window-permute hidden_states at S² (= vision_merge_factor) row
@@ -119,4 +184,5 @@ fn qwen2_5_vl() {
     projected = gemm(mlp0, merger.mlp_2);
     projected = bias_add(projected, merger.mlp_2.bias);
     out = embedding_gather(projected, reverse_indices);
+    }
 }

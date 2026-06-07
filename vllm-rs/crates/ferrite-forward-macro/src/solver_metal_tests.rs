@@ -46,6 +46,8 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
+            arch: Default::default(),
+            torch_dtype: None,
         };
         params.bounds.insert("num_hidden_layers".into(), 1);
         params.bounds.insert("hidden_size".into(), 4096);

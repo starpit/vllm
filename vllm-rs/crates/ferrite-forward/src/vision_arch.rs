@@ -182,6 +182,17 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         );
 
         let half_rot = cfg.half_rot();
+        // GUARD: the CUDA `vision_rope_apply` kernel hardwires NeoX
+        // rotate_half pairing; an interleaved-style tower (MoonViT /
+        // LocateAnything) would consume the interleaved cos/sin table
+        // with the wrong pairing and produce silently-wrong activations.
+        // Only the metal `vision_rope_2d_interleaved` kernel is ported.
+        #[cfg(all(feature = "cuda", not(feature = "metal")))]
+        assert!(
+            cfg.rope_style == ferrite_vision::VisionRopeStyle::NeoxHw,
+            "vision rope style {:?} is not ported to the CUDA backend",
+            cfg.rope_style,
+        );
         let (cos_host, sin_host) = cfg.build_rope_cos_sin_bf16(&grid_thw, total_l);
 
         let (cu_seqlens_host, max_seqlen) = build_cu_seqlens_i32(&grid_thw);
@@ -274,7 +285,14 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         // to the mlx-vlm golden in the vl crate's green-gate test.
         let pos_embeds_buf: Option<GpuTensor> = self.pos_embed_table.as_ref().map(|(table, ng)| {
             let embed_dim = cfg.embed_dim as usize;
-            let pe_f32 = cfg.fast_pos_embed_interpolate(&grid_thw, *ng, table, total_l);
+            let pe_f32 = match cfg.pos_emb_interp {
+                ferrite_vision::PosEmbInterp::Bilinear => {
+                    cfg.fast_pos_embed_interpolate(&grid_thw, *ng, table, total_l)
+                }
+                ferrite_vision::PosEmbInterp::Bicubic => {
+                    cfg.bicubic_pos_embed_interpolate(&grid_thw, *ng, table, total_l)
+                }
+            };
             let pe_bits: Vec<u16> = pe_f32
                 .iter()
                 .map(|&x| ferrite_vision::f32_to_bf16(x))

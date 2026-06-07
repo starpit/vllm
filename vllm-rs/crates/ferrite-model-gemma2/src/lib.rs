@@ -33,7 +33,17 @@ use ferrite_forward_macro::forward;
     workloads = [1, 8, 64, 512, 4096],
     sk_buckets = [128, 512, 2048, 8192],
 )]
-fn gemma2() {
+mod gemma2 {
+    // Gemma2 alternates sliding/global attention every other layer;
+    // the checkpoint configs omit the cadence field, so default the
+    // compressed `layer % pattern == remainder` form the DSL needs.
+    const BOUND_DEFAULTS: &[(&str, u64)] =
+        &[("sliding_window_pattern", 2), ("sliding_window_global_remainder", 1)];
+    // Gemma ties embed_tokens ⟷ lm_head (HF modeling default TRUE;
+    // checkpoints ship no lm_head.* on disk). Explicit json wins.
+    const TIE_DEFAULT: bool = true;
+
+    fn forward() {
     // Gemma scales embeddings by sqrt(hidden_size) — matches vllm
     // Python `hidden_states *= self.normalizer` (layernorm.py line
     // 304) and hand-written `kernels::scale_inplace(hidden_states,
@@ -87,4 +97,5 @@ fn gemma2() {
     normed = rmsnorm(hidden_states, norm + 1.0);
     logits = gemm(normed, lm_head);
     capped = tanh_softcap(logits);
+    }
 }

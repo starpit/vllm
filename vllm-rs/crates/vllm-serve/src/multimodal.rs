@@ -178,6 +178,23 @@ impl ResolvedMmProcessor {
                     });
                 from_file.unwrap_or((default_min_pixels, default_max_pixels))
             }
+            // `max_pixels` carries the PATCH cap for this policy
+            // (LocateAnything `in_token_limit`, counted in raw
+            // patch_size² patches, not pixels). Read from
+            // `preprocessor_config.json::in_token_limit`; fall back to
+            // the declared default.
+            SizePolicy::PatchCapCeilPad {
+                default_max_patches,
+                ..
+            } => {
+                let from_file = model_dir
+                    .map(|dir| dir.join("preprocessor_config.json"))
+                    .and_then(|p| std::fs::read_to_string(&p).ok())
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("in_token_limit").and_then(|x| x.as_u64()))
+                    .map(|v| v as usize);
+                (0, from_file.unwrap_or(default_max_patches))
+            }
             SizePolicy::FixedSquare => (0, 0),
         };
 
@@ -206,6 +223,28 @@ impl ResolvedMmProcessor {
                 self.min_pixels,
                 self.max_pixels,
             ),
+            // mlx-vlm `image_processing_locateanything.py::rescale`:
+            // downscale-only patch cap (`scale = sqrt(limit/patches)`,
+            // dims truncated), then CEIL each dim to a multiple of
+            // `pad_multiple` (= patch · merge = 28). `self.max_pixels`
+            // carries the patch limit for this policy.
+            SizePolicy::PatchCapCeilPad {
+                patch,
+                pad_multiple,
+                ..
+            } => {
+                let p = (patch as usize).max(1);
+                let patches = (src_h / p) * (src_w / p);
+                let limit = self.max_pixels;
+                let (mut nh, mut nw) = (src_h, src_w);
+                if limit > 0 && patches > limit {
+                    let scale = ((limit as f64) / (patches as f64)).sqrt();
+                    nh = ((src_h as f64) * scale) as usize;
+                    nw = ((src_w as f64) * scale) as usize;
+                }
+                let m = (pad_multiple as usize).max(1);
+                (nh.max(1).div_ceil(m) * m, nw.max(1).div_ceil(m) * m)
+            }
         }
     }
 

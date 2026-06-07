@@ -1,0 +1,4 @@
+{
+  "_comment": "nvidia/LocateAnything-3B text decoder (stock Qwen2.5-3B): the VL wrapper nests it under language_model.* on disk. The base locateanything-3b.json is the VERBATIM HF config; this sidecar carries the one ferrite-specific fact.",
+  "decoder_safetensors_prefix": "language_model"
+}

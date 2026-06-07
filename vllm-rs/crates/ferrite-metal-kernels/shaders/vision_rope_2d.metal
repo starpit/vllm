@@ -71,3 +71,63 @@ template <typename T>
 INST_VISION_ROPE_2D(f16,  half)
 INST_VISION_ROPE_2D(bf16, bfloat)
 INST_VISION_ROPE_2D(f32,  float)
+
+// --------------------------------------------------------------------------
+// Interleaved (GPT-J / "traditional") variant — MoonViT (LocateAnything).
+//
+// Faithful port of mlx-vlm `locateanything/vision.py::apply_rope`
+// (`view_as_complex` on adjacent pairs, complex multiply by freqs_cis).
+//
+// Math, for the complex pair i = d/2 of output element (t, h, d):
+//   f         = freqs[t*half + i]                  // one angle per PAIR
+//   out[2i]   = x[2i]*cos(f) - x[2i+1]*sin(f)
+//   out[2i+1] = x[2i]*sin(f) + x[2i+1]*cos(f)
+//
+// The host freqs table carries the LocateAnything interleaved x/y layout
+// (angle[2j] = x·f_j, angle[2j+1] = y·f_j, f_j = theta^(-4j/D)); the kernel
+// is layout-agnostic — it just rotates pair i by freqs[t*half + i].
+//
+// Verified == mlx-vlm golden (rope_block0_q): max_abs_err 4.8e-7, cosine 1.0
+// (numpy transcription in tools/vision_parity, LocateAnything fixtures).
+
+template <typename T>
+[[kernel]] void vision_rope_2d_interleaved(
+    device       T*     out   [[buffer(0)]],
+    const device T*     x     [[buffer(1)]],
+    const device float* freqs [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  uint D = VR_HEAD_DIM;
+  uint H = VR_NUM_HEADS;
+  if (gid >= VR_N_ELEMS) {
+    return;
+  }
+  uint hd = D / 2u;
+  uint d = gid % D;        // dim within the head
+  uint row = gid / D;      // = t*H + h
+  uint t = row / H;        // token index (for the per-token freqs row)
+
+  float f = freqs[t * hd + d / 2u];
+  float c = cos(f);
+  float s = sin(f);
+
+  float xv = float(x[gid]);
+  // adjacent-pair rotation: even lane pairs with -(odd), odd with +(even);
+  // both lanes then share the same xv*c + partner*s form.
+  bool even = (d & 1u) == 0u;
+  float partner = even ? -float(x[gid + 1u]) : float(x[gid - 1u]);
+
+  out[gid] = T(xv * c + partner * s);
+}
+
+#define INST_VISION_ROPE_2D_INTERLEAVED(dtype_tag, mtl_type)                  \
+  template [[host_name("vision_rope_2d_interleaved_" #dtype_tag)]]            \
+  [[kernel]] void vision_rope_2d_interleaved<mtl_type>(                       \
+      device       mtl_type* out   [[buffer(0)]],                            \
+      const device mtl_type* x     [[buffer(1)]],                            \
+      const device float*    freqs [[buffer(2)]],                            \
+      uint gid [[thread_position_in_grid]]);
+
+INST_VISION_ROPE_2D_INTERLEAVED(f16,  half)
+INST_VISION_ROPE_2D_INTERLEAVED(bf16, bfloat)
+INST_VISION_ROPE_2D_INTERLEAVED(f32,  float)

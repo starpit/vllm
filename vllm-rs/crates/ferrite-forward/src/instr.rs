@@ -134,6 +134,12 @@ pub trait CanonicalParams: WeightAccessors {
     /// size the copy-into-arena dispatch. Same defaults / set-by rule as
     /// [`Self::VISION_NUM_HEADS`] (0 on non-vision arches).
     const VISION_IN_FEATURES: usize = 0;
+    /// Vision 2D-RoPE pairing convention: `false` = GPT-NeoX
+    /// rotate_half (every Qwen-VL tower), `true` = adjacent-pair
+    /// GPT-J style (MoonViT / LocateAnything). Set from the optional
+    /// `vision_rope_style` config key ("interleaved_xy"); selects the
+    /// `vision_rope_2d[_interleaved]` kernel entry point at lowering.
+    const VISION_ROPE_INTERLEAVED: bool = false;
     /// Vision-tower softmax scale: `1 / sqrt(vision_head_dim)`. Same
     /// defaults / set-by rule as [`Self::VISION_NUM_HEADS`].
     const VISION_ATTN_SCALE: f32 = 0.0;

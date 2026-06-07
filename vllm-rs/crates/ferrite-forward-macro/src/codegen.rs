@@ -77,26 +77,35 @@ fn safetensors_prefix(
     let mut joined = segs.join(".");
     // DSL-leaf → disk-leaf rename (Gemma4: `self_attn.q_proj_global`
     // shares the on-disk leaf `self_attn.q_proj` with the sliding
-    // class at a different shape; the manifest needs distinct names,
-    // the checkpoint has one). Longest-suffix match on the dotted
-    // DSL path.
+    // class at a different shape; LocateAnything: the projector's
+    // `linear_1`/`linear_2` disk leaves can't be named in the DSL —
+    // a trailing `_<digit>` reads as a layer index — so
+    // `mm.proj_in`/`mm.proj_out` rename here). Longest-suffix match
+    // on the dotted DSL path, applied BEFORE the vision subtree
+    // resolution below so renamed segments flow into subtree paths.
+    let mut segs = segs;
     for (dsl_leaf, disk_leaf) in &program.weight_leaf_renames {
         if joined == *dsl_leaf {
             joined = disk_leaf.clone();
+            segs = joined.split('.').map(str::to_string).collect();
             break;
         }
         if let Some(head) = joined.strip_suffix(&format!(".{dsl_leaf}")) {
             joined = format!("{head}.{disk_leaf}");
+            segs = joined.split('.').map(str::to_string).collect();
             break;
         }
     }
     let is_vision = matches!(program.prelude, crate::classified::Prelude::Vision);
     if is_vision {
-        // Resolve the per-arch vision layout (defaults to today's
-        // hardcoded Qwen layout when the config omits the field —
-        // that path is byte-equivalent to the previous behavior).
-        let qwen_default = crate::config::VisionSafetensorsLayout::qwen_default();
-        let layout = program.vision_layout.as_ref().unwrap_or(&qwen_default);
+        // The per-arch vision layout is a REQUIRED declaration
+        // (`const SAFETENSORS` on the carrier mod) — enforced at
+        // config parse, so absence here is a compiler bug, not a
+        // config gap.
+        let layout = program
+            .vision_layout
+            .as_ref()
+            .expect("vision safetensors layout enforced at config parse");
         // Subtree override: when the DSL path's first segment maps
         // to a sibling subtree on disk, the override fully replaces
         // the `<default_root>(.<layered_subpath>.{l})?` prefix and
@@ -129,8 +138,6 @@ fn safetensors_prefix(
     // `model.<...>` / `lm_head` keys.
     let key = match (index, joined.as_str()) {
         (_, "lm_head") => "lm_head".to_string(),
-        // DeepSeek: the `moe` DSL name maps to `mlp` in HF safetensors.
-        (Some(l), "moe") => format!("model.layers.{l}.mlp"),
         (Some(l), _) => format!("model.layers.{l}.{joined}"),
         (None, _) => format!("model.{joined}"),
     };
@@ -610,7 +617,7 @@ fn plan_field_load(
         .map(|(id, idx)| {
             safetensors_prefix(
                 program,
-                model.decoder_safetensors_prefix.as_deref(),
+                model.arch.decoder_prefix.as_deref(),
                 *id,
                 *idx,
             )
@@ -1579,7 +1586,7 @@ fn emit_fingerprint_check(
     // `{dec_root}.layers.N.q_proj.weight`, and if that name doesn't
     // match what the loader actually reads, every variant rejects and
     // `try_load` returns `Ok(None)` → `ArchNotSupported`.
-    let dec_root: String = match model.decoder_safetensors_prefix.as_deref() {
+    let dec_root: String = match model.arch.decoder_prefix.as_deref() {
         None => "model".to_string(),
         Some(prefix) => {
             let prefix = prefix.trim_end_matches('.');
@@ -2372,7 +2379,7 @@ fn emit_weights_struct(
     // text-only and Qwen-style VL, `<prefix>.model` for arches whose
     // variant config sets `decoder_safetensors_prefix` (Gemma3-MM nests
     // text decoder weights under `language_model.<...>`).
-    let dec_root_for_emit: String = match model.decoder_safetensors_prefix.as_deref() {
+    let dec_root_for_emit: String = match model.arch.decoder_prefix.as_deref() {
         Some(prefix) => format!("{prefix}.model"),
         None => "model".to_string(),
     };
@@ -2531,9 +2538,9 @@ fn emit_weights_struct(
         // loader never queries and load() fails on the missing split.
         let block_prefix_template: String = if is_vision {
             let layout = model
-                .vision_layout
+                .arch.safetensors
                 .clone()
-                .unwrap_or_else(crate::config::VisionSafetensorsLayout::qwen_default);
+            .expect("vision safetensors layout enforced at config parse");
             format!("{}.{}", layout.default_root, layout.layered_subpath)
         } else {
             "model.layers".to_string()
@@ -4408,9 +4415,9 @@ fn emit_group_let(
             // .encoder.layers` (Gemma3-MM). `None` for decoder bodies.
             let vision_root_owned: Option<String> = if is_vision {
                 let layout = model
-                    .vision_layout
+                    .arch.safetensors
                     .clone()
-                    .unwrap_or_else(crate::config::VisionSafetensorsLayout::qwen_default);
+            .expect("vision safetensors layout enforced at config parse");
                 Some(format!(
                     "{}.{}",
                     layout.default_root, layout.layered_subpath
@@ -4423,7 +4430,7 @@ fn emit_group_let(
             // [`safetensors_prefix`]'s prefix handling (replace-vs-prepend),
             // or the L=0 key the loader looks up won't match this root and
             // the `layered_suffix` invariant fires.
-            let decoder_root_owned: String = match model.decoder_safetensors_prefix.as_deref() {
+            let decoder_root_owned: String = match model.arch.decoder_prefix.as_deref() {
                 None => "model.layers".to_string(),
                 Some(prefix) => {
                     let prefix = prefix.trim_end_matches('.');
@@ -6220,6 +6227,12 @@ fn emit_canonical_params_impl(
     } else {
         0.0
     };
+    // Vision 2D-RoPE pairing convention (`vision_rope_style` config
+    // key, validated at parse): absent/"neox_hw" → false (Qwen),
+    // "interleaved_xy" → true (MoonViT / LocateAnything). Selects the
+    // metal `vision_rope_2d[_interleaved]` entry point at lowering.
+    let vision_rope_interleaved =
+        matches!(model.arch.rope_style.as_deref(), Some("interleaved_xy"));
 
     // SigLIP-style patch grid side (square); zero for arches that
     // don't carry an image-tower patch grid. `Instruction::AvgPool2d`
@@ -6432,6 +6445,11 @@ fn emit_canonical_params_impl(
     let vision_attn_scale_lit = proc_macro2::Literal::f32_unsuffixed(vision_attn_scale);
     let vision_patch_grid_side_lit = proc_macro2::Literal::u32_unsuffixed(vision_patch_grid_side);
     let vision_pool_kernel_lit = proc_macro2::Literal::u32_unsuffixed(vision_pool_kernel);
+    let vision_rope_interleaved_lit = if vision_rope_interleaved {
+        quote! { true }
+    } else {
+        quote! { false }
+    };
 
     // MRoPE section override. `Some([t, h, w])` only when the
     // config carries `rope_scaling.mrope_section` (Qwen2-VL /
@@ -6576,6 +6594,7 @@ fn emit_canonical_params_impl(
             const VISION_HEAD_DIM: u32 = #vision_head_dim_lit;
             const VISION_Q_SIZE: usize = #vision_q_size_lit;
             const VISION_IN_FEATURES: usize = #vision_in_features_lit;
+            const VISION_ROPE_INTERLEAVED: bool = #vision_rope_interleaved_lit;
             const VISION_ATTN_SCALE: f32 = #vision_attn_scale_lit;
             const VISION_PATCH_GRID_SIDE: u32 = #vision_patch_grid_side_lit;
             const VISION_POOL_KERNEL: u32 = #vision_pool_kernel_lit;
@@ -8766,12 +8785,7 @@ mod tests {
             rope_scaling: None,
             rope_scaling_hash: None,
             mrope_section: None,
-            vision_layout: None,
-            weight_leaf_renames: Vec::new(),
-            vision_d_model_fingerprint: None,
-            vision_patch_embed_flatten: None,
-            vision_pos_embed_key: None,
-            decoder_safetensors_prefix: None,
+            arch: Default::default(),
             torch_dtype: None,
         }
     }
@@ -8786,7 +8800,7 @@ mod tests {
         // Llama-2-7B-ish numbers: 32 q heads, 32 kv heads,
         // head_dim=128, intermediate=11008.
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 1, false).to_string();
+        let ts = emit_canonical_params_impl(&m, 1, false, false).to_string();
         // Q size = 32 * 128 = 4096; KV size = 32 * 128 = 4096.
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 32"),
@@ -8814,7 +8828,7 @@ mod tests {
     #[test]
     fn canonical_params_at_tp_eq_2_shards_column_parallel_dims() {
         let m = shard_test_model(32, 32, 128, 11008);
-        let ts = emit_canonical_params_impl(&m, 2, false).to_string();
+        let ts = emit_canonical_params_impl(&m, 2, false, false).to_string();
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 16"),
             "tp=2 must shard NUM_Q_HEADS to 16; got {ts}"
@@ -8854,7 +8868,7 @@ mod tests {
         // Llama-3-8B-ish numbers: 32 q heads, 8 kv heads,
         // head_dim=128, intermediate=14336.
         let m = shard_test_model(32, 8, 128, 14336);
-        let ts = emit_canonical_params_impl(&m, 8, false).to_string();
+        let ts = emit_canonical_params_impl(&m, 8, false, false).to_string();
         // 32 / 8 = 4
         assert!(
             ts.contains("NUM_Q_HEADS : u32 = 4"),
@@ -9376,7 +9390,7 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
         let dir = arch_configs("deepseek-v3");
-        let configs = crate::config::load_dir(&dir).expect("load deepseek-v3 configs");
+        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3 configs");
         let manifest = crate::weights_manifest::load_or_empty(&dir)
             .expect("load deepseek-v3 weights manifest");
         // Pick a V3 variant with FP8-block quantization (block_size: Some).
@@ -9416,7 +9430,7 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_flat_q_mla_archs() {
         let dir = arch_configs("deepseek-v3-flat");
-        let configs = crate::config::load_dir(&dir).expect("load deepseek-v3-flat configs");
+        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3-flat configs");
         let manifest = crate::weights_manifest::load_or_empty(&dir)
             .expect("load deepseek-v3-flat weights manifest");
         let model = configs
@@ -9450,7 +9464,7 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
         let dir = arch_configs("qwen3");
-        let configs = crate::config::load_dir(&dir).expect("load qwen3 configs");
+        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
         let model = configs

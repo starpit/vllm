@@ -2731,7 +2731,7 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir_vision(&dir).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
             .find(|c| c.source_stem == "qwen2-vl-2b-instruct")
@@ -2800,7 +2800,7 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir_vision(&dir).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
             .find(|c| c.source_stem == "qwen2-vl-2b-instruct")

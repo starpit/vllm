@@ -46,11 +46,73 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     chat_template_image_part_type: "image",
     placeholder_policy: ferrite_vision::PlaceholderPolicy::RepeatMarker,
     mrope_positions: true,
+    numbered_image_tag_marker: None,
 };
 
 #[cfg(feature = "cuda")]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
-fn qwen2_vl() {
+mod qwen2_vl {
+    /// Qwen2-VL vision tower params — field name = the bound name the
+    /// DSL / weights.json reference; `#[from]` paths index the VERBATIM
+    /// HF config.json's nested `vision_config` block (configs/ carry it
+    /// byte-for-byte). Tower geometry uses the Qwen2-VL key spellings
+    /// (`embed_dim` / `depth` / `num_heads` / `in_chans`); MLP width is
+    /// a ratio (integer in every shipped Qwen2-VL config), so
+    /// `vision_mlp_hidden = embed · ratio`.
+    struct Params {
+        #[from = "vision_config.embed_dim"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.depth"]
+        vision_depth: u64,
+        #[from = "vision_config.num_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.in_chans"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_merge_factor"]
+        vision_merge_hidden: u64,
+        #[expr = "vision_head_dim / 2"]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.mlp_ratio"]
+        vision_mlp_ratio: u64,
+        #[expr = "vision_embed_dim * vision_mlp_ratio"]
+        vision_mlp_hidden: u64,
+        #[from = "vision_config.hidden_size"]
+        d_model: u64,
+    }
+
+    /// Qwen2-VL vision blocks hardcode 1e-6 in the modeling code
+    /// (transformers / mlx-vlm); the flat `vision_norm_eps` override
+    /// wins when present. (Macro default is 1e-6 — declared here for
+    /// the record.)
+    const NORM_EPS: f64 = 1e-6;
+    const SAFETENSORS: Layout = Layout {
+        root: "visual",
+        blocks: "blocks",
+        subtrees: &[],
+    };
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "visual.merger.mlp.2.weight",
+        dim: 0,
+    };
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "visual.patch_embed.proj.weight",
+        leading_dim: 0,
+        channels_last: false,
+    };
+
+    fn forward() {
     hidden_states = gemm(pixels, patch_embed.proj);
 
     for layer in 0..vision_depth {
@@ -102,4 +164,5 @@ fn qwen2_vl() {
     mlp0 = gelu_erf(mlp0);
     out = gemm(mlp0, merger.mlp_2);
     out = bias_add(out, merger.mlp_2.bias);
+    }
 }

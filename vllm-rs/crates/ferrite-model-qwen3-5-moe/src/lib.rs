@@ -40,7 +40,18 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64],
 )]
-fn qwen3_5_moe() {
+mod qwen3_5_moe {
+    // Qwen3.5 `*RMSNorm` stores zero-centered gains (`x * (1 + w)`);
+    // ferrite keeps the on-disk form and offsets in-kernel. The
+    // sparse-MoE router renormalizes top-k weights — newer configs
+    // omit `norm_topk_prob` and the modeling code defaults it TRUE.
+    const BOUND_DEFAULTS: &[(&str, u64)] =
+        &[("rms_norm_zero_centered", 1), ("norm_topk_prob", 1)];
+    // `Qwen3_5MoeForConditionalGeneration` nests the text decoder
+    // under `language_model.*` on disk.
+    const DECODER_PREFIX: &str = "language_model";
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
         normed = rmsnorm(hidden_states, input_layernorm[layer]);
@@ -91,4 +102,5 @@ fn qwen3_5_moe() {
     }
     normed = rmsnorm(hidden_states, norm);
     logits = gemm(normed, lm_head);
+    }
 }

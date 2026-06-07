@@ -34,7 +34,15 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
 )]
-fn qwen3_5() {
+mod qwen3_5 {
+    // Qwen3.5 `*RMSNorm` stores zero-centered gains (`x * (1 + w)`);
+    // ferrite keeps the on-disk form and offsets in-kernel.
+    const BOUND_DEFAULTS: &[(&str, u64)] = &[("rms_norm_zero_centered", 1)];
+    // All Qwen3.5 checkpoints are `Qwen3_5*ForConditionalGeneration`
+    // wrappers nesting the text decoder under `language_model.*`.
+    const DECODER_PREFIX: &str = "language_model";
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
         normed = rmsnorm(hidden_states, input_layernorm[layer]);
@@ -78,4 +86,5 @@ fn qwen3_5() {
     }
     normed = rmsnorm(hidden_states, norm);
     logits = gemm(normed, lm_head);
+    }
 }

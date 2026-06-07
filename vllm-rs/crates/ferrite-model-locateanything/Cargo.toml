@@ -1,0 +1,27 @@
+[package]
+name = "ferrite-model-locateanything"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Ferrite LocateAnything-3B vision tower (MoonViT; text decoder is the stock Qwen2.5 in ferrite-model-qwen2)"
+
+[features]
+default = []
+cuda = ["ferrite-cuda-core/cuda", "ferrite-kernels/cuda", "ferrite-forward/cuda", "ferrite-vision/cuda", "ferrite-forward-macro/cuda"]
+metal = ["ferrite-cuda-core/metal", "ferrite-kernels/metal", "ferrite-forward/metal", "ferrite-vision/metal", "ferrite-forward-macro/metal"]
+nccl = ["cuda", "ferrite-cuda-core/nccl", "ferrite-kernels/nccl", "ferrite-forward/nccl", "ferrite-vision/nccl", "ferrite-forward-macro/nccl"]
+
+[dependencies]
+ferrite-cuda-core = { path = "../ferrite-cuda-core" }
+ferrite-kernels = { path = "../ferrite-kernels" }
+ferrite-forward-macro = { path = "../ferrite-forward-macro" }
+ferrite-forward = { path = "../ferrite-forward" }
+ferrite-vision = { path = "../ferrite-vision" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+half = { workspace = true }
+
+# macOS-only test dep for the metal vision green-gate (`src/lib.rs`
+# `green_gate` mod) — same pattern as ferrite-model-qwen3-5-vl.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-metal = { version = "0.3", features = ["MTLDevice"] }

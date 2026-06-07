@@ -92,6 +92,20 @@ pub struct MmMetadata {
     /// 1D positions where MRoPE was needed and image tokens collapse
     /// onto a single RoPE state.
     pub mrope_positions: bool,
+
+    /// Pre-tokenization text fix-up for arches whose chat template
+    /// renders image parts as literal NUMBERED text rather than a
+    /// special marker token. LocateAnything's template emits
+    /// `<image-1>`, `<image-2>`, … (plain text — tokenizes to several
+    /// ordinary ids); mlx-vlm's processor regex-replaces those before
+    /// tokenizing. `Some(marker)` → serve replaces every `<image-N>`
+    /// occurrence in the rendered prompt with `marker` (the marker
+    /// token's literal text, e.g. `"<IMG_CONTEXT>"`), which then
+    /// tokenizes to the single placeholder id that
+    /// [`Self::placeholder_policy`] expands. `None` for every arch
+    /// whose template already renders a real marker token (Qwen-VL
+    /// `<|image_pad|>`, Gemma3 `<start_of_image>`).
+    pub numbered_image_tag_marker: Option<&'static str>,
 }
 
 /// Token-id expansion + splice-position policy.
@@ -113,6 +127,17 @@ pub enum PlaceholderPolicy {
         /// encodes `\n\n` as a single special token, id 108). One
         /// instance lands before the boi and one after the eoi.
         wrap_token_id: u32,
+    },
+    /// LocateAnything / MoonViT expansion: marker (`<IMG_CONTEXT>`) →
+    /// `[start, marker × N, end]` (`<img>` … `</img>`). Splice at the
+    /// N marker positions. Mirrors mlx-vlm
+    /// `processing_locateanything.py` (`<image-K>` →
+    /// `"<img>" + "<IMG_CONTEXT>" * ((h/2)·(w/2)) + "</img>"`); the
+    /// model was trained with the bracket sentinels, so a flat
+    /// `RepeatMarker` gives garbled grounding.
+    BracketRepeat {
+        start_token_id: u32,
+        end_token_id: u32,
     },
 }
 
@@ -138,6 +163,21 @@ pub enum SizePolicy {
         factor: u32,
         default_min_pixels: usize,
         default_max_pixels: usize,
+    },
+    /// LocateAnything / MoonViT: if `(w/patch)·(h/patch) > max_patches`,
+    /// scale both dims by `sqrt(max_patches / patches)` (downscale
+    /// only — never upscales), then CEIL each dim to a multiple of
+    /// `pad_multiple` (= `patch · merge`, keeps dims divisible by both).
+    /// `max_patches` defaults from the declaration; serve overrides it
+    /// with `preprocessor_config.json::in_token_limit` when present.
+    /// Mirrors mlx-vlm `image_processing_locateanything.py::rescale`
+    /// (collapsing its two sequential bicubic resizes into one resize
+    /// to the final target — the intermediate resize is an
+    /// implementation artifact, not a semantic step).
+    PatchCapCeilPad {
+        patch: u32,
+        pad_multiple: u32,
+        default_max_patches: usize,
     },
 }
 

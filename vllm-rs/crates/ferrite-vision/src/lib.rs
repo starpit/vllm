@@ -38,10 +38,37 @@ pub mod preprocess;
 
 pub use mm_meta::{MmMetadata, PlaceholderPolicy, PreprocessFn, SizePolicy, TokensPerImage};
 
-/// RoPE base used by every Qwen2/2.5-VL tower (and the working assumption
-/// for the next VL arches). Lift to a `VisionConfig` field if a future
-/// tower picks a different theta.
+/// RoPE base used by every Qwen2/2.5-VL tower AND MoonViT (LocateAnything).
+/// Lift to a `VisionConfig` field if a future tower picks a different theta.
 pub const ROPE_THETA: f32 = 10000.0;
+
+/// Per-token 2D-RoPE angle layout + pairing convention of the vision tower.
+/// Selected by the optional `vision_rope_style` config key; absent = `NeoxHw`
+/// (every Qwen-VL tower).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VisionRopeStyle {
+    /// Qwen2/2.5/3.5-VL: per-token angles `[h·f0..h·f17, w·f0..w·f17]`
+    /// (h-block then w-block), applied GPT-NeoX `rotate_half`.
+    NeoxHw,
+    /// MoonViT (LocateAnything): angles `[x·f0, y·f0, x·f1, y·f1, …]`
+    /// (interleaved, x = column first), applied to adjacent pairs
+    /// (GPT-J / "traditional" complex multiply). Same `inv_freq` series
+    /// as `NeoxHw` (`theta^(-2i/half_rot)` ≡ MoonViT's `theta^(-4i/dim)`).
+    InterleavedXy,
+}
+
+/// Learned positional-embedding interpolation flavor (`vision_pos_emb_interp`
+/// config key; absent = `Bilinear`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PosEmbInterp {
+    /// Qwen3.5-VL `fast_pos_embed_interpolate`: 4-corner bilinear with
+    /// `linspace(0, ng-1, n)` source mapping.
+    Bilinear,
+    /// MoonViT (LocateAnything) `Learnable2DInterpPosEmb`: torch-style
+    /// bicubic (a = -0.75, align_corners = false, border taps dropped and
+    /// weights renormalized), `src = (dst + 0.5)·in/out − 0.5` mapping.
+    Bicubic,
+}
 
 /// Common vision-tower config — the geometric fields every VL/MM arch
 /// shares. Arch-specific extras (`mlp_ratio`, `intermediate_size`,
@@ -64,6 +91,8 @@ pub struct VisionConfig {
     /// `text_config.hidden_size`.
     pub d_model: u32,
     pub norm_eps: f32,
+    pub rope_style: VisionRopeStyle,
+    pub pos_emb_interp: PosEmbInterp,
 }
 
 impl VisionConfig {
@@ -141,15 +170,30 @@ impl VisionConfig {
                 for token in 0..frame_len {
                     let hp = hpos[token] as f32;
                     let wp = wpos[token] as f32;
-                    for &f in inv_freq.iter() {
-                        let theta_h = hp * f;
-                        cos.push(f32_to_bf16(theta_h.cos()));
-                        sin.push(f32_to_bf16(theta_h.sin()));
-                    }
-                    for &f in inv_freq.iter() {
-                        let theta_w = wp * f;
-                        cos.push(f32_to_bf16(theta_w.cos()));
-                        sin.push(f32_to_bf16(theta_w.sin()));
+                    match self.rope_style {
+                        VisionRopeStyle::NeoxHw => {
+                            for &f in inv_freq.iter() {
+                                let theta_h = hp * f;
+                                cos.push(f32_to_bf16(theta_h.cos()));
+                                sin.push(f32_to_bf16(theta_h.sin()));
+                            }
+                            for &f in inv_freq.iter() {
+                                let theta_w = wp * f;
+                                cos.push(f32_to_bf16(theta_w.cos()));
+                                sin.push(f32_to_bf16(theta_w.sin()));
+                            }
+                        }
+                        VisionRopeStyle::InterleavedXy => {
+                            // x (= column) angle first, then y, per freq.
+                            for &f in inv_freq.iter() {
+                                let theta_x = wp * f;
+                                cos.push(f32_to_bf16(theta_x.cos()));
+                                sin.push(f32_to_bf16(theta_x.sin()));
+                                let theta_y = hp * f;
+                                cos.push(f32_to_bf16(theta_y.cos()));
+                                sin.push(f32_to_bf16(theta_y.sin()));
+                            }
+                        }
                     }
                 }
             }
@@ -202,11 +246,24 @@ impl VisionConfig {
                 for token in 0..frame_len {
                     let hp = hpos[token] as f32;
                     let wp = wpos[token] as f32;
-                    for &f in inv_freq.iter() {
-                        freqs.push(hp * f);
-                    }
-                    for &f in inv_freq.iter() {
-                        freqs.push(wp * f);
+                    match self.rope_style {
+                        VisionRopeStyle::NeoxHw => {
+                            for &f in inv_freq.iter() {
+                                freqs.push(hp * f);
+                            }
+                            for &f in inv_freq.iter() {
+                                freqs.push(wp * f);
+                            }
+                        }
+                        VisionRopeStyle::InterleavedXy => {
+                            // x (= column) angle first, then y, per freq —
+                            // pairs with the `vision_rope_2d_interleaved`
+                            // kernel's per-pair indexing.
+                            for &f in inv_freq.iter() {
+                                freqs.push(wp * f);
+                                freqs.push(hp * f);
+                            }
+                        }
                     }
                 }
             }
@@ -280,6 +337,95 @@ impl VisionConfig {
                                         + w11 * table[i11 + c],
                                 );
                             }
+                        }
+                    }
+                }
+            }
+            for _ in 0..t {
+                out.extend_from_slice(&frame);
+            }
+        }
+        debug_assert_eq!(out.len(), total_l * e);
+        out
+    }
+
+    /// Host-side bicubic pos-embed interpolation (MoonViT /
+    /// LocateAnything `Learnable2DInterpPosEmb`). Resamples the learned
+    /// `[ng, ng, embed_dim]` table to the image's `(h, w)` patch grid with
+    /// torch-style bicubic: kernel a = -0.75, `align_corners = false`
+    /// (`src = (dst + 0.5)·in/out − 0.5`), out-of-range taps dropped and
+    /// the remaining weights renormalized (mirrors mlx-vlm
+    /// `kernels.bicubic_interpolate`'s accumulate-and-normalize Metal
+    /// path; numpy transcription == mlx golden, cosine 0.9999991 — see
+    /// tools/vision_parity).
+    ///
+    /// Tokens are emitted in spatial-merge order — the same `(hb, wb,
+    /// sh, sw)` walk as [`Self::fast_pos_embed_interpolate`] /
+    /// [`Self::patches_from_normalized_chw`] — so the result pairs
+    /// elementwise with the packed patches. Returns `[total_l,
+    /// embed_dim]` f32.
+    pub fn bicubic_pos_embed_interpolate(
+        &self,
+        grid_thw: &[(u32, u32, u32)],
+        num_grid_per_side: usize,
+        table: &[f32],
+        total_l: usize,
+    ) -> Vec<f32> {
+        let e = self.embed_dim as usize;
+        let s = self.spatial_merge_size as usize;
+        let ng = num_grid_per_side;
+        debug_assert_eq!(table.len(), ng * ng * e, "pos_embed table shape");
+        // Torch ATen bicubic kernel, a = -0.75, support 2.
+        let cubic = |t: f32| -> f32 {
+            const A: f32 = -0.75;
+            let t = t.abs();
+            if t <= 1.0 {
+                (A + 2.0) * t * t * t - (A + 3.0) * t * t + 1.0
+            } else if t < 2.0 {
+                A * (t * t * t - 5.0 * t * t + 8.0 * t - 4.0)
+            } else {
+                0.0
+            }
+        };
+        // align_corners=false source mapping + the 4-tap window
+        // `floor(src - 2) + 1 .. floor(src + 2) + 1` clamped to [0, ng).
+        let src_window = |dst: usize, out_n: usize| -> (f32, usize, usize) {
+            let src = (dst as f32 + 0.5) * (ng as f32) / (out_n as f32) - 0.5;
+            let start = ((src - 2.0).floor() as i64 + 1).max(0) as usize;
+            let end = (((src + 2.0).floor() as i64 + 1).max(0) as usize).min(ng);
+            (src, start, end)
+        };
+        let mut out = Vec::<f32>::with_capacity(total_l * e);
+        let mut acc = vec![0f32; e];
+        for &(t, h, w) in grid_thw {
+            let (h, w, t) = (h as usize, w as usize, t as usize);
+            let (h_blocks, w_blocks) = (h / s, w / s);
+            // One spatial frame in merge order; tiled `t` times below.
+            let mut frame = Vec::<f32>::with_capacity(h * w * e);
+            for hb in 0..h_blocks {
+                for wb in 0..w_blocks {
+                    for sh in 0..s {
+                        for sw in 0..s {
+                            let (row, col) = (hb * s + sh, wb * s + sw);
+                            let (y, ys, ye) = src_window(row, h);
+                            let (x, xs, xe) = src_window(col, w);
+                            acc.fill(0.0);
+                            let mut wsum = 0f32;
+                            for yy in ys..ye {
+                                let wy = cubic(yy as f32 - y);
+                                for xx in xs..xe {
+                                    let wgt = wy * cubic(xx as f32 - x);
+                                    wsum += wgt;
+                                    let base = (yy * ng + xx) * e;
+                                    for (a, &tv) in
+                                        acc.iter_mut().zip(&table[base..base + e])
+                                    {
+                                        *a += wgt * tv;
+                                    }
+                                }
+                            }
+                            let inv = 1.0 / wsum;
+                            frame.extend(acc.iter().map(|&a| a * inv));
                         }
                     }
                 }

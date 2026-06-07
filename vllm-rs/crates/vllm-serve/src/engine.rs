@@ -2876,6 +2876,25 @@ impl AsyncEngine {
             }
             text
         };
+        // Numbered-image-tag normalization (LocateAnything-class
+        // arches): the checkpoint's chat template renders image parts
+        // as literal `<image-N>` text, which would tokenize to several
+        // ordinary ids instead of the single placeholder token the
+        // expansion pass scans for. Replace each tag with the marker
+        // token's text pre-tokenization (mirrors mlx-vlm's processor
+        // regex). Declared per-arch; None for every other family.
+        #[cfg(all(feature = "multimodal", any(feature = "cuda", feature = "metal")))]
+        let text = match self
+            .mm_processor
+            .as_ref()
+            .and_then(|p| p.metadata.numbered_image_tag_marker)
+        {
+            Some(marker) if text.contains("<image-") => {
+                ferrite_vision::preprocess::replace_numbered_image_tags(&text, marker)
+            }
+            _ => text,
+        };
+
         // Tokenize the text, or fall back to byte-value IDs.
         #[allow(unused_mut)]
         let mut token_ids = if let Some(tok) = &self.tokenizer {

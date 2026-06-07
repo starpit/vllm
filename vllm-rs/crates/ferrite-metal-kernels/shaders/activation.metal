@@ -196,6 +196,89 @@ kernel void gelu_tanh_f32(
 }
 
 // ============================================================================
+// GELU Erf (exact): 0.5 * x * (1 + erf(x / sqrt(2)))
+//
+// MSL has no built-in erf; this is the faithfully-rounded rational
+// approximation MLX ships (mlx/backend/metal/kernels/erf.h, itself the
+// well-known Norbert Juffa implementation; max error < 1 ulp). One
+// deviation: MLX's upper branch ends `-expm1f(r)`; we use
+// `1.0f - exp(r)` — there r ≤ −0.86 so exp(r) ≤ 0.42 and the
+// subtraction has no cancellation; the sub-ulp f32 difference vanishes
+// entirely in bf16/f16 outputs.
+//
+// Used by the `gelu_erf` DSL op (LocateAnything projector; the MoonViT
+// block MLP uses `gelu` = tanh — the two flavors are numerically
+// distinct and MUST NOT be conflated).
+// ============================================================================
+
+inline float ferrite_erf(float a) {
+    float r, s, t, u;
+    t = metal::abs(a);
+    s = a * a;
+    if (t > 0.927734375f) {
+        // maximum error 0.99527 ulp
+        r = metal::fma(-1.72853470e-5f, t, 3.83197126e-4f);
+        u = metal::fma(-3.88396438e-3f, t, 2.42546219e-2f);
+        r = metal::fma(r, s, u);
+        r = metal::fma(r, t, -1.06777877e-1f);
+        r = metal::fma(r, t, -6.34846687e-1f);
+        r = metal::fma(r, t, -1.28717512e-1f);
+        r = metal::fma(r, t, -t);
+        r = 1.0f - metal::exp(r);
+        r = metal::copysign(r, a);
+    } else {
+        // maximum error 0.98929 ulp
+        r = -5.96761703e-4f;
+        r = metal::fma(r, s, 4.99119423e-3f);
+        r = metal::fma(r, s, -2.67681349e-2f);
+        r = metal::fma(r, s, 1.12819925e-1f);
+        r = metal::fma(r, s, -3.76125336e-1f);
+        r = metal::fma(r, s, 1.28379166e-1f);
+        r = metal::fma(r, a, a);
+    }
+    return r;
+}
+
+kernel void gelu_erf_f16(
+    device half* output [[buffer(0)]],
+    device const half* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = float(input[gid]);
+    constexpr float INV_SQRT2 = 0.70710678118654752440f;
+    output[gid] = half(0.5f * x * (1.0f + ferrite_erf(x * INV_SQRT2)));
+}
+
+kernel void gelu_erf_bf16(
+    device bfloat* output [[buffer(0)]],
+    device const bfloat* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = float(input[gid]);
+    constexpr float INV_SQRT2 = 0.70710678118654752440f;
+    output[gid] = bfloat(0.5f * x * (1.0f + ferrite_erf(x * INV_SQRT2)));
+}
+
+kernel void gelu_erf_f32(
+    device float* output [[buffer(0)]],
+    device const float* input [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+
+    float x = input[gid];
+    constexpr float INV_SQRT2 = 0.70710678118654752440f;
+    output[gid] = 0.5f * x * (1.0f + ferrite_erf(x * INV_SQRT2));
+}
+
+// ============================================================================
 // GELU Quick Approximation: x * sigmoid(1.702 * x)
 // ============================================================================
 

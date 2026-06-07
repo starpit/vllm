@@ -68,7 +68,19 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
 )]
-fn modernbert() {
+mod modernbert {
+    // ModernBERT spells its dual rotary bases `global_rope_theta` /
+    // `local_rope_theta`; the per-field readers (and the emitted
+    // `rotary` / `rotary_local` cache ctors) consume the
+    // gemma-convention `rope_theta` / `rope_local_base_freq` names.
+    // Alias, don't rename — the config stays verbatim and an explicit
+    // standard-name field still wins.
+    const CONFIG_ALIASES: &[(&str, &str)] = &[
+        ("rope_local_base_freq", "local_rope_theta"),
+        ("rope_theta", "global_rope_theta"),
+    ];
+
+    fn forward() {
     // Embedding lookup + initial CohereLayerNorm.
     hidden_states = embed(input_ids, embeddings.tok_embeddings);
     hidden_states = rmsnorm(sub(hidden_states, mean(hidden_states)), embeddings.norm);
@@ -118,4 +130,5 @@ fn modernbert() {
     // this RmsNorm is `[num_tokens, hidden_size]`; the dispatch
     // layer reads it via `forward_backbone` (1f).
     hidden_states = rmsnorm(sub(hidden_states, mean(hidden_states)), final_norm);
+    }
 }

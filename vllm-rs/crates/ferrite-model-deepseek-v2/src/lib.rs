@@ -24,7 +24,12 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
 )]
-fn deepseek_v2() {
+mod deepseek_v2 {
+    // DeepSeek's `moe` DSL weight name maps to `mlp` on disk (HF
+    // safetensors store the MoE block under `model.layers.{l}.mlp`).
+    const WEIGHT_LEAF_RENAMES: &[(&str, &str)] = &[("moe", "mlp")];
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {
         // ── Attention ──────────────────────────────────────────────
@@ -69,4 +74,5 @@ fn deepseek_v2() {
     }
     normed = rmsnorm(hidden_states, norm);
     logits = gemm(normed, lm_head);
+    }
 }

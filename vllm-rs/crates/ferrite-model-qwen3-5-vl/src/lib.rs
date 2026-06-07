@@ -53,11 +53,77 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     chat_template_image_part_type: "image",
     placeholder_policy: ferrite_vision::PlaceholderPolicy::RepeatMarker,
     mrope_positions: true,
+    numbered_image_tag_marker: None,
 };
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
-fn qwen3_5_vl() {
+mod qwen3_5_vl {
+    /// Qwen3.5-VL vision tower params schema — field name = the bound
+    /// name the DSL / weights.json reference; `#[from]` paths index the
+    /// VERBATIM HF `Qwen3_5ForConditionalGeneration` config.json
+    /// (configs/ carries it byte-for-byte). Rotary tower: `rope_half_dim
+    /// = head_dim / 2`. Reproduces the old `VisionFamily::Qwen3_5Vl`
+    /// derivation (keys hidden_size/depth/num_heads/in_channels;
+    /// temporal/merge default to 1 only when absent — both present here).
+    struct Params {
+        #[from = "vision_config.hidden_size"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.depth"]
+        vision_depth: u64,
+        #[from = "vision_config.num_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.in_channels"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_hidden: u64,
+        #[expr = "vision_head_dim / 2"]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.intermediate_size"]
+        vision_mlp_hidden: u64,
+        #[from = "vision_config.out_hidden_size"]
+        d_model: u64,
+    }
+
+    /// Qwen3.5 vision blocks hardcode 1e-6 in the modeling code
+    /// (transformers / mlx-vlm); the old `VisionFamily::Qwen3_5Vl` spec
+    /// carried `norm_eps_key: None` → 1e-6 default, which the parse
+    /// default already supplies, so no NORM_EPS const is declared.
+    const SAFETENSORS: Layout = Layout {
+        root: "vision_tower",
+        blocks: "blocks",
+        subtrees: &[],
+    };
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "vision_tower.merger.linear_fc2.weight",
+        dim: 0,
+    };
+    /// MLX-converted checkpoints ship the 5D conv weight channels-LAST;
+    /// `try_load_mm` sniffs the actual layout at load, so this flag only
+    /// marks "may need the permute".
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "vision_tower.patch_embed.proj.weight",
+        leading_dim: 0,
+        channels_last: true,
+    };
+    /// Learned pos-embed table interpolated host-side per forward
+    /// (`fast_pos_embed_interpolate`, bilinear default — no
+    /// POS_EMB_INTERP const).
+    const POS_EMBED_KEY: &str = "vision_tower.pos_embed.weight";
+
+    fn forward() {
     hidden_states = gemm(pixels, patch_embed.proj);
     hidden_states = bias_add(hidden_states, patch_embed.proj.bias);
     // Learned positional embedding (`fast_pos_embed_interpolate`,
@@ -108,6 +174,7 @@ fn qwen3_5_vl() {
     mlp0 = gelu(mlp0);
     out = gemm(mlp0, merger.linear_fc2);
     out = bias_add(out, merger.linear_fc2.bias);
+    }
 }
 
 // ───────────────────────────── GREEN GATE ──────────────────────────────

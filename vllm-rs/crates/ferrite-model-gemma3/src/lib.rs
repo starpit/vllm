@@ -24,7 +24,15 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
 )]
-fn gemma3() {
+mod gemma3 {
+    // Gemma ties embed_tokens ⟷ lm_head (HF modeling default TRUE;
+    // checkpoints ship no lm_head.* on disk). Explicit json wins.
+    // The CondGen (multimodal) checkpoints nest the decoder under
+    // `language_model.*` on disk — that prefix is per-config (the
+    // ForCausalLM repos don't), declared via each `<stem>.overrides.json`.
+    const TIE_DEFAULT: bool = true;
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size);
     for layer in 0..num_hidden_layers {
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer] + 1.0);
@@ -56,4 +64,5 @@ fn gemma3() {
     }
     normed = rmsnorm(hidden_states, norm + 1.0);
     logits = gemm(normed, lm_head);
+    }
 }

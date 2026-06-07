@@ -2266,6 +2266,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-model-locateanything"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferrite-cuda-core",
+ "ferrite-forward",
+ "ferrite-forward-macro",
+ "ferrite-kernels",
+ "ferrite-vision",
+ "half",
+ "objc2-metal",
+ "tracing",
+]
+
+[[package]]
 name = "ferrite-model-mistral"
 version = "0.1.0"
 dependencies = [
@@ -2453,6 +2468,7 @@ dependencies = [
  "ferrite-model-gemma4",
  "ferrite-model-granite",
  "ferrite-model-llama",
+ "ferrite-model-locateanything",
  "ferrite-model-mistral",
  "ferrite-model-mixtral",
  "ferrite-model-modernbert",

@@ -47,6 +47,30 @@ fn read_f32(buf: &Buffer, n: usize) -> Vec<f32> {
     unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const f32, n).to_vec() }
 }
 
+/// Interleaved (GPT-J / "traditional") rope reference — MoonViT / LocateAnything
+/// `apply_rope` (complex multiply on adjacent pairs):
+///   out[2i]   = x[2i]*cos(f_i) - x[2i+1]*sin(f_i)
+///   out[2i+1] = x[2i]*sin(f_i) + x[2i+1]*cos(f_i),  f_i = freqs[t*half + i].
+/// Independently verified == the mlx-vlm LocateAnything golden fixture
+/// (rope_block0_q: max_abs_err 4.8e-7, cosine 1.0) — see tools/vision_parity.
+fn rope_ref_interleaved(x: &[f32], freqs: &[f32], l: usize, h: usize, d: usize) -> Vec<f32> {
+    let half = d / 2;
+    let mut out = vec![0f32; l * h * d];
+    for t in 0..l {
+        for hh in 0..h {
+            let base = (t * h + hh) * d;
+            for i in 0..half {
+                let f = freqs[t * half + i];
+                let (c, s) = (f.cos(), f.sin());
+                let (x0, x1) = (x[base + 2 * i], x[base + 2 * i + 1]);
+                out[base + 2 * i] = x0 * c - x1 * s;
+                out[base + 2 * i + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+    out
+}
+
 /// NeoX rotate_half rope reference: out[t,h,d] = x*cos(f) + rotate_half(x)*sin(f),
 /// f = freqs[t*half + d%half]; rotate_half = concat(-x[half:], x[:half]).
 fn rope_ref(x: &[f32], freqs: &[f32], l: usize, h: usize, d: usize) -> Vec<f32> {
@@ -139,5 +163,80 @@ fn vision_rope_2d_matches_neox_reference() {
     assert!(
         err < 1e-4,
         "vision_rope_2d max_abs_err={err} (want≈{want:?} got≈{got:?})"
+    );
+}
+
+#[test]
+fn vision_rope_2d_interleaved_matches_reference() {
+    let Some(di) = detect_device() else {
+        eprintln!("skipping: no Metal device");
+        return;
+    };
+    let device = di.device.clone();
+    let queue = device.newCommandQueue().expect("queue");
+    let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
+        .expect("compile standard shaders");
+
+    // Small config exercising the adjacent-pair rotation + per-pair angle
+    // indexing (freqs row stride = half, one angle per pair).
+    let (l, h, d) = (3usize, 2usize, 8usize);
+    let half = d / 2;
+    let n = l * h * d;
+    let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.1).sin() * 0.7).collect();
+    let freqs: Vec<f32> = (0..l * half).map(|i| 0.05 + (i as f32) * 0.013).collect();
+
+    let want = rope_ref_interleaved(&x, &freqs, l, h, d);
+
+    let key = PipelineKey::new(
+        "vision_rope_2d",
+        "vision_rope_2d_interleaved_f32",
+        vec![
+            ConstantValue::uint(0, d as u32),
+            ConstantValue::uint(1, h as u32),
+            ConstantValue::uint(2, n as u32),
+        ],
+    );
+    let pipeline = cache
+        .get_or_build(&key)
+        .expect("vision_rope_2d_interleaved pipeline");
+
+    let x_buf = buf_f32(&device, &x);
+    let fr_buf = buf_f32(&device, &freqs);
+    let out_buf = buf_zero_f32(&device, n);
+
+    let cb = queue.commandBuffer().expect("commandBuffer");
+    let enc = cb.computeCommandEncoder().expect("computeCommandEncoder");
+    enc.setComputePipelineState(&pipeline);
+    unsafe {
+        enc.setBuffer_offset_atIndex(Some(&out_buf), 0, 0);
+        enc.setBuffer_offset_atIndex(Some(&x_buf), 0, 1);
+        enc.setBuffer_offset_atIndex(Some(&fr_buf), 0, 2);
+    }
+    let tg = n.div_ceil(256);
+    enc.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: tg,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+    enc.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+
+    let got = read_f32(&out_buf, n);
+    let err = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        err < 1e-4,
+        "vision_rope_2d_interleaved max_abs_err={err} (want≈{want:?} got≈{got:?})"
     );
 }

@@ -54,6 +54,8 @@ extern crate ferrite_model_qwen3_5_moe as _keep_qwen3_5_moe;
 extern crate ferrite_model_gemma4 as _keep_gemma4;
 #[cfg(feature = "arch-qwen3-5-vl")]
 extern crate ferrite_model_qwen3_5_vl as _keep_qwen3_5_vl;
+#[cfg(feature = "arch-locateanything")]
+extern crate ferrite_model_locateanything as _keep_locateanything;
 #[cfg(feature = "arch-qwen3-moe")]
 extern crate ferrite_model_qwen3_moe as _keep_qwen3_moe;
 
@@ -75,6 +77,8 @@ pub use ferrite_model_gemma3_mm as gemma3_mm;
 pub use ferrite_model_granite as granite;
 #[cfg(feature = "arch-llama")]
 pub use ferrite_model_llama as llama;
+#[cfg(feature = "arch-locateanything")]
+pub use ferrite_model_locateanything as locateanything;
 #[cfg(feature = "arch-mistral")]
 pub use ferrite_model_mistral as mistral;
 #[cfg(feature = "arch-mixtral")]

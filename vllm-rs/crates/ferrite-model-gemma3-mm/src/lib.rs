@@ -59,11 +59,86 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     },
     // Gemma3 text decoder uses standard 1D RoPE — no MRoPE override.
     mrope_positions: false,
+    numbered_image_tag_marker: None,
 };
 
 #[cfg(feature = "cuda")]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
-fn gemma3_mm() {
+mod gemma3_mm {
+    /// Gemma3-MM SigLIP vision tower params schema — field name = the
+    /// bound name the DSL / weights.json reference; `#[from]` paths index
+    /// the VERBATIM HF `Gemma3ForConditionalGeneration` config.json
+    /// (configs/ carries it byte-for-byte). SigLIP uses a learned
+    /// absolute pos-embed and no rope at all → `vision_rope_half_dim = 0`.
+    /// Reproduces the old `VisionFamily::Gemma3` derivation (keys
+    /// hidden_size/num_hidden_layers/num_attention_heads/num_channels;
+    /// temporal/merge absent → default 1; pool chain off image_size /
+    /// mm_tokens_per_image; d_model = text_config.hidden_size).
+    struct Params {
+        #[from = "vision_config.hidden_size"]
+        vision_embed_dim: u64,
+        #[from = "vision_config.num_hidden_layers"]
+        vision_depth: u64,
+        #[from = "vision_config.num_attention_heads"]
+        vision_num_heads: u64,
+        #[from = "vision_config.num_channels"]
+        vision_in_chans: u64,
+        #[from = "vision_config.patch_size"]
+        vision_patch_size: u64,
+        #[from("vision_config.temporal_patch_size", default = 1)]
+        vision_temporal_patch_size: u64,
+        #[from("vision_config.spatial_merge_size", default = 1)]
+        vision_spatial_merge_size: u64,
+        #[expr = "vision_embed_dim / vision_num_heads"]
+        vision_head_dim: u64,
+        #[expr = "vision_in_chans * vision_temporal_patch_size * vision_patch_size * vision_patch_size"]
+        vision_in_features: u64,
+        #[expr = "vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_factor: u64,
+        #[expr = "vision_embed_dim * vision_spatial_merge_size * vision_spatial_merge_size"]
+        vision_merge_hidden: u64,
+        #[value = 0]
+        vision_rope_half_dim: u64,
+        #[from = "vision_config.intermediate_size"]
+        vision_mlp_hidden: u64,
+        #[from = "vision_config.image_size"]
+        vision_image_size: u64,
+        #[expr = "vision_image_size / vision_patch_size"]
+        vision_patch_grid_side: u64,
+        #[expr = "vision_patch_grid_side * vision_patch_grid_side"]
+        vision_num_positions: u64,
+        #[from = "mm_tokens_per_image"]
+        vision_pooled_tokens: u64,
+        #[expr = "vision_num_positions / vision_pooled_tokens"]
+        vision_pool_factor: u64,
+        #[expr = "sqrt(vision_pool_factor)"]
+        vision_pool_kernel: u64,
+        #[from = "text_config.hidden_size"]
+        d_model: u64,
+    }
+
+    /// SigLIP block norms read `vision_config.layer_norm_eps`, which is
+    /// 1e-6 for every gemma3 checkpoint — the parse default (1e-6)
+    /// already matches, so no NORM_EPS const is declared.
+    const SAFETENSORS: Layout = Layout {
+        root: "vision_tower.vision_model",
+        blocks: "encoder.layers",
+        subtrees: &[("mm", "multi_modal_projector")],
+    };
+    /// The SigLIP→text projector matrix is `[vision_embed_dim, d_model]`,
+    /// so d_model is dim 1.
+    const FINGERPRINT: Fingerprint = Fingerprint {
+        key: "multi_modal_projector.mm_input_projection_weight",
+        dim: 1,
+    };
+    /// 4D `[E, C, P, P]` torch conv weight, channels-first.
+    const PATCH_EMBED_FLATTEN: Flatten = Flatten {
+        key: "vision_tower.vision_model.embeddings.patch_embedding.weight",
+        leading_dim: 0,
+        channels_last: false,
+    };
+
+    fn forward() {
     // Patch embed: Conv2d(in=3, out=1152, k=14, s=14) flattened at
     // load time to a [1152, 588] linear. With bias.
     hidden_states = gemm(pixels, embeddings.patch_embedding);
@@ -135,4 +210,5 @@ fn gemma3_mm() {
     pooled = avg_pool_2d(hidden_states);
     normed_pool = rmsnorm(pooled, mm.mm_soft_emb_norm + 1.0);
     out = gemm(normed_pool, mm.mm_input_projection_weight);
+    }
 }

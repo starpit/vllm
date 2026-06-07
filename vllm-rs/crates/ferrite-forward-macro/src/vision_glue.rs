@@ -85,9 +85,9 @@ pub fn emit_per_variant(
     // is Qwen's `visual.merger.mlp.2.weight` dim 0 — every existing
     // Qwen2-VL / Qwen2.5-VL config keeps that path byte-identically.
     let fingerprint = model
-        .vision_d_model_fingerprint
+        .arch.fingerprint
         .clone()
-        .unwrap_or_else(crate::config::VisionDModelFingerprint::qwen_default);
+        .expect("vision fingerprint enforced at config parse");
     let fp_key_lit = syn::LitStr::new(&fingerprint.key, proc_macro2::Span::call_site());
     let fp_dim_lit = proc_macro2::Literal::usize_unsuffixed(fingerprint.dim);
 
@@ -96,9 +96,9 @@ pub fn emit_per_variant(
     // form. We multiply every dim after `leading_dim` to land at a
     // dense 2D `[d_lead, prod_after]`. Default is Qwen's 5D path.
     let flatten = model
-        .vision_patch_embed_flatten
+        .arch.patch_embed_flatten
         .clone()
-        .unwrap_or_else(crate::config::VisionPatchEmbedFlatten::qwen_default);
+        .expect("vision patch_embed_flatten enforced at config parse");
     let flatten_key_lit = syn::LitStr::new(&flatten.key, proc_macro2::Span::call_site());
     let flatten_lead_lit = proc_macro2::Literal::usize_unsuffixed(flatten.leading_dim);
     let flatten_channels_last = flatten.channels_last;
@@ -109,7 +109,7 @@ pub fn emit_per_variant(
     // `fast_pos_embed_interpolate` over it per forward and uploads the
     // result as the `pos_embeds` extern. Other arches emit a plain
     // `VisionWrapper::new`. `num_grid_per_side = sqrt(table rows)`.
-    let wrapper_ctor: TokenStream = match &model.vision_pos_embed_key {
+    let wrapper_ctor: TokenStream = match &model.arch.pos_embed_key {
         ::std::option::Option::Some(key) => {
             let key_lit = syn::LitStr::new(key, proc_macro2::Span::call_site());
             quote! {{
@@ -128,6 +128,20 @@ pub fn emit_per_variant(
         ::std::option::Option::None => {
             quote! { ::ferrite_forward::VisionWrapper::new(weights) }
         }
+    };
+
+    // Optional style keys (validated at config parse). Absent →
+    // Qwen defaults, keeping every existing VL config byte-identical
+    // in behavior.
+    let rope_style_tokens: TokenStream = match model.arch.rope_style.as_deref() {
+        Some("interleaved_xy") => {
+            quote! { ::ferrite_vision::VisionRopeStyle::InterleavedXy }
+        }
+        _ => quote! { ::ferrite_vision::VisionRopeStyle::NeoxHw },
+    };
+    let pos_emb_interp_tokens: TokenStream = match model.arch.pos_emb_interp.as_deref() {
+        Some("bicubic") => quote! { ::ferrite_vision::PosEmbInterp::Bicubic },
+        _ => quote! { ::ferrite_vision::PosEmbInterp::Bilinear },
     };
 
     let embed_dim_lit = proc_macro2::Literal::u32_unsuffixed(embed_dim);
@@ -151,9 +165,9 @@ pub fn emit_per_variant(
     // when a future arch requires it.
     let layered_prefix = {
         let layout = model
-            .vision_layout
+            .arch.safetensors
             .clone()
-            .unwrap_or_else(crate::config::VisionSafetensorsLayout::qwen_default);
+            .expect("vision safetensors layout enforced at config parse");
         format!("{}.{}", layout.default_root, layout.layered_subpath)
     };
     let pad_calls: Vec<TokenStream> = pad_to_mult8
@@ -251,6 +265,8 @@ pub fn emit_per_variant(
                     in_chans: #in_chans_lit,
                     d_model: #d_model_lit,
                     norm_eps: #eps_lit,
+                    rope_style: #rope_style_tokens,
+                    pos_emb_interp: #pos_emb_interp_tokens,
                 };
                 &C
             }

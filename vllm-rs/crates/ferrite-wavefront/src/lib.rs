@@ -30,5 +30,6 @@ pub mod subtile_ir;
 pub mod subtile_tape;
 pub mod metal_tape;
 pub mod lower_subtile_tape_to_tk_tape;
+pub mod passes;
 pub mod tk_player;
 pub mod tk_tape;

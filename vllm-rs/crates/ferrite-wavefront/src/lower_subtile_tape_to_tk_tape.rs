@@ -517,6 +517,17 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     out.instrs = top;
     validate_tk_tape(&out)
         .expect("lower_subtile_tape_to_tk_tape: produced invalid TkTape (commit 6b post-condition)");
+
+    // §6.5 optimizer pass pipeline. Each pass is a `TkTape → TkTape`
+    // rewrite that preserves `validate_tk_tape` invariants. First pass
+    // to land: `rt_alias_pass` (register-tile slot coalescing) — drops
+    // arena cardinality so the player declares fewer
+    // `kittens::rt<...> rt_<slot>;` per kernel, reducing per-warp
+    // register pressure.
+    crate::passes::rt_alias_pass(&mut out);
+    validate_tk_tape(&out)
+        .expect("rt_alias_pass: produced invalid TkTape (post-condition)");
+
     out
 }
 

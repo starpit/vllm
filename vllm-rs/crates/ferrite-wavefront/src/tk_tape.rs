@@ -99,6 +99,46 @@ pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
 /// Activation-pool size. See [`NUM_PAGES`] for the cap math.
 pub const NUM_ACT_PAGES: u32 = 4;
 
+/// Sealed identifier for the substrate's two pools — `Page` is the
+/// `page_buf[NUM_PAGES]` pool ([`PageTileSpec`] = 128×128 bf16);
+/// `Act` is the `act_buf[NUM_ACT_PAGES]` pool ([`ActTileSpec`] =
+/// 64×128 bf16). Constructable only via the variants here. Per
+/// audit finding `count-macro-string-untyped`: previously the
+/// `shared_*_decl` emit helpers in `tk_player::tk20` accepted
+/// `count_macro: &str` (e.g. `"NUM_PAGES"`) — a typo or copy-paste
+/// (`"NUM_AGES"`) was Rust-compile-clean and surfaced only as an
+/// nvcc undefined-identifier error, and a wrong-pool count_macro
+/// for the act_buf decl would silently mismatch DYN_SMEM math.
+/// `SubstratePool` collapses both fields (CUDA macro name + pool
+/// size) into a sealed variant — the helpers take the variant, the
+/// enum knows its own `count_macro_name()` and `num_entries()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubstratePool {
+    Page,
+    Act,
+}
+
+impl SubstratePool {
+    /// Name of the C++ `constexpr` macro the substrate emit defines
+    /// at kernel-prelude time (see `tk_player::emit_kernel`).
+    pub const fn count_macro_name(self) -> &'static str {
+        match self {
+            Self::Page => "NUM_PAGES",
+            Self::Act => "NUM_ACT_PAGES",
+        }
+    }
+
+    /// Runtime entry count for the pool — derived from the substrate
+    /// constants. Used for byte-size accounting in the host-wrapper
+    /// DYN_SMEM math via [`SUBSTRATE_DYN_SMEM_BYTES`].
+    pub const fn num_entries(self) -> u32 {
+        match self {
+            Self::Page => NUM_PAGES,
+            Self::Act => NUM_ACT_PAGES,
+        }
+    }
+}
+
 /// Canonical type alias for the tile that lives in `act_buf[i]`.
 /// Distinct shape from [`PageTileSpec`] (64 rows vs 128) so a wrong
 /// pool routing is rustc E0308 — see [`ActPageId`] vs [`PageId`].
@@ -146,16 +186,81 @@ const _: () = assert!(
 pub const SUBSTRATE_DYN_SMEM_BYTES: u32 =
     NUM_PAGES * PAGE_SIZE + NUM_ACT_PAGES * ACT_PAGE_SIZE;
 
+/// TK 2.0 `kittens::st<T, R, C, swizzle: bool, swizzle_bytes>` —
+/// the substrate's chosen `swizzle_bytes` for both `page_buf` and
+/// `act_buf` decls. Per `third_party/thunderkittens/include/types/
+/// shared/st.cuh:163`, sub-tile use requires
+/// `subtile_cols % swizzle_elements == 0` where
+/// `swizzle_elements = swizzle_bytes / sizeof(dtype)`. With bf16 +
+/// `swizzle_bytes = 64`, `swizzle_elements = 32` so `subtile<32>`
+/// (used by RopeRotateNeoX/RopeAppend's head_dim=64 split) divides
+/// evenly. WGMMA supports swizzle ∈ {32, 64, 128}.
+///
+/// Per audit finding `swizzle-bytes-not-on-witness`: previously
+/// every `st_<...>` emit hardcoded the literal `, true, 64>`; a
+/// future swizzle change had to hand-flip it in N places. With this
+/// const as the single source, every emit derives from it. The next
+/// step (lifting swizzle onto `SmemTileSpec` as a const generic +
+/// `LegalSubTile<COLS_SUB, SW>` sealed marker) needs
+/// `feature(generic_const_exprs)` for the divisibility relation;
+/// punted until stable. The const + const_assert below is the
+/// stable-Rust equivalent of "single source of truth for swizzle".
+pub const SUBSTRATE_SWIZZLE_BYTES: u32 = 64;
+
+/// `swizzle_bytes / sizeof(dtype)` — per `st.cuh:163`. With bf16 +
+/// SUBSTRATE_SWIZZLE_BYTES=64 → 32.
+pub const SUBSTRATE_SWIZZLE_ELEMENTS_BF16: u32 = SUBSTRATE_SWIZZLE_BYTES / 2;
+
+const _: () = assert!(
+    matches!(SUBSTRATE_SWIZZLE_BYTES, 32 | 64 | 128),
+    "SUBSTRATE_SWIZZLE_BYTES must be one of TK 2.0's WGMMA-legal swizzle values 32 / 64 / 128.",
+);
+
+/// Page-barrier kinds emitted as static `__shared__ kittens::semaphore`
+/// arrays. Today: Ready, Done, Consumed (3 of `PageBarrier`). Tied to
+/// the `barrier_name` mapping in `tk_player`; if a new variant is
+/// added there, the count below grows lockstep. Per
+/// `feedback_we_generate_everything`.
+pub const NUM_PAGE_BARRIER_KINDS: u32 = 3;
+
+/// Bytes consumed by a single `kittens::semaphore` (Hopper mbarrier).
+/// Per CUDA programming guide: 64-bit transaction-state aligned.
+pub const KITTENS_SEMAPHORE_BYTES: u32 = 8;
+
+/// Static `__shared__` semaphore-array footprint of the substrate —
+/// `NUM_PAGE_BARRIER_KINDS × NUM_PAGES × sizeof(kittens::semaphore)`.
+/// (Act-pool barriers are not yet emitted; when they are, add
+/// `+ NUM_ACT_BARRIER_KINDS * NUM_ACT_PAGES * KITTENS_SEMAPHORE_BYTES`
+/// here.) Per audit `static-shared-not-in-dyn-smem-cap`.
+pub const SUBSTRATE_STATIC_SMEM_BYTES: u32 =
+    NUM_PAGE_BARRIER_KINDS * NUM_PAGES * KITTENS_SEMAPHORE_BYTES;
+
 /// Compile-time guard: if the substrate's dynamic-smem total exceeds
 /// the Hopper cap, this `const _: ()` evaluation panics at *Rust
 /// compile time*, NOT at kernel launch. A miswire (NUM_PAGES too
 /// big, page tile shape too big, etc.) becomes `error[E0080]`, never
 /// a runtime `cudaErrorInvalidValue` from `cudaFuncSetAttribute`.
 /// Per `feedback_end_to_end_compile_time_proofs`.
+///
+/// Note: on Hopper the per-block ceiling applies to the SUM of static
+/// `__shared__` and dynamic shared memory (228 KB combined with the
+/// dyn-smem opt-in). Both are accounted for below.
 const _: () = assert!(
-    SUBSTRATE_DYN_SMEM_BYTES <= HOPPER_MAX_DYN_SMEM_BYTES,
-    "substrate dynamic-smem total exceeds Hopper sm_90a 228 KB cap. \
+    SUBSTRATE_DYN_SMEM_BYTES + SUBSTRATE_STATIC_SMEM_BYTES <= HOPPER_MAX_DYN_SMEM_BYTES,
+    "substrate dynamic + static smem total exceeds Hopper sm_90a 228 KB cap. \
      Reduce NUM_PAGES, NUM_ACT_PAGES, or shrink PageTileSpec / ActTileSpec.",
+);
+
+/// Static smem cap for the per-block static `__shared__` budget
+/// without the dyn-smem opt-in (48 KB). The substrate uses dynamic
+/// shared via `shared_allocator` so static usage is bounded only by
+/// the static-only cap; this guard catches a future regression that
+/// emits a large static array (e.g., per-page metadata) past 48 KB.
+pub const HOPPER_MAX_STATIC_SMEM_BYTES_DEFAULT: u32 = 48 * 1024;
+const _: () = assert!(
+    SUBSTRATE_STATIC_SMEM_BYTES <= HOPPER_MAX_STATIC_SMEM_BYTES_DEFAULT,
+    "substrate static __shared__ usage exceeds the 48 KB default cap. \
+     Move data to dynamic shared via shared_allocator.",
 );
 
 // ── Mbarrier arrival counts ──────────────────────────────────────────

@@ -17,7 +17,7 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{ActTileSpec, Bf16, Instr, PageTileSpec, TkTape};
+use crate::tk_tape::{ActTileSpec, Bf16, Instr, PageTileSpec, SubstratePool, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 mod tk20 {
@@ -651,8 +651,14 @@ mod tk20 {
     pub fn st_type_literal<const ROWS: usize, const COLS: usize, T: TileDtype>(
         _spec: SmemTileSpec<ROWS, COLS, T>,
     ) -> String {
+        // Swizzle is single-sourced from `SUBSTRATE_SWIZZLE_BYTES`
+        // (tk_tape.rs). Per audit finding `swizzle-bytes-not-on-witness`:
+        // previously the `, true, 64>` literal was hand-typed per
+        // emit; now every emit derives from one const, so a future
+        // swizzle change is a single-line edit.
+        let sw = crate::tk_tape::SUBSTRATE_SWIZZLE_BYTES;
         format!(
-            "kittens::st_{suffix}<{ROWS}, {COLS}, true, 64>",
+            "kittens::st_{suffix}<{ROWS}, {COLS}, true, {sw}>",
             suffix = T::ST_ALIAS_SUFFIX,
         )
     }
@@ -665,30 +671,31 @@ mod tk20 {
     #[allow(dead_code)]
     pub fn shared_st_decl<const ROWS: usize, const COLS: usize, T: TileDtype>(
         array_name: &str,
-        count_macro: &str,
+        pool: crate::tk_tape::SubstratePool,
         spec: SmemTileSpec<ROWS, COLS, T>,
     ) -> String {
         let ty = st_type_literal(spec);
-        format!("    __shared__ {ty} {array_name}[{count_macro}];\n")
+        let count = pool.count_macro_name();
+        format!("    __shared__ {ty} {array_name}[{count}];\n")
     }
 
     /// Emit `auto &<array_name> = al.allocate<kittens::st_<…>, COUNT>();`
-    /// for the live `shared_allocator` substrate path. The tile type
-    /// comes from the const-generic [`SmemTileSpec`] witness — same
-    /// witness that drives [`PAGE_SIZE`] / [`ACT_PAGE_SIZE`] via
-    /// [`SmemTileSpec::byte_size`]. Two sources of truth collapsed
-    /// into one.
+    /// for the live `shared_allocator` substrate path. Pool selection
+    /// is via the sealed [`SubstratePool`] enum — no `count_macro:
+    /// &str` typo path. Per audit finding `count-macro-string-untyped`.
     pub fn shared_alloc_decl<const ROWS: usize, const COLS: usize, T: TileDtype>(
         array_name: &str,
-        count_macro: &str,
+        pool: crate::tk_tape::SubstratePool,
         spec: SmemTileSpec<ROWS, COLS, T>,
     ) -> String {
         let ty = st_type_literal(spec);
-        format!("    auto &{array_name} = al.allocate<{ty}, {count_macro}>();\n")
+        let count = pool.count_macro_name();
+        format!("    auto &{array_name} = al.allocate<{ty}, {count}>();\n")
     }
 
-    pub fn shared_semaphore_decl(name: &str, count_macro: &str) -> String {
-        format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
+    pub fn shared_semaphore_decl(name: &str, pool: crate::tk_tape::SubstratePool) -> String {
+        let count = pool.count_macro_name();
+        format!("    __shared__ kittens::semaphore {name}[{count}];\n")
     }
 
     /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` — per-slot
@@ -832,12 +839,12 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     out.push_str("    kittens::shared_allocator al((int*)&__shm[0]);\n");
     out.push_str(&tk20::shared_alloc_decl::<128, 128, Bf16>(
         "page_buf",
-        "NUM_PAGES",
+        SubstratePool::Page,
         PageTileSpec::WITNESS,
     ));
     out.push_str(&tk20::shared_alloc_decl::<64, 128, Bf16>(
         "act_buf",
-        "NUM_ACT_PAGES",
+        SubstratePool::Act,
         ActTileSpec::WITNESS,
     ));
     // Page-barrier semaphore arrays. Driven by the [`PageBarrier`]
@@ -854,7 +861,7 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     // `feedback_no_speculative_witnesses`.
     use crate::tk_tape::PageBarrier;
     for kind in [PageBarrier::Ready, PageBarrier::Done, PageBarrier::Consumed] {
-        out.push_str(&tk20::shared_semaphore_decl(barrier_name(kind), "NUM_PAGES"));
+        out.push_str(&tk20::shared_semaphore_decl(barrier_name(kind), SubstratePool::Page));
     }
 
     // Per-slot shared-vec declarations. The arena is BTreeMap so

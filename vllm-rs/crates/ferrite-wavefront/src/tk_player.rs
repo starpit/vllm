@@ -93,19 +93,37 @@ mod tk20 {
     /// `tma::load_async` + `expect_bytes` for one page. Takes the
     /// LoadSpec by reference so the caller arm collapses to one
     /// writeln per Instr (per plan §4 step 8 ≤5-line budget).
+    /// TK 2.0 non-tensor `tma::load_async(void*, void*, size_bytes, semaphore&)` —
+    /// `ops/group/util/tma.cuh:72`. 4-arg signature; the smem dst is
+    /// passed as a void* via reinterpret_cast, the gmem src is the
+    /// kernel-arg pointer offset by bytes, and the semaphore binds
+    /// as an lvalue reference (no `&`).
     pub fn tma_load_async(spec: &crate::tk_tape::LoadSpec) -> String {
+        let bytes = (spec.tile.rows as u64) * (spec.tile.cols as u64) * (spec.tile.elem_bytes as u64);
         format!(
-            "kittens::group<1>::tma::load_async(page_buf[{}], a{}, {}, {}u, {}u, {}u, &page_ready[{}]);",
-            spec.dst_page.0, spec.src_arg.0, byte_offset_expr(&spec.byte_off),
-            spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes, spec.barrier_page.0,
+            "kittens::group<1>::tma::load_async(reinterpret_cast<void*>(&page_buf[{}]), \
+             static_cast<void*>(static_cast<char*>(const_cast<void*>(a{})) + ({})), \
+             {}u, page_ready[{}]);",
+            spec.dst_page.0,
+            spec.src_arg.0,
+            byte_offset_expr(&spec.byte_off),
+            bytes,
+            spec.barrier_page.0,
         )
     }
 
+    /// TK 2.0 `tma::store_async(void*, void*, size_bytes)` — 3 args,
+    /// no semaphore (commit_group flushes the group, not per-store).
     pub fn tma_store_async(spec: &crate::tk_tape::StoreSpec) -> String {
+        let bytes = (spec.tile.rows as u64) * (spec.tile.cols as u64) * (spec.tile.elem_bytes as u64);
         format!(
-            "kittens::group<1>::tma::store_async(a{}, page_buf[{}], {}, {}u, {}u, {}u);",
-            spec.dst_arg.0, spec.src_page.0, byte_offset_expr(&spec.byte_off),
-            spec.tile.rows, spec.tile.cols, spec.tile.elem_bytes,
+            "kittens::group<1>::tma::store_async(\
+             static_cast<void*>(static_cast<char*>(const_cast<void*>(a{})) + ({})), \
+             reinterpret_cast<void*>(&page_buf[{}]), {}u);",
+            spec.dst_arg.0,
+            byte_offset_expr(&spec.byte_off),
+            spec.src_page.0,
+            bytes,
         )
     }
 
@@ -161,7 +179,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::mul(page_buf[{dst}], page_buf[{lhs}], \
-             {scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar:.6}f));"
         )
     }
 
@@ -177,7 +195,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::add(page_buf[{dst}], page_buf[{lhs}], \
-             {scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar:.6}f));"
         )
     }
 
@@ -357,7 +375,7 @@ mod tk20 {
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::mul(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar}f));"
+            "kittens::group<{group_n}>::mul(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar:.6}f));"
         )
     }
     pub fn rt_row_max_acc(group_n: u32, acc: u16, src: u16) -> String {
@@ -466,7 +484,7 @@ mod tk20 {
     ) -> String {
         let scalar_ty = dtype.scalar_name();
         format!(
-            "kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar}f));"
+            "kittens::group<{group_n}>::add(rt_{dst}, rt_{lhs}, {scalar_ty}({scalar:.6}f));"
         )
     }
 
@@ -493,7 +511,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::mul(sv_{dst_slot}, sv_{src_slot}, \
-             {scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar:.6}f));"
         )
     }
 
@@ -509,7 +527,7 @@ mod tk20 {
         let scalar_ty = dtype.scalar_name();
         format!(
             "kittens::group<{group_n}>::add(sv_{dst_slot}, sv_{src_slot}, \
-             {scalar_ty}({scalar}f));"
+             {scalar_ty}({scalar:.6}f));"
         )
     }
 
@@ -576,13 +594,13 @@ mod tk20 {
     }
 
     pub fn ctensor_map_kernel_arg(name: &str, comma: &str) -> String {
-        // CUDA driver type from `cuda.h` (which `kittens.cuh` includes
-        // host-side, line 36) — global namespace, no `kittens::`
-        // prefix. The TK 2.0 `KITTENS_NO_HOST` JIT path stubs a
-        // `kittens::CUtensorMap` opaque shim, but with the normal
-        // host include path we get the driver-API type and that's
-        // the one TK 2.0's TMA helpers expect via `kittens::gl<>::tma_desc`.
-        format!("    const __grid_constant__ CUtensorMap {name}{comma}\n")
+        // Raw global pointer — fed directly to TK 2.0's
+        // `kittens::group<1>::tma::load_async(void*, void*, size, sem&)`
+        // non-tensor bulk transfer at
+        // `ops/group/util/tma.cuh:72`. No CUtensorMap / kittens::gl<>
+        // plumbing needed: the pointer is offset by bytes at the call
+        // site. Host wrapper passes `bufs[i]` (already `void*`) verbatim.
+        format!("    void const *__restrict__ {name}{comma}\n")
     }
 
     pub fn shared_st_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
@@ -603,7 +621,10 @@ mod tk20 {
     }
 
     pub fn ctensor_map_cast(buf_idx: usize) -> String {
-        format!("*reinterpret_cast<const CUtensorMap*>(bufs[{buf_idx}])")
+        // Host wrapper passes the raw `bufs[i]` pointer through
+        // unchanged — kernel arg is now `void const*`, no
+        // CUtensorMap reinterpret needed.
+        format!("bufs[{buf_idx}]")
     }
 }
 
@@ -1318,7 +1339,7 @@ mod tests {
         ));
         assert_eq!(
             s,
-            "kittens::group<16>::mul(page_buf[1], page_buf[0], kittens::bf16(-1f));\n",
+            "kittens::group<16>::mul(page_buf[1], page_buf[0], kittens::bf16(-1.000000f));\n",
         );
     }
 
@@ -1336,7 +1357,7 @@ mod tests {
         ));
         assert_eq!(
             s,
-            "kittens::group<16>::add(page_buf[5], page_buf[4], kittens::bf16(1f));\n",
+            "kittens::group<16>::add(page_buf[5], page_buf[4], kittens::bf16(1.000000f));\n",
         );
     }
 
@@ -1563,7 +1584,7 @@ mod tests {
                 src, dst, ScalarF32::new(1.0), GroupWidth::<16>::ALL_CONSUMERS, AllConsumersRole,
             ));
         });
-        assert_eq!(s, "kittens::group<16>::add(rt_3, rt_2, kittens::bf16(1f));\n");
+        assert_eq!(s, "kittens::group<16>::add(rt_3, rt_2, kittens::bf16(1.000000f));\n");
     }
 
     #[test]

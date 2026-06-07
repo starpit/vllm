@@ -565,6 +565,35 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     validate_tk_tape(&out)
         .expect("page_coalesce_pass: produced invalid TkTape (post-condition)");
 
+    // Static __shared__ budget check — the substrate emits
+    // `__shared__ kittens::sv_<sfx><LEN> sv_<idx>` decls for every
+    // smem_vec_arena entry. These count toward the 48 KB static
+    // cap (and the combined Hopper 228 KB cap). The substrate
+    // semaphore arrays already accounted for via
+    // `SUBSTRATE_STATIC_SMEM_BYTES`; sv arena bytes are tape-runtime
+    // (depends on per-arch ops) so we check at lower-time. Per audit
+    // findings `sv-arena-not-counted-in-static-smem-budget` and
+    // `smem-vec-arena-bytes-not-capped`.
+    let sv_bytes = out.sv_static_smem_bytes();
+    let total_static = crate::tk_tape::SUBSTRATE_STATIC_SMEM_BYTES + sv_bytes;
+    assert!(
+        total_static <= crate::tk_tape::HOPPER_MAX_STATIC_SMEM_BYTES_DEFAULT,
+        "static __shared__ budget exceeded: substrate semaphores {} + sv arena {} = {} > {} (Hopper 48 KB default cap). \
+         Either move sv arena to dynamic smem (al.allocate<>) or reduce per-op shared-vec usage.",
+        crate::tk_tape::SUBSTRATE_STATIC_SMEM_BYTES,
+        sv_bytes,
+        total_static,
+        crate::tk_tape::HOPPER_MAX_STATIC_SMEM_BYTES_DEFAULT,
+    );
+    // Combined cap (static + dynamic) — Hopper's 228 KB ceiling.
+    let combined = crate::tk_tape::SUBSTRATE_DYN_SMEM_BYTES + total_static;
+    assert!(
+        combined <= crate::tk_tape::HOPPER_MAX_DYN_SMEM_BYTES,
+        "combined dynamic + static smem budget exceeded: {} > {} (Hopper sm_90a 228 KB cap).",
+        combined,
+        crate::tk_tape::HOPPER_MAX_DYN_SMEM_BYTES,
+    );
+
     out
 }
 
@@ -1619,6 +1648,24 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     let tile = region_tile_shape(inp);
     let byte_off = region_byte_offset(state.graph, inp);
     let src_arg = state.tensor_arg(inp.tensor);
+    // TK 2.0 mbarrier protocol: init → expect_bytes → load_async.
+    // Without the init+expect pair on every external-load page, the
+    // matching `wait` either deadlocks (uninitialized mbarrier) or
+    // returns before the cp.async.bulk completes (transaction-byte
+    // count not armed). Per audit
+    // `external-load-no-tma-expect-no-barrier-init`. Mirrors the
+    // AttnDecode triple at line ~1394-1457.
+    state.push(Instr::BarrierInit {
+        page_id: dst_page,
+        kind: crate::tk_tape::PageBarrier::Ready,
+        count: crate::tk_tape::ArrivalCount::One,
+    });
+    state.push(Instr::tma_expect_runtime_shape(
+        dst_page,
+        crate::tk_tape::PageBarrier::Ready,
+        tile,
+        LOAD_ROLE,
+    ));
     state.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
         dst_page,
         src_arg,

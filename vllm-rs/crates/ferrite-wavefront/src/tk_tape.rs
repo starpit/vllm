@@ -2001,6 +2001,20 @@ pub(crate) struct SmemVecArenaEntry {
     pub(crate) dtype: TileDtypeTag,
 }
 
+impl SmemVecArenaEntry {
+    /// Byte size of this static `__shared__ kittens::sv_<dtype><LEN>`
+    /// allocation. Per audit findings `sv-arena-not-counted-in-static-
+    /// smem-budget` and `smem-vec-arena-bytes-not-capped`: the
+    /// substrate emit lays these out as static smem at kernel preamble
+    /// time, contributing to the 48 KB static cap. The lowerer's
+    /// `validate_smem_static_budget` (called at `lower_subtile_tape_to_tk_tape`
+    /// finalize) sums this across the arena and asserts the combined
+    /// (substrate semaphores + sv arena) static usage is under cap.
+    pub(crate) const fn byte_size(&self) -> u32 {
+        self.len * self.dtype.elem_bytes()
+    }
+}
+
 /// Typed shared-memory vector handle. Backed by a [`SmemVecSlot`]
 /// minted at lowering time via [`TkTape::mint_smem_vec`]. The
 /// const-generic LEN + sealed `T: TileDtype` propagate into the
@@ -2863,6 +2877,12 @@ impl LoadSpec {
     /// when the lowerer KNOWS the shape (compute Instr arms); at the
     /// external-load boundary the shape is runtime data driven by
     /// the SubtileIR's tensor regions.
+    ///
+    /// Hard-asserts `tile.byte_size() <= PAGE_SIZE` (release-mode):
+    /// a region larger than the page-pool tile would TMA-load past
+    /// the page boundary into adjacent shared-mem regions (silent
+    /// OOB write). Per audit finding
+    /// `external-load-runtime-shape-not-validated-against-page-pool`.
     pub(crate) fn new_runtime_shape(
         dst_page: PageId,
         src_arg: KernelArgRef,
@@ -2871,6 +2891,16 @@ impl LoadSpec {
         role: LoaderRole,
         barrier_page: PageId,
     ) -> Self {
+        let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
+        assert!(
+            bytes <= PAGE_SIZE as u64,
+            "LoadSpec::new_runtime_shape: tile byte size {bytes} exceeds PAGE_SIZE {} \
+             (rows={}, cols={}, elem_bytes={}). Region too large for page_buf entry.",
+            PAGE_SIZE,
+            tile.rows,
+            tile.cols,
+            tile.elem_bytes,
+        );
         Self {
             dst_page,
             src_arg,
@@ -2917,6 +2947,7 @@ impl StoreSpec {
     }
 
     /// Runtime-shape store, parallel to [`LoadSpec::new_runtime_shape`].
+    /// Same `PAGE_SIZE` byte-cap assert.
     pub(crate) fn new_runtime_shape(
         src_page: PageId,
         dst_arg: KernelArgRef,
@@ -2924,6 +2955,16 @@ impl StoreSpec {
         tile: TileShape,
         role: StorerRole,
     ) -> Self {
+        let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
+        assert!(
+            bytes <= PAGE_SIZE as u64,
+            "StoreSpec::new_runtime_shape: tile byte size {bytes} exceeds PAGE_SIZE {} \
+             (rows={}, cols={}, elem_bytes={}). Region too large for page_buf entry.",
+            PAGE_SIZE,
+            tile.rows,
+            tile.cols,
+            tile.elem_bytes,
+        );
         Self {
             src_page,
             dst_arg,
@@ -3373,6 +3414,31 @@ impl Instr {
             barrier_page,
             kind,
             tile: shape_witness.shape(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Runtime-shape variant of [`Instr::tma_expect`] — used by
+    /// `emit_external_load` where the shape comes from the SubtileIR's
+    /// tensor region and is not const-generic. Hard-asserts the byte
+    /// size fits PAGE_SIZE (mirror of LoadSpec::new_runtime_shape).
+    /// Per audit `external-load-no-tma-expect-no-barrier-init`.
+    pub(crate) fn tma_expect_runtime_shape(
+        barrier_page: PageId,
+        kind: PageBarrier,
+        tile: TileShape,
+        role: LoaderRole,
+    ) -> Self {
+        let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
+        assert!(
+            bytes <= PAGE_SIZE as u64,
+            "Instr::tma_expect_runtime_shape: tile byte size {bytes} exceeds PAGE_SIZE {}",
+            PAGE_SIZE,
+        );
+        Self::TmaExpect {
+            barrier_page,
+            kind,
+            tile,
             role: role.to_warp_role(),
         }
     }
@@ -4730,6 +4796,21 @@ impl TkTape {
 
     pub(crate) fn smem_vec_arena(&self) -> &BTreeMap<SmemVecSlot, SmemVecArenaEntry> {
         &self.smem_vec_arena
+    }
+
+    /// Total bytes the substrate's `__shared__ kittens::sv_<sfx><LEN>
+    /// sv_<idx>` static-smem decls will consume — sum of every entry's
+    /// [`SmemVecArenaEntry::byte_size`]. Per audit findings
+    /// `sv-arena-not-counted-in-static-smem-budget` and
+    /// `smem-vec-arena-bytes-not-capped`. The lowering's final
+    /// validator multiplies-checks this against
+    /// `HOPPER_MAX_STATIC_SMEM_BYTES_DEFAULT - SUBSTRATE_STATIC_SMEM_BYTES`
+    /// to stop a tape that would silently exceed the 48 KB static cap.
+    pub fn sv_static_smem_bytes(&self) -> u32 {
+        self.smem_vec_arena
+            .values()
+            .map(|e| e.byte_size())
+            .sum()
     }
 
     /// Append the cross-op gmem-fence as a 5-Instr atomic sequence.

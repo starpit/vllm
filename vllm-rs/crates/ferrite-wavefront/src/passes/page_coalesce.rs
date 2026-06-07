@@ -184,8 +184,54 @@ fn instr_page_accesses(instr: &Instr) -> Vec<(PageId, PageAccess)> {
             out.push((*b_page, PageAccess::Read));
         }
 
-        // ── No PageId-bearing fields ────────────────────────────────
-        _ => {}
+        // ── No PageId-bearing fields — exhaustive listing per audit
+        // finding `S2`. Catch-all `_ => {}` was a hazard: a future
+        // Instr variant adding a PageId field but missing an arm above
+        // would silently make the coalescer leave logical PageIds in
+        // the tape (e.g., `page_buf[17]` on a NUM_PAGES=5 substrate)
+        // → silent shared-memory OOB. The exhaustive match below
+        // forces a build error when a new variant is added.
+        SyncthreadsCta { .. }
+        | SyncthreadsGroup { .. }
+        | ThreadfenceBlock { .. }
+        | ThreadfenceDevice { .. }
+        | ThreadfenceSystem { .. }
+        | CommitGroupBulk { .. }
+        | WaitGroupBulk { .. }
+        | InitRtZero { .. }
+        | InitRvNegInfty { .. }
+        | InitRvZero { .. }
+        | WgmmaFenceAcc { .. }
+        | WgmmaAsyncWait { .. }
+        | RegTileMulScalar { .. }
+        | RegTileRowMaxAcc { .. }
+        | RegTileRowSumAcc { .. }
+        | RegTileSubRow { .. }
+        | RegTileExp2 { .. }
+        | RegTileDivRow { .. }
+        | RegVecSub { .. }
+        | RegVecExp2 { .. }
+        | RegVecMul { .. }
+        | RegTileCopyConvert { .. }
+        | RegVecCopy { .. }
+        | RegTileMulRow { .. }
+        | LoadVecSmemToReg { .. }
+        | StoreRegVecToShmem { .. }
+        | RegTileNeg { .. }
+        | RegTileExp { .. }
+        | RegTileAdd { .. }
+        | RegTileSub { .. }
+        | RegTileDiv { .. }
+        | RegTileMulCol { .. }
+        | RegTileAddScalar { .. }
+        | ShVecMulScalar { .. }
+        | ShVecAddScalar { .. }
+        | RegVecUnaryRsqrt { .. }
+        | LoadShmemToRegFromAct { .. }
+        | DebugOpBeginMarker { .. }
+        | ForLoopOpenConst { .. }
+        | ForLoopOpenKernelArg { .. }
+        | ForLoopClose { .. } => {}
     }
     out
 }
@@ -431,8 +477,50 @@ fn rewrite_instr_pages<F: Fn(&mut PageId)>(instr: &mut Instr, f: &F) {
         WgmmaMmaAB_RegSmem { b_page, .. } | WgmmaMmaABt_RegSmem { b_page, .. } => {
             f(b_page);
         }
-        // No PageId-bearing fields
-        _ => {}
+        // Exhaustive non-PageId-bearing list. Same rationale as
+        // `instr_page_accesses` — adding a new PageId-bearing
+        // variant must cover BOTH places.
+        SyncthreadsCta { .. }
+        | SyncthreadsGroup { .. }
+        | ThreadfenceBlock { .. }
+        | ThreadfenceDevice { .. }
+        | ThreadfenceSystem { .. }
+        | CommitGroupBulk { .. }
+        | WaitGroupBulk { .. }
+        | InitRtZero { .. }
+        | InitRvNegInfty { .. }
+        | InitRvZero { .. }
+        | WgmmaFenceAcc { .. }
+        | WgmmaAsyncWait { .. }
+        | RegTileMulScalar { .. }
+        | RegTileRowMaxAcc { .. }
+        | RegTileRowSumAcc { .. }
+        | RegTileSubRow { .. }
+        | RegTileExp2 { .. }
+        | RegTileDivRow { .. }
+        | RegVecSub { .. }
+        | RegVecExp2 { .. }
+        | RegVecMul { .. }
+        | RegTileCopyConvert { .. }
+        | RegVecCopy { .. }
+        | RegTileMulRow { .. }
+        | LoadVecSmemToReg { .. }
+        | StoreRegVecToShmem { .. }
+        | RegTileNeg { .. }
+        | RegTileExp { .. }
+        | RegTileAdd { .. }
+        | RegTileSub { .. }
+        | RegTileDiv { .. }
+        | RegTileMulCol { .. }
+        | RegTileAddScalar { .. }
+        | ShVecMulScalar { .. }
+        | ShVecAddScalar { .. }
+        | RegVecUnaryRsqrt { .. }
+        | LoadShmemToRegFromAct { .. }
+        | DebugOpBeginMarker { .. }
+        | ForLoopOpenConst { .. }
+        | ForLoopOpenKernelArg { .. }
+        | ForLoopClose { .. } => {}
     }
 }
 

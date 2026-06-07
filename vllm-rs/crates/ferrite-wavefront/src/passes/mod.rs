@@ -38,5 +38,7 @@
 
 pub mod page_coalesce;
 pub mod rt_alias;
+pub mod split_oversized_loads;
 pub use page_coalesce::page_coalesce_pass;
 pub use rt_alias::rt_alias_pass;
+pub use split_oversized_loads::split_oversized_loads_pass;

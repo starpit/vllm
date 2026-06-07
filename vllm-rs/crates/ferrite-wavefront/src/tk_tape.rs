@@ -2878,11 +2878,12 @@ impl LoadSpec {
     /// external-load boundary the shape is runtime data driven by
     /// the SubtileIR's tensor regions.
     ///
-    /// Hard-asserts `tile.byte_size() <= PAGE_SIZE` (release-mode):
-    /// a region larger than the page-pool tile would TMA-load past
-    /// the page boundary into adjacent shared-mem regions (silent
-    /// OOB write). Per audit finding
-    /// `external-load-runtime-shape-not-validated-against-page-pool`.
+    /// The PAGE_SIZE byte-cap is enforced AT THE PASS LEVEL by
+    /// [`crate::passes::split_oversized_loads_pass`], not at
+    /// construction time. The conservative lowering may legitimately
+    /// produce big LoadAsyncs that the K-tile pass then rewrites
+    /// into PAGE_SIZE-fitting K-loop bodies. Per plan §6.5
+    /// (TkTape→TkTape passes own target-specific resource decisions).
     pub(crate) fn new_runtime_shape(
         dst_page: PageId,
         src_arg: KernelArgRef,
@@ -2891,16 +2892,6 @@ impl LoadSpec {
         role: LoaderRole,
         barrier_page: PageId,
     ) -> Self {
-        let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
-        assert!(
-            bytes <= PAGE_SIZE as u64,
-            "LoadSpec::new_runtime_shape: tile byte size {bytes} exceeds PAGE_SIZE {} \
-             (rows={}, cols={}, elem_bytes={}). Region too large for page_buf entry.",
-            PAGE_SIZE,
-            tile.rows,
-            tile.cols,
-            tile.elem_bytes,
-        );
         Self {
             dst_page,
             src_arg,
@@ -2947,7 +2938,8 @@ impl StoreSpec {
     }
 
     /// Runtime-shape store, parallel to [`LoadSpec::new_runtime_shape`].
-    /// Same `PAGE_SIZE` byte-cap assert.
+    /// PAGE_SIZE byte-cap is enforced at the pass level, not at
+    /// construction.
     pub(crate) fn new_runtime_shape(
         src_page: PageId,
         dst_arg: KernelArgRef,
@@ -2955,16 +2947,6 @@ impl StoreSpec {
         tile: TileShape,
         role: StorerRole,
     ) -> Self {
-        let bytes = (tile.rows as u64) * (tile.cols as u64) * (tile.elem_bytes as u64);
-        assert!(
-            bytes <= PAGE_SIZE as u64,
-            "StoreSpec::new_runtime_shape: tile byte size {bytes} exceeds PAGE_SIZE {} \
-             (rows={}, cols={}, elem_bytes={}). Region too large for page_buf entry.",
-            PAGE_SIZE,
-            tile.rows,
-            tile.cols,
-            tile.elem_bytes,
-        );
         Self {
             src_page,
             dst_arg,

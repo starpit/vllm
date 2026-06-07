@@ -561,6 +561,16 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
     // runtime. The pass enforces its compile-time-or-garbage
     // postcondition by panicking with a liveness diagnostic if max
     // concurrent live > pool cap, rather than emitting a bad tape.
+    // Third §6.5 pass — `split_oversized_loads_pass`. K-tiles big
+    // External LoadAsyncs (Gemm weights ≥ 8 MB on Llama-3.2-1B) into
+    // PAGE_SIZE-fitting K-loop bodies. Phase 1 (this commit) just
+    // detects + panics with diagnostic; phase 2 (follow-up) does the
+    // rewrite. Runs BEFORE `page_coalesce_pass` so the post-rewrite
+    // page demand flows into the coalescer.
+    crate::passes::split_oversized_loads_pass(&mut out);
+    validate_tk_tape(&out)
+        .expect("split_oversized_loads_pass: produced invalid TkTape (post-condition)");
+
     crate::passes::page_coalesce_pass(&mut out);
     validate_tk_tape(&out)
         .expect("page_coalesce_pass: produced invalid TkTape (post-condition)");
@@ -1648,24 +1658,19 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     let tile = region_tile_shape(inp);
     let byte_off = region_byte_offset(state.graph, inp);
     let src_arg = state.tensor_arg(inp.tensor);
-    // TK 2.0 mbarrier protocol: init → expect_bytes → load_async.
-    // Without the init+expect pair on every external-load page, the
-    // matching `wait` either deadlocks (uninitialized mbarrier) or
-    // returns before the cp.async.bulk completes (transaction-byte
-    // count not armed). Per audit
-    // `external-load-no-tma-expect-no-barrier-init`. Mirrors the
-    // AttnDecode triple at line ~1394-1457.
-    state.push(Instr::BarrierInit {
-        page_id: dst_page,
-        kind: crate::tk_tape::PageBarrier::Ready,
-        count: crate::tk_tape::ArrivalCount::One,
-    });
-    state.push(Instr::tma_expect_runtime_shape(
-        dst_page,
-        crate::tk_tape::PageBarrier::Ready,
-        tile,
-        LOAD_ROLE,
-    ));
+    // Per `SUBTILE_IR_REDESIGN.md` §6 (commit-6 conservative all-gmem
+    // path):
+    //
+    // > External (source-tensor) read: LoadAsync only (no preceding
+    // > Wait — the dst page is freshly allocated).
+    //
+    // Reverts the `emit_external_load` BarrierInit + TmaExpect +
+    // LoadAsync triple I added in iter-3 cluster X. That added init
+    // and expect-bytes to External loads, contradicting the plan's
+    // explicit architecture. The audit finding
+    // `external-load-no-tma-expect-no-barrier-init` was based on a
+    // TK 2.0 protocol assumption that doesn't apply at this layer
+    // per the plan's design.
     state.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
         dst_page,
         src_arg,

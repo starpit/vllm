@@ -3191,7 +3191,14 @@ impl Instr {
         _width: GroupWidth<4>,
     ) -> Self
     where
-        WgmmaSmemSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+        (): MDimFor<M> + KDimFor<K> + NDimFor<N>,
+        WgmmaSmemSmemShape<
+            <() as MDimFor<M>>::Dim,
+            <() as KDimFor<K>>::Dim,
+            <() as NDimFor<N>>::Dim,
+            T_AB,
+            T_D,
+        >: WgmmaShape,
     {
         Self::WgmmaMmaAB_SmemSmem {
             a_page: a.page(),
@@ -3227,7 +3234,14 @@ impl Instr {
         _width: GroupWidth<4>,
     ) -> Self
     where
-        WgmmaRegSmemShape<M_PER_WARP, K, N, T_AB, T_D>: WgmmaShape,
+        (): MPerWarpDimFor<M_PER_WARP> + KDimFor<K> + NDimFor<N>,
+        WgmmaRegSmemShape<
+            <() as MPerWarpDimFor<M_PER_WARP>>::Dim,
+            <() as KDimFor<K>>::Dim,
+            <() as NDimFor<N>>::Dim,
+            T_AB,
+            T_D,
+        >: WgmmaShape,
     {
         Self::WgmmaMmaABt_RegSmem {
             a: a.slot(),
@@ -3312,7 +3326,14 @@ impl Instr {
         _width: GroupWidth<4>,
     ) -> Self
     where
-        WgmmaSmemSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+        (): MDimFor<M> + KDimFor<K> + NDimFor<N>,
+        WgmmaSmemSmemShape<
+            <() as MDimFor<M>>::Dim,
+            <() as KDimFor<K>>::Dim,
+            <() as NDimFor<N>>::Dim,
+            T_AB,
+            T_D,
+        >: WgmmaShape,
     {
         Self::WgmmaMmaABt_SmemSmem {
             a_page: a.page(),
@@ -3346,7 +3367,14 @@ impl Instr {
         _width: GroupWidth<4>,
     ) -> Self
     where
-        WgmmaRegSmemShape<M, K, N, T_AB, T_D>: WgmmaShape,
+        (): MPerWarpDimFor<M> + KDimFor<K> + NDimFor<N>,
+        WgmmaRegSmemShape<
+            <() as MPerWarpDimFor<M>>::Dim,
+            <() as KDimFor<K>>::Dim,
+            <() as NDimFor<N>>::Dim,
+            T_AB,
+            T_D,
+        >: WgmmaShape,
     {
         Self::WgmmaMmaAB_RegSmem {
             a: a.slot(),
@@ -4082,66 +4110,200 @@ impl Instr {
 // See the comment block above the `wgmma_mma_ab_smem_smem` constructor
 // (in the `impl Instr {}` block) for the rationale. This block defines
 // the witness types + sealed marker trait + the legal-tuple impls.
+//
+// **Why dimension-role types and not raw `usize` const generics:**
+// `feedback_compile_time_or_garbage` + the user's specific concern
+// about a future Claude treating M/K/N as "just numbers". A naive
+// `WgmmaSmemSmemShape<const M: usize, const K: usize, const N: usize,
+// ...>` lets you write `<128, 64, 128>` thinking it's `(M=128, K=64,
+// N=128)` when the impl set actually has `(64, 128, 128)` — the M
+// and K positions silently swap and rustc cannot tell. Worse, at the
+// `impl WgmmaShape for WgmmaSmemSmemShape<X, Y, Z, ...>` site there
+// is NOTHING preventing a typo that swaps two of {M, K, N}; the only
+// guard is a human reading the impl carefully.
+//
+// Instead, dimensions are role-typed: `M64`, `K128`, `N128` are
+// distinct sealed structs implementing exactly one of `MDim` /
+// `KDim` / `NDim`. `WgmmaSmemSmemShape<K128, M64, N128, ...>` is
+// rustc E0277 because `K128: MDim` doesn't hold.
+//
+// Bridging the const-generic `M: usize` on the WGMMA constructor to
+// the type-level `M: MDim` on the witness uses associated-type
+// `MDimFor<const N: usize>` impls — only legal numeric M values have
+// a corresponding `MDim` type, so passing an unimplemented numeric
+// (e.g., M=99) fails the bridge before WgmmaShape is even checked.
 
-/// Phantom witness type identifying a `wgmma_mma_*_smem_smem` shape
-/// tuple `(M, K, N, T_AB, T_D)`. Construction is impossible (no
-/// fields, sealed via the `Sealed` supertrait of `WgmmaShape`); only
-/// used as a type-level argument to the `where` bound on each
-/// `wgmma_*_smem_smem` constructor.
-pub struct WgmmaSmemSmemShape<
-    const M: usize,
-    const K: usize,
-    const N: usize,
-    T_AB: TileDtype,
-    T_D: TileDtype,
-> {
-    _marker: PhantomData<(fn() -> T_AB, fn() -> T_D)>,
+mod dim_role_sealed {
+    pub trait Sealed {}
 }
 
-/// Phantom witness for `wgmma_mma_*_reg_smem` shape tuples. The first
-/// parameter is `M_PER_WARP` (per-warp register-tile rows); collective
-/// M is `4 * M_PER_WARP`.
+/// Sealed dimension-role traits. Impl'd by exactly one
+/// `<Role><N>` zero-sized struct per legal numeric value.
+pub trait MDim: dim_role_sealed::Sealed {
+    const VALUE: usize;
+}
+pub trait KDim: dim_role_sealed::Sealed {
+    const VALUE: usize;
+}
+pub trait NDim: dim_role_sealed::Sealed {
+    const VALUE: usize;
+}
+/// Per-warp M for WGMMA rt-A variants. Collective M = 4 × `MPerWarpDim::VALUE`.
+pub trait MPerWarpDim: dim_role_sealed::Sealed {
+    const VALUE: usize;
+}
+
+/// `M=64`, the minimum collective M for warpgroup WGMMA.
+pub struct M64;
+impl dim_role_sealed::Sealed for M64 {}
+impl MDim for M64 {
+    const VALUE: usize = 64;
+}
+
+/// `M=128`, two warpgroup base rows.
+pub struct M128;
+impl dim_role_sealed::Sealed for M128 {}
+impl MDim for M128 {
+    const VALUE: usize = 128;
+}
+
+/// `K=128` smem-tile K-dim.
+pub struct K128;
+impl dim_role_sealed::Sealed for K128 {}
+impl KDim for K128 {
+    const VALUE: usize = 128;
+}
+
+/// `N=128` smem-tile N-dim.
+pub struct N128;
+impl dim_role_sealed::Sealed for N128 {}
+impl NDim for N128 {
+    const VALUE: usize = 128;
+}
+
+/// `M_PER_WARP=32` for rt-A WGMMA. Collective M = 128.
+pub struct MPerWarp32;
+impl dim_role_sealed::Sealed for MPerWarp32 {}
+impl MPerWarpDim for MPerWarp32 {
+    const VALUE: usize = 32;
+}
+
+// ── Bridge: const-generic numeric → MDim/KDim/NDim type ──────────────
+
+/// Map a const-generic numeric `M` to its corresponding [`MDim`] type.
+/// Impl'd only for legal numeric values via the zero-sized `()`. The
+/// constructor `where` clause uses this so a numeric like `M = 99`
+/// fails to find an impl and the compile errors out before checking
+/// [`WgmmaShape`].
+pub trait MDimFor<const VALUE: usize> {
+    type Dim: MDim;
+}
+impl MDimFor<64> for () {
+    type Dim = M64;
+}
+impl MDimFor<128> for () {
+    type Dim = M128;
+}
+
+pub trait KDimFor<const VALUE: usize> {
+    type Dim: KDim;
+}
+impl KDimFor<128> for () {
+    type Dim = K128;
+}
+
+pub trait NDimFor<const VALUE: usize> {
+    type Dim: NDim;
+}
+impl NDimFor<128> for () {
+    type Dim = N128;
+}
+
+pub trait MPerWarpDimFor<const VALUE: usize> {
+    type Dim: MPerWarpDim;
+}
+impl MPerWarpDimFor<32> for () {
+    type Dim = MPerWarp32;
+}
+
+// ── Witness types — keyed on dim-role TYPES, not numeric usize ───────
+//
+// # Compile-fail proof — swapping M and K positions is rejected
+//
+// The witness's `M: MDim, K: KDim, N: NDim` bounds reject any caller
+// (including a future `impl WgmmaShape for ...` site) that
+// accidentally swaps two dimension positions. K and M cannot be
+// confused as "just numbers" because they are distinct types.
+//
+// ```compile_fail
+// use ferrite_wavefront::tk_tape::{
+//     Bf16, Fp32, K128, M64, N128, WgmmaSmemSmemShape,
+// };
+// // OK: <M64, K128, N128, ...>
+// fn _ok() {
+//     let _: WgmmaSmemSmemShape<M64, K128, N128, Bf16, Fp32>;
+// }
+// // BAD: M and K swapped — rustc rejects (`K128: MDim` not satisfied,
+// // `M64: KDim` not satisfied).
+// fn _bad() {
+//     let _: WgmmaSmemSmemShape<K128, M64, N128, Bf16, Fp32>;
+// }
+// ```
+
+/// Phantom witness type identifying a `wgmma_mma_*_smem_smem` shape
+/// tuple `(M: MDim, K: KDim, N: NDim, T_AB, T_D)`. The dimension
+/// generics are role-typed: passing `<K128, M64, N128, ...>` (K and
+/// M swapped) is rustc E0277 because `K128: MDim` doesn't hold.
+pub struct WgmmaSmemSmemShape<M: MDim, K: KDim, N: NDim, T_AB: TileDtype, T_D: TileDtype> {
+    _marker: PhantomData<(fn() -> M, fn() -> K, fn() -> N, fn() -> T_AB, fn() -> T_D)>,
+}
+
+/// Phantom witness for `wgmma_mma_*_reg_smem`. First parameter is
+/// `MPerWarpDim` (collective M = 4 × value), distinct from `MDim` so
+/// the rt-A variant cannot share an impl with the smem-smem variant
+/// or vice versa.
 pub struct WgmmaRegSmemShape<
-    const M_PER_WARP: usize,
-    const K: usize,
-    const N: usize,
+    MPW: MPerWarpDim,
+    K: KDim,
+    N: NDim,
     T_AB: TileDtype,
     T_D: TileDtype,
 > {
-    _marker: PhantomData<(fn() -> T_AB, fn() -> T_D)>,
+    _marker: PhantomData<(fn() -> MPW, fn() -> K, fn() -> N, fn() -> T_AB, fn() -> T_D)>,
 }
 
 mod wgmma_shape_sealed {
     pub trait Sealed {}
 }
 
-/// Sealed marker — `(M, K, N, T_AB, T_D)` is a TK 2.0 sm_90a-legal
-/// WGMMA shape combo. Impl'd ONLY for the tuples ferrite-wavefront
-/// actually uses today (per `feedback_no_speculative_witnesses`).
-/// A wrong-shape constructor call is `error[E0277]: ... WgmmaShape
-/// ... not satisfied`, NOT an nvcc/ptxas error or runtime garbage.
+/// Sealed marker — the witness type is a TK 2.0 sm_90a-legal WGMMA
+/// shape combo. Impl'd ONLY for the role-typed witnesses
+/// ferrite-wavefront actually uses today (per
+/// `feedback_no_speculative_witnesses`). A wrong-shape constructor
+/// call fails one of:
+/// 1. The `MDimFor<M>` / `KDimFor<K>` / `NDimFor<N>` bridge bound
+///    (numeric not in the legal set).
+/// 2. The `WgmmaShape` impl set (combo not legal even though each
+///    dim is legal individually).
+/// 3. The dim-role type bound on the witness itself (caller swapped
+///    two dim positions, e.g. wrote `<K128, M64, N128, ...>`).
 pub trait WgmmaShape: wgmma_shape_sealed::Sealed {}
 
 // ── Smem-smem legal combos ──────────────────────────────────────────
 
-// `(M=128, K=128, N=128, Bf16, Fp32)` — collective M=128 warpgroup
-// matmul. Used by ferrite-wavefront tests today (the lowerer routes
-// through the rt-A variant for AttnDecode K@V; future GemmTile
-// emits would land here).
-impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<128, 128, 128, Bf16, Fp32> {}
-impl WgmmaShape for WgmmaSmemSmemShape<128, 128, 128, Bf16, Fp32> {}
+// `(M=128, K=128, N=128, Bf16, Fp32)` — collective M=128.
+impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<M128, K128, N128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaSmemSmemShape<M128, K128, N128, Bf16, Fp32> {}
 
-// `(M=64, K=128, N=128, Bf16, Fp32)` — collective M=64 warpgroup
-// matmul. m64 is the minimum collective M for WGMMA.
-impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<64, 128, 128, Bf16, Fp32> {}
-impl WgmmaShape for WgmmaSmemSmemShape<64, 128, 128, Bf16, Fp32> {}
+// `(M=64, K=128, N=128, Bf16, Fp32)` — m64 minimum collective M.
+impl wgmma_shape_sealed::Sealed for WgmmaSmemSmemShape<M64, K128, N128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaSmemSmemShape<M64, K128, N128, Bf16, Fp32> {}
 
 // ── Reg-smem legal combos ───────────────────────────────────────────
 
-// `(M_PER_WARP=32, K=128, N=128, Bf16, Fp32)` — collective M=128
-// (4 warps × 32 rows). Used by AttnDecode P@V and similar.
-impl wgmma_shape_sealed::Sealed for WgmmaRegSmemShape<32, 128, 128, Bf16, Fp32> {}
-impl WgmmaShape for WgmmaRegSmemShape<32, 128, 128, Bf16, Fp32> {}
+// `(M_PER_WARP=32, K=128, N=128, Bf16, Fp32)` — collective M=128.
+impl wgmma_shape_sealed::Sealed for WgmmaRegSmemShape<MPerWarp32, K128, N128, Bf16, Fp32> {}
+impl WgmmaShape for WgmmaRegSmemShape<MPerWarp32, K128, N128, Bf16, Fp32> {}
 
 // ── Witness handles surfacing tape-side dataflow ────────────────────
 

@@ -43,11 +43,23 @@ use std::marker::PhantomData;
 // ── Substrate constants (re-exported from tk_warp_ir for now) ───────
 
 pub const NUM_PAGES: u32 = 13;
+/// 128 rows × 128 cols × 2 bytes (bf16) = 32768 bytes per page_buf entry.
+/// page_buf holds weights and most non-MMA tiles.
 pub const PAGE_SIZE: u32 = 16384;
 pub const SCRATCH_BYTES: u32 = 1024;
 pub const NUM_CONSUMER_WARPS: u8 = 16;
 pub const NUM_SERVICE_WARPS: u8 = 4;
 pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
+
+/// Activation page pool sized for Hopper WGMMA m64 — 64 rows × 128 cols
+/// × 2 bytes = 16384 bytes per act_buf entry. Per
+/// SUBTILE_TK20_DECOMP.md §"Resolved decision 4" ("pad act_smem to 4
+/// tile rows"). WGMMA `mma_AB`/`mma_ABt` rt-A path needs A.rows == 64
+/// for collective M=64 (warpgroup of 4 × per-warp 16 rows). Weights
+/// (B operand) stay in the 128-row page_buf so K=128 doesn't force
+/// K-tiling.
+pub const NUM_ACT_PAGES: u32 = 8;
+pub const ACT_PAGE_SIZE: u32 = 64 * 128 * 2;
 
 // ── The tape ────────────────────────────────────────────────────────
 
@@ -1597,6 +1609,15 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS
 /// Sealed per §2: inner field is `pub(crate)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub(crate) u8);
+
+/// Sealed activation-page id — distinct namespace from [`PageId`].
+/// Indexes into the kernel's `act_buf` shared array (64×128 entries
+/// per [`NUM_ACT_PAGES`]) used for matmul A operands and AttnDecode
+/// q/k/v tiles. Kept separate from `PageId` so passing one where the
+/// other is expected is rustc E0308 — the substrate's two pools have
+/// different shapes and the type system enforces the routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ActPageId(pub(crate) u8);
 
 /// Which TK 2.0 mbarrier of a page slot a wait/arrive talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

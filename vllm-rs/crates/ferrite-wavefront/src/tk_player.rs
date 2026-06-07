@@ -638,6 +638,16 @@ mod tk20 {
         format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
     }
 
+    /// Activation page pool: 64-row × 128-col bf16 shared tiles, sized
+    /// for Hopper WGMMA m64. Same swizzle_bytes as page_buf for
+    /// `subtile<32>(idx)` compatibility per RopeRotateNeoX's
+    /// head_dim=64 split.
+    pub fn shared_act_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
+        format!(
+            "    __shared__ kittens::st_bf<{rows}, {cols}, true, 64> act_buf[{count_macro}];\n"
+        )
+    }
+
     /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` — per-slot
     /// shared-vec declaration. Distinct namespace from `page_buf[]`.
     pub fn shared_sv_decl(idx: u16, len: u32, dtype: &crate::tk_tape::TileDtypeTag) -> String {
@@ -700,12 +710,16 @@ pub(crate) fn kernel_arg_name(n: &crate::tk_tape::KernelArgName) -> String {
 
 pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     use crate::tk_tape::{
-        KernelArgName, KernelArgTy, NUM_CONSUMER_WARPS, NUM_PAGES, NUM_WARPS, PAGE_SIZE,
-        PreludeDecl,
+        ACT_PAGE_SIZE, KernelArgName, KernelArgTy, NUM_ACT_PAGES, NUM_CONSUMER_WARPS,
+        NUM_PAGES, NUM_WARPS, PAGE_SIZE, PreludeDecl,
     };
 
     let total_threads = (NUM_WARPS as u32) * 32;
-    let dyn_smem: u64 = (NUM_PAGES as u64) * (PAGE_SIZE as u64);
+    // DYN_SMEM = page_buf + act_buf budgets. Both pools share the
+    // same dynamic-smem allocation; the host wrapper will set
+    // `cudaFuncAttributeMaxDynamicSharedMemorySize` to this sum.
+    let dyn_smem: u64 = (NUM_PAGES as u64) * (PAGE_SIZE as u64)
+        + (NUM_ACT_PAGES as u64) * (ACT_PAGE_SIZE as u64);
 
     let mut out = String::new();
     out.push_str("// emitted by tk_player\n");
@@ -738,12 +752,21 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
 
     // Substrate constants the body references.
     let _ = writeln!(out, "    constexpr uint NUM_PAGES = {NUM_PAGES}u;");
+    let _ = writeln!(out, "    constexpr uint NUM_ACT_PAGES = {NUM_ACT_PAGES}u;");
     let _ = writeln!(out, "    constexpr uint NUM_CONSUMER_WARPS = {NUM_CONSUMER_WARPS}u;");
     out.push_str(&tk20::shared_st_bf_decl(128, 128, "NUM_PAGES"));
+    // Activation page pool — 64×128 to satisfy WGMMA m64 (A.rows == 4
+    // tile rows). See SUBTILE_TK20_DECOMP.md §"Resolved decision 4"
+    // and PHASE_A_AUDIT.md ADDENDUM 2 §"Substrate-shrink cascade".
+    // Distinct from `page_buf` (128×128) so weights stay K=128 and no
+    // K-tiling is needed for WGMMA B.
+    out.push_str(&tk20::shared_act_bf_decl(64, 128, "NUM_ACT_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_ready", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_carry", "NUM_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("act_ready", "NUM_ACT_PAGES"));
+    out.push_str(&tk20::shared_semaphore_decl("act_done", "NUM_ACT_PAGES"));
 
     // Per-slot shared-vec declarations. The arena is BTreeMap so
     // emit order is deterministic.

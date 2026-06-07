@@ -17,10 +17,12 @@
 
 use std::fmt::Write;
 
-use crate::tk_tape::{Instr, TkTape};
+use crate::tk_tape::{ActTileSpec, Bf16, Instr, PageTileSpec, TkTape};
 
 // ── tk20 — typed wrappers around TK 2.0 / kittens::* primitives ─────
 mod tk20 {
+    use crate::tk_tape::{SmemTileSpec, TileDtype};
+
     pub fn sync(n_warps: u32) -> String {
         format!("kittens::group<{n_warps}>::sync();")
     }
@@ -627,33 +629,66 @@ mod tk20 {
         format!("    void const *__restrict__ {name}{comma}\n")
     }
 
-    pub fn shared_st_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
-        // Explicit `_swizzle_bytes=64` (not the implicit 128 derived
-        // from `cols/TILE_COL_DIM == 8 ⇒ %4==0 ⇒ 128` at
-        // `types/shared/st.cuh:91-103`). Required for `subtile<32>(idx)`
-        // used by RopeRotateNeoX/RopeAppend's head_dim=64 split:
-        // `st.cuh:163` static-asserts `subtile_cols % swizzle_elements
-        // == 0`. With swizzle_bytes=128 ⇒ swizzle_elements=64, so
-        // subtile<32> fails (32 % 64 ≠ 0). swizzle_bytes=64 ⇒
-        // swizzle_elements=32, so subtile<32> divides evenly.
-        // WGMMA supports {32, 64, 128} swizzle (st.cuh:90).
+    /// Emit a `kittens::st_<suffix><ROWS, COLS, true, 64>` type literal
+    /// from a typed [`SmemTileSpec<ROWS, COLS, T>`] witness. The
+    /// numeric proof (rows, cols, dtype suffix) propagates from the
+    /// const generics + sealed `T::ST_ALIAS_SUFFIX` — there is no
+    /// runtime input. Per `feedback_end_to_end_compile_time_proofs`
+    /// + `feedback_no_premature_string_encoding`: the CUDA-syntax
+    /// shape literal lives only inside the player, derived from the
+    /// same witness the substrate constants ([`PAGE_SIZE`] /
+    /// [`ACT_PAGE_SIZE`] via [`SmemTileSpec::byte_size`]) are.
+    ///
+    /// `swizzle_bytes = 64` is hardcoded here. Required for
+    /// `subtile<32>(idx)` used by RopeRotateNeoX/RopeAppend's
+    /// head_dim=64 split: `types/shared/st.cuh:163` static-asserts
+    /// `subtile_cols % swizzle_elements == 0`. With swizzle=128
+    /// (the default), `swizzle_elements = 64` and `subtile<32>`
+    /// fails (32 % 64 ≠ 0). With swizzle=64, `swizzle_elements = 32`,
+    /// so subtile<32> divides evenly. (Lifting swizzle onto the
+    /// witness is a follow-up — sub-tile-swizzle-divisibility audit
+    /// finding `subtile-swizzle-divisibility-missing`.)
+    pub fn st_type_literal<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        _spec: SmemTileSpec<ROWS, COLS, T>,
+    ) -> String {
         format!(
-            "    __shared__ kittens::st_bf<{rows}, {cols}, true, 64> page_buf[{count_macro}];\n"
+            "kittens::st_{suffix}<{ROWS}, {COLS}, true, 64>",
+            suffix = T::ST_ALIAS_SUFFIX,
         )
+    }
+
+    /// Emit a `__shared__` static-array declaration for a smem tile
+    /// pool, derived from a typed [`SmemTileSpec<ROWS, COLS, T>`]
+    /// witness. (Currently only kept for the historical static path —
+    /// the live substrate emit uses [`Self::shared_alloc_decl`]
+    /// against the dynamic [`shared_allocator`].)
+    #[allow(dead_code)]
+    pub fn shared_st_decl<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        array_name: &str,
+        count_macro: &str,
+        spec: SmemTileSpec<ROWS, COLS, T>,
+    ) -> String {
+        let ty = st_type_literal(spec);
+        format!("    __shared__ {ty} {array_name}[{count_macro}];\n")
+    }
+
+    /// Emit `auto &<array_name> = al.allocate<kittens::st_<…>, COUNT>();`
+    /// for the live `shared_allocator` substrate path. The tile type
+    /// comes from the const-generic [`SmemTileSpec`] witness — same
+    /// witness that drives [`PAGE_SIZE`] / [`ACT_PAGE_SIZE`] via
+    /// [`SmemTileSpec::byte_size`]. Two sources of truth collapsed
+    /// into one.
+    pub fn shared_alloc_decl<const ROWS: usize, const COLS: usize, T: TileDtype>(
+        array_name: &str,
+        count_macro: &str,
+        spec: SmemTileSpec<ROWS, COLS, T>,
+    ) -> String {
+        let ty = st_type_literal(spec);
+        format!("    auto &{array_name} = al.allocate<{ty}, {count_macro}>();\n")
     }
 
     pub fn shared_semaphore_decl(name: &str, count_macro: &str) -> String {
         format!("    __shared__ kittens::semaphore {name}[{count_macro}];\n")
-    }
-
-    /// Activation page pool: 64-row × 128-col bf16 shared tiles, sized
-    /// for Hopper WGMMA m64. Same swizzle_bytes as page_buf for
-    /// `subtile<32>(idx)` compatibility per RopeRotateNeoX's
-    /// head_dim=64 split.
-    pub fn shared_act_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
-        format!(
-            "    __shared__ kittens::st_bf<{rows}, {cols}, true, 64> act_buf[{count_macro}];\n"
-        )
     }
 
     /// `__shared__ kittens::sv_<dtype><LEN> sv_<idx>;` — per-slot
@@ -772,13 +807,31 @@ pub fn emit_kernel(name: &str, tape: &TkTape) -> String {
     let _ = writeln!(out, "    constexpr uint NUM_CONSUMER_WARPS = {NUM_CONSUMER_WARPS}u;");
     // Dynamic shared memory via TK 2.0's `shared_allocator` pattern
     // (per `third_party/thunderkittens/README.md`). Total static smem
-    // would exceed 48KB cap (page_buf alone is 416KB at 13×128×128×2);
-    // dynamic smem path uses `cudaFuncAttributeMaxDynamicSharedMemorySize`
-    // (set by the host wrapper at launch) and Hopper's 228KB max.
+    // would exceed 48KB cap; dynamic smem path uses
+    // `cudaFuncAttributeMaxDynamicSharedMemorySize` (set by the host
+    // wrapper at launch).
+    //
+    // The page_buf / act_buf type literals are derived from the
+    // canonical typed witnesses [`PageTileSpec`] / [`ActTileSpec`]
+    // (in `tk_tape.rs`) — same witnesses that drive
+    // [`PAGE_SIZE`] / [`ACT_PAGE_SIZE`] via
+    // [`SmemTileSpec::byte_size`]. There is now ONE source of truth
+    // for the substrate tile shape; the emit cannot drift from the
+    // host-wrapper's DYN_SMEM math. Per
+    // `feedback_end_to_end_compile_time_proofs` +
+    // `feedback_no_premature_string_encoding`.
     out.push_str("    extern __shared__ kittens::alignment_dummy __shm[];\n");
     out.push_str("    kittens::shared_allocator al((int*)&__shm[0]);\n");
-    out.push_str("    auto &page_buf = al.allocate<kittens::st_bf<128, 128, true, 64>, NUM_PAGES>();\n");
-    out.push_str("    auto &act_buf = al.allocate<kittens::st_bf<64, 128, true, 64>, NUM_ACT_PAGES>();\n");
+    out.push_str(&tk20::shared_alloc_decl::<128, 128, Bf16>(
+        "page_buf",
+        "NUM_PAGES",
+        PageTileSpec::WITNESS,
+    ));
+    out.push_str(&tk20::shared_alloc_decl::<64, 128, Bf16>(
+        "act_buf",
+        "NUM_ACT_PAGES",
+        ActTileSpec::WITNESS,
+    ));
     out.push_str(&tk20::shared_semaphore_decl("page_ready", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_done", "NUM_PAGES"));
     out.push_str(&tk20::shared_semaphore_decl("page_consumed", "NUM_PAGES"));

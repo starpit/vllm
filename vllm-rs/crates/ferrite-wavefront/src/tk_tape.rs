@@ -40,26 +40,109 @@ use std::marker::PhantomData;
 // `subtile_ir::RopeForm`, which is the canonical witness; the
 // TkTape-side duplicate was always redundant).
 
-// ── Substrate constants (re-exported from tk_warp_ir for now) ───────
+// ── Substrate constants ──────────────────────────────────────────────
+//
+// Per `feedback_end_to_end_compile_time_proofs` (INVIOLABLE): the
+// substrate's per-page byte size MUST propagate end-to-end from a
+// typed witness, never as a hand-typed literal. The constants below
+// are now *derived* from the canonical type aliases [`PageTileSpec`]
+// and [`ActTileSpec`] via [`SmemTileSpec::byte_size`] — a change to
+// the page-pool tile shape is a single-line edit at the type alias,
+// and the host-wrapper's `DYN_SMEM` and the kernel's `al.allocate<>`
+// emit cannot drift relative to it.
 
-pub const NUM_PAGES: u32 = 13;
-/// 128 rows × 128 cols × 2 bytes (bf16) = 32768 bytes per page_buf entry.
-/// page_buf holds weights and most non-MMA tiles.
-pub const PAGE_SIZE: u32 = 16384;
+/// Page-pool size. Set so `NUM_PAGES * PAGE_SIZE + NUM_ACT_PAGES *
+/// ACT_PAGE_SIZE <= HOPPER_MAX_DYN_SMEM_BYTES` (228 KB) — verified
+/// at Rust compile time by the const_assert below the constants.
+///
+/// At 32 KB per `st_bf<128, 128>` page + 16 KB per `st_bf<64, 128>`
+/// act page, the substrate is bounded by Hopper, not by anything
+/// else. With NUM_PAGES = 5, NUM_ACT_PAGES = 4: total = 5*32 + 4*16
+/// = 224 KB ≤ 228 KB. Margin = 4 KB (for static __shared__
+/// semaphores + sv_ arena, currently sized in static smem).
+///
+/// **Demand vs capacity**: `page_coalesce_pass` empirically observed
+/// 7 unique logical PageIds for the Llama-3.2-1B decode tape. With
+/// NUM_PAGES = 5, the pass will panic at codegen time
+/// (proc-macro expansion in `ferrite-forward-macro`) with the
+/// liveness diagnostic — that's a compile-time-class failure, NOT a
+/// runtime kernel deadlock. Closing the demand-vs-capacity gap is
+/// the next §6.5 pass (mixed-shape pool, gmem spill of long-lived
+/// activations, or finer-grained coalescing) — see
+/// `feedback_compile_time_or_garbage` (INVIOLABLE).
+pub const NUM_PAGES: u32 = 5;
+
+/// Canonical type alias for the tile that lives in `page_buf[i]`. The
+/// substrate is uniform — every PageId indexes a tile of this shape.
+/// Changing the page-pool shape is a single-line edit here; both the
+/// host-wrapper's DYN_SMEM math and the kernel's `al.allocate<...>`
+/// emit derive from this alias.
+pub type PageTileSpec = SmemTileSpec<128, 128, Bf16>;
+
+/// Byte size of a single page_buf entry, derived from the typed
+/// witness — `128 * 128 * 2 = 32768` bytes for bf16. NOT a hand-typed
+/// literal: a future shape change at [`PageTileSpec`] propagates here
+/// automatically.
+pub const PAGE_SIZE: u32 = PageTileSpec::byte_size();
+
 pub const SCRATCH_BYTES: u32 = 1024;
 pub const NUM_CONSUMER_WARPS: u8 = 16;
 pub const NUM_SERVICE_WARPS: u8 = 4;
 pub const NUM_WARPS: u8 = NUM_SERVICE_WARPS + NUM_CONSUMER_WARPS;
 
-/// Activation page pool sized for Hopper WGMMA m64 — 64 rows × 128 cols
-/// × 2 bytes = 16384 bytes per act_buf entry. Per
-/// SUBTILE_TK20_DECOMP.md §"Resolved decision 4" ("pad act_smem to 4
-/// tile rows"). WGMMA `mma_AB`/`mma_ABt` rt-A path needs A.rows == 64
+/// Activation page pool sized for Hopper WGMMA m64 — 64 rows × 128 cols.
+/// Per SUBTILE_TK20_DECOMP.md §"Resolved decision 4" ("pad act_smem to
+/// 4 tile rows"). WGMMA `mma_AB`/`mma_ABt` rt-A path needs A.rows == 64
 /// for collective M=64 (warpgroup of 4 × per-warp 16 rows). Weights
 /// (B operand) stay in the 128-row page_buf so K=128 doesn't force
 /// K-tiling.
-pub const NUM_ACT_PAGES: u32 = 8;
-pub const ACT_PAGE_SIZE: u32 = 64 * 128 * 2;
+/// Activation-pool size. See [`NUM_PAGES`] for the cap math.
+pub const NUM_ACT_PAGES: u32 = 4;
+
+/// Canonical type alias for the tile that lives in `act_buf[i]`.
+/// Distinct shape from [`PageTileSpec`] (64 rows vs 128) so a wrong
+/// pool routing is rustc E0308 — see [`ActPageId`] vs [`PageId`].
+pub type ActTileSpec = SmemTileSpec<64, 128, Bf16>;
+
+/// Byte size of a single act_buf entry, derived from [`ActTileSpec`].
+/// `64 * 128 * 2 = 16384` bytes for bf16.
+pub const ACT_PAGE_SIZE: u32 = ActTileSpec::byte_size();
+
+// ── Hardware capacity bounds ─────────────────────────────────────────
+//
+// Per `feedback_compile_time_or_garbage` (INVIOLABLE): every invariant
+// a fix relies on MUST become a compile-time guard. Hopper's hardware
+// caps below were previously enforced only at kernel-launch time
+// (cudaFuncSetAttribute returning an error code), or worse — silently
+// at runtime. Each `const _: () = assert!(...)` below fails the Rust
+// build if the substrate exceeds hardware, NOT the kernel launch.
+
+/// Hopper sm_90a max dynamic shared memory per block, with the
+/// `cudaFuncAttributeMaxDynamicSharedMemorySize` opt-in. Per CUDA 12.x
+/// programming guide table: 228 KB usable. (Static `__shared__` cap
+/// is 48 KB; the substrate uses dynamic shared via `shared_allocator`
+/// to clear that.)
+pub const HOPPER_MAX_DYN_SMEM_BYTES: u32 = 228 * 1024;
+
+/// Total dynamic-smem claim of the substrate's pools — derived from
+/// the typed witnesses. Mirrors what the kernel's `al.allocate<>`
+/// chain consumes for `page_buf` + `act_buf`. Note: barriers are
+/// currently emitted as static `__shared__` and don't enter this
+/// total (separate audit follow-up).
+pub const SUBSTRATE_DYN_SMEM_BYTES: u32 =
+    NUM_PAGES * PAGE_SIZE + NUM_ACT_PAGES * ACT_PAGE_SIZE;
+
+/// Compile-time guard: if the substrate's dynamic-smem total exceeds
+/// the Hopper cap, this `const _: ()` evaluation panics at *Rust
+/// compile time*, NOT at kernel launch. A miswire (NUM_PAGES too
+/// big, page tile shape too big, etc.) becomes `error[E0080]`, never
+/// a runtime `cudaErrorInvalidValue` from `cudaFuncSetAttribute`.
+/// Per `feedback_end_to_end_compile_time_proofs`.
+const _: () = assert!(
+    SUBSTRATE_DYN_SMEM_BYTES <= HOPPER_MAX_DYN_SMEM_BYTES,
+    "substrate dynamic-smem total exceeds Hopper sm_90a 228 KB cap. \
+     Reduce NUM_PAGES, NUM_ACT_PAGES, or shrink PageTileSpec / ActTileSpec.",
+);
 
 // ── The tape ────────────────────────────────────────────────────────
 
@@ -1611,6 +1694,15 @@ pub struct SmemTileSpec<const ROWS: usize, const COLS: usize, T: TileDtype> {
 }
 
 impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS, T> {
+    /// Const witness — pure phantom-type construction with no runtime
+    /// shape input. The const generics + sealed `T` are the source of
+    /// truth. Use this in const contexts (substrate emit, type-alias
+    /// wiring) where the shape is fixed at compile time. Per
+    /// `feedback_compile_time_or_garbage`: no runtime input means no
+    /// runtime check is needed — the `from_shape` `debug_assert`s
+    /// stay only for the lowerer's runtime-shape boundary case.
+    pub const WITNESS: Self = Self { _marker: PhantomData };
+
     /// Mint a typed spec from a runtime shape. `pub(crate)`: only
     /// the lowerer (which owns the page-shape mapping) can mint
     /// these. `debug_assert!`s shape conformance — a release-mode
@@ -1654,6 +1746,21 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileSpec<ROWS, COLS
     }
     pub const fn cols() -> usize {
         COLS
+    }
+
+    /// Byte size of a single `kittens::st_<T><ROWS, COLS, ...>` smem
+    /// tile, derived from const generics + the sealed `T::ELEM_BYTES`.
+    /// Matches TK 2.0's `types/shared/st.cuh:73,77,105`: storage is
+    /// `dtype data[rows*cols]`, no hidden padding.
+    ///
+    /// This is the source of truth for [`PAGE_SIZE`] / [`ACT_PAGE_SIZE`]
+    /// — the substrate constants are no longer hand-typed literals.
+    /// Per `feedback_end_to_end_compile_time_proofs`: the page byte
+    /// size propagates from the typed witness through to the
+    /// host-wrapper's `DYN_SMEM` and into the kernel's `al.allocate<>`
+    /// chain via the same `T` and ROWS/COLS.
+    pub const fn byte_size() -> u32 {
+        (ROWS as u32) * (COLS as u32) * T::ELEM_BYTES
     }
 }
 

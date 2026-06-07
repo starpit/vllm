@@ -1465,6 +1465,38 @@ impl<const ROWS: usize, const COLS: usize, T: TileDtype> SmemTileId<ROWS, COLS, 
     }
 }
 
+/// Activation-pool peer of [`SmemTileId`]. Indexes into the kernel's
+/// `act_buf` shared array (64×128 tiles, sized for Hopper WGMMA m64
+/// — see [`NUM_ACT_PAGES`]). Distinct type from `SmemTileId` so the
+/// substrate's two pools are routed at compile time, not runtime.
+///
+/// Per audit ADDENDUM 3 §"Step 2 design": minimum-scope plumbing.
+/// Shape const-generics propagate identically to `SmemTileId`; only
+/// the underlying `ActPageId` differs (sealed namespace).
+#[derive(Clone, Copy, Debug)]
+pub struct ActSmemTileId<const ROWS: usize, const COLS: usize, T: TileDtype> {
+    page: ActPageId,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<const ROWS: usize, const COLS: usize, T: TileDtype> ActSmemTileId<ROWS, COLS, T> {
+    pub(crate) const fn from_page(page: ActPageId) -> Self {
+        Self {
+            page,
+            _marker: PhantomData,
+        }
+    }
+    pub const fn page(&self) -> ActPageId {
+        self.page
+    }
+    pub const fn rows() -> usize {
+        ROWS
+    }
+    pub const fn cols() -> usize {
+        COLS
+    }
+}
+
 /// Sealed shared-vec slot identifier. Distinct namespace from
 /// [`PageId`]: pages are uniformly typed `kittens::st_bf<R,C>` tiles
 /// (the `page_buf[]` array), while shared vecs are `kittens::sv_*<LEN>`

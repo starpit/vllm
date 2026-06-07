@@ -896,12 +896,6 @@ fn parse_fp8(obj: &serde_json::Map<String, serde_json::Value>) -> Result<QuantMe
 /// codegen's `SCALE_DTYPE` const, the synth-kernel `t_scale` tag, and
 /// the synth Impl's `applies_to` gate. Divergence = `_s_half_` symbol
 /// reading BF16 bytes = garbage output.
-pub fn is_bf16_scale_arch(model: &crate::config::ModelParams) -> bool {
-    model
-        .architectures
-        .iter()
-        .any(|a| a.starts_with("Qwen3") || a.starts_with("Gemma4"))
-}
 
 pub fn storage_format_for_weight(
     program: &Program,

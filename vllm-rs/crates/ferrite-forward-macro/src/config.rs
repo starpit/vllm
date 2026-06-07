@@ -1029,6 +1029,13 @@ fn resolve_arch_spec(
     {
         a.decoder_prefix = Some(p.to_string());
     }
+    if let Some(s) = json.get("scale_dtype").and_then(|v| v.as_str()) {
+        assert!(
+            matches!(s, "f16" | "bf16"),
+            "config `{source_stem}`: unknown scale_dtype `{s}` (f16|bf16)",
+        );
+        a.scale_dtype = Some(s.to_string());
+    }
     if let Some(m) = json.get("weight_leaf_renames").and_then(|v| v.as_object()) {
         let mut v: Vec<(String, String)> = m
             .iter()

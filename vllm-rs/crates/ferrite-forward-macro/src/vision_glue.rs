@@ -105,21 +105,31 @@ pub fn emit_per_variant(
 
     // Construct the `VisionWrapper`, attaching the learned positional-
     // embedding table host-side when the arch declares one
-    // (`vision_pos_embed_key`). The wrapper then runs
-    // `fast_pos_embed_interpolate` over it per forward and uploads the
-    // result as the `pos_embeds` extern. Other arches emit a plain
-    // `VisionWrapper::new`. `num_grid_per_side = sqrt(table rows)`.
+    // (`vision_pos_embed_key`). The wrapper then interpolates it
+    // host-side per forward (bilinear or bicubic per the declared
+    // `POS_EMB_INTERP`) and uploads the result as the `pos_embeds`
+    // extern. Other arches emit a plain `VisionWrapper::new`.
+    //
+    // `num_grid_per_side` derives from ELEMENT COUNT / embed_dim —
+    // NOT `shape[0]` — because checkpoints ship the square table both
+    // flattened (`[ng², d]`, Qwen3.5-VL `[2304, 1152]`) and as a grid
+    // (`[ng, ng, d]`, MoonViT `[64, 64, 1152]`): `sqrt(shape[0])`
+    // mis-derived ng=8 for the latter and the interp read a garbage
+    // 8×8 view (live pos_embeds absmax 26 vs golden 195).
+    let pe_embed_dim_lit = proc_macro2::Literal::u32_unsuffixed(embed_dim);
     let wrapper_ctor: TokenStream = match &model.arch.pos_embed_key {
         ::std::option::Option::Some(key) => {
             let key_lit = syn::LitStr::new(key, proc_macro2::Span::call_site());
             quote! {{
                 let mut __vw = ::ferrite_forward::VisionWrapper::new(weights);
-                if let (
-                    ::std::option::Option::Some(__pe_tbl),
-                    ::std::option::Option::Some(__pe_shape),
-                ) = (gw.tensor_to_f32(#key_lit), gw.tensor_shape_any(#key_lit))
-                {
-                    let __ng = (__pe_shape[0] as f64).sqrt().round() as usize;
+                if let ::std::option::Option::Some(__pe_tbl) = gw.tensor_to_f32(#key_lit) {
+                    let __rows = __pe_tbl.len() / (#pe_embed_dim_lit as usize);
+                    let __ng = (__rows as f64).sqrt().round() as usize;
+                    ::std::assert_eq!(
+                        __ng * __ng,
+                        __rows,
+                        "learned pos-embed table is not a square grid",
+                    );
                     __vw = __vw.with_pos_embed_table(__pe_tbl, __ng);
                 }
                 __vw

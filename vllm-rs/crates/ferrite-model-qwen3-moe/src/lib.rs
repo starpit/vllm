@@ -34,6 +34,9 @@ use ferrite_forward_macro::forward;
     workloads = [1, 8, 64],
 )]
 mod qwen3_moe {
+    /// Checkpoints ship BF16 RMSNorm gains (Qwen3-family
+    /// convention) — the metal gain-reader symbols must match.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
     // Qwen3 sparse-MoE routers renormalize the top-k weights; configs
     // that omit `norm_topk_prob` default it TRUE (modeling code).
     const BOUND_DEFAULTS: &[(&str, u64)] = &[("norm_topk_prob", 1)];

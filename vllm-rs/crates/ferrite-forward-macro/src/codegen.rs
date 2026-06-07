@@ -5975,7 +5975,7 @@ fn emit_synthesized_kernel_sources_override(
     // Qwen3-Next, dense + MoE + the VL-wrapped `Qwen3_5ForConditional
     // Generation` text decoders) ships BF16 scales+biases. Match by
     // family prefix so new members are covered automatically.
-    let is_bf16_scale = crate::quantization::is_bf16_scale_arch(model);
+    let is_bf16_scale = model.arch.scale_dtype.as_deref() == Some("bf16");
     let t_scale = if is_bf16_scale { "bfloat" } else { "half" };
 
     // Model dims baked as MSL `constant constexpr` literals at synth
@@ -6519,11 +6519,11 @@ fn emit_canonical_params_impl(
     // `_s_bf16_` symbol arms. Match on the HF `architectures` strings
     // baked into `model.architectures`.
     let scale_dtype_override = {
-        // Match the whole Qwen3 family by prefix (Qwen3 / Qwen3Moe /
-        // Qwen3.5 / Qwen3.6 / Qwen3-Next, incl. the VL-wrapped
-        // `Qwen3_5ForConditionalGeneration` text decoders). Must stay in
-        // sync with the synth-kernel `t_scale` gate above.
-        let is_bf16_scale = crate::quantization::is_bf16_scale_arch(model);
+        // Declared per arch (`const SCALE_DTYPE` on the carrier mod;
+        // per-checkpoint repacks override via the `scale_dtype` JSON
+        // drift key). Must stay in sync with the synth-kernel
+        // `t_scale` gate above (same declared value).
+        let is_bf16_scale = model.arch.scale_dtype.as_deref() == Some("bf16");
         // NVFP4 (NVIDIA ModelOpt) checkpoints ship BF16 RMSNorm gains
         // (and BF16 embed/lm_head), unlike the mlx-community 4bit Llama
         // convention of F16. `SCALE_DTYPE` selects the rmsnorm /

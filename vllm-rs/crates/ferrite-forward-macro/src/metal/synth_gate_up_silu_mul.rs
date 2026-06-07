@@ -67,7 +67,7 @@ pub(crate) fn is_qwen3_arch(model: &crate::config::ModelParams) -> bool {
     // Gemma4): if the synth scale-tag gate disagrees, the synth
     // requests a `_half`-scale kernel for a bf16-scale model →
     // metallib mismatch panic (`no library synth_mlp_pre_down_bfloat_half_gs64`).
-    crate::quantization::is_bf16_scale_arch(model)
+    model.arch.scale_dtype.as_deref() == Some("bf16")
 }
 
 /// True for `mlx_lm.convert` affine-quantized checkpoints. The M=1

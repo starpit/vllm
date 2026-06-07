@@ -81,6 +81,15 @@ pub struct DeclaredArchSpec {
     /// `"neox_hw"` (default) / `"interleaved_xy"`.
     pub rope_style: Option<String>,
     pub vision_norm_eps: Option<f64>,
+    /// RMSNorm-GAIN tensor dtype the metal kernels' `_s_<dtype>_`
+    /// symbol arm reads: `"f16"` (default — the mlx-community
+    /// f16-gain repack convention) / `"bf16"` (checkpoints shipping
+    /// bf16 gains: Qwen3-family, Gemma4, full-bf16 originals).
+    /// Mis-declaring reads gain bytes in the wrong float layout —
+    /// e.g. bf16 0x3E87 (0.264) as f16 1.63 — and garbles every
+    /// norm. Per-checkpoint repacks override via the JSON
+    /// `scale_dtype` drift key.
+    pub scale_dtype: Option<String>,
     pub decoder_prefix: Option<String>,
     pub tie_default: Option<bool>,
     pub bound_defaults: Vec<(String, u64)>,
@@ -412,6 +421,18 @@ impl DeclaredArchSpec {
                 });
             }
             "POS_EMBED_KEY" => self.pos_embed_key = Some(lit_str(expr)?),
+            "SCALE_DTYPE" => {
+                self.scale_dtype = Some(match variant_ident(expr)?.as_str() {
+                    "F16" => "f16".to_string(),
+                    "Bf16" => "bf16".to_string(),
+                    other => {
+                        return Err(syn::Error::new(
+                            expr.span(),
+                            format!("SCALE_DTYPE: unknown variant `{other}` (F16|Bf16)"),
+                        ));
+                    }
+                });
+            }
             "SAFETENSORS" => {
                 let mut root = None;
                 let mut blocks = None;
@@ -516,7 +537,7 @@ impl DeclaredArchSpec {
                     item.ident.span(),
                     format!(
                         "unknown arch declaration const `{other}` — known: NORM_EPS, \
-                         ROPE_STYLE, POS_EMB_INTERP, POS_EMBED_KEY, SAFETENSORS, \
+                         ROPE_STYLE, POS_EMB_INTERP, POS_EMBED_KEY, SCALE_DTYPE, SAFETENSORS, \
                          FINGERPRINT, PATCH_EMBED_FLATTEN, WEIGHT_LEAF_RENAMES, \
                          DECODER_PREFIX, TIE_DEFAULT, BOUND_DEFAULTS, CONFIG_ALIASES",
                     ),

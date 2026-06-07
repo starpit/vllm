@@ -51,7 +51,12 @@ use ferrite_forward_macro::forward;
 #[forward(
     workloads = [1, 8, 64, 512, 4096],
 )]
-fn gemma4() {
+mod gemma4 {
+    /// Checkpoints ship BF16 RMSNorm gains — the metal
+    /// gain-reader symbols must match.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
+
+    fn forward() {
     hidden_states = embed(input_ids, embed_tokens) * sqrt(hidden_size);
     for layer in 0..num_hidden_layers {
         pre_attn_normed = rmsnorm(hidden_states, input_layernorm[layer]);
@@ -97,4 +102,5 @@ fn gemma4() {
     }
     normed = rmsnorm(hidden_states, norm);
     logits = tanh_softcap(gemm(normed, lm_head));
+}
 }

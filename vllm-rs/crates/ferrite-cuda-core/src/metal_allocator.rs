@@ -1468,7 +1468,10 @@ impl DeviceAllocator for MetalAllocator {
         // read scalar (`sl[0]`, `weight[i]`) and 2-byte alignment is
         // safe.
         let effective_min_align = min_align.clamp(1, Self::MIN_BIND_ALIGN);
-        if bytes > 0 {
+        // FERRITE_NO_ZERO_COPY=1: diagnostic kill-switch (silent-failure
+        // toolkit family) — route every weight through the memcpy
+        // materialization path, isolating zero-copy mmap-binding bugs.
+        if bytes > 0 && std::env::var_os("FERRITE_NO_ZERO_COPY").is_none() {
             match self.classify_mmap_offset(src_host, bytes, effective_min_align) {
                 MmapClassify::Aligned { aligned_ptr } => {
                     self.load_stats

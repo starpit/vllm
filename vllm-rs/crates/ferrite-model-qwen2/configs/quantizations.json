@@ -7,6 +7,7 @@
     "fp8-dynamic-per-tensor",
     "fp8-static-per-tensor",
     "mlx-affine-b4-g64",
-    "ggml"
+    "ggml",
+    "mlx-affine-b4-g64-qembed"
   ]
 }

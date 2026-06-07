@@ -41,6 +41,9 @@ use ferrite_forward_macro::forward;
     workloads = [1, 8, 64],
 )]
 mod qwen3_5_moe {
+    /// Checkpoints ship BF16 RMSNorm gains (Qwen3-family
+    /// convention) — the metal gain-reader symbols must match.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
     // Qwen3.5 `*RMSNorm` stores zero-centered gains (`x * (1 + w)`);
     // ferrite keeps the on-disk form and offsets in-kernel. The
     // sparse-MoE router renormalizes top-k weights — newer configs

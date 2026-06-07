@@ -583,6 +583,20 @@ pub enum Instr {
         role: WarpRole,
     },
 
+    /// `kittens::group<4>::mma_ABt<D, A, B, FENCE, ACC>(d, a, b)` —
+    /// `ops/group/mma/warpgroup.cuh:323` (rt-st-rt overload). Used by
+    /// AttnDecode_Qkt and any matmul where A is register-resident
+    /// and B is transposed.
+    WgmmaMmaABt_RegSmem {
+        a: RegTileSlot,
+        b_page: PageId,
+        d: RegTileSlot,
+        fence: u8,
+        accumulate: u8,
+        width: GroupWidthTag,
+        role: WarpRole,
+    },
+
     /// `kittens::group<N>::mul(rt_dst, rt_lhs, kittens::<dtype>(scalar))`
     /// — scalar overload of register-tile mul at
     /// `ops/group/register/tile/maps.cuh:708`. Used by AttnDecode_Qkt
@@ -1226,6 +1240,16 @@ impl ComputeWidth for GroupWidth<16> {}
 /// ```
 pub trait WarpLoadWidth: group_width_sealed::Sealed {}
 impl WarpLoadWidth for GroupWidth<1> {}
+
+/// Sealed witness for `(ST::rows, RT::rows)` pairs supported by
+/// `kittens::group<4>::load(rt, st)` (the warpgroup-sharded load).
+/// TK 2.0 `shared_to_register.cuh:17` requires
+/// `ST::rows == GROUP_WARPS * RT::rows`. For our substrate this is
+/// only ever `(128, 32)` — the WGMMA-input load distributes a 128-row
+/// page across 4 warps × 32 per-warp rows.
+pub trait WarpgroupLoadShape<const ST_ROWS: usize, const RT_ROWS: usize>:
+    group_width_sealed::Sealed {}
+impl WarpgroupLoadShape<128, 32> for GroupWidth<4> {}
 
 /// Runtime carrier for the const-generic `GroupWidth<N>` after type
 /// erasure into [`Instr`]. Field is `pub(crate)` (sealed); the only
@@ -2571,6 +2595,37 @@ impl Instr {
         }
     }
 
+    /// Warpgroup-sharded smem→reg load for the rt_st WGMMA path.
+    /// `kittens::group<4>::load(rt, st)` distributes ST.rows across
+    /// the 4 warps of the warpgroup; per
+    /// `ops/group/memory/tile/shared_to_register.cuh:17` this requires
+    /// `ST::rows == 4 * RT::rows`. The `where GroupWidth<4>:
+    /// WarpgroupLoadShape<ST_ROWS, RT_ROWS>` bound restricts callers
+    /// to (ST_ROWS, RT_ROWS) pairs that exist on our substrate (today
+    /// only (128, 32)) — passing arbitrary shapes is rustc E0277.
+    pub(crate) fn load_shmem_to_reg_warpgroup<
+        const ST_ROWS: usize,
+        const RT_ROWS: usize,
+        const COLS: usize,
+        T: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: SmemTileId<ST_ROWS, COLS, T>,
+        dst: RegTileId<RT_ROWS, COLS, T, L>,
+        _width: GroupWidth<4>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<4>: WarpgroupLoadShape<ST_ROWS, RT_ROWS>,
+    {
+        Self::LoadShmemToReg {
+            src: src.page(),
+            dst: dst.slot(),
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
     pub(crate) fn store_reg_tile_to_shmem<
         const N: usize,
         const ROWS: usize,
@@ -2590,6 +2645,41 @@ impl Instr {
             src: src.slot(),
             dst: dst.page(),
             width: width.tag(),
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Warpgroup-sharded reg→smem store. Mirrors
+    /// `load_shmem_to_reg_warpgroup`: 4 warps each contribute their
+    /// per-warp RT_ROWS to the collective ST_ROWS. The
+    /// `WarpgroupLoadShape<ST_ROWS, RT_ROWS>` witness is shared with
+    /// the load constructor — same (ST_ROWS, RT_ROWS) gate.
+    pub(crate) fn store_reg_tile_to_shmem_warpgroup<
+        const ST_ROWS: usize,
+        const RT_ROWS: usize,
+        const COLS: usize,
+        T_ST: TileDtype,
+        T_RT: TileDtype,
+        L: RegTileLayout,
+    >(
+        src: RegTileId<RT_ROWS, COLS, T_RT, L>,
+        dst: SmemTileId<ST_ROWS, COLS, T_ST>,
+        _width: GroupWidth<4>,
+        role: AllConsumersRole,
+    ) -> Self
+    where
+        GroupWidth<4>: WarpgroupLoadShape<ST_ROWS, RT_ROWS>,
+    {
+        // Note: T_ST and T_RT may differ — TK 2.0's `store(st, rt)`
+        // template at `shared_to_register.cuh` permits dtype mismatch
+        // between dst and src (e.g. fp32 rt → bf16 st conversion at
+        // store time), which is what we want for MatmulTile's
+        // accumulator-to-bf16 store. Per plan §"Resolved decision 5"
+        // the proper RegTileCopyConvert lift is a follow-up.
+        Self::StoreRegTileToShmem {
+            src: src.slot(),
+            dst: dst.page(),
+            width: GroupWidth::<4>::WARPGROUP.tag(),
             role: role.to_warp_role(),
         }
     }
@@ -2721,6 +2811,39 @@ impl Instr {
     ) -> Self {
         Self::WgmmaMmaAB_SmemSmem {
             a_page: a.page(),
+            b_page: b.page(),
+            d: d.slot(),
+            fence: F::KIND as u8,
+            accumulate: AC::KIND as u8,
+            width: GroupWidth::<4>::WARPGROUP.tag(),
+            role: WarpRole::AllConsumers,
+        }
+    }
+
+    /// Construct [`Instr::WgmmaMmaAB_RegSmem`]. D[M_per_warp, N] +=
+    /// Construct [`Instr::WgmmaMmaABt_RegSmem`]. D += rt A @ smem B^T.
+    /// `ops/group/mma/warpgroup.cuh:323` register-A variant — N is
+    /// `B::rows / TILE_ROW_DIM` (B is transposed), K is
+    /// `A::cols / TILE_COL_DIM == B::cols / TILE_COL_DIM`.
+    pub(crate) fn wgmma_mma_abt_reg_smem<
+        const M_PER_WARP: usize,
+        const K: usize,
+        const N: usize,
+        T_AB: TileDtype,
+        T_D: TileDtype,
+        L: RegTileLayout,
+        F: FencePolicy,
+        AC: AccPolicy,
+    >(
+        d: RegTileId<M_PER_WARP, N, T_D, L>,
+        a: RegTileId<M_PER_WARP, K, T_AB, L>,
+        b: SmemTileId<N, K, T_AB>,
+        _fence: F,
+        _accumulate: AC,
+        _width: GroupWidth<4>,
+    ) -> Self {
+        Self::WgmmaMmaABt_RegSmem {
+            a: a.slot(),
             b_page: b.page(),
             d: d.slot(),
             fence: F::KIND as u8,
@@ -3879,6 +4002,7 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
             | Instr::WgmmaMmaAB_SmemSmem { .. }
             | Instr::WgmmaMmaABt_SmemSmem { .. }
             | Instr::WgmmaMmaAB_RegSmem { .. }
+            | Instr::WgmmaMmaABt_RegSmem { .. }
             | Instr::WgmmaAsyncWait { .. }
             | Instr::RegTileMulScalar { .. }
             | Instr::RegTileRowMaxAcc { .. }

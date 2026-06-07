@@ -366,6 +366,22 @@ mod tk20 {
              {fence}, {accumulate}>(rt_{d_slot}, rt_{a_slot}, page_buf[{b_page}]);"
         )
     }
+    /// `kittens::group<4>::mma_ABt(rt_d, rt_a, st_b)` —
+    /// `ops/group/mma/warpgroup.cuh:323` register-A variant.
+    pub fn wgmma_mma_abt_reg_smem(
+        d_slot: u16,
+        a_slot: u16,
+        b_page: u8,
+        fence: u8,
+        accumulate: u8,
+    ) -> String {
+        format!(
+            "kittens::group<4>::mma_ABt<decltype(rt_{d_slot}), \
+             decltype(rt_{a_slot}), \
+             std::decay_t<decltype(page_buf[{b_page}])>, \
+             {fence}, {accumulate}>(rt_{d_slot}, rt_{a_slot}, page_buf[{b_page}]);"
+        )
+    }
     pub fn rt_mul_scalar(
         group_n: u32,
         dst: u16,
@@ -604,7 +620,18 @@ mod tk20 {
     }
 
     pub fn shared_st_bf_decl(rows: u32, cols: u32, count_macro: &str) -> String {
-        format!("    __shared__ kittens::st_bf<{rows}, {cols}> page_buf[{count_macro}];\n")
+        // Explicit `_swizzle_bytes=64` (not the implicit 128 derived
+        // from `cols/TILE_COL_DIM == 8 ⇒ %4==0 ⇒ 128` at
+        // `types/shared/st.cuh:91-103`). Required for `subtile<32>(idx)`
+        // used by RopeRotateNeoX/RopeAppend's head_dim=64 split:
+        // `st.cuh:163` static-asserts `subtile_cols % swizzle_elements
+        // == 0`. With swizzle_bytes=128 ⇒ swizzle_elements=64, so
+        // subtile<32> fails (32 % 64 ≠ 0). swizzle_bytes=64 ⇒
+        // swizzle_elements=32, so subtile<32> divides evenly.
+        // WGMMA supports {32, 64, 128} swizzle (st.cuh:90).
+        format!(
+            "    __shared__ kittens::st_bf<{rows}, {cols}, true, 64> page_buf[{count_macro}];\n"
+        )
     }
 
     pub fn shared_semaphore_decl(name: &str, count_macro: &str) -> String {
@@ -972,6 +999,10 @@ fn emit_instr(out: &mut String, tape: &TkTape, instr: &Instr) {
         Instr::WgmmaMmaAB_RegSmem { a, b_page, d, fence, accumulate, width: _, role: _ } => {
             let _ = writeln!(out, "{}",
                 tk20::wgmma_mma_ab_reg_smem(d.0, a.0, b_page.0, *fence, *accumulate));
+        }
+        Instr::WgmmaMmaABt_RegSmem { a, b_page, d, fence, accumulate, width: _, role: _ } => {
+            let _ = writeln!(out, "{}",
+                tk20::wgmma_mma_abt_reg_smem(d.0, a.0, b_page.0, *fence, *accumulate));
         }
         Instr::RegTileMulScalar { lhs, dst, scalar, dtype, width, role: _ } => {
             let _ = writeln!(out, "{}",

@@ -1032,10 +1032,24 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // tape Instrs). This arm orchestrates the WGMMA + zero
             // + fence + wait + store sequence.
             //
-            // Substrate: 128×128 Bf16 pages. Llama Q/K/V projections
-            // on a 128-row chunk: M=128, N=128, K=128 (a single
-            // K-block; multi-block via SumReduce). Accumulator is
-            // RegTileId<128, 128, Fp32, RowLayout> per Hopper convention.
+            // Substrate: 128×128 Bf16 pages. Hopper WGMMA m64 hardcodes
+            // A.rows == 4*TILE_ROW_DIM<bf16> == 64 for the smem-A
+            // variant; the register-A variant at warpgroup.cuh:139 sets
+            // M_DIV_4 = A::height instead, so per-warp 32-row rt_a
+            // (4 warps × 32 = 128 collective) sidesteps the constraint.
+            // Per audit B.1+B.2: switched MatmulTile to RegSmem path.
+            //
+            // Plan-faithful flow (8 Instrs):
+            //   1: InitRtZero          rt_d = 0
+            //   2: LoadShmemToReg      rt_a = load(a)  (group<4> ST→RT)
+            //   3: WgmmaFenceAcc       mma_fence(rt_d)
+            //   4: WgmmaMmaAB_RegSmem  rt_d += rt_a @ b
+            //   5: WgmmaAsyncWait      wait_group<0>
+            //   6: StoreRegTileToShmem dst = rt_d  (fp32→bf16 in TK 2.0)
+            //
+            // Per-warp rt shapes: rt_a / rt_d are <32, 128> per-warp
+            // (group<4>::load distributes ST.rows=128 across 4 warps,
+            // ST.rows / RT.rows == GROUP_WARPS=4 ⇒ RT.rows=32).
             use crate::tk_tape::{
                 AccReset, AllConsumersRole, Bf16, FenceExternal, Fp32,
                 GroupWidth, RegTileId, RoleWitness, RowLayout, SmemTileId,
@@ -1048,54 +1062,40 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
             const R: AllConsumersRole = AllConsumersRole;
 
-            // Mint the fp32 accumulator
-            let rt_d: RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
+            // Per-warp register tiles for the rt_st mma_AB. M=32 per
+            // warp ⇒ height=2; warpgroup of 4 = 128 collective rows.
+            let rt_a: RegTileId<32, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_d: RegTileId<32, 128, Fp32, RowLayout> = state.mint_reg_tile();
 
-            // Step 4: zero the accumulator
+            // Step 4: zero the accumulator (per-warp 32 rows)
             state.push(Instr::init_rt_zero(rt_d, WL, R));
+            // Load A from smem into per-warp rt_a — group<4>::load
+            // splits ST.rows=128 across 4 warps (32 rows per warp).
+            // Typed witness `WarpgroupLoadShape<128, 32>` gates the
+            // shape pair.
+            state.push(Instr::load_shmem_to_reg_warpgroup(a, rt_a, W4, R));
             // Step 5: fence on D
             state.push(Instr::wgmma_fence_acc(rt_d, W4));
-            // Step 6: D += A @ B
-            //   Accumulate (since we just zeroed D, accumulate is the
-            //   safe choice and matches multi-block-K future use).
-            //   FenceExternal because we just emitted WgmmaFenceAcc.
-            state.push(Instr::wgmma_mma_ab_smem_smem(
-                rt_d, a, b, FenceExternal, AccReset, W4,
+            // Step 6: D += rt_a @ B  (register-A variant — no M==4
+            // constraint; M_DIV_4 = A::height = 2)
+            state.push(Instr::wgmma_mma_ab_reg_smem(
+                rt_d, rt_a, b, FenceExternal, AccReset, W4,
             ));
             // Step 7: wait for all WGMMA groups
             state.push(Instr::wgmma_async_wait(0, W4));
 
-            // Step 8: store accumulator → dst page (fp32 → bf16
-            // cast via TK 2.0's store overload). NOTE: store_reg_tile_to_shmem
-            // currently requires src and dst to share dtype. Until
-            // we have RegTileCopyConvert (plan step 13), use a
-            // dst page held as fp32 — but the substrate is bf16.
-            // Pragmatic: emit the store with mismatched dtype and
-            // rely on TK 2.0's `store(st, rt)` template doing the
-            // conversion. The Rust side's typed constructor would
-            // refuse this; mark with TODO + use a raw struct literal
-            // for now until step 13.
-            //
-            // PER feedback_compile_time_or_garbage: this is a known
-            // gap, NOT a runtime garbage path — the emitted CUDA
-            // is correct; only the typed constructor's strict
-            // unification is bypassed here. Marked as a defect to
-            // fix in step 13 (RegTileCopyConvert).
-            //
-            // Alternate: skip the store from this arm and rely on
-            // a downstream Instr to convert+store. But that's a
-            // graph-level concern; for now, emit the store directly.
-            //
-            // Workaround: bypass typed constructor by constructing
-            // the runtime variant directly (still inside the crate,
-            // so the gate is preserved at the typed-constructor
-            // level for callers that aren't this lowerer arm).
-            state.push(Instr::StoreRegTileToShmem {
-                src: rt_d.slot(),
-                dst: dst.page(),
-                width: W16.tag(),
-                role: R.to_warp_role(),
-            });
+            // Step 8: store accumulator → dst page. Per-warp 32-row
+            // rt_d (Fp32) → 128-row smem dst (Bf16) via the
+            // warpgroup-sharded store. TK 2.0 `store(st, rt)` at
+            // `shared_to_register.cuh` handles fp32→bf16 conversion at
+            // store time, so the dtype mismatch is allowed (the
+            // typed constructor's `T_ST != T_RT` parameters reflect
+            // this). Per plan §"Resolved decision 5" the proper
+            // RegTileCopyConvert lift is a follow-up.
+            let _ = W16;
+            state.push(Instr::store_reg_tile_to_shmem_warpgroup(
+                rt_d, dst, W4, R,
+            ));
 
             emit_store_and_arrive(state, &node.output, dst_page);
         }
@@ -1319,23 +1319,32 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             let v_tile = SmemTileId::<128, 128, Bf16>::from_page(v_tile_page);
             let dst_tile = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
 
-            // Register state (persistent across iterations)
-            let rt_o:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
-            let rt_s:   RegTileId<128, 128, Fp32, RowLayout> = state.mint_reg_tile();
-            let rt_p:   RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
-            // AttnDecode rv's: row_max_acc / row_sum_acc / row_map (mul_row,
-            // sub_row, div_row) all flow through TK 2.0 row_reduce / row_map
-            // on a row-layout rt — both require V::layout == col_vec_layout
-            // = ortho_l (rt_base.cuh:79, reductions.cuh:23, maps.cuh:149).
-            let rv_m:     RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
-            let rv_l:     RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
-            let rv_m_old: RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
-            let rv_alpha: RegVecId<128, Fp32, OrthoLayout> = state.mint_reg_vec();
+            // Per-warp register state. Hopper WGMMA's rt_st mma_AB /
+            // mma_ABt at warpgroup.cuh:139,323 requires rt-A and rt-D
+            // to be per-warp slices (4 warps × M_per_warp = collective
+            // M). For collective M=128: M_per_warp = 32 (height=2).
+            // Per audit B.1+B.2 + plan §29 (AttnDecode_Sv = RegSmem).
+            let rt_q:   RegTileId<32, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            let rt_o:   RegTileId<32, 128, Fp32, RowLayout> = state.mint_reg_tile();
+            let rt_s:   RegTileId<32, 128, Fp32, RowLayout> = state.mint_reg_tile();
+            let rt_p:   RegTileId<32, 128, Bf16, RowLayout> = state.mint_reg_tile();
+            // Per-warp rv (ortho layout for row_max / row_sum / row_map
+            // path). LEN==32 ties to rt_s's per-warp ROWS.
+            let rv_m:     RegVecId<32, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_l:     RegVecId<32, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_m_old: RegVecId<32, Fp32, OrthoLayout> = state.mint_reg_vec();
+            let rv_alpha: RegVecId<32, Fp32, OrthoLayout> = state.mint_reg_vec();
 
             // ── Init phase (3 Instrs) ────────────────────────────
+            // Init via group<4> = warpgroup-scope: each of the 4 warps
+            // initializes its own per-warp 32-row slice of rt_o /
+            // 32-element slice of rv_m / rv_l.
             state.push(Instr::init_rt_zero(rt_o, WL, R));
-            state.push(Instr::init_rv_neg_infty(rv_m, W16, R));
-            state.push(Instr::init_rv_zero(rv_l, W16, R));
+            state.push(Instr::init_rv_neg_infty(rv_m, W4, R));
+            state.push(Instr::init_rv_zero(rv_l, W4, R));
+            // Load Q from smem to per-warp register tile once (Q is
+            // constant across the K-loop iterations).
+            state.push(Instr::load_shmem_to_reg_warpgroup(q_tile, rt_q, W4, R));
 
             // BarrierInit for K and V tile pages: each iteration's
             // TMA load arrives on the corresponding page_ready[*]
@@ -1441,10 +1450,12 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 WarpRole::AllConsumers,
             ));
 
-            // S = Q @ K^T (fence, reset; D is fp32)
+            // S = Q @ K^T via rt_st variant (rt_q is register-A; the
+            // rt_st mma_ABt's M_DIV_4 = A::height = 2 ⇒ collective
+            // M=128 across 4-warp warpgroup).
             state.push(Instr::wgmma_fence_acc(rt_s, W4));
-            state.push(Instr::wgmma_mma_abt_smem_smem(
-                rt_s, q_tile, k_tile, FenceExternal, AccReset, W4,
+            state.push(Instr::wgmma_mma_abt_reg_smem(
+                rt_s, rt_q, k_tile, FenceExternal, AccReset, W4,
             ));
             state.push(Instr::wgmma_async_wait(0, W4));
             // S *= scale * log2(e)
@@ -1489,14 +1500,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // ── Finalise phase ───────────────────────────────────
             // O /= l (per-row divide)
             state.push(Instr::reg_tile_div_row(rt_o, rv_l, rt_o, WL, R));
-            // Store O → dst page (fp32 → bf16 cast at TK 2.0's
-            // store boundary, same workaround as MatmulTile).
-            state.push(Instr::StoreRegTileToShmem {
-                src: rt_o.slot(),
-                dst: dst_tile.page(),
-                width: W16.tag(),
-                role: R.to_warp_role(),
-            });
+            // Store O → dst page via warpgroup-sharded store. Per-warp
+            // 32-row rt_o (Fp32) → 128-row dst_tile (Bf16); TK 2.0
+            // `store(st, rt)` handles fp32→bf16 conversion at store
+            // time. Per plan §"Resolved decision 5".
+            let _ = W16;
+            state.push(Instr::store_reg_tile_to_shmem_warpgroup(
+                rt_o, dst_tile, W4, R,
+            ));
 
             emit_store_and_arrive(state, &node.output, dst_page);
             // Suppress unused (some types referenced only for clarity)

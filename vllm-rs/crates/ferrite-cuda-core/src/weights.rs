@@ -318,14 +318,47 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 // device buffer, so take() just hands over an already-uploaded tensor.
 // ---------------------------------------------------------------------------
 
-/// Pre-stage worker count. The proven local-FS concurrency of
-/// runai-model-streamer (`RUNAI_STREAMER_CONCURRENCY` default 16) and
-/// fastsafetensors (`max_threads` default 16), and the count measured
-/// saturating a GCP pd at 96% of its ceiling (vs 61% single-thread).
-/// Cold-cache workers are IO-blocked, so the count is safe on hosts
-/// with fewer cores.
+/// Starting pre-stage reader count (QD): the proven local-FS
+/// concurrency of runai-model-streamer (`RUNAI_STREAMER_CONCURRENCY`
+/// default 16) and fastsafetensors (`max_threads` default 16), and the
+/// count measured saturating a GCP pd at 96% of its ceiling (vs 61%
+/// single-thread). Cold-cache workers are IO-blocked, so the count is
+/// safe on hosts with fewer cores. The ramp controller raises the
+/// active count from here while doing so still improves throughput —
+/// the disk substrate isn't enumerable (a virtualized "NVMe" node can
+/// be a 375 MB/s network disk or a 25 GB/s local RAID), so optimal
+/// queue depth is discovered by observation, not tabled.
 #[cfg(feature = "cuda")]
-const PRESTAGE_WORKERS: usize = 16;
+const PRESTAGE_WORKERS_START: usize = 16;
+
+/// Ceiling for the active reader count — bounds thread/pinned-slot
+/// spend on substrates that keep scaling. Beyond ~64 concurrent
+/// streams the marginal reader is noise on any storage we target.
+#[cfg(feature = "cuda")]
+const PRESTAGE_WORKERS_MAX: usize = 64;
+
+/// Ramp controller observation window. Long enough for several chunks
+/// per reader at disk speeds; short enough that the ramp settles
+/// within ~1s of a multi-second cold load.
+#[cfg(feature = "cuda")]
+const RAMP_WINDOW_MS: u64 = 200;
+
+/// Readers added per ramp step.
+#[cfg(feature = "cuda")]
+const RAMP_STEP: usize = 8;
+
+/// Minimum fractional throughput gain a window must show over the
+/// best seen so far for the ramp to keep raising the reader count;
+/// below this the raise is stepped back and the ramp settles.
+#[cfg(feature = "cuda")]
+const RAMP_GAIN_MIN: f64 = 0.10;
+
+/// Minimum sustained pipeline observation before a settled QD is
+/// persisted to the per-disk sidecar. Warm-page-cache loads finish in
+/// a few windows and measure memcpy parallelism, not the disk — their
+/// settles must not pollute the sidecar.
+#[cfg(feature = "cuda")]
+const RAMP_MIN_OBSERVE_MS: u64 = 1000;
 
 /// Floor for the per-worker pinned staging slot (chunk) size — the
 /// runai-model-streamer local-FS block floor (`min_fs_block_bytesize`);
@@ -379,6 +412,128 @@ fn resolve_stage_slot_bytes() -> usize {
         .clamp(STAGE_SLOT_BYTES_MIN, STAGE_SLOT_BYTES_MAX)
 }
 
+/// Sidecar path persisting the settled reader QD for the filesystem
+/// device backing `model_dir` (`$XDG_CACHE_HOME`/ferrite/io-qd-<dev>,
+/// falling back to `~/.cache`). Keyed by `st_dev` rather than model
+/// path: queue depth is a property of the disk, shared by every model
+/// stored on it.
+#[cfg(feature = "cuda")]
+fn qd_sidecar_path(model_dir: &Path) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(model_dir).ok()?.dev();
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })?;
+        Some(cache.join("ferrite").join(format!("io-qd-{dev}")))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = model_dir;
+        None
+    }
+}
+
+/// Read the persisted reader QD for this disk, clamped to the ramp
+/// range. `None` → first load on this device; start at the floor.
+#[cfg(feature = "cuda")]
+fn read_qd_sidecar(model_dir: &Path) -> Option<usize> {
+    let s = std::fs::read_to_string(qd_sidecar_path(model_dir)?).ok()?;
+    let qd = s.trim().parse::<usize>().ok()?;
+    Some(qd.clamp(PRESTAGE_WORKERS_START, PRESTAGE_WORKERS_MAX))
+}
+
+/// Persist the settled reader QD (best effort; failures ignored).
+#[cfg(feature = "cuda")]
+fn write_qd_sidecar(model_dir: &Path, qd: usize) {
+    let Some(path) = qd_sidecar_path(model_dir) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, qd.to_string()).ok();
+}
+
+/// QD ramp controller: measure a baseline window at the starting
+/// reader count, then repeatedly raise by [`RAMP_STEP`], measure a
+/// window, and keep the raise only when it gained ≥ [`RAMP_GAIN_MIN`];
+/// an unproductive raise is STEPPED BACK (raised lanes re-park after
+/// their in-flight tensor) before the ramp settles. The load itself is
+/// the probe — no wasted IO, and it self-trues on substrates no table
+/// can enumerate.
+///
+/// The settled QD is persisted for this disk only after
+/// [`RAMP_MIN_OBSERVE_MS`] of sustained pipeline observation — a
+/// warm-page-cache load finishes its windows too fast to say anything
+/// about the disk, and must not pollute the sidecar.
+#[cfg(feature = "cuda")]
+fn prestage_ramp_controller(
+    state: Arc<PrecastState>,
+    stats: Arc<PrecastStats>,
+    work_len: usize,
+    next: Arc<std::sync::atomic::AtomicUsize>,
+    model_dir: Option<std::path::PathBuf>,
+) {
+    let window = std::time::Duration::from_millis(RAMP_WINDOW_MS);
+    let mut last_bytes = 0usize;
+    // One window's staged-byte rate; None when the load finished or
+    // shutdown arrived mid-window (no verdict on the disk).
+    let measure = |last: &mut usize| -> Option<f64> {
+        std::thread::sleep(window);
+        if state.shutdown.load(Ordering::Relaxed) || next.load(Ordering::Relaxed) >= work_len {
+            return None;
+        }
+        let bytes = stats.bytes.load(Ordering::Relaxed);
+        let rate = bytes.saturating_sub(*last) as f64 / window.as_secs_f64();
+        *last = bytes;
+        Some(rate)
+    };
+
+    // Baseline at the starting QD — no raise until a measured floor
+    // exists to compare against.
+    let Some(mut best_rate) = measure(&mut last_bytes) else {
+        return;
+    };
+    loop {
+        let prev = state.active_workers.load(Ordering::Relaxed);
+        if prev >= PRESTAGE_WORKERS_MAX {
+            break;
+        }
+        state.active_workers.store(
+            (prev + RAMP_STEP).min(PRESTAGE_WORKERS_MAX),
+            Ordering::Relaxed,
+        );
+        state.cv.notify_all();
+        let Some(rate) = measure(&mut last_bytes) else {
+            return; // Finished mid-window: keep the raise, persist nothing.
+        };
+        if rate > best_rate * (1.0 + RAMP_GAIN_MIN) {
+            best_rate = rate; // Productive raise — keep climbing.
+        } else {
+            // Unproductive: step back and settle.
+            state.active_workers.store(prev, Ordering::Relaxed);
+            break;
+        }
+    }
+    let settled = state.active_workers.load(Ordering::Relaxed);
+    let observed_ms = stats.t0.elapsed().as_millis();
+    if observed_ms >= u128::from(RAMP_MIN_OBSERVE_MS) {
+        tracing::info!("pre-stage QD ramp settled at {settled} readers (persisted)");
+        if let Some(dir) = model_dir {
+            write_qd_sidecar(&dir, settled);
+        }
+    } else {
+        tracing::info!(
+            "pre-stage QD ramp settled at {settled} readers \
+             ({observed_ms}ms observed — too brief to persist)"
+        );
+    }
+}
+
 /// Identity of a tensor's backing bytes: (mmap base, offset, len).
 /// The ready-map is keyed by data identity rather than tensor name so
 /// prefix aliases (two names sharing one mmap range — see the
@@ -413,6 +568,7 @@ type PrecastWorkItem = (PrecastKey, Arc<memmap2::Mmap>, usize, usize, DType);
 /// skips this pipeline entirely.
 #[cfg(feature = "cuda")]
 fn precast_worker(
+    idx: usize,
     state: Arc<PrecastState>,
     target_dtype: Option<DType>,
     work: Arc<Vec<PrecastWorkItem>>,
@@ -421,6 +577,25 @@ fn precast_worker(
     slot_bytes: usize,
     stats: Arc<PrecastStats>,
 ) {
+    // Park until this reader lane is activated by the QD ramp
+    // controller (or the work runs out / shutdown). Lanes above the
+    // starting QD cost nothing while parked: no CUDA context, no
+    // pinned slot.
+    {
+        let mut s = state.shared.lock().unwrap();
+        while idx >= state.active_workers.load(Ordering::Relaxed)
+            && !state.shutdown.load(Ordering::Relaxed)
+            && next.load(Ordering::Relaxed) < work.len()
+        {
+            s = state.cv.wait(s).unwrap();
+        }
+        drop(s);
+    }
+    if state.shutdown.load(Ordering::Relaxed) || next.load(Ordering::Relaxed) >= work.len() {
+        precast_worker_finish(&state, &stats);
+        return;
+    }
+
     // CUDA calls need a current context on THIS thread — spawned
     // threads do not inherit the spawning thread's context. (The old
     // single-thread pipeline skipped this; its cast-path
@@ -442,6 +617,19 @@ fn precast_worker(
     };
 
     loop {
+        // Re-park while this lane is above the active QD — the ramp
+        // controller steps back after an unproductive raise, and
+        // stepped-back lanes must stop claiming work (the in-flight
+        // tensor was finished before we got here).
+        {
+            let mut s = state.shared.lock().unwrap();
+            while idx >= state.active_workers.load(Ordering::Relaxed)
+                && !state.shutdown.load(Ordering::Relaxed)
+                && next.load(Ordering::Relaxed) < work.len()
+            {
+                s = state.cv.wait(s).unwrap();
+            }
+        }
         if state.shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -461,9 +649,12 @@ fn precast_worker(
         }
 
         // Stream the tensor outside the lock — this is the expensive
-        // part and the part that faults the mmap pages.
+        // part and the part that faults the mmap pages. Progress is
+        // counted per chunk (into `stats.bytes`) so the ramp
+        // controller sees smooth windows, not whole-tensor lumps.
         let data = &mmap[*data_offset..*data_offset + *size_bytes];
-        let result = unsafe { stage_to_device(data, *dtype, target_dtype, slot, slot_bytes) };
+        let result =
+            unsafe { stage_to_device(data, *dtype, target_dtype, slot, slot_bytes, &stats.bytes) };
 
         let mut s = state.shared.lock().unwrap();
         s.in_progress.remove(key);
@@ -474,7 +665,6 @@ fn precast_worker(
                 } else {
                     stats.cast.fetch_add(1, Ordering::Relaxed);
                 }
-                stats.bytes.fetch_add(entry.size_bytes, Ordering::Relaxed);
                 s.ready.insert(*key, entry);
             }
             Err(e) => {
@@ -507,6 +697,7 @@ unsafe fn stage_to_device(
     target_dtype: Option<DType>,
     slot: *mut u8,
     slot_bytes: usize,
+    progress_bytes: &std::sync::atomic::AtomicUsize,
 ) -> Result<PrecastEntry> {
     let needs_cast = match target_dtype {
         Some(target) => matches!(dtype, DType::F32 | DType::F16 | DType::BF16) && dtype != target,
@@ -544,6 +735,7 @@ unsafe fn stage_to_device(
         unsafe {
             driver::memcpy_htod(gpu.ptr().add(done * dst_elem), slot, n * dst_elem)?;
         }
+        progress_bytes.fetch_add(n * dst_elem, Ordering::Relaxed);
         done += n;
     }
 
@@ -705,8 +897,13 @@ struct PrecastShared {
 #[cfg(feature = "cuda")]
 struct PrecastState {
     shared: Mutex<PrecastShared>,
-    /// Signaled on: entry ready, worker exit. Paired with `shared`.
+    /// Signaled on: entry ready, worker exit, reader-count raise.
+    /// Paired with `shared`.
     cv: std::sync::Condvar,
+    /// Active reader lanes — worker `i` runs only while
+    /// `i < active_workers`. Raised by the QD ramp controller,
+    /// never lowered.
+    active_workers: std::sync::atomic::AtomicUsize,
     /// Signal for the background workers to stop (e.g. on drop).
     shutdown: AtomicBool,
 }
@@ -744,6 +941,10 @@ pub struct GpuWeights {
     /// the slow path is rare (precast handles the hot path).
     /// Grows as needed, never shrinks.
     cast_scratch: Vec<u8>,
+    /// Directory the safetensors shards were loaded from. Feeds the
+    /// QD-sidecar key (the filesystem device backing the weights);
+    /// `None` for GGUF/`empty()`-constructed instances.
+    source_dir: Option<std::path::PathBuf>,
     /// Pre-stage pipeline state, shared with the background workers.
     /// CUDA-only optimization (uses pinned host memory for DMA);
     /// `None` under non-CUDA backends.
@@ -800,6 +1001,7 @@ impl GpuWeights {
             tensors: HashMap::new(),
             target_dtype: None,
             cast_scratch: Vec::new(),
+            source_dir: None,
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
@@ -828,13 +1030,15 @@ impl GpuWeights {
         let index_path = dir.join("model.safetensors.index.json");
         let single_path = dir.join("model.safetensors");
 
-        if index_path.exists() {
+        let mut gw = if index_path.exists() {
             Self::from_index(&index_path, allocator)
         } else if single_path.exists() {
             Self::from_single_file(&single_path, allocator)
         } else {
             anyhow::bail!("No safetensors files found in {}", dir.display());
-        }
+        }?;
+        gw.source_dir = Some(dir.to_path_buf());
+        Ok(gw)
     }
 
     /// Unified entry point: loads either a safetensors model
@@ -942,6 +1146,7 @@ impl GpuWeights {
             tensors: HashMap::new(),
             target_dtype: None,
             cast_scratch: Vec::new(),
+            source_dir: None,
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
@@ -992,6 +1197,7 @@ impl GpuWeights {
                 tensors: HashMap::new(),
                 target_dtype: None,
                 cast_scratch: Vec::new(),
+                source_dir: None,
                 #[cfg(feature = "cuda")]
                 precast: None,
                 #[cfg(feature = "cuda")]
@@ -1049,6 +1255,7 @@ impl GpuWeights {
             tensors,
             target_dtype: None,
             cast_scratch: Vec::new(),
+            source_dir: None,
             #[cfg(feature = "cuda")]
             precast: None,
             #[cfg(feature = "cuda")]
@@ -1294,16 +1501,26 @@ impl GpuWeights {
         work.sort_by_key(|b| std::cmp::Reverse(b.3)); // Largest first.
         let work = Arc::new(work);
 
+        // Reader QD: persisted per-disk settle if we have one, else the
+        // proven floor. The ramp controller raises it from here while
+        // doing so still improves observed throughput.
+        let start_qd = self
+            .source_dir
+            .as_deref()
+            .and_then(read_qd_sidecar)
+            .unwrap_or(PRESTAGE_WORKERS_START);
+
         let state = Arc::new(PrecastState {
             shared: Mutex::new(PrecastShared::default()),
             cv: std::sync::Condvar::new(),
+            active_workers: std::sync::atomic::AtomicUsize::new(start_qd),
             shutdown: AtomicBool::new(false),
         });
         self.precast = Some(Arc::clone(&state));
 
         let slot_bytes = resolve_stage_slot_bytes();
         tracing::info!(
-            "Pre-stage pipeline: {PRESTAGE_WORKERS} workers × {} MiB pinned slots",
+            "Pre-stage pipeline: {start_qd} readers (QD ramp to ≤{PRESTAGE_WORKERS_MAX}) × {} MiB pinned slots",
             slot_bytes >> 20,
         );
 
@@ -1311,12 +1528,12 @@ impl GpuWeights {
             cast: std::sync::atomic::AtomicUsize::new(0),
             staged: std::sync::atomic::AtomicUsize::new(0),
             bytes: std::sync::atomic::AtomicUsize::new(0),
-            live_workers: std::sync::atomic::AtomicUsize::new(PRESTAGE_WORKERS),
+            live_workers: std::sync::atomic::AtomicUsize::new(PRESTAGE_WORKERS_MAX),
             t0: std::time::Instant::now(),
         });
         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        for i in 0..PRESTAGE_WORKERS {
+        for i in 0..PRESTAGE_WORKERS_MAX {
             let state = Arc::clone(&state);
             let work = Arc::clone(&work);
             let next = Arc::clone(&next);
@@ -1324,9 +1541,26 @@ impl GpuWeights {
             let handle = std::thread::Builder::new()
                 .name(format!("weight-prestage-{i}"))
                 .spawn(move || {
-                    precast_worker(state, target_dtype, work, next, ctx, slot_bytes, stats);
+                    precast_worker(i, state, target_dtype, work, next, ctx, slot_bytes, stats);
                 })
                 .expect("failed to spawn pre-stage worker");
+            self.precast_handles.push(handle);
+        }
+
+        // QD ramp controller — observes windows of staged bytes and
+        // activates more reader lanes while that improves throughput.
+        {
+            let state = Arc::clone(&state);
+            let stats = Arc::clone(&stats);
+            let next = Arc::clone(&next);
+            let work_len = work.len();
+            let model_dir = self.source_dir.clone();
+            let handle = std::thread::Builder::new()
+                .name("weight-prestage-qd".into())
+                .spawn(move || {
+                    prestage_ramp_controller(state, stats, work_len, next, model_dir);
+                })
+                .expect("failed to spawn pre-stage QD controller");
             self.precast_handles.push(handle);
         }
     }

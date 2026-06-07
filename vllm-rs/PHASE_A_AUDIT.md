@@ -604,3 +604,88 @@ is in place. Next pass to land is `rt_to_smem_pass` for the
 liftable RoPE chain. ptxas-clean is 1-2 commits away once that
 lands and either the launch_bounds is loosened or the substrate
 splits.
+
+---
+
+## ADDENDUM 3 (2026-06-07) — substrate split step 1 landed
+
+Commit `b9c0a50292` adds the activation page pool alongside
+`page_buf` without touching existing logic:
+
+* `NUM_ACT_PAGES = 8`, `ACT_PAGE_SIZE = 64*128*2 = 16384` bytes
+  per entry (sized for Hopper WGMMA m64 — A.rows == 4 *
+  TILE_ROW_DIM<bf16> = 64).
+* Sealed `ActPageId(u8)` — distinct namespace from `PageId`.
+  Passing one where the other is required is rustc E0308.
+* `tk_player::shared_act_bf_decl` emits
+  `__shared__ kittens::st_bf<64, 128, true, 64> act_buf[NUM_ACT_PAGES];`
+  alongside `page_buf` in the kernel preamble. Same swizzle_bytes=64
+  so RopeRotateNeoX's `subtile<32>(idx)` head_dim=64 split works
+  on either pool.
+* `act_ready` / `act_done` semaphores parallel to `page_ready` /
+  `page_done`.
+* `DYN_SMEM` math sums both pool budgets; the host wrapper sets
+  `cudaFuncAttributeMaxDynamicSharedMemorySize` to the sum.
+
+No existing arm uses `act_buf` yet. Kernel emit is unchanged
+modulo the new declarations; nvcc still 0 errors; arena still 9
+entries (substrate-add doesn't touch rt slot count); ptxas still
+blocked.
+
+### Step 2 design (remaining work for ptxas-clean)
+
+Routing WGMMA A and AttnDecode q/k/v tiles to `ActPageId` requires
+extending the typed substrate. Two design choices on the table:
+
+1. **`ActSmemTileId<R, C, T>` peer type** — distinct from
+   `SmemTileId`. Each Instr that takes a smem tile gets either a
+   new parallel constructor or its constructor is generic over an
+   `IsSmemTile` trait (so `SmemTileId` and `ActSmemTileId` both
+   satisfy it). The Instr field at the runtime layer becomes an
+   `AnyPageId { Page(PageId), Act(ActPageId) }` enum (or a typed
+   sealed sum), and the player matches at emit time to choose
+   `page_buf[N]` vs `act_buf[N]`.
+   - Pros: full compile-time-or-garbage; routing decisions are
+     in the type.
+   - Cons: ~15 Instr variants get touched (every smem-bearing
+     one); every load/store/compute constructor needs the trait
+     bound; the player gains a per-Instr arm to choose the
+     correct array reference.
+
+2. **Encoded `PageId` (high bit = act)** — keep `PageId(u8)` but
+   reserve the top bit (or N bit-range) for "act pool". Lowerer
+   sets the high bit when minting from act_pool; player checks
+   the bit at emit time.
+   - Pros: minimal type-level disruption; existing Instr fields
+     unchanged.
+   - Cons: runtime-checked routing decision (violates
+     `feedback_compile_time_or_garbage`); the bit-encoding is a
+     premature-format-encoding leak per
+     `feedback_no_premature_string_encoding` adjacent reasoning.
+
+The plan-faithful answer is **option 1**. Substantial work but
+plays well with the rest of the typed-witness substrate. Estimated
+3–5 LOC commits across:
+
+* New `ActSmemTileId` + `IsSmemTile` trait + `AnyPageId` Instr
+  field replacement (or per-arm Instr variants for act-routed ops).
+* WGMMA constructors gain act-source variants (or a generic
+  trait bound).
+* `load_shmem_to_reg_warpgroup` adds a parallel constructor for
+  `src: ActSmemTileId<ST_ROWS, COLS, T>` with new
+  `WarpgroupLoadShape<64, 16>` impl for `GroupWidth<4>`.
+* Lowerer arms: MatmulTile (A → act, dst → act), AttnDecode
+  (q/k/v → act). Per-warp rt sizes drop to 16-row height=1.
+* Player gains `act_buf[N]` emit arm parallel to existing
+  `page_buf[N]` arm; both pools' barriers (act_ready/act_done vs
+  page_ready/page_done) get matched at the appropriate Instr
+  arms.
+
+After step 2 lands and `rt_to_smem_pass` for RoPE follows, the
+arena should drop to ~4 register tiles (down from 9), with
+per-warp 16-row sizes totaling ~192 lane-regs — under Hopper's
+256/lane budget. ptxas-clean is the expected outcome.
+
+Status at this commit: **frontend nvcc 0 errors, ptxas blocked,
+substrate split foundation laid (step 1), step 2 routing is the
+next major commit**.

@@ -689,3 +689,65 @@ per-warp 16-row sizes totaling ~192 lane-regs — under Hopper's
 Status at this commit: **frontend nvcc 0 errors, ptxas blocked,
 substrate split foundation laid (step 1), step 2 routing is the
 next major commit**.
+
+---
+
+## ADDENDUM 4 (2026-06-07) — substrate split steps 2a/2b landed
+
+Two more commits add the typed routing infrastructure without
+touching any consumer:
+
+* `98aaa94b72` (step 2a) — `ActSmemTileId<R, C, T>` peer type with
+  `from_page(ActPageId)` constructor. Stores the sealed `ActPageId`,
+  identical const-generic shape/dtype propagation as `SmemTileId`.
+* `db701d321d` (step 2b) — Act-source warpgroup load path:
+  - `WarpgroupLoadShape<64, 16>` impl for `GroupWidth<4>` (the 64-row
+    act-tile distribution across 4 warps × 16 per-warp = WGMMA m64).
+  - `Instr::LoadShmemToRegFromAct` variant — same TK 2.0 primitive
+    as `LoadShmemToReg`, src is `ActPageId`. Player emits
+    `act_buf[N]` via `tk20::load_act_to_reg_tile`.
+  - `Self::load_shmem_to_reg_warpgroup_from_act` typed constructor
+    gated on the new `WarpgroupLoadShape` impl.
+  - `rt_alias_pass` + validator pick up the new variant.
+
+97 ferrite-wavefront tests green at each step. Each commit is purely
+additive — existing logic unchanged, kernel emit unchanged.
+
+### Step 2c cascade analysis
+
+Lifting MatmulTile A's call site to `ActSmemTileId` cascades through
+the lowerer in a way the audit didn't fully scope:
+
+1. Matmul A goes to `act_buf` (64-row) ✅ trivial — that's what 2a/2b
+   set up.
+2. Matmul **D** (output) is per-warp 16-row × 4 warps = 64 collective
+   rows. Storing back to a 128-row `page_buf` page wastes half the
+   page; storing back to `act_buf` is the natural fit.
+3. **But** subsequent consumers of matmul D (residual ShTileAdd in
+   the layer's residual stream, downstream RmsNorm) currently expect
+   their inputs in `page_buf`. Routing D to `act_buf` means every
+   such consumer needs an act-source variant — `ShTileAddFromAct`,
+   `ShTileMulFromAct`, etc. Cascade.
+
+Three resolution paths:
+
+A. **Mass-plumb act variants** through every smem-bearing compute
+   Instr. ~15 new Instr variants + matching constructors + player
+   arms. Plan-faithful (compile-time-or-garbage upheld) but a sizable
+   commit series.
+B. **Bridge-copy Instr** — add a single `CopyActToPage` Instr that
+   moves data from `act_buf[N]` to `page_buf[M]`. Matmul output goes
+   to act, then bridge-copies to page for downstream ops.
+   Smaller commit; one new Instr instead of fifteen. Some smem
+   bandwidth waste vs option A.
+C. **Output via TMA store** — instead of `group<4>::store(st, rt)`
+   into smem, TMA-store rt directly to gmem. Matmul output goes to
+   gmem; downstream layer's TMA-load brings it back to whichever
+   pool. Existing TMA store path supports this; just route matmul D
+   through it.
+
+Status at this commit: **substrate-split foundation in place** (4
+commits: b9c0a50292, 98aaa94b72, db701d321d + this addendum). Step
+2c is the routing cascade — option B (bridge-copy) is probably the
+smallest path to ptxas-clean while preserving compile-time-or-
+garbage. Roughly 1 new Instr + arm + 1 lowerer site change.

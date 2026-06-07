@@ -361,9 +361,7 @@ impl CudaModel {
     /// every dense / MoE / encoder arch returns `None`. The CUDA worker
     /// uses this for the GDN state pool sizing in `initialize_cache` and
     /// the pre-init reserve in `determine_available_memory`.
-    fn gdn_runtime_config(
-        &self,
-    ) -> Option<ferrite_forward::gdn_state_layout::GdnRuntimeConfig> {
+    fn gdn_runtime_config(&self) -> Option<ferrite_forward::gdn_state_layout::GdnRuntimeConfig> {
         match self {
             Self::Ferrite(m) => m.weights.gdn_runtime_config(),
         }
@@ -4168,9 +4166,7 @@ impl Worker for FerriteWorker {
                     )
                 })
                 .unwrap_or(0);
-            let weights_and_overhead = total
-                .saturating_sub(free)
-                .saturating_add(gdn_reserve);
+            let weights_and_overhead = total.saturating_sub(free).saturating_add(gdn_reserve);
             let peak_activation_estimate = 512 * 1024 * 1024; // 512 MB conservative
             let utilization = self.config.gpu_memory_utilization;
             let available = compute_available_kv_bytes(
@@ -7155,38 +7151,41 @@ impl FerriteWorker {
                     drop(gpu_positions_2d);
                     let logits = *owned;
                     // FERRITE_VERIFY_BINDINGS=1 — real-forward logits
-                    // attestation (UMA: OwnedTensor host-readable).
+                    // attestation (CUDA: blocking D2H copy, env-gated).
                     // Degenerate logits (all-zero / flat / NaN) are the
                     // silent-garbage signature; print stats of the LAST
                     // row (the sampled one).
                     if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some() {
+                        const HEAD_ELEMS: usize = 4;
                         let rows = logits.dim(0);
                         let vocab = logits.dim(1);
-                        let ptr = logits.as_gpu_tensor().raw_ptr() as *const half::f16;
-                        let last =
-                            unsafe { std::slice::from_raw_parts(ptr.add((rows - 1) * vocab), vocab) };
-                        let mut mx = f32::NEG_INFINITY;
-                        let mut mn = f32::INFINITY;
-                        let mut arg = 0usize;
-                        let mut nan = 0usize;
-                        for (i, &v) in last.iter().enumerate() {
-                            let f = v.to_f32();
-                            if f.is_nan() {
-                                nan += 1;
-                                continue;
+                        match Self::logits_to_cpu(logits, device) {
+                            Ok(host) => {
+                                let last = &host[(rows - 1) * vocab..rows * vocab];
+                                let mut mx = f32::NEG_INFINITY;
+                                let mut mn = f32::INFINITY;
+                                let mut arg = 0usize;
+                                let mut nan = 0usize;
+                                for (i, &f) in last.iter().enumerate() {
+                                    if f.is_nan() {
+                                        nan += 1;
+                                        continue;
+                                    }
+                                    if f > mx {
+                                        mx = f;
+                                        arg = i;
+                                    }
+                                    if f < mn {
+                                        mn = f;
+                                    }
+                                }
+                                eprintln!(
+                                    "[verify-logits] rows={rows} vocab={vocab} last-row: max={mx:.4} at {arg} min={mn:.4} nan={nan} head={:?}",
+                                    &last[..HEAD_ELEMS.min(vocab)]
+                                );
                             }
-                            if f > mx {
-                                mx = f;
-                                arg = i;
-                            }
-                            if f < mn {
-                                mn = f;
-                            }
+                            Err(e) => eprintln!("[verify-logits] D2H failed: {e}"),
                         }
-                        eprintln!(
-                            "[verify-logits] rows={rows} vocab={vocab} last-row: max={mx:.4} at {arg} min={mn:.4} nan={nan} head={:?}",
-                            &last[..4.min(vocab)].iter().map(|v| v.to_f32()).collect::<Vec<_>>()
-                        );
                     }
                     (Some(owned), logits)
                 }

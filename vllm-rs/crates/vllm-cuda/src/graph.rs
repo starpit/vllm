@@ -20,6 +20,32 @@ use std::collections::HashMap;
 use anyhow::Result;
 use cudarc::driver::sys::{CUgraphExec, CUstream};
 
+/// Decode-row gather request for the pipelined non-greedy path.
+///
+/// When passed to [`CudaGraphRunner::replay`], the runner skips the host
+/// H2D of `input_ids` and instead launches `gather_last_tokens_gpu` to
+/// pull each decode row's input token from `last_token_ids_gpu[slot]`
+/// directly on the GPU. That eliminates the per-step H2D of host-resident
+/// sampled tokens — which is what previously serialized step N+1 behind
+/// step N's D2H sync. Combined with `replay_decode_fast`-style GPU-side
+/// metadata updates, this lets the executor issue the next forward pass
+/// without ever touching host-side state for the previous step's tokens.
+pub struct DecodeRowGather<'a> {
+    /// `[max_num_seqs] u32` — per-slot most-recently-sampled token. Populated
+    /// by `scatter_sampled_to_slots` on the compute stream after each step.
+    pub last_token_ids_gpu: &'a RawGpuMem,
+    /// `[num_decode] u32` — slot id for each decode row (in row order).
+    pub slot_indices_gpu: &'a RawGpuMem,
+    /// `[num_decode] u32` — offset into the captured `input_ids` buffer for
+    /// each decode row. For pure-decode steps this is `0..num_decode`; for
+    /// mixed steps it skips prefill rows.
+    pub token_offsets_gpu: &'a RawGpuMem,
+    /// Number of decode rows (typically == `batch_size` for pure-decode steps).
+    pub num_decode: usize,
+    /// Maximum slot id (== `max_num_seqs`). Bounds the slot-indices read.
+    pub max_num_seqs: usize,
+}
+
 use crate::alloc::{OwnedTensor, RawGpuMem};
 use crate::device::GpuDevice;
 use crate::driver;
@@ -424,6 +450,20 @@ impl CudaGraphRunner {
     /// FlashInfer scheduler's replan when an FI plan is resident. Pass 0
     /// to skip the replan (harmless when no FI plan exists; mandatory
     /// for FP8 graphs where `max_seqlen_k` isn't a single scalar).
+    /// Replay a captured decode graph after H2D'ing this step's
+    /// metadata.
+    ///
+    /// `gather`: when `Some`, after the H2D of `input_ids` lands on
+    /// the compute stream, launch
+    /// `kernels::gather_last_tokens_gpu(self.input_ids,
+    /// last_token_ids_gpu, gather.slot_indices_gpu,
+    /// gather.token_offsets_gpu, gather.num_decode, gather.max_num_seqs)`
+    /// to overwrite the decode-row sentinels in `input_ids` with the
+    /// per-slot most-recently-sampled tokens. Phase 1 of AsyncScheduler
+    /// redesign — see `ASYNC_REDESIGN.md`. The host caller never
+    /// touches `last_token_ids[host]` for the next forward; the GPU
+    /// state in `last_token_ids_gpu` is the source of truth.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn replay(
         &self,
         batch_size: usize,
@@ -437,6 +477,7 @@ impl CudaGraphRunner {
         block_size: usize,
         device: &mut GpuDevice,
         skip_input_ids_h2d: bool,
+        gather: Option<DecodeRowGather<'_>>,
     ) -> Result<ReplayOutput> {
         let graph = self.graphs.get(&(batch_size, sk_bucket)).ok_or_else(|| {
             anyhow::anyhow!("no captured graph for batch_size={batch_size}, sk_bucket={sk_bucket}")
@@ -451,6 +492,30 @@ impl CudaGraphRunner {
                 batch_size * 4,
                 xfer,
             )?;
+        }
+
+        // Optional decode-row gather: replace the just-H2D'd (or stale)
+        // input_ids[decode_rows] with the per-slot most-recently-sampled
+        // tokens, all on the GPU. Caller passes `skip_input_ids_h2d=true`
+        // and `Some(gather)` together — the H2D is skipped entirely and
+        // input_ids comes from `last_token_ids_gpu`.
+        //
+        // The gather kernel reads on the compute stream so we order it
+        // after the (possibly skipped) H2D via `sync_transfer_to_compute`
+        // below; for the gather-only case there's nothing on the transfer
+        // stream so the sync is a no-op.
+        if let Some(g) = gather.as_ref() {
+            unsafe {
+                ferrite_kernels::kernels::gather_last_tokens_gpu(
+                    self.input_ids.ptr() as *mut u32,
+                    g.last_token_ids_gpu.ptr() as *const u32,
+                    g.slot_indices_gpu.ptr() as *const u32,
+                    g.token_offsets_gpu.ptr() as *const u32,
+                    g.num_decode,
+                    g.max_num_seqs,
+                    device.compute_stream,
+                );
+            }
         }
         driver::memcpy_htod_async(
             self.positions.ptr(),
@@ -552,6 +617,7 @@ impl CudaGraphRunner {
         block_size: usize,
         max_seqlen_k: usize,
         device: &mut GpuDevice,
+        gather: Option<DecodeRowGather<'_>>,
     ) -> Result<ReplayOutput> {
         let graph = self.graphs.get(&(batch_size, sk_bucket)).ok_or_else(|| {
             anyhow::anyhow!("no captured graph for batch_size={batch_size}, sk_bucket={sk_bucket}")
@@ -579,6 +645,23 @@ impl CudaGraphRunner {
 
         if input_ids.is_some() || new_block_table.is_some() {
             device.sync_transfer_to_compute()?;
+        }
+
+        // Gather decode-row tokens from `last_token_ids_gpu` into the
+        // captured input_ids buffer. Runs on compute_stream after the
+        // (skipped) input_ids H2D and before metadata update / graph
+        // launch. With Some(gather) + input_ids=None, the host stays
+        // entirely out of the input-token path.
+        if let Some(g) = gather.as_ref() {
+            ferrite_kernels::kernels::gather_last_tokens_gpu(
+                self.input_ids.ptr() as *mut u32,
+                g.last_token_ids_gpu.ptr() as *const u32,
+                g.slot_indices_gpu.ptr() as *const u32,
+                g.token_offsets_gpu.ptr() as *const u32,
+                g.num_decode,
+                g.max_num_seqs,
+                stream,
+            );
         }
 
         kernels::update_decode_metadata_gpu(

@@ -24,6 +24,8 @@ pub mod metal_info;
 #[cfg(feature = "nccl")]
 pub mod multinode;
 pub mod parallel;
+#[cfg(feature = "cuda")]
+pub mod path_hist;
 pub mod threadpool;
 pub mod uniproc;
 pub mod worker;

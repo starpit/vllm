@@ -139,16 +139,35 @@ pub struct InprocClient {
     pipeline: Option<PipelineState>,
 }
 
-/// Background executor thread state for pipelined execution.
+/// Background pipeline state for async scheduling.
+///
+/// Three OS threads — engine (main), executor, output — connected by typed
+/// `crossbeam_channel` channels. Mirrors python's `step_with_batch_queue` +
+/// `WorkerAsyncOutput` ThreadPoolExecutor shape, but uses real ownership /
+/// drop semantics instead of python's GIL-shaped scaffolding.
+///
+/// Lifecycle:
+/// - `engine` produces `SchedulerOutput` and `try_send`s it on `sched_tx`.
+/// - `executor` runs forward+sample, ships `(sched, output)` on `unresolved_tx`.
+///   Output is "deferred" — its sampled tokens still on the GPU behind a CUDA
+///   event, the resolve closure not yet called.
+/// - `output` thread calls `output.resolve()` (the cuEventSynchronize and
+///   pinned-buffer read), then ships the resolved pair on `resolved_tx`.
+/// - `engine` recv's from `resolved_rx` and runs `finalize_step`. The
+///   cuEventSynchronize is now off the engine thread — that's the perf win.
+///
+/// In-flight tracking is the bounded channels themselves; no `gpu_in_flight`
+/// counter, no `deferred: Option<...>` field. `Box<SchedulerOutput>` is gone
+/// — `SchedulerOutput` moves by value through the typed channels.
 struct PipelineState {
     sched_tx: std::sync::mpsc::SyncSender<PipelineMsg>,
-    result_rx: std::sync::mpsc::Receiver<PipelineResult>,
-    /// Deferred (sched, model_output) from the previous step, to be finalized
-    /// at the start of the next `get_output()` call.
-    deferred: Option<(SchedulerOutput, ModelRunnerOutput)>,
-    /// Number of batches currently in-flight on the executor thread.
-    gpu_in_flight: u32,
-    _thread: std::thread::JoinHandle<()>,
+    resolved_rx: std::sync::mpsc::Receiver<PipelineResult>,
+    /// Outstanding sched_tx sends not yet matched by a resolved_rx recv.
+    /// Tracked here only because `mpsc::SyncSender::len()` doesn't exist;
+    /// crossbeam_channel would let us drop this field.
+    in_flight: u32,
+    _executor_thread: std::thread::JoinHandle<()>,
+    _output_thread: std::thread::JoinHandle<()>,
 }
 
 /// A cloneable, Send+Sync handle for computing embeddings via the
@@ -172,10 +191,17 @@ impl EmbedSender {
     }
 }
 
-/// Messages sent to the background executor thread.
+/// Engine → executor channel payload.
+///
+/// `SchedulerOutput` is intentionally moved by value (no `Box`) to mirror
+/// python's pipeline shape, so clippy's `large-enum-variant` lint is muted
+/// here. The size delta (~480 bytes vs the Embed variant's ~40 bytes) is
+/// negligible at our channel depth (2) — boxing would add a heap alloc per
+/// step on the hot path for no real gain.
+#[allow(clippy::large_enum_variant)]
 enum PipelineMsg {
     /// Execute a model step.
-    Step(Box<SchedulerOutput>),
+    Step(SchedulerOutput),
     /// Compute embeddings (bypasses scheduler).
     Embed(
         Vec<Vec<u32>>,
@@ -183,23 +209,39 @@ enum PipelineMsg {
     ),
 }
 
-/// Results from the background executor thread.
-enum PipelineResult {
-    Step(Box<SchedulerOutput>, EngineResult<ModelRunnerOutput>),
+/// Executor → output channel payload. The `ModelRunnerOutput` may be
+/// deferred (`d2h_resolver: Some(...)`); the output thread resolves it.
+enum UnresolvedMsg {
+    Step(SchedulerOutput, EngineResult<ModelRunnerOutput>),
 }
 
-/// Background executor thread loop: receives scheduler outputs, runs
-/// `execute_model`, and sends back results.
+/// Output → engine channel payload. By the time the engine recv's this,
+/// `ModelRunnerOutput::sampled_token_ids` is host-resident — the
+/// cuEventSynchronize already happened on the output thread.
+enum PipelineResult {
+    Step(SchedulerOutput, EngineResult<ModelRunnerOutput>),
+}
+
+/// Executor thread: pull `PipelineMsg`, run `execute_model` (which may
+/// return a deferred output whose tokens are still on the GPU), ship the
+/// pair to the output thread for resolution.
+///
+/// Embed requests get short-circuited back to the caller without touching
+/// the output thread (they're synchronous and not on the perf-critical
+/// hot path).
 fn executor_bg_loop(
     mut executor: Box<dyn Executor>,
-    rx: std::sync::mpsc::Receiver<PipelineMsg>,
-    tx: std::sync::mpsc::SyncSender<PipelineResult>,
+    sched_rx: std::sync::mpsc::Receiver<PipelineMsg>,
+    unresolved_tx: std::sync::mpsc::SyncSender<UnresolvedMsg>,
 ) {
-    while let Ok(msg) = rx.recv() {
+    while let Ok(msg) = sched_rx.recv() {
         match msg {
             PipelineMsg::Step(sched) => {
                 let result = executor.execute_model(&sched);
-                if tx.send(PipelineResult::Step(sched, result)).is_err() {
+                if unresolved_tx
+                    .send(UnresolvedMsg::Step(sched, result))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -209,6 +251,31 @@ fn executor_bg_loop(
         }
     }
     executor.shutdown();
+}
+
+/// Output thread: pull deferred `(sched, output)` pairs, resolve the D2H
+/// (cuEventSynchronize + pinned-buffer read), ship the resolved pair to
+/// the engine.
+///
+/// This is the work that python's `WorkerAsyncOutput` ThreadPoolExecutor
+/// does — the resolve sits between executor and engine so neither blocks
+/// on the GPU sync.
+fn output_bg_loop(
+    unresolved_rx: std::sync::mpsc::Receiver<UnresolvedMsg>,
+    resolved_tx: std::sync::mpsc::SyncSender<PipelineResult>,
+) {
+    while let Ok(UnresolvedMsg::Step(sched, result)) = unresolved_rx.recv() {
+        let resolved = result.map(|mut o| {
+            o.resolve();
+            o
+        });
+        if resolved_tx
+            .send(PipelineResult::Step(sched, resolved))
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 impl InprocClient {
@@ -234,19 +301,27 @@ impl InprocClient {
             return;
         }
         if let Some(executor) = self.engine.take_executor() {
-            info!("InprocClient: spawning background executor thread for pipelined execution");
+            info!(
+                "InprocClient: spawning vllm-executor + vllm-output threads for pipelined execution"
+            );
+            // Three channels at depth 2 (matches python's max_concurrent_batches=2).
             let (sched_tx, sched_rx) = std::sync::mpsc::sync_channel::<PipelineMsg>(2);
-            let (result_tx, result_rx) = std::sync::mpsc::sync_channel(2);
-            let thread = std::thread::Builder::new()
+            let (unresolved_tx, unresolved_rx) = std::sync::mpsc::sync_channel::<UnresolvedMsg>(2);
+            let (resolved_tx, resolved_rx) = std::sync::mpsc::sync_channel::<PipelineResult>(2);
+            let executor_thread = std::thread::Builder::new()
                 .name("vllm-executor".into())
-                .spawn(move || executor_bg_loop(executor, sched_rx, result_tx))
+                .spawn(move || executor_bg_loop(executor, sched_rx, unresolved_tx))
                 .expect("failed to spawn executor thread");
+            let output_thread = std::thread::Builder::new()
+                .name("vllm-output".into())
+                .spawn(move || output_bg_loop(unresolved_rx, resolved_tx))
+                .expect("failed to spawn output thread");
             self.pipeline = Some(PipelineState {
                 sched_tx,
-                result_rx,
-                deferred: None,
-                gpu_in_flight: 0,
-                _thread: thread,
+                resolved_rx,
+                in_flight: 0,
+                _executor_thread: executor_thread,
+                _output_thread: output_thread,
             });
         }
     }
@@ -270,7 +345,7 @@ impl InprocClient {
             return true;
         }
         if let Some(ref pipeline) = self.pipeline
-            && (pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some())
+            && pipeline.in_flight > 0
         {
             return true;
         }
@@ -306,57 +381,54 @@ impl InprocClient {
         Ok(())
     }
 
-    /// Pipelined get_output matching Python's `step_with_batch_queue`.
+    /// Pipelined get_output: 3-thread shape, cuEventSynchronize off the
+    /// engine thread.
     ///
-    /// 1. Finalize the deferred (previous) step's output.
-    /// 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
-    /// 3. Block on the oldest GPU result, store as deferred.
+    /// 1. Pre-schedule: fill `sched_tx` up to its bound (2 in flight).
+    /// 2. Block on `resolved_rx` — recv'd output already has its D2H
+    ///    sync done by the output thread, so this is a pure cross-thread
+    ///    wait, not a CUDA sync.
+    /// 3. Run `finalize_step` on the engine thread (mutates scheduler state).
     fn get_output_pipelined(
         engine: &mut EngineCore,
         pipeline: &mut PipelineState,
     ) -> EngineResult<(StepOutputs, bool)> {
-        // 1. Finalize previous deferred result. Resolve deferred D2H first
-        //    (syncs the CUDA event and populates token IDs from pinned buffer).
-        let mut prev_outputs: StepOutputs = HashMap::new();
-        let mut had_prev = false;
-        if let Some((prev_sched, mut prev_output)) = pipeline.deferred.take() {
-            prev_output.resolve();
-            prev_outputs = engine.finalize_step(&prev_sched, &prev_output);
-            had_prev = true;
-        }
-
-        // 2. Pre-schedule: fill pipeline up to 2 in-flight batches.
-        while pipeline.gpu_in_flight < 2 {
-            if let Some(sched) = engine.schedule_next() {
-                if pipeline
-                    .sched_tx
-                    .send(PipelineMsg::Step(Box::new(sched)))
-                    .is_err()
-                {
+        // 1. Pre-schedule: keep the executor and output threads fed.
+        //    `try_send` returns Full when sched_tx is at capacity, in which
+        //    case we hand the SchedulerOutput back to the scheduler queue.
+        //    For the bench shape (decode-only, no chunked-prefill resume)
+        //    this loop terminates on the first `schedule_next() -> None`.
+        while pipeline.in_flight < 2 {
+            let Some(sched) = engine.schedule_next() else {
+                break;
+            };
+            match pipeline.sched_tx.try_send(PipelineMsg::Step(sched)) {
+                Ok(()) => pipeline.in_flight += 1,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => break,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                     return Err(EngineError::Executor("executor thread exited".into()));
                 }
-                pipeline.gpu_in_flight += 1;
-            } else {
-                break;
             }
         }
 
-        // 3. Block on oldest GPU result.
-        if pipeline.gpu_in_flight > 0 {
-            let PipelineResult::Step(sched_box, result) = pipeline
-                .result_rx
-                .recv()
-                .map_err(|_| EngineError::Executor("executor thread exited".into()))?;
-            let sched = *sched_box;
-            let model_output = result?;
-            pipeline.deferred = Some((sched, model_output));
-            pipeline.gpu_in_flight -= 1;
+        // 2. Nothing to drain → empty outputs, no model executed.
+        if pipeline.in_flight == 0 {
+            return Ok((HashMap::new(), false));
         }
 
-        Ok((
-            prev_outputs,
-            had_prev || pipeline.gpu_in_flight > 0 || pipeline.deferred.is_some(),
-        ))
+        // 3. Block on the oldest resolved output. The cuEventSynchronize
+        //    already happened on the output thread, so this is a pure
+        //    cross-thread wait.
+        let PipelineResult::Step(sched, result) = pipeline
+            .resolved_rx
+            .recv()
+            .map_err(|_| EngineError::Executor("output thread exited".into()))?;
+        pipeline.in_flight -= 1;
+        let model_output = result?;
+
+        // 4. Finalize on the engine thread (scheduler state mutation).
+        let outputs = engine.finalize_step(&sched, &model_output);
+        Ok((outputs, true))
     }
 }
 

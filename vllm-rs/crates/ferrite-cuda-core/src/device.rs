@@ -26,7 +26,16 @@ pub struct GpuDevice {
     /// Event for gating CPU reuse of pinned buffers after H2D transfer.
     pub transfer_done: CUevent,
     /// Event recorded on transfer_stream after D2H copy for async output.
+    /// Single-event variant — used by paths that sync inline.
     pub d2h_done: CUevent,
+    /// Per-slot D2H events for the pipelined deferred-output path. Indexed
+    /// by `staging.token_buf_idx` (0 or 1) so step N's event is preserved
+    /// while step N+1 records a fresh one. Without this, a single shared
+    /// `d2h_done` would be overwritten by step N+1's `async_d2h` before
+    /// the output thread had a chance to sync on step N's recording —
+    /// the output thread would then end up waiting on step N+1's transfer
+    /// instead of step N's, serializing the pipeline.
+    pub d2h_done_pool: Vec<CUevent>,
     /// Number of streaming multiprocessors on this device.
     pub num_sm: i32,
     /// SM version (compute capability): major*10 + minor. E.g. 89 for L40S, 80 for A100.
@@ -47,6 +56,10 @@ impl GpuDevice {
             let transfer_stream = driver::stream_create()?;
             let transfer_done = driver::event_create_disable_timing()?;
             let d2h_done = driver::event_create_disable_timing()?;
+            // Pool size matches the InprocClient pipeline depth (2 in flight).
+            let d2h_done_pool: Vec<CUevent> = (0..2)
+                .map(|_| driver::event_create_disable_timing())
+                .collect::<Result<Vec<_>>>()?;
 
             let mut caching = CachingAllocator::new();
             let cublas = CublasHandle::new(compute_stream, &mut caching)?;
@@ -69,6 +82,7 @@ impl GpuDevice {
                 caching,
                 transfer_done,
                 d2h_done,
+                d2h_done_pool,
                 num_sm,
                 sm_version,
             })
@@ -117,6 +131,38 @@ impl GpuDevice {
     /// Block until the D2H copy initiated by `async_d2h` is complete.
     pub fn sync_d2h(&self) -> Result<()> {
         unsafe { driver::event_synchronize(self.d2h_done) }
+    }
+
+    /// Per-slot variant of `async_d2h`. Records into `d2h_done_pool[slot]`
+    /// instead of the shared `d2h_done`, so a follow-up step's recording
+    /// doesn't overwrite this one before the consumer syncs.
+    ///
+    /// `slot` MUST be in `0..d2h_done_pool.len()` (same depth as the
+    /// pinned-host token buffer ring — 2 slots today).
+    ///
+    /// # Safety
+    /// Same as `async_d2h`. Caller must keep `host_dst` alive until
+    /// `sync_d2h_slot(slot)` returns.
+    pub unsafe fn async_d2h_into_slot(
+        &self,
+        host_dst: *mut u8,
+        device_src: *const u8,
+        bytes: usize,
+        slot: usize,
+    ) -> Result<()> {
+        // Gate transfer_stream on compute_stream completion.
+        driver::event_record(self.transfer_done, self.compute_stream)?;
+        driver::stream_wait_event(self.transfer_stream, self.transfer_done)?;
+        // D2H on transfer_stream.
+        driver::memcpy_dtoh_async(host_dst, device_src, bytes, self.transfer_stream)?;
+        // Record the per-slot event so multiple in-flight D2Hs don't race.
+        driver::event_record(self.d2h_done_pool[slot], self.transfer_stream)?;
+        Ok(())
+    }
+
+    /// Block until the slot-specific D2H from `async_d2h_into_slot(slot)` completes.
+    pub fn sync_d2h_slot(&self, slot: usize) -> Result<()> {
+        unsafe { driver::event_synchronize(self.d2h_done_pool[slot]) }
     }
 
     /// Allocate persistent device memory (not from caching allocator).

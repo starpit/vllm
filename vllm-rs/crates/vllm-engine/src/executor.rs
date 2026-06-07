@@ -84,7 +84,11 @@ pub struct ModelRunnerOutput {
     /// Matches Python's `AsyncOutput` pattern: the GPU enqueues a D2H copy
     /// on a transfer stream and returns immediately. The closure syncs the
     /// CUDA event and reads from a pinned host buffer.
-    pub d2h_resolver: Option<Box<dyn FnOnce() -> Vec<u32> + Send>>,
+    ///
+    /// Returns `Vec<Vec<u32>>` so it can express per-request discard (empty
+    /// inner vec) for intermediate prefill chunks — used by the non-greedy
+    /// graph decode path which previously was synchronous.
+    pub d2h_resolver: Option<Box<dyn FnOnce() -> Vec<Vec<u32>> + Send>>,
 }
 
 impl std::fmt::Debug for ModelRunnerOutput {
@@ -124,8 +128,7 @@ impl ModelRunnerOutput {
     /// host buffer. No-op if the output is already resolved.
     pub fn resolve(&mut self) {
         if let Some(resolver) = self.d2h_resolver.take() {
-            let token_ids = resolver();
-            self.sampled_token_ids = token_ids.into_iter().map(|t| vec![t]).collect();
+            self.sampled_token_ids = resolver();
         }
     }
 
@@ -204,7 +207,10 @@ impl ModelRunnerOutput {
     /// The `resolver` closure is called by `resolve()` to synchronize the
     /// D2H CUDA event and read token IDs from a pinned host buffer.
     /// Until resolved, `sampled_token_ids` is empty.
-    pub fn deferred(req_ids: Vec<String>, resolver: Box<dyn FnOnce() -> Vec<u32> + Send>) -> Self {
+    pub fn deferred(
+        req_ids: Vec<String>,
+        resolver: Box<dyn FnOnce() -> Vec<Vec<u32>> + Send>,
+    ) -> Self {
         let req_id_to_index: HashMap<String, usize> = req_ids
             .iter()
             .enumerate()

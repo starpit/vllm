@@ -550,6 +550,32 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    // Scatter sampled token IDs into per-slot positions of the persistent
+    // last_token_ids_gpu tensor. Phase 1 of AsyncScheduler redesign:
+    // generalizes the captured-decode-graph self-feed to all decode paths.
+    fn scatter_to_slots(
+        last_token_ids: *mut u32,
+        tok_gpu: *const u32,
+        slot_indices: *const u32,
+        num_reqs: c_int,
+        max_num_seqs: c_int,
+        stream: CUstream,
+    );
+
+    // Gather last tokens from per-slot positions into the next step's
+    // flat_token_ids tensor. Replaces the host-side
+    // `flat_token_ids.push(self.last_token_ids[slot])` loop in
+    // `input_batch::prepare_inputs` for decode rows.
+    fn gather_last_tokens(
+        flat_token_ids: *mut u32,
+        last_token_ids: *const u32,
+        slot_indices: *const u32,
+        token_offsets: *const u32,
+        num_decode: c_int,
+        max_num_seqs: c_int,
+        stream: CUstream,
+    );
+
     // Split fused QKV
     fn split_qkv_f16(
         q: *mut u16,
@@ -2734,6 +2760,73 @@ pub unsafe fn compute_cu_seqlens_k_gpu(
         seqused_k as *const i32,
         cu_seqlens_k as *mut i32,
         num_reqs as c_int,
+        stream,
+    );
+}
+
+/// Scatter sampled token IDs into per-slot positions of the persistent
+/// `last_token_ids_gpu` tensor. Phase 1 of the AsyncScheduler redesign:
+/// generalizes the captured-decode-graph self-feed to all decode paths.
+///
+/// `tok_gpu` is the dense `[num_reqs]` u32 tensor produced by argmax /
+/// gumbel / sample_batched. `slot_indices` is `[num_reqs]` u32 mapping
+/// each batch row to its `InputBatch` slot. `last_token_ids` is the
+/// persistent `[max_num_seqs]` u32 tensor; row `i` is overwritten with
+/// `tok_gpu[i]`. Single-block kernel for typical batch sizes.
+///
+/// # Safety
+/// All pointers must be valid GPU memory. CUDA context must be current.
+/// `last_token_ids` must have capacity `max_num_seqs`. Slot indices must
+/// be < `max_num_seqs`; out-of-range entries are silently dropped.
+pub unsafe fn scatter_to_slots_gpu(
+    last_token_ids: *mut u32,
+    tok_gpu: *const u32,
+    slot_indices: *const u32,
+    num_reqs: usize,
+    max_num_seqs: usize,
+    stream: CUstream,
+) {
+    scatter_to_slots(
+        last_token_ids,
+        tok_gpu,
+        slot_indices,
+        num_reqs as c_int,
+        max_num_seqs as c_int,
+        stream,
+    );
+}
+
+/// Gather last tokens from per-slot positions into the next step's
+/// `flat_token_ids` destination rows. Replaces the host-side
+/// `flat_token_ids.push(self.last_token_ids[slot])` loop in
+/// `input_batch::prepare_inputs` for decode rows.
+///
+/// `slot_indices[i]` is the source slot in `last_token_ids`; the value
+/// is written to `flat_token_ids[token_offsets[i]]`. The two-array
+/// design lets us interleave decode-row writes with prefill-row writes
+/// done by the host path: the kernel only touches the destination rows
+/// it owns. Single-block kernel for typical batch sizes.
+///
+/// # Safety
+/// All pointers must be valid GPU memory. CUDA context must be current.
+/// `slot_indices[i]` must be < `max_num_seqs`; OOB entries are dropped.
+/// `token_offsets[i]` must be a valid index into `flat_token_ids`.
+pub unsafe fn gather_last_tokens_gpu(
+    flat_token_ids: *mut u32,
+    last_token_ids: *const u32,
+    slot_indices: *const u32,
+    token_offsets: *const u32,
+    num_decode: usize,
+    max_num_seqs: usize,
+    stream: CUstream,
+) {
+    gather_last_tokens(
+        flat_token_ids,
+        last_token_ids,
+        slot_indices,
+        token_offsets,
+        num_decode as c_int,
+        max_num_seqs as c_int,
         stream,
     );
 }

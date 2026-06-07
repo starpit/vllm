@@ -361,9 +361,7 @@ impl CudaModel {
     /// every dense / MoE / encoder arch returns `None`. The CUDA worker
     /// uses this for the GDN state pool sizing in `initialize_cache` and
     /// the pre-init reserve in `determine_available_memory`.
-    fn gdn_runtime_config(
-        &self,
-    ) -> Option<ferrite_forward::gdn_state_layout::GdnRuntimeConfig> {
+    fn gdn_runtime_config(&self) -> Option<ferrite_forward::gdn_state_layout::GdnRuntimeConfig> {
         match self {
             Self::Ferrite(m) => m.weights.gdn_runtime_config(),
         }
@@ -1494,9 +1492,31 @@ struct PiecewisePrefillInputs {
 
 /// Deferred commit from a previous decode step.
 ///
-/// Stored when the greedy graph fast path defers D2H sync. The token IDs
-/// live in one of the double-buffered pinned host staging buffers. The
-/// commit is resolved at the start of the next `execute_model_inner` call.
+/// Bundle of state needed by `gpu_sample_and_finalize` and
+/// `finalize_d2h_and_commit` to scatter sampled tokens into the
+/// persistent slot-indexed `last_token_ids_gpu` tensor. Phase 1 of the
+/// AsyncScheduler redesign — see `ASYNC_REDESIGN.md`. Passed through
+/// the static helper functions so each step's sampler kernel output is
+/// committed to GPU-resident slot state before the host D2H queues.
+#[cfg(feature = "cuda")]
+struct SlotScatterCtx<'a> {
+    pub last_token_ids_gpu: Option<&'a vllm_cuda::RawGpuMem>,
+    pub slot_indices_gpu: Option<&'a vllm_cuda::RawGpuMem>,
+    pub slot_indices_scratch: &'a mut Vec<u32>,
+    pub max_num_seqs: usize,
+}
+
+/// Stored when a graph or eager-sample path defers D2H sync. The token
+/// IDs live in one of the double-buffered pinned host staging buffers.
+/// The commit is resolved at the start of the next `execute_model_inner`
+/// call (or earlier if a cold-path entry needs `last_token_ids`).
+///
+/// Two flavors:
+/// - super-fast greedy: per-req `token_count` is implicitly 1, no
+///   discard, no `token_buffers.push` skip.
+/// - non-greedy / mixed-prefill (the new deferred path): mid-prefill
+///   chunks may be discarded (their sampled token isn't appended to
+///   `token_buffers`); represented by `discard[i]=true`.
 #[cfg(feature = "cuda")]
 struct PendingCommit {
     /// Which host_token_ids buffer index holds the deferred token IDs.
@@ -1509,6 +1529,11 @@ struct PendingCommit {
     token_counts: Vec<usize>,
     /// Per-request flag: true if request had speculative tokens.
     has_spec_tokens: Vec<bool>,
+    /// Per-request flag: true if this request is a mid-prefill chunk
+    /// whose sampled token should not be appended to `token_buffers` /
+    /// reported in `ModelRunnerOutput.sampled_token_ids[i]`. Always
+    /// `vec![false; num_reqs]` for the super-fast greedy path.
+    discard: Vec<bool>,
 }
 
 /// A worker backed by the ferrite GPU runtime (cuda or metal) for
@@ -1630,6 +1655,43 @@ pub struct FerriteWorker {
     /// Deferred D2H commit from the previous greedy graph step.
     #[cfg(feature = "cuda")]
     pending_commit: Option<PendingCommit>,
+    /// Persistent slot-indexed last-sampled-token buffer, sized
+    /// `[max_num_seqs]` u32 on `compute_stream`. After every sampling
+    /// kernel produces a dense `tok_gpu: [num_reqs]`, a tiny
+    /// `scatter_to_slots` kernel writes `tok_gpu[i]` into
+    /// `last_token_ids_gpu[slot_indices[i]]`. The next decode step's
+    /// `prepare_inputs` reads back via `gather_last_tokens`, replacing
+    /// the host-side `flat_token_ids.push(self.last_token_ids[slot])`
+    /// loop. Generalizes the captured-decode-graph self-feed
+    /// (`graph.rs:391`) to all decode paths regardless of greedy/non-
+    /// greedy. `None` until `initialize_cache` allocates it; `Some`
+    /// for the lifetime of the worker thereafter. See `ASYNC_REDESIGN.md`.
+    #[cfg(feature = "cuda")]
+    last_token_ids_gpu: Option<vllm_cuda::RawGpuMem>,
+    /// Scratch GPU buffer for slot-index arrays passed to the
+    /// scatter/gather kernels, sized `[max_num_seqs]` u32. Reused
+    /// every step; populated via H2D from a small host scratch Vec
+    /// each step (microseconds at BS=256). Allocated alongside
+    /// `last_token_ids_gpu`.
+    #[cfg(feature = "cuda")]
+    slot_indices_gpu: Option<vllm_cuda::RawGpuMem>,
+    /// Host scratch buffer reused per step to build the `[num_reqs]`
+    /// slot-index Vec before H2D. Avoids per-step Vec allocation.
+    #[cfg(feature = "cuda")]
+    slot_indices_scratch: Vec<u32>,
+    /// Persistent GPU buffer for the per-decode-row slot-index array
+    /// passed to `gather_last_tokens_gpu`. Sized `[max_num_seqs]` u32.
+    /// Refilled from host every step (small H2D on transfer stream).
+    /// Distinct from `slot_indices_gpu` because that one is rewritten
+    /// after sampling for `scatter_to_slots` and would race the gather
+    /// kernel which reads at the *start* of the next step.
+    #[cfg(feature = "cuda")]
+    gather_slot_indices_gpu: Option<vllm_cuda::RawGpuMem>,
+    /// Persistent GPU buffer for the per-decode-row destination offsets
+    /// in `flat_token_ids` that the gather kernel writes to. Sized
+    /// `[max_num_seqs]` u32.
+    #[cfg(feature = "cuda")]
+    gather_token_offsets_gpu: Option<vllm_cuda::RawGpuMem>,
     /// Per-request grammar guide state for constrained decoding.
     #[cfg(all(feature = "cuda", feature = "guided-decoding"))]
     grammar_states: HashMap<String, vllm_model::grammar::GrammarGuide>,
@@ -2122,6 +2184,13 @@ impl FerriteWorker {
             pooling_strategy: vllm_model::embedding::PoolingStrategy::Last,
             is_pooling,
             pending_commit: None,
+            last_token_ids_gpu: None,
+            slot_indices_gpu: None,
+            slot_indices_scratch: Vec::new(),
+            #[cfg(feature = "cuda")]
+            gather_slot_indices_gpu: None,
+            #[cfg(feature = "cuda")]
+            gather_token_offsets_gpu: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -2780,6 +2849,76 @@ impl FerriteWorker {
         }
     }
 
+    /// Scatter the just-sampled `tok_gpu: [num_reqs] u32` into per-slot
+    /// positions of the persistent `last_token_ids_gpu: [max_num_seqs]`
+    /// tensor. Phase 1 of AsyncScheduler redesign — generalizes the
+    /// captured-decode-graph self-feed (`graph.rs:391`) to all decode
+    /// paths. Caller passes the in-batch `req_ids` (same order as
+    /// `tok_gpu` rows); this fn looks up each slot via `InputBatch`,
+    /// H2Ds the slot indices, then launches `scatter_to_slots`.
+    ///
+    /// All work is on `compute_stream` so the next step's
+    /// `gather_last_tokens` is correctly ordered. No host sync.
+    ///
+    /// No-op when `last_token_ids_gpu` hasn't been allocated yet
+    /// (worker pre-init) or `req_ids` is empty.
+    #[allow(clippy::too_many_arguments)]
+    fn scatter_sampled_to_slots(
+        last_token_ids_gpu: Option<&vllm_cuda::RawGpuMem>,
+        slot_indices_gpu: Option<&vllm_cuda::RawGpuMem>,
+        slot_indices_scratch: &mut Vec<u32>,
+        input_batch: &InputBatch,
+        req_ids: &[String],
+        tok_gpu: &GpuTensor,
+        max_num_seqs: usize,
+        device: &GpuDevice,
+    ) -> ExecutorResult<()> {
+        let num_reqs = req_ids.len();
+        if num_reqs == 0 {
+            return Ok(());
+        }
+        let (Some(last_tok), Some(slot_idx)) = (last_token_ids_gpu, slot_indices_gpu) else {
+            return Ok(());
+        };
+        slot_indices_scratch.clear();
+        slot_indices_scratch.reserve(num_reqs);
+        for rid in req_ids {
+            // Slot must exist for any req that produced a token; if
+            // missing (race with preempt), scatter to slot 0 — the
+            // value is dead anyway because the req is no longer
+            // active. Safer than panicking on a transient.
+            let slot = input_batch.slot_for(rid).unwrap_or(0) as u32;
+            slot_indices_scratch.push(slot);
+        }
+        let bytes = num_reqs * 4;
+        // H2D the slot indices on the transfer stream — gated to
+        // compute via sync_transfer_to_compute so the kernel below
+        // sees the new values.
+        unsafe {
+            driver::memcpy_htod_async(
+                slot_idx.ptr(),
+                slot_indices_scratch.as_ptr() as *const u8,
+                bytes,
+                device.transfer_stream,
+            )
+        }
+        .map_err(|e| ExecutorError::WorkerExecution(format!("H2D slot_indices: {e}")))?;
+        device
+            .sync_transfer_to_compute()
+            .map_err(|e| ExecutorError::WorkerExecution(format!("sync slot_indices: {e}")))?;
+        unsafe {
+            vllm_cuda::kernels::scatter_to_slots_gpu(
+                last_tok.ptr() as *mut u32,
+                tok_gpu.raw_ptr() as *const u32,
+                slot_idx.ptr() as *const u32,
+                num_reqs,
+                max_num_seqs,
+                device.compute_stream,
+            );
+        }
+        Ok(())
+    }
+
     /// Enqueue async D2H without sync. Returns the buffer index used.
     /// Caller must sync via `device.sync_d2h()` before reading the buffer.
     fn d2h_token_ids_async(
@@ -2789,11 +2928,15 @@ impl FerriteWorker {
         num_reqs: usize,
         device: &GpuDevice,
     ) -> ExecutorResult<()> {
+        // Use the per-slot event pool so step N's d2h_done isn't clobbered
+        // by step N+1 before the output thread can sync on it. Pool is
+        // sized to 2 (PIPELINE_DEPTH); buf_idx ∈ {0,1} matches.
         unsafe {
-            device.async_d2h(
+            device.async_d2h_into_slot(
                 staging.host_token_ids[buf_idx].ptr(),
                 gpu_tensor.raw_ptr() as *const u8,
                 num_reqs * 4,
+                buf_idx,
             )
         }
         .map_err(|e| ExecutorError::WorkerExecution(format!("async D2H token ids: {e}")))?;
@@ -2804,6 +2947,7 @@ impl FerriteWorker {
     ///
     /// Uses the `LogitsProcessorPipeline` for persistent GPU state (logit_bias,
     /// penalties, min_tokens) and a separate `GrammarMaskProcessor` for grammar.
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn gpu_sample_and_finalize(
         sampling_params_map: &HashMap<String, SamplingParams>,
@@ -2816,7 +2960,8 @@ impl FerriteWorker {
         seal_pad_processor: &SealPadProcessor,
         logits_pipeline: Option<&LogitsProcessorPipeline>,
         seeded_rngs: &mut HashMap<String, rand::rngs::StdRng>,
-        host_staging: &Option<HostStaging>,
+        host_staging: &mut Option<HostStaging>,
+        pending_commit: &mut Option<PendingCommit>,
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
         prompt_lengths: &HashMap<String, usize>,
@@ -2825,6 +2970,7 @@ impl FerriteWorker {
         device: &mut GpuDevice,
         all_greedy: bool,
         vocab_size: usize,
+        slot_scatter: SlotScatterCtx<'_>,
     ) -> ExecutorResult<ModelRunnerOutput> {
         use rand::Rng;
         let num_reqs = prepared.req_inputs.len();
@@ -2844,7 +2990,7 @@ impl FerriteWorker {
                 total_tokens,
                 prepared,
                 device,
-                host_staging,
+                &*host_staging,
                 input_batch,
                 token_buffers,
             );
@@ -2917,11 +3063,12 @@ impl FerriteWorker {
                     num_reqs,
                     prepared,
                     device,
-                    host_staging,
+                    &*host_staging,
                     0,
                     input_batch,
                     token_buffers,
                     prompt_lengths,
+                    slot_scatter,
                 );
             }
 
@@ -2936,7 +3083,7 @@ impl FerriteWorker {
                 // Pack [temps: f32, seeds: u32] — both 4 bytes, same stride.
                 let stride = num_reqs * 4;
                 let total_bytes = stride * 2;
-                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let packed_ptr = Self::get_sampling_packed_ptr_s(&*host_staging, total_bytes);
                 let temps_ptr = packed_ptr as *mut f32;
                 let seeds_ptr = unsafe { packed_ptr.add(stride) as *mut u32 };
                 for (i, req_slice) in prepared.req_inputs.iter().enumerate() {
@@ -2976,7 +3123,7 @@ impl FerriteWorker {
             } else {
                 let stride = num_reqs * 4;
                 let total_bytes = stride * 5;
-                let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+                let packed_ptr = Self::get_sampling_packed_ptr_s(&*host_staging, total_bytes);
                 let temps_ptr = packed_ptr as *mut f32;
                 let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
                 let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
@@ -3038,16 +3185,121 @@ impl FerriteWorker {
                 }
             };
             let token_ids_gpu = token_ids_owned.as_gpu_tensor();
+            // Non-greedy native fast path: deferred D2H. Mirrors the super-fast
+            // and in-graph-fast-meta paths (see PendingCommit doc + line ~5790).
+            // The cuEventSynchronize moves off this thread to the output thread
+            // (set up by `InprocClient::start_pipeline`); the actual commit_step
+            // / token_buffers.push runs on this executor thread one step later
+            // via `self.pending_commit`.
+            if let Some(stg) = host_staging.as_mut() {
+                // 1. Scatter sampled tokens into per-slot last_token_ids_gpu so
+                //    the next decode step's gather sees them. Compute stream.
+                let req_ids: Vec<String> = prepared
+                    .req_inputs
+                    .iter()
+                    .map(|r| r.req_id.clone())
+                    .collect();
+                let SlotScatterCtx {
+                    last_token_ids_gpu,
+                    slot_indices_gpu,
+                    slot_indices_scratch,
+                    max_num_seqs,
+                } = slot_scatter;
+                Self::scatter_sampled_to_slots(
+                    last_token_ids_gpu,
+                    slot_indices_gpu,
+                    slot_indices_scratch,
+                    input_batch,
+                    &req_ids,
+                    &token_ids_gpu,
+                    max_num_seqs,
+                    device,
+                )?;
+
+                // 2. Build discard mask + token_counts before D2H. These read
+                //    InputBatch state that might change before the deferred
+                //    resolve runs.
+                let mut discard = vec![false; num_reqs];
+                let mut token_counts = Vec::with_capacity(num_reqs);
+                let mut has_spec_tokens = Vec::with_capacity(num_reqs);
+                for (req_idx, req_slice) in prepared.req_inputs.iter().enumerate() {
+                    token_counts.push(req_slice.token_count);
+                    has_spec_tokens.push(!req_slice.spec_token_ids.is_empty());
+                    if req_slice.token_count > 1 {
+                        let prompt_len =
+                            prompt_lengths.get(&req_slice.req_id).copied().unwrap_or(0);
+                        let tokens_in_pool = input_batch.tokens_in_pool_for(&req_slice.req_id);
+                        let seq_len_after = tokens_in_pool + req_slice.token_count;
+                        if seq_len_after < prompt_len {
+                            discard[req_idx] = true;
+                        }
+                    }
+                }
+
+                // 3. Async D2H — enqueue on transfer stream, no host sync.
+                let buf_idx = stg.token_buf_idx;
+                Self::d2h_token_ids_async(stg, buf_idx, &token_ids_gpu, num_reqs, device)?;
+
+                // 4. Reclaim prepare-step host buffers (independent of the D2H).
+                input_batch.reclaim_buffers(prepared);
+
+                // 5. Stash the commit state for the executor's next step to
+                //    apply (sync_d2h + commit_step + token_buffers.push).
+                *pending_commit = Some(PendingCommit {
+                    buf_idx,
+                    num_reqs,
+                    req_ids: req_ids.clone(),
+                    token_counts,
+                    has_spec_tokens,
+                    discard: discard.clone(),
+                });
+
+                // 6. Toggle double-buffer for next step.
+                stg.token_buf_idx ^= 1;
+
+                // 7. Build deferred ModelRunnerOutput. Closure runs on the
+                //    output thread (InprocClient pipeline) — does the
+                //    cuEventSynchronize and reads pinned host buffer.
+                //    Discarded rows return an empty Vec so finalize_step
+                //    skips them in the engine-side scheduler update.
+                //    Capture the SLOT-SPECIFIC event so step N+1's recording
+                //    doesn't make this closure wait on the wrong transfer.
+                //    CRITICAL: capture `token_ids_owned` in the closure so the
+                //    sample-output GPU memory stays alive until after the
+                //    transfer_stream's D2H actually reads it. Without this the
+                //    caching allocator can reuse the same GPU bytes for step
+                //    N+1 before step N's transfer reads them.
+                let event_addr = device.d2h_done_pool[buf_idx] as usize;
+                let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
+                crate::path_hist::record_deferred();
+                return Ok(ModelRunnerOutput::deferred(
+                    req_ids,
+                    Box::new(move || unsafe {
+                        driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
+                        // Now that the D2H completed, drop the owned GPU tensor
+                        // so its memory returns to the caching allocator.
+                        drop(token_ids_owned);
+                        let ids = std::slice::from_raw_parts(buf_addr as *const u32, num_reqs);
+                        ids.iter()
+                            .enumerate()
+                            .map(|(i, &t)| if discard[i] { Vec::new() } else { vec![t] })
+                            .collect()
+                    }),
+                ));
+            }
+
+            // No pinned staging: fall back to synchronous finalize.
             return Self::finalize_d2h_and_commit(
                 &token_ids_gpu,
                 num_reqs,
                 prepared,
                 device,
-                host_staging,
+                &*host_staging,
                 0,
                 input_batch,
                 token_buffers,
                 prompt_lengths,
+                slot_scatter,
             );
         }
 
@@ -3143,7 +3395,7 @@ impl FerriteWorker {
             // Full sampling on f32 logits.
             let stride = num_reqs * 4;
             let total_bytes = stride * 5;
-            let packed_ptr = Self::get_sampling_packed_ptr_s(host_staging, total_bytes);
+            let packed_ptr = Self::get_sampling_packed_ptr_s(&*host_staging, total_bytes);
             let temps_ptr = packed_ptr as *mut f32;
             let top_ks_ptr = unsafe { packed_ptr.add(stride) as *mut i32 };
             let top_ps_ptr = unsafe { packed_ptr.add(stride * 2) as *mut f32 };
@@ -3504,7 +3756,36 @@ impl FerriteWorker {
         input_batch: &mut InputBatch,
         token_buffers: &mut HashMap<String, Vec<u32>>,
         prompt_lengths: &HashMap<String, usize>,
+        slot_scatter: SlotScatterCtx<'_>,
     ) -> ExecutorResult<ModelRunnerOutput> {
+        // Scatter the just-sampled tokens into per-slot positions of
+        // last_token_ids_gpu BEFORE the host D2H so subsequent steps
+        // can read GPU-resident state. Phase 1 of AsyncScheduler
+        // redesign — see ASYNC_REDESIGN.md. The scatter runs on
+        // compute_stream, ordered before the D2H. No host sync.
+        {
+            let req_ids: Vec<String> = prepared
+                .req_inputs
+                .iter()
+                .map(|r| r.req_id.clone())
+                .collect();
+            let SlotScatterCtx {
+                last_token_ids_gpu,
+                slot_indices_gpu,
+                slot_indices_scratch,
+                max_num_seqs,
+            } = slot_scatter;
+            Self::scatter_sampled_to_slots(
+                last_token_ids_gpu,
+                slot_indices_gpu,
+                slot_indices_scratch,
+                input_batch,
+                &req_ids,
+                token_ids_gpu,
+                max_num_seqs,
+                device,
+            )?;
+        }
         let host_ids = Self::d2h_token_ids_sync(
             host_staging.as_ref(),
             buf_idx,
@@ -4063,6 +4344,66 @@ impl Worker for FerriteWorker {
 
         self.kv_cache = Some(pool);
 
+        // Allocate the slot-indexed last-sampled-token tensor +
+        // slot-index scratch buffer used by `scatter_to_slots` /
+        // `gather_last_tokens` (see `ASYNC_REDESIGN.md`). Sized by
+        // `max_num_seqs` so the buffer outlives any single batch
+        // composition. Zero-filled initially; real values land after
+        // the first sampling step. The host scratch is reused per
+        // step.
+        {
+            let max_seqs = self.config.max_num_seqs.max(1);
+            let bytes = max_seqs * 4;
+            let last_tok_ptr = unsafe { driver::mem_alloc(bytes) }
+                .map_err(|e| ExecutorError::WorkerInit(format!("alloc last_token_ids_gpu: {e}")))?;
+            let slot_idx_ptr = unsafe { driver::mem_alloc(bytes) }
+                .map_err(|e| ExecutorError::WorkerInit(format!("alloc slot_indices_gpu: {e}")))?;
+            // Zero-fill so reads before the first sampling step see 0
+            // rather than uninitialized memory.
+            if let Some(ref dev) = self.device {
+                unsafe { driver::memset_d8(last_tok_ptr, 0, bytes, dev.compute_stream) }.map_err(
+                    |e| ExecutorError::WorkerInit(format!("memset last_token_ids_gpu: {e}")),
+                )?;
+                unsafe { driver::memset_d8(slot_idx_ptr, 0, bytes, dev.compute_stream) }.map_err(
+                    |e| ExecutorError::WorkerInit(format!("memset slot_indices_gpu: {e}")),
+                )?;
+            }
+            self.last_token_ids_gpu =
+                Some(unsafe { vllm_cuda::RawGpuMem::new(last_tok_ptr, bytes) });
+            self.slot_indices_gpu = Some(unsafe { vllm_cuda::RawGpuMem::new(slot_idx_ptr, bytes) });
+            self.slot_indices_scratch = Vec::with_capacity(max_seqs);
+
+            // Persistent GPU buffers for the per-step gather kernel inputs.
+            // Sized to `max_num_seqs` so they outlive any batch composition;
+            // refilled per step with prepared.gather_slot_indices /
+            // gather_token_offsets (small H2D, transfer stream).
+            let gather_slot_ptr = unsafe { driver::mem_alloc(bytes) }.map_err(|e| {
+                ExecutorError::WorkerInit(format!("alloc gather_slot_indices_gpu: {e}"))
+            })?;
+            let gather_off_ptr = unsafe { driver::mem_alloc(bytes) }.map_err(|e| {
+                ExecutorError::WorkerInit(format!("alloc gather_token_offsets_gpu: {e}"))
+            })?;
+            if let Some(ref dev) = self.device {
+                unsafe { driver::memset_d8(gather_slot_ptr, 0, bytes, dev.compute_stream) }
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("memset gather_slot_indices_gpu: {e}"))
+                    })?;
+                unsafe { driver::memset_d8(gather_off_ptr, 0, bytes, dev.compute_stream) }
+                    .map_err(|e| {
+                        ExecutorError::WorkerInit(format!("memset gather_token_offsets_gpu: {e}"))
+                    })?;
+            }
+            self.gather_slot_indices_gpu =
+                Some(unsafe { vllm_cuda::RawGpuMem::new(gather_slot_ptr, bytes) });
+            self.gather_token_offsets_gpu =
+                Some(unsafe { vllm_cuda::RawGpuMem::new(gather_off_ptr, bytes) });
+
+            info!(
+                "Allocated last_token_ids_gpu + slot_indices_gpu + gather_*_gpu: {} slots ({} bytes each)",
+                max_seqs, bytes
+            );
+        }
+
         // Gated-DeltaNet (Qwen3.5 / Qwen3-Next) recurrent-state pool —
         // the non-paged sibling of the KV cache. Only hybrid arches
         // report a `gdn_runtime_config` (macro-emitted from the unrolled
@@ -4168,9 +4509,7 @@ impl Worker for FerriteWorker {
                     )
                 })
                 .unwrap_or(0);
-            let weights_and_overhead = total
-                .saturating_sub(free)
-                .saturating_add(gdn_reserve);
+            let weights_and_overhead = total.saturating_sub(free).saturating_add(gdn_reserve);
             let peak_activation_estimate = 512 * 1024 * 1024; // 512 MB conservative
             let utilization = self.config.gpu_memory_utilization;
             let available = compute_available_kv_bytes(
@@ -4991,6 +5330,7 @@ impl Worker for FerriteWorker {
         self.prefill_graph_runner = None;
         self.last_graph_batch_size = None;
         self.graph_metadata_valid = false;
+        crate::path_hist::record_invalidation(crate::path_hist::InvalidationSite::Close4992);
 
         // Drop host staging (Drop impl frees pinned memory).
         self.host_staging = None;
@@ -5064,6 +5404,9 @@ impl Worker for FerriteWorker {
         {
             let _ = dev.sync_d2h();
         }
+        // Print the per-step path histogram before tearing down — gated
+        // by FERRITE_PATH_HISTOGRAM=1; no-op otherwise.
+        crate::path_hist::drain_and_print();
         // Drop tracked weight allocations (RawGpuMem::Drop frees GPU memory).
         self.weight_gpu_allocs.clear();
         self.model = None;
@@ -5200,6 +5543,12 @@ impl FerriteWorker {
             self.ctx_set_on_thread = true;
         }
 
+        // Path histogram (FERRITE_PATH_HISTOGRAM=1): tag each terminal
+        // path so we can quantify which one dominates the bench. The
+        // ctx is dropped on every return, so the macro-style helper
+        // closures below must call `step.set(...)` before returning.
+        let mut step = crate::path_hist::StepCtx::begin();
+
         let block_size = self.config.block_size;
 
         // NOTE: pending commit from the previous step is resolved lazily:
@@ -5222,6 +5571,9 @@ impl FerriteWorker {
             // Batch composition changed — can't reuse persistent input_ids or metadata.
             self.last_graph_batch_size = None;
             self.graph_metadata_valid = false;
+            crate::path_hist::record_invalidation(
+                crate::path_hist::InvalidationSite::BatchChanged5223,
+            );
         }
         for req_id in &scheduler_output.finished_req_ids {
             self.token_buffers.remove(req_id);
@@ -5432,6 +5784,26 @@ impl FerriteWorker {
             None
         };
 
+        // Record the FIRST super-fast gate-fail reason for this step.
+        // Order: metadata_invalid → chunked_prefill → no_sk_bucket →
+        // no_graph_bs → no_staging_or_device → not_greedy/needs_full
+        // (recorded inside the if-let block below). One increment per
+        // failing step.
+        {
+            use crate::path_hist::{GateFailReason, record_gate_fail};
+            if !self.graph_metadata_valid {
+                record_gate_fail(GateFailReason::MetadataInvalid);
+            } else if has_chunked_prefill {
+                record_gate_fail(GateFailReason::ChunkedPrefill);
+            } else if fast_sk_bucket.is_none() {
+                record_gate_fail(GateFailReason::NoSkBucket);
+            } else if fast_graph_bs.is_none() {
+                record_gate_fail(GateFailReason::NoGraphBs);
+            } else if self.host_staging.is_none() || self.device.is_none() {
+                record_gate_fail(GateFailReason::NoStagingOrDevice);
+            }
+        }
+
         if let Some(graph_bs) = fast_graph_bs
             && let Some(sk_bucket) = fast_sk_bucket
             && let Some(ref mut stg) = self.host_staging
@@ -5469,11 +5841,18 @@ impl FerriteWorker {
                         }
                 });
 
+            if !all_greedy_fast {
+                crate::path_hist::record_gate_fail(crate::path_hist::GateFailReason::NotGreedy);
+            } else if any_needs_full {
+                crate::path_hist::record_gate_fail(crate::path_hist::GateFailReason::NeedsFull);
+            }
+
             if all_greedy_fast && !any_needs_full {
                 let block_size = self.config.block_size;
 
                 // Block table update for the graph (only if blocks changed).
                 let new_bt = if blocks_changed {
+                    crate::path_hist::record_blocks_changed();
                     let bt = unsafe { stg.fill_block_table(block_tables, graph_bs) };
                     Some(bt)
                 } else {
@@ -5491,11 +5870,28 @@ impl FerriteWorker {
                         block_size,
                         fast_max_seqlen_k,
                         device,
+                        None, // greedy super-fast: in-graph argmax → input_ids self-feeds
                     )
                 }
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("super fast replay_decode_fast: {e}"))
                 })?;
+                step.set(crate::path_hist::PathTag::SuperFastHit);
+
+                // Scatter sampled tokens into per-slot positions of
+                // last_token_ids_gpu so the next decode step's
+                // gather_last_tokens can read them. Phase 1 of the
+                // AsyncScheduler redesign — see ASYNC_REDESIGN.md.
+                Self::scatter_sampled_to_slots(
+                    self.last_token_ids_gpu.as_ref(),
+                    self.slot_indices_gpu.as_ref(),
+                    &mut self.slot_indices_scratch,
+                    &self.input_batch,
+                    &out_req_ids,
+                    &replay_out.token_ids,
+                    self.config.max_num_seqs.max(1),
+                    device,
+                )?;
 
                 // Async D2H — enqueue on transfer stream, don't block.
                 let buf_idx = stg.token_buf_idx;
@@ -5504,8 +5900,8 @@ impl FerriteWorker {
                 // NOW resolve the pending commit from the previous step.
                 // The GPU is running step N, so this CPU work overlaps with it.
                 if let Some(pending) = self.pending_commit.take() {
-                    device.sync_d2h().map_err(|e| {
-                        ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
+                    device.sync_d2h_slot(pending.buf_idx).map_err(|e| {
+                        ExecutorError::WorkerExecution(format!("pending sync_d2h_slot: {e}"))
                     })?;
                     let prev_ids = unsafe {
                         stg.host_token_ids[pending.buf_idx].slice::<u32>(pending.num_reqs)
@@ -5529,31 +5925,41 @@ impl FerriteWorker {
                     req_ids: out_req_ids.clone(),
                     token_counts,
                     has_spec_tokens: vec![false; num_active],
+                    discard: vec![false; num_active],
                 });
 
                 // Toggle double-buffer.
                 stg.token_buf_idx ^= 1;
 
-                // Build deferred output.
-                let event_addr = device.d2h_done as usize;
+                // Build deferred output. Per-slot event so step N+1's
+                // d2h_done recording doesn't clobber step N's.
+                let event_addr = device.d2h_done_pool[buf_idx] as usize;
                 let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
                 let nr = num_active;
+                crate::path_hist::record_deferred();
                 return Ok(ModelRunnerOutput::deferred(
                     out_req_ids,
                     Box::new(move || unsafe {
                         driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, nr).to_vec()
+                        let ids = std::slice::from_raw_parts(buf_addr as *const u32, nr);
+                        ids.iter().map(|&t| vec![t]).collect()
                     }),
                 ));
             }
         }
 
         // Resolve any deferred D2H commit from the previous step before
-        // prepare_inputs (which reads positions, tokens_in_pool, last_token_ids).
+        // `prepare_inputs` runs (which reads `positions` / `tokens_in_pool`).
+        //
+        // The output thread already synced step N-1's event on its way to
+        // building the `ResolvedCommit`, so this `sync_d2h_slot` is typically
+        // a no-op (event already done). The slot-specific event prevents
+        // racing step N's d2h recording.
         if let Some(pending) = self.pending_commit.take() {
+            crate::path_hist::record_pending_resolved_late();
             if let Some(ref dev) = self.device {
-                dev.sync_d2h().map_err(|e| {
-                    ExecutorError::WorkerExecution(format!("pending sync_d2h: {e}"))
+                dev.sync_d2h_slot(pending.buf_idx).map_err(|e| {
+                    ExecutorError::WorkerExecution(format!("pending sync_d2h_slot: {e}"))
                 })?;
             }
             if let Some(ref stg) = self.host_staging {
@@ -5566,7 +5972,11 @@ impl FerriteWorker {
                         pending.token_counts[i],
                         pending.has_spec_tokens[i],
                     );
-                    if let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i]) {
+                    // Skip token_buffers for discarded (mid-prefill-chunk) rows
+                    // — matches the discard semantics in `finalize_d2h_and_commit`.
+                    if !pending.discard.get(i).copied().unwrap_or(false)
+                        && let Some(buf) = self.token_buffers.get_mut(&pending.req_ids[i])
+                    {
                         buf.push(tok);
                     }
                 }
@@ -5689,10 +6099,22 @@ impl FerriteWorker {
         }
 
         // Prepare flat inputs from InputBatch.
+        let _phase_prep_t0 = if crate::path_hist::enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let prepared = self
             .input_batch
             .prepare_inputs(&scheduler_output.scheduled_spec_decode_tokens);
+        if let Some(t0) = _phase_prep_t0 {
+            crate::path_hist::phase_record_ns(
+                crate::path_hist::Phase::PrepareInputs,
+                t0.elapsed().as_nanos() as u64,
+            );
+        }
         if prepared.flat_token_ids.is_empty() {
+            step.set(crate::path_hist::PathTag::Other);
             return Ok(ModelRunnerOutput::from_token_map(HashMap::new()));
         }
 
@@ -5879,6 +6301,7 @@ impl FerriteWorker {
             // Build a ModelRunnerOutput with pooler_output and empty generation fields.
             let mut output = ModelRunnerOutput::from_token_map(HashMap::new());
             output.pooler_output = Some(pooler_map);
+            step.set(crate::path_hist::PathTag::PoolingPath);
             return Ok(output);
         }
 
@@ -6089,6 +6512,7 @@ impl FerriteWorker {
                         self.config.block_size,
                         device,
                         false,
+                        None, // mixed prefill+decode: no gather (prefill rows present)
                     )
                 }
                 .map_err(|e| {
@@ -6237,6 +6661,9 @@ impl FerriteWorker {
             // Invalidate graph metadata since we changed batch composition.
             self.last_graph_batch_size = None;
             self.graph_metadata_valid = false;
+            crate::path_hist::record_invalidation(
+                crate::path_hist::InvalidationSite::MixedPrefill6238,
+            );
 
             // Drop the sub-logits so their memory returns to the caching allocator.
             // (decode_logits is a view into graph output — not owned. prefill_logits is
@@ -6266,6 +6693,14 @@ impl FerriteWorker {
             );
 
             // GPU sampling for mixed prefill+decode merged logits.
+            step.set(crate::path_hist::PathTag::MixedPrefillDecode);
+            crate::path_hist::record_sync_output();
+            let slot_scatter = SlotScatterCtx {
+                last_token_ids_gpu: self.last_token_ids_gpu.as_ref(),
+                slot_indices_gpu: self.slot_indices_gpu.as_ref(),
+                slot_indices_scratch: &mut self.slot_indices_scratch,
+                max_num_seqs: self.config.max_num_seqs.max(1),
+            };
             return Self::gpu_sample_and_finalize(
                 &self.sampling_params_map,
                 #[cfg(feature = "guided-decoding")]
@@ -6275,7 +6710,8 @@ impl FerriteWorker {
                 &self.seal_pad_processor,
                 self.logits_pipeline.as_ref(),
                 &mut self.seeded_rngs,
-                &self.host_staging,
+                &mut self.host_staging,
+                &mut self.pending_commit,
                 &mut self.input_batch,
                 &mut self.token_buffers,
                 &self.prompt_lengths,
@@ -6284,6 +6720,7 @@ impl FerriteWorker {
                 device,
                 all_greedy,
                 vocab_size,
+                slot_scatter,
             );
         }
 
@@ -6333,11 +6770,13 @@ impl FerriteWorker {
             let replay_out = if self.graph_metadata_valid
                 && self.last_graph_batch_size == Some((graph_bs, sk_bucket))
             {
+                step.set(crate::path_hist::PathTag::ColdDecodeGraphFastMeta);
                 // GPU-side metadata update: positions, slot_mapping, seqused_k
                 // are incremented on GPU in a single kernel. Only block_table is
                 // H2D-copied when blocks changed. input_ids were scattered by the
                 // previous graph replay's in-graph argmax.
                 let new_bt = if blocks_changed {
+                    crate::path_hist::record_blocks_changed();
                     let bt =
                         unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
                     Some(bt)
@@ -6356,12 +6795,14 @@ impl FerriteWorker {
                         block_size,
                         max_seqlen_k_step,
                         device,
+                        None, // greedy fast meta: in-graph argmax self-feeds
                     )
                 }
                 .map_err(|e| {
                     ExecutorError::WorkerExecution(format!("graph replay_decode_fast: {e}"))
                 })?
             } else if let Some(stg) = staging {
+                step.set(crate::path_hist::PathTag::ColdDecodeGraphFullH2d);
                 // First step for this batch or batch composition changed:
                 // full H2D of all metadata via pinned staging buffers.
                 unsafe {
@@ -6421,10 +6862,12 @@ impl FerriteWorker {
                         block_size,
                         device,
                         skip_input_ids,
+                        None, // greedy graph fast meta: in-graph argmax self-feeds; no gather
                     )
                 }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
             } else {
+                step.set(crate::path_hist::PathTag::ColdDecodeGraphNoStaging);
                 // Fallback: no pinned staging (shouldn't happen but safe).
                 let mut input_ids = prepared.flat_token_ids.clone();
                 input_ids.resize(graph_bs, 0);
@@ -6481,6 +6924,7 @@ impl FerriteWorker {
                         block_size,
                         device,
                         skip_input_ids,
+                        None, // greedy graph fallback (no pinned staging): no gather
                     )
                 }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
@@ -6496,9 +6940,9 @@ impl FerriteWorker {
             // commit_step is deferred to the start of the next execute_model.
             if let Some(ref mut stg) = self.host_staging {
                 let buf_idx = stg.token_buf_idx;
-                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_reqs, device)?;
 
-                // Capture info needed for deferred commit_step.
+                // Capture commit metadata up front so we can pass req_ids
+                // to scatter_sampled_to_slots before reclaiming `prepared`.
                 let req_ids: Vec<String> = prepared
                     .req_inputs
                     .iter()
@@ -6512,6 +6956,21 @@ impl FerriteWorker {
                     .map(|r| !r.spec_token_ids.is_empty())
                     .collect();
 
+                // Scatter sampled tokens into last_token_ids_gpu so the
+                // next decode step can gather without a host roundtrip.
+                Self::scatter_sampled_to_slots(
+                    self.last_token_ids_gpu.as_ref(),
+                    self.slot_indices_gpu.as_ref(),
+                    &mut self.slot_indices_scratch,
+                    &self.input_batch,
+                    &req_ids,
+                    &replay_out.token_ids,
+                    self.config.max_num_seqs.max(1),
+                    device,
+                )?;
+
+                Self::d2h_token_ids_async(stg, buf_idx, &replay_out.token_ids, num_reqs, device)?;
+
                 self.input_batch.reclaim_buffers(prepared);
 
                 self.pending_commit = Some(PendingCommit {
@@ -6520,6 +6979,7 @@ impl FerriteWorker {
                     req_ids: req_ids.clone(),
                     token_counts,
                     has_spec_tokens,
+                    discard: vec![false; num_reqs],
                 });
 
                 // Toggle double-buffer for next step.
@@ -6529,18 +6989,28 @@ impl FerriteWorker {
                 // event and reads token IDs from the pinned host buffer.
                 // Cast raw pointers to usize for Send safety (pinned buffer
                 // and event outlive the closure — see PendingCommit safety doc).
-                let event_addr = device.d2h_done as usize;
+                // Per-slot event so step N+1 doesn't overwrite step N's.
+                let event_addr = device.d2h_done_pool[buf_idx] as usize;
                 let buf_addr = stg.host_token_ids[buf_idx].ptr() as usize;
+                crate::path_hist::record_deferred();
                 return Ok(ModelRunnerOutput::deferred(
                     req_ids,
                     Box::new(move || unsafe {
                         driver::event_synchronize_raw(event_addr).expect("D2H event sync failed");
-                        std::slice::from_raw_parts(buf_addr as *const u32, num_reqs).to_vec()
+                        let ids = std::slice::from_raw_parts(buf_addr as *const u32, num_reqs);
+                        ids.iter().map(|&t| vec![t]).collect()
                     }),
                 ));
             }
 
             // No pinned staging — fall back to synchronous D2H.
+            crate::path_hist::record_sync_output();
+            let slot_scatter = SlotScatterCtx {
+                last_token_ids_gpu: self.last_token_ids_gpu.as_ref(),
+                slot_indices_gpu: self.slot_indices_gpu.as_ref(),
+                slot_indices_scratch: &mut self.slot_indices_scratch,
+                max_num_seqs: self.config.max_num_seqs.max(1),
+            };
             return Self::finalize_d2h_and_commit(
                 &replay_out.token_ids,
                 num_reqs,
@@ -6551,6 +7021,7 @@ impl FerriteWorker {
                 &mut self.input_batch,
                 &mut self.token_buffers,
                 &self.prompt_lengths,
+                slot_scatter,
             );
         }
 
@@ -6564,6 +7035,7 @@ impl FerriteWorker {
         // same reason on the MM splice path (text-only batches: stays None).
         let mut _mm_holder: Option<(OwnedTensor, Vec<ferrite_forward::EmbedPatch>)> = None;
         let (_logits_owned, logits) = if use_graph {
+            step.set(crate::path_hist::PathTag::DecodeGraphNonGreedyOrFull);
             // CUDA graph replay (non-greedy: in-graph argmax result is
             // discarded; we re-sample with temperature on the logits).
             let graph_bs = graph_bs.unwrap();
@@ -6576,7 +7048,6 @@ impl FerriteWorker {
                 && self.last_graph_batch_size == Some((graph_bs, sk_bucket))
             {
                 // Fast path: GPU-side metadata update (same as greedy).
-                // Only input_ids must be H2D'd (no in-graph argmax scatter for non-greedy).
                 let new_bt = if blocks_changed {
                     let bt =
                         unsafe { staging.unwrap().fill_block_table(&meta.block_ids, graph_bs) };
@@ -6585,18 +7056,77 @@ impl FerriteWorker {
                     None
                 };
 
-                // Must H2D input_ids since non-greedy doesn't use in-graph argmax scatter.
-                let input_ids_slice = if let Some(stg) = staging {
+                // GATHER PATH: instead of H2D'ing the prepared.flat_token_ids
+                // (which depends on the previous step's sampled tokens — the
+                // exact dependency that makes step N+1 wait on step N's D2H),
+                // launch `gather_last_tokens_gpu` to pull each decode row's
+                // input from `last_token_ids_gpu[slot]` directly on the GPU.
+                // The previous step's `scatter_sampled_to_slots` already
+                // populated `last_token_ids_gpu`, so this is purely GPU-to-GPU.
+                //
+                // The gather only kicks in when prepared has gather metadata
+                // (pure decode rows). With prefill rows mixed in this branch
+                // wouldn't trigger anyway — those go to mixed_prefill_decode.
+                let use_gather = !prepared.gather_slot_indices.is_empty()
+                    && self.gather_slot_indices_gpu.is_some()
+                    && self.gather_token_offsets_gpu.is_some()
+                    && self.last_token_ids_gpu.is_some();
+
+                let input_ids_arg = if use_gather {
+                    None // gather kernel will fill input_ids on the GPU
+                } else if let Some(stg) = staging {
                     unsafe {
                         let ids = stg.input_ids.slice_mut::<u32>(graph_bs);
                         ids[..num_reqs].copy_from_slice(&prepared.flat_token_ids);
                         ids[num_reqs..].fill(0);
-                        stg.input_ids.slice::<u32>(graph_bs)
+                        Some(stg.input_ids.slice::<u32>(graph_bs))
                     }
                 } else {
                     let mut ids = prepared.flat_token_ids.clone();
                     ids.resize(graph_bs, 0);
-                    ids.leak()
+                    Some(&*ids.leak())
+                };
+
+                // H2D the per-step gather metadata (small: num_decode * 4 bytes
+                // each). On transfer_stream, gated to compute via the runner's
+                // sync_transfer_to_compute. Skipped when use_gather is false.
+                if use_gather {
+                    let n_decode = prepared.gather_slot_indices.len();
+                    let bytes = n_decode * 4;
+                    let gsi = self.gather_slot_indices_gpu.as_ref().unwrap();
+                    let gto = self.gather_token_offsets_gpu.as_ref().unwrap();
+                    unsafe {
+                        driver::memcpy_htod_async(
+                            gsi.ptr(),
+                            prepared.gather_slot_indices.as_ptr() as *const u8,
+                            bytes,
+                            device.transfer_stream,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("H2D gather_slot_indices: {e}"))
+                        })?;
+                        driver::memcpy_htod_async(
+                            gto.ptr(),
+                            prepared.gather_token_offsets.as_ptr() as *const u8,
+                            bytes,
+                            device.transfer_stream,
+                        )
+                        .map_err(|e| {
+                            ExecutorError::WorkerExecution(format!("H2D gather_token_offsets: {e}"))
+                        })?;
+                    }
+                }
+
+                let gather = if use_gather {
+                    Some(vllm_cuda::DecodeRowGather {
+                        last_token_ids_gpu: self.last_token_ids_gpu.as_ref().unwrap(),
+                        slot_indices_gpu: self.gather_slot_indices_gpu.as_ref().unwrap(),
+                        token_offsets_gpu: self.gather_token_offsets_gpu.as_ref().unwrap(),
+                        num_decode: prepared.gather_slot_indices.len(),
+                        max_num_seqs: self.config.max_num_seqs.max(1),
+                    })
+                } else {
+                    None
                 };
 
                 let max_seqlen_k_step = meta.seq_lens.iter().copied().max().unwrap_or(0);
@@ -6605,11 +7135,12 @@ impl FerriteWorker {
                     runner.replay_decode_fast(
                         graph_bs,
                         sk_bucket,
-                        Some(input_ids_slice),
+                        input_ids_arg,
                         new_bt,
                         block_size,
                         max_seqlen_k_step,
                         device,
+                        gather,
                     )
                 }
                 .map_err(|e| {
@@ -6670,6 +7201,7 @@ impl FerriteWorker {
                         block_size,
                         device,
                         false,
+                        None, // non-greedy first-step / batch-changed: full H2D, no gather
                     )
                 }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
@@ -6727,6 +7259,7 @@ impl FerriteWorker {
                         block_size,
                         device,
                         false,
+                        None, // non-greedy fallback (no pinned staging): no gather
                     )
                 }
                 .map_err(|e| ExecutorError::WorkerExecution(format!("graph replay: {e}")))?
@@ -6744,6 +7277,7 @@ impl FerriteWorker {
             };
             (None, logits)
         } else if use_piecewise {
+            step.set(crate::path_hist::PathTag::PiecewiseDecode);
             // -------------------------------------------------------------
             // Piecewise CUDA-graph decode (tp>1 path). Build padded inputs
             // matching the captured `pw_bs`, H2D into the runner's stable
@@ -6826,12 +7360,18 @@ impl FerriteWorker {
                 };
                 self.last_graph_batch_size = None;
                 self.graph_metadata_valid = false;
+                crate::path_hist::record_invalidation(
+                    crate::path_hist::InvalidationSite::PiecewiseDecode6827,
+                );
                 (Some(logits_full), logits_view)
             }
         } else {
             // Non-decode path: try prefill graph, fall back to eager.
             self.last_graph_batch_size = None;
             self.graph_metadata_valid = false;
+            crate::path_hist::record_invalidation(
+                crate::path_hist::InvalidationSite::PrefillOrEagerElse6833,
+            );
 
             // Check if we can use a prefill graph: single request, fresh prefill
             // (tokens_before == 0 means q_len == seq_len, so the model uses contiguous
@@ -6868,6 +7408,7 @@ impl FerriteWorker {
                     .is_some();
 
             if use_piecewise_prefill_replay {
+                step.set(crate::path_hist::PathTag::PrefillOnlyPiecewise);
                 #[cfg(feature = "nccl")]
                 {
                     let ppr = self.piecewise_prefill.as_ref().unwrap();
@@ -6924,6 +7465,7 @@ impl FerriteWorker {
                     )
                 }
             } else if use_prefill_graph {
+                step.set(crate::path_hist::PathTag::PrefillOnlyGraph);
                 let padded = self
                     .prefill_graph_runner
                     .as_ref()
@@ -6974,6 +7516,12 @@ impl FerriteWorker {
 
                 (None, replay_out.logits)
             } else {
+                // Tag: eager-decode if is_decode (graph miss) else eager-prefill.
+                if is_decode {
+                    step.set(crate::path_hist::PathTag::DecodeEagerNoGraph);
+                } else {
+                    step.set(crate::path_hist::PathTag::PrefillOnlyEager);
+                }
                 // Eager forward path (multi-request prefill or uncaptured size).
                 // Caching allocator: no reset needed — tensors freed on drop.
 
@@ -7202,6 +7750,13 @@ impl FerriteWorker {
 
         // GPU sampling: handles all cases — greedy, non-greedy, penalties,
         // grammar, logit_bias, logprobs — entirely on GPU. No CPU fallback.
+        crate::path_hist::record_sync_output();
+        let slot_scatter = SlotScatterCtx {
+            last_token_ids_gpu: self.last_token_ids_gpu.as_ref(),
+            slot_indices_gpu: self.slot_indices_gpu.as_ref(),
+            slot_indices_scratch: &mut self.slot_indices_scratch,
+            max_num_seqs: self.config.max_num_seqs.max(1),
+        };
         Self::gpu_sample_and_finalize(
             &self.sampling_params_map,
             #[cfg(feature = "guided-decoding")]
@@ -7211,7 +7766,8 @@ impl FerriteWorker {
             &self.seal_pad_processor,
             self.logits_pipeline.as_ref(),
             &mut self.seeded_rngs,
-            &self.host_staging,
+            &mut self.host_staging,
+            &mut self.pending_commit,
             &mut self.input_batch,
             &mut self.token_buffers,
             &self.prompt_lengths,
@@ -7220,6 +7776,7 @@ impl FerriteWorker {
             device,
             all_greedy,
             vocab_size,
+            slot_scatter,
         )
     }
     /// Update logits processor pipeline, grammar, and allowed_token_ids state.
@@ -10376,6 +10933,10 @@ impl Worker for FerriteWorker {
 
     fn shutdown(&mut self) {
         self.is_shutdown = true;
+        // Print the per-step path histogram before tearing down — gated
+        // by FERRITE_PATH_HISTOGRAM=1; no-op otherwise.
+        #[cfg(feature = "cuda")]
+        crate::path_hist::drain_and_print();
         // Drop order matters: KV cache references device buffers; model
         // holds Weights backed by `GpuWeights` whose allocator arenas
         // back every weight tensor. Drop tensors before device.

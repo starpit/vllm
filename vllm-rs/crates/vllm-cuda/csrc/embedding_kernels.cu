@@ -357,3 +357,90 @@ void bias_add_f32(void* out, const void* bias, int M, int N, cudaStream_t stream
 }
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------------
+// scatter_to_slots / gather_last_tokens — async-scheduling decode pipeline
+// (Phase 1 of the AsyncScheduler redesign; see ASYNC_REDESIGN proposal).
+//
+// `last_token_ids_gpu: [max_num_seqs]` is a slot-indexed GPU tensor that
+// always holds, for each active InputBatch slot, the most recently sampled
+// token. The captured-decode-graph already self-feeds an analogous DENSE
+// (batch-positional) `input_ids` buffer via `memcpy_dtod_async` at the end
+// of capture, but only on the greedy super-fast path. The new slot-indexed
+// tensor generalizes that pattern to:
+//   - non-greedy decode (sample kernel writes a [num_reqs] tensor; scatter
+//     into per-slot positions of last_token_ids_gpu).
+//   - mixed prefill+decode (the decode subset's sampled tokens scatter to
+//     their slots; prefill rows still go through the host path until the
+//     prompt is fully consumed).
+// Reads happen in the next step's prepare_inputs via gather_last_tokens,
+// replacing the host-side `flat_token_ids.push(self.last_token_ids[slot])`
+// loop in `input_batch.rs`. The host mirror remains for legacy paths but
+// is no longer load-bearing on the decode hot path.
+// ---------------------------------------------------------------------------
+
+__global__ void scatter_to_slots_kernel(
+    uint32_t* __restrict__ last_token_ids,        // [max_num_seqs]
+    const uint32_t* __restrict__ tok_gpu,         // [num_reqs]
+    const uint32_t* __restrict__ slot_indices,    // [num_reqs]
+    int num_reqs,
+    int max_num_seqs
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_reqs) return;
+    uint32_t slot = slot_indices[i];
+    if (slot >= (uint32_t)max_num_seqs) return;
+    last_token_ids[slot] = tok_gpu[i];
+}
+
+__global__ void gather_last_tokens_kernel(
+    uint32_t* __restrict__ flat_token_ids,        // [num_decode] — destination rows
+    const uint32_t* __restrict__ last_token_ids,  // [max_num_seqs]
+    const uint32_t* __restrict__ slot_indices,    // [num_decode]
+    const uint32_t* __restrict__ token_offsets,   // [num_decode] — destination row index in flat_token_ids
+    int num_decode,
+    int max_num_seqs
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= num_decode) return;
+    uint32_t slot = slot_indices[i];
+    uint32_t off = token_offsets[i];
+    if (slot >= (uint32_t)max_num_seqs) return;
+    flat_token_ids[off] = last_token_ids[slot];
+}
+
+extern "C" {
+
+void scatter_to_slots(
+    uint32_t* last_token_ids,
+    const uint32_t* tok_gpu,
+    const uint32_t* slot_indices,
+    int num_reqs,
+    int max_num_seqs,
+    cudaStream_t stream
+) {
+    if (num_reqs <= 0) return;
+    int threads = 256;
+    int blocks = (num_reqs + threads - 1) / threads;
+    scatter_to_slots_kernel<<<blocks, threads, 0, stream>>>(
+        last_token_ids, tok_gpu, slot_indices, num_reqs, max_num_seqs);
+}
+
+void gather_last_tokens(
+    uint32_t* flat_token_ids,
+    const uint32_t* last_token_ids,
+    const uint32_t* slot_indices,
+    const uint32_t* token_offsets,
+    int num_decode,
+    int max_num_seqs,
+    cudaStream_t stream
+) {
+    if (num_decode <= 0) return;
+    int threads = 256;
+    int blocks = (num_decode + threads - 1) / threads;
+    gather_last_tokens_kernel<<<blocks, threads, 0, stream>>>(
+        flat_token_ids, last_token_ids, slot_indices, token_offsets,
+        num_decode, max_num_seqs);
+}
+
+}  // extern "C"

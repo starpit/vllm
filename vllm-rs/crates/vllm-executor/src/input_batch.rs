@@ -56,6 +56,10 @@ pub struct InputBatch {
     tokens_before_buf: Vec<usize>,
     is_prefill_buf: Vec<bool>,
     req_ids_buf: Vec<String>,
+    /// Per-decode-row gather metadata, reused per step. See
+    /// `PreparedInputs::gather_slot_indices` for semantics.
+    gather_slot_indices_buf: Vec<u32>,
+    gather_token_offsets_buf: Vec<u32>,
 }
 
 impl Default for InputBatch {
@@ -87,6 +91,8 @@ impl InputBatch {
             tokens_before_buf: Vec::new(),
             is_prefill_buf: Vec::new(),
             req_ids_buf: Vec::new(),
+            gather_slot_indices_buf: Vec::new(),
+            gather_token_offsets_buf: Vec::new(),
         }
     }
 
@@ -196,6 +202,15 @@ impl InputBatch {
         self.req_id_to_slot.contains_key(req_id)
     }
 
+    /// Look up the slot index for a request, if known.
+    ///
+    /// Used by the AsyncScheduler redesign (Phase 1) to build the
+    /// `slot_indices` array consumed by the `scatter_to_slots` /
+    /// `gather_last_tokens` CUDA kernels — see `ASYNC_REDESIGN.md`.
+    pub fn slot_for(&self, req_id: &str) -> Option<usize> {
+        self.req_id_to_slot.get(req_id).copied()
+    }
+
     /// Lightweight query for the greedy graph fast path.
     ///
     /// Returns `(req_ids, block_tables, tokens_in_pool)` without building
@@ -248,6 +263,14 @@ impl InputBatch {
         is_prefill_vec.clear();
         let mut batch_req_ids = std::mem::take(&mut self.req_ids_buf);
         batch_req_ids.clear();
+        // Per-decode-row gather metadata (Phase 1 of AsyncScheduler
+        // redesign — see ASYNC_REDESIGN.md). We emit one entry per
+        // decode row; the executor uses `kernels::gather_last_tokens_gpu`
+        // after H2D to populate those rows from `last_token_ids_gpu`.
+        let mut gather_slot_indices = std::mem::take(&mut self.gather_slot_indices_buf);
+        gather_slot_indices.clear();
+        let mut gather_token_offsets = std::mem::take(&mut self.gather_token_offsets_buf);
+        gather_token_offsets.clear();
 
         let mut offset = 0usize;
 
@@ -287,6 +310,18 @@ impl InputBatch {
                 offset += num_tokens;
             } else {
                 // Decode: emit last_token_id + optional spec decode tokens.
+                //
+                // Phase 1 of AsyncScheduler redesign (ASYNC_REDESIGN.md):
+                // for the leading "last token" row of each decode (and
+                // the leading row of a spec-decode burst), push a 0
+                // sentinel into `flat_token_ids` and record a gather
+                // entry. The executor will overwrite the sentinel with
+                // `last_token_ids_gpu[slot]` via
+                // `kernels::gather_last_tokens_gpu` after H2D — no host
+                // dependency on `self.last_token_ids[slot]` for the
+                // forward. Spec-decode draft rows still use the host
+                // values (they come from the scheduler, not from the
+                // last sampled token).
                 let spec_tokens = spec_decode_tokens.get(req_id).cloned().unwrap_or_default();
                 let position = self.positions[slot];
 
@@ -294,8 +329,11 @@ impl InputBatch {
 
                 if spec_tokens.is_empty() {
                     // Normal single-token decode.
-                    self.flat_token_ids.push(self.last_token_ids[slot]);
+                    let leading_offset = self.flat_token_ids.len() as u32;
+                    self.flat_token_ids.push(0); // sentinel — gather kernel fills it
                     self.flat_positions.push(position);
+                    gather_slot_indices.push(slot as u32);
+                    gather_token_offsets.push(leading_offset);
 
                     query_start_loc.push(offset);
                     q_lens.push(1);
@@ -316,8 +354,11 @@ impl InputBatch {
                 } else {
                     // Speculative decode: [last_token, draft_0, ..., draft_K-1].
                     let total = 1 + spec_tokens.len();
-                    self.flat_token_ids.push(self.last_token_ids[slot]);
+                    let leading_offset = self.flat_token_ids.len() as u32;
+                    self.flat_token_ids.push(0); // sentinel — gather kernel fills it
                     self.flat_positions.push(position);
+                    gather_slot_indices.push(slot as u32);
+                    gather_token_offsets.push(leading_offset);
                     for (j, &draft_tok) in spec_tokens.iter().enumerate() {
                         self.flat_token_ids.push(draft_tok);
                         self.flat_positions.push(position + 1 + j as u32);
@@ -361,6 +402,8 @@ impl InputBatch {
             flat_token_ids: std::mem::take(&mut self.flat_token_ids),
             flat_positions: std::mem::take(&mut self.flat_positions),
             attn_meta,
+            gather_slot_indices,
+            gather_token_offsets,
         }
     }
 
@@ -445,6 +488,8 @@ impl InputBatch {
         self.flat_token_ids = prepared.flat_token_ids;
         self.flat_positions = prepared.flat_positions;
         self.req_inputs_buf = prepared.req_inputs;
+        self.gather_slot_indices_buf = prepared.gather_slot_indices;
+        self.gather_token_offsets_buf = prepared.gather_token_offsets;
         // Reclaim AttentionMetadata buffers.
         let meta = prepared.attn_meta;
         self.query_start_loc_buf = meta.query_start_loc;
@@ -469,11 +514,32 @@ pub struct PreparedInputs {
     /// Per-request slicing info.
     pub req_inputs: Vec<ReqSlice>,
     /// Flat token IDs for all requests (moved from InputBatch).
+    ///
+    /// For decode rows, the entries are 0 sentinels — the actual
+    /// token IDs live in `last_token_ids_gpu` (slot-indexed) and are
+    /// gathered into the GPU input_ids buffer by
+    /// `kernels::gather_last_tokens_gpu` after H2D. See
+    /// `ASYNC_REDESIGN.md` step 3. The host array is still the size
+    /// the executor uses for H2D bytes; only the values are fill-by-
+    /// gather. Prefill rows carry real prompt tokens.
     pub flat_token_ids: Vec<u32>,
     /// Flat positions for all requests (moved from InputBatch).
     pub flat_positions: Vec<u32>,
     /// Attention metadata (also owns block_ids and tokens_before).
     pub attn_meta: AttentionMetadata,
+    /// Per-decode-row slot index in `last_token_ids_gpu`. One entry
+    /// per row in `flat_token_ids` that came from a decode (q_len=1)
+    /// row; mid-spec-decode rows that aren't the leading "last token"
+    /// row are excluded (their token IDs come from spec_token_ids on
+    /// the host side). The executor uses these to launch
+    /// `gather_last_tokens_gpu(input_ids_gpu, last_token_ids_gpu,
+    /// gather_slot_indices, gather_token_offsets)` to fill the decode
+    /// rows from GPU-resident state, eliminating the dependency on
+    /// the host `last_token_ids[]` mirror.
+    pub gather_slot_indices: Vec<u32>,
+    /// Destination row indices in `flat_token_ids` that the gather
+    /// kernel writes to. Same length as `gather_slot_indices`.
+    pub gather_token_offsets: Vec<u32>,
 }
 
 /// Per-request slice info within the flat tensors.

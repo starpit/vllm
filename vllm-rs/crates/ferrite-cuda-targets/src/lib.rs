@@ -42,6 +42,12 @@ pub struct ProfileDef {
     pub peak_tflops_fp16: f64,
     /// Global memory bandwidth, gigabytes per second.
     pub memory_bandwidth_gbps: f64,
+    /// Practical pinned host→device copy bandwidth over the host
+    /// link, gigabytes per second — ~80% of the PCIe raw rate (gen4
+    /// x16 ≈ 25 raw → 20 practical; gen5 x16 ≈ 63 raw → 50). The
+    /// weight pre-stage pipeline derives its staging chunk size from
+    /// this so per-copy fixed overhead stays amortized on any link.
+    pub pcie_h2d_gbps: f64,
     /// Shared memory per SM, kilobytes.
     pub shared_memory_per_sm_kb: u32,
     /// Raw CSV bytes from `profiles/cost_<name>.csv`. Parsed by the
@@ -57,6 +63,7 @@ pub const L4_SM89: ProfileDef = ProfileDef {
     num_sms: 58,
     peak_tflops_fp16: 242.0,
     memory_bandwidth_gbps: 300.0,
+    pcie_h2d_gbps: 20.0,
     shared_memory_per_sm_kb: 100,
     cost_csv: include_str!("../profiles/cost_l4_sm89.csv"),
 };
@@ -67,6 +74,7 @@ pub const L40S_SM89: ProfileDef = ProfileDef {
     num_sms: 142,
     peak_tflops_fp16: 362.0,
     memory_bandwidth_gbps: 864.0,
+    pcie_h2d_gbps: 20.0,
     shared_memory_per_sm_kb: 100,
     cost_csv: include_str!("../profiles/cost_l40s_sm89.csv"),
 };
@@ -77,6 +85,7 @@ pub const H100_SM90: ProfileDef = ProfileDef {
     num_sms: 132,
     peak_tflops_fp16: 989.0,
     memory_bandwidth_gbps: 3350.0,
+    pcie_h2d_gbps: 50.0,
     shared_memory_per_sm_kb: 228,
     cost_csv: include_str!("../profiles/cost_h100_sm90.csv"),
 };

@@ -7,7 +7,7 @@ description = "Core GPU types for the ferrite inference framework"
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:ferrite-cuda-targets"]
 nccl = ["cuda", "cudarc/nccl"]
 # Metal backend: routes through `ferrite-metal-kernels` (which owns the
 # `objc2-metal` dep + types) for the `MetalAllocator` impl of
@@ -28,6 +28,7 @@ objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
 ferrite-metal-kernels = { path = "../ferrite-metal-kernels", optional = true }
+ferrite-cuda-targets = { path = "../ferrite-cuda-targets", optional = true }
 half = { workspace = true }
 rayon = { workspace = true }
 safetensors = { workspace = true }

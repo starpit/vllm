@@ -318,26 +318,66 @@ fn load_shard_into_map(path: &Path) -> Result<(HashMap<String, CpuTensorRef>, Ar
 // device buffer, so take() just hands over an already-uploaded tensor.
 // ---------------------------------------------------------------------------
 
-/// Number of parallel pre-stage worker threads. Matches the proven
-/// local-FS concurrency of runai-model-streamer
-/// (`RUNAI_STREAMER_CONCURRENCY` default 16) and fastsafetensors
-/// (`max_threads` default 16): enough concurrent read streams to
-/// saturate a disk that a single faulting thread cannot (measured
-/// 230 MB/s single-thread vs 375 MB/s disk ceiling on a GCP pd).
+/// Pre-stage worker count. The proven local-FS concurrency of
+/// runai-model-streamer (`RUNAI_STREAMER_CONCURRENCY` default 16) and
+/// fastsafetensors (`max_threads` default 16), and the count measured
+/// saturating a GCP pd at 96% of its ceiling (vs 61% single-thread).
+/// Cold-cache workers are IO-blocked, so the count is safe on hosts
+/// with fewer cores.
 #[cfg(feature = "cuda")]
-const PRECAST_WORKERS: usize = 16;
+const PRESTAGE_WORKERS: usize = 16;
 
-/// Per-worker pinned staging slot size. Each worker allocates ONE slot
-/// for its lifetime and streams tensors through it in chunks:
-/// mmap → slot (the read that faults the pages) → blocking H2D. The
-/// blocking copy guarantees the slot is reusable on return — no events,
-/// no stream sync. 2 MiB is runai-model-streamer's local-FS block floor
-/// (`min_fs_block_bytesize`); fastsafetensors uses 1 MiB per thread.
-/// Total pinned memory: PRECAST_WORKERS × 2 MiB = 32 MiB, pinned once —
-/// per-tensor `cuMemAllocHost` was measured to cap the whole pipeline
-/// at 1.2 GiB/s (page-locking cost scales with bytes pinned).
+/// Floor for the per-worker pinned staging slot (chunk) size — the
+/// runai-model-streamer local-FS block floor (`min_fs_block_bytesize`);
+/// fastsafetensors uses 1 MiB per thread.
 #[cfg(feature = "cuda")]
-const STAGE_SLOT_BYTES: usize = 2 << 20;
+const STAGE_SLOT_BYTES_MIN: usize = 2 << 20;
+
+/// Ceiling for the per-worker pinned staging slot size. Bounds total
+/// pinned memory (workers × slot, transient for the load) and
+/// per-chunk latency.
+#[cfg(feature = "cuda")]
+const STAGE_SLOT_BYTES_MAX: usize = 16 << 20;
+
+/// Target wall-time for one chunk's H2D copy. The slot must be big
+/// enough that the transfer dwarfs the per-copy fixed overhead
+/// (driver call + copy-engine launch, ~5-10 µs): at 200 µs/chunk the
+/// overhead is <5% on any link.
+#[cfg(feature = "cuda")]
+const STAGE_CHUNK_TARGET_US: usize = 200;
+
+/// Fallback H2D link bandwidth (GB/s) when the GPU has no
+/// `ferrite-cuda-targets` profile — a conservative PCIe-gen4-x16
+/// figure, so an unknown GPU gets a sane small slot rather than an
+/// oversized one.
+#[cfg(feature = "cuda")]
+const DEFAULT_PCIE_H2D_GBPS: f64 = 20.0;
+
+/// Per-worker staging slot size, derived from the GPU profile table
+/// ([`ferrite_cuda_targets::ProfileDef::pcie_h2d_gbps`], resolved via
+/// `FERRITE_GPU` / nvidia-smi): big enough that one chunk's transfer
+/// takes [`STAGE_CHUNK_TARGET_US`] on this GPU's host link, rounded up
+/// to a power of two, clamped to [[`STAGE_SLOT_BYTES_MIN`],
+/// [`STAGE_SLOT_BYTES_MAX`]]. A gen4 L4/L40S (20 GB/s) derives 4 MiB;
+/// a gen5 H100 (50 GB/s) derives 16 MiB.
+#[cfg(feature = "cuda")]
+fn resolve_stage_slot_bytes() -> usize {
+    const US_PER_SEC: f64 = 1e6;
+    const BYTES_PER_GB: f64 = 1e9;
+    let gbps = match ferrite_cuda_targets::detect() {
+        Ok(profile) => profile.pcie_h2d_gbps,
+        Err(e) => {
+            tracing::info!(
+                "pre-stage: no GPU profile ({e}); assuming {DEFAULT_PCIE_H2D_GBPS} GB/s H2D"
+            );
+            DEFAULT_PCIE_H2D_GBPS
+        }
+    };
+    let target = gbps * BYTES_PER_GB * (STAGE_CHUNK_TARGET_US as f64 / US_PER_SEC);
+    (target as usize)
+        .next_power_of_two()
+        .clamp(STAGE_SLOT_BYTES_MIN, STAGE_SLOT_BYTES_MAX)
+}
 
 /// Identity of a tensor's backing bytes: (mmap base, offset, len).
 /// The ready-map is keyed by data identity rather than tensor name so
@@ -364,7 +404,7 @@ type PrecastWorkItem = (PrecastKey, Arc<memmap2::Mmap>, usize, usize, DType);
 /// Device-resident results land in `state.shared.ready` for take().
 ///
 /// The sequential chunk reads ARE the pre-fault: each worker streams
-/// its tensor's pages in order, and [`PRECAST_WORKERS`] concurrent
+/// its tensor's pages in order, and [`PRESTAGE_WORKERS`] concurrent
 /// streams keep the disk's queue full on a cold cache. The blocking
 /// per-chunk H2D means a finished entry needs no further
 /// synchronization — take() can hand the buffer out directly.
@@ -378,6 +418,7 @@ fn precast_worker(
     work: Arc<Vec<PrecastWorkItem>>,
     next: Arc<std::sync::atomic::AtomicUsize>,
     ctx: usize,
+    slot_bytes: usize,
     stats: Arc<PrecastStats>,
 ) {
     // CUDA calls need a current context on THIS thread — spawned
@@ -391,7 +432,7 @@ fn precast_worker(
         return;
     }
     // One pinned staging slot for this worker's lifetime.
-    let slot = match unsafe { driver::mem_alloc_host(STAGE_SLOT_BYTES) } {
+    let slot = match unsafe { driver::mem_alloc_host(slot_bytes) } {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("pre-stage worker: pinned slot alloc failed, worker idle: {e}");
@@ -422,7 +463,7 @@ fn precast_worker(
         // Stream the tensor outside the lock — this is the expensive
         // part and the part that faults the mmap pages.
         let data = &mmap[*data_offset..*data_offset + *size_bytes];
-        let result = unsafe { stage_to_device(data, *dtype, target_dtype, slot) };
+        let result = unsafe { stage_to_device(data, *dtype, target_dtype, slot, slot_bytes) };
 
         let mut s = state.shared.lock().unwrap();
         s.in_progress.remove(key);
@@ -452,12 +493,12 @@ fn precast_worker(
 }
 
 /// Stream one tensor from its mmap bytes into a fresh device buffer
-/// through `slot` (a [`STAGE_SLOT_BYTES`] pinned staging buffer),
+/// through `slot` (a `slot_bytes`-sized pinned staging buffer),
 /// casting each chunk to `target_dtype` when the tensor is a float of
 /// a different dtype. Returns the device-resident entry.
 ///
 /// # Safety
-/// `slot` must be a valid pinned allocation of [`STAGE_SLOT_BYTES`],
+/// `slot` must be a valid pinned allocation of at least `slot_bytes`,
 /// and the calling thread must have a current CUDA context.
 #[cfg(feature = "cuda")]
 unsafe fn stage_to_device(
@@ -465,6 +506,7 @@ unsafe fn stage_to_device(
     dtype: DType,
     target_dtype: Option<DType>,
     slot: *mut u8,
+    slot_bytes: usize,
 ) -> Result<PrecastEntry> {
     let needs_cast = match target_dtype {
         Some(target) => matches!(dtype, DType::F32 | DType::F16 | DType::BF16) && dtype != target,
@@ -485,7 +527,7 @@ unsafe fn stage_to_device(
     let gpu = unsafe { RawGpuMem::new(dev_ptr, staged_bytes) };
 
     // Elements per chunk, sized so the CHUNK OUTPUT fits the slot.
-    let chunk_elems = STAGE_SLOT_BYTES / dst_elem.max(src_elem);
+    let chunk_elems = slot_bytes / dst_elem.max(src_elem);
     anyhow::ensure!(chunk_elems > 0, "stage slot smaller than one element");
 
     let mut done = 0usize;
@@ -1195,7 +1237,7 @@ impl GpuWeights {
 
     /// Start the background pre-stage pipeline.
     ///
-    /// Spawns [`PRECAST_WORKERS`] threads that pull tensors off a shared
+    /// Spawns [`PRESTAGE_WORKERS`] threads that pull tensors off a shared
     /// list (largest first), fault their mmap pages with one sequential
     /// read, and stream the bytes through a small per-worker pinned slot
     /// straight into per-tensor device buffers — casting floats to
@@ -1204,10 +1246,10 @@ impl GpuWeights {
     /// hands over the already-uploaded device buffers with no further
     /// copy.
     ///
-    /// Host memory overhead is fixed: [`PRECAST_WORKERS`] ×
-    /// [`STAGE_SLOT_BYTES`] of pinned staging. Device memory staged
-    /// ahead of take() is the tensors themselves — their final
-    /// destination.
+    /// Host memory overhead is fixed: [`PRESTAGE_WORKERS`] pinned
+    /// slots, each sized by [`resolve_stage_slot_bytes`] from the GPU
+    /// profile's host-link bandwidth. Device memory staged ahead of
+    /// take() is the tensors themselves — their final destination.
     ///
     /// Must be called after `set_target_dtype()`, from a thread with a
     /// current CUDA context (the workers inherit it explicitly). Safe to
@@ -1259,16 +1301,22 @@ impl GpuWeights {
         });
         self.precast = Some(Arc::clone(&state));
 
+        let slot_bytes = resolve_stage_slot_bytes();
+        tracing::info!(
+            "Pre-stage pipeline: {PRESTAGE_WORKERS} workers × {} MiB pinned slots",
+            slot_bytes >> 20,
+        );
+
         let stats = Arc::new(PrecastStats {
             cast: std::sync::atomic::AtomicUsize::new(0),
             staged: std::sync::atomic::AtomicUsize::new(0),
             bytes: std::sync::atomic::AtomicUsize::new(0),
-            live_workers: std::sync::atomic::AtomicUsize::new(PRECAST_WORKERS),
+            live_workers: std::sync::atomic::AtomicUsize::new(PRESTAGE_WORKERS),
             t0: std::time::Instant::now(),
         });
         let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        for i in 0..PRECAST_WORKERS {
+        for i in 0..PRESTAGE_WORKERS {
             let state = Arc::clone(&state);
             let work = Arc::clone(&work);
             let next = Arc::clone(&next);
@@ -1276,7 +1324,7 @@ impl GpuWeights {
             let handle = std::thread::Builder::new()
                 .name(format!("weight-prestage-{i}"))
                 .spawn(move || {
-                    precast_worker(state, target_dtype, work, next, ctx, stats);
+                    precast_worker(state, target_dtype, work, next, ctx, slot_bytes, stats);
                 })
                 .expect("failed to spawn pre-stage worker");
             self.precast_handles.push(handle);

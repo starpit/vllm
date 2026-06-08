@@ -6116,7 +6116,12 @@ fn dump_wavefront_mega(
         // SubOp::RmsNorm into 1 RmsNormReduce + N RmsNormApply chunks.
         // Applied here (CUDA path only) — the Metal mega::serialize
         // pipeline shares lower_region above and keeps RmsNorm whole.
-        let rg = ferrite_wavefront::subtile_ir::decompose_rmsnorm(&rg_whole, nb);
+        let rg_decomposed = ferrite_wavefront::subtile_ir::decompose_rmsnorm(&rg_whole, nb);
+        // Patch 1 step (d): head-tile each RopeRotate / RopeAppend
+        // into head_blocks(total, nb, head_dim) chunks (= 2 heads per
+        // block at nb=128 / head_dim=64 — Llama-3.2-1B). AttnDecode
+        // stays whole; Patch 2 redesigns its KvCachePageShape.
+        let rg = ferrite_wavefront::subtile_ir::head_tile_rope(&rg_decomposed, nb);
         match ferrite_wavefront::subtile_ir::ValidatedGraph::new(&rg) {
             Ok(valid) => {
                 let subtile_tape = ferrite_wavefront::subtile_tape::lower_dag_to_tape(&valid);

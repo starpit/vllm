@@ -1625,6 +1625,211 @@ pub fn decompose_rmsnorm<F: RopeForm, K: KvCacheShape>(
     }
 }
 
+/// Patch 1 step (d) of `SPLIT_OVERSIZED_HANDOFF.md`: head-tile every
+/// `SubOp::RopeRotate` and `SubOp::RopeAppend` node into
+/// `head_blocks(total_cols, nb, head_dim)` head-aligned chunks.
+///
+/// Each emitted chunk reads a head-aligned slice of the rope's
+/// activation input and writes the matching slice of the output
+/// tensor. cos/sin and (for RopeAppend) cache tensors stay whole —
+/// every chunk reads the same cos/sin row vec; cache writes are
+/// indexed by `layout.layer × position` not by head, and per-block
+/// region narrowing is handled at the lower_compute layer (audit
+/// finding #18 — Patch 2 territory).
+///
+/// Chunk size: `heads_per_block = nb / head_dim` (clamped to ≥1 by
+/// [`head_blocks`]). At `nb = 128` and `head_dim = 64` this is
+/// 2 heads per block — exactly the substrate page width — so each
+/// rope chunk consumes one Linear N-block 1:1 (no multi-writer
+/// downstream).
+///
+/// `SubOp::AttnDecode` is NOT head-tiled by this pass — Patch 2 of
+/// the handoff redesigns its KvCachePageShape, which subsumes head
+/// tiling. AttnDecode's `KvCacheProducer::SameForwardRopeAppend`
+/// node-id ref is remapped through `new_id_for_old` (points to the
+/// FIRST emitted RopeAppend chunk; the remaining chunks are
+/// barrier-synced via predecessors() region overlap).
+pub fn head_tile_rope<F: RopeForm, K: KvCacheShape>(
+    graph: &SubtileIR<F, K>,
+    nb: std::num::NonZeroU32,
+) -> SubtileIR<F, K> {
+    // Pass 1: build new_id_for_old — each rope node grows by N
+    // (= head_blocks().len()) chunks; everything else maps 1:1.
+    let mut new_id_for_old: Vec<u32> = Vec::with_capacity(graph.nodes.len());
+    let mut next_new_id: u32 = 0;
+    for node in &graph.nodes {
+        new_id_for_old.push(next_new_id);
+        match node.op {
+            SubOp::RopeRotate { head_dim, .. } | SubOp::RopeAppend { head_dim, .. } => {
+                let total_cols = node.output.region.cols.len;
+                let head_dim_nz = std::num::NonZeroU32::new(head_dim)
+                    .expect("head_tile_rope: head_dim must be non-zero");
+                next_new_id += head_blocks(total_cols, nb, head_dim_nz).len() as u32;
+            }
+            _ => next_new_id += 1,
+        }
+    }
+
+    // Pass 2: emit the rewritten nodes.
+    let tensors = graph.tensors.clone();
+    let mut nodes: Vec<SubtileNode<F, K>> = Vec::with_capacity(next_new_id as usize);
+    for node in &graph.nodes {
+        match node.op {
+            SubOp::RopeRotate { head_dim, _form: _ } => {
+                let q_in = node.inputs[0].clone();
+                let cos_in = node.inputs[1].clone();
+                let sin_in = node.inputs[2].clone();
+                let total_cols = node.output.region.cols.len;
+                let head_dim_nz = std::num::NonZeroU32::new(head_dim)
+                    .expect("head_tile_rope: head_dim must be non-zero");
+                let q_col_start = q_in.region.cols.start;
+                let out_col_start = node.output.region.cols.start;
+                for blk in head_blocks(total_cols, nb, head_dim_nz) {
+                    nodes.push(SubtileNode {
+                        id: SubtileId(nodes.len() as u32),
+                        op: SubOp::RopeRotate {
+                            head_dim,
+                            _form: PhantomData,
+                        },
+                        inputs: vec![
+                            TensorRegion {
+                                tensor: q_in.tensor,
+                                region: Region {
+                                    rows: q_in.region.rows,
+                                    cols: Range::new(q_col_start + blk.start, blk.len),
+                                },
+                            },
+                            cos_in.clone(),
+                            sin_in.clone(),
+                        ],
+                        output: TensorRegion {
+                            tensor: node.output.tensor,
+                            region: Region {
+                                rows: node.output.region.rows,
+                                cols: Range::new(out_col_start + blk.start, blk.len),
+                            },
+                        },
+                    });
+                }
+            }
+            SubOp::RopeAppend {
+                head_dim,
+                layer,
+                layout,
+                _form: _,
+            } => {
+                // Arity 6: [K, cos, sin, V, K_cache, V_cache]. K and V
+                // are head-tiled; cos/sin and the cache handles stay
+                // whole.
+                let k_in = node.inputs[0].clone();
+                let cos_in = node.inputs[1].clone();
+                let sin_in = node.inputs[2].clone();
+                let v_in = node.inputs[3].clone();
+                let kcache_in = node.inputs[4].clone();
+                let vcache_in = node.inputs[5].clone();
+                let total_cols = node.output.region.cols.len;
+                let head_dim_nz = std::num::NonZeroU32::new(head_dim)
+                    .expect("head_tile_rope: head_dim must be non-zero");
+                let k_col_start = k_in.region.cols.start;
+                let v_col_start = v_in.region.cols.start;
+                let out_col_start = node.output.region.cols.start;
+                for blk in head_blocks(total_cols, nb, head_dim_nz) {
+                    nodes.push(SubtileNode {
+                        id: SubtileId(nodes.len() as u32),
+                        op: SubOp::RopeAppend {
+                            head_dim,
+                            layer,
+                            layout,
+                            _form: PhantomData,
+                        },
+                        inputs: vec![
+                            TensorRegion {
+                                tensor: k_in.tensor,
+                                region: Region {
+                                    rows: k_in.region.rows,
+                                    cols: Range::new(k_col_start + blk.start, blk.len),
+                                },
+                            },
+                            cos_in.clone(),
+                            sin_in.clone(),
+                            TensorRegion {
+                                tensor: v_in.tensor,
+                                region: Region {
+                                    rows: v_in.region.rows,
+                                    cols: Range::new(v_col_start + blk.start, blk.len),
+                                },
+                            },
+                            kcache_in.clone(),
+                            vcache_in.clone(),
+                        ],
+                        output: TensorRegion {
+                            tensor: node.output.tensor,
+                            region: Region {
+                                rows: node.output.region.rows,
+                                cols: Range::new(out_col_start + blk.start, blk.len),
+                            },
+                        },
+                    });
+                }
+            }
+            SubOp::AttnDecode {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                layout,
+                producer,
+                softmax_state,
+            } => {
+                // AttnDecode stays whole — Patch 2 of
+                // SPLIT_OVERSIZED_HANDOFF.md redesigns its
+                // KvCachePageShape and includes head tiling there.
+                // Remap KvCacheProducer's stored producer node id
+                // through new_id_for_old (points to the first
+                // emitted RopeAppend chunk).
+                let new_producer = match producer {
+                    KvCacheProducer::SameForwardRopeAppend {
+                        producer_node_idx,
+                        ..
+                    } => KvCacheProducer::from_rope_append(
+                        new_id_for_old[producer_node_idx as usize],
+                    ),
+                    KvCacheProducer::PrePopulatedExt { .. } => producer,
+                };
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: SubOp::AttnDecode {
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        scale,
+                        layout,
+                        producer: new_producer,
+                        softmax_state,
+                    },
+                    inputs: node.inputs.clone(),
+                    output: node.output,
+                });
+            }
+            _ => {
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: node.op,
+                    inputs: node.inputs.clone(),
+                    output: node.output,
+                });
+            }
+        }
+    }
+
+    SubtileIR {
+        tensors,
+        num_sources: graph.num_sources,
+        nodes,
+        result: graph.result,
+    }
+}
+
 // ── Tests (canonical region IR) ────────────────────────────────────
 
 #[cfg(test)]
@@ -2123,6 +2328,162 @@ mod tests {
                 tile,
                 tile,
             );
+        }
+    }
+
+    /// Head-tiling rewrites a whole RopeRotate into head-aligned
+    /// chunks. With nb=4 and head_dim=2, heads_per_block=2 — so 4 q
+    /// heads (8 cols) become 2 chunks of 2 heads each.
+    ///
+    /// Each chunk reads a head-aligned slice of the rope's
+    /// activation input; cos/sin stay whole; output is the matching
+    /// slice of the rope output tensor. KvCacheProducer remap is
+    /// exercised by the AttnDecode test below; here the upstream is
+    /// a Gemm and downstream is a leaf result.
+    ///
+    /// Step (d) of `SPLIT_OVERSIZED_HANDOFF.md`.
+    #[test]
+    fn head_tile_rope_splits_rope_rotate_into_head_blocks() {
+        let (m, hd, hq, h) = (1u32, 2u32, 4u32, 4u32);
+        let qdim = hq * hd; // 8
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape { rows: m, cols: h },   // 0: x  [m, h]
+                SourceShape { rows: h, cols: qdim }, // 1: Wq [h, qdim]
+                SourceShape { rows: 1, cols: hd },  // 2: cos
+                SourceShape { rows: 1, cols: hd },  // 3: sin
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Gemm { n: qdim },
+                    m,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: LoweredOp::RopeRotate { head_dim: hd },
+                    m,
+                    inputs: vec![InputRef::Op(0), InputRef::Ext(2), InputRef::Ext(3)],
+                },
+            ],
+            result: 1,
+        };
+        // nb = 4, head_dim = 2 → heads_per_block = 2; qdim/hd_per_blk
+        // = 4/2 = 2 rope chunks.
+        let nb = std::num::NonZeroU32::new(4).unwrap();
+        let g_whole = lower_region::<TestShape2x4>(&input, nb);
+        // Pre: 2 Gemm blocks (qdim=8, nb=4) + 1 whole RopeRotate.
+        assert_eq!(g_whole.nodes.len(), 3, "pre: 2 gemm + 1 rope");
+        assert!(matches!(g_whole.nodes[2].op, SubOp::RopeRotate { .. }));
+
+        let g = head_tile_rope(&g_whole, nb);
+        // Post: 2 Gemm blocks + 2 RopeRotate chunks.
+        assert_eq!(g.nodes.len(), 4, "post: 2 gemm + 2 rope chunks");
+        assert!(matches!(g.nodes[2].op, SubOp::RopeRotate { .. }));
+        assert!(matches!(g.nodes[3].op, SubOp::RopeRotate { .. }));
+        // Chunk 0 reads cols [0..4]; chunk 1 reads cols [4..8].
+        assert_eq!(g.nodes[2].inputs[0].region.cols.start, 0);
+        assert_eq!(g.nodes[2].inputs[0].region.cols.len, 4);
+        assert_eq!(g.nodes[3].inputs[0].region.cols.start, 4);
+        assert_eq!(g.nodes[3].inputs[0].region.cols.len, 4);
+        // Output regions match.
+        assert_eq!(g.nodes[2].output.region.cols.start, 0);
+        assert_eq!(g.nodes[2].output.region.cols.len, 4);
+        assert_eq!(g.nodes[3].output.region.cols.start, 4);
+        assert_eq!(g.nodes[3].output.region.cols.len, 4);
+
+        // Predecessor alignment: each rope chunk reads from exactly
+        // one Gemm block (the one that wrote its head-aligned cols).
+        let preds = predecessors(&g);
+        assert_eq!(preds[2], vec![SubtileId(0)], "rope chunk 0 ← gemm block 0");
+        assert_eq!(preds[3], vec![SubtileId(1)], "rope chunk 1 ← gemm block 1");
+    }
+
+    /// AttnDecode stays whole through `head_tile_rope`, but its
+    /// `KvCacheProducer::SameForwardRopeAppend::producer_node_idx` is
+    /// remapped through `new_id_for_old` so it points to the FIRST
+    /// emitted RopeAppend chunk (other chunks are barrier-synced via
+    /// region overlap in `predecessors()`).
+    ///
+    /// Step (d) of `SPLIT_OVERSIZED_HANDOFF.md`.
+    #[test]
+    fn head_tile_rope_remaps_attn_decode_kv_cache_producer() {
+        // Smallest fixture that exercises a RopeAppend → AttnDecode
+        // chain. Uses TestShape1x4 (1 KV head, head_dim 4).
+        let (m, hq, hkv, hd, l) = (1u32, 1u32, 1u32, 4u32, 3u32);
+        let (qdim, kvdim) = (hq * hd, hkv * hd); // both = 4
+        let scale = 0.5f32;
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape { rows: m, cols: hd },   // 0: q   [m, qdim]
+                SourceShape { rows: m, cols: kvdim }, // 1: k_in [m, kvdim]
+                SourceShape { rows: 1, cols: hd },   // 2: cos
+                SourceShape { rows: 1, cols: hd },   // 3: sin
+                SourceShape { rows: m, cols: kvdim }, // 4: v_in
+                SourceShape { rows: l, cols: kvdim }, // 5: prefixK
+                SourceShape { rows: l, cols: kvdim }, // 6: prefixV
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::RopeAppend {
+                        head_dim: hd,
+                        layer: 0,
+                    },
+                    m,
+                    inputs: vec![
+                        InputRef::Ext(1),
+                        InputRef::Ext(2),
+                        InputRef::Ext(3),
+                        InputRef::Ext(4),
+                        InputRef::Ext(5),
+                        InputRef::Ext(6),
+                    ],
+                },
+                OpDesc {
+                    op: LoweredOp::AttnDecode {
+                        num_q_heads: hq,
+                        num_kv_heads: hkv,
+                        head_dim: hd,
+                        scale,
+                    },
+                    m,
+                    inputs: vec![
+                        InputRef::Ext(0),
+                        InputRef::Ext(5),
+                        InputRef::Ext(6),
+                        InputRef::Op(0), // rope_append's K output
+                        InputRef::Ext(0),
+                    ],
+                },
+            ],
+            result: 1,
+        };
+        // nb = head_dim (1 head per block) → 1 RopeAppend chunk
+        // (since num_kv_heads=1). The remap is degenerate but
+        // exercises the code path.
+        let nb = std::num::NonZeroU32::new(hd).unwrap();
+        let g_whole = lower_region::<TestShape1x4>(&input, nb);
+        let g = head_tile_rope(&g_whole, nb);
+        // Find the AttnDecode node and verify producer points to the
+        // RopeAppend's new id (which equals new_id_for_old[0] = 0).
+        let attn = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.op, SubOp::AttnDecode { .. }))
+            .expect("AttnDecode node");
+        match attn.op {
+            SubOp::AttnDecode { producer, .. } => match producer {
+                KvCacheProducer::SameForwardRopeAppend {
+                    producer_node_idx,
+                    ..
+                } => assert_eq!(
+                    producer_node_idx, 0,
+                    "AttnDecode producer must point to remapped RopeAppend id 0"
+                ),
+                KvCacheProducer::PrePopulatedExt { .. } => {
+                    panic!("expected SameForwardRopeAppend producer")
+                }
+            },
+            _ => unreachable!(),
         }
     }
 

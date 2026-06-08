@@ -10483,7 +10483,18 @@ impl Implementation for CutlassGemmAddImpl {
             FufInput::Tile { id, slot } if *id != gemm_id => Some((*id, *slot)),
             _ => None,
         });
-        vec![((add_id, 0), residual_src)]
+        // Output = the Add's logical output, which is the mutated residual
+        // buffer. Alias to the residual-side input so downstream consumers read
+        // the same buffer without a copy. The fused Gemm output (`gemm_id`) is
+        // aliased to the residual too: the `cutlass_gemm_add` kernel has NO
+        // out_slot — it folds `W*x` into the residual in place and never
+        // materializes the Gemm to its own buffer. Without this alias the
+        // colorer gives `gemm_id` its own arena color the kernel never writes (a
+        // phantom); that color is freed at gemm_id's last reference and re-minted
+        // for a same-shape `Owned`, so two OwnedTensors free one allocation →
+        // CachingAllocator free-list corruption (teardown abort, seen on 14B at
+        // a high prefill-token budget where this fusion is the down/o-proj pick).
+        vec![((add_id, 0), residual_src), ((gemm_id, 0), residual_src)]
     }
 
     // ── Host-interpreter codegen ────────────────────────────────
@@ -10743,7 +10754,15 @@ impl Implementation for FusedCublasGemmAddImpl {
             FufInput::Tile { id, slot } if *id != gemm_id => Some((*id, *slot)),
             _ => None,
         });
-        vec![((add_id, 0), residual_src)]
+        // Output = the Add's logical output, which is the mutated residual
+        // buffer. Alias to the residual-side input so downstream consumers read
+        // the same buffer without a copy. The fused Gemm output (`gemm_id`) is
+        // aliased to the residual too: this opcode has NO out_slot — it folds
+        // `W*x` into the residual in place and never materializes the Gemm to
+        // its own slot. Without the alias the colorer gives `gemm_id` its own
+        // phantom color the kernel never writes, which is freed and re-minted
+        // into a same-shape `Owned` → double-free (CachingAllocator corruption).
+        vec![((add_id, 0), residual_src), ((gemm_id, 0), residual_src)]
     }
 
     fn opcode_shape(&self) -> OpcodeShape {

@@ -424,6 +424,9 @@ pub struct FusedGateUpSiluMulDecodeConstants {
     pub bucket_m: BucketM,
     pub intermediate_size: IntermediateSize,
     pub q_size: QSize,
+    /// GELU (Gemma GeGLU) vs SiLU (SwiGLU) activation. Slot 9; default
+    /// false keeps existing SwiGLU dispatches bit-identical.
+    pub is_gelu: bool,
 }
 
 impl From<FusedGateUpSiluMulDecodeConstants> for Vec<ConstantValue> {
@@ -432,6 +435,7 @@ impl From<FusedGateUpSiluMulDecodeConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(3), c.bucket_m.get()),
             ConstantValue::uint(ConstSlot(4), c.intermediate_size.get()),
             ConstantValue::uint(ConstSlot(5), c.q_size.get()),
+            ConstantValue::boolean(ConstSlot(9), c.is_gelu),
         ]
     }
 }
@@ -442,6 +446,8 @@ pub struct FusedGateUpSiluMulPrefillConstants {
     pub bucket_m: BucketM,
     pub intermediate_size: IntermediateSize,
     pub q_size: QSize,
+    /// GELU vs SiLU activation. Slot 10; default false.
+    pub is_gelu: bool,
 }
 
 impl From<FusedGateUpSiluMulPrefillConstants> for Vec<ConstantValue> {
@@ -450,6 +456,7 @@ impl From<FusedGateUpSiluMulPrefillConstants> for Vec<ConstantValue> {
             ConstantValue::uint(ConstSlot(6), c.bucket_m.get()),
             ConstantValue::uint(ConstSlot(7), c.intermediate_size.get()),
             ConstantValue::uint(ConstSlot(8), c.q_size.get()),
+            ConstantValue::boolean(ConstSlot(10), c.is_gelu),
         ]
     }
 }

@@ -439,12 +439,19 @@ impl<W: VisionArchWeights> MultimodalForward for VisionWrapper<W> {
         #[cfg(feature = "metal")]
         let projected = {
             let mut projected = projected;
-            let merge2 = (cfg.spatial_merge_size as usize).pow(2);
-            let n_merged = if merge2 == 0 {
-                total_l
-            } else {
-                total_l / merge2
-            };
+            // Output row count = total patches / the FULL token-reduction
+            // factor. Two independent reductions can apply: the patch
+            // merger (`spatial_merge_size²`, Qwen*-VL / MoonViT) and the
+            // projector AvgPool2d (`pool_kernel²`, gemma3-mm SigLIP).
+            // Gemma3-MM has spatial_merge_size = 1 but pools k = 4, so a
+            // merge-only `total_l / S²` over-counts 16× and the `mm_embeds`
+            // splice reads 16× past the pooled buffer (SIGSEGV in
+            // write_bytes). Folding BOTH factors is correct for every tower
+            // (the absent reduction is 1). (Summing placeholder lengths is
+            // NOT equivalent — it broke Qwen2.5-VL.)
+            let merge2 = (cfg.spatial_merge_size as usize).pow(2).max(1);
+            let pool2 = (cfg.pool_kernel as usize).pow(2).max(1);
+            let n_merged = total_l / (merge2 * pool2);
             unsafe {
                 projected.reshape(&[n_merged, cfg.d_model as usize], DType::BF16);
             }

@@ -28,7 +28,7 @@
 //! 0..vision_num_positions, ...]` u32 per image and uploads as
 //! `ForwardCtx::vision_position_ids`.
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use ferrite_forward_macro::vision_forward;
 
 /// Gemma3-MM CPU preprocessing: SigLIP encoder + 4×4 avg-pool projector.
@@ -62,7 +62,7 @@ pub const PROCESSOR: ferrite_vision::MmMetadata = ferrite_vision::MmMetadata {
     numbered_image_tag_marker: None,
 };
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[vision_forward(workloads = [256, 1024, 4096, 16384], processor = crate::PROCESSOR)]
 mod gemma3_mm {
     /// Gemma3-MM SigLIP vision tower params schema — field name = the
@@ -120,6 +120,13 @@ mod gemma3_mm {
     /// SigLIP block norms read `vision_config.layer_norm_eps`, which is
     /// 1e-6 for every gemma3 checkpoint — the parse default (1e-6)
     /// already matches, so no NORM_EPS const is declared.
+    /// The MM projector's `mm_soft_emb_norm` (rmsnorm(x, w+1.0) →
+    /// ScalarOffsetRmsNorm) ships a BF16 gain in the mlx repacks; the
+    /// `_s_<dtype>_` symbol must read it as bf16 (f16 default mis-decodes
+    /// → garbled projection). The SigLIP block LayerNorms use the
+    /// separate layer_norm_bias kernel (gain read as activation dtype),
+    /// so this only governs the projector's RmsNorm.
+    const SCALE_DTYPE: ScaleDtype = ScaleDtype::Bf16;
     const SAFETENSORS: Layout = Layout {
         root: "vision_tower.vision_model",
         blocks: "encoder.layers",
@@ -131,11 +138,18 @@ mod gemma3_mm {
         key: "multi_modal_projector.mm_input_projection_weight",
         dim: 1,
     };
-    /// 4D `[E, C, P, P]` torch conv weight, channels-first.
+    /// SigLIP patch_embedding conv. mlx_vlm-converted checkpoints store
+    /// it CHANNELS-LAST `[E, kh, kw, C]` (verified shape `[1152,14,14,3]`),
+    /// while the pixel packing is channels-FIRST `(C, kh, kw)` (verified:
+    /// ferrite pixels == mlx pixels at cos 1.0 in (c,kh,kw) order). The
+    /// weight must be permuted to channels-first to match — `channels_last:
+    /// true` does the `[E,kh,kw,C] -> [E,C,kh,kw]` permute. (HF-native
+    /// Conv2d weights are already `[E,C,kh,kw]` → would need `false`; metal
+    /// serves the mlx repacks.)
     const PATCH_EMBED_FLATTEN: Flatten = Flatten {
         key: "vision_tower.vision_model.embeddings.patch_embedding.weight",
         leading_dim: 0,
-        channels_last: false,
+        channels_last: true,
     };
 
     fn forward() {

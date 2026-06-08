@@ -104,6 +104,10 @@ pub struct ForwardInputs<'a> {
     /// Qwen2.5-VL: inverse permutation (u32 bytes) read by
     /// `Instruction::EmbeddingGather(kind = 1)`.
     pub vision_reverse_indices: Option<&'a [u8]>,
+    /// SigLIP learned positional-embedding indices (u32 bytes) read by
+    /// `Instruction::PosEmbed` — `[0..vision_num_positions]` per image.
+    /// `None` for towers without a `pos_embed(...)` gather.
+    pub vision_position_ids: Option<&'a [u8]>,
     /// Vision patch pixel rows (`[num_tokens, vision_in_features]`,
     /// model dtype) as raw bytes. `None` for non-vision arches;
     /// required for any bucket that runs `Instruction::LoadPixels`.

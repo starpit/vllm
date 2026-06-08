@@ -2293,6 +2293,9 @@ pub fn starter_library() -> ImplementationLibrary {
         // `embedding_gather.metal` row-gather against the
         // `vision_window_index` / `vision_reverse_indices` externs.
         lib.push(Box::new(EmbeddingGatherImpl));
+        // 2-D average pool (Gemma3-MM SigLIP→text projector) — the metal
+        // `AvgPool2d` lowering dispatches `avg_pool_2d.metal`.
+        lib.push(Box::new(AvgPool2dImpl));
         // Multimodal embed splice (metal) — claims the post-Embed
         // `OpKind::MmEmbedSplice` that `insert_mm_splices` injects.
         // Target-agnostic matcher; the metal `SpliceMmEmbeds` lowering
@@ -6969,7 +6972,7 @@ impl Implementation for ScalarOffsetRmsNormImpl {
         m: &MatchInfo,
         fuf: &Fuf,
         program: &Program,
-        _bounds: &BTreeMap<String, u64>,
+        bounds: &BTreeMap<String, u64>,
         slots: &SlotMap,
     ) -> Option<Vec<ferrite_forward::Instruction>> {
         let add_id = *m
@@ -7004,13 +7007,45 @@ impl Implementation for ScalarOffsetRmsNormImpl {
         let acc = accessors
             .first()
             .expect("ScalarOffsetRmsNorm: required_weights returned empty");
-        let (_base, layer) = split_base_layer(&acc.name.to_string());
+        let acc_name = acc.name.to_string();
+        let (_base, layer) = split_base_layer(&acc_name);
         let layer = layer.unwrap_or(0) as u32;
+        // `hidden_size` / `m_multiplier` for the metal kernel's baked
+        // reduction width + row count — same name-based detection as
+        // `RmsNormRefImpl::fan_out`. Per-head q/k norms reduce `head_dim`
+        // over `num_q/kv_heads` rows-per-token; every other norm reduces
+        // the residual width once. (Vision-prelude towers use
+        // `vision_embed_dim`; gemma3-mm's text decoder is `Decoder`.)
+        let is_q_norm = acc_name.contains("q_norm");
+        let is_k_norm = acc_name.contains("k_norm");
+        let head_dim = bounds.get("head_dim").copied().unwrap_or(0) as u32;
+        let num_q_heads = bounds.get("num_attention_heads").copied().unwrap_or(0) as u32;
+        let num_kv_heads = bounds
+            .get("num_key_value_heads")
+            .copied()
+            .unwrap_or(num_q_heads as u64) as u32;
+        let residual_hidden = if matches!(program.prelude, crate::classified::Prelude::Vision) {
+            *bounds.get("vision_embed_dim").unwrap_or(&0) as u32
+        } else {
+            *bounds.get("hidden_size").unwrap_or(&0) as u32
+        };
+        let (hidden_size, m_multiplier) = if (is_q_norm || is_k_norm) && head_dim > 0 {
+            let m = if is_q_norm {
+                num_q_heads.max(1)
+            } else {
+                num_kv_heads.max(1)
+            };
+            (head_dim, m)
+        } else {
+            (residual_hidden, 1)
+        };
         Some(vec![Instruction::ScalarOffsetRmsNorm(
             in_slot_idx,
             out_slot_idx,
             layer,
             offset,
+            hidden_size,
+            m_multiplier,
         )])
     }
 }

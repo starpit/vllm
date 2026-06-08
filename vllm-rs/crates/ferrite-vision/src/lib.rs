@@ -86,6 +86,12 @@ pub struct VisionConfig {
     pub patch_size: u32,
     pub temporal_patch_size: u32,
     pub spatial_merge_size: u32,
+    /// k for a `k×k` non-overlapping AvgPool2d the projector applies to
+    /// reduce the patch grid (gemma3-mm SigLIP: k=4, 4096→256 tokens).
+    /// `0` (or `1`) means no pooling — the merge-only token reduction
+    /// (`spatial_merge_size²`) governs the output count. Token output
+    /// rows = `total_patches / (spatial_merge_size² · pool_kernel²)`.
+    pub pool_kernel: u32,
     pub in_chans: u32,
     /// Text-decoder hidden the patch-merger projects into. Equals
     /// `text_config.hidden_size`.

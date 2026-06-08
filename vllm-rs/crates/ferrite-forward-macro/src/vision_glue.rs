@@ -160,6 +160,10 @@ pub fn emit_per_variant(
     let patch_size_lit = proc_macro2::Literal::u32_unsuffixed(patch_size);
     let temporal_patch_size_lit = proc_macro2::Literal::u32_unsuffixed(temporal_patch_size);
     let spatial_merge_size_lit = proc_macro2::Literal::u32_unsuffixed(spatial_merge_size);
+    // Optional projector AvgPool2d kernel (gemma3-mm SigLIP: 4). Absent
+    // on merge-only towers (Qwen*-VL / MoonViT) → 0 = no pooling.
+    let pool_kernel = *model.bounds.get("vision_pool_kernel").unwrap_or(&0) as u32;
+    let pool_kernel_lit = proc_macro2::Literal::u32_unsuffixed(pool_kernel);
     let in_chans_lit = proc_macro2::Literal::u32_unsuffixed(in_chans);
     let d_model_lit = proc_macro2::Literal::u32_unsuffixed(d_model);
     let d_model_usize_lit = proc_macro2::Literal::usize_unsuffixed(d_model as usize);
@@ -272,6 +276,7 @@ pub fn emit_per_variant(
                     patch_size: #patch_size_lit,
                     temporal_patch_size: #temporal_patch_size_lit,
                     spatial_merge_size: #spatial_merge_size_lit,
+                    pool_kernel: #pool_kernel_lit,
                     in_chans: #in_chans_lit,
                     d_model: #d_model_lit,
                     norm_eps: #eps_lit,

@@ -919,6 +919,44 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         {
             return self.maybe_run_dump_pass(worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens);
         }
+        // gemma3-mm SigLIP vision tower: the projector tail
+        // (`AvgPool2d -> soft_emb_norm -> mm_input_projection`) hits an
+        // in-command-buffer write→read coherence failure at the
+        // 4096-patch scale — the projector gemm reads the soft-emb-norm
+        // output as all-zero (→ silent all-zero vision embeds → garbled
+        // text) unless a CB boundary (commit + host-wait) separates the
+        // writer from the reader. No in-CB barrier fixes it (None,
+        // Device, or forced-on-every-dispatch all fail); only the CB
+        // boundary does. So run the WHOLE vision bucket as serialized
+        // single-dispatch segments (each its own CB + host-wait), the
+        // proven-correct execution from the dump replay. This is a
+        // once-per-image prefill path (vision towers have no argmax
+        // tail), so the per-segment host-wait overhead (~0.5 ms ×
+        // dispatches) is immaterial against the multi-second tower.
+        // `FERRITE_METAL_CHUNK_FORWARD=K` overrides the segment size for
+        // tuning; the AvgPool2d-tape auto-trigger defaults to K=1.
+        let chunk_override = std::env::var("FERRITE_METAL_CHUNK_FORWARD")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        let needs_serialized = worker.bucket_has_avg_pool_2d(bucket_idx);
+        if chunk_override.is_some() || needs_serialized {
+            assert!(
+                tail.is_none(),
+                "serialized chunked forward does not support a tail hook \
+                 (vision towers have no argmax tail)",
+            );
+            let k = chunk_override.unwrap_or(1).max(1);
+            let total = worker.count_dispatches(bucket_idx);
+            let mut start = 0usize;
+            while start < total {
+                let end = (start + k).min(total);
+                self.run_dump_segment(
+                    worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens, start..end,
+                )?;
+                start = end;
+            }
+            return Ok(());
+        }
         let trace = std::env::var_os("FERRITE_METAL_TRACE").is_some();
         let timing_enabled = std::env::var_os("FERRITE_METAL_DISPATCH_TIMING").is_some();
         let timing_state = if timing_enabled {
@@ -1873,6 +1911,9 @@ fn write_runtime_inputs(
     if let Some(b) = inputs.vision_reverse_indices {
         write_bytes("vision_reverse_indices", &runtime.vision_reverse_indices, b)?;
     }
+    if let Some(b) = inputs.vision_position_ids {
+        write_bytes("vision_position_ids", &runtime.vision_position_ids, b)?;
+    }
     // Multimodal splice (MM-bearing batches only). mm_embeds = the
     // projected vision output (bytes); mm_dst_rows = per-row dst (u32).
     if let Some(b) = inputs.mm_embeds {
@@ -2092,6 +2133,7 @@ mod tests {
             vision_cu_seqlens_window: alloc(device, 16),
             vision_window_index: alloc(device, 16),
             vision_reverse_indices: alloc(device, 16),
+            vision_position_ids: alloc(device, 16),
         }
     }
 
@@ -2400,6 +2442,7 @@ mod tests {
             vision_cu_seqlens_window: alloc(d, 16),
             vision_window_index: alloc(d, 16),
             vision_reverse_indices: alloc(d, 16),
+            vision_position_ids: alloc(d, 16),
         });
         let pool = MetalWorkerPool::<TestWeights>::new(
             device,

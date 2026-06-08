@@ -697,7 +697,14 @@ pub enum Instruction {
     /// `m_multiplier = 1` and `hidden_size = W::HIDDEN_SIZE`.
     FusedAddRmsNorm(u32, u32, u32, u32, u32),
     FusedAddRmsNormWithOffset(u32, u32, u32, f32),
-    ScalarOffsetRmsNorm(u32, u32, u32, f32),
+    /// `ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset, hidden_size, m_multiplier)`.
+    /// `rmsnorm(x, weight + offset)` — the Gemma `weight + 1.0`
+    /// zero-centered form. `hidden_size` / `m_multiplier` mirror
+    /// [`RmsNorm`](Instruction::RmsNorm): residual-stream norms are
+    /// `(HIDDEN_SIZE, 1)`; per-head q/k norms are `(head_dim,
+    /// num_q/kv_heads)`. The cuda eval reads the tile shape and ignores
+    /// both; the metal lowering bakes them into the kernel fn-consts.
+    ScalarOffsetRmsNorm(u32, u32, u32, f32, u32, u32),
     /// Norm→Gemm fusion: `cutlass_gemm(rms_norm(in), gemm_w)`. The
     /// CUTLASS tile is bucket-pickable per `CUTLASS_TILE_ZOO` entry.
     /// Reuses existing `kernels::rms_norm` + `cutlass::cutlass_gemm`
@@ -1612,7 +1619,16 @@ impl Instruction {
                     ctx.device.compute_stream,
                 );
             },
-            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => unsafe {
+            Instruction::ScalarOffsetRmsNorm(
+                in_slot,
+                out_slot,
+                layer,
+                offset,
+                _hidden_size,
+                _m_multiplier,
+            ) => unsafe {
+                // `hidden_size` / `m_multiplier` are metal-only (baked
+                // fn-consts); the cuda kernel reads the tile shape.
                 let layer = ctx.layer_offset + layer;
                 let v = tile_ref(ctx.tiles, in_slot).as_view(ctx.tiles);
                 let w = ctx.wm.rms_norm_at(bucket, op_idx, 0, layer);

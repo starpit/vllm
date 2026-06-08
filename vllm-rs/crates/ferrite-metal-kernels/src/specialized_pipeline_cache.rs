@@ -355,6 +355,10 @@ impl SpecializedPipelineCache {
                     "embedding_gather",
                     crate::embedded_metallib!("embedding_gather"),
                 ),
+                (
+                    "avg_pool_2d",
+                    crate::embedded_metallib!("avg_pool_2d"),
+                ),
             ],
         )?;
         // NAX qmm_t (`affine_qmm_t_nax_*`) MUST be compiled from source at

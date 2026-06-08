@@ -7955,6 +7955,9 @@ pub fn emit_model(
                             vision_reverse_indices: alloc(
                                 (METAL_MAX_BUCKET_M as u64 + 8) * 4,
                             ),
+                            vision_position_ids: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -8124,6 +8127,12 @@ pub fn emit_model(
                     tv.as_raw().size_bytes(),
                 )
             });
+            let vision_position_ids = ctx.vision_position_ids.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Multimodal splice: vision embeddings (bytes) + a per-source-
             // row destination map built from `embed_patches`. Text-only
             // batches leave `embed_patches` empty → both `None` (no-op).
@@ -8177,6 +8186,7 @@ pub fn emit_model(
                 vision_cu_seqlens_window,
                 vision_window_index,
                 vision_reverse_indices,
+                vision_position_ids,
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,
@@ -8389,6 +8399,9 @@ pub fn emit_model(
                             vision_reverse_indices: alloc(
                                 (METAL_MAX_BUCKET_M as u64 + 8) * 4,
                             ),
+                            vision_position_ids: alloc(
+                                (METAL_MAX_BUCKET_M as u64 + 8) * 4,
+                            ),
                         }
                     });
                 ::ferrite_forward::interpreter::metal::MetalWorkerPool::for_buckets(
@@ -8552,6 +8565,12 @@ pub fn emit_model(
                     tv.as_raw().size_bytes(),
                 )
             });
+            let vision_position_ids = ctx.vision_position_ids.map(|tv| {
+                ::std::slice::from_raw_parts(
+                    tv.as_raw().raw_ptr() as *const u8,
+                    tv.as_raw().size_bytes(),
+                )
+            });
             // Multimodal splice: vision embeddings (bytes) + a per-source-
             // row destination map built from `embed_patches`. Text-only
             // batches leave `embed_patches` empty → both `None` (no-op).
@@ -8605,6 +8624,7 @@ pub fn emit_model(
                 vision_cu_seqlens_window,
                 vision_window_index,
                 vision_reverse_indices,
+                vision_position_ids,
                 mm_embeds,
                 mm_dst_rows,
                 mrope_cos_sin,

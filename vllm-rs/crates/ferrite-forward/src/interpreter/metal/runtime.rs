@@ -114,6 +114,8 @@ pub struct RuntimeBindings {
     pub vision_window_index: Buffer,
     /// u32 inverse permutation (`EmbeddingGather` kind 1).
     pub vision_reverse_indices: Buffer,
+    /// u32 SigLIP positional-embedding indices (`PosEmbed` gather).
+    pub vision_position_ids: Buffer,
 }
 
 impl RuntimeBindings {
@@ -150,6 +152,7 @@ impl RuntimeBindings {
             RuntimeBindingKind::VisionCuSeqlensWindow => &self.vision_cu_seqlens_window,
             RuntimeBindingKind::VisionWindowIndex => &self.vision_window_index,
             RuntimeBindingKind::VisionReverseIndices => &self.vision_reverse_indices,
+            RuntimeBindingKind::VisionPositionIds => &self.vision_position_ids,
         }
     }
 }

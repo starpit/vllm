@@ -474,6 +474,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             r.insert(&runtime.vision_cu_seqlens_window);
             r.insert(&runtime.vision_window_index);
             r.insert(&runtime.vision_reverse_indices);
+            r.insert(&runtime.vision_position_ids);
             r.commit();
         }
 
@@ -523,6 +524,30 @@ impl<W: CanonicalParams> MetalWorker<W> {
             .and_then(|b| b.mtl4_steps.as_ref())
             .map(|steps| steps.iter().map(|s| s.dispatches.len()).sum())
             .unwrap_or(0)
+    }
+
+    /// True if this bucket's tape contains an `AvgPool2d` dispatch — the
+    /// gemma3-mm SigLIP projector's spatial pool. That op (and the
+    /// `soft_emb_norm -> mm_input_projection` tail after it) hits an
+    /// in-command-buffer write→read coherence failure at the 4096-patch
+    /// scale: the projector gemm reads the soft-emb-norm output as
+    /// all-zero (silent all-zero vision embeds → garbled text) UNLESS a
+    /// command-buffer boundary (commit + host-wait) separates the
+    /// writer from the reader. In-CB `Dispatch→Dispatch` barriers — even
+    /// `visibility=Device`, even forced on every dispatch — do NOT fix
+    /// it; only the CB boundary does. The pool serializes such buckets
+    /// via [`run_dump_segment`]-style chunked commits. Cheap to scan
+    /// (handful of steps) and the result gates a once-per-image path.
+    pub fn bucket_has_avg_pool_2d(&self, bucket: usize) -> bool {
+        self.bucket_bakings
+            .get(bucket)
+            .and_then(|b| b.mtl4_steps.as_ref())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .any(|s| matches!(s.kernel, super::lowered::KernelId::AvgPool2d))
+            })
+            .unwrap_or(false)
     }
 
     /// Phase A.3 MTL4 execution path. Encodes the
@@ -1965,6 +1990,7 @@ mod tests {
             vision_cu_seqlens_window: alloc_buffer(device, 16),
             vision_window_index: alloc_buffer(device, 16),
             vision_reverse_indices: alloc_buffer(device, 16),
+            vision_position_ids: alloc_buffer(device, 16),
         }
     }
 

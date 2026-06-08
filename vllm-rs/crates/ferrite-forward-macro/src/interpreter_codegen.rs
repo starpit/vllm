@@ -197,12 +197,14 @@ pub fn instruction_to_tokens(inst: &Instruction) -> TokenStream {
             let d = lit_f32(d);
             quote! { FusedAddRmsNormWithOffset(#a, #b, #c, #d) }
         }
-        I::ScalarOffsetRmsNorm(a, b, c, d) => {
+        I::ScalarOffsetRmsNorm(a, b, c, d, e, f) => {
             let a = lit_u32(a);
             let b = lit_u32(b);
             let c = lit_u32(c);
             let d = lit_f32(d);
-            quote! { ScalarOffsetRmsNorm(#a, #b, #c, #d) }
+            let e = lit_u32(e);
+            let f = lit_u32(f);
+            quote! { ScalarOffsetRmsNorm(#a, #b, #c, #d, #e, #f) }
         }
         I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, h) => {
             let a = lit_u32(a);
@@ -1113,7 +1115,7 @@ pub fn instruction_field_at(inst: &Instruction, idx: usize) -> Option<u64> {
             2 => u(c),
             _ => None,
         },
-        I::ScalarOffsetRmsNorm(a, b, c, _) => match idx {
+        I::ScalarOffsetRmsNorm(a, b, c, _, _, _) => match idx {
             0 => u(a),
             1 => u(b),
             2 => u(c),
@@ -1862,10 +1864,10 @@ pub fn instruction_with_field_set(inst: Instruction, idx: usize, new_val: u32) -
             2 => I::FusedAddRmsNormWithOffset(a, b, n, d),
             _ => panic!("FusedAddRmsNormWithOffset: bad idx {idx}"),
         },
-        I::ScalarOffsetRmsNorm(a, b, c, d) => match idx {
-            0 => I::ScalarOffsetRmsNorm(n, b, c, d),
-            1 => I::ScalarOffsetRmsNorm(a, n, c, d),
-            2 => I::ScalarOffsetRmsNorm(a, b, n, d),
+        I::ScalarOffsetRmsNorm(a, b, c, d, e, f) => match idx {
+            0 => I::ScalarOffsetRmsNorm(n, b, c, d, e, f),
+            1 => I::ScalarOffsetRmsNorm(a, n, c, d, e, f),
+            2 => I::ScalarOffsetRmsNorm(a, b, n, d, e, f),
             _ => panic!("ScalarOffsetRmsNorm: bad idx {idx}"),
         },
         I::CutlassFusedRmsNormGemm(a, b, c, d, e, f, g, h) => match idx {

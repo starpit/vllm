@@ -247,13 +247,22 @@ impl Instruction {
                     F::LayerKind("RmsNorm"),
                 ],
             ),
-            Instruction::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset) => (
+            Instruction::ScalarOffsetRmsNorm(
+                in_slot,
+                out_slot,
+                layer,
+                offset,
+                hidden_size,
+                m_multiplier,
+            ) => (
                 "ScalarOffsetRmsNorm",
                 vec![
                     F::Slot(in_slot),
                     F::Slot(out_slot),
                     F::Layer(layer),
                     F::ConstF32Bits(offset.to_bits()),
+                    F::ConstU32(hidden_size),
+                    F::ConstU32(m_multiplier),
                     F::LayerKind("RmsNorm"),
                 ],
             ),

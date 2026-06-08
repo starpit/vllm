@@ -253,6 +253,9 @@ kernel void fused_gate_up_gelu_mul_f16(
 constant uint FUSED_MLP_DECODE_M [[function_constant(3)]];
 constant uint FUSED_MLP_DECODE_N [[function_constant(4)]];
 constant uint FUSED_MLP_DECODE_K [[function_constant(5)]];
+// GELU (Gemma GeGLU) vs SiLU (SwiGLU) activation selector. Default
+// false (SiLU) so existing FusedGateUpSiluMul stays bit-identical.
+constant bool FUSED_MLP_DECODE_IS_GELU [[function_constant(9)]];
 
 kernel void fused_gate_up_silu_mul_decode_f16_specialized(
     device       half* output  [[buffer(0)]],   // [1, N]
@@ -412,8 +415,10 @@ kernel void fused_gate_up_silu_mul_decode_f16_specialized(
         for (int tm = 0; tm < TM; tm++) {
             const float g = gate_result[tm];
             const float u = up_result[tm];
-            const float silu_g = g / (1.0f + exp(-g));
-            output[out_row + tm] = half(silu_g * u);
+            const float act = FUSED_MLP_DECODE_IS_GELU
+                ? gelu_approx(g)
+                : g / (1.0f + exp(-g));
+            output[out_row + tm] = half(act * u);
         }
     }
 }
@@ -564,8 +569,10 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
         for (int tm = 0; tm < TM; tm++) {
             const float g = gate_result[tm];
             const float u = up_result[tm];
-            const float silu_g = g / (1.0f + exp(-g));
-            output[out_row + tm] = bfloat(silu_g * u);
+            const float act = FUSED_MLP_DECODE_IS_GELU
+                ? gelu_approx(g)
+                : g / (1.0f + exp(-g));
+            output[out_row + tm] = bfloat(act * u);
         }
     }
 }
@@ -627,6 +634,7 @@ kernel void fused_gate_up_silu_mul_decode_bf16_specialized(
 constant uint FUSED_MLP_STEEL_M [[function_constant(6)]];
 constant uint FUSED_MLP_STEEL_N [[function_constant(7)]];
 constant uint FUSED_MLP_STEEL_K [[function_constant(8)]];
+constant bool FUSED_MLP_STEEL_IS_GELU [[function_constant(10)]];
 
 #define STEEL_BM   32
 #define STEEL_BN   32
@@ -804,7 +812,7 @@ kernel void fused_gate_up_silu_mul_gemm_steel_f16_specialized(
     for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
         float g = gate_scratch[t];
         float u = up_scratch[t];
-        c_scratch[t] = half(silu_steel(g) * u);
+        c_scratch[t] = half((FUSED_MLP_STEEL_IS_GELU ? gelu_approx(g) : silu_steel(g)) * u);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -975,7 +983,7 @@ kernel void fused_gate_up_silu_mul_gemm_steel_bf16_specialized(
     for (uint t = thread_idx; t < uint(STEEL_BM * STEEL_BN); t += STEEL_TGP) {
         float g = gate_scratch[t];
         float u = up_scratch[t];
-        c_scratch[t] = bfloat(silu_steel(g) * u);
+        c_scratch[t] = bfloat((FUSED_MLP_STEEL_IS_GELU ? gelu_approx(g) : silu_steel(g)) * u);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

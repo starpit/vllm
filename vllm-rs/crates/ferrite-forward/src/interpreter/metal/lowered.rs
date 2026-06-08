@@ -324,6 +324,9 @@ pub enum KernelId {
     /// Row gather by a runtime u32 index buffer (`embedding_gather.metal`)
     /// — Qwen2.5-VL window permutation / inverse.
     EmbeddingGather,
+    /// 2-D non-overlapping average pool (`avg_pool_2d.metal`) — the
+    /// Gemma3-MM SigLIP→text projector's k×k spatial collapse.
+    AvgPool2d,
     /// Standalone tanh-approx GELU (Qwen3.5-VL ViT MLP / merger MLP).
     /// Maps to `gelu_tanh_{f16,bf16}` in `activation.metallib`. Bindings:
     /// `(out @ 0, in @ 1, n inline @ 2)`.
@@ -856,6 +859,9 @@ pub enum RuntimeBindingKind {
     /// u32 inverse permutation read by `EmbeddingGather(kind = 1)`
     /// (window-grouped → natural order at the merger output).
     VisionReverseIndices,
+    /// u32 SigLIP positional-embedding indices read by `PosEmbed`
+    /// (`[0..vision_num_positions]` per image). Gemma3-MM.
+    VisionPositionIds,
 }
 
 /// One ICB command: kernel + dispatch shape + bindings.

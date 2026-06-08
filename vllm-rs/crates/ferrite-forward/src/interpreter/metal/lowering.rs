@@ -653,7 +653,7 @@ pub fn lower<W: CanonicalParams>(
                             cur_width,
                             m_divisor,
                         )?;
-                        update_shape_state(inst, &mut cur_width, &mut m_divisor);
+                        update_shape_state::<W>(inst, &mut cur_width, &mut m_divisor);
                         let n_cmds = cmds.len();
                         commands.extend(cmds);
                         if n_cmds >= 1 {
@@ -677,7 +677,7 @@ pub fn lower<W: CanonicalParams>(
                     cur_width,
                     m_divisor,
                 )?;
-                update_shape_state(other, &mut cur_width, &mut m_divisor);
+                update_shape_state::<W>(other, &mut cur_width, &mut m_divisor);
                 let n_cmds = cmds.len();
                 commands.extend(cmds);
                 if n_cmds >= 1 {
@@ -721,7 +721,11 @@ pub fn lower<W: CanonicalParams>(
 ///   `dims_div_lit[row_axis] = vision_merge_factor`; every op after it
 ///   operates on `bucket_m / vision_merge_factor` rows. Text reshapes
 ///   carry `dims_div = 1`, so this never fires outside vision towers.
-fn update_shape_state(inst: &Instruction, cur_width: &mut u32, m_divisor: &mut u32) {
+fn update_shape_state<W: CanonicalParams>(
+    inst: &Instruction,
+    cur_width: &mut u32,
+    m_divisor: &mut u32,
+) {
     use Instruction as I;
     match inst {
         // A dense GEMM publishes a `[*, n]` activation.
@@ -756,6 +760,16 @@ fn update_shape_state(inst: &Instruction, cur_width: &mut u32, m_divisor: &mut u
                     *cur_width = dims_lit[ax];
                 }
             }
+        }
+        // AvgPool2d collapses the [ph², e] grid to [(ph/k)², e] — a
+        // k²-fold ROW reduction (Gemma3-MM: 4096 patches → 256 tokens
+        // at k=4). Fold it into the row divisor so the downstream
+        // projector ops dispatch the post-pool row count, not the full
+        // patch count (over-dispatch writes past the pooled tile → GPU
+        // fault). Width (e) is unchanged.
+        I::AvgPool2d(_, _) => {
+            let k = W::VISION_POOL_KERNEL.max(1);
+            *m_divisor *= k * k;
         }
         _ => {}
     }
@@ -875,6 +889,63 @@ fn lower_one<W: CanonicalParams>(
             gemm_dims: None,
         },
 
+        // ── SigLIP learned positional embedding (Gemma3-MM) ────────
+        //
+        // `pos_embed(position_ids, position_embedding)` — identical to
+        // `Embed` (one thread per row gathers `table[idx[i]]`), but the
+        // index buffer is the `vision_position_ids` extern instead of
+        // `input_ids`, and the table is the learned positional
+        // embedding (still `WeightBundleKind::Embedding`, op-local). Row
+        // stride = `W::HIDDEN_SIZE` (= vision_embed_dim on the vision
+        // Weights after the vision-const fix). Faithful to the cuda
+        // `Instruction::PosEmbed` eval (`embedding_gather_masked`).
+        I::PosEmbed(out_slot) => LoweredCommand {
+            kernel: KernelId::Embed,
+            library: "embed",
+            function: pick_specialized_symbol(
+                "embed_f16_specialized",
+                "embed_bf16_specialized",
+                W::METAL_DTYPE,
+            ),
+            constants: super::kernel_constants::EmbedConstants {
+                bucket_m: super::ids::BucketM(bucket_m),
+                q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
+            }
+            .into(),
+            dispatch: {
+                let mut d = DispatchShape::dispatch_1d(bucket_m, THREADS_PER_GROUP);
+                d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                });
+                d
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: *out_slot,
+                    binding_index: 0,
+                },
+                Binding::Weight {
+                    kind: WeightBundleKind::Embedding,
+                    which: WeightTensor::Weight,
+                    layer: super::ids::LayerId(0),
+                    locator: WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
+                    binding_index: 1,
+                },
+                // position_ids extern (in place of input_ids)
+                Binding::Runtime {
+                    kind: RuntimeBindingKind::VisionPositionIds,
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: None,
+        },
+
         // ── Standalone RMSNorm ─────────────────────────────────────
         // Macro/cuda emit `Instruction::RmsNorm(in_slot, out_slot, ...)`
         // (see `instr.rs:689`). An earlier `(out_slot, in_slot, ...)`
@@ -943,6 +1014,58 @@ fn lower_one<W: CanonicalParams>(
             ],
             gemm_dims: None,
         },
+
+        // ── Scalar-offset RMSNorm (Gemma `rmsnorm(x, weight + 1.0)`) ─
+        // Identical to `RmsNorm` except the `(1 + w)` offset rides the
+        // instruction's `offset` field (the DSL's explicit `+ 1.0`),
+        // not the global `W::NORM_WEIGHT_OFFSET`. `hidden_size` /
+        // `m_multiplier` are baked by `ScalarOffsetRmsNormImpl::fan_out`
+        // (residual = HIDDEN_SIZE/1; per-head q/k = head_dim/num_heads).
+        I::ScalarOffsetRmsNorm(in_slot, out_slot, layer, offset, hidden_size, m_multiplier) => {
+            LoweredCommand {
+                kernel: KernelId::RmsNorm,
+                library: "rmsnorm",
+                function: rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
+                constants: super::kernel_constants::RmsNormConstants {
+                    bucket_m: super::ids::BucketM(bucket_m * *m_multiplier),
+                    q_size: super::ids::QSize(*hidden_size),
+                    rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: *offset,
+                }
+                .into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m * *m_multiplier, 1, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
 
         // ── Unit-gain RMSNorm (mlx RMSNormNoScale — Gemma4 v_norm) ─
         // Same row math as `RmsNorm` with gain ≡ 1 and NO weight
@@ -1067,6 +1190,58 @@ fn lower_one<W: CanonicalParams>(
                 bindings: vec![
                     // residual: read+write (in-place add target,
                     // norm-input source)
+                    Binding::ArenaSlot {
+                        slot: *residual_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *delta_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Weight {
+                        kind: WeightBundleKind::RmsNorm,
+                        which: WeightTensor::Weight,
+                        layer: super::ids::LayerId(*layer + layer_offset),
+                        locator: WeightLocator {
+                            bucket: tape_index,
+                            op_idx: index as u32,
+                            slot: 0,
+                        },
+                        binding_index: 2,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
+        // ── FusedAddRmsNorm with per-instruction offset (Gemma3) ───
+        // `add(delta, residual)` then `rmsnorm(·, weight + offset)` —
+        // gemma3's sandwich norms write the `+ 1.0` explicitly, so the
+        // offset rides the instruction field instead of the global
+        // `W::NORM_WEIGHT_OFFSET`. Always on the residual stream
+        // (HIDDEN_SIZE; m=1) — residual adds are never per-head.
+        I::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => {
+            LoweredCommand {
+                kernel: KernelId::FusedAddRmsNorm,
+                library: "fused_add_rmsnorm",
+                function: fused_add_rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
+                constants: super::kernel_constants::RmsNormConstants {
+                    bucket_m: super::ids::BucketM(bucket_m),
+                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
+                    rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                    weight_offset: *offset,
+                }
+                .into(),
+                dispatch: DispatchShape {
+                    threadgroups: (bucket_m, 1, 1),
+                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                        seq_axis: None,
+                        axis: super::lowered::MScaleAxis::X,
+                        bucket_m: super::ids::BucketM(bucket_m),
+                    }),
+                },
+                bindings: vec![
                     Binding::ArenaSlot {
                         slot: *residual_slot,
                         binding_index: 0,
@@ -2102,104 +2277,16 @@ fn lower_one<W: CanonicalParams>(
         // weight `[2*N, K]` internally — gate rows [0, N), up rows
         // [N, 2N). The decode-vs-steel symbol pick happens inline
         // below against `bucket_m`.
-        I::FusedGateUpSiluMul(in_slot, out_slot, layer) => {
-            let inter = W::INTERMEDIATE_SIZE as u32;
-            let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
-                // Decode (MLX gemv port): blockM = BM*SM*TM = 4
-                // outputs per threadgroup, 256 threads/group =
-                // BN*SN = 8 simdgroups × 32 lanes.
-                ((inter.div_ceil(MLP_DECODE_BLOCK_M), 1, 1), (256, 1, 1))
-            } else {
-                // Prefill (MLX-steel matrix variant): 32×32 output
-                // tile, 128 threads = 4 simdgroups × 32 lanes.
-                let tg_x = inter.div_ceil(MLP_STEEL_TILE);
-                let tg_y = bucket_m.div_ceil(MLP_STEEL_TILE);
-                ((tg_x, tg_y, 1), (MLP_STEEL_THREADS, 1, 1))
-            };
-            // Two specialized variants share `fused_gate_up_silu_mul.metallib`;
-            // each binds a distinct constant-slot triple to avoid clashing
-            // when the library is loaded:
-            //   3/4/5 → M=1 decode kernel (gemv with simd_sum)
-            //   6/7/8 → MLX-steel matrix kernel (production for M >= 2)
-            // (slots 0/1/2 keyed the retired legacy 8×8 kernel.)
-            let function = if bucket_m == 1 {
-                pick_specialized_symbol(
-                    "fused_gate_up_silu_mul_decode_f16_specialized",
-                    "fused_gate_up_silu_mul_decode_bf16_specialized",
-                    W::METAL_DTYPE,
-                )
-            } else {
-                pick_specialized_symbol(
-                    "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
-                    "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
-                    W::METAL_DTYPE,
-                )
-            };
-            let constants: Vec<ConstantValue> = if bucket_m == 1 {
-                super::kernel_constants::FusedGateUpSiluMulDecodeConstants {
-                    bucket_m: super::ids::BucketM(bucket_m),
-                    intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
-                    // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
-                    // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
-                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
-                }
-                .into()
-            } else {
-                super::kernel_constants::FusedGateUpSiluMulPrefillConstants {
-                    bucket_m: super::ids::BucketM(bucket_m),
-                    intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
-                    // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
-                    // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
-                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
-                }
-                .into()
-            };
-            LoweredCommand {
-                kernel: KernelId::FusedGateUpSiluMul,
-                library: "fused_gate_up_silu_mul",
-                function,
-                constants,
-                dispatch: DispatchShape {
-                    threadgroups,
-                    threads_per_threadgroup,
-                    // Decode branch is bucket_m == 1 (M never grows);
-                    // prefill branch baselines on y-axis as
-                    // `bucket_m.div_ceil(MLP_STEEL_TILE)` — proportional
-                    // scaling shrinks it to the actual M.
-                    m_scaling: if bucket_m == 1 {
-                        None
-                    } else {
-                        Some(crate::interpreter::metal::lowered::MScaling {
-                            seq_axis: None,
-                            axis: super::lowered::MScaleAxis::Y,
-                            bucket_m: super::ids::BucketM(bucket_m),
-                        })
-                    },
-                },
-                bindings: vec![
-                    Binding::ArenaSlot {
-                        slot: *out_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *in_slot,
-                        binding_index: 1,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::LinearLayer,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator {
-                            bucket: tape_index,
-                            op_idx: index as u32,
-                            slot: 0,
-                        },
-                        binding_index: 2,
-                    },
-                ],
-                gemm_dims: None,
-            }
-        }
+        I::FusedGateUpSiluMul(in_slot, out_slot, layer) => fused_gate_up_mul_cmd::<W>(
+            *in_slot, *out_slot, *layer, false, bucket_m, tape_index, index, layer_offset,
+        ),
+        // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
+        // activation-mul kernel as SiLU; the `IS_GELU` fn-const flips
+        // the epilogue to gelu_approx (tanh). The quant GeGLU path
+        // decomposes to AffineQmm + GeluMul instead.
+        I::FusedGateUpGeluMul(in_slot, out_slot, layer) => fused_gate_up_mul_cmd::<W>(
+            *in_slot, *out_slot, *layer, true, bucket_m, tape_index, index, layer_offset,
+        ),
 
         // ── RoPE + KV cache append ─────────────────────────────────
         I::RopeAppend(
@@ -4434,6 +4521,58 @@ fn lower_one<W: CanonicalParams>(
             }
         }
 
+        // ── 2-D average pool (Gemma3-MM SigLIP→text projector) ─────
+        //
+        // Collapses the [ph², e] post-encoder grid by a k×k cell to
+        // [(ph/k)², e]. ph / k are compile-time (`W::VISION_PATCH_GRID_SIDE`
+        // / `W::VISION_POOL_KERNEL`); e is the vision residual width
+        // (`W::HIDDEN_SIZE` on the vision Weights). Fixed per-image
+        // reduction (cuda eval asserts input rows == ph²), so the grid
+        // is the static output-element count — no m_scaling. Faithful to
+        // the cuda `avg_pool_2d_kernel`: one thread per output element.
+        I::AvgPool2d(in_slot, out_slot) => {
+            let ph = W::VISION_PATCH_GRID_SIDE;
+            let k = W::VISION_POOL_KERNEL;
+            let e = W::HIDDEN_SIZE as u32;
+            assert!(
+                ph > 0 && k > 0 && ph % k == 0 && e > 0,
+                "AvgPool2d: VISION_PATCH_GRID_SIDE={ph} VISION_POOL_KERNEL={k} \
+                 HIDDEN_SIZE={e} — ph must be a positive multiple of k, e > 0"
+            );
+            let ph_out = ph / k;
+            let total = ph_out * ph_out * e;
+            LoweredCommand {
+                kernel: KernelId::AvgPool2d,
+                library: "avg_pool_2d",
+                function: avg_pool_2d_static_name(W::METAL_DTYPE),
+                constants: Vec::new(),
+                dispatch: DispatchShape::dispatch_1d(total, THREADS_PER_GROUP),
+                bindings: vec![
+                    Binding::ArenaSlot {
+                        slot: *out_slot,
+                        binding_index: 0,
+                    },
+                    Binding::ArenaSlot {
+                        slot: *in_slot,
+                        binding_index: 1,
+                    },
+                    Binding::Inline {
+                        binding_index: 2,
+                        value: ph,
+                    },
+                    Binding::Inline {
+                        binding_index: 3,
+                        value: k,
+                    },
+                    Binding::Inline {
+                        binding_index: 4,
+                        value: e,
+                    },
+                ],
+                gemm_dims: None,
+            }
+        }
+
         // ── Metadata-only: no Metal dispatch ───────────────────────
         I::Reshape(_, _, _, _, _, _) | I::Alias(_, _) | I::Free(_) => {
             // These rebind / drop slots in the dispatcher's logical
@@ -4676,6 +4815,122 @@ fn quick_gelu_static_name(dtype: MetalDtype) -> &'static str {
 
 /// `embedding_gather.metal` host-name picker (row gather by a runtime
 /// u32 index buffer — Qwen2.5-VL window permutation / inverse).
+/// Lower a fused gate/up GEMM + activation-mul (`silu` or `gelu`) to
+/// the `fused_gate_up_silu_mul` library. Shared by `FusedGateUpSiluMul`
+/// (SwiGLU, `is_gelu = false`) and `FusedGateUpGeluMul` (dense GeGLU —
+/// Gemma3 text, `is_gelu = true`); the `IS_GELU` fn-const (slot 9
+/// decode / 10 prefill) flips the kernel epilogue. Dispatch / bindings
+/// are identical across activations.
+fn fused_gate_up_mul_cmd<W: CanonicalParams>(
+    in_slot: u32,
+    out_slot: u32,
+    layer: u32,
+    is_gelu: bool,
+    bucket_m: u32,
+    tape_index: u32,
+    index: usize,
+    layer_offset: u32,
+) -> LoweredCommand {
+    let inter = W::INTERMEDIATE_SIZE as u32;
+    let (threadgroups, threads_per_threadgroup) = if bucket_m == 1 {
+        // Decode (MLX gemv port): blockM = BM*SM*TM = 4 outputs per
+        // threadgroup, 256 threads/group = BN*SN = 8 simdgroups × 32 lanes.
+        ((inter.div_ceil(MLP_DECODE_BLOCK_M), 1, 1), (256, 1, 1))
+    } else {
+        // Prefill (MLX-steel matrix variant): 32×32 output tile, 128
+        // threads = 4 simdgroups × 32 lanes.
+        let tg_x = inter.div_ceil(MLP_STEEL_TILE);
+        let tg_y = bucket_m.div_ceil(MLP_STEEL_TILE);
+        ((tg_x, tg_y, 1), (MLP_STEEL_THREADS, 1, 1))
+    };
+    // Both activations share the `fused_gate_up_silu_mul` symbols; the
+    // decode (slots 3/4/5/9) and steel (6/7/8/10) variants keep distinct
+    // fn-const slots so they don't clash when the library is loaded.
+    let function = if bucket_m == 1 {
+        pick_specialized_symbol(
+            "fused_gate_up_silu_mul_decode_f16_specialized",
+            "fused_gate_up_silu_mul_decode_bf16_specialized",
+            W::METAL_DTYPE,
+        )
+    } else {
+        pick_specialized_symbol(
+            "fused_gate_up_silu_mul_gemm_steel_f16_specialized",
+            "fused_gate_up_silu_mul_gemm_steel_bf16_specialized",
+            W::METAL_DTYPE,
+        )
+    };
+    let constants: Vec<ConstantValue> = if bucket_m == 1 {
+        super::kernel_constants::FusedGateUpSiluMulDecodeConstants {
+            bucket_m: super::ids::BucketM(bucket_m),
+            intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
+            // gate/up gemm K-dim = MLP input width = HIDDEN_SIZE, not
+            // Q_SIZE (differ when head_dim != hidden/heads, e.g. Qwen3.5).
+            q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
+            is_gelu,
+        }
+        .into()
+    } else {
+        super::kernel_constants::FusedGateUpSiluMulPrefillConstants {
+            bucket_m: super::ids::BucketM(bucket_m),
+            intermediate_size: super::ids::IntermediateSize(W::INTERMEDIATE_SIZE as u32),
+            q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
+            is_gelu,
+        }
+        .into()
+    };
+    LoweredCommand {
+        kernel: KernelId::FusedGateUpSiluMul,
+        library: "fused_gate_up_silu_mul",
+        function,
+        constants,
+        dispatch: DispatchShape {
+            threadgroups,
+            threads_per_threadgroup,
+            m_scaling: if bucket_m == 1 {
+                None
+            } else {
+                Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::Y,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                })
+            },
+        },
+        bindings: vec![
+            Binding::ArenaSlot {
+                slot: out_slot,
+                binding_index: 0,
+            },
+            Binding::ArenaSlot {
+                slot: in_slot,
+                binding_index: 1,
+            },
+            Binding::Weight {
+                kind: WeightBundleKind::LinearLayer,
+                which: WeightTensor::Weight,
+                layer: super::ids::LayerId(layer + layer_offset),
+                locator: WeightLocator {
+                    bucket: tape_index,
+                    op_idx: index as u32,
+                    slot: 0,
+                },
+                binding_index: 2,
+            },
+        ],
+        gemm_dims: None,
+    }
+}
+
+fn avg_pool_2d_static_name(dtype: MetalDtype) -> &'static str {
+    match dtype {
+        MetalDtype::F16 => "avg_pool_2d_f16",
+        MetalDtype::Bf16 => "avg_pool_2d_bf16",
+        MetalDtype::Int4 => {
+            panic!("avg_pool_2d: Int4 unsupported (activations are bf16/f16)")
+        }
+    }
+}
+
 fn embedding_gather_static_name(dtype: MetalDtype) -> &'static str {
     match dtype {
         MetalDtype::F16 => "embedding_gather_rows_f16",

@@ -72,6 +72,24 @@ struct enable_sm89_to_sm90 : Kernel {
   }
 };
 
+// CUTLASS 3.x (Hopper) kernels invoke via operator(), not the static invoke()
+// used by the 2.x guards above. This guard restricts the C3X SM90 FP8 GEMM to
+// sm_90+ devices and traps otherwise (matches Python vLLM's enable_sm90_or_later).
+template <typename Kernel>
+struct enable_sm90_or_later : Kernel {
+  template <typename... Args>
+  CUTLASS_DEVICE void operator()(Args&&... args) {
+#if defined __CUDA_ARCH__
+  #if __CUDA_ARCH__ >= 900
+    Kernel::operator()(std::forward<Args>(args)...);
+  #else
+    printf("This kernel only supports sm >= 90.\n");
+    asm("trap;");
+  #endif
+#endif
+  }
+};
+
 template <typename Kernel>
 struct enable_sm89_to_sm100 : Kernel {
   template <typename... Args>

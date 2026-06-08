@@ -1895,7 +1895,12 @@ fn emit_external_load<F: RopeForm, K: KvCacheShape>(
     // `external-load-no-tma-expect-no-barrier-init` was based on a
     // TK 2.0 protocol assumption that doesn't apply at this layer
     // per the plan's design.
-    state.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+    // Patch 1 step (e): the conservative lowering deliberately emits
+    // oversized LoadAsyncs (e.g. weight tiles up to 8 MiB); the
+    // split_oversized_loads_pass downstream chunks them into
+    // page-fitting K-loop bodies. This is the unsealed constructor;
+    // post-split chunks use new_page_fitting (sealed).
+    state.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
         dst_page,
         src_arg,
         byte_off,
@@ -1916,7 +1921,11 @@ fn emit_store_and_arrive<F: RopeForm, K: KvCacheShape>(
     let tile = region_tile_shape(out);
     let byte_off = region_byte_offset(state.graph, out);
     let dst_arg = state.tensor_arg(out.tensor);
-    state.push(Instr::StoreAsync(StoreSpec::new_runtime_shape(
+    // Patch 1 step (e): unsealed; pre-split-K-pass tape may carry
+    // oversized output regions (e.g. whole AttnDecode output at
+    // [m, num_q_heads*head_dim]). The pass's NK-rewrite path lifts
+    // these to page-fitting chunks.
+    state.push(Instr::StoreAsync(StoreSpec::new_oversized_runtime_shape(
         dst_page,
         dst_arg,
         byte_off,

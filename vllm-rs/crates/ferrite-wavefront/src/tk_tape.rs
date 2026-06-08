@@ -2475,6 +2475,17 @@ pub struct TileShape {
     pub(crate) elem_bytes: u32,
 }
 
+impl TileShape {
+    /// Byte size of a tile-shaped region: `rows * cols * elem_bytes`.
+    /// Used by the [`LoadSpec::new_page_fitting`] /
+    /// [`StoreSpec::new_page_fitting`] seal (Patch 1 step (e) of
+    /// `SPLIT_OVERSIZED_HANDOFF.md`) to assert each runtime-derived
+    /// tile fits the substrate page at proc-macro time.
+    pub(crate) const fn byte_size(&self) -> u32 {
+        self.rows * self.cols * self.elem_bytes
+    }
+}
+
 /// Runtime sealed dtype tag. The `TileDtype` trait's `tag()` method
 /// is the only construction path; external types cannot satisfy
 /// `TileDtype` (sealed via `tile_dtype_sealed::Sealed`).
@@ -2893,23 +2904,22 @@ impl LoadSpec {
         }
     }
 
-    /// Construct a [`LoadSpec`] from a RUNTIME tile shape — used by
-    /// `emit_external_load` where the shape comes from the upstream
-    /// `TensorRegion` (which varies per source: 1×N for vectors,
-    /// 128×128 for projection weights, etc.).
+    /// Provisional unsealed constructor — the conservative
+    /// lowering's `emit_external_load` deliberately produces oversized
+    /// LoadAsyncs (e.g. a [K, N] = [2048, 2048] weight tile = 8 MiB)
+    /// that [`crate::passes::split_oversized_loads_pass`] later
+    /// rewrites into PAGE_SIZE-fitting K-loop bodies. This
+    /// constructor accepts ANY `tile.byte_size()`; the seal lives
+    /// at the pass's postcondition walk (lines ~191 in
+    /// `passes/split_oversized_loads.rs`).
     ///
-    /// The const-generic typed gate at [`Self::new`] is appropriate
-    /// when the lowerer KNOWS the shape (compute Instr arms); at the
-    /// external-load boundary the shape is runtime data driven by
-    /// the SubtileIR's tensor regions.
-    ///
-    /// The PAGE_SIZE byte-cap is enforced AT THE PASS LEVEL by
-    /// [`crate::passes::split_oversized_loads_pass`], not at
-    /// construction time. The conservative lowering may legitimately
-    /// produce big LoadAsyncs that the K-tile pass then rewrites
-    /// into PAGE_SIZE-fitting K-loop bodies. Per plan §6.5
-    /// (TkTape→TkTape passes own target-specific resource decisions).
-    pub(crate) fn new_runtime_shape(
+    /// **Patch 1 step (e) of `SPLIT_OVERSIZED_HANDOFF.md`** —
+    /// renamed from `new_runtime_shape` to make the
+    /// oversized-allowed-here vs sealed-post-pass split explicit.
+    /// New code that constructs LoadSpecs WITHOUT going through the
+    /// split-K pass should use [`Self::new_page_fitting`] (with the
+    /// proc-macro-time `byte_size <= PAGE_SIZE` assert).
+    pub(crate) fn new_oversized_runtime_shape(
         dst_page: PageId,
         src_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
@@ -2917,6 +2927,60 @@ impl LoadSpec {
         role: LoaderRole,
         barrier_page: PageId,
     ) -> Self {
+        Self {
+            dst_page,
+            src_arg,
+            byte_off,
+            tile,
+            role: role.to_warp_role(),
+            barrier_page,
+        }
+    }
+
+    /// Sealed page-fitting constructor — asserts `tile.byte_size() <=
+    /// PAGE_SIZE` at construction time (release-mode `assert!`, NOT
+    /// `debug_assert!`). The proc-macro runs in release mode, so a
+    /// tile-too-big bug fires at proc-macro expansion, killing the
+    /// model crate's `cargo build` rather than silently emitting a
+    /// malformed kernel.
+    ///
+    /// **Patch 1 step (e) of `SPLIT_OVERSIZED_HANDOFF.md`:** new
+    /// LoadSpec callers that produce already-page-fitting tiles (any
+    /// emit path that runs AFTER `split_oversized_loads_pass`, or any
+    /// inline emit that's structurally page-bounded) should mint
+    /// through this constructor so the seal fires loudly on a
+    /// regression.
+    ///
+    /// Stable Rust without `generic_const_exprs` can't express the
+    /// where-clause variant at the type level for arbitrary runtime
+    /// shapes; the construction-time `assert!` is the equivalent
+    /// seal in stable Rust. The audit's Group A findings #5 and #8
+    /// (oversized `cp.async.bulk` writes past the 32 KB page slot
+    /// into adjacent `page_buf` entries / mbarrier semaphores —
+    /// silent shmem corruption with no `cudaErrorIllegalAddress` /
+    /// no ptxas refusal) are exactly the failure mode this seal
+    /// surfaces at codegen time.
+    pub(crate) fn new_page_fitting(
+        dst_page: PageId,
+        src_arg: KernelArgRef,
+        byte_off: ByteOffsetExpr,
+        tile: TileShape,
+        role: LoaderRole,
+        barrier_page: PageId,
+    ) -> Self {
+        assert!(
+            tile.byte_size() <= PAGE_SIZE,
+            "LoadSpec::new_page_fitting: tile {{rows={}, cols={}, elem_bytes={}}} \
+             byte_size = {} > PAGE_SIZE = {} (Patch 1 step (e) seal — \
+             oversized SubtileIR regions must be chunked BEFORE \
+             reaching this constructor; use new_oversized_runtime_shape \
+             only for provisional pre-split-K-pass tapes).",
+            tile.rows,
+            tile.cols,
+            tile.elem_bytes,
+            tile.byte_size(),
+            PAGE_SIZE,
+        );
         Self {
             dst_page,
             src_arg,
@@ -2962,16 +3026,60 @@ impl StoreSpec {
         }
     }
 
-    /// Runtime-shape store, parallel to [`LoadSpec::new_runtime_shape`].
-    /// PAGE_SIZE byte-cap is enforced at the pass level, not at
-    /// construction.
-    pub(crate) fn new_runtime_shape(
+    /// Provisional unsealed constructor — same role as
+    /// [`LoadSpec::new_oversized_runtime_shape`]: the conservative
+    /// lowering's `emit_store_and_arrive` produces StoreAsyncs whose
+    /// tile shape is driven by the SubtileIR's output region (which
+    /// can be > PAGE_SIZE for whole-tensor outputs in the pre-split
+    /// tape). The split-K pass's NK-rewrite path replaces such
+    /// oversized StoreAsyncs with page-fitting per-iter chunks.
+    pub(crate) fn new_oversized_runtime_shape(
         src_page: PageId,
         dst_arg: KernelArgRef,
         byte_off: ByteOffsetExpr,
         tile: TileShape,
         role: StorerRole,
     ) -> Self {
+        Self {
+            src_page,
+            dst_arg,
+            byte_off,
+            tile,
+            role: role.to_warp_role(),
+        }
+    }
+
+    /// Sealed page-fitting StoreSpec — parallel to
+    /// [`LoadSpec::new_page_fitting`]. Asserts `tile.byte_size() <=
+    /// PAGE_SIZE` at construction (release-mode `assert!`).
+    ///
+    /// **Patch 1 step (e) of `SPLIT_OVERSIZED_HANDOFF.md`** —
+    /// addresses audit Group A finding #8: TK 2.0
+    /// `cp.async.bulk.global.shared::cta.bulk_group` performs no
+    /// smem-side bounds check (PTX ISA 9.7.8.24); the `bytes`
+    /// operand is whatever the producer puts on the IR. No
+    /// `cudaErrorIllegalAddress`, no ptxas refusal — silent wrong
+    /// gmem output (first 32 KB correct, remainder is whatever live
+    /// shmem the read sweeps through, including mbarrier phase
+    /// bytes). The constructor-time assert surfaces this at
+    /// proc-macro time instead.
+    pub(crate) fn new_page_fitting(
+        src_page: PageId,
+        dst_arg: KernelArgRef,
+        byte_off: ByteOffsetExpr,
+        tile: TileShape,
+        role: StorerRole,
+    ) -> Self {
+        assert!(
+            tile.byte_size() <= PAGE_SIZE,
+            "StoreSpec::new_page_fitting: tile {{rows={}, cols={}, elem_bytes={}}} \
+             byte_size = {} > PAGE_SIZE = {} (Patch 1 step (e) seal).",
+            tile.rows,
+            tile.cols,
+            tile.elem_bytes,
+            tile.byte_size(),
+            PAGE_SIZE,
+        );
         Self {
             src_page,
             dst_arg,
@@ -5260,6 +5368,66 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Patch 1 step (e) of `SPLIT_OVERSIZED_HANDOFF.md`: the sealed
+    /// [`LoadSpec::new_page_fitting`] constructor panics at
+    /// proc-macro time when the runtime tile shape exceeds
+    /// PAGE_SIZE. The unsealed [`LoadSpec::new_oversized_runtime_shape`]
+    /// constructor accepts the same input without panicking — the
+    /// split between the two constructors is the seal.
+    #[test]
+    #[should_panic(expected = "Patch 1 step (e) seal")]
+    fn load_spec_new_page_fitting_panics_on_oversized_tile() {
+        let oversized = TileShape {
+            rows: 128,
+            cols: 2048, // 128 * 2048 * 2 = 512 KiB ≫ PAGE_SIZE
+            elem_bytes: 2,
+        };
+        let _ = LoadSpec::new_page_fitting(
+            PageId(0),
+            KernelArgRef(0),
+            ByteOffsetExpr::from_const(0),
+            oversized,
+            LoaderRole,
+            PageId(0),
+        );
+    }
+
+    /// Mirror test for [`StoreSpec::new_page_fitting`].
+    #[test]
+    #[should_panic(expected = "Patch 1 step (e) seal")]
+    fn store_spec_new_page_fitting_panics_on_oversized_tile() {
+        let oversized = TileShape {
+            rows: 128,
+            cols: 2048,
+            elem_bytes: 2,
+        };
+        let _ = StoreSpec::new_page_fitting(
+            PageId(0),
+            KernelArgRef(0),
+            ByteOffsetExpr::from_const(0),
+            oversized,
+            StorerRole,
+        );
+    }
+
+    /// The seal accepts a 128×128 Bf16 page (= PAGE_SIZE exactly).
+    #[test]
+    fn load_spec_new_page_fitting_accepts_page_sized_tile() {
+        let page_sized = TileShape {
+            rows: 128,
+            cols: 128,
+            elem_bytes: 2,
+        };
+        let _ = LoadSpec::new_page_fitting(
+            PageId(0),
+            KernelArgRef(0),
+            ByteOffsetExpr::from_const(0),
+            page_sized,
+            LoaderRole,
+            PageId(0),
+        );
+    }
 
     /// Audit 2026-06-08 finding #9 closure test: a TkTape whose
     /// Instr stream references a RegTileSlot absent from

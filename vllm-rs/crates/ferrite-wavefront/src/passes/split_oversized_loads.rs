@@ -1041,7 +1041,7 @@ mod tests {
         let rt_a: RegTileId<32, 128, Bf16, RowLayout> = tape.mint_reg_tile();
         let rt_d: RegTileId<32, 128, Fp32, RowLayout> = tape.mint_reg_tile();
 
-        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
             a_page,
             KernelArgRef(0),
             ByteOffsetExpr::from_const(0),
@@ -1049,7 +1049,7 @@ mod tests {
             LoaderRole,
             a_page,
         )));
-        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
             b_page,
             KernelArgRef(1),
             ByteOffsetExpr::from_const(0),
@@ -1094,7 +1094,7 @@ mod tests {
         let mut tape = synthetic_oversized_gemm_tape(k_full, n_full);
         let dst_page = PageId(2);
         let storer_role = StorerRole.to_warp_role();
-        tape.instrs.push(Instr::StoreAsync(StoreSpec::new_runtime_shape(
+        tape.instrs.push(Instr::StoreAsync(StoreSpec::new_oversized_runtime_shape(
             dst_page,
             KernelArgRef(2),
             ByteOffsetExpr::from_const(0),
@@ -1310,7 +1310,7 @@ mod tests {
     fn oversized_load_without_gemm_consumer_panics() {
         let mut tape = TkTape::default();
         // Big LoadAsync, no following Wgmma.
-        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+        tape.instrs.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
             PageId(0),
             KernelArgRef(0),
             ByteOffsetExpr::from_const(0),
@@ -1351,7 +1351,7 @@ mod tests {
             let dst_page = PageId(base + 2);
             let rt_a: RegTileId<32, 128, Bf16, RowLayout> = tape.mint_reg_tile();
             let rt_d: RegTileId<32, 128, Fp32, RowLayout> = tape.mint_reg_tile();
-            tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+            tape.instrs.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
                 a_page,
                 KernelArgRef(base as u16),
                 ByteOffsetExpr::from_const(0),
@@ -1359,7 +1359,7 @@ mod tests {
                 LoaderRole,
                 a_page,
             )));
-            tape.instrs.push(Instr::LoadAsync(LoadSpec::new_runtime_shape(
+            tape.instrs.push(Instr::LoadAsync(LoadSpec::new_oversized_runtime_shape(
                 b_page,
                 KernelArgRef(base as u16 + 1),
                 ByteOffsetExpr::from_const(0),

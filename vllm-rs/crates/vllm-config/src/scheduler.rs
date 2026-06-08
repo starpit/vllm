@@ -151,6 +151,48 @@ impl SchedulerConfig {
         self.max_num_scheduled_tokens
             .unwrap_or(self.max_num_batched_tokens)
     }
+
+    // ----- Device/usage-aware batch defaults --------------------------------
+    // Mirror Python vLLM EngineArgs.get_batch_defaults
+    // (vllm/engine/arg_utils.py:1969-1988): the base constants above are the
+    // floor, but a ≥70 GiB non-A100 GPU (H100/MI300x-class) uses much larger
+    // defaults, and the offline (LLM/throughput) context uses larger values
+    // than the online server. The Rust port previously hard-wired the base
+    // constants regardless of device — leaving an 8× smaller token budget than
+    // Python on H100 offline.
+
+    /// Total-memory threshold (bytes) at/above which a GPU uses the large-GPU
+    /// batch defaults. Mirrors Python's `device_memory >= 70 * GiB`.
+    pub const LARGE_GPU_MIN_TOTAL_BYTES: u64 = 70 * 1024 * 1024 * 1024;
+    /// Large-GPU offline (LLM/throughput) defaults: `(max_num_batched_tokens, max_num_seqs)`.
+    const LARGE_GPU_OFFLINE_DEFAULTS: (usize, usize) = (16384, 1024);
+    /// Large-GPU online-server defaults.
+    const LARGE_GPU_SERVER_DEFAULTS: (usize, usize) = (8192, 1024);
+    /// Default-GPU offline (LLM/throughput) defaults.
+    const SMALL_GPU_OFFLINE_DEFAULTS: (usize, usize) = (8192, 256);
+    /// Default-GPU online-server defaults.
+    const SMALL_GPU_SERVER_DEFAULTS: (usize, usize) = (2048, 256);
+
+    /// Device- and usage-context-aware `(max_num_batched_tokens, max_num_seqs)`
+    /// defaults, mirroring Python vLLM's `EngineArgs.get_batch_defaults`.
+    ///
+    /// `is_offline` selects the LLM/throughput context (vs the online server).
+    /// A100 is excluded from the large-GPU tier: large batched-token budgets
+    /// regress A100 throughput (Python vLLM PR #17885).
+    pub fn batch_defaults(
+        device_total_bytes: u64,
+        device_name: &str,
+        is_offline: bool,
+    ) -> (usize, usize) {
+        let is_large = device_total_bytes >= Self::LARGE_GPU_MIN_TOTAL_BYTES
+            && !device_name.to_ascii_lowercase().contains("a100");
+        match (is_large, is_offline) {
+            (true, true) => Self::LARGE_GPU_OFFLINE_DEFAULTS,
+            (true, false) => Self::LARGE_GPU_SERVER_DEFAULTS,
+            (false, true) => Self::SMALL_GPU_OFFLINE_DEFAULTS,
+            (false, false) => Self::SMALL_GPU_SERVER_DEFAULTS,
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -191,6 +233,35 @@ mod tests {
         assert!(cfg.enable_chunked_prefill);
         assert_eq!(cfg.policy, SchedulerPolicy::Fcfs);
         assert_eq!(cfg.effective_max_num_scheduled_tokens(), 2048);
+    }
+
+    #[test]
+    fn test_batch_defaults_device_and_context_aware() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // H100-class (>=70 GiB, non-A100): offline gets the large budget.
+        assert_eq!(
+            SchedulerConfig::batch_defaults(80 * GIB, "NVIDIA H100 80GB HBM3", true),
+            (16384, 1024)
+        );
+        // ...and the online server gets the (smaller) server defaults.
+        assert_eq!(
+            SchedulerConfig::batch_defaults(80 * GIB, "NVIDIA H100 80GB HBM3", false),
+            (8192, 1024)
+        );
+        // A100 is explicitly excluded from the large tier (PR #17885).
+        assert_eq!(
+            SchedulerConfig::batch_defaults(80 * GIB, "NVIDIA A100-SXM4-80GB", true),
+            (8192, 256)
+        );
+        // Smaller GPU (e.g. L4 24 GiB): default tier.
+        assert_eq!(
+            SchedulerConfig::batch_defaults(24 * GIB, "NVIDIA L4", true),
+            (8192, 256)
+        );
+        assert_eq!(
+            SchedulerConfig::batch_defaults(24 * GIB, "NVIDIA L4", false),
+            (2048, 256)
+        );
     }
 
     #[test]

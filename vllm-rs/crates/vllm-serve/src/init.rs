@@ -965,11 +965,29 @@ fn is_recurrent_hybrid_arch(architectures: &[String]) -> bool {
 /// Common initialization: worker → cache → executor → InprocClient → tokenizer.
 ///
 /// Handles both single-GPU (TP=1) and multi-GPU (TP>1) transparently.
+/// Offline (LLM/throughput) vs online-server default for `max_num_batched_tokens`,
+/// resolved per device (mirrors Python vLLM `EngineArgs.get_batch_defaults`):
+/// an H100-class GPU on the offline path gets 16384 rather than the base 2048.
+/// Falls back to the base `SchedulerConfig` constant when the device cannot be
+/// queried or on non-CUDA builds. Only the batched-tokens value is consumed
+/// here; `max_num_seqs` keeps its existing default for now.
+fn resolve_default_max_num_batched_tokens(is_offline: bool) -> usize {
+    #[cfg(feature = "cuda")]
+    if let Some((total_bytes, name)) = vllm_cuda::current_device_total_bytes_and_name() {
+        return SchedulerConfig::batch_defaults(total_bytes, &name, is_offline).0;
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = is_offline;
+    SchedulerConfig::DEFAULT_MAX_NUM_BATCHED_TOKENS
+}
+
 /// Shared by [`initialize_stack`] (async server path) and
-/// [`initialize_stack_sync`] (sync LLM path).
+/// [`initialize_stack_sync`] (sync LLM path). `is_offline` selects the
+/// device-aware batched-token default (offline LLM vs online server context).
 fn initialize_core(
     config: &VllmConfig,
     progress: Option<&Arc<crate::progress::StartupProgress>>,
+    is_offline: bool,
 ) -> Result<InitializedCore> {
     let tp_size = config.tensor_parallel_size;
 
@@ -1110,9 +1128,12 @@ fn initialize_core(
 
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            // Default 2048. Mixed batches use the unified eager path.
-            // See PREFILL_DECODE_SPLIT.md for history.
-            max_num_batched_tokens: config.max_num_batched_tokens.unwrap_or(2048),
+            // Device-aware default (mirrors Python vLLM get_batch_defaults):
+            // base 2048, but 16384 on H100-class offline. Mixed batches use
+            // the unified eager path. See PREFILL_DECODE_SPLIT.md for history.
+            max_num_batched_tokens: config
+                .max_num_batched_tokens
+                .unwrap_or_else(|| resolve_default_max_num_batched_tokens(is_offline)),
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,
@@ -1485,7 +1506,8 @@ pub fn initialize_stack_sync(config: &VllmConfig) -> Result<InitializedSyncStack
         Arc::new(crate::progress::StartupProgress::new(show_progress))
     };
 
-    let core = initialize_core(config, Some(&progress))?;
+    // Offline LLM/throughput context → device-aware offline batch defaults.
+    let core = initialize_core(config, Some(&progress), true)?;
     progress.finish();
     info!(
         "init engine (load model, create kv cache) took {:.2} seconds",
@@ -1552,7 +1574,8 @@ pub fn initialize_stack(
 
     // TP=1: single-GPU path.
     progress.set_stage("Initializing backend");
-    let core = initialize_core(config, Some(&progress))?;
+    // Online-server context → keep the (smaller) server batch defaults.
+    let core = initialize_core(config, Some(&progress), false)?;
 
     progress.set_stage("Creating engine");
 

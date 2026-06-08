@@ -99,6 +99,19 @@ pub mod weights_quant;
 #[path = "layers_tests.rs"]
 mod layers_tests;
 
+/// Total memory (bytes) and name of the current CUDA device.
+///
+/// Used to pick device-aware scheduler batch defaults (mirroring Python vLLM's
+/// `EngineArgs.get_batch_defaults`). Requires a current CUDA context; returns
+/// `None` if the device cannot be queried (caller falls back to base defaults).
+#[cfg(feature = "cuda")]
+pub fn current_device_total_bytes_and_name() -> Option<(u64, String)> {
+    let (_free, total) = cudarc::driver::result::mem_get_info().ok()?;
+    let dev = cudarc::driver::result::device::get(0).ok()?;
+    let name = cudarc::driver::result::device::get_name(dev).ok()?;
+    Some((total as u64, name))
+}
+
 // ---------------------------------------------------------------------------
 // Flat re-exports for convenience
 // ---------------------------------------------------------------------------

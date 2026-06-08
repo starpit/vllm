@@ -2744,6 +2744,27 @@ pub fn colored_slot_map(
         }
     }
 
+    // Extend each owner's last-use to cover reads made THROUGH its aliases.
+    // A `View`/`Reshaped` collapses onto its owner's arena color (the
+    // `is_alias` branch below `continue`s without registering a lifetime of
+    // its own), and it is a *stored* alias referenced by slot index — not a
+    // borrow the compiler can check. So the owner's color must stay live until
+    // the LAST read of every alias that shares it. Without this the owner dies
+    // at its own last use, its color is re-minted for a same-shape tile while
+    // the alias still points at the old storage, and that dangling stored alias
+    // double-frees the block at teardown (the hole `pinned_owned` only half-
+    // contains). `view_last_use` already holds each alias's last reader; fold it
+    // into the resolved owner so the shared color outlives every aliasing read.
+    for alias_key in alias_to_owner.keys() {
+        if let Some(&alias_lu) = view_last_use.get(alias_key) {
+            let owner = resolve(*alias_key);
+            owner_last_use
+                .entry(owner)
+                .and_modify(|p| *p = (*p).max(alias_lu))
+                .or_insert(alias_lu);
+        }
+    }
+
     // Collect every (tile, output_slot) pair, sorted by per-tile
     // sub-position.
     let mut def_pos: HashMap<TileId, usize> = HashMap::new();

@@ -163,6 +163,19 @@ struct LoweringState<'g, F: RopeForm, K: KvCacheShape> {
     /// substrate.
     next_act_page: u8,
     free_act_pages: Vec<crate::tk_tape::ActPageId>,
+    /// Slot id → IR node id that wrote it. Built up as Compute Instrs
+    /// are lowered; lets the RmsNormApply arm look up the upstream
+    /// RmsNormReduce by slot identity in order to retrieve the
+    /// side-channelled inv_rms vec.
+    slot_writer_node: BTreeMap<u32, SubtileId>,
+    /// Side channel: RmsNormReduce node id → inv_rms smem-vec slot.
+    /// Patch 1 step (c) of `SPLIT_OVERSIZED_HANDOFF.md`. The
+    /// IR-level output region of RmsNormReduce is `[m, 1]` (a tile
+    /// page satisfies the substrate contract); the actual inv_rms
+    /// data lives in this minted smem-vec slot, threaded out-of-band
+    /// to the downstream RmsNormApply arms that share the same
+    /// reduce predecessor.
+    rms_inv_rms_vec: BTreeMap<SubtileId, crate::tk_tape::SmemVecId<128, crate::tk_tape::Bf16>>,
 }
 
 impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
@@ -193,6 +206,8 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
             ephemeral_pages: Vec::new(),
             next_act_page: 0,
             free_act_pages: Vec::new(),
+            slot_writer_node: BTreeMap::new(),
+            rms_inv_rms_vec: BTreeMap::new(),
         }
     }
 
@@ -512,6 +527,11 @@ pub fn lower_subtile_tape_to_tk_tape<F: RopeForm, K: KvCacheShape>(
                 writes,
                 inputs,
             } => {
+                // Record the writer-node id BEFORE lowering: arms
+                // (e.g. RmsNormApply) may need to look up an upstream
+                // producer's IR-node id by slot identity. Per Patch 1
+                // step (c) of `SPLIT_OVERSIZED_HANDOFF.md`.
+                state.slot_writer_node.insert(writes.index(), *node);
                 lower_compute(&mut state, *node, *writes, inputs);
             }
             STInstr::FreeSlot { slot } => {
@@ -1017,6 +1037,185 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //    next gap to close — see Cat 5 follow-up.
             let gamma_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
             let _ = gamma_page; // gamma external page tracked for predecessor coverage; the SmemVecSlot path supersedes it once the external-load substrate emits sv-shaped pages.
+            state.push(Instr::sh_tile_mul_col(dst, gamma_vec, dst, W));
+
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
+        SubOp::RmsNormReduce { eps } => {
+            let [x_in] = inputs.expect_a1("RmsNormReduce");
+            // Patch 1 step (c) of SPLIT_OVERSIZED_HANDOFF.md:
+            // RmsNormReduce computes inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
+            // and stashes the resulting smem-vec slot in the
+            // LoweringState side channel for downstream RmsNormApply
+            // arms that share this reduce predecessor.
+            //
+            // Per-arm Instrs (single-chunk x — current nb=u32::MAX state;
+            // multi-chunk x lift is queued for after a TK 2.0
+            // sh_tile_row_sum_acc primitive lands):
+            //   1: ShTileMul          x_sq    = x * x
+            //   2: ShTileRowSum       sum_sq  = row_sum(x_sq)
+            //   3: ShVecMulScalar     mean_sq = sum_sq * (1/cols)
+            //   4: ShVecAddScalar     var     = mean_sq + eps
+            //   5: LoadVecSmemToReg   rv_var  = var
+            //   6: RegVecUnaryRsqrt   rv_inv  = rsqrt(rv_var)
+            //   7: StoreRegVecToShmem inv_rms = rv_inv     (side channel)
+            //
+            // The SubtileTape contract requires a tile-shaped Compute
+            // output; we satisfy it by binding `dst_page` and emitting
+            // the trailing StoreAsync, but downstream RmsNormApply arms
+            // read the inv_rms vec via state.rms_inv_rms_vec, NOT via
+            // dst_page contents.
+            //
+            // Multi-chunk-x (nb < hidden_size) panics at proc-macro time
+            // with a named-arm message — Patch 1 step (f) is gated on
+            // adding the `sh_tile_row_sum_acc` primitive (3-arg
+            // accumulating row_sum from smem tile to smem vec). Until
+            // that lands, RmsNormReduce only handles the single-chunk
+            // case (current nb=u32::MAX).
+            //
+            // External x is supported (the very first RmsNorm in a
+            // forward reads the input embedding, an Ext source); for
+            // External we allocate a fresh temp page and load. For
+            // Computed we walk the writer list (asserting len == 1
+            // until the multi-chunk lift).
+            if let ComputeInput::Computed(slots) = x_in {
+                assert_eq!(
+                    slots.len(),
+                    1,
+                    "lower_compute RmsNormReduce: multi-writer Computed x \
+                     (writers={:?}) requires the TK 2.0 sh_tile_row_sum_acc \
+                     primitive (3-arg accumulating row_sum) which has not \
+                     been bound yet — Patch 1 step (c2) of \
+                     SPLIT_OVERSIZED_HANDOFF.md. Currently exercised only \
+                     at nb=u32::MAX (single-chunk x).",
+                    slots,
+                );
+            }
+            let x_page = state.resolve_input_page(x_in, "RmsNormReduce", 0);
+            use crate::tk_tape::{
+                AllConsumersRole, Bf16, GroupWidth, OrthoLayout, RegVecId, SmemTileId,
+                SmemVecId,
+            };
+            let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+            const WL: GroupWidth<1> = GroupWidth::<1>::PER_WARP;
+            const R: AllConsumersRole = AllConsumersRole;
+            let x_sq_page = state.alloc_temp_page();
+            let x_sq = SmemTileId::<128, 128, Bf16>::from_page(x_sq_page);
+            let var_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
+            let inv_rms_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
+            let rv_var: RegVecId<128, Bf16, OrthoLayout> = state.mint_reg_vec();
+            let rv_inv: RegVecId<128, Bf16, OrthoLayout> = state.mint_reg_vec();
+
+            // 1-2: x_sq = x*x; sum_sq = row_sum(x_sq)
+            state.push(Instr::sh_tile_mul(x, x, x_sq, W));
+            state.push(Instr::sh_tile_row_sum(x_sq, var_vec, W));
+            // 3-4: mean = sum_sq / hidden;  var = mean + eps
+            // Note: hidden_size is the FULL input width (= node.inputs[0]
+            // region cols.len), not the page width. With single-chunk x
+            // (assert above), they are equal — 128.
+            let hidden = node.inputs[0].region.cols.len as f32;
+            state.push(Instr::sh_vec_mul_scalar(
+                var_vec,
+                var_vec,
+                crate::tk_tape::ScalarF32::new(1.0 / hidden),
+                W,
+            ));
+            state.push(Instr::sh_vec_add_scalar(
+                var_vec,
+                var_vec,
+                crate::tk_tape::ScalarF32::new(*eps),
+                W,
+            ));
+            // 5-7: rv_var = load(var); rv_inv = rsqrt; store inv_rms
+            state.push(Instr::load_vec_smem_to_reg(var_vec, rv_var, WL, R));
+            state.push(Instr::reg_vec_unary_rsqrt(rv_var, rv_inv, WL, R));
+            state.push(Instr::store_reg_vec_to_shmem(rv_inv, inv_rms_vec, WL, R));
+
+            // Side-channel: stash inv_rms_vec slot for downstream
+            // RmsNormApply nodes sharing this reduce.
+            state.rms_inv_rms_vec.insert(node_id, inv_rms_vec);
+
+            // Satisfy the SubtileTape contract — emit a placeholder
+            // StoreAsync for the IR-level [m, 1] output region. The
+            // dst_page contents are unused; the StoreAsync exists so
+            // the page-ready barrier sequencing matches every other
+            // Compute Instr (RmsNormApply waits on this barrier as a
+            // dependency anchor before reading the side-channelled
+            // inv_rms_vec).
+            emit_store_and_arrive(state, &node.output, dst_page);
+        }
+        SubOp::RmsNormApply => {
+            let [x_in, inv_rms_in, gamma_in] = inputs.expect_a3("RmsNormApply");
+            // Patch 1 step (c): per-chunk apply.
+            //   y[m, chunk] = x[m, chunk] * inv_rms[per row] * gamma[per col]
+            //
+            // Single-writer x (the upstream Linear/Add tile k aligned
+            // by nb) and single-writer inv_rms (from RmsNormReduce).
+            // gamma is loaded externally per chunk.
+            //
+            // Plan §"Per-SubOp Instr counts" tail (4 Instrs):
+            //   1: ShTileMulRow       x_norm = x * inv_rms (per-row)
+            //   2: ShTileMulCol       y      = x_norm * gamma (per-col)
+            //
+            // Look up the upstream RmsNormReduce's side-channelled
+            // inv_rms vec slot. inv_rms_in is `Computed(Vec<SlotId>)`
+            // with a single writer (the reduce node).
+            let reduce_node_id = match inv_rms_in {
+                ComputeInput::Computed(slots) => {
+                    assert_eq!(
+                        slots.len(),
+                        1,
+                        "lower_compute RmsNormApply inv_rms must be \
+                         single-writer (writers={:?}); the upstream \
+                         RmsNormReduce produces exactly one node",
+                        slots,
+                    );
+                    *state
+                        .slot_writer_node
+                        .get(&slots[0].index())
+                        .expect(
+                            "lower_compute RmsNormApply inv_rms slot has no \
+                             recorded writer node — slot_writer_node map \
+                             must be populated as Compute Instrs lower",
+                        )
+                }
+                ComputeInput::External { .. } => panic!(
+                    "lower_compute RmsNormApply inv_rms is External; \
+                     must come from a sibling RmsNormReduce node"
+                ),
+            };
+            let inv_rms_vec = *state.rms_inv_rms_vec.get(&reduce_node_id).expect(
+                "lower_compute RmsNormApply: no inv_rms vec stashed by the \
+                 upstream RmsNormReduce node — side channel population \
+                 in the RmsNormReduce arm must run first",
+            );
+
+            // x and gamma resolved through the standard single-writer
+            // path; inv_rms_in's tile-page is consumed only as a
+            // barrier-wait dependency (the actual data lives in
+            // inv_rms_vec, side-channelled).
+            let x_page = state.resolve_input_page(x_in, "RmsNormApply", 0);
+            let _inv_rms_page =
+                state.resolve_input_page(inv_rms_in, "RmsNormApply", 1);
+            let gamma_page =
+                state.resolve_input_page(gamma_in, "RmsNormApply", 2);
+
+            use crate::tk_tape::{Bf16, GroupWidth, SmemTileId, SmemVecId};
+            let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
+            let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
+            const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
+
+            // Gamma vec (per-col broadcast). Same SmemVecId pattern as
+            // the whole-RmsNorm arm; the external gamma_page anchors
+            // predecessor coverage but the col-vec form rides the
+            // dedicated SmemVecSlot.
+            let gamma_vec: SmemVecId<128, Bf16> = state.mint_smem_vec();
+            let _ = gamma_page;
+
+            // 1: x_norm = x * inv_rms (per-row broadcast)
+            state.push(Instr::sh_tile_mul_row(x, inv_rms_vec, dst, W));
+            // 2: y = x_norm * gamma (per-col broadcast)
             state.push(Instr::sh_tile_mul_col(dst, gamma_vec, dst, W));
 
             emit_store_and_arrive(state, &node.output, dst_page);

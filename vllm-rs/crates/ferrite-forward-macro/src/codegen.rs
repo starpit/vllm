@@ -6109,9 +6109,14 @@ fn dump_wavefront_mega(
         // .cu (which is what the audit flagged). See
         // SPLIT_OVERSIZED_HANDOFF.md for the design.
         let nb = NonZeroU32::new(u32::MAX).expect("u32::MAX != 0");
-        let rg = ferrite_wavefront::subtile_ir::lower_region::<
+        let rg_whole = ferrite_wavefront::subtile_ir::lower_region::<
             ferrite_wavefront::subtile_ir::LlamaShape8x64,
         >(&fused, nb);
+        // Patch 1 step (c) of SPLIT_OVERSIZED_HANDOFF.md: rewrite each
+        // SubOp::RmsNorm into 1 RmsNormReduce + N RmsNormApply chunks.
+        // Applied here (CUDA path only) — the Metal mega::serialize
+        // pipeline shares lower_region above and keeps RmsNorm whole.
+        let rg = ferrite_wavefront::subtile_ir::decompose_rmsnorm(&rg_whole, nb);
         match ferrite_wavefront::subtile_ir::ValidatedGraph::new(&rg) {
             Ok(valid) => {
                 let subtile_tape = ferrite_wavefront::subtile_tape::lower_dag_to_tape(&valid);

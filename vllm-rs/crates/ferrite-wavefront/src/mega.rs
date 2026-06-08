@@ -1370,6 +1370,22 @@ impl<'a, F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvCacheShape> Ser
                 detail: "standalone Mul — fuse Silu+Mul into SiluMul before scheduling",
             }),
             SubOp::SumReduce => self.emit_sum_reduce(node),
+            // Patch 1 step (c): the chunked-RmsNorm decomposition
+            // (RmsNormReduce + RmsNormApply) is produced only by
+            // `subtile_ir::lower_region` — the partition pipeline that
+            // feeds mega.rs uses `lower_partitioned`, which keeps
+            // RmsNorm whole. These arms are structurally unreachable
+            // from the partition path.
+            SubOp::RmsNormReduce { .. } => Err(SerializeError::UnsupportedOp {
+                id: node.id.0,
+                detail: "RmsNormReduce — produced by lower_region only; \
+                         partition lowering uses whole RmsNorm",
+            }),
+            SubOp::RmsNormApply => Err(SerializeError::UnsupportedOp {
+                id: node.id.0,
+                detail: "RmsNormApply — produced by lower_region only; \
+                         partition lowering uses whole RmsNorm",
+            }),
         }
     }
 

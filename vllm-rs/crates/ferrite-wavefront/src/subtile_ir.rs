@@ -535,7 +535,34 @@ pub enum SubOp<F: RopeForm = NeoX, K: KvCacheShape = LlamaShape8x64> {
     /// RMS-norm over each row: `out[i] = x[i] / rms(x[i,:]) * weight`,
     /// `rms = sqrt(mean(x²) + eps)`. `inputs[0]` = x `[rows, cols]`,
     /// `inputs[1]` = weight `[1, cols]`.
+    ///
+    /// **Whole** form. Lower-stage decomposes into [`SubOp::RmsNormReduce`]
+    /// (one reduce node) + N [`SubOp::RmsNormApply`] nodes (one per
+    /// chunk of `cols`) when `nb < cols` (Patch 1 step (c) of
+    /// `SPLIT_OVERSIZED_HANDOFF.md`); the whole form is kept as a
+    /// canonical IR-level op for the eval_node host reference and the
+    /// `LoweredOp::RmsNorm` translation path that pre-decomposition
+    /// callers (validate-only tests, partition lowering) consume.
     RmsNorm { eps: f32 },
+    /// Phase 1 of chunked RmsNorm: reads x `[m, hidden]` (whole),
+    /// computes `inv_rms[i] = 1 / sqrt(mean(x[i,:]^2) + eps)`. Output
+    /// region is `[m, 1]` — a per-row scalar (the inv-RMS vector). The
+    /// host eval is identical to `1 / sqrt(mean_sq + eps)` over the
+    /// whole input row.
+    ///
+    /// `inputs[0]` = x `[m, hidden]`. The lower_compute side channels
+    /// the inv_rms vec via `LoweringState` so that downstream
+    /// [`SubOp::RmsNormApply`] nodes can broadcast it without a tile-
+    /// shaped re-store.
+    RmsNormReduce { eps: f32 },
+    /// Phase 2 of chunked RmsNorm: per-chunk apply.
+    /// `inputs[0]` = x chunk `[m, chunk_cols]`,
+    /// `inputs[1]` = inv_rms `[m, 1]` (the producing
+    /// [`SubOp::RmsNormReduce`] node's output region; lower_compute
+    /// reads the side-channelled smem-vec slot, not this tile-region),
+    /// `inputs[2]` = gamma chunk `[1, chunk_cols]`.
+    /// Output: `y[m, chunk_cols] = x * inv_rms[per row] * gamma[per col]`.
+    RmsNormApply,
     /// Rotary embedding over `[rows, heads * head_dim]` in the
     /// `F: RopeForm` pairing. `inputs[0]` = x, `inputs[1]` = cos row,
     /// `inputs[2]` = sin row.
@@ -788,6 +815,40 @@ pub fn eval_node<F: RopeForm, K: KvCacheShape>(
             }
             out
         }
+        SubOp::RmsNormReduce { eps } => {
+            // Phase 1: compute inv_rms[i] = 1/sqrt(mean(x[i,:]^2) + eps).
+            // Output is `[m, 1]` — one scalar per row.
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            debug_assert_eq!(out_rows, xr, "rms_reduce out_rows vs x rows");
+            debug_assert_eq!(out_cols, 1, "rms_reduce output must be [m, 1]");
+            let (m, d) = (xr as usize, xc as usize);
+            let mut out = vec![0f32; m];
+            for i in 0..m {
+                let row = &x[i * d..(i + 1) * d];
+                let sum_sq: f32 = row.iter().map(|&v| v * v).sum();
+                out[i] = 1.0 / (sum_sq / d as f32 + eps).sqrt();
+            }
+            out
+        }
+        SubOp::RmsNormApply => {
+            // Phase 2: y[m, chunk_cols] = x * inv_rms[per row] * gamma[per col].
+            let (x, xr, xc) = gather(&node.inputs[0], graph, bufs);
+            let (inv_rms, ir, ic) = gather(&node.inputs[1], graph, bufs);
+            let (gamma, _gr, gc) = gather(&node.inputs[2], graph, bufs);
+            debug_assert_eq!((xr, xc), (out_rows, out_cols), "rms_apply x shape");
+            debug_assert_eq!(ir, out_rows, "rms_apply inv_rms rows");
+            debug_assert_eq!(ic, 1, "rms_apply inv_rms cols must be 1");
+            debug_assert_eq!(gc, out_cols, "rms_apply gamma cols");
+            let (m, d) = (xr as usize, xc as usize);
+            let mut out = vec![0f32; m * d];
+            for i in 0..m {
+                let inv = inv_rms[i];
+                for j in 0..d {
+                    out[i * d + j] = x[i * d + j] * inv * gamma[j];
+                }
+            }
+            out
+        }
         // RopeAppend's host eval is rotation only (identical to RopeRotate);
         // its V input + the paged-cache write are GPU-only.
         SubOp::RopeRotate { head_dim, _form: _ }
@@ -1010,6 +1071,8 @@ pub fn validate<F: RopeForm, K: KvCacheShape>(graph: &SubtileIR<F, K>) -> Result
             SubOp::Elementwise(EwKind::Mul | EwKind::Add) => arity == 2,
             SubOp::SiluMul => arity == 2,
             SubOp::RmsNorm { .. } => arity == 2,
+            SubOp::RmsNormReduce { .. } => arity == 1,
+            SubOp::RmsNormApply => arity == 3,
             SubOp::RopeRotate { .. } => arity == 3,
             // E.12: RopeAppend takes [K, cos, sin, V, K_cache, V_cache]
             // — the K_cache / V_cache are per-layer PrefixK / PrefixV
@@ -1392,6 +1455,173 @@ pub fn lower_region<K: KvCacheShape>(input: &crate::lower::LoweringInput, nb: st
         num_sources,
         nodes,
         result: op_tensor[input.result],
+    }
+}
+
+/// Patch 1 step (c) of `SPLIT_OVERSIZED_HANDOFF.md`: rewrite a
+/// `SubtileIR` so every `SubOp::RmsNorm` becomes
+/// `SubOp::RmsNormReduce` (1 node, output `[m, 1]`) plus
+/// `n_blocks(hidden, nb)` `SubOp::RmsNormApply` nodes (one per chunk
+/// of the original output's `cols`).
+///
+/// Operates on a built `SubtileIR<F, K>` rather than inside
+/// [`lower_region`] because the Metal `mega::serialize` backend
+/// shares `lower_region` with the CUDA pipeline and only the CUDA
+/// path's `lower_subtile_tape_to_tk_tape` knows the new SubOps. The
+/// CUDA codegen probe runs `lower_region` then `decompose_rmsnorm`;
+/// the Metal path leaves it whole.
+///
+/// Tensor renumbering: the inv_rms tensor for each replaced RmsNorm
+/// is appended at the end of `tensors`, so existing `TensorId`
+/// references in subsequent nodes are preserved verbatim.
+///
+/// Node renumbering: every replaced RmsNorm grows by `n_apply` nodes;
+/// downstream nodes' positions shift accordingly. The only embedded
+/// `SubtileId` reference outside the linear ordering is
+/// [`KvCacheProducer::SameForwardRopeAppend::producer_node_idx`] on
+/// `SubOp::AttnDecode`; this pass remaps it through `new_id_for_old`.
+pub fn decompose_rmsnorm<F: RopeForm, K: KvCacheShape>(
+    graph: &SubtileIR<F, K>,
+    nb: std::num::NonZeroU32,
+) -> SubtileIR<F, K> {
+    // Pass 1: build new_id_for_old[i] = the new SubtileId that the
+    // node at old position i maps to. For RmsNorm, this is the id of
+    // the reduce node (the apply nodes follow immediately after).
+    let mut new_id_for_old: Vec<u32> = Vec::with_capacity(graph.nodes.len());
+    let mut next_new_id: u32 = 0;
+    for node in &graph.nodes {
+        new_id_for_old.push(next_new_id);
+        if matches!(node.op, SubOp::RmsNorm { .. }) {
+            let hidden = node.output.region.cols.len;
+            let n_apply = n_blocks(hidden, nb).len() as u32;
+            next_new_id += 1 + n_apply;
+        } else {
+            next_new_id += 1;
+        }
+    }
+
+    // Pass 2: emit the rewritten nodes.
+    let mut tensors = graph.tensors.clone();
+    let mut nodes: Vec<SubtileNode<F, K>> = Vec::with_capacity(next_new_id as usize);
+    for node in &graph.nodes {
+        match node.op {
+            SubOp::RmsNorm { eps } => {
+                let x_in = node.inputs[0].clone();
+                let gamma_in = node.inputs[1].clone();
+                let y_out = node.output;
+                let m = y_out.region.rows.len;
+                let hidden = y_out.region.cols.len;
+
+                let inv_rms_t = TensorId(tensors.len() as u32);
+                tensors.push(TensorShape { rows: m, cols: 1 });
+
+                // 1 RmsNormReduce: reads x (whole), writes inv_rms (whole).
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: SubOp::RmsNormReduce { eps },
+                    inputs: vec![x_in.clone()],
+                    output: TensorRegion {
+                        tensor: inv_rms_t,
+                        region: Region {
+                            rows: Range::new(0, m),
+                            cols: Range::new(0, 1),
+                        },
+                    },
+                });
+
+                // N RmsNormApply: chunked along cols.
+                let x_col_start = x_in.region.cols.start;
+                let gamma_col_start = gamma_in.region.cols.start;
+                let y_col_start = y_out.region.cols.start;
+                for blk in n_blocks(hidden, nb) {
+                    nodes.push(SubtileNode {
+                        id: SubtileId(nodes.len() as u32),
+                        op: SubOp::RmsNormApply,
+                        inputs: vec![
+                            TensorRegion {
+                                tensor: x_in.tensor,
+                                region: Region {
+                                    rows: x_in.region.rows,
+                                    cols: Range::new(x_col_start + blk.start, blk.len),
+                                },
+                            },
+                            TensorRegion {
+                                tensor: inv_rms_t,
+                                region: Region {
+                                    rows: Range::new(0, m),
+                                    cols: Range::new(0, 1),
+                                },
+                            },
+                            TensorRegion {
+                                tensor: gamma_in.tensor,
+                                region: Region {
+                                    rows: gamma_in.region.rows,
+                                    cols: Range::new(gamma_col_start + blk.start, blk.len),
+                                },
+                            },
+                        ],
+                        output: TensorRegion {
+                            tensor: y_out.tensor,
+                            region: Region {
+                                rows: y_out.region.rows,
+                                cols: Range::new(y_col_start + blk.start, blk.len),
+                            },
+                        },
+                    });
+                }
+            }
+            SubOp::AttnDecode {
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                layout,
+                producer,
+                softmax_state,
+            } => {
+                // Remap the KvCacheProducer's stored producer node id
+                // so an upstream RopeAppend's new SubtileId stays
+                // referenceable after RmsNorm decomposition shifts ids.
+                let new_producer = match producer {
+                    KvCacheProducer::SameForwardRopeAppend {
+                        producer_node_idx,
+                        ..
+                    } => KvCacheProducer::from_rope_append(
+                        new_id_for_old[producer_node_idx as usize],
+                    ),
+                    KvCacheProducer::PrePopulatedExt { .. } => producer,
+                };
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: SubOp::AttnDecode {
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        scale,
+                        layout,
+                        producer: new_producer,
+                        softmax_state,
+                    },
+                    inputs: node.inputs.clone(),
+                    output: node.output,
+                });
+            }
+            _ => {
+                nodes.push(SubtileNode {
+                    id: SubtileId(nodes.len() as u32),
+                    op: node.op,
+                    inputs: node.inputs.clone(),
+                    output: node.output,
+                });
+            }
+        }
+    }
+
+    SubtileIR {
+        tensors,
+        num_sources: graph.num_sources,
+        nodes,
+        result: graph.result,
     }
 }
 
@@ -1819,17 +2049,19 @@ mod tests {
         }
     }
 
-    /// Whole-tensor producer feeding an N-tiled consumer: when the
-    /// upstream op stays whole (current state for RmsNorm and other
-    /// non-tiled ops), each downstream elementwise tile finds the SOLE
-    /// whole-tensor writer as its predecessor — single-writer, no
-    /// EdgeMismatch.
+    /// Chunked RmsNorm decomposition feeding a tiled Mul consumer:
+    /// `decompose_rmsnorm` rewrites RmsNorm into 1 RmsNormReduce + N
+    /// RmsNormApply (one per chunk). Each downstream Mul tile lines
+    /// up with one Apply tile (single-writer). Reduce is the sole
+    /// writer of `inv_rms_t`, read by every Apply.
     ///
-    /// Step (b) of `SPLIT_OVERSIZED_HANDOFF.md`: covers the asymmetric
-    /// alignment case (whole producer → tiled consumer) that step (a)'s
-    /// multi-writer plumbing must continue to handle once nb < u32::MAX.
+    /// Step (c) of `SPLIT_OVERSIZED_HANDOFF.md`: pins the rewrite's
+    /// node count + per-tile predecessor edges. lower_region itself
+    /// is unchanged (Metal mega::serialize-compatible); the CUDA
+    /// codegen probe applies decompose_rmsnorm before
+    /// `lower_dag_to_tape`.
     #[test]
-    fn whole_producer_feeds_tiled_consumer() {
+    fn decompose_rmsnorm_rewrites_into_reduce_plus_apply_chunks() {
         let (m, k) = (1u32, 6u32);
         let input = crate::lower::LoweringInput {
             sources: vec![
@@ -1850,20 +2082,45 @@ mod tests {
             ],
             result: 1,
         };
-        let g =
-            lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(2).unwrap());
+        let nb = std::num::NonZeroU32::new(2).unwrap();
+        let g_whole = lower_region::<TestShape2x4>(&input, nb);
+        // Pre-decomposition: 1 whole RmsNorm + 3 Mul tiles.
+        assert_eq!(g_whole.nodes.len(), 4, "pre-decompose: 1 rms + 3 mul");
+
+        let g = decompose_rmsnorm(&g_whole, nb);
         let preds = predecessors(&g);
-        // 1 RmsNorm (whole) + 3 Mul tiles. Total 4 nodes.
-        assert_eq!(g.nodes.len(), 4, "expected 1 RmsNorm + 3 Mul tiles");
-        assert!(preds[0].is_empty(), "RmsNorm reads only sources");
-        // Each Mul tile reads cols of RmsNorm output via its single
-        // whole-tensor writer (RmsNorm node 0). predecessors()
-        // dedupes the two identical input refs to a single entry.
-        for tile in 1..4 {
+        // Post-decomposition: 1 RmsNormReduce (id 0) + 3 RmsNormApply
+        // (ids 1,2,3) + 3 Mul tiles (ids 4,5,6). Total 7 nodes.
+        assert_eq!(
+            g.nodes.len(),
+            7,
+            "post-decompose: 1 reduce + 3 apply + 3 mul tiles"
+        );
+        assert!(matches!(g.nodes[0].op, SubOp::RmsNormReduce { .. }));
+        for i in 1..4 {
+            assert!(matches!(g.nodes[i].op, SubOp::RmsNormApply));
+        }
+        // Reduce reads only sources (x).
+        assert!(preds[0].is_empty(), "RmsNormReduce reads only sources");
+        // Each Apply reads the inv_rms tensor (whole) → single
+        // predecessor = RmsNormReduce. (x and gamma are sources, so
+        // they contribute no node preds.)
+        for apply in 1..4 {
             assert_eq!(
-                preds[tile],
+                preds[apply],
                 vec![SubtileId(0)],
-                "Mul tile {} must depend on the sole RmsNorm writer",
+                "RmsNormApply {} reads inv_rms from the sole reduce writer",
+                apply,
+            );
+        }
+        // Each Mul tile k reads cols [k*2..(k+1)*2] of out_t — exactly
+        // the region written by RmsNormApply tile k (id 1+k).
+        for tile in 0..3 {
+            assert_eq!(
+                preds[4 + tile],
+                vec![SubtileId(1 + tile as u32)],
+                "Mul tile {} depends on RmsNormApply tile {}",
+                tile,
                 tile,
             );
         }

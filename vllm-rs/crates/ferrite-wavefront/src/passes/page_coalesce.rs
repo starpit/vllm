@@ -544,10 +544,14 @@ fn rewrite_prelude_pages(prelude: &mut [crate::tk_tape::PreludeDecl], remap: &BT
 /// the substrate's `__shared__` capacity requirement by reusing
 /// physical pages whose contents are dead.
 ///
-/// **Postcondition (validator-checked):** every `PageId` referenced
-/// by an Instr (or by a `PreludeDecl::SmemTilePtr`) is in
-/// `[0, NUM_PAGES)`. Enforced by construction in [`coalesce`] which
-/// panics with a liveness diagnostic if the cap is exceeded.
+/// **Postcondition (in-pass-checked, NOT validator-checked):** every
+/// `PageId` referenced by an Instr (or by a `PreludeDecl::SmemTilePtr`)
+/// is in `[0, NUM_PAGES)`. Enforced by construction in [`coalesce`]
+/// which panics with a liveness diagnostic if the cap is exceeded,
+/// plus a defensive walk at the end of this fn that asserts the
+/// remap covers every reference. `validate_tk_tape` does NOT cross-
+/// check this — it is stage-blind and pre-coalesce tapes legitimately
+/// hold PageIds beyond NUM_PAGES (audit 2026-06-08 finding #13).
 pub fn page_coalesce_pass(tape: &mut TkTape) {
     let ranges = compute_liveness(&tape.instrs);
     if ranges.is_empty() {

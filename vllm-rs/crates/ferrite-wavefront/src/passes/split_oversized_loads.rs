@@ -138,8 +138,14 @@ const _: () = assert!(
 /// `Instr::LoadAsync` whose consumer is a `WgmmaMmaAB_RegSmem` Gemm
 /// emit-sequence.
 ///
-/// **Postcondition (validator-checked):** every `Instr::LoadAsync`
-/// in the post-pass tape has `tile.byte_size() <= PAGE_SIZE`.
+/// **Postcondition (in-pass-checked, NOT validator-checked):** every
+/// `Instr::LoadAsync` in the post-pass tape has
+/// `tile.byte_size() <= PAGE_SIZE`. Enforced by the defensive walk at
+/// the end of this fn. `validate_tk_tape` does NOT cross-check this —
+/// pre-pass tapes legitimately hold oversized External LoadAsyncs
+/// (the conservative lowering emits them; this pass rewrites them).
+/// Audit 2026-06-08 finding #13 documented the prior "validator-
+/// checked" claim as drift.
 pub fn split_oversized_loads_pass(tape: &mut TkTape) {
     // Mint loop vars from `max_existing + 1` so the rewrites don't
     // collide with the lowering's own `LoopVarId`s (e.g., AttnDecode

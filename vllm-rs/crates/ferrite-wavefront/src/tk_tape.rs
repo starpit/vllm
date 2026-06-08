@@ -4879,17 +4879,204 @@ pub enum TkValidationError {
         expect_at: usize,
         load_at: usize,
     },
+    /// Instr at index `at` references `RegTileSlot(slot)` which is
+    /// NOT a key in `tape.reg_tile_arena`. Producer (typed
+    /// `RegTileId<R, C, T, L>` constructor) is supposed to insert into
+    /// the arena at mint time; this error means the slot was either
+    /// minted via a path that bypassed the typed constructor, or a
+    /// pass evicted the arena entry while leaving an Instr reference
+    /// intact. Player would emit `rt_<slot>` referencing an
+    /// undeclared identifier — nvcc compile error or silent UB on
+    /// id collision. Per audit 2026-06-08 finding #9: previously
+    /// rt_alias_pass declared this postcondition as "validator-
+    /// checked" but the validator never actually inspected it; the
+    /// only enforcement was a unit test. This variant + the check
+    /// in `walk` close that gap.
+    RegTileSlotNotInArena { slot: u16, at: usize },
 }
 
 /// Validate a [`TkTape`]. Runs at the exit of `lower_subtile_tape_to_tk_tape` and
 /// after every TkTape→TkTape optimizer pass.
+///
+/// **Invariants checked (stage-invariant — hold throughout the pipeline):**
+/// - `MissingFenceBeforeArrive`: a `PageBarrierArrive(Done)` on a page with
+///   an in-flight `StoreAsync` not preceded by `ThreadfenceDevice` /
+///   `ThreadfenceSystem` / `WaitGroupBulk{n: 0}`.
+/// - `TmaExpectLoadShapeMismatch`: a `TmaExpect{Ready, tile}` paired with
+///   a subsequent `LoadAsync` on the same `barrier_page` that carries a
+///   different tile shape.
+/// - `RegTileSlotNotInArena`: any `RegTileSlot` referenced by an Instr
+///   that is absent from `tape.reg_tile_arena`. This was previously
+///   claimed as a "validator-checked" postcondition of `rt_alias_pass`
+///   in the pass's module doc, but the check was never actually wired
+///   here — only verified by a unit test (audit 2026-06-08 finding #9).
+///
+/// **Invariants NOT checked here** (enforced by the producing pass's
+/// own in-pass postcondition walk; the validator is stage-blind so it
+/// cannot run them between passes that haven't yet produced the
+/// invariant):
+/// - `LoadAsync.tile.byte_size() <= PAGE_SIZE` — postcondition of
+///   `passes::split_oversized_loads_pass`. Before that pass runs the
+///   conservative lowering deliberately emits oversized External loads
+///   that the pass rewrites; checking this here would fire spuriously
+///   between the lowering and the pass. The pass's defensive walk at
+///   the end of its body catches violations.
+/// - `PageId.0 < NUM_PAGES` — postcondition of
+///   `passes::page_coalesce_pass`. The conservative lowering mints
+///   fresh PageIds well past `NUM_PAGES` (~68 on Llama-3.2-1B); the
+///   coalesce pass remaps them onto the cap. Same rationale.
 pub fn validate_tk_tape(tape: &TkTape) -> Result<(), Vec<TkValidationError>> {
     let mut errors = Vec::new();
     walk(&tape.instrs, &mut WalkState::new(), &mut errors);
+    check_reg_tile_arena_membership(tape, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// For every `RegTileSlot` referenced by an Instr, assert
+/// `slot ∈ tape.reg_tile_arena`. Closes audit 2026-06-08 finding #9.
+///
+/// The exhaustive variant list mirrors `passes::rt_alias::instr_rt_accesses`
+/// — both must list the SAME rt-bearing variants, and adding a new
+/// rt-bearing variant requires updating BOTH (rustc E0004 at each
+/// site, no `_ => {}` catch-all).
+fn check_reg_tile_arena_membership(tape: &TkTape, errors: &mut Vec<TkValidationError>) {
+    let arena = &tape.reg_tile_arena;
+    let mut report = |slot: RegTileSlot, at: usize, errors: &mut Vec<TkValidationError>| {
+        if !arena.contains_key(&slot) {
+            errors.push(TkValidationError::RegTileSlotNotInArena {
+                slot: slot.0,
+                at,
+            });
+        }
+    };
+    for (at, instr) in tape.instrs.iter().enumerate() {
+        match instr {
+            // ── rt-bearing variants ──────────────────────────────────
+            Instr::LoadShmemToReg { dst, .. } => report(*dst, at, errors),
+            Instr::LoadShmemToRegFromAct { dst, .. } => report(*dst, at, errors),
+            Instr::StoreRegTileToShmem { src, .. } => report(*src, at, errors),
+            Instr::LoadShmemSubTileToReg { dst, .. } => report(*dst, at, errors),
+            Instr::StoreRegTileSubTileToShmem { src, .. } => report(*src, at, errors),
+            Instr::InitRtZero { dst, .. } => report(*dst, at, errors),
+            Instr::WgmmaFenceAcc { d, .. } => report(*d, at, errors),
+            Instr::WgmmaMmaAB_SmemSmem { d, .. } => report(*d, at, errors),
+            Instr::WgmmaMmaABt_SmemSmem { d, .. } => report(*d, at, errors),
+            Instr::WgmmaMmaAB_RegSmem { a, d, .. } => {
+                report(*a, at, errors);
+                report(*d, at, errors);
+            }
+            Instr::WgmmaMmaABt_RegSmem { a, d, .. } => {
+                report(*a, at, errors);
+                report(*d, at, errors);
+            }
+            Instr::RegTileMulScalar { lhs, dst, .. } => {
+                report(*lhs, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileRowMaxAcc { src, .. } => report(*src, at, errors),
+            Instr::RegTileRowSumAcc { src, .. } => report(*src, at, errors),
+            Instr::RegTileSubRow { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileExp2 { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileDivRow { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileCopyConvert { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileMulRow { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileNeg { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileExp { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileAdd { lhs, rhs, dst, .. } => {
+                report(*lhs, at, errors);
+                report(*rhs, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileSub { lhs, rhs, dst, .. } => {
+                report(*lhs, at, errors);
+                report(*rhs, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileDiv { lhs, rhs, dst, .. } => {
+                report(*lhs, at, errors);
+                report(*rhs, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileMulCol { src, dst, .. } => {
+                report(*src, at, errors);
+                report(*dst, at, errors);
+            }
+            Instr::RegTileAddScalar { lhs, dst, .. } => {
+                report(*lhs, at, errors);
+                report(*dst, at, errors);
+            }
+            // ── Non-rt-bearing variants ──────────────────────────────
+            // Exhaustive listing — no `_ => {}` catch-all. Same shape
+            // (and same rationale) as `passes::rt_alias::instr_rt_accesses`.
+            Instr::SyncthreadsCta { .. }
+            | Instr::SyncthreadsGroup { .. }
+            | Instr::ThreadfenceBlock { .. }
+            | Instr::ThreadfenceDevice { .. }
+            | Instr::ThreadfenceSystem { .. }
+            | Instr::CommitGroupBulk { .. }
+            | Instr::WaitGroupBulk { .. }
+            | Instr::BarrierInit { .. }
+            | Instr::PageBarrierWaitStaticP0 { .. }
+            | Instr::PageBarrierWaitStaticP1 { .. }
+            | Instr::PageBarrierWaitLoopStart0 { .. }
+            | Instr::PageBarrierWaitLoopStart1 { .. }
+            | Instr::PageBarrierArrive { .. }
+            | Instr::ArriveIfRuntimeEven { .. }
+            | Instr::StoreAsyncTyped { .. }
+            | Instr::ShTileMul { .. }
+            | Instr::ShTileAdd { .. }
+            | Instr::ShTileDiv { .. }
+            | Instr::ShTileExp { .. }
+            | Instr::ShTileMulScalar { .. }
+            | Instr::ShTileAddScalar { .. }
+            | Instr::TmaExpect { .. }
+            | Instr::WgmmaAsyncWait { .. }
+            | Instr::InitRvNegInfty { .. }
+            | Instr::InitRvZero { .. }
+            | Instr::RegVecSub { .. }
+            | Instr::RegVecExp2 { .. }
+            | Instr::RegVecMul { .. }
+            | Instr::RegVecCopy { .. }
+            | Instr::LoadVecSmemToReg { .. }
+            | Instr::StoreRegVecToShmem { .. }
+            | Instr::ShTileRowSum { .. }
+            | Instr::ShVecMulScalar { .. }
+            | Instr::ShVecAddScalar { .. }
+            | Instr::RegVecUnaryRsqrt { .. }
+            | Instr::ShTileMulRow { .. }
+            | Instr::ShTileMulCol { .. }
+            | Instr::DebugOpBeginMarker { .. }
+            | Instr::ForLoopOpenConst { .. }
+            | Instr::ForLoopOpenKernelArg { .. }
+            | Instr::ForLoopClose { .. }
+            | Instr::LoadAsync(_)
+            | Instr::StoreAsync(_) => {}
+        }
     }
 }
 
@@ -5073,6 +5260,48 @@ fn walk(instrs: &[Instr], state: &mut WalkState, errors: &mut Vec<TkValidationEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 2026-06-08 finding #9 closure test: a TkTape whose
+    /// Instr stream references a RegTileSlot absent from
+    /// `tape.reg_tile_arena` must produce
+    /// `RegTileSlotNotInArena { slot, at }` from `validate_tk_tape`.
+    /// Previously this postcondition was claimed as "validator-checked"
+    /// in `passes::rt_alias_pass` module doc but the validator never
+    /// looked at it; only a unit test in rt_alias.rs did.
+    #[test]
+    fn validate_tk_tape_flags_dangling_reg_tile_slot() {
+        let mut tape = TkTape::new();
+        // Inject an Instr referencing slot 0 without minting an arena
+        // entry for it. `mint_reg_tile` is the only path that inserts
+        // into `reg_tile_arena`; we deliberately skip it here.
+        tape.instrs.push(Instr::InitRtZero {
+            dst: RegTileSlot(0),
+            width: GroupWidth::<1>::PER_WARP.tag(),
+            role: WarpRole::AllConsumers,
+        });
+        let errs = validate_tk_tape(&tape).expect_err("dangling slot should fail validation");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                TkValidationError::RegTileSlotNotInArena { slot: 0, at: 0 }
+            )),
+            "expected RegTileSlotNotInArena {{slot:0, at:0}}, got {errs:?}",
+        );
+    }
+
+    /// Once the arena entry exists, the same tape validates cleanly.
+    /// Confirms the check is a proper presence test, not over-eager.
+    #[test]
+    fn validate_tk_tape_accepts_in_arena_reg_tile_slot() {
+        let mut tape = TkTape::new();
+        let slot: RegTileId<32, 128, Bf16, RowLayout> = tape.mint_reg_tile();
+        tape.instrs.push(Instr::init_rt_zero(
+            slot,
+            GroupWidth::<1>::PER_WARP,
+            AllConsumersRole,
+        ));
+        validate_tk_tape(&tape).expect("in-arena slot should validate");
+    }
 
     #[test]
     fn fence_is_five_primitive_instrs() {

@@ -160,7 +160,14 @@ fn instr_rt_accesses(instr: &Instr) -> Vec<(RegTileSlot, SlotAccess)> {
             out.push((*lhs, SlotAccess::Read));
             out.push((*dst, SlotAccess::Write));
         }
-        // No rt-bearing variants
+        // ── Exhaustive non-rt-bearing list ───────────────────────────
+        // No `_ => {}` catch-all. Mirror of `passes::page_coalesce`'s
+        // post-S2 hardening (audit 2026-06-08 finding #14): a future
+        // rt-bearing Instr variant added without an arm above would be
+        // silently absorbed by `_ => {}` and excluded from coalescing,
+        // leaving stale slot ids in the rewritten tape. Making the
+        // match exhaustive turns that into a rustc E0004 at the
+        // `add the variant to tk_tape::Instr` site.
         SyncthreadsCta { .. }
         | SyncthreadsGroup { .. }
         | ThreadfenceBlock { .. }
@@ -169,6 +176,10 @@ fn instr_rt_accesses(instr: &Instr) -> Vec<(RegTileSlot, SlotAccess)> {
         | CommitGroupBulk { .. }
         | WaitGroupBulk { .. }
         | BarrierInit { .. }
+        | PageBarrierWaitStaticP0 { .. }
+        | PageBarrierWaitStaticP1 { .. }
+        | PageBarrierWaitLoopStart0 { .. }
+        | PageBarrierWaitLoopStart1 { .. }
         | PageBarrierArrive { .. }
         | ArriveIfRuntimeEven { .. }
         | StoreAsyncTyped { .. }
@@ -200,12 +211,6 @@ fn instr_rt_accesses(instr: &Instr) -> Vec<(RegTileSlot, SlotAccess)> {
         | ForLoopClose { .. }
         | LoadAsync(_)
         | StoreAsync(_) => {}
-        // Catch-all for any future Instr variants — non-rt-bearing
-        // by default. Adding a rt-bearing variant should explicitly
-        // be added to the match above; this fallback is so a new
-        // non-rt variant (e.g. a sync primitive) doesn't break the
-        // build.
-        _ => {}
     }
     out
 }
@@ -332,13 +337,28 @@ fn coalesce(
     let mut free_pool: Vec<(RegTileSlot, usize, RegTileArenaEntry)> = Vec::new();
 
     for (slot, range) in by_def.iter().copied() {
-        let entry = match arena.get(&slot) {
-            Some(e) => *e,
-            None => {
-                slot_remap.insert(slot, slot);
-                continue;
-            }
-        };
+        // No fail-soft on arena-missing slots. A slot referenced by
+        // an Instr but absent from `tape.reg_tile_arena` is a dangling
+        // reference: the lowering minted a typed `RegTileId<R, C, T, L>`
+        // (which inserts into the arena) and then the Instr cited the
+        // slot id, but somewhere upstream the arena entry was lost. If
+        // we silently identity-remap, the player emits CUDA referencing
+        // an undeclared `rt_<slot>` identifier — nvcc compile error or
+        // (worse) silent UB if the id collides with an unrelated decl.
+        // Audit 2026-06-08 finding #14 closed this fail-soft hole.
+        // Panic at codegen with full context so the upstream hole is
+        // visible at the proc-macro expansion site, not at nvcc time.
+        let entry = *arena.get(&slot).unwrap_or_else(|| panic!(
+            "rt_alias_pass: RegTileSlot({slot:?}) referenced by an Instr at \
+             first_def_idx={first} but absent from tape.reg_tile_arena. \
+             Either the lowering minted the slot via a path that bypasses \
+             the typed RegTileId<...> constructor (which auto-inserts into \
+             the arena), or a prior pass evicted the entry while leaving \
+             the Instr reference intact. Investigate the producer (look \
+             for `mint_reg_tile_slot` calls without RegTileId witness).",
+            slot = slot.0,
+            first = range.first_def,
+        ));
         // A slot's "effective free index" — the first linear idx at
         // which another slot may safely alias its representative:
         //   - non-loop-local slot: its `last_use`
@@ -477,8 +497,56 @@ fn rewrite_instr<F: Fn(&mut RegTileSlot)>(instr: &mut Instr, f: &F) {
             f(lhs);
             f(dst);
         }
-        // No rt-bearing variants
-        _ => {}
+        // ── Exhaustive non-rt-bearing list ───────────────────────────
+        // Same shape and same rationale as `instr_rt_accesses`. Both
+        // matches must stay in lockstep — adding an rt-bearing variant
+        // here without one in `instr_rt_accesses` (or vice-versa)
+        // produces an inconsistent pass: the variant either escapes
+        // liveness tracking or escapes rewriting. The exhaustive list
+        // makes adding a new variant a rustc E0004 at both sites.
+        SyncthreadsCta { .. }
+        | SyncthreadsGroup { .. }
+        | ThreadfenceBlock { .. }
+        | ThreadfenceDevice { .. }
+        | ThreadfenceSystem { .. }
+        | CommitGroupBulk { .. }
+        | WaitGroupBulk { .. }
+        | BarrierInit { .. }
+        | PageBarrierWaitStaticP0 { .. }
+        | PageBarrierWaitStaticP1 { .. }
+        | PageBarrierWaitLoopStart0 { .. }
+        | PageBarrierWaitLoopStart1 { .. }
+        | PageBarrierArrive { .. }
+        | ArriveIfRuntimeEven { .. }
+        | StoreAsyncTyped { .. }
+        | ShTileMul { .. }
+        | ShTileAdd { .. }
+        | ShTileDiv { .. }
+        | ShTileExp { .. }
+        | ShTileMulScalar { .. }
+        | ShTileAddScalar { .. }
+        | TmaExpect { .. }
+        | WgmmaAsyncWait { .. }
+        | InitRvNegInfty { .. }
+        | InitRvZero { .. }
+        | RegVecSub { .. }
+        | RegVecExp2 { .. }
+        | RegVecMul { .. }
+        | RegVecCopy { .. }
+        | LoadVecSmemToReg { .. }
+        | StoreRegVecToShmem { .. }
+        | ShTileRowSum { .. }
+        | ShVecMulScalar { .. }
+        | ShVecAddScalar { .. }
+        | RegVecUnaryRsqrt { .. }
+        | ShTileMulRow { .. }
+        | ShTileMulCol { .. }
+        | DebugOpBeginMarker { .. }
+        | ForLoopOpenConst { .. }
+        | ForLoopOpenKernelArg { .. }
+        | ForLoopClose { .. }
+        | LoadAsync(_)
+        | StoreAsync(_) => {}
     }
     // Suppress unused warnings for LoadSpec / StoreSpec — they are
     // not rt-bearing today but the type imports are kept for parity
@@ -492,8 +560,15 @@ fn rewrite_instr<F: Fn(&mut RegTileSlot)>(instr: &mut Instr, f: &F) {
 /// of `kittens::rt<...> rt_<slot>;` declarations the player emits in
 /// the kernel preamble.
 ///
-/// Postcondition (validator-checked): every `RegTileSlot` referenced
-/// by an Instr exists as a key in `tape.reg_tile_arena`.
+/// **Postcondition (validator-checked):** every `RegTileSlot` referenced
+/// by an Instr exists as a key in `tape.reg_tile_arena`. The check
+/// lives in
+/// [`crate::tk_tape::validate_tk_tape`] →
+/// `check_reg_tile_arena_membership` and emits
+/// [`crate::tk_tape::TkValidationError::RegTileSlotNotInArena`] on
+/// violation. Audit 2026-06-08 finding #9 closed the prior gap where
+/// this was claimed as validator-checked but the validator never
+/// actually inspected it.
 pub fn rt_alias_pass(tape: &mut TkTape) {
     let ranges = compute_liveness(&tape.instrs);
     let remap = coalesce(&ranges, &tape.reg_tile_arena);

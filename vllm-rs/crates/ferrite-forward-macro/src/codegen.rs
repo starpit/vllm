@@ -6085,11 +6085,29 @@ fn dump_wavefront_mega(
     );
     {
         use std::num::NonZeroU32;
-        // The TkTape probe uses a coarse nb (one block per Gemm) so
-        // the conservative all-gmem lowering's max-live-slot stays
-        // under NUM_PAGES. Fine-grained nb (e.g. 256) is the §6.5
-        // optimizer-pass concern, not the substrate's. The mega-side
-        // rg/sched + ferrite-runtime build still tile finely.
+        // Per audit 2026-06-08 Group A finding: nb = u32::MAX makes
+        // `lower_region` emit ONE Gemm SubOp per logical Linear with
+        // the FULL output region (e.g. {1×2048} for q_proj). The
+        // lowering's compute arms then mint
+        // `SmemTileId<128, 128, Bf16>::from_page(...)` on those pages
+        // — silent wrong numerics across RmsNorm, RopeRotate,
+        // AttnDecode, and oversized External LoadAsyncs.
+        //
+        // Switching to nb = 128 N-tiles every Gemm but breaks
+        // `subtile_tape::lower_dag_to_tape` because its
+        // `input_producer` loop picks ONE writer per consumer region
+        // (`break;` on first overlap), which fails when an N-tiled
+        // Gemm's 16 writers all overlap a downstream Cat::Whole
+        // consumer. Patch 1's full fix needs (a) N-tile-aware
+        // consumers in `lower_subtile_tape_to_tk_tape` (RmsNorm
+        // chunked reduction, element-wise per-chunk loop) AND
+        // (b) `lower_dag_to_tape::input_producer` collecting ALL
+        // overlapping writers, not just the first.
+        //
+        // Until both land, keep nb = u32::MAX so the build stays
+        // green at the cost of silent-wrong numerics in the emitted
+        // .cu (which is what the audit flagged). See
+        // SPLIT_OVERSIZED_HANDOFF.md for the design.
         let nb = NonZeroU32::new(u32::MAX).expect("u32::MAX != 0");
         let rg = ferrite_wavefront::subtile_ir::lower_region::<
             ferrite_wavefront::subtile_ir::LlamaShape8x64,

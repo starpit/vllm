@@ -35,6 +35,7 @@ impl OwnedTensor {
         alloc: *mut crate::alloc::CachingAllocator,
         size_bytes: usize,
     ) -> Self {
+        crate::alloc::own_debug::on_own(inner.raw_ptr() as usize);
         Self {
             inner,
             alloc,
@@ -63,6 +64,7 @@ impl OwnedTensor {
     #[cfg(feature = "cuda")]
     pub fn into_gpu_tensor(self) -> GpuTensor {
         let t = self.inner;
+        crate::alloc::own_debug::on_release(t.raw_ptr() as usize);
         unsafe {
             (*self.alloc).unregister_active_block(t.raw_ptr() as usize);
         }
@@ -93,6 +95,7 @@ impl Drop for OwnedTensor {
     fn drop(&mut self) {
         #[cfg(feature = "cuda")]
         unsafe {
+            crate::alloc::own_debug::on_release(self.inner.raw_ptr() as usize);
             (*self.alloc).free(self.inner.raw_ptr(), self.size_bytes);
         }
         #[cfg(feature = "metal")]

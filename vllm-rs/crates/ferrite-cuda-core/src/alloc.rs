@@ -24,6 +24,95 @@ pub use crate::owned_tensor::OwnedTensor;
 pub use crate::raw_mem::RawGpuMem;
 
 // ---------------------------------------------------------------------------
+// Ownership tracker (diagnostic) — env-gated via FERRITE_ALLOC_DEBUG.
+//
+// The teardown abort is a free-list corruption: a block freed twice (two
+// OwnedTensors over one allocation) or re-handed while still owned. This
+// tracker pins the *moment* a second owner appears for a pointer, or alloc
+// hands out a still-owned pointer, and dumps both backtraces — so the failing
+// run names the exact code path instead of aborting opaquely at teardown.
+// Zero cost unless FERRITE_ALLOC_DEBUG is set (one bool check, then return).
+// ---------------------------------------------------------------------------
+pub(crate) mod own_debug {
+    use std::backtrace::Backtrace;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    struct Entry {
+        count: i64,
+        first: String,
+    }
+    static TRACK: OnceLock<Mutex<HashMap<usize, Entry>>> = OnceLock::new();
+
+    fn enabled() -> bool {
+        static EN: OnceLock<bool> = OnceLock::new();
+        *EN.get_or_init(|| std::env::var_os("FERRITE_ALLOC_DEBUG").is_some())
+    }
+    fn track() -> &'static Mutex<HashMap<usize, Entry>> {
+        TRACK.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// A fresh `OwnedTensor` took ownership of `ptr`.
+    pub(crate) fn on_own(ptr: usize) {
+        if !enabled() || ptr == 0 {
+            return;
+        }
+        let Ok(mut m) = track().lock() else { return };
+        let e = m.entry(ptr).or_insert_with(|| Entry {
+            count: 0,
+            first: format!("{}", Backtrace::force_capture()),
+        });
+        e.count += 1;
+        if e.count >= 2 {
+            eprintln!(
+                "[ferrite-alloc] DOUBLE-OWN ptr={ptr:#x} live_owners={}\n\
+                 ---- FIRST owner created at:\n{}\n\
+                 ---- SECOND owner created at:\n{}",
+                e.count,
+                e.first,
+                Backtrace::force_capture()
+            );
+        }
+    }
+
+    /// An `OwnedTensor` for `ptr` was dropped or detached.
+    pub(crate) fn on_release(ptr: usize) {
+        if !enabled() || ptr == 0 {
+            return;
+        }
+        let Ok(mut m) = track().lock() else { return };
+        if let Some(e) = m.get_mut(&ptr) {
+            e.count -= 1;
+            if e.count <= 0 {
+                m.remove(&ptr);
+            }
+        }
+    }
+
+    /// `alloc` is about to hand `ptr` to a fresh `OwnedTensor`; flag it if a
+    /// prior owner still holds this address (re-mint of a live block).
+    pub(crate) fn on_handout(ptr: usize) {
+        if !enabled() || ptr == 0 {
+            return;
+        }
+        let Ok(m) = track().lock() else { return };
+        let info = m
+            .get(&ptr)
+            .filter(|e| e.count > 0)
+            .map(|e| (e.count, e.first.clone()));
+        drop(m);
+        if let Some((cnt, prior)) = info {
+            eprintln!(
+                "[ferrite-alloc] RE-HANDOUT ptr={ptr:#x} still has {cnt} live owner(s)\n\
+                 ---- prior owner created at:\n{prior}\n\
+                 ---- handed out again at:\n{}",
+                Backtrace::force_capture()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Capture mode guard (matches PyTorch's CUDAStreamCaptureModeGuard)
 // ---------------------------------------------------------------------------
 
@@ -540,6 +629,7 @@ impl CachingAllocator {
         let numel: usize = shape.iter().product();
         let size_bytes = numel * dtype.size_bytes();
         let ptr = self.alloc(size_bytes);
+        own_debug::on_handout(ptr as usize);
         let inner = unsafe { GpuTensor::new(ptr, shape, dtype) };
         unsafe { OwnedTensor::from_caching_alloc(inner, self as *mut CachingAllocator, size_bytes) }
     }

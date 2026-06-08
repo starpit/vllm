@@ -198,8 +198,15 @@ pub enum LoopBound {
 /// page (Computed) or a tensor handle (External).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeInput {
-    /// The input was produced by an earlier `Compute` writing this slot.
-    Computed(SlotId),
+    /// The input was produced by one or more earlier `Compute` writes
+    /// covering the consumer's read region. With single-writer producers
+    /// (the pre-N-tile baseline) the vec has length 1; once an N-tiled
+    /// producer (e.g. Gemm with `nb < u32::MAX`) emits one node per
+    /// col-block, every overlapping writer lands in the vec in
+    /// ascending-SubtileId order. Per Patch 1 step (a) of
+    /// `SPLIT_OVERSIZED_HANDOFF.md`. The vec is always non-empty
+    /// (enforced at construction in `lower_dag_to_tape`).
+    Computed(Vec<SlotId>),
     /// The input is a leaf graph-source (model weight, cache handle,
     /// pre-populated KV slot, etc.). Lowering side resolves the tensor
     /// + region against the SubtileIR's source manifest.
@@ -210,14 +217,29 @@ pub enum ComputeInput {
 }
 
 impl ComputeInput {
-    /// Extract the [`SlotId`] for a `Computed` input. Panics with a
-    /// named message for `External` inputs — used by lower_compute
-    /// arms that haven't yet been taught to handle external sources
-    /// (Phase A step 4+ replaces these calls with proper layout-
-    /// witnessed external-source resolution).
-    pub fn expect_computed_slot(&self, arm: &'static str, pos: usize) -> SlotId {
+    /// Single-writer view — returns the sole [`SlotId`] when exactly one
+    /// upstream `Compute` writes this input's region. Panics with a
+    /// named message for `External` inputs (lowering arms that haven't
+    /// learned to resolve external sources yet) and for multi-writer
+    /// `Computed` inputs (lowering arms that haven't been lifted to
+    /// consume per-block predecessor pages yet — Patch 1 (b)-(d) of
+    /// `SPLIT_OVERSIZED_HANDOFF.md`).
+    pub fn expect_single_computed(&self, arm: &'static str, pos: usize) -> SlotId {
         match self {
-            Self::Computed(slot) => *slot,
+            Self::Computed(slots) => {
+                assert_eq!(
+                    slots.len(),
+                    1,
+                    "lower_compute {} input[{}] is multi-writer \
+                     (writers={:?}); this arm has not been lifted to \
+                     multi-page consumption yet (Patch 1 step (b)-(d) \
+                     of SPLIT_OVERSIZED_HANDOFF.md)",
+                    arm,
+                    pos,
+                    slots,
+                );
+                slots[0]
+            }
             Self::External { tensor, region } => panic!(
                 "lower_compute {} input[{}] is External \
                  (tensor={:?}, region={:?}); external-source resolution \
@@ -625,10 +647,15 @@ fn regions_overlap_helper(a: crate::subtile_ir::Region, b: crate::subtile_ir::Re
 }
 
 /// Caller-side input form for [`TapeBuilder::compute_to`]. Mirrors
-/// [`ComputeInput`] but borrows the `SlotWritten` for computed inputs
-/// (so the SlotWritten consumed-once seal stays intact).
+/// [`ComputeInput`] but borrows the `SlotWritten` tokens for computed
+/// inputs (so the SlotWritten consumed-once seal stays intact).
+///
+/// `Computed` carries a `Vec<&SlotWritten>` — one entry per overlapping
+/// upstream writer. With single-writer producers the vec has length 1;
+/// once N-tiled producers emit one node per col-block, every
+/// overlapping writer's `SlotWritten` lands in the vec.
 pub enum ComputeInputBuild<'a> {
-    Computed(&'a SlotWritten),
+    Computed(Vec<&'a SlotWritten>),
     External {
         tensor: crate::subtile_ir::TensorId,
         region: crate::subtile_ir::Region,
@@ -637,7 +664,9 @@ pub enum ComputeInputBuild<'a> {
 
 fn ci_from(b: &ComputeInputBuild<'_>) -> ComputeInput {
     match b {
-        ComputeInputBuild::Computed(w) => ComputeInput::Computed(w.slot),
+        ComputeInputBuild::Computed(ws) => {
+            ComputeInput::Computed(ws.iter().map(|w| w.slot).collect())
+        }
         ComputeInputBuild::External { tensor, region } => ComputeInput::External {
             tensor: *tensor,
             region: *region,
@@ -896,16 +925,19 @@ fn check_edge_coverage<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::KvC
                 // Walk only Computed inputs for edge validation;
                 // External inputs reference graph-source tensors that
                 // have no producer node and contribute no DAG edge.
-                let read_writers: Vec<SubtileId> = inputs
-                    .iter()
-                    .filter_map(|ci| match ci {
-                        ComputeInput::Computed(slot) => writer_of.get(&slot.id).copied(),
-                        ComputeInput::External { .. } => None,
-                    })
-                    .collect();
-                // ComputeInputs::iter() returns Box<dyn Iterator>; the
-                // .collect above forces it to a Vec. Same shape as
-                // before the typed-arity refactor.
+                // Per Patch 1 step (a): each Computed input carries a
+                // Vec<SlotId> of overlapping writers; every entry
+                // contributes one read_writer.
+                let mut read_writers: Vec<SubtileId> = Vec::new();
+                for ci in inputs.iter() {
+                    if let ComputeInput::Computed(slots) = ci {
+                        for slot in slots {
+                            if let Some(w) = writer_of.get(&slot.id).copied() {
+                                read_writers.push(w);
+                            }
+                        }
+                    }
+                }
                 let n_idx = node.0 as usize;
                 if n_idx < preds.len() {
                     let mut expected = preds[n_idx].clone();
@@ -993,32 +1025,45 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::K
         vec![Vec::new(); graph.tensors.len()];
     for node in &graph.nodes {
         let nid = node.id.0;
-        // Track which producer SubtileId is needed per positional input
-        // (None = External / graph source).
-        let mut input_producer: Vec<Option<u32>> = Vec::with_capacity(node.inputs.len());
+        // Per Patch 1 step (a) of SPLIT_OVERSIZED_HANDOFF.md: collect
+        // ALL overlapping writers per consumer-input (not just the
+        // first one). With single-writer producers each list has
+        // length 1; once N-tiled producers emit one node per
+        // col-block, every overlapping writer ends up in the list,
+        // matching the SSA edge validator's expected_preds.
+        //
+        // Empty list = External / graph source.
+        let mut input_producer: Vec<Vec<u32>> = Vec::with_capacity(node.inputs.len());
         for inp in &node.inputs {
             if graph.is_source(inp.tensor) {
-                input_producer.push(None);
+                input_producer.push(Vec::new());
             } else {
-                let mut producer: Option<u32> = None;
+                let mut producers: Vec<u32> = Vec::new();
                 for (wid, wreg) in &writers[inp.tensor.0 as usize] {
                     if regions_overlap_helper(*wreg, inp.region) {
-                        producer = Some(*wid);
-                        break;
+                        producers.push(*wid);
+                        // No `break;` — collect every overlapping writer.
                     }
                 }
-                input_producer.push(producer);
+                assert!(
+                    !producers.is_empty(),
+                    "lower_dag_to_tape: non-source input \
+                     (tensor={:?}, region={:?}) has no overlapping writer; \
+                     SubtileIR validator should have rejected this graph",
+                    inp.tensor,
+                    inp.region,
+                );
+                input_producer.push(producers);
             }
         }
-        // Take SlotWritten tokens for each computed predecessor in
-        // positional order. The same producer can appear at multiple
-        // positions (rare); we re-take only on the LAST positional
-        // reference (consumer_remaining handles consumer accounting).
-        // For now: take once per unique producer; positional refs
-        // share via the resolved-token map.
+        // Take each unique computed predecessor's `SlotWritten` token
+        // exactly once. Multiple positional refs to the same producer
+        // (or the same producer appearing at multiple input positions)
+        // share via the resolved-token map. consumer_remaining is
+        // decremented once per unique producer at the end of the loop.
         let mut taken_tokens: BTreeMap<u32, SlotWritten> = BTreeMap::new();
-        for opt in &input_producer {
-            if let Some(pid) = opt {
+        for prods in &input_producer {
+            for pid in prods {
                 if !taken_tokens.contains_key(pid) {
                     let token = written[*pid as usize].take().expect(
                         "lower_dag_to_tape: predecessor missing live SlotWritten \
@@ -1032,14 +1077,21 @@ pub fn lower_dag_to_tape<F: crate::subtile_ir::RopeForm, K: crate::subtile_ir::K
         let inputs_built: Vec<ComputeInputBuild<'_>> = input_producer
             .iter()
             .zip(node.inputs.iter())
-            .map(|(opt, inp)| match opt {
-                Some(pid) => ComputeInputBuild::Computed(
-                    taken_tokens.get(pid).expect("token taken above"),
-                ),
-                None => ComputeInputBuild::External {
-                    tensor: inp.tensor,
-                    region: inp.region,
-                },
+            .map(|(prods, inp)| {
+                if prods.is_empty() {
+                    ComputeInputBuild::External {
+                        tensor: inp.tensor,
+                        region: inp.region,
+                    }
+                } else {
+                    let writers: Vec<&SlotWritten> = prods
+                        .iter()
+                        .map(|pid| {
+                            taken_tokens.get(pid).expect("token taken above")
+                        })
+                        .collect();
+                    ComputeInputBuild::Computed(writers)
+                }
             })
             .collect();
 
@@ -1411,7 +1463,7 @@ mod tests {
                 Instr::Compute {
                     node: SubtileId(0),
                     writes: mk_slot(0),
-                    inputs: ComputeInputs::A1([ComputeInput::Computed(mk_slot(0))]), // self-read names node 0 as a pred — bogus
+                    inputs: ComputeInputs::A1([ComputeInput::Computed(vec![mk_slot(0)])]), // self-read names node 0 as a pred — bogus
                 },
                 Instr::FreeSlot { slot: mk_slot(0) },
             ],

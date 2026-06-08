@@ -351,8 +351,11 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
                      (would have been caught by validate_subtile_tape)")
     }
 
-    /// Resolve a [`ComputeInput`] to the [`PageId`] holding its data.
-    /// For `Computed`: returns the existing slot→page mapping.
+    /// Resolve a [`ComputeInput`] to the single [`PageId`] holding its
+    /// data. For `Computed`: returns the slot→page mapping for the
+    /// SOLE upstream writer (panics with named `arm` on multi-writer
+    /// inputs — Patch 1 (b)-(d) of `SPLIT_OVERSIZED_HANDOFF.md` lifts
+    /// each arm to consume per-block predecessor pages).
     /// For `External`: allocates a fresh temp page, emits an
     /// `emit_external_load` TMA load to bring the source-tensor
     /// region into that page, and returns the new page.
@@ -361,9 +364,27 @@ impl<'g, F: RopeForm, K: KvCacheShape> LoweringState<'g, F, K> {
     /// per-input external resolution that replaces the broken
     /// "load all externals into dst_page" loop at the top of
     /// lower_compute.
-    fn resolve_input_page(&mut self, input: &ComputeInput) -> PageId {
+    fn resolve_input_page(
+        &mut self,
+        input: &ComputeInput,
+        arm: &'static str,
+        pos: usize,
+    ) -> PageId {
         match input {
-            ComputeInput::Computed(slot) => self.page_of(*slot),
+            ComputeInput::Computed(slots) => {
+                assert_eq!(
+                    slots.len(),
+                    1,
+                    "lower_compute {} input[{}] is multi-writer \
+                     (writers={:?}); this arm has not been lifted to \
+                     multi-page consumption yet (Patch 1 (b)-(d) of \
+                     SPLIT_OVERSIZED_HANDOFF.md)",
+                    arm,
+                    pos,
+                    slots,
+                );
+                self.page_of(slots[0])
+            }
             ComputeInput::External { tensor, region } => {
                 let page = self.alloc_temp_page();
                 self.ephemeral_pages.push(page);
@@ -693,14 +714,18 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
     // same page. External inputs don't have a barrier (they're loaded
     // ahead of time via emit_external_load).
     // Conservative all-gmem path uses parity 0.
+    // Per Patch 1 step (a): each Computed input carries a Vec<SlotId>
+    // of overlapping writers; emit one Wait per writer page.
     for ci in inputs.iter() {
-        if let ComputeInput::Computed(slot) = ci {
-            let p = state.page_of(*slot);
-            state.push(Instr::PageBarrierWaitStaticP0 {
-                page_id: p,
-                kind: PageBarrier::Ready,
-                role: COMPUTE_ROLE,
-            });
+        if let ComputeInput::Computed(slots) = ci {
+            for slot in slots {
+                let p = state.page_of(*slot);
+                state.push(Instr::PageBarrierWaitStaticP0 {
+                    page_id: p,
+                    kind: PageBarrier::Ready,
+                    role: COMPUTE_ROLE,
+                });
+            }
         }
     }
 
@@ -737,8 +762,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //     expected.
             // Per `feedback_ff_subtile_compile_time_inviolable`.
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0, "Elementwise(Mul)", 0));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1, "Elementwise(Mul)", 1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let _ = COMPUTE_ROLE; // role-tag retained for future
                                   // walker-side gating.
@@ -756,8 +781,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // emitted TK 2.0 primitive differs (`group<N>::add` vs
             // `group<N>::mul`).
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
-            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
-            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1));
+            let lhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0, "Elementwise(Add)", 0));
+            let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in1, "Elementwise(Add)", 1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             state.push(Instr::sh_tile_add(
                 lhs,
@@ -790,8 +815,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{Bf16, GroupWidth, SmemTileId};
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             // First add: dst = reads[0] + reads[1]
-            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[0]));
-            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[1]));
+            let r0 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[0], "SumReduce", 0));
+            let r1 = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(&inputs_v[1], "SumReduce", 1));
             state.push(Instr::sh_tile_add(
                 r0,
                 r1,
@@ -799,8 +824,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 GroupWidth::<16>::ALL_CONSUMERS,
             ));
             // Subsequent adds: dst += reads[i]
-            for ci in &inputs_v[2..] {
-                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(ci));
+            for (i, ci) in inputs_v[2..].iter().enumerate() {
+                let rhs = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(ci, "SumReduce", 2 + i));
                 state.push(Instr::sh_tile_add(
                     dst,
                     rhs,
@@ -827,8 +852,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             //   step 4: ShTileDiv     (dst, gate, dst)      // dst = silu(gate)
             //   step 5: ShTileMul     (dst, dst, up)        // dst = silu(gate) * up
             use crate::tk_tape::{Bf16, GroupWidth, ScalarF32, SmemTileId};
-            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(gate_in));
-            let up = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(up_in));
+            let gate = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(gate_in, "SiluMul", 0));
+            let up = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(up_in, "SiluMul", 1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
             // step 1
@@ -866,7 +891,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             use crate::tk_tape::{
                 AllConsumersRole, Bf16, GroupWidth, RegTileId, RowLayout, ScalarF32, SmemTileId,
             };
-            let src = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0));
+            let src = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(in0, "Elementwise(Silu)", 0));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             let rt_x: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
             let rt_neg: RegTileId<128, 128, Bf16, RowLayout> = state.mint_reg_tile();
@@ -926,8 +951,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
             // Resolve each positional input to a page. Computed
             // inputs reuse their producer's page; External inputs
             // get a fresh temp page populated by an emit_external_load.
-            let x_page = state.resolve_input_page(x_in);
-            let gamma_page = state.resolve_input_page(gamma_in);
+            let x_page = state.resolve_input_page(x_in, "RmsNorm", 0);
+            let gamma_page = state.resolve_input_page(gamma_in, "RmsNorm", 1);
             let x = SmemTileId::<128, 128, Bf16>::from_page(x_page);
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1029,14 +1054,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AllConsumersRole, AlignLayout, Bf16, GroupWidth, RegTileId,
                 RegVecId, RowLayout, SmemTileId, SmemVecId,
             };
-            let q_page = state.resolve_input_page(q_in);
+            let q_page = state.resolve_input_page(q_in, "RopeRotate", 0);
             // Resolve cos/sin to External tile pages for predecessor
             // coverage; mint dedicated `SmemVecId<32, Bf16>` slots
             // that the player declares as `__shared__ sv_bf<32> sv_<id>`
             // and the external-load path will route into. Cat 5 of
             // step-8: vec endpoints cannot live in `page_buf[]`.
-            let _cos_page = state.resolve_input_page(cos_in);
-            let _sin_page = state.resolve_input_page(sin_in);
+            let _cos_page = state.resolve_input_page(cos_in, "RopeRotate", 1);
+            let _sin_page = state.resolve_input_page(sin_in, "RopeRotate", 2);
             let cos_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
             let sin_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
             let q_full = SmemTileId::<128, 128, Bf16>::from_page(q_page);
@@ -1141,8 +1166,8 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 AccReset, AllConsumersRole, Bf16, FenceExternal, Fp32,
                 GroupWidth, RegTileId, RoleWitness, RowLayout, SmemTileId,
             };
-            let a = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(a_in));
-            let b = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(b_in));
+            let a = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(a_in, "MatmulTile", 0));
+            let b = SmemTileId::<128, 128, Bf16>::from_page(state.resolve_input_page(b_in, "MatmulTile", 1));
             let dst = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W4: GroupWidth<4> = GroupWidth::<4>::WARPGROUP;
             const W16: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1225,14 +1250,14 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 RegTileId, RegVecId, RowLayout, SmemTileId, SmemVecId,
                 StoreSpec, TileShape, WarpRole,
             };
-            let k_page = state.resolve_input_page(k_in);
+            let k_page = state.resolve_input_page(k_in, "RopeAppend", 0);
             // Cos/sin External pages → predecessor coverage only;
             // dedicated SmemVecId slots for the actual vec ops.
-            let _cos_page = state.resolve_input_page(cos_in);
-            let _sin_page = state.resolve_input_page(sin_in);
+            let _cos_page = state.resolve_input_page(cos_in, "RopeAppend", 1);
+            let _sin_page = state.resolve_input_page(sin_in, "RopeAppend", 2);
             let cos_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
             let sin_vec: SmemVecId<32, Bf16> = state.mint_smem_vec();
-            let v_page = state.resolve_input_page(v_in);
+            let v_page = state.resolve_input_page(v_in, "RopeAppend", 3);
             let k_full = SmemTileId::<128, 128, Bf16>::from_page(k_page);
             let dst_full = SmemTileId::<128, 128, Bf16>::from_page(dst_page);
             const W: GroupWidth<16> = GroupWidth::<16>::ALL_CONSUMERS;
@@ -1377,7 +1402,7 @@ fn lower_compute<F: RopeForm, K: KvCacheShape>(
                 WarpRole,
             };
             // reads = [q_page, k_cache_handle, v_cache_handle, ...]
-            let q_page = state.resolve_input_page(q_in);
+            let q_page = state.resolve_input_page(q_in, "AttnDecode", 0);
             // K and V cache TensorIds come from the layout witness
             // (single source of truth, not from reads[].)
             let k_cache = state.tensor_arg(layout.cache_tensor());

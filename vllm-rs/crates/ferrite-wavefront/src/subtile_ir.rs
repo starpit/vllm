@@ -1764,6 +1764,111 @@ mod tests {
         assert_eq!(preds[5], vec![SubtileId(2)], "silu tile 2 ← matmul block 2");
     }
 
+    /// SiluMul (binary input) with both inputs N-tiled at the same `nb`:
+    /// SiluMul tile k must depend on exactly the matching block of EACH
+    /// upstream producer (gate-block-k AND up-block-k, no others).
+    ///
+    /// Step (b) of `SPLIT_OVERSIZED_HANDOFF.md`: pins the invariant that
+    /// elementwise N-tiling produces aligned per-block predecessor
+    /// edges across both input positions of a binary elementwise op.
+    #[test]
+    fn silu_mul_nblock_aligns_with_two_gemms() {
+        let (m, k, n) = (1u32, 4u32, 6u32);
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape { rows: m, cols: k }, // 0: x  [m, k]
+                SourceShape { rows: k, cols: n }, // 1: Wg [k, n] (gate)
+                SourceShape { rows: k, cols: n }, // 2: Wu [k, n] (up)
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::Gemm { n },
+                    m,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)], // gate = x @ Wg
+                },
+                OpDesc {
+                    op: LoweredOp::Gemm { n },
+                    m,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(2)], // up   = x @ Wu
+                },
+                OpDesc {
+                    op: LoweredOp::SiluMul,
+                    m,
+                    inputs: vec![InputRef::Op(0), InputRef::Op(1)], // SiluMul(gate, up)
+                },
+            ],
+            result: 2,
+        };
+        let g =
+            lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(2).unwrap());
+        let preds = predecessors(&g);
+        // 3 gate matmul blocks (0,1,2) + 3 up matmul blocks (3,4,5)
+        // + 3 silu_mul tiles (6,7,8). Total 9 nodes.
+        assert_eq!(g.nodes.len(), 9, "expected 3+3+3 nodes");
+        // Each silu_mul tile k reads gate-block-k AND up-block-k.
+        // predecessors() returns ascending-id order; gate-block-k = id k,
+        // up-block-k = id k+3.
+        for k in 0..3u32 {
+            let silu_id = 6 + k as usize;
+            let want = vec![SubtileId(k), SubtileId(k + 3)];
+            assert_eq!(
+                preds[silu_id], want,
+                "silu_mul tile {} must depend on gate-block {} + up-block {}",
+                k, k, k,
+            );
+        }
+    }
+
+    /// Whole-tensor producer feeding an N-tiled consumer: when the
+    /// upstream op stays whole (current state for RmsNorm and other
+    /// non-tiled ops), each downstream elementwise tile finds the SOLE
+    /// whole-tensor writer as its predecessor — single-writer, no
+    /// EdgeMismatch.
+    ///
+    /// Step (b) of `SPLIT_OVERSIZED_HANDOFF.md`: covers the asymmetric
+    /// alignment case (whole producer → tiled consumer) that step (a)'s
+    /// multi-writer plumbing must continue to handle once nb < u32::MAX.
+    #[test]
+    fn whole_producer_feeds_tiled_consumer() {
+        let (m, k) = (1u32, 6u32);
+        let input = crate::lower::LoweringInput {
+            sources: vec![
+                SourceShape { rows: m, cols: k }, // 0: x     [m, k]
+                SourceShape { rows: 1, cols: k }, // 1: gamma [1, k]
+            ],
+            ops: vec![
+                OpDesc {
+                    op: LoweredOp::RmsNorm { eps: 1e-6 },
+                    m,
+                    inputs: vec![InputRef::Ext(0), InputRef::Ext(1)],
+                },
+                OpDesc {
+                    op: LoweredOp::Mul,
+                    m,
+                    inputs: vec![InputRef::Op(0), InputRef::Op(0)], // self-mul keeps it elementwise
+                },
+            ],
+            result: 1,
+        };
+        let g =
+            lower_region::<TestShape2x4>(&input, std::num::NonZeroU32::new(2).unwrap());
+        let preds = predecessors(&g);
+        // 1 RmsNorm (whole) + 3 Mul tiles. Total 4 nodes.
+        assert_eq!(g.nodes.len(), 4, "expected 1 RmsNorm + 3 Mul tiles");
+        assert!(preds[0].is_empty(), "RmsNorm reads only sources");
+        // Each Mul tile reads cols of RmsNorm output via its single
+        // whole-tensor writer (RmsNorm node 0). predecessors()
+        // dedupes the two identical input refs to a single entry.
+        for tile in 1..4 {
+            assert_eq!(
+                preds[tile],
+                vec![SubtileId(0)],
+                "Mul tile {} must depend on the sole RmsNorm writer",
+                tile,
+            );
+        }
+    }
+
     #[test]
     fn validate_rejects_uncovered_read() {
         let tensors = vec![

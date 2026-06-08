@@ -216,8 +216,15 @@ fn cuda_build() {
 fn build_cutlass_scaled_mm(cache_dir: &str, rerun_files: &mut Vec<String>) {
     const CUTLASS_COMMIT: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
 
-    let scaled_mm_sources =
-        vec!["../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_c2x_sm89.cu".to_string()];
+    // C2X SM89 (Ada) path + C3X SM90 (Hopper) path. The SM90 .cu always defines
+    // its extern "C" symbols (so the Rust FFI links everywhere), but its real
+    // CUTLASS-3.x body is gated behind ENABLE_SCALED_MM_SM90, set only on sm_90+
+    // build hosts. On those hosts cudaforge auto-detects sm_90a, which the
+    // Hopper FP8 fast-accum schedules require.
+    let scaled_mm_sources = vec![
+        "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_c2x_sm89.cu".to_string(),
+        "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_c3x_sm90.cu".to_string(),
+    ];
     let scaled_mm_watch = [
         "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/common.hpp",
         "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/math.hpp",
@@ -225,12 +232,15 @@ fn build_cutlass_scaled_mm(cache_dir: &str, rerun_files: &mut Vec<String>) {
         "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_c2x_sm89_fp8_dispatch.cuh",
         "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_epilogues_c2x.hpp",
         "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/broadcast_load_epilogue_c2x.hpp",
+        "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_c3x_sm90_fp8_dispatch.cuh",
+        "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/scaled_mm_epilogues_c3x.hpp",
+        "../../crates/vllm-cuda/csrc/cutlass_scaled_mm/broadcast_load_epilogue_c3x.hpp",
     ];
 
     rerun_files.extend(scaled_mm_sources.iter().cloned());
     rerun_files.extend(scaled_mm_watch.iter().map(|s| s.to_string()));
 
-    cudaforge::KernelBuilder::new()
+    let mut builder = cudaforge::KernelBuilder::new()
         .out_dir(cache_dir)
         .source_files(scaled_mm_sources)
         .watch(scaled_mm_watch.iter().map(|s| s.to_string()))
@@ -242,7 +252,11 @@ fn build_cutlass_scaled_mm(cache_dir: &str, rerun_files: &mut Vec<String>) {
         .arg("--expt-relaxed-constexpr")
         .arg("--expt-extended-lambda")
         .arg("-Xcompiler")
-        .arg("-fPIC")
+        .arg("-fPIC");
+    if detect_cuda_arch().parse::<u32>().unwrap_or(0) >= 90 {
+        builder = builder.arg("-DENABLE_SCALED_MM_SM90=1");
+    }
+    builder
         .build_lib(format!("{}/libcutlass_scaled_mm.a", cache_dir))
         .expect("Failed to build cutlass_scaled_mm");
 }

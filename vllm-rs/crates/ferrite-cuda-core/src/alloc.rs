@@ -23,6 +23,21 @@ use std::ptr;
 pub use crate::owned_tensor::OwnedTensor;
 pub use crate::raw_mem::RawGpuMem;
 
+/// Serializes every `CachingAllocator::alloc`/`free` critical section.
+///
+/// The allocator is created and the model is loaded on the main thread, then
+/// the executor that owns it is *moved* to the `vllm-executor` background
+/// thread for the run (core_client.rs). At teardown the executor thread's
+/// `JoinHandle` is detached (never joined), so the background thread drops the
+/// executor + every model `OwnedTensor` (freeing) at the same time the main
+/// thread tears down — two threads mutating `free_blocks` (a `BTreeSet`) with
+/// no synchronization, which corrupts it ("empty internal node", the
+/// deterministic teardown abort). A process-wide lock around the mutating
+/// paths makes those accesses mutually exclusive. It is uncontended during
+/// steady-state execution (only the executor thread allocates), so the cost is
+/// effectively a teardown-time serialization.
+static ALLOC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------------------------------------------------------------------------
 // Ownership tracker (diagnostic) — env-gated via FERRITE_ALLOC_DEBUG.
 //
@@ -46,10 +61,51 @@ pub(crate) mod own_debug {
 
     fn enabled() -> bool {
         static EN: OnceLock<bool> = OnceLock::new();
-        *EN.get_or_init(|| std::env::var_os("FERRITE_ALLOC_DEBUG").is_some())
+        *EN.get_or_init(|| {
+            let on = std::env::var_os("FERRITE_ALLOC_DEBUG").is_some();
+            if on {
+                // Unconditional proof the tracker is live in THIS process — so
+                // "no output" can be read as "no violation" and not "never ran"
+                // (e.g. the env var didn't reach a worker subprocess).
+                eprintln!(
+                    "[ferrite-alloc] ownership tracker ARMED in pid {} (FERRITE_ALLOC_DEBUG set)",
+                    std::process::id()
+                );
+            }
+            on
+        })
     }
     fn track() -> &'static Mutex<HashMap<usize, Entry>> {
         TRACK.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Flag (once) if the allocator is touched from more than one thread.
+    /// `CachingAllocator` is mutated through a bare `*mut` with no lock, so
+    /// cross-thread access means concurrent `free_blocks` mutation — a data
+    /// race that corrupts the BTreeSet ("empty internal node"), tracker-silent
+    /// because it isn't a double-own. This is the leading hypothesis for the
+    /// teardown abort that the double-own/re-handout checks don't explain.
+    fn check_thread() {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FIRST: AtomicU64 = AtomicU64::new(0);
+        static WARNED: AtomicU64 = AtomicU64::new(0);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::thread::current().id().hash(&mut h);
+        let tid = h.finish() | 1; // never 0
+        let first = match FIRST.compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => tid,
+            Err(f) => f,
+        };
+        if first != tid && WARNED.swap(1, Ordering::SeqCst) == 0 {
+            eprintln!(
+                "[ferrite-alloc] MULTI-THREAD allocator access: first thread {first:#x}, now \
+                 {tid:#x}. CachingAllocator is mutated via *mut with no lock — concurrent \
+                 free()/alloc is a data race on free_blocks (the BTreeSet 'empty internal node' \
+                 corruption). Backtrace of the second thread:\n{}",
+                Backtrace::force_capture()
+            );
+        }
     }
 
     /// A fresh `OwnedTensor` took ownership of `ptr`.
@@ -57,6 +113,7 @@ pub(crate) mod own_debug {
         if !enabled() || ptr == 0 {
             return;
         }
+        check_thread();
         let Ok(mut m) = track().lock() else { return };
         let e = m.entry(ptr).or_insert_with(|| Entry {
             count: 0,
@@ -397,6 +454,7 @@ impl CachingAllocator {
 
     /// Allocate GPU memory.
     pub fn alloc(&mut self, orig_size: usize) -> *mut u8 {
+        let _alloc_guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let size = Self::round_size(orig_size);
 
         // 1. Try to find a free block in the pool.
@@ -551,6 +609,7 @@ impl CachingAllocator {
 
     /// Free GPU memory (returns block to free pool, coalesces with neighbors).
     pub unsafe fn free(&mut self, ptr: *mut u8, _size_bytes: usize) {
+        let _alloc_guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(block_ptr) = self.active_blocks.remove(&(ptr as usize)) else {
             return; // not tracked (e.g., persistent allocation)
         };

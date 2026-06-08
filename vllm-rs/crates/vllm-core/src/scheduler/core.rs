@@ -950,8 +950,8 @@ impl Scheduler {
     /// Build `CachedRequestData` for running + resumed requests.
     fn make_cached_request_data(
         &self,
-        running_reqs: &[Request],
-        resumed_reqs: &[Request],
+        running_reqs: &[usize],
+        resumed_reqs: &[usize],
         num_scheduled_tokens: &HashMap<String, usize>,
         req_to_new_blocks: &HashMap<String, Vec<Vec<usize>>>,
     ) -> CachedRequestData {
@@ -968,8 +968,9 @@ impl Scheduler {
         // Matches Python: vllm/v1/core/sched/scheduler.py _make_cached_request_data
         let send_pp_tokens = self.use_pp && !self.async_scheduling;
 
-        for (idx, req) in running_reqs.iter().chain(resumed_reqs.iter()).enumerate() {
+        for (idx, &slot) in running_reqs.iter().chain(resumed_reqs.iter()).enumerate() {
             let is_resumed = idx >= running_reqs.len();
+            let req = &self.running[slot];
             let req_id = req.request_id.clone();
 
             if is_resumed {
@@ -1170,8 +1171,13 @@ impl SchedulerInterface for Scheduler {
         // 3. Build and return SchedulerOutput.
 
         let mut scheduled_new_reqs: Vec<Request> = Vec::new();
-        let mut scheduled_resumed_reqs: Vec<Request> = Vec::new();
-        let mut scheduled_running_reqs: Vec<Request> = Vec::new();
+        // Zero-copy: running/resumed requests are recorded by their index into
+        // `self.running` and read by reference when building CachedRequestData,
+        // rather than deep-cloning the (growing) Request every step. Only new
+        // requests, whose full data is sent to the worker once per lifetime,
+        // are cloned (into NewRequestData below).
+        let mut scheduled_resumed_reqs: Vec<usize> = Vec::new();
+        let mut scheduled_running_reqs: Vec<usize> = Vec::new();
         let mut preempted_reqs: Vec<Request> = Vec::new();
 
         let mut req_to_new_blocks: HashMap<String, Vec<Vec<usize>>> = HashMap::new();
@@ -1244,19 +1250,20 @@ impl SchedulerInterface for Scheduler {
                 continue;
             }
 
-            // Try to allocate blocks. We need to clone the request because
-            // allocate_slots takes &Request but we also need &mut self.kv_cache.
-            // TODO: Refactor allocate_slots to take minimal fields to avoid this clone.
-            let request_clone = self.running[req_index].clone();
+            // Zero-copy: pass a reference to the running request directly.
+            // `kv_cache` and `running` are disjoint fields of `self`, so the
+            // borrow checker permits `&mut self.kv_cache` (the method receiver)
+            // alongside `&self.running[req_index]` — no Request clone needed.
             let new_blocks = self.kv_cache.allocate_slots(
-                &request_clone,
+                &self.running[req_index],
                 num_new_tokens,
                 self.num_lookahead_tokens,
             );
 
             if let Some(blocks) = new_blocks {
-                // Successfully allocated.
-                scheduled_running_reqs.push(self.running[req_index].clone());
+                // Successfully allocated. Zero-copy: record the running index;
+                // the request is read by reference in make_cached_request_data.
+                scheduled_running_reqs.push(req_index);
                 let request_id = self.running[req_index].request_id.clone();
 
                 // Handle speculative decode tokens.
@@ -1307,7 +1314,7 @@ impl SchedulerInterface for Scheduler {
                     }
                     req_to_new_blocks.remove(&pid);
                     scheduled_spec_decode_tokens.remove(&pid);
-                    scheduled_running_reqs.retain(|r| r.request_id != pid);
+                    scheduled_running_reqs.retain(|&idx| idx != preempt_idx);
 
                     // Clone the request for the waiting queue; move into preempted list.
                     self.waiting.prepend_request(preempted.clone());
@@ -1324,7 +1331,7 @@ impl SchedulerInterface for Scheduler {
                     }
                     req_to_new_blocks.remove(&pid);
                     scheduled_spec_decode_tokens.remove(&pid);
-                    scheduled_running_reqs.retain(|r| r.request_id != pid);
+                    scheduled_running_reqs.retain(|&idx| idx != preempt_idx);
 
                     self.waiting.prepend_request(preempted.clone());
                     preempted_reqs.push(preempted);
@@ -1428,17 +1435,23 @@ impl SchedulerInterface for Scheduler {
                             request.num_cached_tokens = num_computed_tokens as i32;
                         }
 
-                        // One clone goes to scheduled list, original goes to running.
+                        // New requests need their full data copied once into
+                        // NewRequestData (sent to the worker, per lifetime).
                         if was_waiting {
                             scheduled_new_reqs.push(request.clone());
-                        } else if was_preempted {
-                            scheduled_resumed_reqs.push(request.clone());
-                        } else {
+                        } else if !was_preempted {
                             warn!("Unexpected request status for {}", request.request_id);
                         }
 
                         // Move to running list (no extra clone).
                         self.running_push(request);
+
+                        // Zero-copy: resumed requests are recorded by their
+                        // index in `self.running` (just pushed above) and read
+                        // by reference in make_cached_request_data.
+                        if was_preempted {
+                            scheduled_resumed_reqs.push(self.running.len() - 1);
+                        }
 
                         req_to_new_blocks.insert(request_id.clone(), blocks);
                         num_scheduled_tokens.insert(request_id.clone(), num_new_tokens);

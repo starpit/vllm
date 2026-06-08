@@ -688,6 +688,13 @@ impl LLM {
         }
 
         // Sync step loop — mirrors Python's LLM._run_engine().
+        // O(1) request-id -> slot lookup: avoids an O(num_requests) linear scan
+        // per output per step (O(batch^2)/step) on the saturated hot path.
+        let id_to_idx: std::collections::HashMap<&str, usize> = request_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.as_str(), i))
+            .collect();
         let mut generated_tokens: Vec<Vec<u32>> = vec![Vec::new(); total];
         let mut finish_reasons: Vec<Option<String>> = vec![None; total];
 
@@ -724,7 +731,7 @@ impl LLM {
 
             let mut newly_finished = 0usize;
             for output in &outputs.outputs {
-                if let Some(idx) = request_ids.iter().position(|id| *id == output.request_id) {
+                if let Some(&idx) = id_to_idx.get(output.request_id.as_str()) {
                     // Track TTFT / ITL timing.
                     if !output.new_token_ids.is_empty() {
                         let now = std::time::Instant::now();

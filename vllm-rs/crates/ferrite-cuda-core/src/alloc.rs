@@ -453,8 +453,69 @@ impl CachingAllocator {
     }
 
     /// Allocate GPU memory.
+    /// DIAGNOSTIC (env-gated FERRITE_ALLOC_VALIDATE=1): walk every free-list and
+    /// verify each entry's stored key still matches its block's `(size, ptr)`
+    /// and the block is not marked `allocated`. Catches a key mutated in-place
+    /// while in the set, a `Block` smashed by an out-of-bounds write, a
+    /// double-listed block, and — via the traversal itself — structural BTree
+    /// corruption ("empty internal node"). Throttled to every 64th call so it is
+    /// usable even with a huge free list. Reports the FIRST op that observes a
+    /// corrupt `free_blocks`, mid-run with a backtrace, instead of at teardown.
+    fn validate_pools(&self, ctx: &str) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("FERRITE_ALLOC_VALIDATE").is_some()) {
+            return;
+        }
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) % 64 != 0 {
+            return;
+        }
+        let base: [(&str, &BlockPool); 2] =
+            [("small", &self.small_pool), ("large", &self.large_pool)];
+        let privs = self
+            .private_small_pool
+            .as_ref()
+            .map(|p| ("priv_small", p))
+            .into_iter()
+            .chain(self.private_large_pool.as_ref().map(|p| ("priv_large", p)));
+        for (name, pool) in base.into_iter().chain(privs) {
+            // Iterating forces a full BTree traversal; if its structure is
+            // corrupt, the "empty internal node" panic fires HERE — now with the
+            // `ctx` / backtrace of the op that observed it, not at teardown.
+            for &(stored_key, block_ptr) in pool.free_blocks.iter() {
+                let block = unsafe { &*block_ptr };
+                let cur = BlockKey::from_block(block);
+                if cur != stored_key {
+                    eprintln!(
+                        "[ferrite-alloc] CORRUPT free_blocks at {ctx} (pool {name}): entry stored \
+                         (size={}, ptr={:#x}) but block is now (size={}, ptr={:#x}, allocated={}). \
+                         A key was mutated in-place while in the set, or this Block was smashed by \
+                         an out-of-bounds write.\n{}",
+                        stored_key.size,
+                        stored_key.ptr,
+                        cur.size,
+                        cur.ptr,
+                        block.allocated,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                } else if block.allocated {
+                    eprintln!(
+                        "[ferrite-alloc] free_blocks holds an ALLOCATED block at {ctx} (pool \
+                         {name}): ptr={:#x} size={} — a live block was double-listed / double-freed.\n{}",
+                        block.ptr as usize,
+                        block.size,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
+        }
+    }
+
     pub fn alloc(&mut self, orig_size: usize) -> *mut u8 {
         let _alloc_guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_pools("alloc-entry");
         let size = Self::round_size(orig_size);
 
         // 1. Try to find a free block in the pool.
@@ -610,6 +671,7 @@ impl CachingAllocator {
     /// Free GPU memory (returns block to free pool, coalesces with neighbors).
     pub unsafe fn free(&mut self, ptr: *mut u8, _size_bytes: usize) {
         let _alloc_guard = ALLOC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.validate_pools("free-entry");
         let Some(block_ptr) = self.active_blocks.remove(&(ptr as usize)) else {
             return; // not tracked (e.g., persistent allocation)
         };

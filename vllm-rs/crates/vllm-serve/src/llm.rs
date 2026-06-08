@@ -381,7 +381,14 @@ impl LLM {
         // Start the background executor pipeline for overlapping CPU
         // scheduling with GPU execution (the server path uses its own
         // pipeline via spawn_step_loop_async instead).
-        stack.client.start_pipeline();
+        //
+        // DIAGNOSTIC: set FERRITE_NO_PIPELINE=1 to skip the pipeline and run
+        // synchronously (single batch in flight, all on the main thread). If
+        // the teardown corruption disappears with this set, the bug is a race
+        // in the depth-2 pipeline (two batches in flight), host- or GPU-side.
+        if std::env::var_os("FERRITE_NO_PIPELINE").is_none() {
+            stack.client.start_pipeline();
+        }
         Ok(Self {
             client: stack.client,
             tokenizer: stack.tokenizer,

@@ -3516,6 +3516,59 @@ unsafe extern "C" {
         out_dtype: i32,
         stream: CUstream,
     );
+
+    /// CUTLASS 3.x FP8 scaled matmul on SM90 (Hopper). Same ABI as the SM89
+    /// entry; selects a Hopper TMA warp-specialized tile config by (M, N).
+    /// Matches Python vLLM's `cutlass_scaled_mm_sm90` (the C3X path).
+    fn cutlass_scaled_mm_sm90(
+        c: *mut u8,
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        a_scales_numel: i32,
+        b_scales: *const f32,
+        b_scales_numel: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        out_dtype: i32,
+        stream: CUstream,
+    );
+
+    /// CUTLASS 3.x FP8 scaled matmul on SM90 (Hopper) with bias.
+    fn cutlass_scaled_mm_bias_sm90(
+        c: *mut u8,
+        a: *const u8,
+        b: *const u8,
+        a_scales: *const f32,
+        a_scales_numel: i32,
+        b_scales: *const f32,
+        b_scales_numel: i32,
+        bias: *const u8,
+        m: i32,
+        n: i32,
+        k: i32,
+        out_dtype: i32,
+        stream: CUstream,
+    );
+}
+
+/// Cached device compute capability (major*10 + minor, e.g. 89 / 90).
+///
+/// Routes FP8 `cutlass_scaled_mm` to the correct CUTLASS kernel: the SM89 (Ada)
+/// C2X kernel and the SM90 (Hopper) C3X kernel are arch-guarded at the device
+/// level and trap if launched on the wrong SM (this is the bug that produced
+/// "This kernel only supports sm[89, 90)." on H100). Compute capability is fixed
+/// for the process, so query the current device once.
+fn device_sm_version() -> u32 {
+    use std::sync::OnceLock;
+    static SM_VERSION: OnceLock<u32> = OnceLock::new();
+    *SM_VERSION.get_or_init(|| unsafe {
+        let dev = ferrite_cuda_core::driver::current_device()
+            .expect("cutlass_scaled_mm: no current CUDA device/context");
+        ferrite_cuda_core::driver::device_get_sm_version(dev)
+            .expect("cutlass_scaled_mm: failed to query device compute capability")
+    })
 }
 
 /// Fused CUTLASS FP8 GEMM with per-row activation scales.
@@ -3558,20 +3611,48 @@ pub unsafe fn cutlass_scaled_mm(
         dt => panic!("cutlass_scaled_mm: output must be BF16 or F16, got {dt}"),
     };
 
-    cutlass_scaled_mm_sm89(
-        output.as_gpu_tensor().as_mut_ptr(),
-        a.as_ptr(),
-        b.as_ptr(),
-        a_scales.as_ptr() as *const f32,
-        a_scales.numel() as i32,
-        b_scales.as_ptr() as *const f32,
-        b_scales.numel() as i32,
-        m as i32,
-        n as i32,
-        k as i32,
-        out_dtype_code,
-        stream,
-    );
+    // Route by device compute capability. The SM89 (Ada) and SM90 (Hopper)
+    // kernels are each arch-guarded at the device level; calling the wrong one
+    // traps with "This kernel only supports sm[..]". Hopper (90..100) needs the
+    // CUTLASS 3.x C3X kernel; Ada (89) uses the C2X kernel.
+    let sm = device_sm_version();
+    let c = output.as_gpu_tensor().as_mut_ptr();
+    if (90..100).contains(&sm) {
+        cutlass_scaled_mm_sm90(
+            c,
+            a.as_ptr(),
+            b.as_ptr(),
+            a_scales.as_ptr() as *const f32,
+            a_scales.numel() as i32,
+            b_scales.as_ptr() as *const f32,
+            b_scales.numel() as i32,
+            m as i32,
+            n as i32,
+            k as i32,
+            out_dtype_code,
+            stream,
+        );
+    } else if sm == 89 {
+        cutlass_scaled_mm_sm89(
+            c,
+            a.as_ptr(),
+            b.as_ptr(),
+            a_scales.as_ptr() as *const f32,
+            a_scales.numel() as i32,
+            b_scales.as_ptr() as *const f32,
+            b_scales.numel() as i32,
+            m as i32,
+            n as i32,
+            k as i32,
+            out_dtype_code,
+            stream,
+        );
+    } else {
+        panic!(
+            "cutlass_scaled_mm: FP8 scaled_mm requires SM89 (Ada) or SM90 (Hopper), \
+             got SM{sm}. No compiled CUTLASS FP8 kernel for this compute capability."
+        );
+    }
 
     output
 }
@@ -3604,21 +3685,46 @@ pub unsafe fn cutlass_scaled_mm_with_bias(
         dt => panic!("cutlass_scaled_mm_with_bias: output must be BF16 or F16, got {dt}"),
     };
 
-    cutlass_scaled_mm_bias_sm89(
-        output.as_gpu_tensor().as_mut_ptr(),
-        a.as_ptr(),
-        b.as_ptr(),
-        a_scales.as_ptr() as *const f32,
-        a_scales.numel() as i32,
-        b_scales.as_ptr() as *const f32,
-        b_scales.numel() as i32,
-        bias.as_ptr(),
-        m as i32,
-        n as i32,
-        k as i32,
-        out_dtype_code,
-        stream,
-    );
+    let sm = device_sm_version();
+    let c = output.as_gpu_tensor().as_mut_ptr();
+    if (90..100).contains(&sm) {
+        cutlass_scaled_mm_bias_sm90(
+            c,
+            a.as_ptr(),
+            b.as_ptr(),
+            a_scales.as_ptr() as *const f32,
+            a_scales.numel() as i32,
+            b_scales.as_ptr() as *const f32,
+            b_scales.numel() as i32,
+            bias.as_ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            out_dtype_code,
+            stream,
+        );
+    } else if sm == 89 {
+        cutlass_scaled_mm_bias_sm89(
+            c,
+            a.as_ptr(),
+            b.as_ptr(),
+            a_scales.as_ptr() as *const f32,
+            a_scales.numel() as i32,
+            b_scales.as_ptr() as *const f32,
+            b_scales.numel() as i32,
+            bias.as_ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            out_dtype_code,
+            stream,
+        );
+    } else {
+        panic!(
+            "cutlass_scaled_mm_with_bias: FP8 scaled_mm requires SM89 (Ada) or SM90 \
+             (Hopper), got SM{sm}. No compiled CUTLASS FP8 kernel for this capability."
+        );
+    }
 
     output
 }

@@ -1066,6 +1066,9 @@ fn initialize_core(
         &config.device,
         &config.kv_cache_dtype,
     )?;
+    // Capture the target-reactive prefill-bucket cap before `worker` is moved
+    // into the engine below — used to clamp the scheduler's batched-token bound.
+    let worker_prefill_bucket_max_m = worker.prefill_bucket_max_m();
 
     info!(
         "Available memory: {:.1} GB, memory_utilization={}, num_gpu_blocks={}",
@@ -1126,14 +1129,42 @@ fn initialize_core(
         config.enable_prefix_caching && !hybrid
     };
 
+    // Device-specific `max_num_batched_tokens` default — no flat constant on any
+    // backend. On backends that prune a compiled prefill-bucket ladder
+    // target-reactively (Metal today), the largest resident bucket the device
+    // just selected IS the right per-device default, and a single forward can
+    // never exceed it (no NoBucketFits). On backends without ladder pruning
+    // (CUDA), fall back to the existing device-aware default (queries GPU
+    // mem/name; e.g. 16384 on an H100-class offline part). An explicit
+    // `--max-num-batched-tokens` always wins, clamped to the resident bucket
+    // where one exists so the user can't overflow it.
+    let max_num_batched_tokens = match (config.max_num_batched_tokens, worker_prefill_bucket_max_m)
+    {
+        (Some(user), Some(cap)) => {
+            let clamped = user.min(cap as usize);
+            if clamped < user {
+                info!(
+                    "Clamping max_num_batched_tokens {} -> {} (largest resident prefill bucket)",
+                    user, clamped
+                );
+            }
+            clamped
+        }
+        (Some(user), None) => user,
+        (None, Some(cap)) => {
+            info!(
+                "Device-selected max_num_batched_tokens = {} (largest resident prefill bucket)",
+                cap
+            );
+            cap as usize
+        }
+        (None, None) => resolve_default_max_num_batched_tokens(is_offline),
+    };
     let engine_config = EngineCoreConfig {
         scheduler_config: SchedulerConfig {
-            // Device-aware default (mirrors Python vLLM get_batch_defaults):
-            // base 2048, but 16384 on H100-class offline. Mixed batches use
-            // the unified eager path. See PREFILL_DECODE_SPLIT.md for history.
-            max_num_batched_tokens: config
-                .max_num_batched_tokens
-                .unwrap_or_else(|| resolve_default_max_num_batched_tokens(is_offline)),
+            // Resolved above: the device-selected prefill bucket on pruning
+            // backends (Metal), else the device-aware CUDA default.
+            max_num_batched_tokens,
             max_num_seqs: config.max_num_seqs,
             policy: SchedulerPolicy::Fcfs,
             enable_chunked_prefill: true,

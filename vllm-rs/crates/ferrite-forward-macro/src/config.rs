@@ -138,8 +138,7 @@ pub struct VisionSafetensorsLayout {
     pub subtrees: BTreeMap<String, String>,
 }
 
-impl VisionSafetensorsLayout {
-}
+impl VisionSafetensorsLayout {}
 
 /// d_model fingerprint key + dim — see [`ModelParams::vision_d_model_fingerprint`].
 #[derive(Clone, Debug)]
@@ -148,8 +147,7 @@ pub struct VisionDModelFingerprint {
     pub dim: usize,
 }
 
-impl VisionDModelFingerprint {
-}
+impl VisionDModelFingerprint {}
 
 /// Patch-embed flatten target — see [`ModelParams::vision_patch_embed_flatten`].
 #[derive(Clone, Debug)]
@@ -165,8 +163,7 @@ pub struct VisionPatchEmbedFlatten {
     pub channels_last: bool,
 }
 
-impl VisionPatchEmbedFlatten {
-}
+impl VisionPatchEmbedFlatten {}
 
 /// Arch-agnostic rope-scaling flavor parsed from `config.json`.
 /// Integer-valued `original_max_position_embeddings` is kept as
@@ -1235,7 +1232,6 @@ fn vision_params_from_json(
     })
 }
 
-
 /// Parse `vision_safetensors_layout`, if present. Missing or
 /// malformed → `None`; codegen falls back to
 /// [`VisionSafetensorsLayout::qwen_default`] in that case.
@@ -1588,9 +1584,7 @@ fn derive_implicit_bounds(bounds: &mut BTreeMap<String, u64>) {
         bounds
             .entry("kv_lora_out".to_string())
             .or_insert(heads * (nope + vhd));
-        bounds
-            .entry("attn_out".to_string())
-            .or_insert(heads * vhd);
+        bounds.entry("attn_out".to_string()).or_insert(heads * vhd);
         if let Some(&kv_lora_rank) = bounds.get("kv_lora_rank") {
             bounds
                 .entry("kv_a_proj_out".to_string())
@@ -1845,7 +1839,8 @@ mod tests {
         //      anchoring `vision_in_features` / `vision_rope_half_dim`)
         //      lands in `bounds`.
         let dir = repo_model_archs("qwen2-vl");
-        let configs = load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl vision configs");
+        let configs =
+            load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl vision configs");
         assert_eq!(
             configs.len(),
             3,
@@ -1971,7 +1966,10 @@ mod tests {
 
     #[test]
     fn missing_dir_errors_cleanly() {
-        let result = load_dir(Path::new("/nonexistent/path/to/configs"), &Default::default());
+        let result = load_dir(
+            Path::new("/nonexistent/path/to/configs"),
+            &Default::default(),
+        );
         assert!(matches!(result, Err(ConfigError::NotADirectory(_))));
     }
 

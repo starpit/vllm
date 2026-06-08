@@ -565,7 +565,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
         has_spec_tokens: bool,
         enc: &ProtocolObject<dyn ::objc2_metal::MTL4ComputeCommandEncoder>,
     ) -> Result<(), WorkerError> {
-        self.run_bucket_mtl4_inner(bucket, num_tokens, num_seqs, has_spec_tokens, enc, None, None)
+        self.run_bucket_mtl4_inner(
+            bucket,
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            enc,
+            None,
+            None,
+        )
     }
 
     /// Activation-dump replay segment: encode only the flat dispatch
@@ -779,8 +787,12 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 {
                     eprintln!(
                         "[verify-dispatch] cmd{this_idx} tg=({},{},{}) tpt=({},{},{})",
-                        tg_scaled.width, tg_scaled.height, tg_scaled.depth,
-                        tpt.width, tpt.height, tpt.depth
+                        tg_scaled.width,
+                        tg_scaled.height,
+                        tg_scaled.depth,
+                        tpt.width,
+                        tpt.height,
+                        tpt.depth
                     );
                 }
                 enc.dispatchThreadgroups_threadsPerThreadgroup(tg_scaled, *tpt);

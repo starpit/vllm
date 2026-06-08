@@ -30,9 +30,10 @@
 
 use ferrite_forward_macro::forward;
 
-#[forward(
-    workloads = [1, 8, 64],
-)]
+// No `workloads`: uses the global default ladder, pruned per-device at load
+// time by `select_prefill_bucket`. The old `[1,8,64]` cap was the same
+// 24Gi-arena fear since handled by runtime selection — not a real constraint.
+#[forward]
 mod qwen3_moe {
     /// Checkpoints ship BF16 RMSNorm gains (Qwen3-family
     /// convention) — the metal gain-reader symbols must match.
@@ -42,24 +43,24 @@ mod qwen3_moe {
     const BOUND_DEFAULTS: &[(&str, u64)] = &[("norm_topk_prob", 1)];
 
     fn forward() {
-    hidden_states = embed(input_ids, embed_tokens);
-    for layer in 0..num_hidden_layers {
-        normed = rmsnorm(hidden_states, input_layernorm[layer]);
-        q = gemm(normed, self_attn.q_proj[layer]);
-        q = rmsnorm(q, self_attn.q_norm[layer]);
-        k = gemm(normed, self_attn.k_proj[layer]);
-        k = rmsnorm(k, self_attn.k_norm[layer]);
-        v = gemm(normed, self_attn.v_proj[layer]);
-        (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
-        attn = attention(q, k, v, kv_cache[layer], block_table);
-        oproj = gemm(attn, self_attn.o_proj[layer]);
-        hidden_states = add(oproj, hidden_states);
+        hidden_states = embed(input_ids, embed_tokens);
+        for layer in 0..num_hidden_layers {
+            normed = rmsnorm(hidden_states, input_layernorm[layer]);
+            q = gemm(normed, self_attn.q_proj[layer]);
+            q = rmsnorm(q, self_attn.q_norm[layer]);
+            k = gemm(normed, self_attn.k_proj[layer]);
+            k = rmsnorm(k, self_attn.k_norm[layer]);
+            v = gemm(normed, self_attn.v_proj[layer]);
+            (q, k, v) = rope_append(q, k, v, positions, rotary, kv_cache[layer]);
+            attn = attention(q, k, v, kv_cache[layer], block_table);
+            oproj = gemm(attn, self_attn.o_proj[layer]);
+            hidden_states = add(oproj, hidden_states);
 
-        normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
-        mlp_out = moe_block(normed2, mlp[layer]);
-        hidden_states = add(mlp_out, hidden_states);
-    }
-    normed = rmsnorm(hidden_states, norm);
-    logits = gemm(normed, lm_head);
+            normed2 = rmsnorm(hidden_states, post_attention_layernorm[layer]);
+            mlp_out = moe_block(normed2, mlp[layer]);
+            hidden_states = add(mlp_out, hidden_states);
+        }
+        normed = rmsnorm(hidden_states, norm);
+        logits = gemm(normed, lm_head);
     }
 }

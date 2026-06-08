@@ -20,7 +20,6 @@ use ferrite_forward_macro::forward;
     // K=4 verify case (num_tokens=6) to 8 anyway. See Python's
     // copy_and_expand_eagle_inputs_kernel approach mirrored by
     // `DraftModelProposer::propose_for_step`.
-    workloads = [1, 2, 4, 8, 64, 512, 1024, 2048, 4096],
     sk_buckets = [128, 512, 2048, 8192],
 )]
 fn llama() {

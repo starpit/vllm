@@ -31,8 +31,7 @@ use std::ptr::NonNull;
 use ferrite_metal_kernels::device::detect_device;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary,
-    MTLResourceOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions,
 };
 
 const GIB: usize = 1024 * 1024 * 1024;
@@ -456,8 +455,16 @@ fn shared_buffer_compute_read_at_large_offsets() {
             enc.setBuffer_offset_atIndex(Some(&dst), 0, 1);
         }
         enc.dispatchThreads_threadsPerThreadgroup(
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.commit();
@@ -577,8 +584,16 @@ fn shared_buffer_mtl4_gpuaddress_read_at_large_offsets() {
         enc.setComputePipelineState(&pso);
         enc.setArgumentTable(Some(&table));
         enc.dispatchThreads_threadsPerThreadgroup(
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.endCommandBuffer();
@@ -701,15 +716,26 @@ fn shared_buffer_mtl4_read_under_residency_pressure() {
         enc.setComputePipelineState(&pso);
         enc.setArgumentTable(Some(&table));
         enc.dispatchThreads_threadsPerThreadgroup(
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
-            objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
+            objc2_metal::MTLSize {
+                width: 32,
+                height: 1,
+                depth: 1,
+            },
         );
         enc.endEncoding();
         cb.endCommandBuffer();
         let cb_protocol: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTL4CommandBuffer> = &cb;
         let mut cb_array = [std::ptr::NonNull::from(cb_protocol)];
         unsafe { queue4.commit_count(std::ptr::NonNull::from(&mut cb_array[0]), 1) };
-        queue4.signalEvent_value(objc2::runtime::ProtocolObject::from_ref(&*event), (i + 1) as u64);
+        queue4.signalEvent_value(
+            objc2::runtime::ProtocolObject::from_ref(&*event),
+            (i + 1) as u64,
+        );
         assert!(event.waitUntilSignaledValue_timeoutMS((i + 1) as u64, 30_000));
 
         let got = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
@@ -809,7 +835,9 @@ fn blit_vs_memcpy_shard_throughput() {
             cb.commit();
             unsafe { cb.waitUntilCompleted() };
         } else {
-            unsafe { madvise(base, len, 3 /* MADV_WILLNEED */) };
+            unsafe {
+                madvise(base, len, 3 /* MADV_WILLNEED */)
+            };
             let d = dst.contents().as_ptr() as *mut u8;
             unsafe { std::ptr::copy_nonoverlapping(base as *const u8, d, len) };
         }
@@ -971,8 +999,16 @@ fn nocopy_residency_wiring_at_scale() {
             enc.setComputePipelineState(&pso);
             enc.setArgumentTable(Some(&table));
             enc.dispatchThreads_threadsPerThreadgroup(
-                objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
-                objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
             );
             enc.endEncoding();
             cb.endCommandBuffer();
@@ -981,7 +1017,10 @@ fn nocopy_residency_wiring_at_scale() {
             unsafe { queue4.commit_count(std::ptr::NonNull::from(&mut arr[0]), 1) };
             sig += 1;
             queue4.signalEvent_value(objc2::runtime::ProtocolObject::from_ref(&*event), sig);
-            assert!(event.waitUntilSignaledValue_timeoutMS(sig, 120_000), "timeout");
+            assert!(
+                event.waitUntilSignaledValue_timeoutMS(sig, 120_000),
+                "timeout"
+            );
             // integrity: GPU bytes == CPU mmap bytes at same offset
             let g = unsafe { std::slice::from_raw_parts(dst.contents().as_ptr() as *const u8, 32) };
             let c = unsafe {

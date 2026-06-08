@@ -186,16 +186,18 @@ pub fn lower_pair<W: CanonicalParams>(
         match (lm_head, lh.commands.len()) {
             // Plain lm_head (Llama / Qwen / Mistral).
             (
-                [Instruction::AffineQmm(
-                    in_slot,
-                    out_slot,
-                    layer,
-                    n,
-                    k,
-                    group_size,
-                    bits,
-                    _vector_limit,
-                )],
+                [
+                    Instruction::AffineQmm(
+                        in_slot,
+                        out_slot,
+                        layer,
+                        n,
+                        k,
+                        group_size,
+                        bits,
+                        _vector_limit,
+                    ),
+                ],
                 1,
             ) if qmm_cmd_ok(0) => Some(LmHeadSliceInfo {
                 in_slot: *in_slot,
@@ -218,16 +220,19 @@ pub fn lower_pair<W: CanonicalParams>(
             // lm_head + final softcap (Gemma2/4). The softcap must
             // consume the qmm's output slot.
             (
-                [Instruction::AffineQmm(
-                    in_slot,
-                    out_slot,
-                    layer,
-                    n,
-                    k,
-                    group_size,
-                    bits,
-                    _vector_limit,
-                ), Instruction::TanhSoftCap(sc_in, sc_out)],
+                [
+                    Instruction::AffineQmm(
+                        in_slot,
+                        out_slot,
+                        layer,
+                        n,
+                        k,
+                        group_size,
+                        bits,
+                        _vector_limit,
+                    ),
+                    Instruction::TanhSoftCap(sc_in, sc_out),
+                ],
                 2,
             ) if qmm_cmd_ok(0)
                 && matches!(
@@ -1126,10 +1131,8 @@ fn lower_one<W: CanonicalParams>(
             ),
             constants: Vec::new(),
             dispatch: {
-                let mut d = DispatchShape::dispatch_1d(
-                    eff_m * (W::HIDDEN_SIZE as u32),
-                    THREADS_PER_GROUP,
-                );
+                let mut d =
+                    DispatchShape::dispatch_1d(eff_m * (W::HIDDEN_SIZE as u32), THREADS_PER_GROUP);
                 d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                     seq_axis: None,
                     axis: super::lowered::MScaleAxis::X,
@@ -1220,51 +1223,49 @@ fn lower_one<W: CanonicalParams>(
         // offset rides the instruction field instead of the global
         // `W::NORM_WEIGHT_OFFSET`. Always on the residual stream
         // (HIDDEN_SIZE; m=1) — residual adds are never per-head.
-        I::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => {
-            LoweredCommand {
-                kernel: KernelId::FusedAddRmsNorm,
-                library: "fused_add_rmsnorm",
-                function: fused_add_rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
-                constants: super::kernel_constants::RmsNormConstants {
-                    bucket_m: super::ids::BucketM(bucket_m),
-                    q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
-                    rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
-                    weight_offset: *offset,
-                }
-                .into(),
-                dispatch: DispatchShape {
-                    threadgroups: (bucket_m, 1, 1),
-                    threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
-                    m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
-                        seq_axis: None,
-                        axis: super::lowered::MScaleAxis::X,
-                        bucket_m: super::ids::BucketM(bucket_m),
-                    }),
-                },
-                bindings: vec![
-                    Binding::ArenaSlot {
-                        slot: *residual_slot,
-                        binding_index: 0,
-                    },
-                    Binding::ArenaSlot {
-                        slot: *delta_slot,
-                        binding_index: 1,
-                    },
-                    Binding::Weight {
-                        kind: WeightBundleKind::RmsNorm,
-                        which: WeightTensor::Weight,
-                        layer: super::ids::LayerId(*layer + layer_offset),
-                        locator: WeightLocator {
-                            bucket: tape_index,
-                            op_idx: index as u32,
-                            slot: 0,
-                        },
-                        binding_index: 2,
-                    },
-                ],
-                gemm_dims: None,
+        I::FusedAddRmsNormWithOffset(delta_slot, residual_slot, layer, offset) => LoweredCommand {
+            kernel: KernelId::FusedAddRmsNorm,
+            library: "fused_add_rmsnorm",
+            function: fused_add_rmsnorm_kernel_static_name::<W>(scale_dtype_for::<W>()),
+            constants: super::kernel_constants::RmsNormConstants {
+                bucket_m: super::ids::BucketM(bucket_m),
+                q_size: super::ids::QSize(W::HIDDEN_SIZE as u32),
+                rms_norm_eps: super::ids::RmsNormEps(W::RMS_NORM_EPS),
+                weight_offset: *offset,
             }
-        }
+            .into(),
+            dispatch: DispatchShape {
+                threadgroups: (bucket_m, 1, 1),
+                threads_per_threadgroup: (THREADS_PER_GROUP, 1, 1),
+                m_scaling: Some(crate::interpreter::metal::lowered::MScaling {
+                    seq_axis: None,
+                    axis: super::lowered::MScaleAxis::X,
+                    bucket_m: super::ids::BucketM(bucket_m),
+                }),
+            },
+            bindings: vec![
+                Binding::ArenaSlot {
+                    slot: *residual_slot,
+                    binding_index: 0,
+                },
+                Binding::ArenaSlot {
+                    slot: *delta_slot,
+                    binding_index: 1,
+                },
+                Binding::Weight {
+                    kind: WeightBundleKind::RmsNorm,
+                    which: WeightTensor::Weight,
+                    layer: super::ids::LayerId(*layer + layer_offset),
+                    locator: WeightLocator {
+                        bucket: tape_index,
+                        op_idx: index as u32,
+                        slot: 0,
+                    },
+                    binding_index: 2,
+                },
+            ],
+            gemm_dims: None,
+        },
 
         // ── Gemma4 post-FFN tail: rmsnorm → add → scalar_weight_mul ─
         I::NormAddScalarMul(delta_slot, residual_slot, out_slot, layer, hidden_size) => {
@@ -2278,14 +2279,28 @@ fn lower_one<W: CanonicalParams>(
         // [N, 2N). The decode-vs-steel symbol pick happens inline
         // below against `bucket_m`.
         I::FusedGateUpSiluMul(in_slot, out_slot, layer) => fused_gate_up_mul_cmd::<W>(
-            *in_slot, *out_slot, *layer, false, bucket_m, tape_index, index, layer_offset,
+            *in_slot,
+            *out_slot,
+            *layer,
+            false,
+            bucket_m,
+            tape_index,
+            index,
+            layer_offset,
         ),
         // Dense GeGLU (Gemma3 text MLP) — same fused gate/up GEMM +
         // activation-mul kernel as SiLU; the `IS_GELU` fn-const flips
         // the epilogue to gelu_approx (tanh). The quant GeGLU path
         // decomposes to AffineQmm + GeluMul instead.
         I::FusedGateUpGeluMul(in_slot, out_slot, layer) => fused_gate_up_mul_cmd::<W>(
-            *in_slot, *out_slot, *layer, true, bucket_m, tape_index, index, layer_offset,
+            *in_slot,
+            *out_slot,
+            *layer,
+            true,
+            bucket_m,
+            tape_index,
+            index,
+            layer_offset,
         ),
 
         // ── RoPE + KV cache append ─────────────────────────────────
@@ -2309,7 +2324,11 @@ fn lower_one<W: CanonicalParams>(
             // sliding tiles use the base consts (256 / 8 / full).
             // Identity on uniform models.
             let (hd, n_kv, rd) = if *is_global {
-                (W::GLOBAL_HEAD_DIM, W::NUM_GLOBAL_KV_HEADS, W::GLOBAL_ROT_DIM)
+                (
+                    W::GLOBAL_HEAD_DIM,
+                    W::NUM_GLOBAL_KV_HEADS,
+                    W::GLOBAL_ROT_DIM,
+                )
             } else {
                 (W::HEAD_DIM, W::NUM_KV_HEADS, W::ROT_DIM)
             };
@@ -2390,7 +2409,11 @@ fn lower_one<W: CanonicalParams>(
             );
             // Same geometry-class selection as the RopeAppend arm.
             let (hd, n_kv, rd) = if *is_global {
-                (W::GLOBAL_HEAD_DIM, W::NUM_GLOBAL_KV_HEADS, W::GLOBAL_ROT_DIM)
+                (
+                    W::GLOBAL_HEAD_DIM,
+                    W::NUM_GLOBAL_KV_HEADS,
+                    W::GLOBAL_ROT_DIM,
+                )
             } else {
                 (W::HEAD_DIM, W::NUM_KV_HEADS, W::ROT_DIM)
             };
@@ -3632,8 +3655,7 @@ fn lower_one<W: CanonicalParams>(
                 // file-scoped (slot 0 = BIAS_ADD_NUM_COLS).
                 constants: vec![ConstantValue::float(1, W::FINAL_LOGIT_SOFTCAPPING)],
                 dispatch: {
-                    let mut d =
-                        DispatchShape::dispatch_1d(eff_m * cur_width, THREADS_PER_GROUP);
+                    let mut d = DispatchShape::dispatch_1d(eff_m * cur_width, THREADS_PER_GROUP);
                     d.m_scaling = Some(crate::interpreter::metal::lowered::MScaling {
                         seq_axis: None,
                         axis: super::lowered::MScaleAxis::X,

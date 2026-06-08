@@ -24,8 +24,8 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 use syn::spanned::Spanned;
+use syn::{Ident, ItemFn, LitInt, Token, parse_macro_input};
 
 mod arch_spec;
 mod ast;
@@ -137,11 +137,14 @@ impl Parse for ForwardArgs {
             }
         }
 
-        let workloads =
-            workloads.ok_or_else(|| syn::Error::new(span, "#[forward] missing `workloads`"))?;
-        if workloads.is_empty() {
-            return Err(syn::Error::new(span, "#[forward] `workloads` is empty"));
-        }
+        // `workloads` is now OPTIONAL. When omitted, `#[forward]` fills the
+        // global default ladder (`DEFAULT_DECODER_WORKLOADS`, applied in the
+        // `forward` entry point); `#[vision_forward]` still requires it (its
+        // workloads are image-patch counts, not the text-decode ladder, so it
+        // re-validates non-empty). Per-bucket affordability is decided at load
+        // time by `select_prefill_bucket`, so declaring the full ladder here is
+        // free on small devices — they just prune it.
+        let workloads = workloads.unwrap_or_default();
         // Default: 1-D sweep. `sk_bucket = 0` is the sentinel value
         // that non-sk-constrained impls (Any / NumTokensRange) accept
         // unconditionally; FI impls with a real sk range won't match,
@@ -352,6 +355,14 @@ fn discover_models_dir(start: &std::path::Path, arch: &str) -> Result<std::path:
 
 // ── Macro entry point ─────────────────────────────────────────────
 
+/// Global, target-reactive prefill/decode bucket ladder. Every `#[forward]`
+/// arch that does not explicitly override `workloads` compiles THIS ladder
+/// (for both the CUDA and Metal codegen). The full ladder is always emitted;
+/// the affordable subset is chosen per device at load time by
+/// `select_prefill_bucket` (Metal prunes its colored arena, CUDA its captured
+/// graph shapes). Mirrors `ferrite-model-llama`'s historical ladder.
+const DEFAULT_DECODER_WORKLOADS: &[u64] = &[1, 2, 4, 8, 64, 512, 1024, 2048, 4096];
+
 #[proc_macro_attribute]
 pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
     // FERRITE_DUMP_SYNTH=<path> writes the MVP-synthesized pre-attn
@@ -365,7 +376,12 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
         let _ = std::fs::write(&path, &kernel.source);
     }
 
-    let args = parse_macro_input!(args as ForwardArgs);
+    let mut args = parse_macro_input!(args as ForwardArgs);
+    // Models no longer declare `workloads`; fall back to the global ladder.
+    // An explicit `workloads = [...]` still wins (special-case escape hatch).
+    if args.workloads.is_empty() {
+        args.workloads = DEFAULT_DECODER_WORKLOADS.to_vec();
+    }
     let carrier = parse_macro_input!(item as syn::Item);
 
     match parse_carrier(carrier).and_then(|c| compile_common(&args, &c, CompileMode::DECODER)) {
@@ -393,6 +409,16 @@ pub fn forward(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn vision_forward(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ForwardArgs);
+    // Vision workloads are image-patch counts, not the text-decode ladder —
+    // there is no sensible global default, so keep requiring them explicitly.
+    if args.workloads.is_empty() {
+        return syn::Error::new(
+            args.span,
+            "#[vision_forward] requires `workloads = [...]` (image-patch counts)",
+        )
+        .to_compile_error()
+        .into();
+    }
     let carrier = parse_macro_input!(item as syn::Item);
 
     match parse_carrier(carrier).and_then(|c| compile_common(&args, &c, CompileMode::VISION)) {
@@ -475,9 +501,8 @@ fn parse_carrier(item: syn::Item) -> syn::Result<Carrier> {
                     }
                 }
             }
-            let func = func.ok_or_else(|| {
-                syn::Error::new(name_span, "carrier mod is missing the DSL fn")
-            })?;
+            let func = func
+                .ok_or_else(|| syn::Error::new(name_span, "carrier mod is missing the DSL fn"))?;
             Ok(Carrier {
                 func,
                 arch_name,
@@ -663,8 +688,8 @@ fn compile_common(
     // Backend selection via feature flags (compile-time, not runtime)
     #[cfg(feature = "cuda")]
     let target_profile = {
-        let target_def = ferrite_cuda_targets::detect()
-            .map_err(|e| syn::Error::new(carrier.name_span, e))?;
+        let target_def =
+            ferrite_cuda_targets::detect().map_err(|e| syn::Error::new(carrier.name_span, e))?;
         target::from_profile_def(target_def)
     };
 
@@ -1886,6 +1911,20 @@ fn emit_arch_dispatcher(
         })
         .collect();
 
+    // Per-variant `METAL_BUCKET_ARENA_COSTS` reads — the `(bucket_m, bytes)`
+    // table the worker feeds to `select_prefill_bucket` for target-reactive
+    // bucket pruning. Mirrors `metal_arena_peak_arms`.
+    let metal_bucket_costs_arms: Vec<proc_macro2::TokenStream> = arms
+        .iter()
+        .map(|a| {
+            let variant_ident = pascal_case(&a.model_ident);
+            let model_ident = &a.model_ident;
+            quote! {
+                Weights::#variant_ident(_) => #model_ident::METAL_BUCKET_ARENA_COSTS,
+            }
+        })
+        .collect();
+
     // Accessor methods on Weights — each returns a per-variant
     // constant from the matched model's bounds. Consumers (e.g.
     // vllm-executor's CudaModel enum) delegate their own accessor
@@ -2302,6 +2341,13 @@ fn emit_arch_dispatcher(
             fn metal_arena_peak_bytes(&self) -> u64 {
                 match self {
                     #(#metal_arena_peak_arms)*
+                }
+            }
+
+            #[cfg(feature = "metal")]
+            fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
+                match self {
+                    #(#metal_bucket_costs_arms)*
                 }
             }
 

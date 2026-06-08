@@ -482,12 +482,9 @@ impl<'a> Unroller<'a> {
                     &input_shapes,
                     self.inferred.hybrid_attention_geometry,
                 )
-                    .map_err(|e| {
-                        UnrollError::UnsupportedCfgShape(format!(
-                            "nested {} shape: {e}",
-                            op.as_str()
-                        ))
-                    })?;
+                .map_err(|e| {
+                    UnrollError::UnsupportedCfgShape(format!("nested {} shape: {e}", op.as_str()))
+                })?;
                 let out_shape = sig.output.clone();
                 let tile_id = self.push_tile(*op, inputs, vec![sig.output]);
                 Ok((

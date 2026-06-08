@@ -264,9 +264,21 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
             let enc = cb.computeCommandEncoder().expect("encoder");
             for _ in 0..BATCH {
                 qmm.execute_with_kernel(
-                    &x_buf, &packed_buf, &scales_buf, &biases_buf, &y_buf,
-                    m as u32, n as u32, k as u32, 1, gs as u32, bits,
-                    DequantDtype::Bf16, ScaleDtype::Bf16, QmmTKernel::Nax, &enc,
+                    &x_buf,
+                    &packed_buf,
+                    &scales_buf,
+                    &biases_buf,
+                    &y_buf,
+                    m as u32,
+                    n as u32,
+                    k as u32,
+                    1,
+                    gs as u32,
+                    bits,
+                    DequantDtype::Bf16,
+                    ScaleDtype::Bf16,
+                    QmmTKernel::Nax,
+                    &enc,
                 )
                 .expect("dispatch");
             }
@@ -296,9 +308,7 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
         .expect("nax lib");
     use objc2_metal::MTLLibrary as _;
     for (label, bits) in [("dims b8", 8u32), ("dims b4", 4u32)] {
-        let name = format!(
-            "affine_qmm_t_nax_dims_bf16_s_bf16_gs_64_b_{bits}_alN_true_batch_0"
-        );
+        let name = format!("affine_qmm_t_nax_dims_bf16_s_bf16_gs_64_b_{bits}_alN_true_batch_0");
         let func = lib
             .newFunctionWithName(&NSString::from_str(&name))
             .expect("dims function");
@@ -326,7 +336,11 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
                 height: m.div_ceil(64),
                 depth: 1,
             };
-            let tpg = objc2_metal::MTLSize { width: 128, height: 1, depth: 1 };
+            let tpg = objc2_metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            };
             enc.dispatchThreadgroups_threadsPerThreadgroup(tg, tpg);
             enc.endEncoding();
             stream.commit().expect("commit");
@@ -341,19 +355,24 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
         }
         let dt = t0.elapsed().as_secs_f64() / iters2 as f64;
         let tflops = (2.0 * m as f64 * n as f64 * k as f64) / dt / 1e12;
-        eprintln!("[nax {label} unspecialized] {:.2} ms/iter -> {tflops:.2} TFLOPS", dt * 1e3);
+        eprintln!(
+            "[nax {label} unspecialized] {:.2} ms/iter -> {tflops:.2} TFLOPS",
+            dt * 1e3
+        );
     }
 
     // MLX's OWN compiled binary (the wheel's mlx.metallib), same
     // machine, our harness — isolates toolchain codegen from source.
     let mlxlib_path = std::env::var("FERRITE_BENCH_MLX_METALLIB").unwrap_or_default();
     if !mlxlib_path.is_empty() {
-        let bytes: &'static [u8] =
-            Box::leak(std::fs::read(&mlxlib_path).expect("mlx.metallib").into_boxed_slice());
+        let bytes: &'static [u8] = Box::leak(
+            std::fs::read(&mlxlib_path)
+                .expect("mlx.metallib")
+                .into_boxed_slice(),
+        );
         let lib = ferrite_metal_kernels::shader_cache::load_library_from_bytes(&device, bytes)
             .expect("load mlx.metallib");
-        let name =
-            "affine_qmm_t_nax_bfloat16_t_gs_64_b_8_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0";
+        let name = "affine_qmm_t_nax_bfloat16_t_gs_64_b_8_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0";
         let func = lib
             .newFunctionWithName(&NSString::from_str(name))
             .expect("mlx nax function");
@@ -385,7 +404,11 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
                 height: m.div_ceil(64),
                 depth: 1,
             };
-            let tpg = objc2_metal::MTLSize { width: 32, height: 2, depth: 2 };
+            let tpg = objc2_metal::MTLSize {
+                width: 32,
+                height: 2,
+                depth: 2,
+            };
             enc.dispatchThreadgroups_threadsPerThreadgroup(tg, tpg);
             enc.endEncoding();
             stream.commit().expect("commit");
@@ -399,7 +422,10 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
         }
         let dt = t0.elapsed().as_secs_f64() / 20.0;
         let tflops = (2.0 * m as f64 * n as f64 * k as f64) / dt / 1e12;
-        eprintln!("[nax MLX-BINARY b8] {:.2} ms/iter -> {tflops:.2} TFLOPS", dt * 1e3);
+        eprintln!(
+            "[nax MLX-BINARY b8] {:.2} ms/iter -> {tflops:.2} TFLOPS",
+            dt * 1e3
+        );
 
         // Output parity: the MLX binary must produce the same numbers
         // as OUR kernel on the same inputs — otherwise the timing
@@ -410,9 +436,21 @@ fn qmm_t_nax_b8_bf16_gemma4_mlp_bench() {
             let cb = stream.get_command_buffer().expect("cb").clone();
             let enc = cb.computeCommandEncoder().expect("encoder");
             qmm.execute_with_kernel(
-                &x_buf, &packed_buf, &scales_buf, &biases_buf, &y_ours,
-                m as u32, n as u32, k as u32, 1, gs as u32, 8,
-                DequantDtype::Bf16, ScaleDtype::Bf16, QmmTKernel::Nax, &enc,
+                &x_buf,
+                &packed_buf,
+                &scales_buf,
+                &biases_buf,
+                &y_ours,
+                m as u32,
+                n as u32,
+                k as u32,
+                1,
+                gs as u32,
+                8,
+                DequantDtype::Bf16,
+                ScaleDtype::Bf16,
+                QmmTKernel::Nax,
+                &enc,
             )
             .expect("dispatch");
             enc.endEncoding();

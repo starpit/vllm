@@ -85,7 +85,8 @@ pub fn emit_per_variant(
     // is Qwen's `visual.merger.mlp.2.weight` dim 0 — every existing
     // Qwen2-VL / Qwen2.5-VL config keeps that path byte-identically.
     let fingerprint = model
-        .arch.fingerprint
+        .arch
+        .fingerprint
         .clone()
         .expect("vision fingerprint enforced at config parse");
     let fp_key_lit = syn::LitStr::new(&fingerprint.key, proc_macro2::Span::call_site());
@@ -96,7 +97,8 @@ pub fn emit_per_variant(
     // form. We multiply every dim after `leading_dim` to land at a
     // dense 2D `[d_lead, prod_after]`. Default is Qwen's 5D path.
     let flatten = model
-        .arch.patch_embed_flatten
+        .arch
+        .patch_embed_flatten
         .clone()
         .expect("vision patch_embed_flatten enforced at config parse");
     let flatten_key_lit = syn::LitStr::new(&flatten.key, proc_macro2::Span::call_site());
@@ -179,7 +181,8 @@ pub fn emit_per_variant(
     // when a future arch requires it.
     let layered_prefix = {
         let layout = model
-            .arch.safetensors
+            .arch
+            .safetensors
             .clone()
             .expect("vision safetensors layout enforced at config parse");
         format!("{}.{}", layout.default_root, layout.layered_subpath)

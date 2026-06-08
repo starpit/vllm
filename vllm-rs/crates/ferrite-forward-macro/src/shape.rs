@@ -697,10 +697,7 @@ fn sig_attention(
         Dim::Bound("num_attention_heads".into()),
         Dim::Bound(hd_name.into()),
     ]);
-    let kv_heads = Dim::Mul(vec![
-        Dim::Bound(kv_name.into()),
-        Dim::Bound(hd_name.into()),
-    ]);
+    let kv_heads = Dim::Mul(vec![Dim::Bound(kv_name.into()), Dim::Bound(hd_name.into())]);
     if q.is_empty() {
         return Err(ShapeError::BadArgs {
             op: OpKind::Attention,
@@ -1868,7 +1865,12 @@ impl InferCtx {
                         .iter()
                         .map(|a| self.expr_shape(a))
                         .collect::<Result<_, _>>()?;
-                    apply_signature_with_geometry(&mut self.solver, *op, &all_input_shapes, self.hybrid_attention_geometry)?;
+                    apply_signature_with_geometry(
+                        &mut self.solver,
+                        *op,
+                        &all_input_shapes,
+                        self.hybrid_attention_geometry,
+                    )?;
                     // Now bind targets to the post-unification
                     // shapes. (Since rope_append is shape-preserving,
                     // target shapes equal input shapes.)
@@ -1907,7 +1909,12 @@ impl InferCtx {
                         .iter()
                         .map(|a| self.expr_shape(a))
                         .collect::<Result<_, _>>()?;
-                    apply_signature_with_geometry(&mut self.solver, *op, &all_input_shapes, self.hybrid_attention_geometry)?;
+                    apply_signature_with_geometry(
+                        &mut self.solver,
+                        *op,
+                        &all_input_shapes,
+                        self.hybrid_attention_geometry,
+                    )?;
                     self.locals.insert(targets[0], q_shape);
                     self.locals.insert(targets[1], k_shape);
                     Ok(())
@@ -2095,7 +2102,12 @@ impl InferCtx {
                     .iter()
                     .map(|a| self.expr_shape(a))
                     .collect::<Result<_, _>>()?;
-                let sig = apply_signature_with_geometry(&mut self.solver, *op, &inputs, self.hybrid_attention_geometry)?;
+                let sig = apply_signature_with_geometry(
+                    &mut self.solver,
+                    *op,
+                    &inputs,
+                    self.hybrid_attention_geometry,
+                )?;
                 Ok(sig.output)
             }
             Expr::Mul { lhs, rhs } => {
@@ -2731,7 +2743,8 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir, &Default::default())
+            .expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
             .find(|c| c.source_stem == "qwen2-vl-2b-instruct")
@@ -2800,7 +2813,8 @@ mod tests {
             .join("..")
             .join("ferrite-model-qwen2-vl")
             .join("configs");
-        let configs = crate::config::load_dir_vision(&dir, &Default::default()).expect("load qwen2-vl configs");
+        let configs = crate::config::load_dir_vision(&dir, &Default::default())
+            .expect("load qwen2-vl configs");
         let cfg = configs
             .iter()
             .find(|c| c.source_stem == "qwen2-vl-2b-instruct")

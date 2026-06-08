@@ -423,9 +423,7 @@ impl VisionConfig {
                                     let wgt = wy * cubic(xx as f32 - x);
                                     wsum += wgt;
                                     let base = (yy * ng + xx) * e;
-                                    for (a, &tv) in
-                                        acc.iter_mut().zip(&table[base..base + e])
-                                    {
+                                    for (a, &tv) in acc.iter_mut().zip(&table[base..base + e]) {
                                         *a += wgt * tv;
                                     }
                                 }

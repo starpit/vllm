@@ -9110,7 +9110,10 @@ pub unsafe fn sigmoid_rowgate_combine(
             cols,
             stream,
         ),
-        _ => panic!("sigmoid_rowgate_combine: unsupported dtype {:?}", out.dtype()),
+        _ => panic!(
+            "sigmoid_rowgate_combine: unsupported dtype {:?}",
+            out.dtype()
+        ),
     }
 }
 

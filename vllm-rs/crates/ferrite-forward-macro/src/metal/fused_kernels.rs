@@ -639,7 +639,12 @@ impl Implementation for MetalFusedGateUpSiluMulImpl {
             return FusedGateUpSiluMulImpl.fan_out(m, fuf, program, bounds, slots);
         }
         Some(quant_decomposed_fan_out(
-            m, fuf, program, bounds, slots, self.is_gelu,
+            m,
+            fuf,
+            program,
+            bounds,
+            slots,
+            self.is_gelu,
         ))
     }
 }
@@ -890,7 +895,6 @@ fn decomposed_qmm_inst(
     }
 }
 
-
 /// Gemma4 post-FFN tail fusion. Claims the 3-tile elementwise chain
 ///
 ///   `RmsNorm(down, post_ffwd_ln) → Add(normed, residual) →
@@ -1087,11 +1091,8 @@ impl Implementation for MetalNormAddScalarMulImpl {
 
         let (delta_id, delta_sub) = first_tile_input(fuf.get(rms_tile))?;
         let delta_slot = slots.of(delta_id, delta_sub);
-        let (residual_id, residual_sub) = fuf
-            .get(add_tile)
-            .inputs
-            .iter()
-            .find_map(|i| match i {
+        let (residual_id, residual_sub) =
+            fuf.get(add_tile).inputs.iter().find_map(|i| match i {
                 FufInput::Tile { id, slot } if *id != rms_tile => Some((*id, *slot)),
                 _ => None,
             })?;

@@ -588,10 +588,33 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         bucket_specs: &[MetalBucketSpec],
         runtime_factory: RuntimeFactory,
         max_workers: usize,
+        max_bucket_m: Option<u32>,
     ) -> Result<Self, PoolBuildError> {
         if bucket_specs.is_empty() {
             return Err(PoolBuildError::NoBuckets);
         }
+
+        // Target-reactive pruning: keep only buckets the device can afford
+        // (`bucket_m <= max_bucket_m`, the cap the worker derived from the
+        // memory budget). The arena below is colored over the KEPT specs, so
+        // pruning the top buckets is exactly what shrinks the resident arena to
+        // fit the KV budget. Always keep at least the smallest bucket so decode
+        // + minimal prefill still run on a memory-starved device; longer
+        // prompts then chunk to the largest kept bucket via `pick_bucket`.
+        let kept: Vec<&MetalBucketSpec> = match max_bucket_m {
+            Some(cap) => {
+                let mut v: Vec<&MetalBucketSpec> =
+                    bucket_specs.iter().filter(|s| s.bucket_m <= cap).collect();
+                if v.is_empty() {
+                    if let Some(smallest) = bucket_specs.iter().min_by_key(|s| s.bucket_m) {
+                        v.push(smallest);
+                    }
+                }
+                v
+            }
+            None => bucket_specs.iter().collect(),
+        };
+        let bucket_specs: &[&MetalBucketSpec] = &kept;
 
         // Worker arena is sized for the largest activation across every
         // bucket, AND for the largest colored slot count across buckets.
@@ -917,7 +940,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 .and_then(|v| v.parse::<usize>().ok())
                 == Some(num_tokens)
         {
-            return self.maybe_run_dump_pass(worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens);
+            return self.maybe_run_dump_pass(
+                worker,
+                bucket_idx,
+                num_tokens,
+                num_seqs,
+                has_spec_tokens,
+            );
         }
         // gemma3-mm SigLIP vision tower: the projector tail
         // (`AvgPool2d -> soft_emb_norm -> mm_input_projection`) hits an
@@ -951,7 +980,12 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             while start < total {
                 let end = (start + k).min(total);
                 self.run_dump_segment(
-                    worker, bucket_idx, num_tokens, num_seqs, has_spec_tokens, start..end,
+                    worker,
+                    bucket_idx,
+                    num_tokens,
+                    num_seqs,
+                    has_spec_tokens,
+                    start..end,
                 )?;
                 start = end;
             }
@@ -1165,7 +1199,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                 // SAFETY: diagnostic-only; buffer outlives the process
                 // via the allocator's MmapRegion.
                 let buf: &::objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> = unsafe {
-                    &*(*buf_ptr as *const ::objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>)
+                    &*(*buf_ptr
+                        as *const ::objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>)
                 };
                 use objc2_metal::{
                     MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
@@ -1204,14 +1239,23 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                     enc.setBuffer_offset_atIndex(Some(&dstb), 0, 1);
                 }
                 enc.dispatchThreads_threadsPerThreadgroup(
-                    objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
-                    objc2_metal::MTLSize { width: 32, height: 1, depth: 1 },
+                    objc2_metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
                 );
                 enc.endEncoding();
                 cb.commit();
                 unsafe { cb.waitUntilCompleted() };
-                let gpu =
-                    unsafe { std::slice::from_raw_parts(dstb.contents().as_ptr() as *const u8, 32) };
+                let gpu = unsafe {
+                    std::slice::from_raw_parts(dstb.contents().as_ptr() as *const u8, 32)
+                };
                 let cpu = unsafe {
                     std::slice::from_raw_parts(
                         (buf.contents().as_ptr() as *const u8).add(*off as usize),
@@ -1232,9 +1276,8 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // bisect). Optionally bounded by FERRITE_DUMP_CMD_RANGE
         // "lo..hi" (flat command indices) to keep file volume sane.
         let dump_all = kernels_csv == "all";
-        let cmd_range: Option<(usize, usize)> = std::env::var("FERRITE_DUMP_CMD_RANGE")
-            .ok()
-            .and_then(|v| {
+        let cmd_range: Option<(usize, usize)> =
+            std::env::var("FERRITE_DUMP_CMD_RANGE").ok().and_then(|v| {
                 let (lo, hi) = v.split_once("..")?;
                 Some((lo.parse().ok()?, hi.parse().ok()?))
             });
@@ -1282,12 +1325,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             }
             // A dump point whose runtime gate doesn't fire for this
             // forward never ran — its output slot holds stale data.
-            if !super::worker::gate_matches(
-                dc.gate,
-                num_tokens as u32,
-                num_seqs,
-                has_spec_tokens,
-            ) {
+            if !super::worker::gate_matches(dc.gate, num_tokens as u32, num_seqs, has_spec_tokens) {
                 continue;
             }
             let occ_i = {
@@ -1318,14 +1356,13 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
             for (bind_idx, slot) in &dc.arena_slots {
                 let buf = &worker.arena[*slot as usize];
                 let len = buf.length();
-                let fname = format!(
-                    "cmd{idx:04}_{kname}_occ{occ_i:03}_b{bind_idx}_slot{slot}.bin"
-                );
+                let fname = format!("cmd{idx:04}_{kname}_occ{occ_i:03}_b{bind_idx}_slot{slot}.bin");
                 // SAFETY: arena slots are StorageModeShared whole
                 // buffers; the segment's host wait completed, so the
                 // GPU is done writing this range.
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len) };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buf.contents().as_ptr() as *const u8, len)
+                };
                 if let Err(e) = std::fs::write(dir.join(&fname), bytes) {
                     eprintln!("[dump] write {fname} failed: {e}");
                     continue;
@@ -1340,7 +1377,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
         if timing_only {
             let mut rows: Vec<(&String, &(usize, f64))> = per_kernel.iter().collect();
-            rows.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+            rows.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
             let total: f64 = rows.iter().map(|(_, (_, ms))| ms).sum();
             eprintln!(
                 "[dump-timing bucket={bucket_idx} num_tokens={num_tokens}] \
@@ -2679,6 +2716,7 @@ mod tests {
             bucket_specs,
             runtime_factory,
             max_workers,
+            None,
         ))
     }
 
@@ -2706,6 +2744,7 @@ mod tests {
             &[],
             runtime_factory,
             1,
+            None,
         );
         match res {
             Err(PoolBuildError::NoBuckets) => {}

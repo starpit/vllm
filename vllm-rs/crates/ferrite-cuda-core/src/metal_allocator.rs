@@ -606,11 +606,8 @@ impl MetalAllocator {
     fn aligned_cache_meta(path: &Path, aligned_capacity: usize) -> Option<AlignedCacheMeta> {
         let md = std::fs::metadata(path).ok()?;
         let mtime = md.modified().ok()?;
-        let src_mtime_ns = mtime
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos()
-            & (u64::MAX as u128);
+        let src_mtime_ns =
+            mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() & (u64::MAX as u128);
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -670,14 +667,18 @@ impl MetalAllocator {
             return Err((anyhow::anyhow!("null mmap base"), mmap));
         };
         let Some(buffer) = (unsafe {
-            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
-                nn,
-                rounded,
-                MTLResourceOptions::StorageModeShared,
-                None,
-            )
+            self.device
+                .newBufferWithBytesNoCopy_length_options_deallocator(
+                    nn,
+                    rounded,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
         }) else {
-            return Err((anyhow::anyhow!("newBufferWithBytesNoCopy returned nil"), mmap));
+            return Err((
+                anyhow::anyhow!("newBufferWithBytesNoCopy returned nil"),
+                mmap,
+            ));
         };
         self.residency.insert(&buffer);
 
@@ -741,17 +742,26 @@ impl MetalAllocator {
                 }
                 for (w_off, w_len) in [
                     (0usize, t.len.min(4096)),
-                    (t.len / 2 & !63, t.len.saturating_sub(t.len / 2 & !63).min(4096)),
+                    (
+                        t.len / 2 & !63,
+                        t.len.saturating_sub(t.len / 2 & !63).min(4096),
+                    ),
                     (t.len.saturating_sub(4096), t.len.min(4096)),
                 ] {
                     if w_len == 0 {
                         continue;
                     }
                     let a = unsafe {
-                        std::slice::from_raw_parts((src_base + t.src_offset + w_off) as *const u8, w_len)
+                        std::slice::from_raw_parts(
+                            (src_base + t.src_offset + w_off) as *const u8,
+                            w_len,
+                        )
                     };
                     let b = unsafe {
-                        std::slice::from_raw_parts((dst_base + t.dst_offset + w_off) as *const u8, w_len)
+                        std::slice::from_raw_parts(
+                            (dst_base + t.dst_offset + w_off) as *const u8,
+                            w_len,
+                        )
                     };
                     if a != b {
                         bad += 1;
@@ -875,7 +885,8 @@ impl MetalAllocator {
             };
             {
                 use std::os::fd::AsRawFd;
-                let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                let rc =
+                    unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if rc != 0 {
                     tracing::info!(
                         "aligned-cache: another process is building {}; skipping",
@@ -888,7 +899,10 @@ impl MetalAllocator {
             // finished the build while we waited on the latch) and
             // sweep any orphaned tmp from a killed builder.
             if meta.is_valid_on_disk() {
-                tracing::info!("aligned-cache: {} already built; skipping", cache_bin.display());
+                tracing::info!(
+                    "aligned-cache: {} already built; skipping",
+                    cache_bin.display()
+                );
                 return;
             }
             // Pid-suffixed tmp: even if exclusion is ever bypassed,
@@ -896,7 +910,9 @@ impl MetalAllocator {
             // is atomic and both write identical bytes.
             let tmp = cache_bin.with_extension(format!("tmp.{}", std::process::id()));
             if let Some(dir) = cache_bin.parent()
-                && let Some(stem) = cache_bin.file_name().map(|f| f.to_string_lossy().into_owned())
+                && let Some(stem) = cache_bin
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
                 && let Ok(rd) = std::fs::read_dir(dir)
             {
                 for e in rd.flatten() {
@@ -922,9 +938,8 @@ impl MetalAllocator {
                 let mut off = 0usize;
                 while off < len {
                     let n = (len - off).min(CHUNK);
-                    let s = unsafe {
-                        std::slice::from_raw_parts((aligned_base + off) as *const u8, n)
-                    };
+                    let s =
+                        unsafe { std::slice::from_raw_parts((aligned_base + off) as *const u8, n) };
                     f.write_all(s)?;
                     off += n;
                 }
@@ -948,7 +963,9 @@ impl MetalAllocator {
                 let _ = std::fs::remove_file(&tmp);
                 return;
             }
-            let meta_tmp = meta.meta_json_path().with_extension(format!("json.tmp.{}", std::process::id()));
+            let meta_tmp = meta
+                .meta_json_path()
+                .with_extension(format!("json.tmp.{}", std::process::id()));
             if let Err(e) = std::fs::write(&meta_tmp, meta.to_json())
                 .and_then(|()| std::fs::rename(&meta_tmp, meta.meta_json_path()))
             {
@@ -980,7 +997,6 @@ impl MetalAllocator {
         meta: Option<AlignedCacheMeta>,
         cache_enabled: bool,
     ) -> Result<()> {
-
         let dst_buffer = self
             .device
             .newBufferWithLength_options(aligned_capacity, MTLResourceOptions::StorageModeShared)
@@ -1114,17 +1130,19 @@ impl MetalAllocator {
             let jobs = &chunk_jobs;
             std::thread::scope(|scope| {
                 for _ in 0..n_workers {
-                    scope.spawn(|| loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((chunk_src, chunk_dst, chunk_sz, ready)) = jobs.get(i) else {
-                            break;
-                        };
-                        let dst = (dst_base_usize + chunk_dst) as *mut u8;
-                        let src = (src_base_usize + chunk_src) as *const u8;
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(src, dst, *chunk_sz);
+                    scope.spawn(|| {
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some((chunk_src, chunk_dst, chunk_sz, ready)) = jobs.get(i) else {
+                                break;
+                            };
+                            let dst = (dst_base_usize + chunk_dst) as *mut u8;
+                            let src = (src_base_usize + chunk_src) as *const u8;
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(src, dst, *chunk_sz);
+                            }
+                            ready.signal_chunk();
                         }
-                        ready.signal_chunk();
                     });
                 }
             });
@@ -1147,7 +1165,10 @@ impl MetalAllocator {
                 let mut all_zero = true;
                 for (w_off, w_len) in [
                     (0usize, t.len.min(4096)),
-                    (t.len / 2 & !63, t.len.saturating_sub(t.len / 2 & !63).min(4096)),
+                    (
+                        t.len / 2 & !63,
+                        t.len.saturating_sub(t.len / 2 & !63).min(4096),
+                    ),
                     (t.len.saturating_sub(4096), t.len.min(4096)),
                 ] {
                     if w_len == 0 {
@@ -1155,10 +1176,18 @@ impl MetalAllocator {
                     }
                     // SAFETY: both ranges proven in-bounds by construction
                     // above; copies for this tensor completed synchronously.
-                    let src =
-                        unsafe { std::slice::from_raw_parts((src_base_usize + t.src_offset + w_off) as *const u8, w_len) };
-                    let dst =
-                        unsafe { std::slice::from_raw_parts((dst_base_usize + t.dst_offset + w_off) as *const u8, w_len) };
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            (src_base_usize + t.src_offset + w_off) as *const u8,
+                            w_len,
+                        )
+                    };
+                    let dst = unsafe {
+                        std::slice::from_raw_parts(
+                            (dst_base_usize + t.dst_offset + w_off) as *const u8,
+                            w_len,
+                        )
+                    };
                     if src != dst {
                         mismatch = true;
                     }

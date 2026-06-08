@@ -653,6 +653,16 @@ mod dispatcher {
             512 * 1024 * 1024
         }
 
+        /// `(bucket_m, total_arena_bytes)` for every compiled prefill bucket,
+        /// ascending by `bucket_m`. The macro overrides this per-arch from the
+        /// canonical's `METAL_BUCKET_ARENA_COSTS`; the load-time selector uses
+        /// it to prune the global ladder to what the device can afford. Default
+        /// empty → the selector falls back to keeping all compiled buckets.
+        #[cfg(feature = "metal")]
+        fn metal_bucket_arena_costs(&self) -> &'static [(u32, u64)] {
+            &[]
+        }
+
         /// Per-canonical metal dtype. The macro emits an override
         /// returning `<Self as CanonicalParams>::METAL_DTYPE` so the
         /// worker can route argmax / weight-loader / etc. between

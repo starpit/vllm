@@ -554,9 +554,7 @@ pub fn qmv_kernel_static_name(
                      — only 64 and 128 instantiated"
                 );
             }
-            format!(
-                "affine_qmv_quad_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_d_{d}_batch_0"
-            )
+            format!("affine_qmv_quad_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_d_{d}_batch_0")
         }
         QmvKernel::Fast => {
             format!("affine_qmv_fast_{dtype_s}_s_{scale_s}_gs_{group_size}_b_{bits}_batch_0")

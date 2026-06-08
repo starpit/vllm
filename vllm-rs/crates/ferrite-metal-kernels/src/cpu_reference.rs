@@ -368,6 +368,6 @@ pub fn affine_qmm_t_b8_bf16_s_bf16(
     affine_qmm_t_b8::<half::bf16, half::bf16>(packed, scales, biases, x, m, n, k, group_size)
 }
 
+pub use affine_qmm_t_b4_f16 as affine_qmv_b4_f16;
 pub use affine_qmm_t_b8_bf16_s_bf16 as affine_qmv_b8_bf16_s_bf16;
 pub use affine_qmm_t_b8_f16 as affine_qmv_b8_f16;
-pub use affine_qmm_t_b4_f16 as affine_qmv_b4_f16;

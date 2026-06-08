@@ -1683,6 +1683,13 @@ pub struct FerriteWorker {
     /// `Weights::load` upload path) plus the per-step CommandQueue.
     #[cfg(feature = "metal")]
     gpu_device: Option<GpuDevice>,
+    /// Largest prefill bucket this device can afford, chosen at load time by
+    /// `select_prefill_bucket` from the compiled ladder + the memory budget.
+    /// Used to clamp the scheduler's `max_num_batched_tokens` so a single
+    /// forward never exceeds the largest resident (pruned) bucket. `None` until
+    /// `determine_available_memory` runs / on arches without a cost table.
+    #[cfg(feature = "metal")]
+    metal_prefill_bucket_max_m: Option<u32>,
     /// Loaded ferrite-forward weights — `Box<dyn FerriteWeights>`
     /// dispatched through `try_load`. The trait `forward` body
     /// collapses to the per-canonical metal `forward` fn under
@@ -7434,6 +7441,149 @@ pub fn compute_available_kv_bytes(
     requested.saturating_sub(non_kv_cache)
 }
 
+/// Outcome of target-reactive prefill-bucket selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillBucketSelection {
+    /// Largest prefill `bucket_m` to keep resident. The backend prunes its
+    /// per-bucket tapes/shapes above this, and the scheduler clamps
+    /// `max_num_batched_tokens` to it so a single forward never exceeds it.
+    pub max_bucket_m: u32,
+    /// Activation footprint of the selected bucket (the cost actually paid):
+    /// on Metal the colored arena bytes, on CUDA the capture working set.
+    pub arena_bytes: u64,
+    /// Bytes left for the KV cache after the fixed allocations and the
+    /// selected activation footprint.
+    pub kv_bytes: u64,
+}
+
+/// Pick the largest prefill bucket the device can afford — the backend-neutral
+/// half of "target-reactive buckets". The forward macro emits the SAME
+/// candidate ladder for every backend; each backend supplies its own
+/// per-bucket activation cost (`bucket_costs`, `(bucket_m, bytes)`) and applies
+/// the result to its own mechanism (Metal: the pre-reserved colored arena that
+/// trades off against KV; CUDA: which graph shapes to capture). The policy:
+/// the activation footprint may use up to `arena_fraction` of the headroom left
+/// after the fixed (weights + recurrent-state reserve + redundancy)
+/// allocations; the KV cache gets the rest. The smallest bucket is always kept
+/// so a memory-starved device still runs (it just chunks prefill harder).
+///
+/// This is why nothing here is Apple-specific: a 24 GB 4090 vs an 80 GB H100
+/// reacts exactly like a 32 GB M-series vs a 192 GB Ultra.
+pub fn select_prefill_bucket(
+    budget_bytes: u64,
+    fixed_bytes: u64,
+    bucket_costs: &[(u32, u64)],
+    arena_fraction: f64,
+) -> PrefillBucketSelection {
+    let headroom = budget_bytes.saturating_sub(fixed_bytes);
+    let arena_budget = (headroom as f64 * arena_fraction.clamp(0.0, 1.0)) as u64;
+    // Always-available fallback: the smallest-`m` bucket. Used when even it
+    // exceeds `arena_budget` on a severely memory-starved device.
+    let fallback = bucket_costs
+        .iter()
+        .copied()
+        .min_by_key(|&(m, _)| m)
+        .unwrap_or((1, 0));
+    // Largest `m` whose activation cost fits the arena budget. Costs are
+    // monotonic in `m`, but `max_by_key` over the fitting set is robust to
+    // any ordering of `bucket_costs`.
+    let chosen = bucket_costs
+        .iter()
+        .copied()
+        .filter(|&(_, cost)| cost <= arena_budget)
+        .max_by_key(|&(m, _)| m)
+        .unwrap_or(fallback);
+    PrefillBucketSelection {
+        max_bucket_m: chosen.0,
+        arena_bytes: chosen.1,
+        kv_bytes: headroom.saturating_sub(chosen.1),
+    }
+}
+
+#[cfg(all(test, any(feature = "cuda", feature = "metal")))]
+mod bucket_selection_tests {
+    use super::{PrefillBucketSelection, select_prefill_bucket};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    // The Qwen3.5-35B-A3B ladder costs measured on Metal (arena bytes per
+    // bucket): tiny for the decode buckets, then the prefill ramp.
+    fn ladder() -> Vec<(u32, u64)> {
+        vec![
+            (1, 4 * MIB),
+            (8, 8 * MIB),
+            (64, 36 * MIB),
+            (512, 288 * MIB),
+            (2048, 1150 * MIB),
+            (4096, 2300 * MIB),
+        ]
+    }
+
+    #[test]
+    fn starved_box_picks_small_bucket_keeps_kv() {
+        // 32 GB M-series running a 35B: budget 22.5 GiB, fixed (weights+gdn)
+        // ~21.3 GiB -> ~1.2 GiB headroom. Only the 512 bucket fits 0.6x of it.
+        let sel = select_prefill_bucket(22_500 * MIB, 21_300 * MIB, &ladder(), 0.6);
+        assert_eq!(
+            sel.max_bucket_m, 512,
+            "32GB box should pick 512, got {sel:?}"
+        );
+        assert!(
+            sel.kv_bytes > 700 * MIB,
+            "must leave healthy KV, got {sel:?}"
+        );
+    }
+
+    #[test]
+    fn roomy_box_picks_top_bucket() {
+        // 64 GB part: budget ~43 GiB, same fixed -> ~21.7 GiB headroom ->
+        // the 4096 bucket (2.3 GiB) easily fits 0.6x of it.
+        let sel = select_prefill_bucket(43 * GIB, 21_300 * MIB, &ladder(), 0.6);
+        assert_eq!(
+            sel.max_bucket_m, 4096,
+            "64GB box should pick 4096, got {sel:?}"
+        );
+        assert!(
+            sel.kv_bytes > 18 * GIB,
+            "should leave lots of KV, got {sel:?}"
+        );
+    }
+
+    #[test]
+    fn severely_starved_falls_back_to_smallest() {
+        // No headroom at all: must still return a runnable (smallest) bucket.
+        let sel = select_prefill_bucket(21 * GIB, 21_300 * MIB, &ladder(), 0.6);
+        assert_eq!(
+            sel.max_bucket_m, 1,
+            "starved box falls back to smallest, got {sel:?}"
+        );
+    }
+
+    #[test]
+    fn monotonic_kv_decreases_as_bucket_grows() {
+        // Sanity: a bigger arena_fraction selects a bigger bucket and leaves
+        // less KV — the explicit prefill-vs-KV tradeoff.
+        let lean = select_prefill_bucket(43 * GIB, 21_300 * MIB, &ladder(), 0.1);
+        let rich = select_prefill_bucket(43 * GIB, 21_300 * MIB, &ladder(), 0.9);
+        assert!(lean.max_bucket_m <= rich.max_bucket_m);
+        assert!(lean.kv_bytes >= rich.kv_bytes);
+    }
+
+    #[test]
+    fn empty_ladder_is_safe() {
+        let sel = select_prefill_bucket(43 * GIB, 1 * GIB, &[], 0.6);
+        assert_eq!(
+            sel,
+            PrefillBucketSelection {
+                max_bucket_m: 1,
+                arena_bytes: 0,
+                kv_bytes: 42 * GIB
+            }
+        );
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -7684,6 +7834,8 @@ impl FerriteWorker {
             progress_callback: None,
             metal_device: None,
             gpu_device: None,
+            #[cfg(feature = "metal")]
+            metal_prefill_bucket_max_m: None,
             model: None,
             mm: None,
             mm_pending: None,
@@ -8631,6 +8783,7 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 device: main_dev.device.clone(),
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
+                metal_bucket_max_m: main_dev.metal_bucket_max_m,
             })
         } else {
             None
@@ -8904,6 +9057,7 @@ impl ::vllm_engine::spec_decode::SpecDecodeBackend for FerriteWorker {
                 device: main_dev.device.clone(),
                 queue: draft_q,
                 allocator: main_dev.allocator.clone(),
+                metal_bucket_max_m: main_dev.metal_bucket_max_m,
             })
         } else {
             None
@@ -8999,6 +9153,12 @@ impl Worker for FerriteWorker {
         self.metal_device = Some(std::sync::Arc::new(device));
         info!("FerriteWorker(metal): Metal device initialized");
         Ok(())
+    }
+
+    fn prefill_bucket_max_m(&self) -> Option<u32> {
+        // Set by `determine_available_memory` from the target-reactive bucket
+        // selection; the engine clamps `max_num_batched_tokens` to it.
+        self.metal_prefill_bucket_max_m
     }
 
     fn load_model(&mut self) -> ExecutorResult<()> {
@@ -9546,11 +9706,62 @@ impl Worker for FerriteWorker {
             .device
             .currentAllocatedSize()
             .saturating_add(gdn_reserve);
-        let arena_peak = self
+        // ── Target-reactive prefill-bucket selection ─────────────────────
+        // The forward macro now compiles a full bucket ladder for every arch
+        // (no per-model `workloads` cap). Pick the largest bucket THIS device
+        // can afford: the activation arena may use up to ARENA_FRACTION of the
+        // headroom left after weights + GDN reserve + pads, and KV gets the
+        // rest. The chosen cap is stashed on the GpuDevice the forward path
+        // uses, so the lazy `MetalWorkerPool::for_buckets` prunes the ladder to
+        // match — the same binary runs 512 on a 32 GiB box and 4096 on a
+        // 192 GiB one, with nothing Apple-specific about the policy. An empty
+        // cost table (older arches that never emitted it) falls back to the
+        // prior "reserve the full-ladder arena peak" behavior.
+        const ARENA_FRACTION: f64 = 0.6;
+        let utilization = self.config.gpu_memory_utilization;
+        let bucket_costs: &'static [(u32, u64)] = self
             .model
             .as_ref()
-            .map(|m| m.metal_arena_peak_bytes() as usize)
-            .unwrap_or(512 * 1024 * 1024);
+            .map(|m| m.metal_bucket_arena_costs())
+            .unwrap_or(&[]);
+        let selection = if bucket_costs.is_empty() {
+            None
+        } else {
+            // `pad` mirrors the non-arena, non-KV terms the KV formula
+            // subtracts (64 MiB runtime/staging + 150 MiB redundancy) so the
+            // headroom the selector splits equals what is actually left.
+            let pad = (64 + 150) * 1024 * 1024u64;
+            let budget = (total as f64 * utilization) as u64;
+            let fixed = (weights_and_overhead as u64).saturating_add(pad);
+            let sel = select_prefill_bucket(budget, fixed, bucket_costs, ARENA_FRACTION);
+            tracing::info!(
+                "FerriteWorker(metal): target-reactive prefill bucket = {} \
+                 (arena {:.1} MiB, KV ~{:.1} MiB; candidate ladder {:?} pruned \
+                 to fit {:.2} GiB budget)",
+                sel.max_bucket_m,
+                sel.arena_bytes as f64 / 1_048_576.0,
+                sel.kv_bytes as f64 / 1_048_576.0,
+                bucket_costs.iter().map(|(m, _)| *m).collect::<Vec<_>>(),
+                budget as f64 / 1_073_741_824.0,
+            );
+            // Stash the cap on the metal `gpu_device` (the GpuDevice every
+            // metal forward path runs through — `self.device` is the
+            // cuda-only field). Whichever forward triggers the one-shot lazy
+            // pool init reads it and prunes the ladder.
+            if let Some(dev) = self.gpu_device.as_mut() {
+                dev.metal_bucket_max_m = Some(sel.max_bucket_m);
+            }
+            self.metal_prefill_bucket_max_m = Some(sel.max_bucket_m);
+            Some(sel)
+        };
+        let arena_peak = match selection {
+            Some(sel) => sel.arena_bytes as usize,
+            None => self
+                .model
+                .as_ref()
+                .map(|m| m.metal_arena_peak_bytes() as usize)
+                .unwrap_or(512 * 1024 * 1024),
+        };
         // When a draft model is loaded we also need an activation arena for
         // it. Decode-only forwards on a 1B model peak well below the target,
         // but the target's prefill (M >> 1) arena is the worst case across
@@ -9561,7 +9772,7 @@ impl Worker for FerriteWorker {
             arena_peak
         };
         let peak_activation_estimate = arena_peak_pair.saturating_add(64 * 1024 * 1024);
-        let utilization = self.config.gpu_memory_utilization;
+        // `utilization` computed above with the bucket selection.
         let available = compute_available_kv_bytes(
             total,
             weights_and_overhead,
@@ -10161,6 +10372,9 @@ impl Worker for FerriteWorker {
                             device: mtl_device_clone,
                             queue: draft_queue_clone,
                             allocator: allocator_clone,
+                            // Draft chain shadow device: draft is a small
+                            // non-GDN model; keep all its buckets (no prune).
+                            metal_bucket_max_m: None,
                         };
                         // Upload host slices into fresh shared
                         // MTLBuffers (thread-local, dropped at thread

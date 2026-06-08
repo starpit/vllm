@@ -381,8 +381,11 @@ impl KvCachePool {
                 "per_layer_block_elems len must equal num_layers"
             );
         }
-        let layer_block_elems =
-            |layer: usize| per_layer_block_elems.as_ref().map_or(per_block_elems, |v| v[layer]);
+        let layer_block_elems = |layer: usize| {
+            per_layer_block_elems
+                .as_ref()
+                .map_or(per_block_elems, |v| v[layer])
+        };
 
         let mut k_chunks: Vec<Vec<RawGpuMem>> = Vec::with_capacity(num_layers);
         let mut v_chunks: Vec<Vec<RawGpuMem>> = Vec::with_capacity(num_layers);

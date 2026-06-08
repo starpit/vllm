@@ -118,8 +118,7 @@ pub fn bake_mtl4_steps(steps: &[BucketStep], device: &Device) -> Option<Vec<Mtl4
                         // `set_buffer_offset_atIndex` does the
                         // equivalent under the hood.
                         let addr = buf.gpuAddress() + *off;
-                        if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some()
-                            && tables.len() < 2
+                        if std::env::var_os("FERRITE_VERIFY_BINDINGS").is_some() && tables.len() < 2
                         {
                             eprintln!(
                                 "[verify-table] cmd{} idx{} addr={:#x} (base={:#x} off={})",

@@ -224,8 +224,8 @@ struct AttnCase {
 /// (the paged layout with an identity block table).
 #[allow(clippy::too_many_arguments)]
 fn attn_ref(
-    q: &[f32],     // [num_q, num_q_heads, head_dim] (one row per query token)
-    k: &[f32],     // paged layout, f16-rounded
+    q: &[f32], // [num_q, num_q_heads, head_dim] (one row per query token)
+    k: &[f32], // paged layout, f16-rounded
     v: &[f32],
     case: &AttnCase,
     block_size: usize,
@@ -514,14 +514,6 @@ fn attention_window_gemma4_sliding_geometry() {
     });
 }
 
-
-
-
-
-
-
-
-
 #[test]
 fn rmsnorm_unit_f16_matches_cpu() {
     let Some(di) = detect_device() else {
@@ -558,8 +550,16 @@ fn rmsnorm_unit_f16_matches_cpu() {
         enc.setBuffer_offset_atIndex(Some(&in_buf), 0, 1);
     }
     enc.dispatchThreadgroups_threadsPerThreadgroup(
-        MTLSize { width: rows, height: 1, depth: 1 },
-        MTLSize { width: 256, height: 1, depth: 1 },
+        MTLSize {
+            width: rows,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
     );
     enc.endEncoding();
     cb.commit();
@@ -599,7 +599,9 @@ fn scalar_weight_mul_f16_matches_cpu() {
         "scalar_weight_mul_f16_specialized",
         Vec::new(),
     );
-    let pipeline = cache.get_or_build(&key).expect("scalar_weight_mul pipeline");
+    let pipeline = cache
+        .get_or_build(&key)
+        .expect("scalar_weight_mul pipeline");
     let in_buf = buf_f16(&device, &x);
     let w_buf = buf_f16(&device, &[scalar]);
     let out_buf = buf_zero(&device, n * 2);

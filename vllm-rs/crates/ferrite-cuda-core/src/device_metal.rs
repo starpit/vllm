@@ -21,6 +21,13 @@ pub struct GpuDevice {
     pub device: Arc<Device>,
     pub queue: CommandQueue,
     pub allocator: Arc<MetalAllocator>,
+    /// Target-reactive prefill-bucket cap. The worker computes the largest
+    /// bucket this device can afford (see `select_prefill_bucket`) and stashes
+    /// it here AFTER `determine_available_memory` and BEFORE the first forward;
+    /// the lazy `MetalWorkerPool::for_buckets` reads it to prune the compiled
+    /// ladder so the activation arena matches the KV budget. `None` = keep all
+    /// compiled buckets (no pruning).
+    pub metal_bucket_max_m: Option<u32>,
 }
 
 impl GpuDevice {
@@ -32,6 +39,7 @@ impl GpuDevice {
             device,
             queue,
             allocator,
+            metal_bucket_max_m: None,
         }
     }
 

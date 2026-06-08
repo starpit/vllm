@@ -3951,19 +3951,13 @@ impl Instruction {
                 );
             }
             Instruction::ScalarWeightMul(..) => {
-                unimplemented!(
-                    "ScalarWeightMul cuda eval is unwired — Gemma4 is metal-first"
-                );
+                unimplemented!("ScalarWeightMul cuda eval is unwired — Gemma4 is metal-first");
             }
             Instruction::NormAddScalarMul(..) => {
-                unimplemented!(
-                    "NormAddScalarMul cuda eval is unwired — Gemma4 is metal-first"
-                );
+                unimplemented!("NormAddScalarMul cuda eval is unwired — Gemma4 is metal-first");
             }
             Instruction::RopeAppendNormed(..) => {
-                unimplemented!(
-                    "RopeAppendNormed cuda eval is unwired — Gemma4 is metal-first"
-                );
+                unimplemented!("RopeAppendNormed cuda eval is unwired — Gemma4 is metal-first");
             }
             Instruction::MetalBiasAdd(..) => {
                 unreachable!(

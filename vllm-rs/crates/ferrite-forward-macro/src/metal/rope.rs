@@ -358,7 +358,6 @@ impl Implementation for MetalRopeAppendInterleavedImpl {
     }
 }
 
-
 /// Gemma4 pre-attention tail fusion: claims the 4-tile chain
 ///
 ///   `RmsNorm(q_raw, q_gains) / RmsNorm(k_raw, k_gains) /
@@ -435,9 +434,8 @@ fn match_rope_normed_at(fuf: &Fuf, seed: TileId) -> Option<MatchInfo> {
             return None;
         };
         let (q_in, k_in, v_t) = (*q_in, *k_in, *v_t);
-        let single_consumer = |t: TileId| -> bool {
-            fuf.nodes.iter().filter(|n| consumes_tile(n, t)).count() == 1
-        };
+        let single_consumer =
+            |t: TileId| -> bool { fuf.nodes.iter().filter(|n| consumes_tile(n, t)).count() == 1 };
         // q/k may reach the rope through a flatten-back Reshape over
         // the per-head norm; peel it (and claim it) when present.
         let (q_t, q_rs) = peel_reshape(fuf, q_in);
@@ -529,11 +527,8 @@ impl Implementation for MetalRopeAppendNormedImpl {
         let mut cur = seed;
         let mut hops = 0;
         let rope_id = loop {
-            let consumers: Vec<&crate::fuf::FufNode> = fuf
-                .nodes
-                .iter()
-                .filter(|n| consumes_tile(n, cur))
-                .collect();
+            let consumers: Vec<&crate::fuf::FufNode> =
+                fuf.nodes.iter().filter(|n| consumes_tile(n, cur)).collect();
             let [next] = consumers.as_slice() else {
                 return None;
             };
@@ -685,9 +680,10 @@ impl Implementation for MetalRopeAppendNormedImpl {
             .find(|t| matches!(fuf.get(**t).op, OpKind::RopeAppend))?;
         let rope_node = fuf.get(rope_id);
         // Geometry class — same detection as RopeAppendRefImpl.
-        let is_global = !fuf.nodes.iter().any(|n| {
-            n.op == OpKind::SlidingAttention && consumes_tile(n, rope_id)
-        });
+        let is_global = !fuf
+            .nodes
+            .iter()
+            .any(|n| n.op == OpKind::SlidingAttention && consumes_tile(n, rope_id));
         // RAW (pre-norm) slots: the rope input tiles are the claimed
         // norms; their tile inputs are the projection outputs.
         let raw_slot = |idx: usize| -> Option<u32> {
@@ -722,15 +718,7 @@ impl Implementation for MetalRopeAppendNormedImpl {
             as u32;
 
         Some(vec![ferrite_forward::Instruction::RopeAppendNormed(
-            q_slot,
-            k_slot,
-            v_slot,
-            q_out_slot,
-            k_out_slot,
-            v_out_slot,
-            layer,
-            false,
-            is_global,
+            q_slot, k_slot, v_slot, q_out_slot, k_out_slot, v_out_slot, layer, false, is_global,
         )])
     }
 }

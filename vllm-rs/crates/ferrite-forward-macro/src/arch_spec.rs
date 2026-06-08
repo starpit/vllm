@@ -157,9 +157,7 @@ impl DeclaredArchSpec {
                 ParamSource::From { path, default } => json_path(json, path)
                     .and_then(|v| v.as_u64())
                     .or(*default)
-                    .ok_or_else(|| {
-                        format!("params field `{}`: config has no `{path}`", f.name)
-                    })?,
+                    .ok_or_else(|| format!("params field `{}`: config has no `{path}`", f.name))?,
                 ParamSource::Expr(e) => eval_expr(e, bounds)
                     .map_err(|err| format!("params field `{}`: {err}", f.name))?,
                 ParamSource::Value(v) => *v,
@@ -338,7 +336,10 @@ fn lit_str_u64_pairs(expr: &syn::Expr) -> syn::Result<Vec<(String, u64)>> {
         {
             out.push((lit_str(&t.elems[0])?, lit_u64(&t.elems[1])?));
         } else {
-            return Err(syn::Error::new(el.span(), "expected (\"name\", <int>) tuple"));
+            return Err(syn::Error::new(
+                el.span(),
+                "expected (\"name\", <int>) tuple",
+            ));
         }
     }
     Ok(out)
@@ -352,7 +353,10 @@ fn slice_elems(expr: &syn::Expr) -> syn::Result<Vec<&syn::Expr>> {
     if let syn::Expr::Array(a) = inner {
         return Ok(a.elems.iter().collect());
     }
-    Err(syn::Error::new(expr.span(), "expected `&[…]` slice literal"))
+    Err(syn::Error::new(
+        expr.span(),
+        "expected `&[…]` slice literal",
+    ))
 }
 
 /// Struct-literal field access: `Layout { root: "…", … }`.
@@ -377,7 +381,10 @@ fn variant_ident(expr: &syn::Expr) -> syn::Result<String> {
     {
         return Ok(seg.ident.to_string());
     }
-    Err(syn::Error::new(expr.span(), "expected a path like `Enum::Variant`"))
+    Err(syn::Error::new(
+        expr.span(),
+        "expected a path like `Enum::Variant`",
+    ))
 }
 
 impl DeclaredArchSpec {

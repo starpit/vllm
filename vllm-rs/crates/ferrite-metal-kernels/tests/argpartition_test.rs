@@ -158,7 +158,13 @@ fn run_case(dtype: ArgsortDType, rows: usize, cols: usize, top_k: usize, seed: u
 #[test]
 fn argsort_f32_mixtral_topk() {
     // E=8, top_k=2 (Mixtral default).
-    run_case(ArgsortDType::F32, /*rows=*/ 11, /*cols=*/ 8, /*top_k=*/ 2, 0xC0FFEE);
+    run_case(
+        ArgsortDType::F32,
+        /*rows=*/ 11,
+        /*cols=*/ 8,
+        /*top_k=*/ 2,
+        0xC0FFEE,
+    );
 }
 
 #[test]

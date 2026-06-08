@@ -8549,9 +8549,10 @@ impl Implementation for RopeAppendRefImpl {
         // uniform-geometry models the two const families are equal,
         // so the default `true` is also correct when no attention
         // consumer is found (e.g. encoder shapes).
-        let is_global = !fuf.nodes.iter().any(|n| {
-            n.op == OpKind::SlidingAttention && consumes_tile(n, rope_id)
-        });
+        let is_global = !fuf
+            .nodes
+            .iter()
+            .any(|n| n.op == OpKind::SlidingAttention && consumes_tile(n, rope_id));
         let resolve_tile = |idx: usize| -> (TileId, u8) {
             match node.inputs.get(idx) {
                 Some(FufInput::Tile { id, slot }) => (*id, *slot),

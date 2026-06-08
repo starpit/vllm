@@ -107,8 +107,7 @@ fn safetensors_prefix(
         // NOT a crate-global: sibling variants of one arch can drift
         // (mlx_vlm repacks `visual.*` as `vision_tower.*`), and a
         // models[0]-keyed layout poisons every other variant's paths.
-        let layout =
-            vision_layout.expect("vision safetensors layout enforced at config parse");
+        let layout = vision_layout.expect("vision safetensors layout enforced at config parse");
         // Subtree override: when the DSL path's first segment maps
         // to a sibling subtree on disk, the override fully replaces
         // the `<default_root>(.<layered_subpath>.{l})?` prefix and
@@ -2542,9 +2541,10 @@ fn emit_weights_struct(
         // loader never queries and load() fails on the missing split.
         let block_prefix_template: String = if is_vision {
             let layout = model
-                .arch.safetensors
+                .arch
+                .safetensors
                 .clone()
-            .expect("vision safetensors layout enforced at config parse");
+                .expect("vision safetensors layout enforced at config parse");
             format!("{}.{}", layout.default_root, layout.layered_subpath)
         } else {
             "model.layers".to_string()
@@ -3125,73 +3125,50 @@ fn emit_weights_struct(
                     )?;
             }
         } else {
-        match (rotary_dim_metal, scaling) {
-            (None, None) => quote! {
-                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
-                let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
-                    gw,
-                    #head_dim,
-                    rope_max_pos,
-                    #rope_theta,
-                    None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
-                )?;
-            },
-            (
-                None,
-                Some(crate::config::RopeScaling::Llama3 {
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_position_embeddings,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
+            match (rotary_dim_metal, scaling) {
+                (None, None) => quote! {
                     let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
                     let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
                         gw,
                         #head_dim,
                         rope_max_pos,
                         #rope_theta,
-                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
-                            factor: #factor,
-                            low_freq_factor: #low_freq_factor,
-                            high_freq_factor: #high_freq_factor,
-                            original_max_position_embeddings: #orig,
-                        }),
+                        None,
                         ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
                     )?;
-                }
-            }
-            // Partial rotary, no scaling (Qwen3.5 / Qwen3-Next:
-            // partial_rotary_factor 0.25). Builds a `[max_pos, rotary_dim]`
-            // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
-            // trailing head_dim-rotary_dim channels pass through unrotated.
-            (Some(rotary_dim), None) => quote! {
-                let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
-                let rotary = ::ferrite_kernels::rotary::RotaryCache::new_partial_from_gpuweights(
-                    gw,
-                    #head_dim,
-                    #rotary_dim,
-                    rope_max_pos,
-                    #rope_theta,
+                },
+                (
                     None,
-                    ::ferrite_cuda_core::dtype::DType::BF16,
-                )?;
-            },
-            // Partial rotary + Llama3 scaling.
-            (
-                Some(rotary_dim),
-                Some(crate::config::RopeScaling::Llama3 {
-                    factor,
-                    low_freq_factor,
-                    high_freq_factor,
-                    original_max_position_embeddings,
-                }),
-            ) => {
-                let orig = original_max_position_embeddings as usize;
-                quote! {
+                    Some(crate::config::RopeScaling::Llama3 {
+                        factor,
+                        low_freq_factor,
+                        high_freq_factor,
+                        original_max_position_embeddings,
+                    }),
+                ) => {
+                    let orig = original_max_position_embeddings as usize;
+                    quote! {
+                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rotary = ::ferrite_kernels::rotary::RotaryCache::new_from_gpuweights(
+                            gw,
+                            #head_dim,
+                            rope_max_pos,
+                            #rope_theta,
+                            Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                                factor: #factor,
+                                low_freq_factor: #low_freq_factor,
+                                high_freq_factor: #high_freq_factor,
+                                original_max_position_embeddings: #orig,
+                            }),
+                            ::ferrite_cuda_core::dtype::DType::BF16,  // bf16 cos/sin (HEAD-original)
+                        )?;
+                    }
+                }
+                // Partial rotary, no scaling (Qwen3.5 / Qwen3-Next:
+                // partial_rotary_factor 0.25). Builds a `[max_pos, rotary_dim]`
+                // cache; `W::ROT_DIM` (= rotary_dim) drives the kernel so the
+                // trailing head_dim-rotary_dim channels pass through unrotated.
+                (Some(rotary_dim), None) => quote! {
                     let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
                     let rotary = ::ferrite_kernels::rotary::RotaryCache::new_partial_from_gpuweights(
                         gw,
@@ -3199,42 +3176,65 @@ fn emit_weights_struct(
                         #rotary_dim,
                         rope_max_pos,
                         #rope_theta,
-                        Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
-                            factor: #factor,
-                            low_freq_factor: #low_freq_factor,
-                            high_freq_factor: #high_freq_factor,
-                            original_max_position_embeddings: #orig,
-                        }),
+                        None,
                         ::ferrite_cuda_core::dtype::DType::BF16,
                     )?;
+                },
+                // Partial rotary + Llama3 scaling.
+                (
+                    Some(rotary_dim),
+                    Some(crate::config::RopeScaling::Llama3 {
+                        factor,
+                        low_freq_factor,
+                        high_freq_factor,
+                        original_max_position_embeddings,
+                    }),
+                ) => {
+                    let orig = original_max_position_embeddings as usize;
+                    quote! {
+                        let rope_max_pos = ::core::cmp::min(max_model_len, #max_pos);
+                        let rotary = ::ferrite_kernels::rotary::RotaryCache::new_partial_from_gpuweights(
+                            gw,
+                            #head_dim,
+                            #rotary_dim,
+                            rope_max_pos,
+                            #rope_theta,
+                            Some(&::ferrite_kernels::rotary::Llama3RopeScaling {
+                                factor: #factor,
+                                low_freq_factor: #low_freq_factor,
+                                high_freq_factor: #high_freq_factor,
+                                original_max_position_embeddings: #orig,
+                            }),
+                            ::ferrite_cuda_core::dtype::DType::BF16,
+                        )?;
+                    }
                 }
+                // LongRoPE / YaRN (with or without partial rotary): the
+                // macro can't emit a working metal init yet (no
+                // `*_from_gpuweights` counterpart in `ferrite-kernels::rotary`).
+                // Stub to a runtime panic so the build remains green for the
+                // metal-supported subset; arches that hit this won't load
+                // successfully under metal until the proper port lands.
+                //
+                // The panic lives inside an immediately-invoked closure so
+                // `rustc` doesn't propagate the `!` type through to the
+                // outer scope and warn `unreachable_code` on every line of
+                // generated code that follows the rotary load. Closure
+                // body has type `RotaryCache` (the never type coerces);
+                // the call-site sees a regular `RotaryCache` value.
+                _ => quote! {
+                    let rotary: ::ferrite_kernels::rotary::RotaryCache =
+                        (|| -> ::ferrite_kernels::rotary::RotaryCache {
+                            ::core::panic!(
+                                "metal: rotary scaling variant not yet supported \
+                                 (LongRoPE / Yarn / partial-rotary). Land a metal \
+                                 counterpart to RotaryCache::new_from_gpuweights for \
+                                 this scaling family before enabling this model \
+                                 under --features metal."
+                            )
+                        })();
+                },
             }
-            // LongRoPE / YaRN (with or without partial rotary): the
-            // macro can't emit a working metal init yet (no
-            // `*_from_gpuweights` counterpart in `ferrite-kernels::rotary`).
-            // Stub to a runtime panic so the build remains green for the
-            // metal-supported subset; arches that hit this won't load
-            // successfully under metal until the proper port lands.
-            //
-            // The panic lives inside an immediately-invoked closure so
-            // `rustc` doesn't propagate the `!` type through to the
-            // outer scope and warn `unreachable_code` on every line of
-            // generated code that follows the rotary load. Closure
-            // body has type `RotaryCache` (the never type coerces);
-            // the call-site sees a regular `RotaryCache` value.
-            _ => quote! {
-                let rotary: ::ferrite_kernels::rotary::RotaryCache =
-                    (|| -> ::ferrite_kernels::rotary::RotaryCache {
-                        ::core::panic!(
-                            "metal: rotary scaling variant not yet supported \
-                             (LongRoPE / Yarn / partial-rotary). Land a metal \
-                             counterpart to RotaryCache::new_from_gpuweights for \
-                             this scaling family before enabling this model \
-                             under --features metal."
-                        )
-                    })();
-            },
-        }
         } // else: !global_proportional
     } else {
         quote! {}
@@ -4419,9 +4419,10 @@ fn emit_group_let(
             // .encoder.layers` (Gemma3-MM). `None` for decoder bodies.
             let vision_root_owned: Option<String> = if is_vision {
                 let layout = model
-                    .arch.safetensors
+                    .arch
+                    .safetensors
                     .clone()
-            .expect("vision safetensors layout enforced at config parse");
+                    .expect("vision safetensors layout enforced at config parse");
                 Some(format!(
                     "{}.{}",
                     layout.default_root, layout.layered_subpath
@@ -6333,9 +6334,21 @@ fn emit_canonical_params_impl(
     // committed text/VL-text decoder shifts.
     let vision_embed_dim = *model.bounds.get("vision_embed_dim").unwrap_or(&0) as usize;
     let is_vision_only = num_q_heads == 0 && vision_num_heads > 0;
-    let head_dim = if is_vision_only { vision_head_dim } else { head_dim };
-    let num_q_heads = if is_vision_only { vision_num_heads } else { num_q_heads };
-    let q_size = if is_vision_only { vision_q_size } else { q_size };
+    let head_dim = if is_vision_only {
+        vision_head_dim
+    } else {
+        head_dim
+    };
+    let num_q_heads = if is_vision_only {
+        vision_num_heads
+    } else {
+        num_q_heads
+    };
+    let q_size = if is_vision_only {
+        vision_q_size
+    } else {
+        q_size
+    };
 
     let head_dim_lit = proc_macro2::Literal::u32_unsuffixed(head_dim);
     let num_q_heads_lit = proc_macro2::Literal::u32_unsuffixed(num_q_heads);
@@ -6351,7 +6364,11 @@ fn emit_canonical_params_impl(
         .get("hidden_size")
         .copied()
         .map(|v| v as usize)
-        .unwrap_or(if is_vision_only { vision_embed_dim } else { q_size });
+        .unwrap_or(if is_vision_only {
+            vision_embed_dim
+        } else {
+            q_size
+        });
     let hidden_size_lit = proc_macro2::Literal::usize_unsuffixed(hidden_size_for_const);
     let intermediate_size_lit = proc_macro2::Literal::usize_unsuffixed(intermediate_size);
     // VOCAB_SIZE: lm_head output dim. Read from the verbatim HF config
@@ -6460,10 +6477,7 @@ fn emit_canonical_params_impl(
     // Drives the metal rope kernel's pairing offset (lane i pairs
     // with i + head_dim/2, not i + rot_dim/2).
     let rope_proportional = global_rot_dim != global_head_dim
-        && model
-            .scalars
-            .get("global_partial_rotary_factor")
-            .is_some();
+        && model.scalars.get("global_partial_rotary_factor").is_some();
     let rope_proportional_tokens: proc_macro2::TokenStream = if rope_proportional {
         quote! { const ROPE_PROPORTIONAL: bool = true; }
     } else {
@@ -6552,12 +6566,8 @@ fn emit_canonical_params_impl(
     // lowering arm's `kernel_symbol` matches the registered library.
     // Mismatch surfaces at worker init as
     // `PipelineLookup(no library …_bias in SpecializedPipelineCache)`.
-    let synth_sources_override = emit_synthesized_kernel_sources_override(
-        model,
-        tp_world_size,
-        has_bias_add,
-        has_gelu_mlp,
-    );
+    let synth_sources_override =
+        emit_synthesized_kernel_sources_override(model, tp_world_size, has_bias_add, has_gelu_mlp);
 
     // SCALE_DTYPE override — only matters under `--features metal`.
     // mlx-community 4bit convention (probed across cached HF snapshots):
@@ -7390,6 +7400,10 @@ pub fn emit_model(
     // themselves are backend-agnostic).
     let mut metal_bucket_entries: Vec<TokenStream> = Vec::new();
     let mut metal_arena_bytes_statics: Vec<TokenStream> = Vec::new();
+    // `(bucket_m, total_colored_arena_bytes)` per bucket — the per-bucket cost
+    // the load-time `select_prefill_bucket` compares against the device's
+    // affordable arena budget to prune the ladder target-reactively.
+    let mut metal_bucket_cost_entries: Vec<TokenStream> = Vec::new();
     for &m in &num_tokens_points {
         // Prefer the sk=0 canonical for this `m`; fall back to any wp
         // at `m` if the model never declared sk=0 explicitly.
@@ -7457,6 +7471,15 @@ pub fn emit_model(
                 *b = 1;
             }
         }
+
+        // Per-bucket total arena cost (sum over colored slots) for the
+        // load-time selector. Monotonic in `m`; consumed by
+        // `select_prefill_bucket` via `metal_bucket_arena_costs()`.
+        let bucket_total_arena_lit =
+            proc_macro2::Literal::u64_unsuffixed(bucket_arena_bytes.iter().sum::<u64>());
+        metal_bucket_cost_entries.push(quote! {
+            (#bucket_m_lit, #bucket_total_arena_lit),
+        });
 
         let arena_static_ident = bucket_static_ident("METAL_ARENA_BYTES_M", wp);
         let arena_bytes_lits = bucket_arena_bytes
@@ -7747,6 +7770,17 @@ pub fn emit_model(
         #[cfg(feature = "metal")]
         pub const METAL_ARENA_PEAK_BYTES: u64 = #metal_arena_peak_bytes_lit;
 
+        /// `(bucket_m, total_colored_arena_bytes)` for every compiled bucket
+        /// of this canonical, ascending by `bucket_m`. The load-time
+        /// `select_prefill_bucket` reads this (via
+        /// `FerriteWeights::metal_bucket_arena_costs`) to prune the global
+        /// ladder to the largest bucket the device can afford while leaving a
+        /// KV floor — the target-reactive replacement for a hardcoded
+        /// per-model `workloads` cap.
+        #[cfg(feature = "metal")]
+        pub static METAL_BUCKET_ARENA_COSTS: &[(u32, u64)] =
+            &[ #(#metal_bucket_cost_entries)* ];
+
         /// Build a [`MetalWorkerPool`] for this canonical. Thin
         /// wrapper over [`MetalWorkerPool::for_buckets`] that threads
         /// the per-canonical [`METAL_BUCKETS`] static so callers don't
@@ -7782,6 +7816,9 @@ pub fn emit_model(
                 METAL_BUCKETS,
                 runtime_factory,
                 max_workers,
+                // Standalone factory: no device-budget context here, so keep
+                // all buckets. The lazy-init path below passes the real cap.
+                None,
             )
         }
 
@@ -7967,6 +8004,10 @@ pub fn emit_model(
                     METAL_BUCKETS,
                     factory,
                     1,
+                    // Target-reactive cap stashed on the device by the worker
+                    // after `determine_available_memory`. Prunes the compiled
+                    // ladder so the colored arena fits the KV budget.
+                    device.metal_bucket_max_m,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             });
@@ -8411,6 +8452,10 @@ pub fn emit_model(
                     METAL_BUCKETS,
                     factory,
                     1,
+                    // Target-reactive cap stashed on the device by the worker
+                    // after `determine_available_memory`. Prunes the compiled
+                    // ladder so the colored arena fits the KV budget.
+                    device.metal_bucket_max_m,
                 )
                 .expect("MetalWorkerPool::for_buckets: pool init failed")
             });
@@ -8902,7 +8947,7 @@ fn emit_shim_model(
         #[cfg(feature = "metal")]
         pub use super::#canonical::{
             forward, forward_chain_with_encoder, forward_with_metal_followup,
-            METAL_ARENA_PEAK_BYTES, METAL_BUCKETS, metal_pool,
+            METAL_ARENA_PEAK_BYTES, METAL_BUCKET_ARENA_COSTS, METAL_BUCKETS, metal_pool,
         };
     }
 }
@@ -9549,7 +9594,8 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_a_proj_for_mla_archs() {
         let dir = arch_configs("deepseek-v3");
-        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3 configs");
+        let configs =
+            crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3 configs");
         let manifest = crate::weights_manifest::load_or_empty(&dir)
             .expect("load deepseek-v3 weights manifest");
         // Pick a V3 variant with FP8-block quantization (block_size: Some).
@@ -9589,7 +9635,8 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_flat_q_mla_archs() {
         let dir = arch_configs("deepseek-v3-flat");
-        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load deepseek-v3-flat configs");
+        let configs = crate::config::load_dir(&dir, &Default::default())
+            .expect("load deepseek-v3-flat configs");
         let manifest = crate::weights_manifest::load_or_empty(&dir)
             .expect("load deepseek-v3-flat weights manifest");
         let model = configs
@@ -9623,7 +9670,8 @@ mod fingerprint_tests {
     #[test]
     fn fp8_block_disambiguation_uses_q_proj_for_non_mla_archs() {
         let dir = arch_configs("qwen3");
-        let configs = crate::config::load_dir(&dir, &Default::default()).expect("load qwen3 configs");
+        let configs =
+            crate::config::load_dir(&dir, &Default::default()).expect("load qwen3 configs");
         let manifest =
             crate::weights_manifest::load_or_empty(&dir).expect("load qwen3 weights manifest");
         let model = configs

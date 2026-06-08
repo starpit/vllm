@@ -159,9 +159,7 @@ impl ShaderCache {
                 Box::leak(
                     std::fs::read(&v)
                         .map_err(|e| {
-                            MetalStreamError::ShaderCompilationFailed(format!(
-                                "read {v:?}: {e}"
-                            ))
+                            MetalStreamError::ShaderCompilationFailed(format!("read {v:?}: {e}"))
                         })?
                         .into_boxed_slice(),
                 )
@@ -461,8 +459,8 @@ pub fn compile_nax_library_from_source(device: &Device) -> Result<Library, Strin
 
     let opts = MTLCompileOptions::new();
     opts.setMathMode(MTLMathMode::Safe); // == fastMath off; what mlx uses
-    // Language version: default to 4.0; FERRITE_NAX_LANG_DEFAULT=1
-    // leaves the runtime default (newest the OS supports) — perf A/B.
+                                         // Language version: default to 4.0; FERRITE_NAX_LANG_DEFAULT=1
+                                         // leaves the runtime default (newest the OS supports) — perf A/B.
     if std::env::var_os("FERRITE_NAX_LANG_DEFAULT").is_none() {
         opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
     }

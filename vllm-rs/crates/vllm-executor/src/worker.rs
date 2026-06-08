@@ -82,6 +82,16 @@ pub trait Worker: Send {
         Ok(())
     }
 
+    /// Largest prefill bucket the device can afford, if the backend prunes a
+    /// compiled bucket ladder target-reactively (see `select_prefill_bucket`).
+    /// The engine clamps `SchedulerConfig::max_num_batched_tokens` to this so a
+    /// single forward never exceeds the largest resident bucket (which would
+    /// otherwise hit `NoBucketFits` mid-run). `None` = no cap (keep the
+    /// configured value); valid only after `determine_available_memory`.
+    fn prefill_bucket_max_m(&self) -> Option<u32> {
+        None
+    }
+
     /// Check whether the worker is healthy.
     fn check_health(&self) -> ExecutorResult<()> {
         Ok(())

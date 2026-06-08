@@ -34,9 +34,7 @@
 
 use ferrite_forward_macro::forward;
 
-#[forward(
-    workloads = [1, 8, 64, 512, 4096],
-)]
+#[forward()]
 fn commandr() {
     hidden_states = embed(input_ids, embed_tokens);
     for layer in 0..num_hidden_layers {

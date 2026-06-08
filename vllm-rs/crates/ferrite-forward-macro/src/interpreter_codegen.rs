@@ -3632,8 +3632,7 @@ pub fn lower_bucket(
                 || kv_w
                     .map(|l| pending_kv_writes.contains(&l) || pending_kv_reads.contains(&l))
                     .unwrap_or(false);
-            let need_barrier =
-                !metadata_only && !first_dispatch && (arena_conflict || kv_conflict);
+            let need_barrier = !metadata_only && !first_dispatch && (arena_conflict || kv_conflict);
             if std::env::var_os("FERRITE_MACRO_BARRIER_DEBUG").is_some() {
                 eprintln!(
                     "[hazard] imp={:32} claimed={:?} reads={:?} writes={:?} \

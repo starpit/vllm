@@ -22,7 +22,8 @@
 use ferrite_forward_macro::forward;
 
 #[forward(
-    workloads = [1, 8, 64, 512, 4096],
+    // No `workloads` — uses the global default ladder, pruned per-device at
+    // load time by `select_prefill_bucket`. `sk_buckets` (KV-span axis) stays.
     sk_buckets = [128, 512, 2048, 8192],
 )]
 fn qwen2() {

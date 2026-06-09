@@ -871,10 +871,18 @@ impl CachingAllocator {
 
 impl Drop for CachingAllocator {
     fn drop(&mut self) {
-        // DIAGNOSTIC: no-op. Leak the segments and the `Block` structs instead
-        // of freeing them, to test whether the teardown corruption originates
-        // here (a free / Box::from_raw of memory still referenced elsewhere).
-        // The process is exiting, so the leak is harmless for this test.
+        // Free all segments.
+        for &(ptr, _) in &self.segments {
+            unsafe {
+                let _ = driver::mem_free(ptr);
+            }
+        }
+        // Free all Block structs.
+        for &bp in &self.all_blocks {
+            unsafe {
+                let _ = Box::from_raw(bp);
+            }
+        }
     }
 }
 

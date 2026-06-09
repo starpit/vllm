@@ -1587,8 +1587,6 @@ pub struct FerriteWorker {
     // CUDA-only orchestration state.
     // ---------------------------------------------------------------
     #[cfg(feature = "cuda")]
-    device: Option<GpuDevice>,
-    #[cfg(feature = "cuda")]
     model: Option<CudaModel>,
     /// CUDA graph runner for decode batches (monolithic mode).
     #[cfg(feature = "cuda")]
@@ -1661,6 +1659,17 @@ pub struct FerriteWorker {
     /// Saved num_gpu_blocks for re-init after wake.
     #[cfg(feature = "cuda")]
     num_gpu_blocks_saved: usize,
+    /// The `CachingAllocator` (inside `GpuDevice`) is declared LAST among the
+    /// CUDA fields so it drops AFTER every `OwnedTensor` holder above — `model`,
+    /// the graph runners, `logits_pipeline` (which owns `PenaltiesProcessor` and
+    /// its penalty tensors), the KV cache, etc. Rust drops fields in declaration
+    /// order; if the allocator drops first, those fields' `OwnedTensor::drop`
+    /// calls `free()` into an already-freed allocator — an ASan-confirmed
+    /// heap-use-after-free that surfaces as the teardown `BTreeSet` "empty
+    /// internal node". Keep `device` last, and do not drop it early in
+    /// `shutdown()`.
+    #[cfg(feature = "cuda")]
+    device: Option<GpuDevice>,
     // Pipeline-parallel (PP) plumbing was removed alongside the hand-written
     // CUDA model forwards: the only `forward_pp` impls lived on
     // `vllm_cuda::model::{llama,qwen2,gemma2,gemma3}` and the send/recv
@@ -5120,7 +5129,13 @@ impl Worker for FerriteWorker {
         self.weight_gpu_allocs.clear();
         self.model = None;
         self.kv_cache = None;
-        self.device = None;
+        // Do NOT drop `self.device` here. The allocator must outlive every
+        // OwnedTensor holder still on `self` (logits_pipeline/PenaltiesProcessor,
+        // graph runners, …). It is the last CUDA field, so it drops last when the
+        // worker itself drops — after those fields. Freeing it here freed the
+        // allocator while those tensors were still live → use-after-free in their
+        // Drop (ASan-confirmed: PenaltiesProcessor::drop → CachingAllocator::free
+        // → active_blocks.remove on a freed table).
         self.is_shutdown = true;
     }
 
